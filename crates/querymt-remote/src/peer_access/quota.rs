@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{GrantStoreError, PeerGrantKey, SharingProtocol, valid_id};
 
 mod store;
-pub use store::QuotaStore;
+pub use store::{DispatchedAttempt, QuotaStore, ReservedAttempt};
 
 /// A provider-wide or model-specific quota on a particular host and peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

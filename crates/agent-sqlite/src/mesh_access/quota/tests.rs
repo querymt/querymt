@@ -247,6 +247,50 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
 }
 
 #[tokio::test]
+async fn dropped_attempts_release_only_work_that_could_not_dispatch() {
+    use querymt_remote::peer_access::quota::ReservedAttempt;
+
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    f.limit(&provider, 20, QuotaWindow::Weekly).await;
+    let store = Arc::new(f.store.clone());
+    let reserved = ReservedAttempt::reserve(store.clone(), f.request("a", Some(5), TUESDAY).await)
+        .await
+        .unwrap();
+    let dispatched = ReservedAttempt::reserve(store, f.request("b", Some(10), TUESDAY).await)
+        .await
+        .unwrap()
+        .begin()
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .quota(&f.key, &provider, TUESDAY)
+            .await
+            .unwrap()
+            .reserved_tokens,
+        15
+    );
+    drop(reserved);
+    drop(dispatched);
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = f.store.quota(&f.key, &provider, TUESDAY).await.unwrap();
+            if status.reserved_tokens == 0 {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must settle both attempts without a restart");
+    assert_eq!(status.known_tokens, 0);
+    assert_eq!(status.estimated_tokens, 10);
+    assert_eq!(status.available_tokens, Some(10));
+}
+
+#[tokio::test]
 async fn a_stale_authorization_cannot_reserve_under_a_regrant() {
     let f = Fixture::new().await;
     let provider = scope(None);

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore, ReservationId,
+    AttemptUsage, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore, ReservedAttempt,
 };
 use crate::peer_access::{PeerGrant, PeerGrantState};
 use crate::provider_host_actor::validate_item_aware_request;
@@ -229,7 +229,7 @@ impl GuardedProvider {
         let (provider, id) = self
             .prepare_attempt(peer, request, &call, request_id)
             .await?;
-        self.mark_dispatched(id).await?;
+        let attempt = id.begin().await.map_err(quota_error)?;
         let watch = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -249,7 +249,7 @@ impl GuardedProvider {
             .ok()
             .and_then(|reply| reply.usage.as_ref())
             .map_or(AttemptUsage::Unknown, AttemptUsage::from_usage);
-        self.settle(id, usage).await?;
+        enforce_settlement(attempt.settle(usage).await.map_err(quota_error)?)?;
         self.binding(peer, &msg.provider, &msg.model).await?;
         response.map(ProviderChatResponse::from)
     }
@@ -260,7 +260,7 @@ impl GuardedProvider {
         request: ProviderBuildRequest,
         call: &ChatCall<'_>,
         request_id: Uuid,
-    ) -> Result<(Arc<dyn querymt::LLMProvider>, ReservationId), RemoteProviderHostError> {
+    ) -> Result<(Arc<dyn querymt::LLMProvider>, ReservedAttempt), RemoteProviderHostError> {
         let grant = self
             .binding(peer, &request.provider_name, &request.model)
             .await?;
@@ -270,9 +270,9 @@ impl GuardedProvider {
             .ok()
             .and_then(|time| i64::try_from(time.as_secs()).ok())
             .ok_or_else(|| quota_error(QuotaError::InvalidTime))?;
-        let id = self
-            .store
-            .reserve(QuotaAttempt {
+        let attempt = ReservedAttempt::reserve(
+            self.store.clone(),
+            QuotaAttempt {
                 peer: peer.key().clone(),
                 grant_revision: grant.revision,
                 protocol: peer.protocol(),
@@ -281,9 +281,10 @@ impl GuardedProvider {
                 request_id,
                 bound_tokens,
                 now,
-            })
-            .await
-            .map_err(quota_error)?;
+            },
+        )
+        .await
+        .map_err(quota_error)?;
         let prepared = tokio::time::timeout(
             Duration::from_secs(30),
             self.backend.build_provider(request.clone()),
@@ -299,7 +300,7 @@ impl GuardedProvider {
         let provider = match prepared {
             Ok(provider) => provider,
             Err(error) => {
-                self.store.release_unused(id).await.map_err(quota_error)?;
+                attempt.release().await.map_err(quota_error)?;
                 return Err(error);
             }
         };
@@ -308,39 +309,22 @@ impl GuardedProvider {
             .binding(peer, &request.provider_name, &request.model)
             .await
         {
-            self.store.release_unused(id).await.map_err(quota_error)?;
+            attempt.release().await.map_err(quota_error)?;
             return Err(error);
         }
-        Ok((provider, id))
+        Ok((provider, attempt))
     }
+}
 
-    async fn mark_dispatched(&self, id: ReservationId) -> Result<(), RemoteProviderHostError> {
-        // The store rechecks the reservation's revision in this transaction.
-        if let Err(error) = self.store.mark_dispatched(id).await {
-            if let Err(release) = self.store.release_unused(id).await {
-                tracing::warn!(%release, "mesh quota reservation requires reconciliation");
-            }
-            return Err(quota_error(error));
-        }
-        Ok(())
+fn enforce_settlement(outcome: QuotaSettlement) -> Result<(), RemoteProviderHostError> {
+    if outcome == QuotaSettlement::BoundExceeded {
+        return Err(failure(
+            ProviderErrorKind::UnknownPermanent,
+            "mesh_quota_bound_exceeded",
+            "provider exceeded its enforced token bound",
+        ));
     }
-
-    async fn settle(
-        &self,
-        id: ReservationId,
-        usage: AttemptUsage,
-    ) -> Result<(), RemoteProviderHostError> {
-        if self.store.settle(id, usage).await.map_err(quota_error)?
-            == QuotaSettlement::BoundExceeded
-        {
-            return Err(failure(
-                ProviderErrorKind::UnknownPermanent,
-                "mesh_quota_bound_exceeded",
-                "provider exceeded its enforced token bound",
-            ));
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 fn quota_error(error: QuotaError) -> RemoteProviderHostError {

@@ -1,9 +1,11 @@
 //! Peer-owned provider streams. The legacy actor remains separate: its local
 //! controls and unauthenticated wire handlers cannot address these streams.
 
-use super::{GuardedProvider, failure, quota_error, validate_item_aware_request};
+use super::{
+    GuardedProvider, enforce_settlement, failure, quota_error, validate_item_aware_request,
+};
 use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
-use crate::peer_access::quota::{AttemptUsage, QuotaError, ReservationId};
+use crate::peer_access::quota::{AttemptUsage, QuotaError, ReservedAttempt};
 use crate::peer_access::{PeerGrantKey, SharingProtocol};
 use crate::request_timeout::ask_sharing_v1;
 use crate::{
@@ -338,7 +340,7 @@ impl StreamRelay {
         self,
         provider: Arc<dyn querymt::LLMProvider>,
         call: ChatCall<'_>,
-        reservation: ReservationId,
+        reservation: ReservedAttempt,
     ) {
         let mut meter = StreamMeter::default();
         let mut seq = 0;
@@ -348,18 +350,10 @@ impl StreamRelay {
             self.authorized().await
         };
         let (outcome, settled) = match ready {
-            Err(error) => (
-                Err(error),
-                self.service
-                    .provider
-                    .store
-                    .release_unused(reservation)
-                    .await
-                    .map_err(quota_error),
-            ),
-            Ok(()) => match self.service.provider.mark_dispatched(reservation).await {
-                Err(error) => (Err(error), Ok(())),
-                Ok(()) => {
+            Err(error) => (Err(error), reservation.release().await.map_err(quota_error)),
+            Ok(()) => match reservation.begin().await {
+                Err(error) => (Err(quota_error(error)), Ok(())),
+                Ok(attempt) => {
                     let outcome = tokio::select! {
                         biased;
                         _ = self.active.cancel.cancelled() => Err(cancelled()),
@@ -371,11 +365,11 @@ impl StreamRelay {
                             self.forward(stream, &mut meter, &mut seq).await
                         } => result,
                     };
-                    let settled = self
-                        .service
-                        .provider
-                        .settle(reservation, meter.complete_usage())
-                        .await;
+                    let settled = attempt
+                        .settle(meter.complete_usage())
+                        .await
+                        .map_err(quota_error)
+                        .and_then(enforce_settlement);
                     (outcome, settled)
                 }
             },
