@@ -16,6 +16,18 @@
   multimodal and speculative (target) generation. Changing the adapter path
   reloads the model; changing only the scale does not. New exports
   `LoraAdapterConfig`, `LoraScale` and `LoraScaleError`.
+- **Harness adapter profile.** `crates/agent/examples/confs/harness_adapter.toml`
+  is a frozen QueryMT harness profile for training and serving RL-trained LoRA harness
+  adapters: endpoint, model and key from `QMT_BASE_URL`, `QMT_MODEL` and
+  `QMT_API_KEY`, a fixed 15-tool set, append-only history (no pruning or
+  compaction) and a 50-call `limits` budget. The `experiments/harness-adapter/`
+  package carries the training pipeline.
+- **`qmt-headless` example binary.** A non-interactive runner for the harness
+  adapter profile: `cargo run --example qmt-headless -- run <profile> --cwd DIR
+  --instruction-file FILE --db FILE` runs one task to completion, and
+  `qmt-headless export --db FILE --atif OUT --summary OUT` writes the
+  trajectory as ATIF plus a run summary. Static musl builds are attached to
+  nightly and stable releases as `qmt-headless-<version>-<target>.tar.gz`.
 
 ### Behavior changes
 
@@ -47,8 +59,8 @@
   `idle_secs`, and the model request span carries `qmt.cache.prefix_change` and
   `qmt.cache.idle_secs`.
 - **Tool order:** the tool list sent to the model is sorted by name, and
-  `ToolRegistry` keeps registration order, so the tool prefix is byte-stable
-  between requests.
+  `ToolRegistry` is ordered by name, so the tool prefix is byte-stable
+  between requests and processes.
 - **Compaction:** the summary is followed by the session's active task, so a
   compacted session keeps its task commitment.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
@@ -311,6 +323,21 @@
 
 ### Fixed
 
+- **HTTP clients no longer panic when the system has no CA certificates.** In
+  a minimal container image (no `ca-certificates`), building the shared
+  outbound client, the plugin host's client and the `browse` and `web_fetch`
+  tools' clients failed with "No CA certificates were loaded from the system",
+  and the agent exited before its first model call. `querymt::outbound::build_client`
+  now retries once with the Mozilla roots bundled in the binary (added to the
+  empty system roots) and logs one warning; hosts that have system roots are
+  unchanged. This adds about the size of the bundled root list to the binary.
+- **A profile's `[agent] api_key` is now used.** It loaded and passed validation
+  but was dropped when the session was created (the stored session config never
+  keeps `api_key`), so the provider fell back to the environment variable, the
+  secret store or OAuth. The profile key is now applied as the provider's key
+  override whenever a session uses the profile's own provider and model; it is
+  withheld after a switch to another model or provider and is still never
+  persisted.
 - **Faster prompt records, and corrupt non-prompt parts no longer fail loads.**
   Structured user prompt records (remote and local session loads, older-history
   pages, peer prompt requests and history replay for clients without snapshot

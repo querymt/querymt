@@ -306,6 +306,25 @@ impl SessionProvider {
         &self.initial_config
     }
 
+    /// The profile's `api_key`, when `provider`/`model` is exactly the profile's
+    /// selection.
+    ///
+    /// The key is never persisted with the session's LLM config, so each
+    /// provider build re-applies it as an override. It is withheld for any other
+    /// selection (the same rule as [`Self::selection_params`]) so a profile key
+    /// is never sent to a different provider after a model switch.
+    pub fn profile_api_key(&self, provider: &str, model: &str) -> Option<&str> {
+        let is_profile_model = self.initial_config.provider.as_deref() == Some(provider)
+            && self.initial_config.model.as_deref() == Some(model);
+        if !is_profile_model {
+            return None;
+        }
+        self.initial_config
+            .api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+    }
+
     /// Base parameters for a model selection.
     ///
     /// Selecting exactly the profile's provider and model keeps the profile's
@@ -392,6 +411,7 @@ impl SessionProvider {
 
         let req = ProviderRequest::new(&config.provider, &config.model)
             .with_params(config.params.as_ref())
+            .with_api_key_override(self.profile_api_key(&config.provider, &config.model))
             .with_session_id(session_id);
         #[cfg(feature = "remote")]
         let req = req.with_provider_node_id(provider_node_id.as_deref());
@@ -902,6 +922,10 @@ impl SessionHandle {
                 })?;
                 let request = ProviderRequest::new(&config.provider, &config.model)
                     .with_params(config.params.as_ref())
+                    .with_api_key_override(
+                        self.provider
+                            .profile_api_key(&config.provider, &config.model),
+                    )
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
                 let request = request.with_provider_node_id(self.provider_node_id.as_deref());
@@ -1941,6 +1965,43 @@ pub mod tests {
         let params = provider.selection_params("openai", "M");
 
         assert_eq!(params, LLMParams::new().provider("openai").model("M"));
+    }
+
+    #[tokio::test]
+    async fn profile_api_key_is_used_for_the_profile_selection() {
+        let provider = provider_with_profile(
+            LLMParams::new()
+                .provider("openai")
+                .model("m")
+                .api_key("profile-key"),
+        )
+        .await;
+
+        assert_eq!(provider.profile_api_key("openai", "m"), Some("profile-key"));
+    }
+
+    #[tokio::test]
+    async fn profile_api_key_is_withheld_after_a_model_or_provider_switch() {
+        let provider = provider_with_profile(
+            LLMParams::new()
+                .provider("openai")
+                .model("m")
+                .api_key("profile-key"),
+        )
+        .await;
+
+        assert_eq!(provider.profile_api_key("openai", "other"), None);
+        assert_eq!(provider.profile_api_key("anthropic", "m"), None);
+    }
+
+    #[tokio::test]
+    async fn profile_api_key_is_none_when_absent_or_empty() {
+        let none = provider_with_profile(LLMParams::new().provider("openai").model("m")).await;
+        assert_eq!(none.profile_api_key("openai", "m"), None);
+
+        let empty =
+            provider_with_profile(LLMParams::new().provider("openai").model("m").api_key("")).await;
+        assert_eq!(empty.profile_api_key("openai", "m"), None);
     }
 
     #[cfg(feature = "remote")]

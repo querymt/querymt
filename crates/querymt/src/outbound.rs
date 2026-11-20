@@ -24,7 +24,72 @@ mod http_client {
         use serde_json::Value;
 
         /// A single, global client, built once
-        pub static CLIENT: Lazy<Client> = Lazy::new(Client::new);
+        pub static CLIENT: Lazy<Client> = Lazy::new(|| {
+            build_client(|builder| builder).expect("failed to build outbound HTTP client")
+        });
+
+        /// Build a `reqwest::Client` from `configure(Client::builder())`.
+        ///
+        /// With no usable system certificate store (for example a minimal
+        /// container image without CA certificates) the TLS verifier cannot be
+        /// created and the build fails. In that case the client is built once
+        /// more with the Mozilla roots bundled in the binary added to the
+        /// (empty) system roots, and one warning naming the cause is logged.
+        /// The second result is returned. Hosts that have system roots never
+        /// take the fallback, so enterprise and user-installed roots keep
+        /// working.
+        ///
+        /// `configure` runs once per attempt, so it must not have side effects.
+        pub fn build_client<F>(configure: F) -> Result<Client, reqwest::Error>
+        where
+            F: Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+        {
+            build_client_with(
+                configure,
+                |builder, bundled| {
+                    if bundled {
+                        builder.tls_certs_merge(bundled_roots()).build()
+                    } else {
+                        builder.build()
+                    }
+                },
+                |message| log::warn!("{message}"),
+            )
+        }
+
+        /// The retry logic of [`build_client`], with the build step and the
+        /// warning sink injected so it can be tested on any platform.
+        ///
+        /// `build(builder, false)` is the plain attempt; `build(builder, true)`
+        /// is the retry that must add the bundled roots.
+        pub(crate) fn build_client_with<F, B, W>(
+            configure: F,
+            build: B,
+            warn: W,
+        ) -> Result<Client, reqwest::Error>
+        where
+            F: Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+            B: Fn(reqwest::ClientBuilder, bool) -> Result<Client, reqwest::Error>,
+            W: FnOnce(String),
+        {
+            match build(configure(Client::builder()), false) {
+                Ok(client) => Ok(client),
+                Err(error) => {
+                    warn(format!(
+                        "HTTP client could not be built with the system certificate store ({error}); \
+                         retrying with the bundled root certificates"
+                    ));
+                    build(configure(Client::builder()), true)
+                }
+            }
+        }
+
+        pub(crate) fn bundled_roots() -> Vec<reqwest::Certificate> {
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
+                .collect()
+        }
 
         #[cfg(debug_assertions)]
         fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
@@ -326,6 +391,8 @@ mod http_client {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use http_client::imp::build_client;
 pub use http_client::imp::{call_outbound, call_outbound_raw, call_outbound_stream_raw};
 
 #[cfg(test)]

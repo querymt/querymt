@@ -8,6 +8,7 @@ This document covers example programs, configurations, and usage patterns for Qu
 - [Configuration Examples](#configuration-examples)
 - [Mesh Networking Examples](#mesh-networking-examples)
 - [Profile Examples](#profile-examples)
+- [Harness Adapter Profile](#harness-adapter-profile)
 - [Slash Command Examples](#slash-command-examples)
 - [Code Intelligence Examples](#code-intelligence-examples)
 - [Remote Session Examples](#remote-session-examples)
@@ -69,6 +70,48 @@ cargo run --example qmtcode --features dashboard -- path/to/config.toml --dashbo
 - ACP mode logs to stderr only (stdout is reserved for JSON-RPC)
 - Dashboard mode uses full telemetry
 - Mesh mode registers `RemoteNodeManager` and `ProviderHostActor` in the DHT
+
+---
+
+## Harness Adapter Profile
+
+`crates/agent/examples/confs/harness_adapter.toml` is a frozen profile for
+training and serving a *harness adapter*: a LoRA trained with reinforcement
+learning to run inside the QueryMT harness. The experiment that trains and
+publishes one lives in `experiments/harness-adapter/` (see its `README.md`).
+
+The harness is the `qmt-headless` example: one session, one instruction, and
+the result written to a session database.
+
+```bash
+echo "List the files in this directory." > /tmp/instruction.md
+QMT_BASE_URL=http://localhost:8000/v1 QMT_MODEL=qmt-adapter QMT_API_KEY=sk-local \
+  cargo run --example qmt-headless -- run \
+  crates/agent/examples/confs/harness_adapter.toml \
+  --cwd . --instruction-file /tmp/instruction.md --db /tmp/qmt-session.db
+cargo run --example qmt-headless -- export --db /tmp/qmt-session.db \
+  --atif /tmp/trajectory.json --summary /tmp/summary.json
+```
+
+The three environment variables are all required and have no defaults; a
+missing one fails profile loading and names the variable. The endpoint must
+serve OpenAI chat completions (provider `openai`).
+
+Why the profile differs from `single_coder.toml`:
+
+- **Pruning, compaction and the `context` middleware are off.** Training
+  stitches turns by exact token prefix, so rewriting history would fork a
+  rollout into separate rows, and a compaction call would be credited with the
+  task reward.
+- **`question` and `browse` (and `skill`, `session_history`) are not exposed.**
+  `question` blocks with no user present; `browse` adds network access.
+- **The system prompt omits the provider/model line**, so the training
+  endpoint is not baked into the prompt.
+- **Model calls are capped at 50** by the `limits` middleware.
+- Snapshots are off so sandbox workspaces are not written to.
+
+Do not edit the profile after training an adapter against it: publishing
+checks its SHA-256 against the training record.
 
 ---
 

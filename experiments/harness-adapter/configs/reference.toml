@@ -1,0 +1,146 @@
+# Reference recipe: harness-hub Qwen3.8-27B-pi-adapted, transposed to the QueryMT harness.
+# Every value here is a default of the harness-adapter-training spec; the
+# pipeline, trainer, evaluator and launcher read this file and nothing else.
+#
+# Card value -> TRL field mapping (design D5), confirmed against the pinned TRL commit
+# (8773d24f, `AsyncGRPOConfig`) and checked by tests/test_train.py. The resolved result,
+# with provenance hashes, is what `querymt_harbor.train` writes to training_config.json.
+
+[run]
+name = "qmt-qwen38-27b"
+dir = "runs/qmt-qwen38-27b"          # /data/runs/<name> on HF Jobs
+seed = 0
+
+[model]
+base = "Qwen/Qwen3.8-27B"
+served_name = "qmt-adapter"
+
+[profile]
+# Paths are relative to this file.
+path = "../../../crates/agent/examples/confs/harness_adapter.toml"
+prompts = ["../../../crates/agent/examples/prompts/default_system.txt",
+           "../../../crates/agent/examples/prompts/harness_adapter_meta.jinja2"]
+
+# The openai provider plugin, pinned by SHA-256 and installed into the sandbox as a
+# local file, so nothing is downloaded during a rollout (and the plugin the adapter
+# trains against is the one it is served with). Resolved from
+# oci://ghcr.io/querymt/openai (version 0.6.0) when this experiment was written.
+[plugin]
+registry = "ghcr.io"
+repository = "querymt/openai"
+manifest_digest = "sha256:fc928da98236f0507e52e0d018bdc6203643184df7e2b35ec0e7ed3a36ac18e7"
+blob_sha256 = "d32f38b2ac296bff7b2dbaf2f747600fff2d1f620f5e9945d2f0c82828033a21"
+
+[data]
+scale800 = { repo = "harness-hub/scale800-harbor", revision = "main", tasks = 750 }
+termgrade = { repo = "harness-hub/termgrade-train-harbor", revision = "main", tasks = 300 }
+# Benchmarks the training split must not overlap with (instruction SHA-1).
+benchmarks = [
+  { repo = "harness-hub/swebench-pro-v2-hard51-harbor", revision = "main" },
+  { repo = "harborframework/terminal-bench-2.1", revision = "main" },
+]
+
+# peft `LoraConfig(r, lora_alpha, target_modules)`; vLLM must serve --max-lora-rank >= r.
+[lora]
+r = 32
+alpha = 64
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# AsyncGRPOConfig.learning_rate
+[optimizer]
+learning_rate = 2e-5
+
+# AsyncGRPOConfig.num_generations / temperature / top_p; `thinking = false` becomes
+# chat_template_kwargs = {enable_thinking = false}. top_k is fixed at -1 (full vocabulary),
+# which an agent-owned loop needs because it records no candidate sets.
+[sampling]
+num_generations = 8
+temperature = 0.8
+top_p = 1.0
+thinking = false
+
+# agent_step_limit / agent_timeout_sec: HarborSessionFactory arguments (not config fields).
+# max_staleness, gradient_accumulation_steps, max_steps: the AsyncGRPOConfig fields of the same
+# name. micro_batch_max_tokens -> AsyncGRPOConfig.token_budget ("maximum number of tokens
+# forwarded in a single row"; the TokenBudgetBatcher packs each micro-batch row within it, and
+# a sample longer than it is dropped, so it must be >= the vLLM max_model_len of 131072 or
+# long rollouts are lost: see the README limitations).
+[budget]
+agent_step_limit = 50
+agent_timeout_sec = 1800
+max_staleness = 16
+gradient_accumulation_steps = 16
+micro_batch_max_tokens = 65536
+max_steps = 1000
+
+# AsyncGRPOConfig.save_steps; keep_all = true is save_total_limit = None.
+[checkpoints]
+save_every = 10
+keep_all = true
+
+# querymt_harbor.reward.RewardConfig (the trainer's rollout_reward_fn).
+[reward]
+bonus_weight = 0.1
+tool_budget = 15
+
+[guard]
+enabled = true
+port = 8787
+
+# Process layout (design D7, `querymt_harbor.commands`). vLLM takes GPU 0 and the trainer
+# GPU 1; the Harbor server's env port must not collide with vLLM's, hence 8001. `expose` is
+# how a sandbox reaches the capture proxy (gradio | cloudflare | direct); gradio is OpenEnv's
+# default, which its own notes measured as the steadier tunnel at evaluation scale (cloudflared
+# quick tunnels logged repeated errors); `direct` is for a Docker sandbox on this host. `max_loras` is
+# vLLM's `--max-loras`; evaluation serves up to that many checkpoints at once.
+# `max_concurrent_rollouts` is the Harbor server's `MAX_CONCURRENT_ENVS`: OpenEnv defaults it
+# to 4 and REFUSES (not queues) a fifth rollout, so training's 8 rollouts per task would mostly
+# come back unscorable. It must cover the trainer's in-flight rollouts and `eval.concurrency`.
+[serving]
+vllm_gpu = 0
+trainer_gpu = 1
+vllm_port = 8000
+server_port = 8001
+capture_port = 8100
+expose = "gradio"
+max_model_len = 131072
+max_loras = 18
+max_concurrent_rollouts = 64
+
+[eval]
+attempts = 1
+agent_step_limit = 100
+temperature = 0.8
+top_p = 1.0
+thinking = false
+infra_reruns = 2
+timeout_sec = { swebench_pro_hard51 = 7200, terminal_bench_2_1 = 3600 }
+first_checkpoint = 80
+every = 20
+concurrency = 16                    # rollouts in flight at once; at most serving.max_concurrent_rollouts
+
+[selection]
+terminal_bench_subset = 18          # fixed by seed, recorded before any eval
+
+# What the preflight stage requires before any service starts.
+[preflight]
+min_gpus = 2                        # vLLM on one GPU, the trainer on the other
+min_free_disk_gb = 200              # model weights, checkpoints (all kept) and trajectories
+
+# The model repository `pipeline run --stage publish` uploads to; override with --repo-id.
+[publish]
+repo_id = ""
+
+# The qmt-headless binary installed into every sandbox (design D2, D2b). One archive per
+# platform, each with a `url` (https) or a local `path` plus a required `sha256`. The host
+# reads it once, checks the hash and uploads it; the sandbox fetches nothing, and a
+# mismatch fails the install before anything is uploaded.
+#
+# No archive is pinned yet: task 3.7 builds the musl archives, records their hashes here
+# and later switches to nightly URLs. Until then install fails with "no pinned
+# qmt-headless archive for <platform>". Entries look like:
+#   [headless_binary.platforms.linux-aarch64]
+#   path = "/abs/path/qmt-headless-<ver>-aarch64-unknown-linux-musl.tar.gz"
+#   sha256 = "<64 hex>"
+[headless_binary]
+version = "unpinned"

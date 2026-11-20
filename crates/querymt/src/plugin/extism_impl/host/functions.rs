@@ -50,7 +50,8 @@ impl HostState {
             #[cfg(feature = "http-client")]
             http_streams: std::collections::HashMap::new(),
             #[cfg(feature = "http-client")]
-            http_client: reqwest::Client::new(),
+            http_client: crate::outbound::build_client(|builder| builder)
+                .expect("failed to build plugin host HTTP client"),
             next_stream_id: 1,
             yield_tx: None,
             tokio_handle,

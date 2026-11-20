@@ -11965,6 +11965,7 @@ dependencies = [
  "typeshare",
  "url",
  "uuid 1.29.3",
+ "webpki-root-certs",
  "which 8.0.6",
 ]
 
