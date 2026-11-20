@@ -1,3 +1,7 @@
+use crate::mesh_ingress::{SharingCallError, SharingRejection};
+use crate::peer_access::SharingProtocol;
+use crate::provider_share::guarded::MeteredChat;
+use crate::request_timeout::{SharingAskError, ask_sharing_v1, ask_with_sharing};
 use crate::{
     AttachStreamConsumer, CancelProviderStreamRequest, GenericProviderStreamRequest,
     GetProviderCatalog, GetProviderContractInfo, GetProviderStreamStatus, MeshHandle, MeshScopeId,
@@ -26,6 +30,38 @@ static PROVIDER_HOST_CACHE: OnceLock<
 static STREAM_ROUTER_CACHE: OnceLock<
     RwLock<HashMap<String, kameo::actor::ActorRef<ProviderStreamRouterActor>>>,
 > = OnceLock::new();
+
+fn provider_ask_error(error: SharingAskError<crate::RemoteProviderHostError>) -> LLMError {
+    match error {
+        SharingAskError::Sharing(error) => sharing_error(error),
+        SharingAskError::Actor(error) => match crate::remote_send_error_base(error) {
+            Ok(error) => error,
+            Err(handler) => LLMError::from_payload(handler.to_payload()),
+        },
+    }
+}
+
+fn sharing_error(error: SharingCallError) -> LLMError {
+    use querymt::error::{ProviderErrorKind, ProviderFailure};
+    let (kind, code) = match error {
+        SharingCallError::Rejected(SharingRejection::Denied | SharingRejection::Changed) => {
+            (ProviderErrorKind::Authentication, "mesh_access_denied")
+        }
+        SharingCallError::UnsupportedProtocol
+        | SharingCallError::Rejected(SharingRejection::UnsupportedOperation) => (
+            ProviderErrorKind::UnsupportedOperation,
+            "mesh_access_incompatible",
+        ),
+        _ => (
+            ProviderErrorKind::UnknownPermanent,
+            "mesh_access_unavailable",
+        ),
+    };
+    // An ambiguous v1 failure must not re-dispatch with a fresh attempt ID.
+    ProviderFailure::new(kind, error.to_string())
+        .with_code(Some(code.into()))
+        .into()
+}
 
 #[derive(Clone)]
 pub struct KameoMeshClientTransport {
@@ -180,15 +216,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, LLMError> {
-        host.ask(&request)
-            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .send()
+        ask_with_sharing(&self.mesh, host, &request, Self::PROVIDER_CONTROL_TIMEOUT)
             .await
-            .map_err(|error| match crate::remote_send_error_base(error) {
-                Ok(error) => error,
-                Err(handler) => LLMError::from_payload(handler.to_payload()),
-            })
+            .map_err(provider_ask_error)
     }
 
     async fn prepare_stream_router(
@@ -228,6 +258,31 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: &crate::ProviderChatRequest,
     ) -> Result<crate::ProviderChatResponse, LLMError> {
+        let peer = host
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or(SharingCallError::Unavailable)
+            .map_err(sharing_error)?;
+        if self
+            .mesh
+            .select_sharing_protocol(peer, Self::PROVIDER_CONTROL_TIMEOUT)
+            .await
+            .map_err(sharing_error)?
+            == SharingProtocol::V1
+        {
+            return ask_sharing_v1(
+                &self.mesh,
+                host,
+                &MeteredChat {
+                    request_id: uuid::Uuid::now_v7(),
+                    request: request.clone(),
+                },
+                Self::PROVIDER_CHAT_REPLY_TIMEOUT,
+            )
+            .await
+            .map_err(provider_ask_error);
+        }
         let encoded_bytes = crate::provider_transport::remote_ask_request_size(
             host,
             request,
@@ -472,9 +527,13 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
             peers_checked += 1;
             tracing::Span::current().record("peers_checked", peers_checked);
 
-            let snapshot = match catalog_ref
-                .ask::<GetProviderCatalog>(&GetProviderCatalog)
-                .await
+            let snapshot = match ask_with_sharing(
+                mesh,
+                &catalog_ref,
+                &GetProviderCatalog,
+                Duration::from_secs(10),
+            )
+            .await
             {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
@@ -491,8 +550,8 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
                 continue;
             }
 
-            if let Ok(node_id) = NodeId::parse(&snapshot.node.node_id) {
-                candidates.push((peer_id, node_id));
+            if NodeId::parse(&snapshot.node.node_id).is_ok_and(|id| id.as_peer_id() == &peer_id) {
+                candidates.push((peer_id, NodeId::from_peer_id(peer_id)));
             }
         }
     }

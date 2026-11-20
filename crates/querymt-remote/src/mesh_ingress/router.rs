@@ -34,9 +34,15 @@ type Routes = HashMap<ActorId, HashMap<(SharingProtocol, &'static str, &'static 
 pub struct PeerRequest {
     key: PeerGrantKey,
     protocol: SharingProtocol,
+    revision: Option<Uuid>,
 }
 
 impl PeerRequest {
+    /// Revision authorized at ingress, absent for identity-only routes.
+    pub fn revision(&self) -> Option<Uuid> {
+        self.revision
+    }
+
     /// Host and authenticated caller in the direction of resource access.
     pub fn key(&self) -> &PeerGrantKey {
         &self.key
@@ -246,14 +252,16 @@ impl InboundRouter {
                 message_remote_id,
             }));
         };
-        let origin = PeerRequest {
+        let mut origin = PeerRequest {
             key: PeerGrantKey {
                 host: NodeId::from_peer_id(self.host),
                 peer: NodeId::from_peer_id(peer),
             },
             protocol,
+            revision: None,
         };
         let revision = self.grant_revision(&origin, route.access).await?;
+        origin.revision = revision;
         let is_current = || {
             self.routes
                 .read()

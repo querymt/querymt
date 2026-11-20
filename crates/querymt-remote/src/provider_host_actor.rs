@@ -41,7 +41,7 @@ fn remove_active_stream(
         .remove(&(session_id.to_string(), request_id.to_string()));
 }
 
-fn validate_item_aware_request(
+pub(crate) fn validate_item_aware_request(
     messages: &[querymt::chat::ChatMessage],
     advertised_version: Option<u32>,
 ) -> Result<(), RemoteProviderHostError> {

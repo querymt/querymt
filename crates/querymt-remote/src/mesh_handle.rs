@@ -11,10 +11,11 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::mesh_events::MeshEvent;
-use crate::mesh_ingress::{SharingCallError, SharingRequest, SharingResponse};
+use crate::mesh_ingress::{InboundRouter, SharingCallError, SharingRequest, SharingResponse};
 use crate::mesh_routes::{MeshRoute, RouteTable};
 use crate::mesh_runtime_support::{DialReason, SwarmCommand};
 use crate::peer_access::SharingProtocol;
+use crate::peer_access::quota::QuotaStore;
 use crate::{
     InviteError, InviteGrant, InvitePermissions, InviteStore, MeshScopeId, MeshStateStore,
     MeshTransportMode, NodeId, PeerEntry, SignedInviteGrant, mesh_id_for,
@@ -48,6 +49,12 @@ type PeerNodeResolver = Arc<
 >;
 
 #[derive(Clone)]
+pub(crate) struct MeshPolicy {
+    pub(crate) router: Arc<InboundRouter>,
+    pub(crate) store: Arc<dyn QuotaStore>,
+}
+
+#[derive(Clone)]
 pub struct MeshHandle {
     peer_id: PeerId,
     pub(crate) peer_events_tx: broadcast::Sender<MeshEvent>,
@@ -67,6 +74,8 @@ pub struct MeshHandle {
     peer_node_resolver: Option<PeerNodeResolver>,
     pub(crate) iroh_diagnostics: crate::iroh_diagnostics::IrohDiagnostics,
     known_sharing: Arc<RwLock<std::collections::HashSet<PeerId>>>,
+    pub(crate) policy: Option<MeshPolicy>,
+    pub(crate) sharing_enabled: bool,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -116,6 +125,8 @@ impl MeshHandle {
             peer_node_resolver: None,
             iroh_diagnostics: Default::default(),
             known_sharing: Default::default(),
+            policy: None,
+            sharing_enabled: false,
         }
     }
 
@@ -131,6 +142,16 @@ impl MeshHandle {
 
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
+    }
+
+    /// The guarded route registry for local resource exports.
+    pub fn inbound_router(&self) -> Option<&Arc<InboundRouter>> {
+        self.policy.as_ref().map(|policy| &policy.router)
+    }
+
+    /// The host's policy store, when this mesh was bootstrapped with one.
+    pub fn quota_store(&self) -> Option<&Arc<dyn QuotaStore>> {
+        self.policy.as_ref().map(|policy| &policy.store)
     }
 
     /// Probe the remote transport without performing a protected operation.
@@ -152,6 +173,26 @@ impl MeshHandle {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Select the protocol on a guarded mesh. An older local runtime has only
+    /// the legacy transport; it cannot negotiate v1.
+    pub async fn select_sharing_protocol(
+        &self,
+        peer: PeerId,
+        timeout: Duration,
+    ) -> Result<SharingProtocol, SharingCallError> {
+        if !self.sharing_enabled {
+            return Ok(SharingProtocol::Legacy);
+        }
+        if self.known_sharing.read().contains(&peer) {
+            return Ok(SharingProtocol::V1);
+        }
+        tokio::time::timeout(timeout, self.sharing_protocol(peer))
+            .await
+            .map_err(|_| {
+                SharingCallError::Transport(libp2p::request_response::OutboundFailure::Timeout)
+            })?
     }
 
     /// Send a grant-aware operation. Errors never fall back to the legacy route.
