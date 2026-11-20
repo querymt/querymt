@@ -24,7 +24,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
-use super::start::{badged_tone, mode_tone, model_toolbar_button, reasoning_color, toolbar_button};
+use super::start::{badged_tone, mode_tone, toolbar_button};
 use super::{Page, QmtApp, kit};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
@@ -3996,15 +3996,6 @@ impl QmtApp {
         let blocked = loading || view.error.is_some() || !connected;
         let pending = view.pending_options.clone();
         let mode = view.mode_option();
-        let reasoning = view.reasoning_option();
-        let model_pending = pending.contains("model");
-        let store = self.store.read(cx);
-        let models = store.models(&view.agent_id);
-        let has_models = !models.is_empty();
-        let selected_model = models
-            .iter()
-            .find(|m| Some(m.id.as_str()) == view.model.as_deref())
-            .cloned();
 
         let plus = toolbar_button("s-attach", p)
             .w(px(32.))
@@ -4015,32 +4006,7 @@ impl QmtApp {
             .child(kit::icon(IconName::Plus, 17., p.muted))
             .on_click(cx.listener(|this, _, _, cx| this.attach_files(true, cx)));
 
-        let model_button = model_toolbar_button(
-            "s-model",
-            view.model_label().unwrap_or_else(|| {
-                if has_models {
-                    "Choose model".into()
-                } else {
-                    "Model unknown".into()
-                }
-            }),
-            selected_model.as_ref(),
-            model_pending,
-            p,
-        )
-        .when(has_models && !model_pending, |el| {
-            el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
-        });
-        let model_button: AnyElement = match reasoning
-            .as_ref()
-            .map(|r| (r.current_label(), r.current.clone()))
-            .filter(|(l, _)| !l.is_empty())
-        {
-            Some((label, value)) => {
-                badged_tone(model_button, &label, reasoning_color(&value, p), p).into_any_element()
-            }
-            None => model_button.into_any_element(),
-        };
+        let model_button = self.model_picker_button(p, cx);
 
         let options_button = toolbar_button("s-options", p)
             .child(kit::icon(IconName::Settings2, 14., p.muted))

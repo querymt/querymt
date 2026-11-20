@@ -405,6 +405,77 @@ impl QmtApp {
         cx.notify();
     }
 
+    /// The composer's model pill, shared by Start and the session: the chosen
+    /// model (with the mesh icon when another machine serves it), the
+    /// reasoning badge, and the picker on click.
+    pub(super) fn model_picker_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let in_session = self.page == Page::Session;
+        let agent = self.picker_agent(cx);
+        let store = self.store.read(cx);
+        let has_models = agent
+            .as_deref()
+            .is_some_and(|a| !store.models(a).is_empty());
+        let (model, label, pending, reasoning) = if in_session {
+            let view = store.session.as_ref();
+            let model = store.session_model().cloned();
+            let label = model
+                .as_ref()
+                .map(|m| m.label.clone())
+                .or_else(|| view.and_then(|v| v.model_label()))
+                .unwrap_or_else(|| {
+                    if has_models {
+                        "Choose model"
+                    } else {
+                        "Model unknown"
+                    }
+                    .into()
+                });
+            let reasoning = view
+                .and_then(|v| v.reasoning_option())
+                .map(|r| (r.current_label(), r.current))
+                .filter(|(label, _)| !label.is_empty());
+            let pending = view.is_some_and(|v| v.pending_options.contains("model"));
+            (model, label, pending, reasoning)
+        } else {
+            let model = agent
+                .as_deref()
+                .and_then(|a| store.launch_model(a))
+                .cloned();
+            let label = match (&model, has_models, agent.is_some()) {
+                (Some(m), _, _) => m.label.clone(),
+                (None, true, _) => "Choose model".into(),
+                (None, false, true) => "Loading models…".into(),
+                _ => "No model".into(),
+            };
+            let level = store.prefs.reasoning().to_string();
+            (model, label, false, Some((level.clone(), level)))
+        };
+        let tip = model.as_ref().map(Model::describe);
+        let button = model_toolbar_button(
+            if in_session {
+                "s-model"
+            } else {
+                "model-button"
+            },
+            label,
+            model.as_ref(),
+            pending,
+            p,
+        )
+        .when_some(tip, |el, tip| {
+            el.tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
+        })
+        .when(has_models && !pending, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
+        });
+        match reasoning {
+            Some((text, level)) => {
+                badged_tone(button, &text, reasoning_color(&level, p), p).into_any_element()
+            }
+            None => button.into_any_element(),
+        }
+    }
+
     /// Agent whose models the picker lists: the open session's on the Session page.
     pub(super) fn picker_agent(&self, cx: &App) -> Option<String> {
         let store = self.store.read(cx);
@@ -414,13 +485,14 @@ impl QmtApp {
         store.primary_agent()
     }
 
-    fn select_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+    /// Choose a model by selection key ([`Model::key`]).
+    fn select_model(&mut self, key: String, cx: &mut Context<Self>) {
         if self.page == Page::Session {
             self.store
-                .update(cx, |s, cx| s.set_session_option("model", &model_id, cx));
+                .update(cx, |s, cx| s.set_session_option("model", &key, cx));
         } else if let Some(agent) = self.store.read(cx).primary_agent() {
             self.store
-                .update(cx, |s, cx| s.set_launch_model(&agent, model_id, cx));
+                .update(cx, |s, cx| s.set_launch_model(&agent, key, cx));
         }
         self.model_open = false;
         cx.notify();
@@ -432,7 +504,7 @@ impl QmtApp {
             .into_iter()
             .flat_map(|(_, models)| models)
             .next()
-            .map(|m| m.id);
+            .map(|m| m.key());
         if let Some(id) = first {
             self.select_model(id, cx);
         }
@@ -625,14 +697,14 @@ impl QmtApp {
         if query.is_empty() {
             let recent: Vec<Model> = store.recent_models(&agent).into_iter().cloned().collect();
             if !recent.is_empty() {
-                taken.extend(recent.iter().map(|m| m.id.clone()));
+                taken.extend(recent.iter().map(Model::key));
                 sections.push(("Recent".into(), recent));
             }
         }
         for m in store
             .models(&agent)
             .iter()
-            .filter(|m| matches(m) && !taken.contains(&m.id))
+            .filter(|m| matches(m) && !taken.contains(&m.key()))
         {
             let label = match &m.node {
                 Some(node) => format!("{} · {node}", m.provider),
@@ -677,16 +749,7 @@ impl QmtApp {
         let launch_busy = store.launch.busy;
         let launch_error = store.launch.error.clone();
         let started = store.launch.last_started.is_some();
-        let selected_model = agent
-            .as_deref()
-            .and_then(|a| store.launch_model(a))
-            .cloned();
-        let model_label = selected_model.as_ref().map(|m| m.label.clone());
-        let has_models = agent
-            .as_deref()
-            .is_some_and(|a| !store.models(a).is_empty());
         let mode = store.prefs.mode().to_string();
-        let reasoning = store.prefs.reasoning().to_string();
         let agent_choices: Vec<(String, String)> = connected
             .iter()
             .filter_map(|id| store.config(id).map(|c| (id.clone(), c.name.clone())))
@@ -819,27 +882,7 @@ impl QmtApp {
             .child(kit::icon(IconName::Plus, 17., p.muted))
             .on_click(cx.listener(|this, _, _, cx| this.attach_files(false, cx)));
 
-        let model_button = model_toolbar_button(
-            "model-button",
-            match (&model_label, has_models, agent.is_some()) {
-                (Some(label), _, _) => label.clone(),
-                (None, true, _) => "Choose model".into(),
-                (None, false, true) => "Loading models…".into(),
-                _ => "No model".into(),
-            },
-            selected_model.as_ref(),
-            false,
-            &p,
-        )
-        .when(has_models, |el| {
-            el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
-        });
-        let model_button = badged_tone(
-            model_button,
-            &reasoning,
-            reasoning_color(&reasoning, &p),
-            &p,
-        );
+        let model_button = self.model_picker_button(&p, cx);
 
         let options_button = toolbar_button("options-button", &p)
             .child(kit::icon(IconName::Settings2, 14., p.muted))
@@ -1277,10 +1320,11 @@ impl QmtApp {
         let refreshing = store
             .runtime(&agent)
             .is_some_and(|rt| rt.pending.contains("models"));
+        // Selection keys: the same model on two machines is two rows.
         let selected = if in_session {
-            store.session.as_ref().and_then(|v| v.model.clone())
+            store.session_model_key()
         } else {
-            store.launch_model(&agent).map(|m| m.id.clone())
+            store.launch_model(&agent).map(Model::key)
         };
         // Reasoning effort: the session's config option, or the launch preference on Start.
         let reasoning: Option<ReasoningControl> = if in_session {
@@ -1339,9 +1383,9 @@ impl QmtApp {
             };
             let hidden = models.len() - shown;
             for m in models.into_iter().take(shown) {
-                let is_selected = selected.as_deref() == Some(m.id.as_str());
+                let id = m.key();
+                let is_selected = selected.as_deref() == Some(id.as_str());
                 let hover = p.card;
-                let id = m.id.clone();
                 // A model can be listed under Recent and under its provider.
                 let row_key = format!("{label}:{id}");
                 let known = !m.modalities.is_empty();
@@ -1632,8 +1676,8 @@ impl QmtApp {
             .children(reasoning_footer)
             .child(
                 h_flex().px_4().py_3().justify_end().child(
-                    kit::button("model-done")
-                        .label("Done")
+                    kit::flat_btn("model-done", true, true, &p)
+                        .child("Done")
                         .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                 ),
             );
