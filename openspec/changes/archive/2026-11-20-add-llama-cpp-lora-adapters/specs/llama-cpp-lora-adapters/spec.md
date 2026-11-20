@@ -51,15 +51,15 @@ An adapter that cannot be loaded onto the configured base model (a different arc
 Every generation with a configured adapter SHALL apply it at its `scale`: chat, streaming chat, completion, tool-call generation, multimodal generation and the target model of speculative decoding. A `scale` of `0` SHALL produce the same output as the base model. The speculative draft model and the multimodal projector SHALL NOT receive the adapter.
 
 #### Scenario: Adapter changes generated text
-- **WHEN** the same prompt is completed greedily with the same seed once with an adapter at `scale = 1.0` and once without `lora`
-- **THEN** the two outputs differ, and the adapted output shows the adapter's trained behavior
+- **WHEN** the prompt `Look in thy glass` is completed greedily with the same seed on the `stories15M_MOE` base model once with its `moe_shakespeare15M` adapter at `scale = 1.0` and once without `lora`
+- **THEN** the two outputs differ, and the adapted output contains Shakespearean vocabulary (`eye`, `love` or `sun`) that the base output does not
 
 #### Scenario: Zero scale matches the base model
 - **WHEN** the same prompt is completed greedily with the same seed once with an adapter at `scale = 0` and once without `lora`
 - **THEN** the two outputs are identical
 
 #### Scenario: Adapter applies to streaming output
-- **WHEN** the same prompt is streamed greedily with the same seed once with an adapter at `scale = 1.0` and once with the same adapter at `scale = 0`
+- **WHEN** the prompt `Look in thy glass` is streamed greedily with the same seed on the `stories15M_MOE` base model once with its `moe_shakespeare15M` adapter at `scale = 1.0` and once with the same adapter at `scale = 0`
 - **THEN** the two streamed texts differ, and the `scale = 0` text equals a streamed run without `lora`
 
 #### Scenario: Adapter applies to tool-call, multimodal and speculative generation
