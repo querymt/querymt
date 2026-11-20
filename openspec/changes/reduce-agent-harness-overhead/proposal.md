@@ -117,7 +117,7 @@ The groups are independent and can land separately, in the order below.
 
 - `querymt`: chat capabilities gain a prompt-cache declaration and a tool-update declaration, and chat messages gain a tool-change kind that crosses the Extism boundary (public Rust API, additive); the plugin registry remembers failed loads (features `extism_host`, `tracing`); this also applies to `querymt-cli` and `querymt-py`, which use the same registry.
 - `qmt-anthropic`, `qmt-openai`, `qmt-codex`: declare prompt-cache support (features `native` and `extism`). `qmt-anthropic` also sends tool-change markers.
-- `querymt-agent-protocol-types`, `querymt-agent-core`: new events, new `llm_request_end` fields, new config tables and key, new stored message part kinds for notices and tool changes.
+- `querymt-agent-core`: new events, new `llm_request_end` fields, new config tables and key, new stored message part kinds for notices and tool changes.
 - `querymt-agent-services`: `shell`, `job_wait`, `job_kill`, path resolution, system cache defaults, output truncation.
 - `querymt-agent-runtime`: request assembly, stored notices, mode reminders, hints, context hooks, tool order, waits, retries, output cap, tool dispatch errors, ACP notifications, session listing spans, remote lifecycle requests (feature `remote`).
 - `querymt-agent-sqlite`: the lifecycle update reports whether anything changed.

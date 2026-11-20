@@ -617,7 +617,9 @@ impl SessionCompaction {
                 m.parts
                     .iter()
                     .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
+                        MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
+                            self.estimator.estimate(content)
+                        }
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
@@ -2034,6 +2036,25 @@ mod tests {
 
         let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for all part types");
+    }
+
+    #[test]
+    fn notice_is_estimated_like_text_of_the_same_content() {
+        let fixture = CompactionFixture::new();
+        let content = "The agent mode changed. ".repeat(20);
+        let text = MessageFixture::user_message("1", "s1", &content);
+        let mut notice = text.clone();
+        notice.parts = vec![MessagePart::Notice {
+            source: querymt_agent_core::model::NoticeSource::AgentMode,
+            content: content.clone(),
+        }];
+
+        let notice_tokens = fixture.service.estimate_messages_tokens(&[notice], None);
+        assert!(notice_tokens > 0);
+        assert_eq!(
+            notice_tokens,
+            fixture.service.estimate_messages_tokens(&[text], None)
+        );
     }
 
     #[test]

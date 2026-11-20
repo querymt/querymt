@@ -37,6 +37,14 @@ A `shell` call without `background = true` that is still running after `foregrou
 - **WHEN** `foreground_limit_secs = 0` and a command runs for 20 minutes
 - **THEN** the call returns only when the command exits
 
+### Requirement: A foreground command waits for a free background slot
+When a foreground command reaches `foreground_limit_secs` while the session already has `max_background` background commands running, the call SHALL keep waiting in the foreground, without restarting the command, until the command exits or a background command ends; in the latter case it SHALL move the command then. The number of running background commands SHALL never exceed `max_background`.
+
+#### Scenario: Limit reached while every background slot is taken
+- **WHEN** `max_background = 1`, one background command is running, and a foreground command is still running after `foreground_limit_secs`
+- **THEN** the call keeps waiting and the command is not restarted
+- **AND** when the background command exits, the foreground call returns with `moved_to_background = true` and one background command is running
+
 ### Requirement: Background command output is kept in a file
 The standard output and standard error of a background command SHALL be appended, in arrival order, to the file at `output_path` while the command runs. The file SHALL be readable with the session's file tools while the command runs and after it exits. For a command moved from the foreground, the file SHALL also contain the output produced before the move.
 
@@ -83,7 +91,7 @@ The `shell` tool SHALL accept `wake_on_exit` (boolean, default true), which appl
 - **THEN** one run starts and its input contains both exit notices
 
 ### Requirement: The model can wait for background commands
-The `job_wait` tool SHALL accept `job_ids` (array of job ids; when omitted, every running background command of the session) and `timeout_secs` (integer, 1 to 240, default 60). It SHALL return when any named command has exited or the timeout elapses, whichever is first, reporting for each named command its status, exit code if exited, and at most the last 4 KiB of output. An exit reported by `job_wait` SHALL NOT also be delivered as an exit notice.
+The `job_wait` tool SHALL accept `job_ids` (array of job ids; when omitted, every running background command of the session) and `timeout_secs` (integer, 1 to 240, default 60). It SHALL return when any named command has exited or the timeout elapses, whichever is first, reporting for each named command its status, exit code if exited, and at most the last 4 KiB of output.
 
 #### Scenario: Wait returns on exit
 - **WHEN** the model calls `job_wait` for a command that exits 5 seconds later with code 0
@@ -105,6 +113,14 @@ The `job_wait` tool SHALL accept `job_ids` (array of job ids; when omitted, ever
 #### Scenario: Unknown job id in wait
 - **WHEN** the model calls `job_wait` with a `job_id` the session never started
 - **THEN** the call fails with an error naming that id
+
+### Requirement: An exit is reported once as a notice
+`job_wait` SHALL report an exited command as exited whether or not its exit notice was already delivered. An exit first reported by `job_wait` SHALL NOT later be delivered as an exit notice.
+
+#### Scenario: Wait on a command whose exit was already noticed
+- **WHEN** a background command exited, its exit notice was delivered before a model request, and the model then calls `job_wait` for it
+- **THEN** the call returns immediately with status `exited` and its exit code
+- **AND** no further exit notice is delivered for it
 
 ### Requirement: The model can stop a background command
 The `job_kill` tool SHALL accept `job_id` and SHALL stop that command together with every process it started, then return its final status and at most the last 4 KiB of output. Stopping a command that has already exited SHALL return its recorded status without an error. A command stopped by `job_kill` SHALL NOT wake the session and SHALL NOT produce an exit notice.
@@ -161,7 +177,7 @@ The agent SHALL record a durable `background_command_started` event (job id, com
 - **AND** the session is not woken for it
 
 ### Requirement: Background command settings are validated
-`[agent.execution.shell]` SHALL accept `foreground_limit_secs` (integer seconds, 0 to 86400, default 240; 0 disables moving) and `max_background` (integer, 1 to 64, default 8; the number of background commands one session may have running). A value outside its range or of the wrong type, or an unknown key in the table, SHALL be a load error naming the key. Starting a command beyond `max_background` SHALL return an error result naming the limit, and the command SHALL NOT start.
+`[agent.execution.shell]` SHALL accept `foreground_limit_secs` (integer seconds, 0 to 86400, default 240; 0 disables moving) and `max_background` (integer, 1 to 64, default 8; the number of background commands one session may have running). A value outside its range or of the wrong type, or an unknown key in the table, SHALL be a load error naming the key.
 
 #### Scenario: Shell settings default when omitted
 - **WHEN** a configuration has no `[agent.execution.shell]` table
@@ -170,6 +186,9 @@ The agent SHALL record a durable `background_command_started` event (job id, com
 #### Scenario: Invalid shell setting is rejected
 - **WHEN** `[agent.execution.shell]` sets `max_background = 0` or `foreground_limit_secs = -5`
 - **THEN** loading fails with an error naming the offending key
+
+### Requirement: Background starts are limited per session
+Starting a command with `background = true` while the session already has `max_background` background commands running SHALL return an error result naming the limit, and the command SHALL NOT start.
 
 #### Scenario: Too many background commands
 - **WHEN** `max_background = 2`, two background commands are running and the model starts a third with `background = true`

@@ -7,7 +7,7 @@ Defines when the agent attempts to load a provider plugin again after an attempt
 ## ADDED Requirements
 
 ### Requirement: A failed local plugin load is not repeated while its file is unchanged
-After a provider plugin configured by a local path fails to load, the agent SHALL NOT attempt to load it again while the file at that path is in the same state as at the failed attempt: still missing, or the same size and modification time. This SHALL hold for model listings, status reads and requests that name the provider.
+After a provider plugin configured by a local path fails to load, the agent SHALL NOT attempt to load it again while the file at that path is in the same state as at the failed attempt: still missing, or the same size and modification time. This SHALL hold for model listings, status reads and requests that name the provider, except for an explicit `querymt/refreshModels` request.
 
 #### Scenario: Missing plugin file and repeated model listings
 - **WHEN** a configured provider's plugin file does not exist and a client lists models 100 times
@@ -22,11 +22,15 @@ After a provider plugin configured by a local path fails to load, the agent SHAL
 - **THEN** the agent attempts the load again and, when it succeeds, the provider's models are listed
 
 #### Scenario: Plugin file is rebuilt
-- **WHEN** a plugin failed to load because its file was invalid, the file is replaced with a different one, and a client lists models
+- **WHEN** a plugin failed to load because its file was invalid, the file is replaced with one of a different size or modification time, and a client lists models
 - **THEN** the agent attempts the load again
 
+#### Scenario: Replacement with the same size and modification time
+- **WHEN** a plugin failed to load because its file was invalid and the file is replaced with one of the same size and modification time
+- **THEN** a model listing does not attempt the load again, and a following `querymt/refreshModels` request does
+
 ### Requirement: A failed remote plugin fetch is retried after a wait
-After a provider plugin fetched from a registry or URL fails to load, the agent SHALL NOT attempt to load it again until 300 seconds have passed since the failed attempt. This SHALL hold for model listings, status reads and requests that name the provider.
+After a provider plugin fetched from a registry or URL fails to load, the agent SHALL NOT attempt to load it again until 300 seconds have passed since the failed attempt. This SHALL hold for model listings, status reads and requests that name the provider, except for an explicit `querymt/refreshModels` request.
 
 #### Scenario: Remote plugin source within the wait
 - **WHEN** fetching a plugin from a registry failed 60 seconds ago and a client lists models

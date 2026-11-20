@@ -58,7 +58,6 @@ use crate::agent::utils::u32_from_usize;
 use crate::hooks::StopRequest;
 use crate::middleware::ExecutionState;
 use log::{debug, info, trace, warn};
-use querymt::chat::ChatRole;
 use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
 use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
@@ -403,6 +402,20 @@ pub(crate) async fn store_pending_notices(
     Ok(Arc::new(next))
 }
 
+/// Store the queued notices and prepare the model request.
+///
+/// The context-hook trigger is read before the notices are stored, so a
+/// notice after a tool batch keeps the `after_tool_batch` trigger.
+pub(crate) async fn prepare_model_request(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    context: &Arc<crate::middleware::ConversationContext>,
+) -> Result<ExecutionState, anyhow::Error> {
+    let trigger = transitions::context_hook_trigger(&context.messages);
+    let stored = store_pending_notices(exec_ctx, context).await?;
+    transitions::transition_before_llm_call(config, &stored, exec_ctx, trigger).await
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
@@ -445,9 +458,9 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.cancellation_token.is_cancelled()
     );
 
-    let (messages, stored_mode_notice): (Arc<[querymt::chat::ChatMessage]>, _) = async {
+    let (messages, stored_mode_notice, turns): (Arc<[querymt::chat::ChatMessage]>, _, _) = async {
         let started = std::time::Instant::now();
-        let (history, summaries, stored_mode_notice) = exec_ctx
+        let (history, summaries, stored_mode_notice, turns) = exec_ctx
             .session_handle
             .history_with_notice_state()
             .await
@@ -458,7 +471,7 @@ pub(crate) async fn execute_cycle_state_machine(
         let span = tracing::Span::current();
         span.record("history_ms", elapsed_ms);
         span.record("message_count", messages.len() as u64);
-        Ok::<_, anyhow::Error>((messages, stored_mode_notice))
+        Ok::<_, anyhow::Error>((messages, stored_mode_notice, turns))
     }
     .instrument(info_span!(
         "agent.execution.history_load",
@@ -473,11 +486,6 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.session_id,
         messages.len()
     );
-    let turns = messages
-        .iter()
-        .filter(|msg| matches!(msg.role, ChatRole::User))
-        .filter(|msg| !msg.has_tool_result())
-        .count();
     let stats = crate::middleware::AgentStats {
         turns,
         ..Default::default()
@@ -647,11 +655,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     } => {
                         // Middleware queued its notices during step start; store
                         // them now, after any tool results and before the request.
-                        let stored = store_pending_notices(exec_ctx, conv_context).await?;
-                        let conv_context = &stored;
-                        let next =
-                            transitions::transition_before_llm_call(config, conv_context, exec_ctx)
-                                .await?;
+                        let next = prepare_model_request(config, exec_ctx, conv_context).await?;
                         crate::agent::utils::llm_metrics::step_overhead(
                             "pre_request",
                             step_started.elapsed().as_secs_f64(),
@@ -809,7 +813,7 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let (history, summaries, stored_mode_notice) = exec_ctx
+                let (history, summaries, stored_mode_notice, _) = exec_ctx
                     .session_handle
                     .history_with_notice_state()
                     .await
@@ -1679,6 +1683,31 @@ mod tests {
             sources,
             [NoticeSource::DuplicateToolCall, NoticeSource::AgentMode]
         );
+    }
+
+    /// A stored notice is not a user turn, so it does not bring `max_turns` closer.
+    #[tokio::test]
+    async fn restored_turns_do_not_count_stored_notices() {
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::model::{AgentMessage, MessagePart, NoticeSource};
+
+        let (_fixture, exec_ctx, context) = notice_fixture().await;
+        let mut prompt = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        prompt.parts.push(MessagePart::Text {
+            content: "fix the build".into(),
+        });
+        exec_ctx.session_handle.add_message(prompt).await.unwrap();
+        let queued = Arc::new(context.queue_notice(NoticeSource::ProgressReview, "review".into()));
+        super::store_pending_notices(&exec_ctx, &queued)
+            .await
+            .unwrap();
+
+        let (_, _, _, turns) = exec_ctx
+            .session_handle
+            .history_with_notice_state()
+            .await
+            .unwrap();
+        assert_eq!(turns, 1);
     }
 
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {

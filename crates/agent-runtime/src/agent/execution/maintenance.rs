@@ -274,7 +274,9 @@ pub(crate) async fn compact_history(
             m.parts
                 .iter()
                 .map(|p| match p {
-                    MessagePart::Text { content } => content.len() / 4,
+                    MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
+                        content.len() / 4
+                    }
                     MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
                         crate::agent::utils::render_prompt_for_llm(blocks, prompt_limit).len() / 4
                     }
@@ -1000,6 +1002,34 @@ mod tests {
         assert_eq!(summary, expected);
         assert!(context_tokens.unwrap() > 0);
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_start_counts_stored_notices() {
+        let (config, mut exec_ctx, state, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        let notice_text = "The instructions from the earlier mode no longer apply. ".repeat(10);
+        let mut notice = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        notice.parts.push(MessagePart::Notice {
+            source: querymt_agent_core::model::NoticeSource::AgentMode,
+            content: notice_text.clone(),
+        });
+        exec_ctx.session_handle.add_message(notice).await.unwrap();
+
+        let mut events = config.subscribe_events();
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        let compaction_events = take_compaction_events(&mut events);
+        let AgentEventKind::CompactionStart { token_estimate, .. } = &compaction_events[0].kind
+        else {
+            panic!("first compaction event must be a start: {compaction_events:?}");
+        };
+        let original = "Keep the implemented shader and verified test results.";
+        assert_eq!(
+            *token_estimate as usize,
+            original.len() / 4 + notice_text.len() / 4
+        );
     }
 
     mod accounting_tests {

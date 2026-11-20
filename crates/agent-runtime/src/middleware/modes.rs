@@ -70,19 +70,17 @@ impl AgentModeMiddleware {
     /// the effective history (stored or queued): a reminder is stored when the
     /// mode has one and the last notice is missing or another mode's; a leave
     /// notice is stored when the mode has none and the last notice is a
-    /// reminder. Checked per request, not per switch, so switches without a
-    /// request store nothing and a reminder lost to compaction is stored again.
+    /// reminder. Any stored mode notice other than the leave notice counts as a
+    /// reminder, so one written under an earlier reminder text is still left.
+    /// Checked per request, not per switch, so switches without a request store
+    /// nothing and a reminder lost to compaction is stored again.
     fn notice_for(&self, context: &ConversationContext) -> Option<String> {
         let last = context.last_mode_notice();
         match self.reminders.get(&context.session_mode) {
             Some(reminder) => (last != Some(reminder.as_str())).then(|| reminder.clone()),
-            None => {
-                let last = last?;
-                self.reminders
-                    .values()
-                    .any(|reminder| reminder == last)
-                    .then(|| LEAVE_NOTICE.to_string())
-            }
+            None => last
+                .filter(|last| *last != LEAVE_NOTICE)
+                .map(|_| LEAVE_NOTICE.to_string()),
         }
     }
 }
@@ -411,6 +409,14 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].0, NoticeSource::AgentMode);
         assert_eq!(notices[0].1, LEAVE_NOTICE);
+    }
+
+    #[tokio::test]
+    async fn leaving_a_mode_whose_reminder_text_changed_stores_a_leave_notice() {
+        // The stored reminder was written under an earlier configuration.
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Build, Some("old plan reminder"))).await;
+        assert_eq!(queued(&next), vec![(NoticeSource::AgentMode, LEAVE_NOTICE)]);
     }
 
     #[tokio::test]

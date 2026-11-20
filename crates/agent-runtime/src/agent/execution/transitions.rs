@@ -43,13 +43,29 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
+/// Context-hook trigger for a request over `messages`.
+///
+/// Read before the request's notices are stored, so a notice stored after a
+/// tool batch does not make the request a user-prompt request.
+pub(super) fn context_hook_trigger(messages: &[ChatMessage]) -> &'static str {
+    if messages
+        .last()
+        .is_some_and(|message| message.has_tool_result())
+    {
+        "after_tool_batch"
+    } else {
+        "user_prompt"
+    }
+}
+
 /// Transition from BeforeLlmCall to CallLlm.
 ///
 /// This collects available tools, computes their hash, and emits a ToolsAvailable event
-/// if the tool set has changed.
+/// if the tool set has changed. `trigger` is the context-hook trigger, from
+/// [`context_hook_trigger`] over the history before notices were stored.
 #[instrument(
     name = "agent.transition.before_llm_call",
-    skip(config, context, exec_ctx),
+    skip(config, context, exec_ctx, trigger),
     fields(
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
@@ -61,6 +77,7 @@ pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
+    trigger: &'static str,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "BeforeLlmCall: session={}, steps={}",
@@ -156,14 +173,6 @@ pub(super) async fn transition_before_llm_call(
 
     // The context hook sees durable history only (stored notices included).
     let mut messages = context.messages.to_vec();
-    let trigger = if messages
-        .last()
-        .is_some_and(|message| message.has_tool_result())
-    {
-        "after_tool_batch"
-    } else {
-        "user_prompt"
-    };
     let context_window =
         querymt_agent_services::model_info::get_model_info(&context.provider, &context.model)
             .and_then(|info| info.limits.context)
@@ -2555,6 +2564,18 @@ async fn apply_clarification_answer(
 //  Tests
 // ══════════════════════════════════════════════════════════════════════════
 
+/// [`transition_before_llm_call`] over a history that has no notices stored
+/// for this request, so the trigger can be read from it.
+#[cfg(test)]
+pub(super) async fn transition_before_llm_call_in_test(
+    config: &AgentConfig,
+    context: &Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &ExecutionContext,
+) -> Result<ExecutionState, anyhow::Error> {
+    let trigger = context_hook_trigger(&context.messages);
+    transition_before_llm_call(config, context, exec_ctx, trigger).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2921,7 +2942,7 @@ mod tests {
                     );
                     exec.add_message(orphan).await.unwrap();
                 }
-                let (mut messages, summaries, _) = exec
+                let (mut messages, summaries, _, _) = exec
                     .session_handle
                     .history_with_notice_state()
                     .await
@@ -2936,7 +2957,7 @@ mod tests {
                         .delete_messages_after(&exec.session_id, &boundary_id)
                         .await
                         .unwrap();
-                    let (_, refreshed, _) = exec
+                    let (_, refreshed, _, _) = exec
                         .session_handle
                         .history_with_notice_state()
                         .await
@@ -2988,7 +3009,7 @@ mod tests {
                 let (result, spans) = capture_info(async {
                     let request = if mode.starts_with("hook_") {
                         let ExecutionState::CallLlm { request, .. } =
-                            transition_before_llm_call(&config, &context, &exec)
+                            transition_before_llm_call_in_test(&config, &context, &exec)
                                 .await
                                 .unwrap()
                         else {
@@ -3646,7 +3667,7 @@ mod tests {
                     .with_request_overrides(overrides),
             );
 
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { request, context } = state else {
@@ -3682,7 +3703,7 @@ mod tests {
             let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
             context.messages = Arc::from(messages.into_boxed_slice());
             let context = context.with_request_objective(objective.map(Arc::from));
-            let state = transition_before_llm_call(config, &Arc::new(context), exec)
+            let state = transition_before_llm_call_in_test(config, &Arc::new(context), exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { request, .. } = state else {
@@ -3841,6 +3862,36 @@ mod tests {
             assert_eq!(after.last().unwrap().text(), "plan reminder");
         }
 
+        /// A notice stored after a tool batch does not turn the request into a
+        /// user-prompt request for context hooks.
+        #[tokio::test]
+        async fn notice_after_a_tool_batch_keeps_the_after_tool_batch_trigger() {
+            use querymt_agent_core::model::NoticeSource;
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(history.into_boxed_slice());
+            let context =
+                Arc::new(context.queue_notice(NoticeSource::DuplicateToolCall, "same".into()));
+
+            let (_, spans) = capture(async {
+                crate::agent::execution::prepare_model_request(&fixture.config, &exec, &context)
+                    .await
+                    .expect("prepare request");
+            })
+            .await;
+            let hook = spans
+                .iter()
+                .find(|span| span.name == "agent.hooks.context")
+                .expect("context hook span");
+            assert_eq!(
+                attr(hook, "trigger"),
+                Some(&Value::from("after_tool_batch"))
+            );
+        }
+
         #[tokio::test]
         async fn durable_prefix_is_stable_for_a_provider_without_breakpoints() {
             // A local provider: hints are compared away, content must still match.
@@ -3997,7 +4048,7 @@ mod tests {
                 let exec = fixture.execution_context().await;
                 let mut events = config.subscribe_events();
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
-                transition_before_llm_call(config, &context, &exec)
+                transition_before_llm_call_in_test(config, &context, &exec)
                     .await
                     .expect("before llm call");
                 let deadline = std::time::Duration::from_secs(2);
@@ -4048,9 +4099,10 @@ mod tests {
             .and_then(|info| info.limits.context)
             .unwrap_or(u64::from(u32::MAX))
             .min(u64::from(u32::MAX)) as u32;
-            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), &exec)
-                .await
-                .unwrap();
+            let state =
+                transition_before_llm_call_in_test(&fixture.config, &Arc::new(context), &exec)
+                    .await
+                    .unwrap();
             let ExecutionState::CallLlm { request, .. } = state else {
                 panic!("expected CallLlm, got {}", state.name());
             };
@@ -4319,7 +4371,7 @@ mod tests {
             assert_eq!(context.request_overrides.max_tokens, Some(128_000));
 
             // Retry: same request at the ceiling.
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4422,7 +4474,7 @@ mod tests {
             assert_eq!(context.request_overrides.max_tokens, Some(128_000));
 
             // Request 2: ceiling, thinking only again -> not escalated twice, stops.
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before 2");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4475,7 +4527,7 @@ mod tests {
             let context = crate::agent::execution::store_pending_notices(&exec, &context)
                 .await
                 .expect("store notice");
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before 3");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4556,7 +4608,7 @@ mod tests {
             let ExecutionState::BeforeLlmCall { context } = state else {
                 panic!("expected BeforeLlmCall");
             };
-            let state = transition_before_llm_call(config, &context, exec)
+            let state = transition_before_llm_call_in_test(config, &context, exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -5258,7 +5310,7 @@ mod tests {
             let exec = fixture.execution_context().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (_, spans) = capture(async {
-                let _ = transition_before_llm_call(&fixture.config, &context, &exec).await;
+                let _ = transition_before_llm_call_in_test(&fixture.config, &context, &exec).await;
             })
             .await;
             let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
@@ -6456,9 +6508,10 @@ mod tests {
             let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
             context.messages = Arc::from(messages.into_boxed_slice());
             context.model = model.into();
-            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), exec)
-                .await
-                .expect("before llm call");
+            let state =
+                transition_before_llm_call_in_test(&fixture.config, &Arc::new(context), exec)
+                    .await
+                    .expect("before llm call");
             let ExecutionState::CallLlm { context, request } = state else {
                 panic!("expected CallLlm, got {}", state.name());
             };

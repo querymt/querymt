@@ -53,7 +53,7 @@ flowchart LR
 
 Why a separate trailing message: it is the only position where changing or removing the text cannot alter anything before it. It also keeps message-level hints working with the existing adapters, because the last block of a hinted message is now durable content.
 
-Consecutive user messages (prompt, then tail) already occur today when fragments are inserted before the latest prompt, so providers already handle them.
+This design produces adjacent user messages: a prompt followed by the tail or by a stored notice, and a tool-result message followed by a notice. Not every provider accepts them. The history merge (`merge_consecutive_tool_result_messages`, `crates/agent-core/src/history.rs`) only joins runs of tool-result messages, so it does not cover these sequences. llama-cpp renders each user message as its own template message (`crates/providers/llama-cpp/src/messages.rs`), and chat templates that require alternating roles reject two in a row. Requirement: every provider adapter SHALL either accept adjacent user messages or merge them before rendering. Which one each adapter does is decided per adapter; llama-cpp is unverified (task 1.20).
 
 Alternatives considered:
 
@@ -152,6 +152,8 @@ Alternatives considered:
 
 The limit has to be shorter than the shortest default cache lifetime (300 s) with room for the following request. In the window, 279 `shell` spans ran 5 minutes or longer and 1,205 ran between 1 and 5 minutes; how many of the latter exceed 240 s was not measured. A build that takes longer than the limit is moved, and the model continues with `job_wait` or ends its turn. `job_wait` is capped at 240 s for the same reason.
 
+When every `max_background` slot is taken at the limit, the command stays in the foreground until it exits or a slot frees, then moves without a restart. This keeps the concurrency bound, at the cost that a hung command blocks as it does today while the slots are busy. Exempting moved commands from the bound, or killing them at the limit, were rejected: the first breaks `max_background`, the second loses work.
+
 The hung `ssh … nohup` calls (up to 13.4 h) are a different case from a detached local child: the `ssh` process itself stays alive until the remote command closes its output. The return-on-exit behaviour in D6 does not help there. The foreground limit does.
 
 ### D9. `shell` bounds its own output
@@ -188,7 +190,7 @@ Evidence: 15 of 16 escalations were at `high` or `max`, and the largest retried 
 ### D14. Journal content
 
 - **Progress records.** The two `record_progress` call sites (`crates/agent-runtime/src/agent/execution/tool_calls.rs:446` for tool calls, `transitions.rs:1648` for model responses) are removed. They write a `progress_entries` row and a `progress_recorded` event each. Load snapshots already send an empty `progress_entries` list, so no client receives them through a load. The `ProgressKind` values and the event kind stay, because other callers and existing journals use them.
-- **Snapshot events.** `snapshot_start` and `snapshot_end` are classified as ephemeral in `classify_durability` (`crates/agent-protocol-types/src/events.rs:1307`). Undo reads `TurnSnapshotStart`/`TurnSnapshotPatch` message parts, not these events; the remaining readers are an example and a benchmark.
+- **Snapshot events.** `snapshot_start` and `snapshot_end` are classified as ephemeral in `classify_durability` (`crates/agent-core/src/events.rs:1382`). Undo reads `TurnSnapshotStart`/`TurnSnapshotPatch` message parts, not these events; the remaining readers are an example and a benchmark.
 - **`provider_changed` on load.** The materializer emits it on every load (`crates/agent-runtime/src/agent/session_materializer.rs:1609`). It will emit only when the selection differs from the session's most recent one. The task picks the cheapest source for "most recent" (the whole-session state a load already computes is the first candidate).
 
 No code is added to read old journals: the event kinds remain defined, so existing sessions deserialize as before.
@@ -212,7 +214,7 @@ Lifecycle requests for a session owned by a node that is not connected: 73 calls
 
 `PluginRegistry::load_all_plugins` and `get` (`crates/querymt/src/plugin/host/mod.rs:203`, `:401`) retry every provider that is not loaded. Two configured providers point at build outputs that do not exist, so each model listing and each authentication status read fails them again (231 and 184 logged errors per provider). The load span is not marked as failed.
 
-The registry keeps, per provider, the error and a fingerprint of the cause: for a local path, whether the file exists and its size and modification time; for a registry or URL source, the time of the attempt. Both entry points skip a provider whose fingerprint is unchanged (local) or younger than 300 s (remote), and `get` returns the stored error. `querymt/refreshModels` clears the record. The load function records its error on the span.
+The registry keeps, per provider, the error and a fingerprint of the cause: for a local path, whether the file exists and its size and modification time; for a registry or URL source, the time of the attempt. Both entry points skip a provider whose fingerprint is unchanged (local) or younger than 300 s (remote), and `get` returns the stored error. `querymt/refreshModels` clears the record, so it retries every failed provider regardless of fingerprint or age. A replacement file with the same size and modification time (for example `cp -p` or a build with fixed timestamps) is not detected; the refresh is the manual retry for that case. The load function records its error on the span.
 
 ### D18. Unknown tools and `~`
 
@@ -251,7 +253,7 @@ Today any change to the offered tools changes the head of the request, which inv
 
 - **Baseline.** At the first request after a session starts, after a compaction and after a model switch, the offered tools are stored in history as a `tool_baseline` part. It is not sent as a message; it is the request's leading tool list until the next baseline. All three points rewrite the cache anyway.
 - **Marker.** Before each request the agent folds the baseline with the stored markers and compares the result with the tools offered now. A difference is stored as a `tool_change` part (definitions added or redefined, names removed), after any tool results, and sent to the provider as a tool-change message. Additions are in name order.
-- **Other providers** get the current list in the request, as today, and no parts are stored.
+- **Other providers** get the current list in the request, as today, and no parts are stored. Baseline and tool-change parts stored under an earlier model stay in history and are left out of their requests, not translated. A tool-change part before the most recent baseline is never sent. Leaving them out after a model switch is the one exception to the unchanged-history rule (D1); that request reports `prefix_change = "model"` anyway.
 
 `querymt` gains the capability flag and a tool-change message kind. The agent sends that kind only to providers that declare the flag, so a plugin built before this change never receives one. `prefix_change` (D4) hashes the leading list, so a change sent as a marker reports `none`.
 
@@ -282,7 +284,7 @@ Expected effect is small: 3 real tool-list changes in 14 days, none mid-run. Sor
 - **[Snapshots and background writes.]** A background command can modify files while later tool calls are snapshotted, so its changes are attributed to whichever call was snapshotted next. → Same situation as a detached process today; turn-level undo still covers them. Documented, not solved.
 - **[Fewer journal events could break a consumer.]** → In this repository only an example and a benchmark read the affected events. The desktop follow-up confirms the same for `querymt-desktop` before group F ships.
 - **[Hiding kameo spans removes parents from traces.]** Spans created inside a handler become roots or attach to the caller's span. → That is how they already appear for work that crosses a spawn. `QMT_TELEMETRY_LEVEL=info,kameo=info` restores them.
-- **[A remembered plugin failure hides a fixed plugin.]** → Local files are re-checked by size and modification time on every use, and `querymt/refreshModels` clears the record.
+- **[A remembered plugin failure hides a fixed plugin.]** → Local files are re-checked by size and modification time on every use, and `querymt/refreshModels` clears the record. A replacement that keeps both values is only picked up by the refresh.
 - **[A 2-second transport retry can hit a provider that is down.]** → The attempt budget is unchanged (3), and the second wait doubles.
 
 ## Migration Plan

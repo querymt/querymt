@@ -82,7 +82,7 @@ The only messages in a request that are not in session history SHALL be request-
 - **THEN** the request ends with one message holding the run objective followed by the hook's text
 
 ### Requirement: Durable history is sent unchanged between requests
-When a session sends two consecutive model requests and its history was only appended to in between, the second request SHALL begin with the first request's durable messages, identical in content and order. Only the position of cache hints MAY differ. This SHALL hold for every provider, including providers without explicit breakpoints.
+When a session sends two consecutive model requests and its history was only appended to in between, the second request SHALL begin with the first request's durable messages, identical in content and order. Only the position of cache hints MAY differ. This SHALL hold for every provider, including providers without explicit breakpoints. The only exception is the one in "Stored tool parts are left out for providers without tool-update support".
 
 #### Scenario: Prefix is stable across a tool step
 - **WHEN** a request is answered with tool calls and the next request carries their results
@@ -266,7 +266,7 @@ For a provider that declares `tool_updates`, the agent SHALL store the offered t
 - **THEN** its next request carries the same tool list and the same tool-change message as its last request before the restart
 
 ### Requirement: Tool changes are sent as messages when the provider supports them
-For a provider that declares `tool_updates`, the agent SHALL compare, before each request, the tools offered now with the baseline as changed by the tool-change messages stored after it. On a difference it SHALL store one tool-change message holding the definitions added or redefined, in name order, and the names removed, and SHALL send it at that position in this and every later request.
+For a provider that declares `tool_updates`, the agent SHALL compare, before each request, the tools offered now with the baseline as changed by the tool-change messages stored after it. On a difference it SHALL store one tool-change message holding the definitions added or redefined, in name order, and the names removed, and SHALL send it at that position in this and every later request until a newer baseline is stored.
 
 #### Scenario: Tool added mid-session
 - **WHEN** an MCP server adds tool `deploy` between two requests on a provider that declares `tool_updates`
@@ -289,6 +289,13 @@ For a provider that declares `tool_updates`, the agent SHALL compare, before eac
 - **WHEN** the user undoes past a tool-change message that added `deploy` while `deploy` is still offered
 - **THEN** a new tool-change message adding `deploy` is stored before the next request
 
+### Requirement: Tool-change messages before the latest baseline are not sent
+A tool-change message stored before the most recent baseline SHALL NOT be sent in any request.
+
+#### Scenario: Tool-change messages before a newer baseline are not sent
+- **WHEN** a tool-change message adding `deploy` was stored and the user then switches to another model whose provider declares `tool_updates`
+- **THEN** the requests to that model carry the tools offered now as their tool list and do not contain the earlier tool-change message
+
 ### Requirement: Tool-change messages follow tool results
 A tool-change message SHALL never be placed between a tool call and its result. A change found while tool results are pending SHALL be stored after them.
 
@@ -302,6 +309,13 @@ For a provider that does not declare `tool_updates`, the request's tool list SHA
 #### Scenario: Provider without tool-update support
 - **WHEN** an MCP server adds a tool between two requests on a provider that does not declare `tool_updates`
 - **THEN** the second request's tool list contains the new tool and no tool-change message is stored
+
+### Requirement: Stored tool parts are left out for providers without tool-update support
+Baselines and tool-change messages already in session history, for example stored under an earlier model, SHALL stay in history unchanged. A request to a provider that does not declare `tool_updates` SHALL leave them out, neither sending nor translating them. This is the only exception to "Durable history is sent unchanged between requests"; it occurs only after a model change, which the request already reports as a prefix change.
+
+#### Scenario: Switch to a provider without tool-update support
+- **WHEN** a session whose history holds a tool-change message adding `deploy` switches to a model whose provider does not declare `tool_updates`
+- **THEN** the next request contains no tool-change message, its tool list is the tools offered now, and the stored tool-change message is still in session history
 
 ### Requirement: Providers declare prompt-cache support
 A provider's chat capabilities SHALL include a `prompt_cache` declaration for the configured model and endpoint with two fields: `explicit_breakpoints` (boolean) and `ttl_secs` (the selectable cache lifetimes in seconds, ascending; empty when the lifetime cannot be chosen). A provider or plugin that reports no declaration SHALL be treated as `explicit_breakpoints = false` with no selectable lifetimes.

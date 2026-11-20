@@ -987,20 +987,23 @@ impl SessionHandle {
         self.project_history(&agent_msgs)
     }
 
-    /// Effective history, its compaction summaries, and the content of the
-    /// most recent stored `agent_mode` notice (a `ChatMessage` does not carry
-    /// its notice source, so it is read here from the stored messages).
+    /// Effective history, its compaction summaries, the content of the most
+    /// recent stored `agent_mode` notice, and the number of user turns in it.
+    /// A `ChatMessage` does not carry its notice source, so the last two are
+    /// read here from the stored messages.
     pub(crate) async fn history_with_notice_state(
         &self,
     ) -> SessionResult<(
         Vec<ChatMessage>,
         Vec<ChatMessage>,
         Option<std::sync::Arc<str>>,
+        usize,
     )> {
         let agent_msgs = self.get_effective_agent_history().await?;
         let messages = self.project_history(&agent_msgs)?;
         let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
-        Ok((messages, summaries, last_mode_notice(&agent_msgs)))
+        let turns = user_turns(&agent_msgs, &messages);
+        Ok((messages, summaries, last_mode_notice(&agent_msgs), turns))
     }
 
     fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
@@ -1464,6 +1467,24 @@ pub(crate) fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
             } => Some(Arc::from(content.as_str())),
             _ => None,
         })
+}
+
+/// User turns in a history: user messages that carry no tool result and are
+/// not made only of harness notices. `messages` is the one-to-one projection
+/// of `agent_msgs`.
+fn user_turns(agent_msgs: &[AgentMessage], messages: &[ChatMessage]) -> usize {
+    agent_msgs
+        .iter()
+        .zip(messages)
+        .filter(|(stored, message)| {
+            let notice_only = !stored.parts.is_empty()
+                && stored
+                    .parts
+                    .iter()
+                    .all(|part| matches!(part, MessagePart::Notice { .. }));
+            message.role == ChatRole::User && !message.has_tool_result() && !notice_only
+        })
+        .count()
 }
 
 fn is_oauth_refresh_failure(error: &SessionError) -> bool {

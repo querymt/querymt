@@ -446,7 +446,9 @@ impl DelegationSummarizer {
                 m.parts
                     .iter()
                     .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
+                        MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
+                            self.estimator.estimate(content)
+                        }
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, None)),
