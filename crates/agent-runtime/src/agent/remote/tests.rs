@@ -1385,6 +1385,265 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
+    async fn guarded_turns_do_not_control_owner_work_and_recheck_on_revocation() {
+        use crate::agent::messages::{
+            Cancel, DiscardQueuedInput, DiscardQueuedInputResult, GetRuntimeStatus, InputDelivery,
+            SubmitInput, SubmitInputResult, SubmitSessionInput,
+        };
+        use crate::agent::remote::remote_actor_impl::register_session_turns;
+        use crate::error::AgentError;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_agent_core::events::AgentEventKind;
+        use querymt_remote::mesh_ingress::{InboundRouter, MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+        };
+
+        struct Store(PeerGrantKey, parking_lot::Mutex<PeerGrantState>);
+        #[async_trait::async_trait]
+        impl GrantStore for Store {
+            async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(if *key == self.0 {
+                    self.1.lock().clone()
+                } else {
+                    PeerGrantState::default()
+                })
+            }
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                unreachable!("test changes its fixture state directly")
+            }
+            async fn managed_peers(
+                &self,
+                _: &querymt_remote::NodeId,
+            ) -> Result<Vec<querymt_remote::NodeId>, GrantStoreError> {
+                unreachable!("unused by turn routes")
+            }
+        }
+
+        let mesh = get_test_mesh().await;
+        let (config, _dir) = test_agent_config().await;
+        let history = config.provider.history_store().clone();
+        let id = history
+            .create_session(Some("turn-revocation".into()), None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        // Keep the production execution future waiting before any history or provider IO.
+        let _permit = runtime
+            .execution_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let session = SessionActor::spawn(SessionActor::new(config.clone(), id.clone(), runtime));
+        let host = *mesh.peer_id();
+        let peer = libp2p::PeerId::random();
+        let store = Arc::new(Store(
+            PeerGrantKey {
+                host: querymt_remote::NodeId::from_peer_id(host),
+                peer: querymt_remote::NodeId::from_peer_id(peer),
+            },
+            parking_lot::Mutex::new(PeerGrantState::default()),
+        ));
+        let set_grant = |grant| {
+            *store.1.lock() = PeerGrantState {
+                grant,
+                revision: Uuid::now_v7(),
+            }
+        };
+        let ingress = InboundRouter::new(host, store.clone());
+        register_session_turns(&ingress, store.clone(), &session);
+        let input = |delivery, expected_run_id| SubmitSessionInput {
+            input: SubmitInput {
+                session_id: id.clone(),
+                client_input_id: Some("same-key".into()),
+                expected_run_id,
+                delivery,
+                prompt: vec!["inert prompt".into()],
+            },
+        };
+        let queue =
+            || node_ask::<SessionActor, _>(session.id(), &input(InputDelivery::Queue, None));
+        let read_receipt = |response| {
+            let SwarmResponse::Ask(Ok(bytes)) = response else {
+                panic!("expected successful turn receipt: {response:?}");
+            };
+            rmp_serde::from_slice::<SubmitInputResult>(&bytes).unwrap()
+        };
+        let denied = |response| {
+            let SwarmResponse::Ask(Err(RemoteSendError::HandlerError(bytes))) = response else {
+                panic!("expected actor denial: {response:?}");
+            };
+            assert!(matches!(
+                rmp_serde::from_slice::<AgentError>(&bytes).unwrap(),
+                AgentError::MeshAccessDenied
+            ));
+        };
+        let wait_idle = || async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if session
+                        .ask(GetRuntimeStatus)
+                        .await
+                        .unwrap()
+                        .active_run_id
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("run must stop after cancellation");
+        };
+
+        set_grant(PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            providers: vec![],
+        });
+        assert!(matches!(
+            ingress.handle_v1(peer, queue()).await,
+            Err(SharingRejection::Denied)
+        ));
+        set_grant(PeerGrant::Full);
+
+        let SubmitInputResult::Started {
+            run_id: owner_run, ..
+        } = session
+            .ask(input(InputDelivery::Queue, None))
+            .await
+            .unwrap()
+        else {
+            panic!("owner prompt must start");
+        };
+        let steer = input(InputDelivery::Steer, Some(owner_run.clone()));
+        denied(
+            ingress
+                .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &steer))
+                .await
+                .unwrap(),
+        );
+        denied(
+            ingress
+                .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &Cancel))
+                .await
+                .unwrap(),
+        );
+
+        // Same key as the owner must not return the owner's receipt.
+        let first = read_receipt(ingress.handle_v1(peer, queue()).await.unwrap());
+        let SubmitInputResult::Queued {
+            input_id: peer_input,
+            ..
+        } = first
+        else {
+            panic!("peer input must queue");
+        };
+        assert_ne!(peer_input, "same-key");
+        assert!(
+            matches!(read_receipt(ingress.handle_v1(peer, queue()).await.unwrap()),
+            SubmitInputResult::Queued { input_id, .. } if input_id == peer_input)
+        );
+        let owner_queue = session
+            .ask(SubmitSessionInput {
+                input: SubmitInput {
+                    client_input_id: Some("owner-pending".into()),
+                    ..input(InputDelivery::Queue, None).input
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(owner_queue, SubmitInputResult::Queued { .. }));
+        let discard = DiscardQueuedInput {
+            input_id: "owner-pending".into(),
+        };
+        let result = ingress
+            .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &discard))
+            .await
+            .unwrap();
+        let SwarmResponse::Ask(Ok(bytes)) = result else {
+            panic!("expected discard receipt");
+        };
+        assert!(matches!(
+            rmp_serde::from_slice::<DiscardQueuedInputResult>(&bytes).unwrap(),
+            DiscardQueuedInputResult::NotPending { .. }
+        ));
+        session.ask(discard).await.unwrap();
+
+        set_grant(PeerGrant::None);
+        assert_eq!(
+            session
+                .ask(GetRuntimeStatus)
+                .await
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(owner_run.as_str())
+        );
+        session.tell(Cancel).await.unwrap();
+        wait_idle().await;
+        let stream = config.event_sink.session_stream(&id);
+        stream.flush().await;
+        let events = config
+            .event_sink
+            .journal()
+            .load_session_stream(&id, None, None)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(&event.kind,
+            AgentEventKind::QueuedInputDiscarded { input_id, reason }
+                if input_id == &peer_input && reason == "mesh_access_denied")));
+        assert!(!events.iter().any(|event| matches!(&event.kind,
+            AgentEventKind::QueuedInputStarted { input_id, .. } if input_id == &peer_input)));
+
+        // The legacy admission path must also retain its authenticated origin.
+        let mut live = config.subscribe_events();
+        set_grant(PeerGrant::Full);
+        let SubmitInputResult::Started {
+            run_id: peer_run, ..
+        } = read_receipt(ingress.handle_legacy(peer, queue()).await)
+        else {
+            panic!("legacy Full peer prompt must start");
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    *live.recv().await.unwrap().kind(),
+                    AgentEventKind::SessionQueued { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("legacy turn must reach the execution permit before revocation");
+        set_grant(PeerGrant::None);
+        wait_idle().await;
+        stream.flush().await;
+        let events = config
+            .event_sink
+            .journal()
+            .load_session_stream(&id, None, None)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(&event.kind,
+            AgentEventKind::RunCompleted { run_id, outcome, .. } if run_id == &peer_run && outcome == "cancelled")));
+        assert!(history.get_history(&id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn revocation_stops_session_relay_without_stopping_local_observers() {
         use crate::agent::messages::SubscribeEvents;
         use crate::agent::remote::EventRelayActor;

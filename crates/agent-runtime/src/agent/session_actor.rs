@@ -183,6 +183,7 @@ pub struct SessionActor {
     // ── Execution tracking ───────────────────────────────────────
     pub(crate) prompt_running: bool,
     pub(crate) active_run: Option<ActiveRun>,
+    active_authority: TurnAuthority,
     runtime_epoch: String,
     runtime_revision: u64,
     published_pending_steering: usize,
@@ -310,6 +311,7 @@ const MAX_SUBMIT_RECEIPT_AGE_MS: u64 = 30 * 60 * 1000;
 #[derive(Debug, Clone)]
 struct SubmitInputReceipt {
     client_input_id: String,
+    authority: TurnAuthority,
     result: SubmitInputResult,
     accepted_at_ms: u64,
 }
@@ -323,8 +325,77 @@ fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) enum TurnAuthority {
+    #[default]
+    Local,
+    #[cfg(feature = "remote")]
+    Peer(Arc<PeerTurn>),
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct PeerTurn {
+    pub(crate) origin: querymt_remote::mesh_ingress::PeerRequest,
+    pub(crate) store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for PeerTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTurn")
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnAuthority {
+    async fn check(&self) -> Result<(), AgentError> {
+        match self {
+            Self::Local => Ok(()),
+            // Until restricted tools and hosted inference share the quota and
+            // policy boundary, only a current Full grant may execute a turn.
+            #[cfg(feature = "remote")]
+            Self::Peer(peer) => match peer.store.grant(peer.origin.key()).await {
+                Ok(state)
+                    if Some(state.revision) == peer.origin.revision()
+                        && state.grant == querymt_remote::peer_access::PeerGrant::Full =>
+                {
+                    Ok(())
+                }
+                _ => Err(AgentError::MeshAccessDenied),
+            },
+        }
+    }
+
+    fn same_origin(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local, Self::Local) => true,
+            #[cfg(feature = "remote")]
+            (Self::Peer(a), Self::Peer(b)) => {
+                a.origin.key() == b.origin.key()
+                    && a.origin.revision() == b.origin.revision()
+                    && a.origin.protocol() == b.origin.protocol()
+            }
+            #[cfg(feature = "remote")]
+            _ => false,
+        }
+    }
+
+    fn can_control(&self, target: &Self) -> bool {
+        matches!(self, Self::Local) || self.same_origin(target)
+    }
+}
+
+/// Mailbox-only request; peer authority is supplied by authenticated mesh ingress.
+#[cfg(feature = "remote")]
+pub(crate) struct PeerTurnMessage<M> {
+    pub(crate) message: M,
+    pub(crate) authority: TurnAuthority,
+}
+
 struct QueuedPrompt {
     input_id: String,
+    authority: TurnAuthority,
     req: crate::acp::protocol::PromptRequest,
     reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
 }
@@ -361,6 +432,7 @@ impl SessionActor {
             turn_state: TurnState::new(),
             prompt_running: false,
             active_run: None,
+            active_authority: TurnAuthority::Local,
             runtime_epoch: Uuid::new_v4().to_string(),
             runtime_revision: 0,
             published_pending_steering: 0,
@@ -480,11 +552,18 @@ impl SessionActor {
 
     /// Return the original receipt for a repeated `client_input_id`, if it is
     /// still within the bounded cache window.
-    fn cached_submit_receipt(&mut self, client_input_id: &str) -> Option<SubmitInputResult> {
+    fn cached_submit_receipt(
+        &mut self,
+        client_input_id: &str,
+        authority: &TurnAuthority,
+    ) -> Option<SubmitInputResult> {
         self.prune_submit_receipts(now_ms());
         self.submit_receipts
             .iter()
-            .find(|receipt| receipt.client_input_id == client_input_id)
+            .find(|receipt| {
+                receipt.client_input_id == client_input_id
+                    && receipt.authority.same_origin(authority)
+            })
             .map(|receipt| receipt.result.clone())
     }
 
@@ -495,6 +574,7 @@ impl SessionActor {
         &mut self,
         client_input_id: Option<String>,
         result: &SubmitInputResult,
+        authority: TurnAuthority,
     ) {
         let Some(client_input_id) = client_input_id else {
             return;
@@ -503,6 +583,7 @@ impl SessionActor {
         self.prune_submit_receipts(now);
         self.submit_receipts.push_back(SubmitInputReceipt {
             client_input_id,
+            authority,
             result: result.clone(),
             accepted_at_ms: now,
         });
@@ -607,7 +688,9 @@ impl SessionActor {
         reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         queued_input_id: Option<String>,
+        authority: TurnAuthority,
     ) {
+        self.active_authority = authority.clone();
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         self.turn_state.token = CancellationToken::new();
@@ -662,7 +745,7 @@ impl SessionActor {
             // The reply carries the last `session_seq` the run produced, so a
             // transport can hold the response until its connection has
             // delivered every update of this prompt.
-            let run = execute_prompt_detached(exec).await;
+            let run = execute_authorized_prompt(exec, &authority).await;
             let disposition = run_disposition(completion_token.is_cancelled(), &run);
             let tip = event_stream.resolved_tip().await;
             let result = run.map(|run| crate::acp::delivery::with_event_tip(run.response, tip));
@@ -720,6 +803,32 @@ impl Message<Cancel> for SessionActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        self.cancel_turn().await;
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerTurnMessage<Cancel>> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: PeerTurnMessage<Cancel>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        msg.authority.check().await?;
+        if self.active_run.is_some() {
+            if !msg.authority.can_control(&self.active_authority) {
+                return Err(AgentError::MeshAccessDenied);
+            }
+            self.cancel_turn().await;
+        }
+        Ok(())
+    }
+}
+
+impl SessionActor {
+    async fn cancel_turn(&mut self) {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
         let cancelled_elicitations = crate::elicitation::cancel_pending_elicitations_for_session(
@@ -861,6 +970,7 @@ impl Message<PromptFinished> for SessionActor {
         }
 
         self.active_run = None;
+        self.active_authority = TurnAuthority::Local;
         self.prompt_running = false;
         self.turn_state.token = CancellationToken::new();
 
@@ -868,17 +978,29 @@ impl Message<PromptFinished> for SessionActor {
         // it, so no other owner can start a run between two queued turns.
         // The completion above is already persisted, so a reconciler never
         // sees a free lease with this run still open.
-        if let Some(queued) = self.queued_prompts.pop_front() {
+        while let Some(queued) = self.queued_prompts.pop_front() {
+            if let Err(error) = queued.authority.check().await {
+                self.config.emit_event(
+                    &self.session_id,
+                    AgentEventKind::QueuedInputDiscarded {
+                        input_id: queued.input_id,
+                        reason: "mesh_access_denied".into(),
+                    },
+                );
+                let _ = queued.reply.send(Err(error));
+                continue;
+            }
             self.launch_prompt(
                 queued.req,
                 queued.reply,
                 ctx.actor_ref().clone(),
                 Some(queued.input_id),
+                queued.authority,
             );
-        } else {
-            self.run_lease = None;
-            self.publish_runtime().await;
+            return;
         }
+        self.run_lease = None;
+        self.publish_runtime().await;
     }
 }
 
@@ -2297,6 +2419,33 @@ impl Message<SubmitSessionInput> for SessionActor {
         msg: SubmitSessionInput,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.submit_input(msg, &TurnAuthority::Local, ctx.actor_ref())
+            .await
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerTurnMessage<SubmitSessionInput>> for SessionActor {
+    type Reply = Result<SubmitInputResult, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: PeerTurnMessage<SubmitSessionInput>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.submit_input(msg.message, &msg.authority, ctx.actor_ref())
+            .await
+    }
+}
+
+impl SessionActor {
+    async fn submit_input(
+        &mut self,
+        msg: SubmitSessionInput,
+        authority: &TurnAuthority,
+        actor_ref: &kameo::actor::ActorRef<Self>,
+    ) -> Result<SubmitInputResult, AgentError> {
+        authority.check().await?;
         let input = msg.input;
         if input.session_id != self.session_id {
             return Err(AgentError::from(TurnControlError::SessionMismatch {
@@ -2305,16 +2454,19 @@ impl Message<SubmitSessionInput> for SessionActor {
             }));
         }
         validate_prompt_blocks(&input.prompt)?;
-        let input_id = input
-            .client_input_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Peer idempotency keys are not session-global queue identifiers.
+        let input_id = match authority {
+            TurnAuthority::Local => input.client_input_id.clone(),
+            #[cfg(feature = "remote")]
+            TurnAuthority::Peer(_) => None,
+        }
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Bounded same-actor receipt dedup: a retried keyed submission whose
         // original reply was lost returns the original receipt instead of
         // enqueuing a duplicate turn.
         if let Some(client_input_id) = input.client_input_id.as_deref()
-            && let Some(receipt) = self.cached_submit_receipt(client_input_id)
+            && let Some(receipt) = self.cached_submit_receipt(client_input_id, authority)
         {
             info!(
                 "Session {}: SubmitInput client_input_id={} replayed cached receipt",
@@ -2325,6 +2477,9 @@ impl Message<SubmitSessionInput> for SessionActor {
 
         match input.delivery {
             InputDelivery::Steer => {
+                if !authority.can_control(&self.active_authority) && self.active_run.is_some() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
                 // Steered text would reach the model verbatim; reject built-ins
                 // regardless of which path submitted them.
                 Builtin::parse_for(&input.prompt, Submission::Steer)?;
@@ -2356,6 +2511,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id,
                     }));
                 }
+                authority.check().await?;
                 let blocks = input.prompt.clone();
                 let position = run
                     .steering
@@ -2387,7 +2543,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     input_id,
                     position,
                 };
-                self.record_submit_receipt(input.client_input_id, &result);
+                self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                 self.publish_runtime().await;
                 Ok(result)
             }
@@ -2421,14 +2577,20 @@ impl Message<SubmitSessionInput> for SessionActor {
                     }
                 });
                 if self.active_run.is_none() {
-                    self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
+                    self.launch_prompt(
+                        req,
+                        reply,
+                        actor_ref.clone(),
+                        Some(input_id.clone()),
+                        authority.clone(),
+                    );
                     let run_id = self
                         .active_run
                         .as_ref()
                         .map(|run| run.run_id.to_string())
                         .unwrap_or_default();
                     let result = SubmitInputResult::Started { run_id, input_id };
-                    self.record_submit_receipt(input.client_input_id, &result);
+                    self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                     self.publish_runtime().await;
                     Ok(result)
                 } else {
@@ -2452,11 +2614,12 @@ impl Message<SubmitSessionInput> for SessionActor {
                         .map_err(AgentError::from)?;
                     self.queued_prompts.push_back(QueuedPrompt {
                         input_id: input_id.clone(),
+                        authority: authority.clone(),
                         req,
                         reply,
                     });
                     let result = SubmitInputResult::Queued { input_id, position };
-                    self.record_submit_receipt(input.client_input_id, &result);
+                    self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                     self.publish_runtime().await;
                     Ok(result)
                 }
@@ -2473,12 +2636,34 @@ impl Message<DiscardQueuedInput> for SessionActor {
         msg: DiscardQueuedInput,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.discard_queued_input(msg, &TurnAuthority::Local).await
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerTurnMessage<DiscardQueuedInput>> for SessionActor {
+    type Reply = Result<DiscardQueuedInputResult, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: PeerTurnMessage<DiscardQueuedInput>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.discard_queued_input(msg.message, &msg.authority).await
+    }
+}
+
+impl SessionActor {
+    async fn discard_queued_input(
+        &mut self,
+        msg: DiscardQueuedInput,
+        authority: &TurnAuthority,
+    ) -> Result<DiscardQueuedInputResult, AgentError> {
+        authority.check().await?;
         let input_id = msg.input_id;
-        let Some(position) = self
-            .queued_prompts
-            .iter()
-            .position(|queued| queued.input_id == input_id)
-        else {
+        let Some(position) = self.queued_prompts.iter().position(|queued| {
+            queued.input_id == input_id && authority.can_control(&queued.authority)
+        }) else {
             return Ok(DiscardQueuedInputResult::NotPending { input_id });
         };
         self.config
@@ -2508,25 +2693,69 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
-            return ctx.spawn(async move { Err(AgentError::from(error)) });
+        let queued = self
+            .enqueue_prompt(msg, TurnAuthority::Local, ctx.actor_ref())
+            .await;
+        ctx.spawn(wait_for_prompt_reply(queued))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerTurnMessage<Prompt>> for SessionActor {
+    type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
+
+    async fn handle(
+        &mut self,
+        msg: PeerTurnMessage<Prompt>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let queued = self
+            .enqueue_prompt(msg.message, msg.authority, ctx.actor_ref())
+            .await;
+        ctx.spawn(wait_for_prompt_reply(queued))
+    }
+}
+
+type PromptReceiver = oneshot::Receiver<Result<PromptResponse, AgentError>>;
+
+async fn wait_for_prompt_reply(
+    queued: Result<PromptReceiver, AgentError>,
+) -> Result<PromptResponse, AgentError> {
+    queued?
+        .await
+        .map_err(|_| AgentError::Internal("prompt execution dropped".into()))?
+}
+
+impl SessionActor {
+    async fn enqueue_prompt(
+        &mut self,
+        msg: Prompt,
+        authority: TurnAuthority,
+        actor_ref: &kameo::actor::ActorRef<Self>,
+    ) -> Result<PromptReceiver, AgentError> {
+        authority.check().await?;
+        if msg.req.session_id.0.as_ref() != self.session_id {
+            return Err(TurnControlError::SessionMismatch {
+                expected: self.session_id.clone(),
+                received: msg.req.session_id.0.to_string(),
+            }
+            .into());
         }
-        if self.active_run.is_none()
-            && let Err(error) = self.acquire_run_lease().await
-        {
-            return ctx.spawn(async move { Err(error) });
+        validate_prompt_blocks(&msg.req.prompt)?;
+        if self.active_run.is_none() {
+            self.acquire_run_lease().await?;
         }
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
-                let error = queued_prompt_capacity_error(&self.session_id);
-                return ctx.spawn(async move { Err(error) });
+                return Err(queued_prompt_capacity_error(&self.session_id));
             }
             let input_id = Uuid::new_v4().to_string();
             let position = self.queued_prompts.len() + 1;
             let blocks = msg.req.prompt.clone();
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
+                authority,
                 req: msg.req,
                 reply,
             });
@@ -2544,14 +2773,10 @@ impl Message<Prompt> for SessionActor {
                 },
             );
         } else {
-            self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None);
+            self.launch_prompt(msg.req, reply, actor_ref.clone(), None, authority);
         }
         self.publish_runtime().await;
-        ctx.spawn(async move {
-            receiver.await.unwrap_or_else(|_| {
-                Err(AgentError::Internal("prompt execution dropped".to_string()))
-            })
-        })
+        Ok(receiver)
     }
 }
 
@@ -2909,6 +3134,47 @@ fn run_disposition(
 }
 
 async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
+    execute_authorized_prompt(exec, &TurnAuthority::Local).await
+}
+
+async fn execute_authorized_prompt(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+) -> Result<PromptRun, AgentError> {
+    authority.check().await?;
+    #[cfg(feature = "remote")]
+    if let TurnAuthority::Peer(_) = authority {
+        let cancel = exec.cancel_token.clone();
+        let run = execute_prompt_with_span(exec, authority);
+        let revoked = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if let Err(error) = authority.check().await {
+                    return error;
+                }
+            }
+        };
+        tokio::pin!(run);
+        return tokio::select! {
+            result = &mut run => {
+                authority.check().await?;
+                result
+            }
+            error = revoked => {
+                // Let the normal cancellation path finish accounting and cleanup.
+                cancel.cancel();
+                let _ = run.await;
+                Err(error)
+            }
+        };
+    }
+    execute_prompt_with_span(exec, authority).await
+}
+
+async fn execute_prompt_with_span(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+) -> Result<PromptRun, AgentError> {
     // Construct the existing execution span explicitly: OTel 0.33 starts it on entry,
     // so the request's remote parent must be installed before instrumenting the future.
     let span = info_span!(
@@ -2943,24 +3209,29 @@ async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<Prompt
         let _ = span.set_parent(parent);
     }
     async move {
-        execute_prompt_inner(exec).await.inspect_err(|error| {
-            let error_type = match error {
-                AgentError::PermissionCancelled => return,
-                AgentError::ClientBridgeClosed
-                | AgentError::PermissionChannelDropped
-                | AgentError::WorkspaceQueryChannelDropped => "client_disconnected",
-                AgentError::SessionTimeout { .. } => "timeout",
-                AgentError::InvalidPromptContent { .. } => "invalid_prompt",
-                _ => "agent_error",
-            };
-            genai::error(error_type);
-        })
+        execute_prompt_inner(exec, authority)
+            .await
+            .inspect_err(|error| {
+                let error_type = match error {
+                    AgentError::PermissionCancelled => return,
+                    AgentError::ClientBridgeClosed
+                    | AgentError::PermissionChannelDropped
+                    | AgentError::WorkspaceQueryChannelDropped => "client_disconnected",
+                    AgentError::SessionTimeout { .. } => "timeout",
+                    AgentError::InvalidPromptContent { .. } => "invalid_prompt",
+                    _ => "agent_error",
+                };
+                genai::error(error_type);
+            })
     }
     .instrument(span)
     .await
 }
 
-async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
+async fn execute_prompt_inner(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+) -> Result<PromptRun, AgentError> {
     let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
@@ -3039,6 +3310,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         }
     };
 
+    authority.check().await?;
     let history_store = config.provider.history_store();
     let scheduled_task =
         validate_execution_task(&*history_store, &execution_origin, &session_id).await?;
@@ -3124,6 +3396,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .as_ref()
         .filter(|command| command.builtin == crate::slash_commands::builtin::Builtin::Compact)
     {
+        authority.check().await?;
         log::info!("Session {}: manual compaction requested", session_id);
         let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
         let outcome = crate::agent::execution::compact_history(
@@ -3215,6 +3488,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
     let message_id = Uuid::new_v4().to_string();
 
+    authority.check().await?;
     let hook_result = config
         .hooks
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {

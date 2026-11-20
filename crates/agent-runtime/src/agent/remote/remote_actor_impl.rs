@@ -18,13 +18,18 @@
 use crate::agent::messages;
 use crate::agent::remote::event_forwarder::PeerSubscription;
 use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
-use crate::agent::session_actor::{SessionActor, SubscribePeerEvents, UnsubscribePeerEvents};
+use crate::agent::session_actor::{
+    PeerTurn, PeerTurnMessage, SessionActor, SubscribePeerEvents, TurnAuthority,
+    UnsubscribePeerEvents,
+};
 use crate::error::AgentError;
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::message::Message;
 use kameo::remote::{_internal, RemoteActor, RemoteMessage};
 use kameo::reply::Reply;
-use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter};
+use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
+use querymt_remote::peer_access::GrantStore;
+use std::sync::Arc;
 use std::time::Duration;
 
 // Use only for reads that are safe under the session grant. Mutations must
@@ -77,6 +82,104 @@ pub(crate) fn register_session_routes(
     register_session_history(router, actor);
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
+    register_session_turns(router, store.clone(), actor);
+}
+
+pub(super) fn register_session_turns(
+    router: &InboundRouter,
+    store: Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) {
+    register_turn_ask::<messages::Prompt, _>(router, &store, actor, Duration::from_secs(600));
+    register_turn_ask::<messages::SubmitSessionInput, _>(
+        router,
+        &store,
+        actor,
+        Duration::from_secs(10),
+    );
+    register_turn_ask::<messages::DiscardQueuedInput, _>(
+        router,
+        &store,
+        actor,
+        Duration::from_secs(10),
+    );
+
+    let weak = actor.downgrade();
+    let cancel = move |origin, message| {
+        send_peer_turn(
+            weak.clone(),
+            store.clone(),
+            origin,
+            message,
+            Duration::from_secs(10),
+        )
+    };
+    router.register_legacy_tell::<SessionActor, messages::Cancel, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        cancel.clone(),
+    );
+    router.register_v1_ask::<SessionActor, messages::Cancel, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        cancel,
+    );
+}
+
+fn register_turn_ask<M, R>(
+    router: &InboundRouter,
+    store: &Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+    timeout: Duration,
+) where
+    SessionActor: RemoteMessage<M> + Message<PeerTurnMessage<M>>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    <SessionActor as Message<PeerTurnMessage<M>>>::Reply: Reply<Ok = R, Error = AgentError>,
+    R: serde::Serialize + Send + 'static,
+{
+    let weak = actor.downgrade();
+    let store = store.clone();
+    let handle = move |origin, message| {
+        send_peer_turn(weak.clone(), store.clone(), origin, message, timeout)
+    };
+    router.register_ask::<SessionActor, M, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        handle.clone(),
+    );
+    router.register_v1_ask::<SessionActor, M, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        handle,
+    );
+}
+
+async fn send_peer_turn<M, R>(
+    weak: WeakActorRef<SessionActor>,
+    store: Arc<dyn GrantStore>,
+    origin: PeerRequest,
+    message: M,
+    timeout: Duration,
+) -> Result<R, AgentError>
+where
+    SessionActor: Message<PeerTurnMessage<M>>,
+    M: Send + 'static,
+    <SessionActor as Message<PeerTurnMessage<M>>>::Reply: Reply<Ok = R, Error = AgentError>,
+    R: Send + 'static,
+{
+    let actor = weak
+        .upgrade()
+        .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+    actor
+        .ask(PeerTurnMessage {
+            authority: TurnAuthority::Peer(Arc::new(PeerTurn { store, origin })),
+            message,
+        })
+        .mailbox_timeout(Duration::from_secs(10))
+        .reply_timeout(timeout)
+        .send()
+        .await
+        .map_err(local_session_error)
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {

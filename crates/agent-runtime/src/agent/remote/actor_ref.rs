@@ -363,9 +363,24 @@ impl SessionActorRef {
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => {
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                let message = messages::Prompt { req };
+                if let Some(mesh) = mesh
+                    .as_deref()
+                    .filter(|mesh| mesh.inbound_router().is_some())
+                {
+                    return Self::read_remote(
+                        Some(mesh),
+                        actor_ref,
+                        &message,
+                        Self::REMOTE_PROMPT_REPLY_TIMEOUT,
+                    )
+                    .await;
+                }
                 actor_ref
-                    .ask(&messages::Prompt { req })
+                    .ask(&message)
                     .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
                     .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
                     .send()
@@ -408,18 +423,17 @@ impl SessionActorRef {
                 other => AgentError::RemoteActor(other.to_string()),
             }),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|error| {
-                    Self::map_agent_timeout_remote_send_error(
-                        error,
-                        "SubmitInput timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -543,18 +557,17 @@ impl SessionActorRef {
                 other => AgentError::RemoteActor(other.to_string()),
             }),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|error| {
-                    Self::map_agent_timeout_remote_send_error(
-                        error,
-                        "DiscardQueuedInput timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -598,10 +611,36 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .tell(&messages::Cancel)
-                .send()
-                .map_err(Self::map_infallible_remote_send_error),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                if let Some(mesh) = mesh {
+                    use querymt_remote::mesh_ingress::SharingCallError;
+                    use querymt_remote::peer_access::SharingProtocol;
+                    let peer = actor_ref.id().peer_id().copied().ok_or_else(|| {
+                        AgentError::from_sharing_ask(SharingCallError::Unavailable.into())
+                    })?;
+                    let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
+                    let protocol = mesh
+                        .select_sharing_protocol(peer, timeout)
+                        .await
+                        .map_err(|error| AgentError::from_sharing_ask(error.into()))?;
+                    if protocol == SharingProtocol::V1 {
+                        return querymt_remote::request_timeout::ask_sharing_v1(
+                            mesh,
+                            actor_ref,
+                            &messages::Cancel,
+                            timeout,
+                        )
+                        .await
+                        .map_err(AgentError::from_sharing_ask);
+                    }
+                }
+                actor_ref
+                    .tell(&messages::Cancel)
+                    .send()
+                    .map_err(Self::map_infallible_remote_send_error)
+            }
         }
     }
 
