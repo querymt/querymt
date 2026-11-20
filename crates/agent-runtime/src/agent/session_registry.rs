@@ -343,11 +343,7 @@ impl SessionRegistry {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
             let scopes = runtime.active_scopes();
             for (session_id, actor_ref) in &self.local_actor_refs {
-                if let Some(router) = mesh.inbound_router() {
-                    crate::agent::remote::remote_actor_impl::register_session_history(
-                        router, actor_ref,
-                    );
-                }
+                crate::agent::remote::remote_actor_impl::register_session_routes(mesh, actor_ref);
                 for scope in &scopes {
                     let dht_name = scoped_session(scope, session_id);
                     let runtime = runtime.clone();
@@ -536,11 +532,7 @@ impl SessionRegistry {
             && let Some(ref mesh) = self.mesh
         {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
-            if let Some(router) = mesh.inbound_router() {
-                crate::agent::remote::remote_actor_impl::register_session_history(
-                    router, &actor_ref,
-                );
-            }
+            crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor_ref);
             for scope in runtime.active_scopes() {
                 let dht_name = scoped_session(&scope, &session_id);
                 let runtime = runtime.clone();
@@ -953,6 +945,9 @@ impl Drop for PreparedRemoteAttachment {
             return;
         }
         if let Some(mesh) = &self.mesh {
+            if let Some(router) = mesh.inbound_router() {
+                router.withdraw_actor(self.relay_ref.id());
+            }
             let runtime = MeshRuntimeHandle::from(mesh.clone());
             for name in &self.registered_relay_names {
                 runtime.deregister_actor(name);
@@ -1036,6 +1031,23 @@ pub(crate) async fn prepare_remote_attachment(
         );
     }
 
+    if let Some(router) = candidate
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.inbound_router())
+    {
+        let owner = remote_ref
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or(AgentError::MeshAccessDenied)?;
+        crate::agent::remote::remote_actor_impl::register_session_relay(
+            router,
+            &candidate.relay_ref,
+            owner,
+            &candidate.session_id,
+        );
+    }
     let relay_remote_ref = candidate.relay_ref.into_remote_ref().await;
     if let Err(error) = candidate
         .session_ref
@@ -1058,21 +1070,30 @@ pub(crate) async fn prepare_remote_attachment(
         });
         cleanup_attachment_parts(candidate.cleanup_parts(), !unavailable).await;
         candidate.armed = false;
+        if AgentError::is_acp_mesh_access_denied(&error) {
+            return Err(AgentError::MeshAccessDenied);
+        }
         return Err(AgentError::RemoteActor(format!(
             "failed to subscribe remote session events: {error}"
         )));
     }
 
-    // Register the observer before linking: a disconnect must be recognizable
-    // by the owner even if it happens while the attachment is being installed.
-    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
-        abort_prepared_remote_attachment(candidate).await;
-        return Err(AgentError::RemoteActor(format!(
-            "failed to link event relay to remote session: {error}"
-        )));
+    // Guarded subscriptions use peer-bound RPCs, not Kameo lifecycle authority.
+    // Legacy runtimes still use links to track attachment liveness.
+    if candidate
+        .mesh
+        .as_ref()
+        .is_none_or(|mesh| mesh.inbound_router().is_none())
+    {
+        if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
+            abort_prepared_remote_attachment(candidate).await;
+            return Err(AgentError::RemoteActor(format!(
+                "failed to link event relay to remote session: {error}"
+            )));
+        }
+        candidate.linked = true;
     }
-    candidate.linked = true;
-    // Direct subscription and linking must succeed before this candidate is discoverable.
+    // Do not publish the relay until the owner accepts its subscription.
     if let Some(mesh) = candidate.mesh.clone() {
         let runtime = MeshRuntimeHandle::from(mesh);
         for name in &candidate.registered_relay_names {
@@ -1197,6 +1218,9 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
     }
 
     if let Some(mesh) = mesh {
+        if let Some(router) = mesh.inbound_router() {
+            router.withdraw_actor(relay_ref.id());
+        }
         let runtime = MeshRuntimeHandle::from(mesh.clone());
         for name in registered_relay_names {
             runtime.deregister_actor(name);

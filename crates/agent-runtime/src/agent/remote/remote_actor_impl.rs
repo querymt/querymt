@@ -16,8 +16,9 @@
 //! dispatch to find our actor and message handlers at runtime.
 
 use crate::agent::messages;
+use crate::agent::remote::event_forwarder::PeerSubscription;
 use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
-use crate::agent::session_actor::SessionActor;
+use crate::agent::session_actor::{SessionActor, SubscribePeerEvents, UnsubscribePeerEvents};
 use crate::error::AgentError;
 use kameo::actor::ActorRef;
 use kameo::message::Message;
@@ -64,6 +65,97 @@ pub(crate) fn register_session_history(router: &InboundRouter, actor: &ActorRef<
     register_session_read::<_, messages::GetEventStream>(router, actor);
     register_session_read::<_, messages::GetEventStreamSince>(router, actor);
     register_session_read::<_, messages::GetEventStreamChunk>(router, actor);
+}
+
+pub(crate) fn register_session_routes(
+    mesh: &querymt_remote::MeshHandle,
+    actor: &ActorRef<SessionActor>,
+) {
+    let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) else {
+        return;
+    };
+    register_session_history(router, actor);
+    register_session_subscriptions(router, mesh, store.clone(), actor);
+}
+
+pub(super) fn register_session_subscriptions(
+    router: &InboundRouter,
+    mesh: &querymt_remote::MeshHandle,
+    store: std::sync::Arc<dyn querymt_remote::peer_access::GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) {
+    let weak = actor.downgrade();
+    let egress = mesh.sharing_egress();
+    let subscribe = move |origin, message| {
+        let weak = weak.clone();
+        let subscriber = PeerSubscription {
+            egress: egress.clone(),
+            store: store.clone(),
+            origin,
+        };
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+            actor
+                .ask(SubscribePeerEvents {
+                    message,
+                    subscriber,
+                })
+                .mailbox_timeout(Duration::from_secs(3))
+                .reply_timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(local_session_error)
+        }
+    };
+    router.register_ask::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        subscribe.clone(),
+    );
+    router.register_v1_ask::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
+        actor.id(),
+        InboundAccess::Sessions,
+        subscribe,
+    );
+
+    let weak = actor.downgrade();
+    let unsubscribe = move |origin: querymt_remote::mesh_ingress::PeerRequest, message| {
+        let weak = weak.clone();
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+            actor
+                .ask(UnsubscribePeerEvents {
+                    message,
+                    peer: *origin.key().peer.as_peer_id(),
+                })
+                .mailbox_timeout(Duration::from_secs(3))
+                .reply_timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(local_session_error)
+        }
+    };
+    router.register_ask::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        unsubscribe.clone(),
+    );
+    router.register_v1_ask::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
+        actor.id(),
+        InboundAccess::Sessions,
+        unsubscribe,
+    );
+}
+
+fn local_session_error<M>(error: kameo::error::SendError<M, AgentError>) -> AgentError {
+    match error {
+        kameo::error::SendError::HandlerError(error) => error,
+        other => AgentError::RemoteActor(other.to_string()),
+    }
 }
 
 // ── RemoteActor ──────────────────────────────────────────────────────────
@@ -312,6 +404,58 @@ remote_msg_impl!(
     "querymt::ResolveInteraction",
     REG_RESOLVE_INTERACTION
 );
+
+/// Accept callbacks only from the session owner selected at attachment time.
+/// The destination is specific to one attachment and authorizes no other RPC.
+pub(crate) fn register_session_relay(
+    router: &InboundRouter,
+    relay: &ActorRef<EventRelayActor>,
+    owner: libp2p::PeerId,
+    session_id: &str,
+) {
+    macro_rules! register_callback {
+        ($message:ty, $session:expr) => {{
+            let weak = relay.downgrade();
+            let session_id = session_id.to_owned();
+            let deliver = move |origin: querymt_remote::mesh_ingress::PeerRequest,
+                                message: $message| {
+                let weak = weak.clone();
+                let matches_attachment =
+                    origin.key().peer.as_peer_id() == &owner && ($session)(&message, &session_id);
+                async move {
+                    if !matches_attachment {
+                        return Err(AgentError::MeshAccessDenied);
+                    }
+                    let relay = weak
+                        .upgrade()
+                        .ok_or_else(|| AgentError::RemoteActor("session relay stopped".into()))?;
+                    relay
+                        .tell(message)
+                        .mailbox_timeout(Duration::from_secs(3))
+                        .send()
+                        .await
+                        .map_err(|error| AgentError::RemoteActor(error.to_string()))
+                }
+            };
+            router.register_legacy_tell::<EventRelayActor, $message, _, _, _>(
+                relay.id(),
+                InboundAccess::Identity,
+                deliver.clone(),
+            );
+            router.register_v1_ask::<EventRelayActor, $message, _, _, _, _>(
+                relay.id(),
+                InboundAccess::Identity,
+                deliver,
+            );
+        }};
+    }
+    register_callback!(RelayedEvent, |msg: &RelayedEvent, id: &str| msg
+        .event
+        .session_id
+        == id);
+    register_callback!(RelayLagged, |msg: &RelayLagged, id: &str| msg.session_id
+        == id);
+}
 
 // ── EventRelayActor RemoteActor ──────────────────────────────────────────
 

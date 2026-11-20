@@ -187,6 +187,8 @@ pub(crate) enum RemoteSessionConnectError {
     LocationConflict { session_id: String, message: String },
     /// Mesh runtime is not bootstrapped locally, so no remote work is possible.
     MeshUnavailable { node_id: String },
+    /// The owner rejected this peer's access to the session.
+    AccessDenied,
     /// The target node could not be contacted at all.
     NodeUnavailable {
         node_id: String,
@@ -230,6 +232,7 @@ impl RemoteSessionConnectError {
             Self::BookmarkLookupFailed { .. } => "session_bookmark_lookup_failed",
             Self::BookmarkSaveFailed { .. } => "session_bookmark_save_failed",
             Self::LocationConflict { .. } => "session_location_conflict",
+            Self::AccessDenied => "mesh_access_denied",
             Self::MeshUnavailable { .. } => "remote_node_unavailable",
             Self::NodeUnavailable { .. } => "remote_node_unavailable",
             Self::RecoveryFailed { .. } => "remote_recovery_failed",
@@ -285,7 +288,8 @@ impl RemoteSessionConnectError {
             | Self::BookmarkLookupFailed { .. }
             | Self::BookmarkSaveFailed { .. }
             | Self::LocationConflict { .. }
-            | Self::SessionNotFoundOnHost { .. } => false,
+            | Self::SessionNotFoundOnHost { .. }
+            | Self::AccessDenied => false,
             Self::MeshUnavailable { .. }
             | Self::NodeUnavailable { .. }
             | Self::RecoveryFailed { .. }
@@ -300,6 +304,7 @@ impl RemoteSessionConnectError {
             Self::BookmarkMissing { .. }
             | Self::LocationConflict { .. }
             | Self::SessionNotFoundOnHost { .. } => -32002,
+            Self::AccessDenied => -32000,
             _ => -32603,
         };
         let mut data = serde_json::json!({
@@ -334,7 +339,7 @@ impl RemoteSessionConnectError {
                 data["session_id"] = serde_json::Value::String(session_id.clone());
                 data["retry_after_ms"] = serde_json::Value::from(*retry_after_ms);
             }
-            Self::RecoveryFailed { .. } | Self::TimedOut { .. } => {}
+            Self::AccessDenied | Self::RecoveryFailed { .. } | Self::TimedOut { .. } => {}
         }
         if let Some(failure) = self.transport_failure() {
             data["transport_kind"] =
@@ -383,6 +388,7 @@ impl std::fmt::Display for RemoteSessionConnectError {
             } => {
                 write!(f, "remote node '{node_id}' is unavailable: {message}")
             }
+            Self::AccessDenied => write!(f, "mesh access denied"),
             Self::RecoveryFailed { message, .. } => {
                 write!(f, "remote session recovery failed: {message}")
             }
@@ -946,6 +952,9 @@ impl LocalAgentHandle {
                 .await
             {
                 Ok(connected) => return Ok(connected),
+                Err(RemoteSessionConnectError::AccessDenied) => {
+                    return Err(RemoteSessionConnectError::AccessDenied);
+                }
                 Err(err) => {
                     log::warn!(
                         "remote session {} connect: DHT-published actor failed validation ({}); \
@@ -1111,10 +1120,13 @@ impl LocalAgentHandle {
         )
         .instrument(prepare_span)
         .await
-        .map_err(|error| RemoteSessionConnectError::HealthCheckFailed {
-            session_id: session_id.to_string(),
-            transport: None,
-            message: error.to_string(),
+        .map_err(|error| match error {
+            AgentError::MeshAccessDenied => RemoteSessionConnectError::AccessDenied,
+            error => RemoteSessionConnectError::HealthCheckFailed {
+                session_id: session_id.to_string(),
+                transport: None,
+                message: error.to_string(),
+            },
         })?;
         let session_ref = prepared.session_ref().clone();
         let attachment_id = prepared.attachment_id();
@@ -1132,7 +1144,14 @@ impl LocalAgentHandle {
         }
 
         let health_timeout = Self::remote_connect_health_timeout();
-        let health = tokio::time::timeout(health_timeout, session_ref.get_mode()).await;
+        let health = tokio::time::timeout(health_timeout, async {
+            if session_ref.uses_guarded_mesh() {
+                session_ref.check_history_access().await
+            } else {
+                session_ref.get_mode().await.map(|_| ())
+            }
+        })
+        .await;
         let saved = if matches!(health, Ok(Ok(_))) {
             self.config
                 .provider
@@ -1148,7 +1167,11 @@ impl LocalAgentHandle {
             .take()
             .expect("prepared candidate parked before health check");
         match health {
-            Ok(Ok(_mode)) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(AgentError::MeshAccessDenied)) => {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(RemoteSessionConnectError::AccessDenied);
+            }
             Ok(Err(error)) => {
                 log::warn!(
                     "remote session {} connect: candidate attachment_id={} failed health check: {}",

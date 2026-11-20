@@ -1323,6 +1323,120 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
+    async fn revocation_stops_session_relay_without_stopping_local_observers() {
+        use crate::agent::messages::SubscribeEvents;
+        use crate::agent::remote::EventRelayActor;
+        use crate::agent::remote::remote_actor_impl::register_session_subscriptions;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::mesh_ingress::{InboundRouter, MeshIngress};
+        use querymt_remote::peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+        };
+
+        struct Store(parking_lot::Mutex<PeerGrantState>);
+        #[async_trait::async_trait]
+        impl GrantStore for Store {
+            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(self.0.lock().clone())
+            }
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                unreachable!("fixture changes grant directly")
+            }
+            async fn managed_peers(
+                &self,
+                _: &querymt_remote::NodeId,
+            ) -> Result<Vec<querymt_remote::NodeId>, GrantStoreError> {
+                unreachable!("unused by subscriptions")
+            }
+        }
+        let mesh = get_test_mesh().await;
+        let (config, _dir) = test_agent_config().await;
+        let (SessionActorRef::Local(session), id) =
+            spawn_test_session_with_id(config.clone(), "relay-revocation").await
+        else {
+            panic!("expected local fixture")
+        };
+        let (viewer, _viewer_dir) = test_agent_config().await;
+        let relay = EventRelayActor::spawn(EventRelayActor::new(
+            viewer.event_sink.clone(),
+            id.clone(),
+            "test relay".into(),
+            None,
+            None,
+        ));
+        let mut observed = viewer.event_sink.fanout().subscribe();
+        let mut local = config.event_sink.fanout().subscribe();
+        let store = Arc::new(Store(parking_lot::Mutex::new(PeerGrantState {
+            grant: PeerGrant::Full,
+            revision: Uuid::now_v7(),
+        })));
+        let host = *mesh.peer_id();
+        let ingress = InboundRouter::new(host, store.clone());
+        register_session_subscriptions(&ingress, mesh, store.clone(), &session);
+        let request = SubscribeEvents {
+            relay_actor_id: relay.id().sequence_id(),
+            relay_ref: Some(relay.into_remote_ref().await),
+            relay_dht_name: Some("relay-fixture".into()),
+            after_source_seq: None,
+        };
+        let subscribe = || node_ask::<SessionActor, _>(session.id(), &request);
+        let stranger = libp2p::PeerId::random();
+        assert!(matches!(
+            ingress.handle_legacy(stranger, subscribe()).await,
+            SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_)))
+        ));
+        // The receive guard and the real legacy relay actor run in one process here.
+        // The transport-authenticated caller is supplied at the ingress boundary.
+        assert!(matches!(
+            ingress.handle_legacy(host, subscribe()).await,
+            SwarmResponse::Ask(Ok(_))
+        ));
+        let publish = |name: &'static str, seq| {
+            config
+                .event_sink
+                .fanout()
+                .publish(querymt_agent_core::events::EventEnvelope::Durable(
+                    querymt_agent_core::events::DurableEvent {
+                        event_id: name.into(),
+                        session_id: id.clone(),
+                        stream_seq: seq,
+                        session_seq: 0,
+                        timestamp: 100,
+                        source_node: None,
+                        origin: querymt_agent_core::events::EventOrigin::Local,
+                        kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
+                    },
+                ))
+        };
+        publish("before", 1);
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        local.recv().await.unwrap();
+        *store.0.lock() = PeerGrantState {
+            grant: PeerGrant::None,
+            revision: Uuid::now_v7(),
+        };
+        publish("after", 2);
+        tokio::time::timeout(Duration::from_secs(3), local.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), observed.recv())
+                .await
+                .is_err()
+        );
+        assert!(session.is_alive());
+    }
+
+    #[tokio::test]
     async fn test_admission_readmits_valid_member_but_rejects_other_scopes_and_bad_signatures() {
         use querymt_remote::{InvitePermissions, MembershipToken, MeshScopeId};
         let mesh = get_test_mesh().await;

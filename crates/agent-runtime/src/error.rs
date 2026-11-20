@@ -319,6 +319,16 @@ fn provider_error_metadata(error: &LLMErrorPayload) -> (Option<ProviderErrorKind
 
 impl AgentError {
     #[cfg(feature = "remote")]
+    pub(crate) fn is_acp_mesh_access_denied(error: &AcpError) -> bool {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str)
+            == Some("mesh_access_denied")
+    }
+
+    #[cfg(feature = "remote")]
     pub(crate) fn from_sharing_ask(
         error: querymt_remote::request_timeout::SharingAskError<Self>,
     ) -> Self {

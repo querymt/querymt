@@ -924,10 +924,8 @@ mod remote_impl {
                 return SessionHandoff::no_attach_path();
             }
 
-            if let Some(router) = self.mesh.as_ref().and_then(MeshHandle::inbound_router) {
-                crate::agent::remote::remote_actor_impl::register_session_history(
-                    router, &actor_ref,
-                );
+            if let Some(mesh) = &self.mesh {
+                crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor_ref);
             }
             match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
                 .catch_unwind()

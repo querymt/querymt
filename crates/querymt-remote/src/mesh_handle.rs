@@ -154,6 +154,14 @@ impl MeshHandle {
         self.policy.as_ref().map(|policy| &policy.store)
     }
 
+    /// An outbound handle that can be retained by a registered ingress handler
+    /// without keeping the ingress router alive through a reference cycle.
+    pub fn sharing_egress(&self) -> Self {
+        let mut egress = self.clone();
+        egress.policy = None;
+        egress
+    }
+
     /// Probe the remote transport without performing a protected operation.
     /// Once a peer has negotiated v1 it cannot silently downgrade in this runtime.
     pub async fn sharing_protocol(

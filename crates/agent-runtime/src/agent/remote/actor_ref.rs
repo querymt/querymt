@@ -171,13 +171,13 @@ impl SessionActorRef {
         }
     }
 
+    pub(crate) fn uses_guarded_mesh(&self) -> bool {
+        matches!(self, Self::Remote { mesh: Some(mesh), .. } if mesh.inbound_router().is_some())
+    }
+
     /// Check the current grant without transferring history before serving a cached read.
     pub(crate) async fn check_history_access(&self) -> Result<(), AgentError> {
-        if let Self::Remote {
-            mesh: Some(mesh), ..
-        } = self
-            && mesh.inbound_router().is_some()
-        {
+        if self.uses_guarded_mesh() {
             self.get_event_stream_since(Some(i64::MAX), 1).await?;
         }
         Ok(())
@@ -1325,18 +1325,16 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "SubscribeEvents timed out on remote session",
-                    ))
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => Self::read_remote(
+                mesh.as_deref(),
+                actor_ref,
+                &message,
+                Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+            )
+            .await
+            .map_err(AcpError::from),
         }
     }
 
@@ -1385,21 +1383,19 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::UnsubscribeEvents {
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => Self::read_remote(
+                mesh.as_deref(),
+                actor_ref,
+                &messages::UnsubscribeEvents {
                     relay_actor_id,
                     relay_dht_name,
-                })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "UnsubscribeEvents timed out on remote session",
-                    ))
-                }),
+                },
+                Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+            )
+            .await
+            .map_err(AcpError::from),
         }
     }
 

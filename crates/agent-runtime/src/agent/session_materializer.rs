@@ -1504,12 +1504,10 @@ impl SessionMaterializer {
             && let Some(mesh) = self.mesh()
         {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
-            if let Some(router) = mesh.inbound_router() {
-                crate::agent::remote::remote_actor_impl::register_session_history(
-                    router,
-                    &prepared.actor_ref,
-                );
-            }
+            crate::agent::remote::remote_actor_impl::register_session_routes(
+                &mesh,
+                &prepared.actor_ref,
+            );
             for scope in runtime.active_scopes() {
                 let dht_name = scoped_session(&scope, &prepared.session_id);
                 let runtime = runtime.clone();

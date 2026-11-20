@@ -1886,99 +1886,174 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
     ) -> Self::Reply {
         #[cfg(feature = "remote")]
         {
-            use crate::agent::remote::event_forwarder::EventForwarder;
-            use crate::agent::remote::event_relay::EventRelayActor;
-
-            // Unsubscribe identifies a relay by sequence ID and peer-scoped name.
-            let relay_name = msg
-                .relay_dht_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| {
-                    AgentError::RemoteActor(
-                        "SubscribeEvents requires a non-empty relay_dht_name for unsubscribe identity"
-                            .to_string(),
-                    )
-                })?;
-            let relay_source = if msg.relay_ref.is_some() {
-                "direct"
-            } else {
-                "dht"
-            };
-            let relay_ref = if let Some(relay_ref) = msg.relay_ref {
-                relay_ref
-            } else {
-                let mesh = self.mesh.as_ref().ok_or(AgentError::MeshNotBootstrapped)?;
-                mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
-                    .await
-                    .map_err(|error| AgentError::SwarmLookupFailed {
-                        key: relay_name.to_string(),
-                        reason: error.to_string(),
-                    })?
-                    .ok_or_else(|| {
-                        AgentError::RemoteActor(format!(
-                            "event relay '{relay_name}' is not available"
-                        ))
-                    })?
-            };
-
-            let relay_id = relay_ref.id();
-            if let Some((_, prev_handle)) = self.relay_forwarder_handles.remove(&relay_id) {
-                prev_handle.abort();
-                log::debug!(
-                    "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
-                    self.session_id,
-                    msg.relay_actor_id
-                );
-            }
-
-            let fanout = self.config.event_sink.fanout().clone();
-            let handle = EventForwarder::start(
-                fanout,
-                relay_ref,
-                format!("session:{}", self.session_id),
-                self.session_id.clone(),
-            );
-            self.relay_forwarder_handles
-                .insert(relay_id, (msg.relay_dht_name, handle));
-
-            // Re-emit readiness if indexing completed before the live path existed.
-            if let Some(workspace) = self.runtime.workspace_handle.get()
-                && let Some(index) = workspace.file_index()
-                && let Err(e) = self
-                    .config
-                    .emit_event_persisted(
-                        &self.session_id,
-                        querymt_agent_core::events::AgentEventKind::WorkspaceIndexReady {
-                            workspace_root: index.root.display().to_string(),
-                        },
-                    )
-                    .await
-            {
-                warn!(
-                    "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
-                    self.session_id, e
-                );
-            }
-
-            log::debug!(
-                "Session {}: SubscribeEvents installed EventForwarder via {} (relay_actor_id={})",
-                self.session_id,
-                relay_source,
-                msg.relay_actor_id,
-            );
-            Ok(())
+            self.install_event_subscription(msg, None).await
         }
 
         #[cfg(not(feature = "remote"))]
         {
             let _ = msg;
-            info!(
-                "Session {}: SubscribeEvents ignored (remote feature not enabled)",
-                self.session_id
-            );
             Ok(())
         }
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct SubscribePeerEvents {
+    pub(crate) message: SubscribeEvents,
+    pub(crate) subscriber: crate::agent::remote::event_forwarder::PeerSubscription,
+}
+
+#[cfg(feature = "remote")]
+impl Message<SubscribePeerEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: SubscribePeerEvents,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.install_event_subscription(msg.message, Some(msg.subscriber))
+            .await
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct UnsubscribePeerEvents {
+    pub(crate) message: UnsubscribeEvents,
+    pub(crate) peer: libp2p::PeerId,
+}
+
+#[cfg(feature = "remote")]
+impl Message<UnsubscribePeerEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: UnsubscribePeerEvents,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let id = kameo::actor::ActorId::new_with_peer_id(msg.message.relay_actor_id, msg.peer);
+        if self
+            .relay_forwarder_handles
+            .get(&id)
+            .is_some_and(|(name, _)| name.as_deref() == Some(msg.message.relay_dht_name.as_str()))
+        {
+            self.relay_forwarder_handles.remove(&id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "remote")]
+impl SessionActor {
+    async fn install_event_subscription(
+        &mut self,
+        msg: SubscribeEvents,
+        subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
+    ) -> Result<(), AgentError> {
+        use crate::agent::remote::event_forwarder::EventForwarder;
+        use crate::agent::remote::event_relay::EventRelayActor;
+
+        // Unsubscribe identifies a relay by sequence ID and peer-scoped name.
+        let relay_name = msg
+            .relay_dht_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                AgentError::RemoteActor(
+                    "SubscribeEvents requires a non-empty relay_dht_name for unsubscribe identity"
+                        .to_string(),
+                )
+            })?;
+        let relay_source = if msg.relay_ref.is_some() {
+            "direct"
+        } else {
+            "dht"
+        };
+        let relay_ref = if let Some(relay_ref) = msg.relay_ref {
+            relay_ref
+        } else {
+            let mesh = subscriber
+                .as_ref()
+                .map(|subscriber| &subscriber.egress)
+                .or(self.mesh.as_ref())
+                .ok_or(AgentError::MeshNotBootstrapped)?;
+            mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
+                .await
+                .map_err(|error| AgentError::SwarmLookupFailed {
+                    key: relay_name.to_string(),
+                    reason: error.to_string(),
+                })?
+                .ok_or_else(|| {
+                    AgentError::RemoteActor(format!("event relay '{relay_name}' is not available"))
+                })?
+        };
+
+        let relay_id = relay_ref.id();
+        if let Some(subscriber) = &subscriber
+            && (relay_id.sequence_id() != msg.relay_actor_id
+                || relay_id.peer_id() != Some(subscriber.origin.key().peer.as_peer_id())
+                || !subscriber.is_current().await)
+        {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        if let Some((_, prev_handle)) = self.relay_forwarder_handles.remove(&relay_id) {
+            prev_handle.abort();
+            log::debug!(
+                "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
+                self.session_id,
+                msg.relay_actor_id
+            );
+        }
+
+        let fanout = self.config.event_sink.fanout().clone();
+        let guarded = subscriber.is_some();
+        let handle = if guarded {
+            EventForwarder::start_with_policy(
+                fanout,
+                relay_ref,
+                format!("session:{}", self.session_id),
+                self.session_id.clone(),
+                subscriber,
+            )
+        } else {
+            EventForwarder::start(
+                fanout,
+                relay_ref,
+                format!("session:{}", self.session_id),
+                self.session_id.clone(),
+            )
+        };
+        self.relay_forwarder_handles
+            .insert(relay_id, (msg.relay_dht_name, handle));
+
+        // Re-emit readiness if indexing completed before the live path existed.
+        if !guarded
+            && let Some(workspace) = self.runtime.workspace_handle.get()
+            && let Some(index) = workspace.file_index()
+            && let Err(e) = self
+                .config
+                .emit_event_persisted(
+                    &self.session_id,
+                    querymt_agent_core::events::AgentEventKind::WorkspaceIndexReady {
+                        workspace_root: index.root.display().to_string(),
+                    },
+                )
+                .await
+        {
+            warn!(
+                "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
+                self.session_id, e
+            );
+        }
+
+        log::debug!(
+            "Session {}: SubscribeEvents installed EventForwarder via {} (relay_actor_id={})",
+            self.session_id,
+            relay_source,
+            msg.relay_actor_id,
+        );
+        Ok(())
     }
 }
 
