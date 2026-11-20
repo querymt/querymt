@@ -33,7 +33,7 @@ pub trait QuotaStore: GrantStore {
         now: i64,
     ) -> Result<Uuid, QuotaError>;
 
-    /// Check the current grant and atomically reserve every applicable finite scope.
+    /// Require the initiating grant revision and atomically reserve all applicable finite scopes.
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError>;
 
     /// Mark the attempt may-have-dispatched before issuing any upstream request.

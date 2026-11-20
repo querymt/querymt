@@ -261,7 +261,8 @@ impl GuardedProvider {
         call: &ChatCall<'_>,
         request_id: Uuid,
     ) -> Result<(Arc<dyn querymt::LLMProvider>, ReservationId), RemoteProviderHostError> {
-        self.binding(peer, &request.provider_name, &request.model)
+        let grant = self
+            .binding(peer, &request.provider_name, &request.model)
             .await?;
         let bound_tokens = self.backend.quota_bound(&request, call);
         let now = SystemTime::now()
@@ -273,6 +274,7 @@ impl GuardedProvider {
             .store
             .reserve(QuotaAttempt {
                 peer: peer.key().clone(),
+                grant_revision: grant.revision,
                 protocol: peer.protocol(),
                 provider_id: request.provider_name.clone(),
                 model_id: request.model.clone(),

@@ -404,7 +404,9 @@ impl QuotaStore for SqliteMeshAccess {
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let grant = load_grant(&tx, &attempt.peer)?;
-            if !grant.grant.allows_model(attempt.protocol, &attempt.provider_id, &attempt.model_id) {
+            if grant.revision != attempt.grant_revision
+                || !grant.grant.allows_model(attempt.protocol, &attempt.provider_id, &attempt.model_id)
+            {
                 return Err(QuotaError::Denied);
             }
             let host = attempt.peer.host.to_string();

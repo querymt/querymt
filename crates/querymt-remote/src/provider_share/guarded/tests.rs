@@ -78,7 +78,10 @@ impl QuotaStore for Store {
         unreachable!("fixture has immutable caps")
     }
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
-        assert!(self.grants.lock().contains_key(&attempt.peer));
+        assert_eq!(
+            self.grants.lock()[&attempt.peer].revision,
+            attempt.grant_revision
+        );
         assert_eq!(attempt.provider_id, "fixture");
         assert_eq!(attempt.model_id, "allowed");
         assert_eq!(attempt.bound_tokens, Some(25));

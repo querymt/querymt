@@ -64,9 +64,10 @@ impl Fixture {
         .unwrap();
     }
 
-    fn request(&self, model: &str, tokens: Option<i64>, now: i64) -> QuotaAttempt {
+    async fn request(&self, model: &str, tokens: Option<i64>, now: i64) -> QuotaAttempt {
         QuotaAttempt {
             peer: self.key.clone(),
+            grant_revision: self.store.grant(&self.key).await.unwrap().revision,
             protocol: SharingProtocol::V1,
             provider_id: "provider".into(),
             model_id: model.into(),
@@ -99,8 +100,8 @@ async fn concurrent_requests_cannot_overcommit_quota() {
     f.limit(&b, 100, QuotaWindow::Weekly).await;
     let second = SqliteMeshAccess::open(&f.path).await.unwrap();
     let (res_a, res_b) = tokio::join!(
-        f.store.reserve(f.request("a", Some(60), TUESDAY)),
-        second.reserve(f.request("b", Some(60), TUESDAY))
+        f.store.reserve(f.request("a", Some(60), TUESDAY).await),
+        second.reserve(f.request("b", Some(60), TUESDAY).await)
     );
     let (rejected, rejected_scope) = match (res_a, res_b) {
         (Ok(_), Err(error)) => (error, b),
@@ -120,16 +121,16 @@ async fn provider_and_model_limits_are_independently_binding() {
     let model = scope(Some("a"));
     f.limit(&model, 10, QuotaWindow::Daily).await;
     assert!(
-        matches!(f.store.reserve(f.request("a", Some(11), TUESDAY)).await,
+        matches!(f.store.reserve(f.request("a", Some(11), TUESDAY).await).await,
         Err(QuotaError::Exhausted(ref scopes)) if scopes == &[LimitingQuota { scope: model, available_tokens: 10, next_reset_at: Some(WEDNESDAY) }])
     );
     assert!(matches!(
-        f.store.reserve(f.request("a", None, TUESDAY)).await,
+        f.store.reserve(f.request("a", None, TUESDAY).await).await,
         Err(QuotaError::Unsupported(_))
     ));
     let unlimited = f
         .store
-        .reserve(f.request("b", None, TUESDAY))
+        .reserve(f.request("b", None, TUESDAY).await)
         .await
         .unwrap();
     f.store.mark_dispatched(unlimited).await.unwrap();
@@ -163,7 +164,7 @@ async fn recurring_windows_renew_at_utc_calendar_boundaries() {
     );
     let attempt = f
         .store
-        .reserve(f.request("daily", Some(20), TUESDAY))
+        .reserve(f.request("daily", Some(20), TUESDAY).await)
         .await
         .unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
@@ -214,7 +215,7 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
     let model = scope(Some("a"));
     f.limit(&provider, 30, QuotaWindow::Weekly).await;
     f.limit(&model, 10, QuotaWindow::Daily).await;
-    let req = f.request("a", Some(10), TUESDAY);
+    let req = f.request("a", Some(10), TUESDAY).await;
     let attempt = f.store.reserve(req.clone()).await.unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
     assert_eq!(f.status(&model, WEDNESDAY).await.available_tokens, Some(10));
@@ -246,18 +247,51 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
 }
 
 #[tokio::test]
+async fn a_stale_authorization_cannot_reserve_under_a_regrant() {
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    f.limit(&provider, 20, QuotaWindow::Weekly).await;
+    let stale = f.request("a", Some(15), TUESDAY).await;
+    let revoked = f
+        .store
+        .replace_grant(&f.key, stale.grant_revision, PeerGrant::None)
+        .await
+        .unwrap();
+    let regranted = f
+        .store
+        .replace_grant(&f.key, revoked.revision, f.grant.clone())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        f.store.reserve(stale.clone()).await,
+        Err(QuotaError::Denied)
+    ));
+    let status = f.store.quota(&f.key, &provider, TUESDAY).await.unwrap();
+    assert_eq!(status.reserved_tokens, 0);
+    // No attempt or replay tombstone was created for the rejected reservation.
+    f.store
+        .reserve(QuotaAttempt {
+            grant_revision: regranted.revision,
+            ..stale
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn restart_and_regrant_do_not_top_up_an_allowance() {
     let f = Fixture::new().await;
     let provider = scope(None);
     f.limit(&provider, 20, QuotaWindow::Weekly).await;
     let pending = f
         .store
-        .reserve(f.request("a", Some(5), TUESDAY))
+        .reserve(f.request("a", Some(5), TUESDAY).await)
         .await
         .unwrap();
     let dispatched = f
         .store
-        .reserve(f.request("b", Some(10), TUESDAY))
+        .reserve(f.request("b", Some(10), TUESDAY).await)
         .await
         .unwrap();
     f.store.mark_dispatched(dispatched).await.unwrap();
@@ -273,7 +307,9 @@ async fn restart_and_regrant_do_not_top_up_an_allowance() {
         .await
         .unwrap();
     assert!(matches!(
-        reopened.reserve(f.request("b", Some(1), TUESDAY)).await,
+        reopened
+            .reserve(f.request("b", Some(1), TUESDAY).await)
+            .await,
         Err(QuotaError::Denied)
     ));
     reopened
@@ -295,7 +331,7 @@ async fn reset_waits_for_outstanding_attempts() {
     f.limit(&model, 25, QuotaWindow::Daily).await;
     let attempt = f
         .store
-        .reserve(f.request("a", Some(15), TUESDAY))
+        .reserve(f.request("a", Some(15), TUESDAY).await)
         .await
         .unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
@@ -346,12 +382,12 @@ async fn records_actual_usage_and_suspends_finite_binding_on_bound_violation() {
     f.limit(&provider, 100, QuotaWindow::Weekly).await;
     let attempt = f
         .store
-        .reserve(f.request("a", Some(5), TUESDAY))
+        .reserve(f.request("a", Some(5), TUESDAY).await)
         .await
         .unwrap();
     let waiting = f
         .store
-        .reserve(f.request("a", Some(5), TUESDAY))
+        .reserve(f.request("a", Some(5), TUESDAY).await)
         .await
         .unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
@@ -369,12 +405,14 @@ async fn records_actual_usage_and_suspends_finite_binding_on_bound_violation() {
     f.store.release_unused(waiting).await.unwrap();
     assert_eq!(f.status(&provider, TUESDAY).await.known_tokens, 8);
     assert!(matches!(
-        f.store.reserve(f.request("a", Some(5), TUESDAY)).await,
+        f.store
+            .reserve(f.request("a", Some(5), TUESDAY).await)
+            .await,
         Err(QuotaError::Unsupported(_))
     ));
     assert!(
         f.store
-            .reserve(f.request("b", Some(5), TUESDAY))
+            .reserve(f.request("b", Some(5), TUESDAY).await)
             .await
             .is_ok()
     );
@@ -387,7 +425,7 @@ async fn revocation_invalidates_reserved_but_undispatched_attempt() {
     f.limit(&provider, 100, QuotaWindow::Weekly).await;
     let pending = f
         .store
-        .reserve(f.request("a", Some(60), TUESDAY))
+        .reserve(f.request("a", Some(60), TUESDAY).await)
         .await
         .unwrap();
     let revision = f.store.grant(&f.key).await.unwrap().revision;
