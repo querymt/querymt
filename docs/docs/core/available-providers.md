@@ -465,6 +465,7 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `tensor_split` | float[] | Relative share of the model per device, in `devices` order (`[3, 1]` = 75% / 25%). Unset = proportional to free memory |
 | `split_mode` | string | `"none"` \| `"layer"` (llama.cpp default) \| `"row"` \| `"tensor"` (experimental) |
 | `main_gpu` | integer | Index into `devices` of the GPU used for the whole model (`split_mode = "none"`) or intermediate results (`"row"`). Default `0` |
+| `lora` | table[] | LoRA adapter applied on top of `model`: `[{ path = "...", scale = 1.0 }]`. At most one adapter. See [LoRA adapters](#lora-adapters) |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
 | `grammar_backend` | string | `"llguidance"` (default) \| `"gbnf"`. Engine that enforces tool-call grammars; see [Tool-call grammars](#tool-call-grammars) |
 
@@ -486,6 +487,27 @@ tensor_split = [3, 1]        # 75% of the model on CUDA0, 25% on CUDA1
 - Changing any placement option reloads the model instead of reusing the cached one.
 - An MTP `speculative` sidecar model is never split: it loads on a single device from the same `devices` list, chosen by `speculative.main_gpu` (default: the target's `main_gpu`). Bundled MTP tensors follow the target model's placement.
 - The startup memory advisory estimates against a single GPU, so it can over-warn for split setups.
+
+#### LoRA adapters
+
+Run a fine-tune without merging it into a full model copy. The adapter is a GGUF LoRA file, loaded once with the base model and applied to every generation:
+
+```toml
+[providers.config]
+model = "/models/base.gguf"
+lora = [{ path = "/models/style-lora.gguf", scale = 0.8 }]
+```
+
+- `path` is a local GGUF path or a Hugging Face `<repo>:<selector>` reference, resolved like `model`. A repo without a selector is rejected.
+- `scale` is any finite number. It defaults to `1`, `0` keeps the adapter loaded but does not apply it (output matches the base model), and negative values are allowed. `nan` and `inf` are rejected. Unknown keys inside an entry are rejected.
+- Only **one** adapter is supported per provider. The option is a list so the limit can be lifted later without changing the config shape; two or more entries fail configuration.
+- Adapters must be GGUF. Convert PEFT/safetensors adapters with llama.cpp's `convert_lora_to_gguf.py`.
+- Entries are validated before the base model is loaded or downloaded. An adapter that does not match the base model (different architecture or tensor shapes, or a file that is not a LoRA adapter) fails configuration with an error naming `lora[0].path`.
+- Changing the adapter **path** reloads the model. Changing only the `scale` reuses the loaded model, so delegates that share a model can use different scales.
+- The adapter applies to chat, streaming, completion, tool-call and multimodal generation, and to the target model of speculative (MTP) decoding.
+- The MTP draft model and the multimodal projector do not receive the adapter, so draft acceptance can drop with an adapter; output stays correct because the target verifies every draft token.
+- Activated LoRA (aLoRA) files are applied as plain LoRA, without invocation-token handling.
+- Adapter memory is not counted in the startup memory advisory.
 
 #### Tool-call grammars
 

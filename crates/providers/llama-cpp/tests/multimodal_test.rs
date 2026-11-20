@@ -59,43 +59,7 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         n_ctx: Some(4096),
         n_gpu_layers: Some(0),
         max_tokens: Some(100),
-        temperature: None,
-        top_p: None,
-        min_p: None,
-        top_k: None,
-        repeat_penalty: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        penalty_last_n: None,
-        system: vec![],
-        n_batch: None,
-        n_threads: None,
-        n_threads_batch: None,
-        seed: None,
-        chat_template: None,
-        use_chat_template: None,
-        add_bos: None,
-        log: None,
-        enable_thinking: None,
-        reasoning_effort: None,
-        preserve_reasoning: None,
-        thinking_budget: None,
-        flash_attention: None,
-        kv_cache_type_k: None,
-        kv_cache_type_v: None,
-        media_marker: None,
-        mmproj_threads: None,
-        mmproj_use_gpu: None,
-        n_ubatch: None,
-        text_only: None,
-        speculative: None,
-        backend_sampling: None,
-        json_schema: None,
-        grammar_backend: None,
-        devices: None,
-        tensor_split: None,
-        split_mode: None,
-        main_gpu: None,
+        ..Default::default()
     };
     create_provider(cfg).expect("Failed to create provider")
 }
@@ -306,10 +270,7 @@ async fn test_text_only_with_vision_model() {
 
     assert!(!text.is_empty(), "Should get text response");
     assert!(
-        response
-            .usage
-            .as_ref()
-            .map_or(false, |u| u.output_tokens > 0),
+        response.usage.as_ref().is_some_and(|u| u.output_tokens > 0),
         "Should generate tokens"
     );
 
@@ -327,40 +288,7 @@ fn test_config_with_multimodal_fields() {
         n_ctx: Some(8192),
         n_gpu_layers: Some(33),
         max_tokens: Some(512),
-        temperature: None,
-        top_p: None,
-        min_p: None,
-        top_k: None,
-        repeat_penalty: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        penalty_last_n: None,
-        system: vec![],
-        n_batch: None,
-        n_threads: None,
-        n_threads_batch: None,
-        seed: None,
-        chat_template: None,
-        use_chat_template: None,
-        add_bos: None,
-        log: None,
-        enable_thinking: None,
-        reasoning_effort: None,
-        preserve_reasoning: None,
-        thinking_budget: None,
-        flash_attention: None,
-        kv_cache_type_k: None,
-        kv_cache_type_v: None,
-        n_ubatch: None,
-        text_only: None,
-        speculative: None,
-        backend_sampling: None,
-        json_schema: None,
-        grammar_backend: None,
-        devices: None,
-        tensor_split: None,
-        split_mode: None,
-        main_gpu: None,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&config).expect("serialize");

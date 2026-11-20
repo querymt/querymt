@@ -385,6 +385,20 @@ pub(crate) const MTP_MODEL: HfFile = HfFile {
     file: "Qwen3.5-0.8B-Q4_0.gguf",
 };
 
+/// Base model of llama.cpp's own LoRA test pair (`tools/server/tests/unit/test_lora.py`).
+pub(crate) const LORA_BASE_MODEL: HfFile = HfFile {
+    repo: "ggml-org-dev/stories15M_MOE",
+    rev: "b79d85fd44cb281d525c0f75e79b522b9fdf714b",
+    file: "stories15M_MOE-F16.gguf",
+};
+
+/// The LoRA adapter that matches [`LORA_BASE_MODEL`].
+pub(crate) const LORA_ADAPTER: HfFile = HfFile {
+    repo: "ggml-org-dev/stories15M_MOE",
+    rev: "b79d85fd44cb281d525c0f75e79b522b9fdf714b",
+    file: "moe_shakespeare15M.gguf",
+};
+
 /// Whole model file (521 MB for [`MTP_MODEL`]), cached next to the vocabularies.
 pub(crate) fn ensure_full_model(hf: &HfFile) -> Result<PathBuf, VocabError> {
     let dir = cache_dir();

@@ -2,30 +2,31 @@ use crate::chat_format::parse_assistant_format_with_tools;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::generation::decode_token_piece;
-use crate::multimodal::MultimodalContext;
+use crate::lora::Models;
+use crate::multimodal::MediaInputs;
 use crate::response::{GeneratedText, GenerationTermination};
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
 use querymt_utils::str_utils::{truncate_str, truncate_str_tail};
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// Generate text with grammar-constrained sampling for tool calls.
 pub(crate) fn generate_with_tools(
-    model: &Arc<LlamaModel>,
+    models: Models<'_>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
-    mm_ctx: Option<&MultimodalContext>,
-    bitmaps: &[MtmdBitmap],
+    media: MediaInputs<'_>,
 ) -> Result<GeneratedText, LLMError> {
+    let model = models.target;
+    let MediaInputs {
+        ctx: mm_ctx,
+        bitmaps,
+    } = media;
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
         let sampler = if let Some(schema) = cfg.structured_schema() {
@@ -49,8 +50,7 @@ pub(crate) fn generate_with_tools(
             }
         }
         let stats = crate::mtp::run_mtp(
-            model,
-            mtp_model,
+            models,
             cfg,
             &result.prompt,
             max_tokens,
@@ -87,8 +87,7 @@ pub(crate) fn generate_with_tools(
             termination: stats.termination,
         });
     }
-    let mut state =
-        prefill_for_tool_generation(model, cfg, &result.prompt, max_tokens, mm_ctx, bitmaps)?;
+    let mut state = prefill_for_tool_generation(models, cfg, &result.prompt, max_tokens, media)?;
 
     log::debug!(
         "Generating with tools: input_tokens={}, max_tokens={}, has_multimodal={}",
@@ -258,21 +257,21 @@ pub(crate) fn generate_with_tools(
     })
 }
 
+/// Parsed assistant output: content, thinking, tool calls and finish reason.
+type ParsedToolResponse = (
+    String,
+    Option<String>,
+    Option<Vec<querymt::ToolCall>>,
+    querymt::chat::FinishReason,
+);
+
 /// Parse the generated response using the ChatTemplateResult to extract tool calls.
 ///
 /// Returns (content, thinking, tool_calls, finish_reason).
 pub(crate) fn parse_tool_response(
     result: &ChatTemplateResult,
     text: &str,
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<Vec<querymt::ToolCall>>,
-        querymt::chat::FinishReason,
-    ),
-    LLMError,
-> {
+) -> Result<ParsedToolResponse, LLMError> {
     log::debug!("Parsing tool response: text_len={}", text.len());
     log::debug!("Raw generated text: {}", text);
 
@@ -294,15 +293,7 @@ fn extract_parsed_response(
     reasoning_format: crate::common_chat::ReasoningFormat,
     starts_in_thinking: bool,
     tools: &[querymt::chat::Tool],
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<Vec<querymt::ToolCall>>,
-        querymt::chat::FinishReason,
-    ),
-    LLMError,
-> {
+) -> Result<ParsedToolResponse, LLMError> {
     let parsed =
         parse_assistant_format_with_tools(text, reasoning_format, starts_in_thinking, tools);
     let finish_reason = if parsed.tool_calls.is_some() {

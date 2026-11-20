@@ -1,6 +1,6 @@
 use querymt::chat::ReasoningEffort;
 use querymt::chat::{GenerationOptions, StructuredOutputFormat};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 /// Default maximum tokens to generate when not specified.
@@ -11,7 +11,7 @@ pub(crate) const LLAMA_FLASH_ATTN_TYPE_AUTO: i32 = -1;
 pub(crate) const LLAMA_FLASH_ATTN_TYPE_DISABLED: i32 = 0;
 pub(crate) const LLAMA_FLASH_ATTN_TYPE_ENABLED: i32 = 1;
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct LlamaCppConfig {
     /// Model reference. Supports local GGUF paths and Hugging Face refs `<repo>:<selector>`.
@@ -203,6 +203,174 @@ pub struct LlamaCppConfig {
     /// model (`split_mode = none`) or for intermediate results (`row`).
     /// Defaults to 0.
     pub main_gpu: Option<u32>,
+    /// LoRA adapters applied on top of `model`. At most one adapter is
+    /// supported. Omit or leave empty to run the base model.
+    ///
+    /// Changing the adapter paths reloads the model; changing a `scale` does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lora: Vec<LoraAdapterConfig>,
+}
+
+/// Strength of a LoRA adapter: any finite `f32`. `0` disables the adapter and
+/// negative values are allowed.
+///
+/// A `LoraScale` is always finite; the check runs on construction and while
+/// deserializing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Option<f32>", into = "f32")]
+pub struct LoraScale(f32);
+
+impl LoraScale {
+    /// Creates a scale from a finite value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoraScaleError`] when `value` is NaN or infinite.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use qmt_llama_cpp::LoraScale;
+    ///
+    /// # fn main() -> Result<(), qmt_llama_cpp::LoraScaleError> {
+    /// let scale = LoraScale::new(0.5)?;
+    /// assert_eq!(scale.get(), 0.5);
+    /// assert!(LoraScale::new(f32::NAN).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub const fn new(value: f32) -> Result<Self, LoraScaleError> {
+        if value.is_finite() {
+            Ok(Self(value))
+        } else {
+            Err(LoraScaleError { value: Some(value) })
+        }
+    }
+
+    /// Returns the scale as an `f32`.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+
+    /// Returns `true` when the scale is zero, so the adapter is not applied.
+    #[must_use]
+    pub const fn is_disabled(self) -> bool {
+        // `0` is a user-written sentinel, not a computed value; `-0.0 == 0.0`.
+        self.0 == 0.0
+    }
+}
+
+impl Default for LoraScale {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl TryFrom<f32> for LoraScale {
+    type Error = LoraScaleError;
+
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// `None` stands for a JSON `null`, which is what a TOML `nan`/`inf` becomes
+/// once it reaches the provider as JSON.
+impl TryFrom<Option<f32>> for LoraScale {
+    type Error = LoraScaleError;
+
+    fn try_from(value: Option<f32>) -> Result<Self, Self::Error> {
+        value.map_or(Err(LoraScaleError { value: None }), Self::new)
+    }
+}
+
+impl From<LoraScale> for f32 {
+    fn from(scale: LoraScale) -> Self {
+        scale.get()
+    }
+}
+
+impl JsonSchema for LoraScale {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LoraScale".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "number",
+            "default": 1.0,
+            "description": "LoRA adapter strength: a finite number. 0 disables the adapter."
+        })
+    }
+}
+
+/// A LoRA scale that is not a finite number.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error(
+    "invalid LoRA scale {}: must be a finite number",
+    .value.map_or_else(|| "null".to_owned(), |v| v.to_string())
+)]
+pub struct LoraScaleError {
+    /// `None` when the input was `null`.
+    value: Option<f32>,
+}
+
+/// One LoRA adapter to load with the base model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct LoraAdapterConfig {
+    /// Local GGUF path or Hugging Face `<repo>:<selector>`, resolved like `model`.
+    pub path: String,
+    /// Adapter strength. Defaults to `1.0`; `0` keeps the adapter loaded but
+    /// does not apply it.
+    #[serde(default)]
+    pub scale: LoraScale,
+}
+
+impl LoraAdapterConfig {
+    /// Creates an adapter entry with the default scale of `1.0`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            scale: LoraScale::default(),
+        }
+    }
+
+    /// Sets the adapter strength.
+    #[must_use]
+    pub const fn with_scale(mut self, scale: LoraScale) -> Self {
+        self.scale = scale;
+        self
+    }
+}
+
+impl LlamaCppConfig {
+    /// Creates a config for `model` with every other option unset.
+    ///
+    /// Set options with struct-update syntax, which keeps working when new
+    /// options are added:
+    ///
+    /// ```
+    /// use qmt_llama_cpp::LlamaCppConfig;
+    ///
+    /// let cfg = LlamaCppConfig {
+    ///     n_ctx: Some(4096),
+    ///     max_tokens: Some(256),
+    ///     ..LlamaCppConfig::new("/models/base.gguf")
+    /// };
+    /// assert_eq!(cfg.model, "/models/base.gguf");
+    /// assert!(cfg.lora.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// How a model is distributed across devices. See [`LlamaCppConfig::split_mode`].
@@ -356,7 +524,73 @@ pub enum FlashAttentionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{GrammarBackend, SpeculativeConfig, SpeculativeType};
+    use super::{GrammarBackend, LlamaCppConfig, LoraScale, SpeculativeConfig, SpeculativeType};
+
+    fn parse_json(lora: &str) -> Result<LlamaCppConfig, serde_json::Error> {
+        serde_json::from_str(&format!(r#"{{"model": "m.gguf", "lora": {lora}}}"#))
+    }
+
+    /// Keep in sync with the "LoRA adapters" section of
+    /// `docs/docs/core/available-providers.md`.
+    const DOCUMENTED_LORA_EXAMPLE: &str = r#"
+model = "/models/base.gguf"
+lora = [{ path = "/models/style-lora.gguf", scale = 0.8 }]
+"#;
+
+    #[test]
+    fn documented_lora_example_parses() {
+        let cfg: LlamaCppConfig = toml::from_str(DOCUMENTED_LORA_EXAMPLE).unwrap();
+        assert_eq!(cfg.lora.len(), 1);
+        assert_eq!(cfg.lora[0].path, "/models/style-lora.gguf");
+        assert_eq!(cfg.lora[0].scale.get(), 0.8);
+        let docs = include_str!("../../../../docs/docs/core/available-providers.md");
+        assert!(
+            docs.contains(r#"lora = [{ path = "/models/style-lora.gguf", scale = 0.8 }]"#),
+            "the docs example drifted from DOCUMENTED_LORA_EXAMPLE"
+        );
+    }
+
+    #[test]
+    fn lora_omitted_keeps_the_base_model() {
+        let cfg: LlamaCppConfig = serde_json::from_str(r#"{"model": "m.gguf"}"#).unwrap();
+        assert!(cfg.lora.is_empty());
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("lora").is_none(), "empty lora must be omitted");
+    }
+
+    #[test]
+    fn adapter_scale_defaults_to_one() {
+        let cfg = parse_json(r#"[{"path": "/models/style.gguf"}]"#).unwrap();
+        assert_eq!(cfg.lora[0].scale.get(), 1.0);
+        let cfg = parse_json(r#"[{"path": "/models/style.gguf", "scale": -0.5}]"#).unwrap();
+        assert_eq!(cfg.lora[0].scale.get(), -0.5);
+    }
+
+    #[test]
+    fn unknown_adapter_key_rejected() {
+        let err = parse_json(r#"[{"path": "/models/style.gguf", "weight": 0.5}]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weight"), "{err}");
+    }
+
+    #[test]
+    fn non_finite_adapter_scale_rejected() {
+        for literal in ["nan", "inf", "-inf"] {
+            let src = format!(
+                "model = \"m.gguf\"\nlora = [{{ path = \"/models/style.gguf\", scale = {literal} }}]"
+            );
+            let err = toml::from_str::<LlamaCppConfig>(&src)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be a finite number"), "{literal}: {err}");
+        }
+        let err = parse_json(r#"[{"path": "/models/style.gguf", "scale": null}]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a finite number"), "{err}");
+        assert!(LoraScale::new(f32::NAN).is_err());
+    }
 
     #[test]
     fn grammar_backend_rejects_unknown_value() {

@@ -316,14 +316,11 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             // template-less prompt building.
             if let Some(output) = msg.output() {
                 for item in &output.items {
-                    match item {
-                        ChatOutputItem::FunctionCall(call) => {
-                            builder = builder.text(format!(
-                                "[ToolUse: {} ({}) args={}]",
-                                call.name, call.call_id, call.arguments
-                            ));
-                        }
-                        _ => {}
+                    if let ChatOutputItem::FunctionCall(call) = item {
+                        builder = builder.text(format!(
+                            "[ToolUse: {} ({}) args={}]",
+                            call.name, call.call_id, call.arguments
+                        ));
                     }
                 }
             }
@@ -356,7 +353,7 @@ mod tests {
             arguments: serde_json::Value,
         },
         Image(String, Vec<u8>),
-        ImageUrl(String),
+        ImageUrl,
         ToolResult {
             id: String,
             name: Option<String>,
@@ -373,8 +370,8 @@ mod tests {
         Block::Image(mime.to_string(), data)
     }
 
-    fn image_url(url: &str) -> Block {
-        Block::ImageUrl(url.to_string())
+    fn image_url() -> Block {
+        Block::ImageUrl
     }
 
     fn thinking(s: &str) -> Block {
@@ -423,47 +420,7 @@ mod tests {
     fn test_config() -> LlamaCppConfig {
         LlamaCppConfig {
             model: "test.gguf".to_string(),
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            min_p: None,
-            top_k: None,
-            repeat_penalty: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            penalty_last_n: None,
-            system: vec![],
-            n_ctx: None,
-            n_batch: None,
-            n_threads: None,
-            n_threads_batch: None,
-            n_gpu_layers: None,
-            seed: None,
-            chat_template: None,
-            use_chat_template: None,
-            add_bos: None,
-            log: None,
-            enable_thinking: None,
-            reasoning_effort: None,
-            preserve_reasoning: None,
-            thinking_budget: None,
-            flash_attention: None,
-            kv_cache_type_k: None,
-            kv_cache_type_v: None,
-            mmproj_path: None,
-            media_marker: None,
-            mmproj_threads: None,
-            mmproj_use_gpu: None,
-            n_ubatch: None,
-            text_only: None,
-            speculative: None,
-            backend_sampling: None,
-            json_schema: None,
-            grammar_backend: None,
-            devices: None,
-            tensor_split: None,
-            split_mode: None,
-            main_gpu: None,
+            ..Default::default()
         }
     }
 
@@ -526,7 +483,7 @@ mod tests {
                     .collect();
                 Some(ChatInputPart::tool_result(result))
             }
-            Block::ImageUrl(_) | Block::Thinking(_) | Block::ToolUse { .. } => None,
+            Block::ImageUrl | Block::Thinking(_) | Block::ToolUse { .. } => None,
         }
     }
 
@@ -915,19 +872,16 @@ mod tests {
         // 1 tool message + 3 user marker messages
         assert_eq!(parsed.len(), 4);
         assert_eq!(parsed[0]["role"], "tool");
-        for i in 1..=3 {
-            assert_eq!(parsed[i]["role"], "user");
-            assert_eq!(parsed[i]["content"], "<M>");
+        for entry in &parsed[1..=3] {
+            assert_eq!(entry["role"], "user");
+            assert_eq!(entry["content"], "<M>");
         }
     }
 
     #[test]
     fn image_url_skipped_no_marker() {
         let cfg = test_config();
-        let messages = vec![user_msg(vec![
-            Block::ImageUrl("https://example.com/photo.jpg".to_string()),
-            text("What is this?"),
-        ])];
+        let messages = vec![user_msg(vec![Block::ImageUrl, text("What is this?")])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -944,7 +898,7 @@ mod tests {
         let messages = vec![user_msg(vec![named_tool_result(
             "call_1".to_string(),
             "tool",
-            vec![text("result"), image_url("https://example.com/img.png")],
+            vec![text("result"), image_url()],
         )])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();

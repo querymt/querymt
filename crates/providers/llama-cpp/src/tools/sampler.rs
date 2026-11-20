@@ -51,7 +51,7 @@ impl SamplingParams {
     /// allowed to kick in: if the user set *any* sampling parameter we must
     /// honour it rather than silently substituting defaults.
     pub(crate) fn is_explicit(&self) -> bool {
-        self.temperature.map_or(false, |t| t > 0.0)
+        self.temperature.is_some_and(|t| t > 0.0)
             || self.top_p.is_some()
             || self.top_k.is_some()
             || self.min_p.is_some()
@@ -1548,14 +1548,12 @@ mod grammar_tests {
                     .expect("template");
             assert!(result.grammar.is_some(), "{backend:?}: no tool grammar");
             let generated = crate::tools::generate_with_tools(
-                model,
+                provider.models(),
                 &cfg,
-                provider.mtp_model.as_ref(),
                 &result,
                 160,
                 None,
-                None,
-                &[],
+                crate::multimodal::MediaInputs::default(),
             )
             .expect("generate");
 
