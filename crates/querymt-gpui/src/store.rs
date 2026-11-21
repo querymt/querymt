@@ -1346,6 +1346,10 @@ pub struct Prefs {
     /// First-run setup finished or skipped.
     #[serde(default)]
     pub onboarding: setup::Onboarding,
+    /// Workspace folders saved on the Workspaces page, newest first: paths
+    /// on the machine where the agent runs.
+    #[serde(default)]
+    pub workspaces: Vec<String>,
 }
 
 impl Prefs {
@@ -2051,6 +2055,28 @@ impl AgentsStore {
         if self.prefs.schedule_timezone != zone {
             self.prefs.schedule_timezone = zone;
             self.save();
+        }
+    }
+
+    /// Save a workspace folder (already validated), first in the list.
+    /// Returns false when it was saved before.
+    pub fn add_workspace(&mut self, path: String, cx: &mut Context<Self>) -> bool {
+        if self.prefs.workspaces.contains(&path) {
+            return false;
+        }
+        self.prefs.workspaces.insert(0, path);
+        self.save();
+        cx.notify();
+        true
+    }
+
+    /// Forget a saved workspace; the folder itself is untouched.
+    pub fn remove_workspace(&mut self, path: &str, cx: &mut Context<Self>) {
+        let before = self.prefs.workspaces.len();
+        self.prefs.workspaces.retain(|w| w != path);
+        if self.prefs.workspaces.len() != before {
+            self.save();
+            cx.notify();
         }
     }
 

@@ -155,13 +155,30 @@ fn list_dirs(_base: &str) -> Vec<String> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn home_dir() -> Option<String> {
+pub(super) fn home_dir() -> Option<String> {
     dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 #[cfg(target_family = "wasm")]
-fn home_dir() -> Option<String> {
+pub(super) fn home_dir() -> Option<String> {
     None
+}
+
+/// The machine of `agent` (the primary agent when `None`) is this one, so
+/// its paths can be checked and completed on the local filesystem.
+pub(super) fn local_fs(store: &AgentsStore, agent: Option<&str>) -> bool {
+    if cfg!(target_family = "wasm") {
+        return false;
+    }
+    match agent
+        .map(str::to_owned)
+        .or_else(|| store.primary_agent())
+        .and_then(|a| store.config(&a))
+        .map(|c| &c.endpoint)
+    {
+        Some(Endpoint::WebSocket { address, .. }) => is_loopback(address),
+        Some(Endpoint::Process { .. }) | None => true,
+    }
 }
 
 /// A workspace path input with completion. Owns the completion state; the
@@ -252,24 +269,11 @@ impl WorkspaceField {
     /// The agent's machine is this one, so its paths can be completed from
     /// the local filesystem.
     fn local_fs(&self, cx: &App) -> bool {
-        if cfg!(target_family = "wasm") {
-            return false;
-        }
-        let store = self.store.read(cx);
-        match self
-            .agent
-            .clone()
-            .or_else(|| store.primary_agent())
-            .and_then(|a| store.config(&a))
-            .map(|c| &c.endpoint)
-        {
-            Some(Endpoint::WebSocket { address, .. }) => is_loopback(address),
-            Some(Endpoint::Process { .. }) | None => true,
-        }
+        local_fs(self.store.read(cx), self.agent.as_deref())
     }
 
-    /// Workspaces of the session list (local sessions, most recent first),
-    /// led by the last workspace used.
+    /// The last workspace used, saved workspaces, then those of the session
+    /// list (local sessions, most recent first).
     fn known_workspaces(&self, cx: &App) -> Vec<String> {
         let store = self.store.read(cx);
         let mut sessions: Vec<_> = store
@@ -280,8 +284,9 @@ impl WorkspaceField {
             .collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let mut out: Vec<String> = Vec::new();
-        for w in
-            std::iter::once(store.prefs.cwd.as_str()).chain(sessions.iter().map(|s| s.group_cwd()))
+        for w in std::iter::once(store.prefs.cwd.as_str())
+            .chain(store.prefs.workspaces.iter().map(String::as_str))
+            .chain(sessions.iter().map(|s| s.group_cwd()))
         {
             if !w.trim().is_empty() && !out.iter().any(|o| o == w) {
                 out.push(w.to_string());

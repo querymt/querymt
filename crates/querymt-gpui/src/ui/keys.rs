@@ -82,13 +82,14 @@ enum PaletteTarget {
     Session(Box<SessionSummary>),
 }
 
-const PAGES: [(Page, IconName, &str); 7] = [
+const PAGES: [(Page, IconName, &str); 8] = [
     (Page::Start, IconName::LayoutDashboard, "Start"),
     (Page::Inbox, IconName::Inbox, "Inbox"),
     (Page::Sessions, IconName::MessagesSquare, "Sessions"),
-    (Page::Automations, IconName::CalendarClock, "Automations"),
+    (Page::Workspaces, IconName::FolderOpen, "Workspaces"),
     (Page::Agents, IconName::Bot, "Agents"),
     (Page::Mesh, IconName::Network, "Mesh"),
+    (Page::Automations, IconName::CalendarClock, "Automations"),
     (Page::Settings, IconName::Settings, "Settings"),
 ];
 
