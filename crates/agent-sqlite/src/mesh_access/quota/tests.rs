@@ -620,3 +620,49 @@ async fn unlimited_unknown_usage_survives_reconfigure_only_in_its_original_perio
     assert!(!fresh.has_unknown_usage);
     assert!(fresh.next_reset_at.is_none());
 }
+
+#[tokio::test]
+async fn full_access_suspends_custom_limits_without_changing_their_balance() {
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    f.limit(&provider, 20, QuotaWindow::Manual).await;
+    let attempt = f
+        .store
+        .reserve(f.request("a", Some(20), TUESDAY).await)
+        .await
+        .unwrap();
+    f.store.mark_dispatched(attempt).await.unwrap();
+    f.store
+        .settle(attempt, AttemptUsage::Observed(20))
+        .await
+        .unwrap();
+    let exhausted = f.status(&provider, TUESDAY).await;
+    assert_eq!(exhausted.available_tokens, Some(0));
+    let revision = f.store.grant(&f.key).await.unwrap().revision;
+    let full = f
+        .store
+        .replace_grant(&f.key, revision, PeerGrant::Full)
+        .await
+        .unwrap();
+
+    let mut legacy = f.request("a", None, TUESDAY).await;
+    legacy.protocol = SharingProtocol::Legacy;
+    let attempt = f.store.reserve(legacy).await.unwrap();
+    f.store.mark_dispatched(attempt).await.unwrap();
+    f.store
+        .settle(attempt, AttemptUsage::Observed(500))
+        .await
+        .unwrap();
+    assert_eq!(f.status(&provider, TUESDAY).await, exhausted);
+    f.store
+        .replace_grant(&f.key, full.revision, f.grant.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .reserve(f.request("a", Some(1), TUESDAY).await)
+            .await,
+        Err(QuotaError::Exhausted(_))
+    ));
+    assert_eq!(f.status(&provider, TUESDAY).await, exhausted);
+}

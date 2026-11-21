@@ -472,6 +472,162 @@ mod access {
         assert!(peer_catalog_changed(&PeerGrant::Full, &old, &hidden));
     }
 
+    #[cfg(test)]
+    mod catalog_tests {
+        use super::*;
+        use crate::agent::remote::{RemoteNodeManager, node_manager::GetPeerSharing};
+        use crate::model_inventory::catalog_fixture::CatalogFixture;
+        use kameo::actor::Spawn;
+        use kameo::remote::{
+            RemoteActor, RemoteMessage,
+            messaging::{SwarmRequest, SwarmResponse},
+        };
+        use querymt_agent_sqlite::mesh_access::SqliteMeshAccess;
+        use querymt_remote::{
+            LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
+            mesh_ingress::{InboundRouter, MeshIngress},
+            peer_access::GrantStore,
+        };
+        use std::time::Duration;
+
+        async fn owner_access(handle: &LocalAgentHandle, peer: &NodeId) -> serde_json::Value {
+            let params = json!({"version": 1, "peer_id": peer.to_string()});
+            let request = ExtRequest::new(
+                "querymt/mesh/getPeerAccess",
+                serde_json::value::to_raw_value(&params).unwrap().into(),
+            );
+            let response = handle.handle_ext_mesh_access(request, true).await.unwrap();
+            serde_json::from_str(response.0.get()).unwrap()
+        }
+
+        async fn peer_access(
+            router: &InboundRouter,
+            peer: &NodeId,
+            actor_id: kameo::actor::ActorId,
+        ) -> serde_json::Value {
+            let request = SwarmRequest::Ask {
+                actor_id,
+                actor_remote_id: <RemoteNodeManager as RemoteActor>::REMOTE_ID.into(),
+                message_remote_id: <RemoteNodeManager as RemoteMessage<GetPeerSharing>>::REMOTE_ID
+                    .into(),
+                payload: rmp_serde::to_vec_named(&GetPeerSharing).unwrap(),
+                mailbox_timeout: None,
+                reply_timeout: None,
+                immediate: false,
+            };
+            let SwarmResponse::Ask(Ok(bytes)) = router
+                .handle_v1(*peer.as_peer_id(), request)
+                .await
+                .expect("v1 peer access request")
+            else {
+                panic!("expected a peer access snapshot");
+            };
+            rmp_serde::from_slice(&bytes).unwrap()
+        }
+
+        #[tokio::test]
+        async fn catalog_withdrawal_refreshes_owner_and_v1_peer_access() {
+            let (config, fixture, dir) = CatalogFixture::config().await;
+            let handle = LocalAgentHandle::from_config(config);
+            let deadline = Duration::from_secs(5);
+            let store = Arc::new(SqliteMeshAccess::open(":memory:").await.unwrap());
+            let runtime = querymt_remote::bootstrap_mesh_runtime_with_policy(
+                &MeshRuntimeConfig {
+                    enabled: true,
+                    lan: Some(LanMeshConfig {
+                        listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                        discovery: LanDiscovery::None,
+                        directory: querymt_remote::DirectoryMode::Cached,
+                    }),
+                    iroh_enabled: false,
+                    iroh_gso: false,
+                    iroh_dns: None,
+                    iroh_scopes: vec![],
+                    identity_file: Some(dir.path().join("identity.key")),
+                    request_timeout: deadline,
+                    stream_reconnect_grace: deadline,
+                    node_name: None,
+                    peers: vec![],
+                    auto_fallback: false,
+                },
+                store.clone(),
+            )
+            .await
+            .unwrap();
+            let mesh = runtime.as_mesh_handle();
+            handle.set_mesh(mesh.clone());
+            let peer = NodeId::from_peer_id(libp2p::PeerId::random());
+            let key = PeerGrantKey {
+                host: NodeId::from_peer_id(*mesh.peer_id()),
+                peer: peer.clone(),
+            };
+            let grant = store
+                .replace_grant(&key, Uuid::nil(), PeerGrant::Full)
+                .await
+                .unwrap();
+
+            let inventory = &handle.model_inventory;
+            tokio::time::timeout(deadline, inventory.ensure_local_refresh().await.wait())
+                .await
+                .expect("initial local catalog refresh");
+            let actor = RemoteNodeManager::spawn(RemoteNodeManager::new(
+                handle.config.clone(),
+                handle.registry.clone(),
+                Some(mesh.clone()),
+                handle.scheduler_handle.clone(),
+            ));
+            let router = mesh.inbound_router().unwrap();
+            register_peer_access_read(router, store, &actor, &handle, mesh);
+            let mut updates = handle.subscribe_ext_notifications();
+
+            let before = owner_access(&handle, &peer).await;
+            assert_eq!(before["incoming"], json!({"status": "unavailable"}));
+            assert_eq!(before["outgoing"]["grant"], json!({"mode": "full"}));
+            assert_eq!(before["outgoing"]["revision"], json!(grant.revision));
+            assert_eq!(
+                before["shareable_catalog"],
+                json!([{
+                    "provider_id": "fixture",
+                    "models": [{"model_id": "old-model", "finite_quota_supported": false}]
+                }])
+            );
+            let before_peer = peer_access(router, &peer, actor.id()).await;
+            assert_eq!(before_peer["status"], "granted");
+            assert_eq!(
+                before_peer["effective"]["providers"],
+                json!([{
+                    "provider_id": "fixture", "models": {"mode": "all"}
+                }])
+            );
+
+            fixture.set_models(&[]);
+            inventory.invalidate_local().await;
+            let invalidation = tokio::time::timeout(deadline, updates.recv())
+                .await
+                .expect("catalog refresh should invalidate the owner view")
+                .unwrap();
+            assert_eq!(
+                invalidation.method.as_ref(),
+                "querymt/mesh/peerAccessChanged"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(invalidation.params.get()).unwrap(),
+                json!({"version": 1, "peer_id": peer.to_string(), "direction": "outgoing", "reason": "catalog"})
+            );
+
+            let after = owner_access(&handle, &peer).await;
+            assert_eq!(
+                after["outgoing"], before["outgoing"],
+                "catalog withdrawal must not rewrite the grant"
+            );
+            assert_eq!(after["shareable_catalog"], json!([]));
+            let after_peer = peer_access(router, &peer, actor.id()).await;
+            assert_eq!(after_peer["status"], "granted");
+            assert_eq!(after_peer["effective"]["providers"], json!([]));
+            mesh.shutdown().await;
+        }
+    }
+
     pub(crate) fn register_peer_access_read(
         router: &querymt_remote::mesh_ingress::InboundRouter,
         store: Arc<dyn querymt_remote::peer_access::quota::QuotaStore>,

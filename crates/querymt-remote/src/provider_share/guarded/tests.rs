@@ -1,10 +1,18 @@
 use super::*;
-use crate::mesh_ingress::MeshIngress;
+use crate::mesh_ingress::{
+    MeshIngress, ResponseSender, SharingCallError, SharingRejection, SharingRequest,
+    SharingResponse,
+};
+use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{QuotaEdit, QuotaScope, QuotaStatus, ReservationId};
 use crate::peer_access::{
     GrantStore, GrantStoreError, ModelSelection, PeerGrantKey, ProviderGrant,
 };
-use crate::{NodeId, StaticCatalogBackend};
+use crate::{
+    CancelProviderStreamRequest, GetProviderStreamStatus, MeshHandle, MeshTransportMode, NodeId,
+    ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease,
+    RoutedStreamRelayMessage, StaticCatalogBackend, StreamRelayMessage,
+};
 use async_trait::async_trait;
 use kameo::error::RemoteSendError;
 use kameo::remote::{
@@ -16,9 +24,12 @@ use parking_lot::Mutex;
 use querymt::chat::{ChatOutput, ChatProvider, ChatStream, FinishReason, StreamChunk};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
+use querymt::error::TransportErrorKind;
 use querymt::{LLMProvider, Usage};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::timeout;
 
 #[derive(Default)]
 struct Store {
@@ -116,11 +127,20 @@ impl QuotaStore for Store {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum StreamEnding {
+    #[default]
+    Done,
+    Eof,
+    Error,
+}
+
 #[derive(Default)]
 struct Backend {
     builds: Mutex<Vec<ProviderBuildRequest>>,
     calls: Arc<AtomicUsize>,
     finish_stream: Arc<tokio::sync::Notify>,
+    stream_ending: StreamEnding,
 }
 
 #[async_trait]
@@ -143,6 +163,7 @@ impl RemoteProviderBackend for Backend {
         Ok(Arc::new(Provider {
             calls: self.calls.clone(),
             finish_stream: self.finish_stream.clone(),
+            stream_ending: self.stream_ending,
         }))
     }
 }
@@ -150,6 +171,7 @@ impl RemoteProviderBackend for Backend {
 struct Provider {
     calls: Arc<AtomicUsize>,
     finish_stream: Arc<tokio::sync::Notify>,
+    stream_ending: StreamEnding,
 }
 
 #[async_trait]
@@ -180,20 +202,31 @@ impl ChatProvider for Provider {
                 ..Usage::default()
             })),
         ]);
+        let ending = self.stream_ending;
         let complete = stream::once(async move {
             finish.notified().await;
-            Ok(StreamChunk::Usage(Usage {
-                input_tokens: 8,
-                output_tokens: 4,
-                reasoning_tokens: 2,
-                cache_read: 3,
-                cache_write: 1,
-                ..Usage::default()
-            }))
+            stream::iter(match ending {
+                StreamEnding::Done => vec![
+                    Ok(StreamChunk::Usage(Usage {
+                        input_tokens: 8,
+                        output_tokens: 4,
+                        reasoning_tokens: 2,
+                        cache_read: 3,
+                        cache_write: 1,
+                        ..Usage::default()
+                    })),
+                    Ok(StreamChunk::Done {
+                        finish_reason: FinishReason::Stop,
+                    }),
+                ],
+                StreamEnding::Eof => vec![],
+                StreamEnding::Error => vec![Err(LLMError::Transport {
+                    kind: TransportErrorKind::ConnectionClosed,
+                    message: "fixture upstream error".into(),
+                })],
+            })
         })
-        .chain(stream::iter([Ok(StreamChunk::Done {
-            finish_reason: FinishReason::Stop,
-        })]));
+        .flatten();
         Ok(Box::pin(initial.chain(complete)))
     }
 }
@@ -213,6 +246,21 @@ impl EmbeddingProvider for Provider {
 }
 impl LLMProvider for Provider {}
 
+fn ask_request<A: RemoteActor + RemoteMessage<M>, M: Serialize>(
+    actor_id: ActorId,
+    request: &M,
+) -> SwarmRequest {
+    SwarmRequest::Ask {
+        actor_id,
+        actor_remote_id: <A as RemoteActor>::REMOTE_ID.into(),
+        message_remote_id: <A as RemoteMessage<M>>::REMOTE_ID.into(),
+        payload: rmp_serde::to_vec_named(request).unwrap(),
+        mailbox_timeout: None,
+        reply_timeout: None,
+        immediate: false,
+    }
+}
+
 async fn ask<
     A: RemoteActor + RemoteMessage<M>,
     M: Serialize,
@@ -224,22 +272,18 @@ async fn ask<
     actor_id: ActorId,
     request: &M,
 ) -> Result<R, E> {
-    let result = router
-        .handle_v1(
-            caller,
-            SwarmRequest::Ask {
-                actor_id,
-                actor_remote_id: <A as RemoteActor>::REMOTE_ID.into(),
-                message_remote_id: <A as RemoteMessage<M>>::REMOTE_ID.into(),
-                payload: rmp_serde::to_vec_named(request).unwrap(),
-                mailbox_timeout: None,
-                reply_timeout: None,
-                immediate: false,
-            },
-        )
-        .await
-        .unwrap();
-    match result {
+    decode_ask(
+        router
+            .handle_v1(caller, ask_request::<A, _>(actor_id, request))
+            .await
+            .unwrap(),
+    )
+}
+
+fn decode_ask<R: serde::de::DeserializeOwned, E: serde::de::DeserializeOwned>(
+    response: SwarmResponse,
+) -> Result<R, E> {
+    match response {
         SwarmResponse::Ask(Ok(data)) => Ok(rmp_serde::from_slice(&data).unwrap()),
         SwarmResponse::Ask(Err(RemoteSendError::HandlerError(data))) => {
             Err(rmp_serde::from_slice(&data).unwrap())
@@ -372,17 +416,6 @@ async fn guarded_catalog_and_chat_enforce_grants_host_binding_and_attempt_identi
 
 #[tokio::test]
 async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work() {
-    use crate::mesh_ingress::{SharingRequest, SharingResponse};
-    use crate::mesh_runtime_support::SwarmCommand;
-    use crate::{
-        CancelProviderStreamRequest, GetProviderStreamStatus, MeshHandle, MeshTransportMode,
-        ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease,
-        RoutedStreamRelayMessage, StreamRelayMessage,
-    };
-    use std::time::Duration;
-    use tokio::sync::{broadcast, mpsc};
-    use tokio::time::timeout;
-
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let host = keypair.public().to_peer_id();
     let peer = PeerId::random();
@@ -432,11 +465,7 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
     );
     // Kameo deserializes the legacy callback envelope against its process-global
     // registry. V1 delivery itself goes through the normal sharing command path.
-    kameo::remote::Behaviour::new(
-        host,
-        crate::mesh_runtime::messaging_config(Duration::from_secs(3)),
-    )
-    .init_global();
+    init_callback_registry(host);
     let (relay_tx, mut relays) = mpsc::unbounded_channel();
     let driver = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
@@ -461,11 +490,6 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
         }
     });
     timeout(Duration::from_secs(5), async {
-        #[derive(Clone, Serialize)]
-        struct Callback { id: ActorId }
-        impl RemoteMessage<ProviderStreamRequest<Callback>> for ProviderHostActor {
-            const REMOTE_ID: &'static str = <Self as RemoteMessage<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>>>::REMOTE_ID;
-        }
         let request_id = Uuid::now_v7();
         let mut request = ProviderStreamRequest {
             provider: "fixture".into(), model: "allowed".into(), messages: vec![], tools: None,
@@ -514,4 +538,589 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
     }).await.expect("guarded stream test timed out");
     driver.abort();
     assert!(driver.await.unwrap_err().is_cancelled());
+}
+
+#[derive(Clone, Serialize)]
+struct Callback {
+    id: ActorId,
+}
+
+impl RemoteMessage<ProviderStreamRequest<Callback>> for ProviderHostActor {
+    const REMOTE_ID: &'static str = <Self as RemoteMessage<
+        ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>,
+    >>::REMOTE_ID;
+}
+
+struct StreamFixture {
+    host: PeerId,
+    peer: PeerId,
+    actor: ActorId,
+    router: InboundRouter,
+    store: Arc<Store>,
+    backend: Arc<Backend>,
+    commands: mpsc::UnboundedReceiver<SwarmCommand>,
+}
+
+impl StreamFixture {
+    async fn new(ending: StreamEnding) -> Self {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let host = keypair.public().to_peer_id();
+        let peer = PeerId::random();
+        let store = Arc::new(Store::default());
+        store
+            .replace_grant(&key(host, peer), Uuid::nil(), PeerGrant::Full)
+            .await
+            .unwrap();
+        let backend = Arc::new(Backend {
+            stream_ending: ending,
+            ..Backend::default()
+        });
+        let router = InboundRouter::new(host, store.clone());
+        let (command_tx, commands) = mpsc::unbounded_channel();
+        let mesh = MeshHandle::new(
+            host,
+            broadcast::channel(8).0,
+            Arc::new(crate::RouteTable::new(Duration::from_secs(60))),
+            "test-host".into(),
+            Default::default(),
+            keypair,
+            None,
+            None,
+            MeshTransportMode::Lan,
+            command_tx,
+            Duration::from_secs(10),
+        );
+        let actor = ActorId::new_with_peer_id(1, host);
+        streams::install(
+            Arc::new(GuardedProvider {
+                backend: backend.clone(),
+                catalog: Arc::new(StaticCatalogBackend::provider_model(
+                    host.to_string(),
+                    None,
+                    "fixture",
+                    "allowed",
+                )),
+                store: store.clone(),
+            }),
+            &mesh,
+            &router,
+            actor,
+        );
+        init_callback_registry(host);
+        Self {
+            host,
+            peer,
+            actor,
+            router,
+            store,
+            backend,
+            commands,
+        }
+    }
+
+    fn request(&self) -> ProviderStreamRequest<Callback> {
+        ProviderStreamRequest {
+            provider: "fixture".into(),
+            model: "allowed".into(),
+            messages: vec![],
+            tools: None,
+            session_id: "fixture-session".into(),
+            request_id: Uuid::now_v7().to_string(),
+            stream_router_ref: Callback {
+                id: ActorId::new_with_peer_id(2, self.peer),
+            },
+            reconnect_grace_secs: 1,
+            heartbeat_interval_secs: 60,
+            lease_ttl_secs: 60,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        }
+    }
+
+    async fn call<M: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        request: &M,
+    ) -> Result<R, RemoteProviderHostError>
+    where
+        ProviderHostActor: RemoteMessage<M>,
+    {
+        ask::<ProviderHostActor, _, _, _>(&self.router, self.peer, self.actor, request).await
+    }
+
+    async fn legacy<M: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        request: &M,
+    ) -> Result<R, RemoteProviderHostError>
+    where
+        ProviderHostActor: RemoteMessage<M>,
+    {
+        decode_ask(
+            self.router
+                .handle_legacy(
+                    self.peer,
+                    ask_request::<ProviderHostActor, _>(self.actor, request),
+                )
+                .await,
+        )
+    }
+
+    async fn relay(
+        &mut self,
+        request: &ProviderStreamRequest<Callback>,
+    ) -> (RoutedStreamRelayMessage, ResponseSender) {
+        let command = timeout(Duration::from_secs(4), self.commands.recv())
+            .await
+            .expect("timed out waiting for callback")
+            .expect("egress closed");
+        let SwarmCommand::Sharing {
+            peer,
+            request: SharingRequest::Actor(envelope),
+            tx,
+        } = command
+        else {
+            panic!("expected a sharing callback");
+        };
+        let SwarmRequest::Ask {
+            actor_id, payload, ..
+        } = *envelope
+        else {
+            panic!("expected callback ask");
+        };
+        assert_eq!(peer, self.peer);
+        assert_eq!(actor_id, request.stream_router_ref.id);
+        let relay: RoutedStreamRelayMessage = rmp_serde::from_slice(&payload).unwrap();
+        assert_eq!(relay.request_id, request.request_id);
+        (relay, tx)
+    }
+
+    fn assert_settled(&self, request: &ProviderStreamRequest<Callback>, usage: AttemptUsage) {
+        assert_eq!(self.backend.calls.load(Ordering::Relaxed), 1);
+        let id = self.store.attempts.lock()[&(
+            key(self.host, self.peer),
+            request.request_id.parse().unwrap(),
+        )];
+        assert_eq!(*self.store.settled.lock(), [(id, usage)]);
+    }
+}
+
+fn init_callback_registry(host: PeerId) {
+    // The callback envelope needs Kameo's process-wide registry, but V1 uses
+    // mesh commands for egress. An already initialized registry works too.
+    let _ = kameo::remote::Behaviour::new(
+        host,
+        crate::mesh_runtime::messaging_config(Duration::from_secs(3)),
+    )
+    .try_init_global();
+}
+
+fn ack(reply: ResponseSender) {
+    reply
+        .send(Ok(SharingResponse::Actor(Ok(SwarmResponse::Ask(Ok(
+            rmp_serde::to_vec(&()).unwrap(),
+        ))))))
+        .unwrap();
+}
+
+fn disconnect(reply: ResponseSender) {
+    reply.send(Err(SharingCallError::Unavailable)).unwrap();
+}
+
+fn assert_transport(
+    relay: RoutedStreamRelayMessage,
+    expected_kind: TransportErrorKind,
+    expected_message: &str,
+) {
+    assert_eq!(relay.seq, None);
+    let StreamRelayMessage::ProviderError { error } = relay.message else {
+        panic!("expected terminal provider error, got {:?}", relay.message);
+    };
+    let LLMError::Transport { kind, message } = LLMError::from_payload(error) else {
+        panic!("expected transport failure");
+    };
+    assert_eq!(kind, expected_kind);
+    assert!(message.contains(expected_message), "{message}");
+}
+
+fn stream_status(request: &ProviderStreamRequest<Callback>) -> GetProviderStreamStatus {
+    GetProviderStreamStatus {
+        session_id: request.session_id.clone(),
+        request_id: Some(request.request_id.clone()),
+    }
+}
+
+#[tokio::test]
+async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_control() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+
+    let link = || SwarmRequest::Link {
+        actor_id: fixture.actor,
+        actor_remote_id: <ProviderHostActor as RemoteActor>::REMOTE_ID.into(),
+        sibling_id: request.stream_router_ref.id,
+        sibling_remote_id: <crate::ProviderStreamRouterActor as RemoteActor>::REMOTE_ID.into(),
+    };
+    assert!(matches!(
+        fixture.router.handle_legacy(fixture.peer, link()).await,
+        SwarmResponse::Link(Err(RemoteSendError::BadActorType))
+    ));
+    assert!(matches!(
+        fixture.router.handle_v1(fixture.peer, link()).await,
+        Err(SharingRejection::UnsupportedOperation)
+    ));
+
+    let status = stream_status(&request);
+    let renew = RenewProviderStreamLease {
+        session_id: request.session_id.clone(),
+        request_id: request.request_id.clone(),
+        lease_ttl_secs: 1,
+    };
+    let mut cancel = CancelProviderStreamRequest {
+        session_id: request.session_id.clone(),
+        request_id: Some(Uuid::now_v7().to_string()),
+        reason: None,
+    };
+    assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 0);
+    cancel.request_id = Some(request.request_id.clone());
+    // A full legacy grant still cannot control a V1 request of the same peer.
+    assert!(
+        fixture
+            .legacy::<_, Option<ProviderStreamStatus>>(&status)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fixture.legacy::<_, bool>(&renew).await.unwrap());
+    assert_eq!(fixture.legacy::<_, usize>(&cancel).await.unwrap(), 0);
+    let live = fixture
+        .call::<_, Option<ProviderStreamStatus>>(&status)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(live.receiver_connected);
+    assert!(live.lease_expires_in_ms > 1_000);
+    assert!(fixture.store.settled.lock().is_empty());
+
+    assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 1);
+    assert!(!fixture.call::<_, bool>(&renew).await.unwrap());
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_transport(
+        terminal,
+        TransportErrorKind::ConnectionClosed,
+        "provider stream cancelled",
+    );
+    fixture.assert_settled(&request, AttemptUsage::Unknown);
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&status)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 0);
+    ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_reconnect_retries_data_and_terminal_without_restarting_inference() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (first, reply) = fixture.relay(&request).await;
+    assert_eq!(first.seq, Some(0));
+    disconnect(reply);
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+    assert_eq!(notice.seq, None);
+    let live = fixture
+        .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!live.receiver_connected);
+    assert_eq!(live.chunk_count, 0);
+    ack(reply);
+    let (retry, reply) = fixture.relay(&request).await;
+    assert_eq!(
+        rmp_serde::to_vec_named(&retry).unwrap(),
+        rmp_serde::to_vec_named(&first).unwrap()
+    );
+    ack(reply);
+
+    fixture.backend.finish_stream.notify_one();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_eq!(terminal.seq, Some(1));
+    assert!(crate::relay_message_is_terminal(&terminal.message));
+    fixture.assert_settled(&request, AttemptUsage::Observed(18));
+    disconnect(reply);
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+    assert_eq!(notice.seq, None);
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    ack(reply);
+    let (retry, reply) = fixture.relay(&request).await;
+    assert_eq!(
+        rmp_serde::to_vec_named(&retry).unwrap(),
+        rmp_serde::to_vec_named(&terminal).unwrap()
+    );
+    fixture.assert_settled(&request, AttemptUsage::Observed(18));
+    ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeout() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    disconnect(reply);
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let (notice, reply) = fixture.relay(&request).await;
+            let settled = !fixture.store.settled.lock().is_empty();
+            assert_eq!(notice.seq, None);
+            assert!(matches!(notice.message, StreamRelayMessage::TransportReconnected { buffered_chunks }
+                if buffered_chunks == usize::from(!settled)));
+            if settled {
+                ack(reply);
+                break;
+            }
+            disconnect(reply);
+        }
+    }).await.expect("reconnect grace did not expire");
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_transport(
+        terminal,
+        TransportErrorKind::Timeout,
+        "reconnect grace expired",
+    );
+    fixture.assert_settled(&request, AttemptUsage::Unknown);
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_heartbeat_does_not_renew_the_lease() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    request.heartbeat_interval_secs = 1;
+    request.lease_ttl_secs = 2;
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+    let (heartbeat, reply) = fixture.relay(&request).await;
+    assert_eq!(heartbeat.seq, None);
+    assert!(matches!(
+        heartbeat.message,
+        StreamRelayMessage::Heartbeat {
+            phase: ProviderStreamPhase::Streaming,
+            chunk_count: 2,
+            ..
+        }
+    ));
+    ack(reply);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let (terminal, reply) = fixture.relay(&request).await;
+            if matches!(terminal.message, StreamRelayMessage::Heartbeat { .. }) {
+                ack(reply);
+                continue;
+            }
+            assert_transport(
+                terminal,
+                TransportErrorKind::Timeout,
+                "lease or deadline expired",
+            );
+            fixture.assert_settled(&request, AttemptUsage::Unknown);
+            ack(reply);
+            break;
+        }
+    })
+    .await
+    .expect("stream lease did not expire");
+}
+
+#[tokio::test]
+async fn guarded_stream_reports_upstream_error_and_missing_terminal() {
+    for (ending, message) in [
+        (StreamEnding::Eof, "provider ended without a terminal chunk"),
+        (StreamEnding::Error, "fixture upstream error"),
+    ] {
+        let mut fixture = StreamFixture::new(ending).await;
+        let request = fixture.request();
+        fixture.call::<_, ()>(&request).await.unwrap();
+        let (initial, reply) = fixture.relay(&request).await;
+        assert_eq!(initial.seq, Some(0));
+        assert!(!crate::relay_message_is_terminal(&initial.message));
+        ack(reply);
+        fixture.backend.finish_stream.notify_one();
+        let (terminal, reply) = fixture.relay(&request).await;
+        assert_transport(terminal, TransportErrorKind::ConnectionClosed, message);
+        fixture.assert_settled(&request, AttemptUsage::Unknown);
+        ack(reply);
+    }
+}
+
+#[tokio::test]
+async fn guarded_stream_rejects_invalid_id_and_unlisted_model_before_reserving() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    let valid_id = std::mem::replace(&mut request.request_id, "not-a-uuid".into());
+    assert_eq!(
+        code(fixture.call::<_, ()>(&request).await.unwrap_err()),
+        "mesh_stream_id"
+    );
+    request.request_id = valid_id;
+    request.model = "unlisted".into();
+    assert_eq!(
+        code(fixture.call::<_, ()>(&request).await.unwrap_err()),
+        "mesh_access_denied"
+    );
+    assert!(fixture.backend.builds.lock().is_empty());
+    assert!(fixture.store.attempts.lock().is_empty());
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn guarded_provider_contract_requires_eligibility_and_valid_inference_options() {
+    let host = PeerId::random();
+    let custom = PeerId::random();
+    let full = PeerId::random();
+    let catalog_id = ActorId::new_with_peer_id(1, host);
+    let actor = ActorId::new_with_peer_id(2, host);
+    let store = Arc::new(Store::default());
+    for (peer, grant) in [(custom, allowed()), (full, PeerGrant::Full)] {
+        store
+            .replace_grant(&key(host, peer), Uuid::nil(), grant)
+            .await
+            .unwrap();
+    }
+    let backend = Arc::new(Backend::default());
+    let router = InboundRouter::new(host, store.clone());
+    Arc::new(GuardedProvider {
+        backend: backend.clone(),
+        catalog: Arc::new(StaticCatalogBackend::provider(
+            host.to_string(),
+            None,
+            "fixture",
+        )),
+        store: store.clone(),
+    })
+    .install(&router, catalog_id, actor);
+
+    let browse_catalog = |peer| {
+        ask::<ProviderCatalogActor, _, ProviderCatalogSnapshot, String>(
+            &router,
+            peer,
+            catalog_id,
+            &GetProviderCatalog,
+        )
+    };
+    assert!(browse_catalog(custom).await.unwrap().providers.is_empty());
+    let snapshot = browse_catalog(full).await.unwrap();
+    assert!(snapshot.node.capabilities.is_empty());
+    assert_eq!(snapshot.providers.len(), 1);
+    assert_eq!(snapshot.providers[0].provider, "fixture");
+    assert_eq!(snapshot.providers[0].model, None);
+
+    let mut request = GetProviderContractInfo {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        params: None,
+    };
+    assert_eq!(
+        code(
+            ask::<ProviderHostActor, _, ProviderContractInfo, RemoteProviderHostError>(
+                &router, custom, actor, &request,
+            )
+            .await
+            .unwrap_err()
+        ),
+        "mesh_access_denied"
+    );
+    request.params = Some(serde_json::json!({"temperature": "not a number"}));
+    assert_eq!(
+        code(
+            ask::<ProviderHostActor, _, ProviderContractInfo, RemoteProviderHostError>(
+                &router, full, actor, &request,
+            )
+            .await
+            .unwrap_err()
+        ),
+        "mesh_access_invalid_params"
+    );
+    assert!(backend.builds.lock().is_empty());
+
+    request.params = Some(serde_json::json!({"temperature": 0.25}));
+    let contract = ask::<ProviderHostActor, _, ProviderContractInfo, RemoteProviderHostError>(
+        &router, full, actor, &request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        contract.protocol_version,
+        Some(crate::provider_protocol::MESH_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        contract.item_aware_chat_version,
+        Some(crate::ITEM_AWARE_CHAT_CONTRACT_VERSION)
+    );
+    assert_eq!(
+        backend.builds.lock()[0].params,
+        Some(
+            serde_json::json!({"base_url": "https://example.test/provider", "max_tokens": 20, "temperature": 0.25})
+        )
+    );
+    assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    assert!(store.attempts.lock().is_empty());
+
+    let chat = ProviderChatRequest {
+        provider: request.provider,
+        model: request.model,
+        messages: vec![],
+        tools: None,
+        params: None,
+        item_aware_contract_version: None,
+        options: None,
+    };
+    let response = router
+        .handle_legacy(full, ask_request::<ProviderHostActor, _>(actor, &chat))
+        .await;
+    let response = decode_ask::<ProviderChatResponse, RemoteProviderHostError>(response).unwrap();
+    assert_eq!(response.output.usage.unwrap().input_tokens, 8);
+    assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    let attempts = store.attempts.lock();
+    assert_eq!(attempts.len(), 1);
+    let ((peer, request_id), reservation) = attempts.iter().next().unwrap();
+    assert_eq!(*peer, key(host, full));
+    assert!(!request_id.is_nil());
+    assert_eq!(
+        *store.settled.lock(),
+        [(*reservation, AttemptUsage::Observed(18))]
+    );
 }

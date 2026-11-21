@@ -377,8 +377,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn session_inference_and_direct_inference_share_an_allowance() {
+    async fn finite_quota_fixture(
+        tokens: i64,
+    ) -> (
+        tempfile::TempDir,
+        Arc<querymt_agent_sqlite::mesh_access::SqliteMeshAccess>,
+        PeerGrantKey,
+        QuotaScope,
+        Uuid,
+        i64,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open_exclusive(
@@ -419,13 +427,19 @@ mod tests {
                 grant.revision,
                 &scope,
                 QuotaEdit::Reconfigure(QuotaLimit::Finite {
-                    tokens: 16,
+                    tokens,
                     window: QuotaWindow::Manual,
                 }),
                 now,
             )
             .await
             .unwrap();
+        (dir, store, key, scope, revision, now)
+    }
+
+    #[tokio::test]
+    async fn session_inference_and_direct_inference_share_an_allowance() {
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
         let direct = ReservedAttempt::reserve(
             store.clone(),
             QuotaAttempt {
@@ -467,5 +481,229 @@ mod tests {
         let after = store.quota(&key, &scope, now).await.unwrap();
         assert_eq!(after.known_tokens, 7);
         assert_eq!(after.reserved_tokens, 0);
+    }
+
+    struct ScriptedStream(std::sync::Mutex<Option<Result<ChatStream, LLMError>>>);
+
+    #[async_trait]
+    impl ChatProvider for ScriptedStream {
+        async fn chat(&self, _: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            panic!("only streaming calls are expected")
+        }
+
+        async fn chat_stream(&self, _: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+            self.0.lock().unwrap().take().expect("one upstream call")
+        }
+    }
+
+    #[async_trait]
+    impl querymt::completion::CompletionProvider for ScriptedStream {
+        async fn complete(
+            &self,
+            _: &querymt::completion::CompletionRequest,
+        ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+            panic!("only streaming calls are expected")
+        }
+    }
+
+    #[async_trait]
+    impl querymt::embedding::EmbeddingProvider for ScriptedStream {
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            panic!("only streaming calls are expected")
+        }
+    }
+
+    impl LLMProvider for ScriptedStream {}
+
+    fn hosted_stream(
+        stream: Result<ChatStream, LLMError>,
+        key: &PeerGrantKey,
+        revision: Uuid,
+        store: Arc<dyn QuotaStore>,
+    ) -> HostedProvider {
+        HostedProvider::new(
+            Arc::new(ScriptedStream(std::sync::Mutex::new(Some(stream)))),
+            PeerTurn::test_peer(key.clone(), revision, store.clone()),
+            store,
+            "fixture".into(),
+            "model".into(),
+            Some(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn hosted_stream_settles_usage_only_after_terminal_chunk() {
+        use querymt::chat::{FinishReason, StreamChunk};
+
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let usage = querymt::Usage {
+            input_tokens: 4,
+            output_tokens: 3,
+            ..Default::default()
+        };
+        let upstream = futures_util::stream::iter([
+            Ok(StreamChunk::Usage(usage.clone())),
+            Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            }),
+        ]);
+        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+
+        assert!(
+            matches!(stream.next().await, Some(Ok(StreamChunk::Usage(actual))) if actual == usage)
+        );
+        let ongoing = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!((ongoing.known_tokens, ongoing.reserved_tokens), (0, 10));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop
+            }))
+        ));
+        let settled = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!(
+            (
+                settled.known_tokens,
+                settled.estimated_tokens,
+                settled.reserved_tokens
+            ),
+            (7, 0, 0)
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            store.quota(&key, &scope, now).await.unwrap(),
+            settled,
+            "EOF must not settle a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_stream_charges_bound_when_upstream_does_not_report_terminal_usage() {
+        use querymt::chat::StreamChunk;
+
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(32).await;
+        let provider_error = || LLMError::NotImplemented("fixture upstream error".into());
+        let partial_usage = || {
+            Ok(StreamChunk::Usage(querymt::Usage {
+                input_tokens: 2,
+                ..Default::default()
+            }))
+        };
+        let eof = hosted_stream(
+            Ok(Box::pin(futures_util::stream::iter([partial_usage()]))),
+            &key,
+            revision,
+            store.clone(),
+        );
+        let mut stream = eof.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Usage(_)))
+        ));
+        assert!(stream.next().await.is_none());
+        let after_eof = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!(
+            (
+                after_eof.known_tokens,
+                after_eof.estimated_tokens,
+                after_eof.reserved_tokens
+            ),
+            (0, 10, 0)
+        );
+
+        let midstream = hosted_stream(
+            Ok(Box::pin(futures_util::stream::iter([
+                partial_usage(),
+                Err(provider_error()),
+            ]))),
+            &key,
+            revision,
+            store.clone(),
+        );
+        let mut stream = midstream.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Usage(_)))
+        ));
+        assert!(
+            matches!(stream.next().await, Some(Err(LLMError::NotImplemented(message))) if message == "fixture upstream error")
+        );
+        let after_error = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!(
+            (
+                after_error.known_tokens,
+                after_error.estimated_tokens,
+                after_error.reserved_tokens
+            ),
+            (0, 20, 0)
+        );
+
+        let startup = hosted_stream(Err(provider_error()), &key, revision, store.clone());
+        assert!(
+            matches!(startup.chat_stream(&ChatCall::new(&[])).await, Err(LLMError::NotImplemented(message)) if message == "fixture upstream error")
+        );
+        let after_startup = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!(
+            (
+                after_startup.known_tokens,
+                after_startup.estimated_tokens,
+                after_startup.reserved_tokens
+            ),
+            (0, 30, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_stream_revocation_wakes_a_pending_read_and_charges_bound() {
+        use querymt::chat::StreamChunk;
+        use std::time::Duration;
+
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let upstream = futures_util::stream::iter([Ok(StreamChunk::Text("fixture".into()))])
+            .chain(futures_util::stream::pending());
+        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        assert!(
+            matches!(stream.next().await, Some(Ok(StreamChunk::Text(text))) if text == "fixture")
+        );
+        assert_eq!(
+            store
+                .quota(&key, &scope, now)
+                .await
+                .unwrap()
+                .reserved_tokens,
+            10
+        );
+        let mut pending = stream.next();
+        assert!(futures_util::poll!(&mut pending).is_pending());
+
+        store
+            .replace_grant(&key, revision, PeerGrant::None)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Some(Err(LLMError::ProviderResponseError(failure))) if failure.code() == Some("mesh_access_denied"))
+        );
+        assert!(
+            matches!(provider.chat_stream(&ChatCall::new(&[])).await, Err(LLMError::ProviderResponseError(failure)) if failure.code() == Some("mesh_access_denied"))
+        );
+
+        // Dropping a dispatched attempt settles on a background task.
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = store.quota(&key, &scope, now).await.unwrap();
+                if status.reserved_tokens == 0 {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("revocation must release the reservation");
+        assert_eq!((settled.known_tokens, settled.estimated_tokens), (0, 10));
     }
 }

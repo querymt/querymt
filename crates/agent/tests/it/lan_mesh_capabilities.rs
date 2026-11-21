@@ -226,6 +226,53 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         .await
         .unwrap();
     let reset: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    let reset_revision = &reset["outgoing"]["revision"];
+    let quota_request = |operation, limit| {
+        request(
+            "querymt/mesh/setPeerQuota",
+            serde_json::json!({
+                "version": 1, "peer_id": peer, "expected_revision": reset_revision,
+                "scope": {"provider_id":"fixture", "model_id":"offline"},
+                "operation": operation, "limit": limit
+            }),
+        )
+    };
+    // A rejected amount or window edit must not replace the accounting period.
+    while updates.try_recv().is_ok() {}
+    for (amount, window, code) in [
+        ("+100", "weekly", "mesh_access_invalid_params"),
+        (
+            "9223372036854775808",
+            "weekly",
+            "mesh_access_invalid_params",
+        ),
+        ("0", "weekly", "mesh_access_invalid_params"),
+        ("100", "monthly", "mesh_quota_reconfigure_required"),
+    ] {
+        let error = handle
+            .owner_ext_method(quota_request(
+                "update",
+                serde_json::json!({
+                    "kind":"finite", "limit_tokens":amount, "window":window
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.unwrap()["code"], code);
+    }
+    assert!(updates.try_recv().is_err());
+    let response = handle
+        .owner_ext_method(quota_request(
+            "update",
+            serde_json::json!({
+                "kind":"finite", "limit_tokens":"9007199254740993", "window":"weekly"
+            }),
+        ))
+        .await
+        .unwrap();
+    let unchanged: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(unchanged["outgoing"], reset["outgoing"]);
+    assert!(updates.try_recv().is_err());
     let quota = reset["outgoing"]["quotas"]
         .as_array()
         .unwrap()

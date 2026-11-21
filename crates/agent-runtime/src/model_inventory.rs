@@ -1124,6 +1124,83 @@ impl ModelInventory {
 }
 
 #[cfg(test)]
+pub(crate) mod catalog_fixture {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::helpers::empty_plugin_registry;
+    use querymt::{
+        LLMParams, LLMProvider,
+        error::LLMError,
+        plugin::{Fut, LLMProviderFactory},
+    };
+    use tokio::sync::oneshot;
+
+    type ListingGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    pub(crate) struct CatalogFixture {
+        models: parking_lot::Mutex<Vec<String>>,
+        next_listing_gate: parking_lot::Mutex<Option<ListingGate>>,
+    }
+
+    impl CatalogFixture {
+        pub(crate) async fn config() -> (Arc<AgentConfig>, Arc<Self>, tempfile::TempDir) {
+            let (plugins, dir) = empty_plugin_registry().unwrap();
+            let fixture = Arc::new(Self {
+                models: parking_lot::Mutex::new(vec!["old-model".into()]),
+                next_listing_gate: parking_lot::Mutex::new(None),
+            });
+            plugins.register_static(fixture.clone());
+            let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+            let config = AgentConfigBuilder::new(
+                Arc::new(plugins),
+                storage,
+                LLMParams::new().provider("fixture").model("old-model"),
+            )
+            .build();
+            (Arc::new(config), fixture, dir)
+        }
+
+        pub(crate) fn set_models(&self, models: &[&str]) {
+            *self.models.lock() = models.iter().map(|model| (*model).into()).collect();
+        }
+
+        pub(super) fn pause_next_listing(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (captured, captured_rx) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.next_listing_gate.lock() = Some((captured, release_rx));
+            (captured_rx, release)
+        }
+    }
+
+    impl LLMProviderFactory for CatalogFixture {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn config_schema(&self) -> String {
+            r#"{"type":"object","properties":{"model":{"type":"string"}}}"#.into()
+        }
+
+        fn from_config(&self, _: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+            panic!("listing a catalog must not create an inference provider")
+        }
+
+        fn list_models<'a>(&'a self, _: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
+            Box::pin(async {
+                let models = self.models.lock().clone();
+                let gate = self.next_listing_gate.lock().take();
+                if let Some((captured, release)) = gate {
+                    let _ = captured.send(());
+                    let _ = release.await;
+                }
+                Ok(models)
+            })
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
@@ -1972,27 +2049,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalidation_during_active_refresh_requests_follow_up_cycle() {
-        let config = make_test_config().await;
+    async fn invalidation_during_local_refresh_publishes_the_latest_catalog() {
+        let (config, fixture, _dir) = catalog_fixture::CatalogFixture::config().await;
         let inventory = ModelInventory::new(config);
+        let mut updates = inventory.subscribe_updates();
+        let (captured, release) = fixture.pause_next_listing();
+        let deadline = Duration::from_secs(5);
 
-        let _handle = inventory.trigger_refresh().await;
+        let _refresh = inventory.ensure_local_refresh().await;
+        tokio::time::timeout(deadline, captured)
+            .await
+            .expect("initial refresh should read the old catalog")
+            .unwrap();
+        fixture.set_models(&["new-model"]);
+        inventory.invalidate_local().await;
+        release.send(()).unwrap();
 
-        {
-            let state = inventory.inner.refresh_state.lock().await;
-            assert!(state.local_refreshing || state.remote_refreshing);
-        }
-
-        inventory.invalidate_all().await;
-
-        {
-            let state = inventory.inner.refresh_state.lock().await;
-            assert!(
-                state.refresh_requested_after_current
-                    || state.local_refreshing
-                    || state.remote_refreshing,
-                "invalidation during an active refresh should queue or immediately run a follow-up cycle"
-            );
-        }
+        tokio::time::timeout(deadline, async {
+            updates.recv().await.unwrap();
+            updates.recv().await.unwrap();
+        })
+        .await
+        .expect("in-flight invalidation should publish a follow-up refresh");
+        let models = inventory.local_snapshot_entries_blocking();
+        assert_eq!(
+            models
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture/new-model"],
+            "the second refresh must replace, not retain, the stale catalog"
+        );
     }
 }

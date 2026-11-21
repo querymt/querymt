@@ -213,3 +213,65 @@ pub async fn render_confined_file(
 ) -> Result<Vec<ToolResultPart>, String> {
     Err("confined workspace reads are not supported on this host".into())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn confined_read_returns_pages_and_refuses_to_inline_large_or_unsupported_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(root.join("binary"), [0x80, 0x81]).unwrap();
+        std::fs::File::create(root.join("large.txt"))
+            .unwrap()
+            .set_len(MAX_BINARY_READ_BYTES + 1)
+            .unwrap();
+        let read = |name, offset, limit| {
+            let root = &root;
+            async move {
+                let output = render_confined_file(root, Path::new(name), offset, limit)
+                    .await
+                    .unwrap();
+                let [ToolResultPart::Text { text }] = output.as_slice() else {
+                    panic!("expected rendered text for {name}");
+                };
+                text.clone()
+            }
+        };
+        let page = read("notes.txt", 1, 1).await;
+        assert!(page.contains("00002| two"));
+        assert!(page.contains("more lines"));
+        assert!(!page.contains("00001| one") && !page.contains("00003| three"));
+        let tail = read("notes.txt", 2, 1).await;
+        assert!(tail.contains("00003| three") && tail.contains("End of file"));
+        assert!(
+            read("binary", 0, 1)
+                .await
+                .contains("not a supported format")
+        );
+        assert!(read("large.txt", 0, 1).await.contains("File too large"));
+    }
+
+    #[tokio::test]
+    async fn confined_read_requires_a_regular_single_link_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("original"), "shared fixture").unwrap();
+        std::fs::hard_link(root.join("original"), root.join("second-name")).unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        for name in ["second-name", "directory"] {
+            let error = render_confined_file(&root, Path::new(name), 0, 1)
+                .await
+                .unwrap_err();
+            assert!(error.contains("regular, single-link file"), "{error}");
+        }
+        std::fs::remove_file(root.join("second-name")).unwrap();
+        assert!(
+            render_confined_file(&root, Path::new("original"), 0, 1)
+                .await
+                .is_ok()
+        );
+    }
+}
