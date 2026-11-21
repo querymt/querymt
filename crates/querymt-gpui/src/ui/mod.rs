@@ -18,6 +18,7 @@ mod setup;
 mod smooth_scroll;
 mod start;
 mod workspace_select;
+mod workspaces;
 
 use gpui_kit::assets::IconName;
 use std::collections::{HashMap, HashSet};
@@ -54,6 +55,8 @@ pub enum Page {
     Session,
     /// First-run setup: full window, without the sidebar.
     Setup,
+    /// Saved and recent workspace folders.
+    Workspaces,
 }
 
 pub(crate) struct AgentDialog {
@@ -214,6 +217,7 @@ pub struct QmtApp {
     session_filters: SessionFilters,
     automations: automations::AutomationPage,
     setup: setup::SetupState,
+    workspaces: workspaces::WorkspacesPage,
     /// Which Sessions-page groups are open.
     session_groups: sessions::GroupOpenState,
     /// Virtualized Sessions page list.
@@ -444,6 +448,9 @@ impl QmtApp {
             let (store, cwd, scroll) = (store.clone(), cwd.clone(), smooth_scroll.clone());
             cx.new(|cx| workspace_select::WorkspaceField::new(store, cwd, false, scroll, cx))
         };
+        let workspaces =
+            workspaces::WorkspacesPage::new(store.clone(), smooth_scroll.clone(), window, cx);
+        subs.push(workspaces.subscribe(window, cx));
         let mut this = Self {
             store,
             page,
@@ -459,6 +466,7 @@ impl QmtApp {
             session_filters: SessionFilters::default(),
             automations: Default::default(),
             setup: Default::default(),
+            workspaces,
             session_groups: Default::default(),
             session_list: Default::default(),
             group_shown: HashMap::new(),
@@ -609,6 +617,7 @@ impl QmtApp {
             || self.dialog.take().is_some()
             || std::mem::take(&mut self.invite_form)
             || self.details.take().is_some()
+            || self.close_workspace_overlay()
         {
             return true;
         }
@@ -793,7 +802,17 @@ impl QmtApp {
                         &p,
                         cx,
                     ))
+                    .child(self.nav_item(
+                        Page::Workspaces,
+                        IconName::FolderOpen,
+                        "Workspaces",
+                        None,
+                        &p,
+                        cx,
+                    ))
                     .child(separator())
+                    .child(self.nav_item(Page::Agents, IconName::Bot, "Agents", None, &p, cx))
+                    .child(self.nav_item(Page::Mesh, IconName::Network, "Mesh", None, &p, cx))
                     .child(self.nav_item(
                         Page::Automations,
                         IconName::CalendarClock,
@@ -802,8 +821,6 @@ impl QmtApp {
                         &p,
                         cx,
                     ))
-                    .child(self.nav_item(Page::Agents, IconName::Bot, "Agents", None, &p, cx))
-                    .child(self.nav_item(Page::Mesh, IconName::Network, "Mesh", None, &p, cx))
                     .child(separator())
                     .child(
                         v_flex()
@@ -1141,15 +1158,15 @@ impl QmtApp {
                         &p,
                         cx,
                     ))
-                    .child(section("Manage"))
                     .child(self.nav_item(
-                        Page::Automations,
-                        IconName::CalendarClock,
-                        "Automations",
+                        Page::Workspaces,
+                        IconName::FolderOpen,
+                        "Workspaces",
                         None,
                         &p,
                         cx,
                     ))
+                    .child(section("Manage"))
                     .child(self.nav_item(
                         Page::Agents,
                         IconName::Bot,
@@ -1169,6 +1186,14 @@ impl QmtApp {
                                 .child(n.to_string())
                                 .into_any_element()
                         }),
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        Page::Automations,
+                        IconName::CalendarClock,
+                        "Automations",
+                        None,
                         &p,
                         cx,
                     ))
@@ -1282,6 +1307,7 @@ impl Render for QmtApp {
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
             Page::Session => self.render_session(window, cx).into_any_element(),
             Page::Setup => self.render_setup(cx).into_any_element(),
+            Page::Workspaces => self.render_workspaces(cx).into_any_element(),
         };
         let setup = self.page == Page::Setup;
         let radii = gpui_kit::component::window_corner_radii(window, cx);
@@ -1292,6 +1318,7 @@ impl Render for QmtApp {
             .or_else(|| self.render_palette(radii, cx))
             .or_else(|| self.render_model_modal(radii, cx))
             .or_else(|| self.render_automation_overlay(radii, cx))
+            .or_else(|| self.render_workspace_overlay(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));
         let header = self.render_header(window, cx).into_any_element();
         let render_ms = crate::util::now_ms() - render_started;
