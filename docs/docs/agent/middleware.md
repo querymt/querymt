@@ -4,18 +4,23 @@ Middleware in QueryMT Agent provides a pluggable way to extend and modify agent 
 
 ## Architecture
 
-The middleware system uses a **driver-based architecture** where each middleware implements the `MiddlewareDriver` trait. Multiple drivers are chained together in a `CompositeDriver` that processes each agent interaction.
+A middleware has two parts. The `Middleware` is agent-scoped: it holds configuration and shared services and lives as long as the agent. For every run (one prompt of one session) it creates a `TurnMiddleware`, which owns all state of that run and is dropped when the run ends. Several middleware are chained in a `CompositeDriver`; each run consults the instances in the order the middleware were configured.
 
 ```mermaid
 flowchart LR
     A([User Request])
-    subgraph CD["CompositeDriver (Middleware Chain)"]
+    subgraph CD["CompositeDriver (agent-scoped)"]
         M1["Limits<br/>Middleware"] --> M2["Context<br/>Middleware"] --> M3["AgentMode<br/>Middleware"]
+    end
+    subgraph RUN["One run (per prompt)"]
+        T1["Limits<br/>instance"] --> T2["Context<br/>instance"] --> T3["AgentMode<br/>instance"]
     end
     B([Agent Processing])
 
-    A --> CD --> B
+    A --> CD -- "begin_turn" --> RUN --> B
 ```
+
+State a middleware keeps while a run executes belongs to that run only: it is not visible to a run of another session and does not carry into the next run of the same session. A middleware that needs something across runs reads it from the session's stored history or from its configuration.
 
 ## Hooks vs Middleware
 
@@ -25,33 +30,56 @@ If you need local scripts, policy checks, approval automation, or profile-level 
 
 See the [Hooks Guide](hooks.md) for config-level lifecycle command hooks.
 
-## Middleware Driver Trait
-
-All middleware must implement the `MiddlewareDriver` trait:
+## The Middleware Traits
 
 ```rust
-pub trait MiddlewareDriver: Send + Sync {
-    /// Unique name for this middleware
-    fn name(&self) -> &str;
-    
-    /// Process incoming request (before agent processes)
-    fn process_request(&self, request: &mut Request) -> Result<()>;
-    
-    /// Process outgoing response (after agent processes)
-    fn process_response(&self, response: &mut Response) -> Result<()>;
-    
-    /// Process tool call (before tool execution)
-    fn process_tool_call(&self, tool_call: &mut ToolCall) -> Result<()>;
-    
-    /// Process tool result (after tool execution)
-    fn process_tool_result(&self, result: &mut ToolResult) -> Result<()>;
+/// Agent-scoped. Holds configuration and shared services only.
+pub trait Middleware: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Create the state of one run.
+    fn begin_turn(&self, turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware>;
+    fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {}
+    fn limits(&self) -> Option<SessionLimits> { None }
+    fn budget_pricing(&self) -> Option<ModelPricing> { None }
+}
+
+/// One per run. All run state of a middleware lives in `self`.
+#[async_trait]
+pub trait TurnMiddleware: Send {
+    async fn on_turn_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict>;
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict>;
+    async fn on_after_llm(&mut self, cx: &mut HookCx<'_>, reply: &LlmResponse) -> Result<ReplyVerdict>;
+    async fn on_prepared_tool_calls(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        batch: &PreparedBatch<'_>,
+    ) -> Result<Vec<PreparedCallVerdict>>;
+    async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict>;
+    async fn on_stopped(&mut self, cx: &mut HookCx<'_>, stop: &Stop) -> Result<StopVerdict>;
 }
 ```
+
+Every hook has a default that passes, so a middleware implements only the hooks it needs. Each hook returns a verdict that names only what that stage allows:
+
+| Hook | Runs | Verdict | Meaning |
+|---|---|---|---|
+| `on_turn_start` | once, before the first step | `StepVerdict`: `Proceed`, `Stop(Stop)` | `Stop` ends the run before any model request |
+| `on_step_start` | before every model request | `StepVerdict` | as above |
+| `on_after_llm` | after a reply, before it is stored | `ReplyVerdict`: `Proceed`, `Stop(Stop)`, `Retry` | `Retry` discards the reply, counts its usage and sends the request again |
+| `on_prepared_tool_calls` | before a batch of tool calls is scheduled | one `PreparedCallVerdict` per call | `Reject(result)` replaces the call with its final result |
+| `on_turn_end` | when the model has ended its turn | `EndVerdict`: `Finish`, `Continue`, `Stop(Stop)` | `Continue` sends another request in the same run |
+| `on_stopped` | when the run is about to end on a stop | `StopVerdict`: `Pass`, `Recover` | `Recover` replaces the stop with another request |
+
+The first middleware that returns a decision other than the passing one (`Proceed`, `Finish`, `Pass`) ends the stage; later middleware are not consulted for it. Notices and overrides queued by earlier middleware in that stage are kept.
+
+`HookCx` is what a hook may read of the run (`session_id`, `history`, `stats`, `provider`, `model`, `profile`, `mode`, `last_applied`, `request_overrides`, `last_mode_notice`, `changed_paths`, `runtime`) and the two things it may write, at any stage: `queue_notice(source, text)` stores a notice before the next model request, and `set_request_overrides(options)` sets generation overrides for that request.
+
+When a run is cancelled while a hook is running, the hook's future is dropped and the run ends as cancelled without waiting for it. A hook must leave `self` usable at every `.await`, which is trivially true because the instance is dropped with the run.
 
 ### Reviewing prepared tool calls
 
 Middleware that needs to reason about what a tool call will do should implement
-`on_prepared_tool_calls(&PreparedBatch)` rather than parse `ToolCall` arguments. Each
+`on_prepared_tool_calls(cx, &PreparedBatch)` rather than parse `ToolCall` arguments. Each
 `PreparedToolCall` carries the call, its **effective** arguments and the file access
 declared for them; the raw model text on `ToolCall.function.arguments` must not be
 used for conflict decisions. Return one `PreparedCallVerdict` per call: `Proceed`, or
@@ -194,7 +222,7 @@ Same-file writes in one batch are always executed one after another in the model
 order, so no edit is lost, whether or not this middleware is active. The guard only
 changes what the model is told.
 
-The guard reviews *prepared* calls (`MiddlewareDriver::on_prepared_tool_calls`): the
+The guard reviews *prepared* calls (`TurnMiddleware::on_prepared_tool_calls`): the
 file access it inspects was declared for each call's final effective arguments, after
 alias normalisation and pre-tool hook updates, and is the same access the scheduler
 plans from. Two calls that only look disjoint in the model's raw arguments, but are
@@ -213,7 +241,7 @@ mode = "warn"   # "warn" (default) or "deny"
 **Modes:**
 - `warn` (default): every call runs. Before the next model request, a guidance
   message naming the affected files and recommending `multiedit` is added after the
-  tool results. It is sent once.
+  tool results. It is queued once per flagged batch.
 - `deny`: only the first writing call per file runs. Each later writing call to that
   file gets an error result that names the file and tells the model to combine the
   edits into one `multiedit` call. Calls to other files still run, and every tool
@@ -234,8 +262,8 @@ Only calls that declare file writes count (`edit`, `multiedit`, `write_file`,
 
 When a batch is flagged, a `HookNotice` event (`parallel_edit_guard`) is also
 published so UIs can show the warning. It is persisted in the background and
-never delays the tool calls. A guidance message that was not delivered
-(for example because the turn was cancelled) is discarded at the next turn start.
+never delays the tool calls. A guidance message that was not delivered (for
+example because the run was cancelled) is dropped with the run.
 
 Read-only file tools (`read_tool`, `get_function`, `get_symbol`, `index`, `mdq`,
 `find_symbol_references`, `search_text`, `ls`, `glob`) are ordered after earlier writes to
@@ -327,120 +355,105 @@ compact_on_overflow = true
 
 ### Basic Middleware
 
+A middleware that logs every model reply and tool batch. It keeps no run state, so its per-run instance is empty.
+
 ```rust
-use querymt_agent::middleware::{MiddlewareDriver, MiddlewareError, Result};
-use querymt_agent::middleware::state::{ExecutionState, ToolCall, ToolResult};
-use std::sync::Arc;
+use async_trait::async_trait;
+use querymt_agent::middleware::{
+    HookCx, LlmResponse, Middleware, PreparedBatch, PreparedCallVerdict, ReplyVerdict, Result,
+    TurnInfo, TurnMiddleware,
+};
 
-pub struct LoggingMiddleware {
-    name: String,
+pub struct LoggingMiddleware;
+
+impl Middleware for LoggingMiddleware {
+    fn name(&self) -> &'static str {
+        "logging"
+    }
+
+    fn begin_turn(&self, turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        log::info!("run started for session {}", turn.session_id);
+        Box::new(LoggingTurn)
+    }
 }
 
-impl LoggingMiddleware {
-    pub fn new() -> Self {
-        Self {
-            name: "logging".to_string(),
+struct LoggingTurn;
+
+#[async_trait]
+impl TurnMiddleware for LoggingTurn {
+    async fn on_after_llm(&mut self, cx: &mut HookCx<'_>, reply: &LlmResponse) -> Result<ReplyVerdict> {
+        log::info!("reply in {}: {} tool call(s)", cx.session_id(), reply.tool_calls.len());
+        Ok(ReplyVerdict::Proceed)
+    }
+
+    async fn on_prepared_tool_calls(
+        &mut self,
+        _cx: &mut HookCx<'_>,
+        batch: &PreparedBatch<'_>,
+    ) -> Result<Vec<PreparedCallVerdict>> {
+        for prepared in batch.calls {
+            log::info!("tool call: {}({})", prepared.call.function.name, prepared.args);
         }
-    }
-}
-
-impl MiddlewareDriver for LoggingMiddleware {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    
-    fn process_request(&self, request: &mut Request) -> Result<()> {
-        log::info!("Request: {:?}", request);
-        Ok(())
-    }
-    
-    fn process_response(&self, response: &mut Response) -> Result<()> {
-        log::info!("Response: {:?}", response);
-        Ok(())
-    }
-    
-    fn process_tool_call(&self, tool_call: &mut ToolCall) -> Result<()> {
-        log::info!("Tool call: {}({})", 
-            tool_call.function.name, 
-            tool_call.function.arguments);
-        Ok(())
-    }
-    
-    fn process_tool_result(&self, result: &mut ToolResult) -> Result<()> {
-        log::info!("Tool result: {} -> {} bytes", 
-            result.tool_name, 
-            result.result.len());
-        Ok(())
+        Ok(batch.calls.iter().map(|_| PreparedCallVerdict::Proceed).collect())
     }
 }
 ```
 
-### Middleware with State
+### Middleware with Run State
+
+State that belongs to a run lives on the `TurnMiddleware`. This one stops the run after it has made too many requests in a single run, and reminds the model once:
 
 ```rust
-use std::sync::{Arc, Mutex};
+use querymt_agent::events::StopType;
+use querymt_agent::middleware::{HookCx, Middleware, Result, StepVerdict, Stop, TurnInfo, TurnMiddleware};
+use querymt_agent::model::NoticeSource;
 
-pub struct RateLimitMiddleware {
-    name: String,
-    requests: Arc<Mutex<Vec<u64>>>,
-    max_per_second: usize,
+pub struct RequestBudget {
+    pub max_requests: usize,
 }
 
-impl RateLimitMiddleware {
-    pub fn new(max_per_second: usize) -> Self {
-        Self {
-            name: "rate_limit".to_string(),
-            requests: Arc::new(Mutex::new(Vec::new())),
-            max_per_second,
-        }
+impl Middleware for RequestBudget {
+    fn name(&self) -> &'static str {
+        "request_budget"
     }
-    
-    fn cleanup_old_requests(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        let mut requests = self.requests.lock().unwrap();
-        requests.retain(|&t| now - t < 1);
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(RequestBudgetTurn { max: self.max_requests, seen: 0, reminded: false })
     }
 }
 
-impl MiddlewareDriver for RateLimitMiddleware {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    
-    fn process_request(&self, request: &mut Request) -> Result<()> {
-        self.cleanup_old_requests();
-        
-        let mut requests = self.requests.lock().unwrap();
-        if requests.len() >= self.max_per_second {
-            return Err(MiddlewareError::rate_limit_exceeded(
-                self.name().to_string()
-            ));
+struct RequestBudgetTurn {
+    max: usize,
+    seen: usize,
+    reminded: bool,
+}
+
+#[async_trait::async_trait]
+impl TurnMiddleware for RequestBudgetTurn {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        self.seen += 1;
+        if self.seen > self.max {
+            return Ok(StepVerdict::Stop(Stop::new(StopType::Other, "request budget used")));
         }
-        requests.push(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs());
-        
-        Ok(())
+        if self.seen == self.max && !std::mem::replace(&mut self.reminded, true) {
+            cx.queue_notice(NoticeSource::ProgressReview, "This is your last request in this run.");
+        }
+        Ok(StepVerdict::Proceed)
     }
-    
-    // Other methods...
 }
 ```
+
+Because the instance is created for each run, the counter starts at zero in every run and two sessions never share it. Do not keep per-run state in the `Middleware` itself.
 
 ### Middleware with Configuration
 
+Configuration belongs to the agent-scoped `Middleware`; hand a copy to each run in `begin_turn`.
+
 ```rust
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MyMiddlewareConfig {
-    pub enabled: bool,
     pub option1: String,
     pub option2: Option<usize>,
 }
@@ -449,27 +462,14 @@ pub struct MyMiddleware {
     config: MyMiddlewareConfig,
 }
 
-impl MyMiddleware {
-    pub fn new(config: MyMiddlewareConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl MiddlewareDriver for MyMiddleware {
-    fn name(&self) -> &str {
+impl Middleware for MyMiddleware {
+    fn name(&self) -> &'static str {
         "my_middleware"
     }
-    
-    fn process_request(&self, request: &mut Request) -> Result<()> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-        
-        // Custom logic here
-        Ok(())
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(MyTurn { config: self.config.clone() })
     }
-    
-    // Other methods...
 }
 ```
 
@@ -489,14 +489,13 @@ option2 = 42
 
 ```rust
 use querymt_agent::prelude::*;
-use querymt_agent::middleware::MiddlewareDriver;
 
 let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell"])
-    .middleware(LoggingMiddleware::new())
-    .middleware(RateLimitMiddleware::new(10))
+    .middleware(|_agent| LoggingMiddleware)
+    .middleware(|_agent| RequestBudget { max_requests: 50 })
     .build()
     .await?;
 ```
@@ -506,7 +505,7 @@ let agent = Agent::builder()
 For config-based middleware creation, implement the `MiddlewareFactory` trait:
 
 ```rust
-use querymt_agent::middleware::{MiddlewareFactory, MiddlewareDriver, Result};
+use querymt_agent::middleware::{Middleware, MiddlewareFactory};
 use querymt_agent::agent::agent_config::AgentConfig;
 use serde_json::Value;
 use std::sync::Arc;
@@ -517,130 +516,96 @@ impl MiddlewareFactory for MyMiddlewareFactory {
     fn type_name(&self) -> &'static str {
         "my_middleware"
     }
-    
+
+    /// `Ok(None)` declines to build (for example `enabled = false`).
     fn create(
         &self,
         config: &Value,
         _agent_config: &AgentConfig,
-    ) -> Result<Arc<dyn MiddlewareDriver>> {
-        let config: MyMiddlewareConfig = serde_json::from_value(config.clone())
-            .map_err(|e| anyhow::anyhow!("Invalid config: {}", e))?;
-        
-        Ok(Arc::new(MyMiddleware::new(config)))
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
+        let config: MyMiddlewareConfig = serde_json::from_value(config.clone())?;
+        Ok(Some(Arc::new(MyMiddleware { config })))
     }
 }
-
-// Register the factory
-use querymt_agent::middleware::MIDDLEWARE_REGISTRY;
-MIDDLEWARE_REGISTRY.register(Arc::new(MyMiddlewareFactory));
 ```
+
+The registry holds the factories of the built-in middleware types. Middleware of your own is added in code with `AgentBuilder::middleware`.
 
 ## Middleware Execution Order
 
-Middleware is executed in the order it was added to the chain:
+At every stage the middleware are consulted in the order they were added to the chain, and the first decisive verdict ends the stage:
 
 ```mermaid
 flowchart TD
-    A([Request]) --> M1
-    M1["Middleware 1 (first added)"] --> M2
-    M2[Middleware 2] --> M3
-    M3["Middleware 3 (last added)"] --> AP
-    AP([Agent Processing]) --> M3R
-    M3R["Middleware 3 (response)"] --> M2R
-    M2R["Middleware 2 (response)"] --> M1R
-    M1R["Middleware 1 (response)"] --> Z([Done])
+    A([Stage, for example before a model request]) --> M1
+    M1["Middleware 1 (first added)"] -- "Proceed" --> M2
+    M2[Middleware 2] -- "Proceed" --> M3
+    M3["Middleware 3 (last added)"] -- "Proceed" --> Go([Stage passes])
+    M1 -. "Stop" .-> Dec([Stage ends with that decision])
+    M2 -. "Stop" .-> Dec
+    M3 -. "Stop" .-> Dec
 ```
 
 ## Common Patterns
 
-### Request Validation
+### Stopping a run
 
 ```rust
-pub struct PermissionMiddleware {
-    // ...
+#[async_trait::async_trait]
+impl TurnMiddleware for QuotaTurn {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        if cx.stats().total_output_tokens > self.quota {
+            return Ok(StepVerdict::Stop(Stop::new(StopType::Other, "quota used")));
+        }
+        Ok(StepVerdict::Proceed)
+    }
 }
+```
 
-impl MiddlewareDriver for PermissionMiddleware {
-    fn process_tool_call(&self, tool_call: &mut ToolCall) -> Result<()> {
-        if self.requires_permission(&tool_call.function.name) {
-            // Request permission from user
-            let granted = self.request_permission()?;
-            if !granted {
-                return Err(MiddlewareError::permission_denied(
-                    tool_call.function.name.clone()
-                ));
+### Rejecting a tool call
+
+```rust
+async fn on_prepared_tool_calls(
+    &mut self,
+    _cx: &mut HookCx<'_>,
+    batch: &PreparedBatch<'_>,
+) -> Result<Vec<PreparedCallVerdict>> {
+    Ok(batch
+        .calls
+        .iter()
+        .map(|prepared| {
+            if prepared.call.function.name == "shell" {
+                PreparedCallVerdict::Reject(Box::new(denied_result(prepared)))
+            } else {
+                PreparedCallVerdict::Proceed
             }
-        }
-        Ok(())
-    }
+        })
+        .collect())
 }
 ```
 
-### Response Modification
+### Continuing at the end of a run
 
 ```rust
-pub struct SanitizationMiddleware {
-    // ...
-}
-
-impl MiddlewareDriver for SanitizationMiddleware {
-    fn process_response(&self, response: &mut Response) -> Result<()> {
-        // Remove sensitive information
-        response.content = self.sanitize(&response.content);
-        Ok(())
+async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict> {
+    if self.checked {
+        return Ok(EndVerdict::Finish);
     }
-}
-```
-
-### Tool Call Interception
-
-```rust
-pub struct ToolLoggingMiddleware {
-    // ...
-}
-
-impl MiddlewareDriver for ToolLoggingMiddleware {
-    fn process_tool_call(&self, tool_call: &mut ToolCall) -> Result<()> {
-        // Log before execution
-        self.log_tool_call(tool_call);
-        
-        // Modify arguments if needed
-        if tool_call.function.name == "shell" {
-            // Add safety prefix
-            tool_call.function.arguments = self.sanitize_shell_args(
-                &tool_call.function.arguments
-            );
-        }
-        
-        Ok(())
-    }
+    self.checked = true;
+    cx.queue_notice(NoticeSource::DuplicateCode, "Re-read your changes once more.");
+    Ok(EndVerdict::Continue)
 }
 ```
 
 ## Error Handling
 
-Middleware errors are categorized:
-
-```rust
-pub enum MiddlewareError {
-    InternalError(String),
-    ValidationError(String),
-    PermissionDenied(String),
-    RateLimitExceeded(String),
-    ConfigError(String),
-}
-```
-
-Errors can:
-- **Block execution**: Return error to stop processing
-- **Modify behavior**: Return Ok() with modified data
-- **Log only**: Log and continue
+A hook returns `Result<Verdict>`. An `Err` ends the run with a middleware error that keeps its source; a verdict never signals an error. To end a run on purpose, return `Stop`.
 
 ## Best Practices
 
 1. **Keep middleware focused**: Each middleware should do one thing well
-2. **Be idempotent**: Middleware should produce same result on repeated runs
-3. **Handle errors gracefully**: Don't crash the agent on middleware errors
+2. **Keep run state on the `TurnMiddleware`**: never in the `Middleware`, which every session shares
+3. **Handle errors gracefully**: Return `Err` only when the middleware itself is broken
 4. **Log appropriately**: Use logging for debugging, not for every call
 5. **Consider performance**: Avoid expensive operations in hot paths
 6. **Document behavior**: Clearly document what each middleware does
@@ -655,9 +620,8 @@ Errors can:
 
 ### Middleware Order Issues
 
-- Middleware executes in registration order
-- Use `CompositeDriver` to control order explicitly
-- Consider using middleware presets for common patterns
+- Middleware is consulted in registration order
+- Use middleware presets for common patterns
 
 ### Performance Issues
 

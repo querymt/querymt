@@ -1,13 +1,15 @@
-use crate::agent::core::SessionRuntime;
-pub use crate::middleware::middleware_driver::MiddlewareDriver;
-use crate::middleware::{ExecutionState, Result, ToolCall, ToolResult};
+use crate::middleware::middleware_driver::{
+    EndVerdict, HookCx, Middleware, ReplyVerdict, StepVerdict, Stop, StopVerdict, TurnInfo,
+    TurnMiddleware,
+};
+use crate::middleware::{LlmResponse, Result, ToolCall, ToolResult};
 use crate::tools::FileAccess;
-use log::{debug, trace};
 use querymt_agent_core::events::SessionLimits;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug_span, instrument};
+use tracing::{Instrument, debug, debug_span};
 
 /// One prepared tool call as seen by middleware review.
 ///
@@ -39,126 +41,213 @@ pub enum PreparedCallVerdict {
     Reject(Box<ToolResult>),
 }
 
-/// Composite driver that runs multiple middleware drivers in sequence
+/// The agent's middleware, in configured order. Holds no run state: a run
+/// calls [`begin_turn`](CompositeDriver::begin_turn) to get its own
+/// [`TurnStack`].
 pub struct CompositeDriver {
-    drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    middleware: Vec<Arc<dyn Middleware>>,
 }
 
 impl CompositeDriver {
-    pub fn new(drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
-        debug!("Creating CompositeDriver with {} middleware", drivers.len());
-        Self { drivers }
+    /// A driver over `middleware`, consulted in this order.
+    pub fn new(middleware: Vec<Arc<dyn Middleware>>) -> Self {
+        debug!(count = middleware.len(), "creating composite driver");
+        Self { middleware }
     }
 
+    /// True when no middleware is configured.
     pub fn is_empty(&self) -> bool {
-        self.drivers.is_empty()
+        self.middleware.is_empty()
     }
 
+    /// The number of configured middleware.
     pub fn len(&self) -> usize {
-        self.drivers.len()
+        self.middleware.len()
     }
 
-    pub async fn run_turn_start(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::TurnStart, None)
-            .await
+    /// The state of one run: one instance per middleware.
+    pub fn begin_turn(&self, info: &TurnInfo<'_>) -> TurnStack {
+        TurnStack {
+            instances: self
+                .middleware
+                .iter()
+                .map(|middleware| Instance {
+                    name: middleware.name(),
+                    inner: middleware.begin_turn(info),
+                })
+                .collect(),
+        }
     }
 
-    pub async fn run_turn_start_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::TurnStart,
-            Some(cancellation_token),
-        )
-        .await
+    /// The first manual budget pricing any middleware configures.
+    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        self.middleware
+            .iter()
+            .find_map(|middleware| middleware.budget_pricing())
     }
 
-    pub async fn run_step_start(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::StepStart, None)
-            .await
+    /// The limits of all middleware; the first value of each limit wins.
+    pub fn limits(&self) -> Option<SessionLimits> {
+        self.middleware
+            .iter()
+            .filter_map(|middleware| middleware.limits())
+            .reduce(|first, next| SessionLimits {
+                max_steps: first.max_steps.or(next.max_steps),
+                max_turns: first.max_turns.or(next.max_turns),
+                max_cost_usd: first.max_cost_usd.or(next.max_cost_usd),
+            })
+    }
+}
+
+struct Instance {
+    name: &'static str,
+    inner: Box<dyn TurnMiddleware>,
+}
+
+/// Outcome of consulting the middleware of a stage.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Folded<V> {
+    /// The verdict of the first decisive middleware, or the pass verdict when
+    /// every middleware passed.
+    Decided(V),
+    /// The run was cancelled while the stage was being consulted.
+    Cancelled,
+}
+
+/// A verdict that can say "nothing to decide".
+trait Verdict {
+    const PASS: Self;
+    fn passes(&self) -> bool;
+}
+
+impl Verdict for StepVerdict {
+    const PASS: Self = StepVerdict::Proceed;
+    fn passes(&self) -> bool {
+        matches!(self, StepVerdict::Proceed)
+    }
+}
+
+impl Verdict for ReplyVerdict {
+    const PASS: Self = ReplyVerdict::Proceed;
+    fn passes(&self) -> bool {
+        matches!(self, ReplyVerdict::Proceed)
+    }
+}
+
+impl Verdict for EndVerdict {
+    const PASS: Self = EndVerdict::Finish;
+    fn passes(&self) -> bool {
+        matches!(self, EndVerdict::Finish)
+    }
+}
+
+impl Verdict for StopVerdict {
+    const PASS: Self = StopVerdict::Pass;
+    fn passes(&self) -> bool {
+        matches!(self, StopVerdict::Pass)
+    }
+}
+
+/// Wait for `hook`, or for cancellation, whichever comes first. A hook that
+/// loses the race is dropped and its verdict discarded.
+async fn race<V>(
+    cancel: &CancellationToken,
+    hook: impl Future<Output = Result<V>>,
+) -> Result<Option<V>> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Ok(None),
+        verdict = hook => verdict.map(Some),
+    }
+}
+
+/// The middleware of one run. Dropped with the run, so no state outlives it.
+#[derive(Default)]
+pub struct TurnStack {
+    instances: Vec<Instance>,
+}
+
+/// Consult `$stack`'s instances in order with `$call`, stopping at the first
+/// decisive verdict. Notices and overrides written to `$cx` before that stay.
+macro_rules! consult {
+    ($self:ident, $cx:ident, $cancel:ident, $phase:literal, |$mw:ident| $call:expr) => {{
+        for instance in &mut $self.instances {
+            if $cancel.is_cancelled() {
+                return Ok(Folded::Cancelled);
+            }
+            let span = debug_span!("middleware.driver", name = instance.name, phase = $phase);
+            let $mw = &mut instance.inner;
+            match race($cancel, $call.instrument(span)).await? {
+                None => return Ok(Folded::Cancelled),
+                Some(verdict) if !Verdict::passes(&verdict) => return Ok(Folded::Decided(verdict)),
+                Some(_) => {}
+            }
+        }
+        Ok(Folded::Decided(Verdict::PASS))
+    }};
+}
+
+impl TurnStack {
+    /// True when no middleware is configured.
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
     }
 
-    pub async fn run_step_start_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::StepStart,
-            Some(cancellation_token),
-        )
-        .await
+    /// Before the first step of the run.
+    pub(crate) async fn turn_start(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<StepVerdict>> {
+        consult!(self, cx, cancel, "turn_start", |mw| mw.on_turn_start(cx))
     }
 
-    pub async fn run_after_llm(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::AfterLlm, None)
-            .await
+    /// Before a model request.
+    pub(crate) async fn step_start(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<StepVerdict>> {
+        consult!(self, cx, cancel, "step_start", |mw| mw.on_step_start(cx))
     }
 
-    pub async fn run_after_llm_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::AfterLlm,
-            Some(cancellation_token),
-        )
-        .await
+    /// After a model reply.
+    pub(crate) async fn after_llm(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        reply: &LlmResponse,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<ReplyVerdict>> {
+        consult!(self, cx, cancel, "after_llm", |mw| mw
+            .on_after_llm(cx, reply))
     }
 
-    pub async fn run_processing_tool_calls(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::ProcessingToolCalls, None)
-            .await
+    /// When the model has ended its turn.
+    pub(crate) async fn turn_end(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<EndVerdict>> {
+        consult!(self, cx, cancel, "turn_end", |mw| mw.on_turn_end(cx))
     }
 
-    pub async fn run_processing_tool_calls_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::ProcessingToolCalls,
-            Some(cancellation_token),
-        )
-        .await
+    /// When the run is about to end on `stop`. The first middleware that
+    /// recovers ends the stage.
+    pub(crate) async fn stopped(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        stop: &Stop,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<StopVerdict>> {
+        consult!(self, cx, cancel, "stopped", |mw| mw.on_stopped(cx, stop))
     }
 
-    /// Run every driver's [`MiddlewareDriver::on_prepared_tool_calls`] review.
-    /// A call rejected by one driver is not shown to later drivers. Returns one
-    /// verdict per input call, in order.
-    pub async fn run_prepared_tool_calls(
-        &self,
+    /// Reviews the prepared calls of one scheduling segment. A call rejected
+    /// by one middleware is not shown to later ones. Returns one verdict per
+    /// input call, in order.
+    pub(crate) async fn prepared_tool_calls(
+        &mut self,
+        cx: &mut HookCx<'_>,
         batch: &PreparedBatch<'_>,
     ) -> Result<Vec<PreparedCallVerdict>> {
         let mut verdicts: Vec<PreparedCallVerdict> = batch
@@ -166,7 +255,7 @@ impl CompositeDriver {
             .iter()
             .map(|_| PreparedCallVerdict::Proceed)
             .collect();
-        for driver in &self.drivers {
+        for instance in &mut self.instances {
             let live: Vec<usize> = verdicts
                 .iter()
                 .enumerate()
@@ -178,516 +267,26 @@ impl CompositeDriver {
             }
             let subset: Vec<PreparedToolCall<'_>> =
                 live.iter().map(|&index| batch.calls[index]).collect();
-            let reviewed = driver
-                .on_prepared_tool_calls(&PreparedBatch {
-                    session_id: batch.session_id,
-                    cwd: batch.cwd,
-                    calls: &subset,
-                })
+            let reviewed = instance
+                .inner
+                .on_prepared_tool_calls(
+                    cx,
+                    &PreparedBatch {
+                        session_id: batch.session_id,
+                        cwd: batch.cwd,
+                        calls: &subset,
+                    },
+                )
+                .instrument(debug_span!(
+                    "middleware.driver",
+                    name = instance.name,
+                    phase = "prepared_tool_calls"
+                ))
                 .await?;
             for (&index, verdict) in live.iter().zip(reviewed) {
                 verdicts[index] = verdict;
             }
         }
         Ok(verdicts)
-    }
-
-    pub async fn run_turn_end(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::TurnEnd, None)
-            .await
-    }
-
-    pub async fn run_turn_end_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::TurnEnd,
-            Some(cancellation_token),
-        )
-        .await
-    }
-
-    /// Offers a `Stopped` state to each driver in order.
-    ///
-    /// Returns `BeforeLlmCall` as soon as a driver recovers (later drivers are
-    /// skipped), `Cancelled` on cancellation, otherwise the unchanged stop.
-    pub async fn run_stopped(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::Stopped, None)
-            .await
-    }
-
-    pub async fn run_stopped_cancellable(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<ExecutionState> {
-        self.run_phase(
-            state,
-            runtime,
-            MiddlewarePhase::Stopped,
-            Some(cancellation_token),
-        )
-        .await
-    }
-
-    pub fn reset(&self) {
-        debug!(
-            "Resetting CompositeDriver with {} middleware",
-            self.drivers.len()
-        );
-        for driver in &self.drivers {
-            trace!("Resetting driver: {}", driver.name());
-            driver.reset();
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        "CompositeDriver"
-    }
-
-    /// The first manual budget pricing any driver configures.
-    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
-        self.drivers
-            .iter()
-            .find_map(|driver| driver.budget_pricing())
-    }
-
-    pub fn get_limits(&self) -> Option<SessionLimits> {
-        // Aggregate limits from all drivers
-        let mut limits = SessionLimits::default();
-        let mut has_any = false;
-
-        for driver in &self.drivers {
-            if let Some(driver_limits) = driver.get_limits() {
-                has_any = true;
-                // Take the first non-None value for each limit
-                if limits.max_steps.is_none() && driver_limits.max_steps.is_some() {
-                    limits.max_steps = driver_limits.max_steps;
-                }
-                if limits.max_turns.is_none() && driver_limits.max_turns.is_some() {
-                    limits.max_turns = driver_limits.max_turns;
-                }
-                if limits.max_cost_usd.is_none() && driver_limits.max_cost_usd.is_some() {
-                    limits.max_cost_usd = driver_limits.max_cost_usd;
-                }
-            }
-        }
-
-        if has_any { Some(limits) } else { None }
-    }
-
-    #[instrument(
-        name = "middleware.phase",
-        level = "debug",
-        skip(self, state, runtime),
-        fields(
-            phase = %phase.name(),
-            input_state = %state.name(),
-            output_state = tracing::field::Empty,
-            drivers_count = %self.drivers.len()
-        )
-    )]
-    async fn run_phase(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-        phase: MiddlewarePhase,
-        cancellation_token: Option<&CancellationToken>,
-    ) -> Result<ExecutionState> {
-        let state_name = state.name();
-        trace!(
-            "CompositeDriver::run_phase entering {} with state: {}",
-            phase.name(),
-            state_name
-        );
-
-        let mut current = state;
-
-        for (idx, driver) in self.drivers.iter().enumerate() {
-            let driver_name = driver.name();
-            let current_state_name = current.name();
-
-            trace!(
-                "  Running driver {}/{}: {} on phase {} with state: {}",
-                idx + 1,
-                self.drivers.len(),
-                driver_name,
-                phase.name(),
-                current_state_name
-            );
-
-            let span = debug_span!(
-                "middleware.driver",
-                name = %driver_name,
-                phase = %phase.name(),
-                index = idx,
-                total = self.drivers.len(),
-                input_state = %current_state_name,
-                output_state = tracing::field::Empty,
-                terminal = tracing::field::Empty,
-            );
-            if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-                current = ExecutionState::Cancelled;
-            } else {
-                let invocation = match phase {
-                    MiddlewarePhase::TurnStart => driver.on_turn_start(current, runtime),
-                    MiddlewarePhase::StepStart => driver.on_step_start(current, runtime),
-                    MiddlewarePhase::AfterLlm => driver.on_after_llm(current, runtime),
-                    MiddlewarePhase::ProcessingToolCalls => {
-                        driver.on_processing_tool_calls(current, runtime)
-                    }
-                    MiddlewarePhase::TurnEnd => driver.on_turn_end(current, runtime),
-                    MiddlewarePhase::Stopped => driver.on_stopped(current, runtime),
-                }
-                .instrument(span.clone());
-
-                current = if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => ExecutionState::Cancelled,
-                        result = invocation => result?,
-                    }
-                } else {
-                    invocation.await?
-                };
-            }
-
-            let new_state_name = current.name();
-            span.record("output_state", new_state_name);
-            trace!(
-                "  Driver {} transitioned: {} -> {}",
-                driver_name, current_state_name, new_state_name
-            );
-
-            // During TurnEnd, Complete is the expected pass-through state —
-            // middleware may transform it to BeforeLlmCall (e.g., dedup_check
-            // injecting a duplicate-code review). Only Stopped/Cancelled are
-            // truly terminal during TurnEnd.
-            //
-            // During Stopped, the stop itself is the pass-through state: the
-            // phase ends only when a driver recovers (BeforeLlmCall) or the
-            // run is cancelled.
-            let is_terminal = match phase {
-                MiddlewarePhase::Stopped => matches!(
-                    current,
-                    ExecutionState::BeforeLlmCall { .. } | ExecutionState::Cancelled
-                ),
-                MiddlewarePhase::TurnEnd => {
-                    matches!(
-                        current,
-                        ExecutionState::Stopped { .. } | ExecutionState::Cancelled
-                    )
-                }
-                _ => {
-                    matches!(
-                        current,
-                        ExecutionState::Complete { .. }
-                            | ExecutionState::Stopped { .. }
-                            | ExecutionState::Cancelled
-                    )
-                }
-            };
-            if is_terminal {
-                span.record("terminal", true);
-                debug!(
-                    "CompositeDriver: {} produced terminal state {}, stopping pipeline",
-                    driver_name, new_state_name
-                );
-                break;
-            }
-
-            span.record("terminal", false);
-        }
-
-        let final_state_name = current.name();
-        trace!(
-            "CompositeDriver::run_phase exiting {} with state: {}",
-            phase.name(),
-            final_state_name
-        );
-
-        // Record the output state in the tracing span
-        tracing::Span::current().record("output_state", final_state_name);
-
-        Ok(current)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum MiddlewarePhase {
-    TurnStart,
-    StepStart,
-    AfterLlm,
-    ProcessingToolCalls,
-    TurnEnd,
-    Stopped,
-}
-
-impl MiddlewarePhase {
-    fn name(&self) -> &'static str {
-        match self {
-            MiddlewarePhase::TurnStart => "turn_start",
-            MiddlewarePhase::StepStart => "step_start",
-            MiddlewarePhase::AfterLlm => "after_llm",
-            MiddlewarePhase::ProcessingToolCalls => "processing_tool_calls",
-            MiddlewarePhase::TurnEnd => "turn_end",
-            MiddlewarePhase::Stopped => "stopped",
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::middleware::{AgentStats, ConversationContext};
-    use async_trait::async_trait;
-    use querymt_agent_core::events::StopType;
-    use std::sync::Arc;
-
-    struct TestDriver {
-        name: &'static str,
-        should_stop: bool,
-    }
-
-    #[async_trait]
-    impl MiddlewareDriver for TestDriver {
-        async fn on_turn_start(
-            &self,
-            state: ExecutionState,
-            _runtime: Option<&Arc<SessionRuntime>>,
-        ) -> Result<ExecutionState> {
-            if self.should_stop {
-                Ok(ExecutionState::Stopped {
-                    message: "test stop".into(),
-                    stop_type: StopType::Other,
-                    context: None,
-                })
-            } else {
-                Ok(state)
-            }
-        }
-
-        fn reset(&self) {}
-
-        fn name(&self) -> &'static str {
-            self.name
-        }
-    }
-
-    #[tokio::test]
-    async fn test_composite_driver_pass_through() {
-        let drivers = vec![
-            Arc::new(TestDriver {
-                name: "driver1",
-                should_stop: false,
-            }) as Arc<dyn MiddlewareDriver>,
-            Arc::new(TestDriver {
-                name: "driver2",
-                should_stop: false,
-            }) as Arc<dyn MiddlewareDriver>,
-        ];
-
-        let composite = CompositeDriver::new(drivers);
-        let context = Arc::new(ConversationContext {
-            session_id: "test".into(),
-            messages: Arc::from([]),
-            request_objective: None,
-            pending_notices: Arc::from([]),
-            stored_mode_notice: None,
-            tool_baseline: None,
-            stats: Arc::new(AgentStats::default()),
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: Default::default(),
-            profile: Default::default(),
-            last_applied: Default::default(),
-        });
-
-        let state = ExecutionState::BeforeLlmCall { context };
-        let result = composite.run_turn_start(state, None).await.unwrap();
-
-        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_composite_driver_stop() {
-        let drivers = vec![
-            Arc::new(TestDriver {
-                name: "driver1",
-                should_stop: false,
-            }) as Arc<dyn MiddlewareDriver>,
-            Arc::new(TestDriver {
-                name: "stopper",
-                should_stop: true,
-            }) as Arc<dyn MiddlewareDriver>,
-            Arc::new(TestDriver {
-                name: "driver3",
-                should_stop: false,
-            }) as Arc<dyn MiddlewareDriver>,
-        ];
-
-        let composite = CompositeDriver::new(drivers);
-        let context = Arc::new(ConversationContext {
-            session_id: "test".into(),
-            messages: Arc::from([]),
-            request_objective: None,
-            pending_notices: Arc::from([]),
-            stored_mode_notice: None,
-            tool_baseline: None,
-            stats: Arc::new(AgentStats::default()),
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: Default::default(),
-            profile: Default::default(),
-            last_applied: Default::default(),
-        });
-
-        let state = ExecutionState::BeforeLlmCall { context };
-        let result = composite.run_turn_start(state, None).await.unwrap();
-
-        // Should stop at the second driver and not run third
-        assert!(matches!(result, ExecutionState::Stopped { .. }));
-    }
-
-    /// Records every `on_stopped` call and optionally recovers from the stop.
-    struct StopRecorder {
-        name: &'static str,
-        recover: bool,
-        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
-    }
-
-    #[async_trait]
-    impl MiddlewareDriver for StopRecorder {
-        async fn on_stopped(
-            &self,
-            state: ExecutionState,
-            _runtime: Option<&Arc<SessionRuntime>>,
-        ) -> Result<ExecutionState> {
-            self.calls.lock().unwrap().push(self.name);
-            match (self.recover, state.context()) {
-                (true, Some(context)) => Ok(ExecutionState::BeforeLlmCall {
-                    context: context.clone(),
-                }),
-                _ => Ok(state),
-            }
-        }
-
-        fn reset(&self) {}
-
-        fn name(&self) -> &'static str {
-            self.name
-        }
-    }
-
-    fn stopped_state() -> ExecutionState {
-        let context = Arc::new(ConversationContext::new(
-            "test".into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock-model".into(),
-        ));
-        ExecutionState::Stopped {
-            message: "cut off".into(),
-            stop_type: StopType::ModelTokenLimit,
-            context: Some(context),
-        }
-    }
-
-    fn recorders(
-        spec: &[(&'static str, bool)],
-    ) -> (CompositeDriver, Arc<std::sync::Mutex<Vec<&'static str>>>) {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let drivers = spec
-            .iter()
-            .map(|&(name, recover)| {
-                Arc::new(StopRecorder {
-                    name,
-                    recover,
-                    calls: calls.clone(),
-                }) as Arc<dyn MiddlewareDriver>
-            })
-            .collect();
-        (CompositeDriver::new(drivers), calls)
-    }
-
-    #[tokio::test]
-    async fn run_stopped_passes_the_stop_through_when_nobody_recovers() {
-        let (composite, calls) = recorders(&[("first", false), ("second", false)]);
-
-        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
-
-        assert!(matches!(
-            result,
-            ExecutionState::Stopped {
-                stop_type: StopType::ModelTokenLimit,
-                ..
-            }
-        ));
-        // A Stopped result moves on, so every driver gets to act.
-        assert_eq!(*calls.lock().unwrap(), vec!["first", "second"]);
-    }
-
-    #[tokio::test]
-    async fn run_stopped_ends_the_phase_when_a_driver_recovers() {
-        let (composite, calls) = recorders(&[("recovers", true), ("never_runs", true)]);
-
-        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
-
-        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
-        assert_eq!(*calls.lock().unwrap(), vec!["recovers"]);
-    }
-
-    #[tokio::test]
-    async fn run_stopped_runs_drivers_in_order_until_one_recovers() {
-        let (composite, calls) = recorders(&[("first", false), ("second", true), ("third", true)]);
-
-        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
-
-        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
-        assert_eq!(*calls.lock().unwrap(), vec!["first", "second"]);
-    }
-
-    #[tokio::test]
-    async fn default_on_stopped_is_a_pass_through() {
-        let composite = CompositeDriver::new(vec![Arc::new(TestDriver {
-            name: "plain",
-            should_stop: false,
-        }) as Arc<dyn MiddlewareDriver>]);
-
-        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
-
-        assert!(matches!(result, ExecutionState::Stopped { .. }));
-    }
-
-    #[tokio::test]
-    async fn run_stopped_cancellable_reports_cancellation() {
-        let (composite, calls) = recorders(&[("first", true)]);
-        let token = CancellationToken::new();
-        token.cancel();
-
-        let result = composite
-            .run_stopped_cancellable(stopped_state(), None, &token)
-            .await
-            .unwrap();
-
-        assert!(matches!(result, ExecutionState::Cancelled));
-        assert!(calls.lock().unwrap().is_empty());
     }
 }

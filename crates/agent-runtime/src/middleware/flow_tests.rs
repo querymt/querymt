@@ -1,163 +1,153 @@
 use crate::middleware::{
-    AgentStats, CompositeDriver, ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver,
+    AgentStats, ConversationContext, ExecutionState, LlmResponse, Middleware, ReplyVerdict,
+    StepVerdict, Stop,
 };
-use crate::test_utils::{
-    AlwaysStopDriver, BeforeLlmCallToCallLlmDriver, MessageInjectingDriver, StateRecordingDriver,
-    test_context,
-};
+use crate::test_utils::{Act, HookRig, ScriptedMiddleware, test_context};
 use querymt::chat::FinishReason;
 use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
-#[tokio::test]
-async fn test_state_recording_middleware() {
-    let (recorder, states) = StateRecordingDriver::new();
-    let composite = CompositeDriver::new(vec![Arc::new(recorder)]);
-    let context = test_context("sess-1", 0);
-    let response = Arc::new(LlmResponse::new(
+fn stack_of(middleware: &[&ScriptedMiddleware]) -> crate::middleware::TurnStack {
+    HookRig::stack(
+        middleware
+            .iter()
+            .map(|m| Arc::new((*m).clone()) as Arc<dyn Middleware>)
+            .collect(),
+    )
+}
+
+fn response() -> Arc<LlmResponse> {
+    Arc::new(LlmResponse::new(
         "".to_string(),
         vec![],
         None,
         Some(FinishReason::Stop),
-    ));
+    ))
+}
 
-    composite
-        .run_turn_start(
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    composite
-        .run_step_start(
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    composite
-        .run_after_llm(
-            ExecutionState::AfterLlm {
-                response,
-                context: context.clone(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+#[tokio::test]
+async fn every_hook_is_called_in_run_order() {
+    let recorder = ScriptedMiddleware::default();
+    let mut stack = stack_of(&[&recorder]);
+    let rig = HookRig::new();
+    let context = test_context("sess-1", 0);
 
-    let recorded = states.lock().unwrap();
-    assert_eq!(recorded.len(), 3);
-    assert_eq!(recorded[0], "BeforeLlmCall");
-    assert_eq!(recorded[1], "BeforeLlmCall");
-    assert_eq!(recorded[2], "AfterLlm");
+    rig.turn_start(
+        &mut stack,
+        ExecutionState::BeforeLlmCall {
+            context: context.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    rig.step_start(
+        &mut stack,
+        ExecutionState::BeforeLlmCall {
+            context: context.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    rig.after_llm(
+        &mut stack,
+        ExecutionState::AfterLlm {
+            response: response(),
+            context: context.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let hooks: Vec<_> = recorder.calls().into_iter().map(|(hook, _)| hook).collect();
+    assert_eq!(hooks, ["turn_start", "step_start", "after_llm"]);
 }
 
 #[tokio::test]
 async fn test_message_injection_flow() {
-    let injector = MessageInjectingDriver {
-        inject_content: "Remember to be helpful".to_string(),
-    };
-    let composite = CompositeDriver::new(vec![Arc::new(injector)]);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let injector = ScriptedMiddleware::default()
+        .turn_start([Act::Notice("Remember to be helpful", StepVerdict::Proceed)]);
+    let mut stack = stack_of(&[&injector]);
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
+    let result = HookRig::new()
+        .turn_start(
+            &mut stack,
+            ExecutionState::BeforeLlmCall {
+                context: test_context("sess-1", 0),
+            },
+        )
+        .await
+        .unwrap();
 
-    if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.pending_notices.len(), 1);
-        assert!(
-            context.pending_notices[0]
-                .content
-                .contains("Remember to be helpful")
-        );
-    } else {
+    let ExecutionState::BeforeLlmCall { context } = result else {
         panic!("Expected BeforeLlmCall state");
-    }
+    };
+    assert_eq!(context.pending_notices.len(), 1);
+    assert!(
+        context.pending_notices[0]
+            .content
+            .contains("Remember to be helpful")
+    );
 }
 
 #[tokio::test]
 async fn test_multiple_middleware_interaction() {
-    let (recorder, states) = StateRecordingDriver::new();
-    let injector = MessageInjectingDriver {
-        inject_content: "injected".to_string(),
-    };
-    let composite = CompositeDriver::new(vec![Arc::new(recorder), Arc::new(injector)]);
-    let context = test_context("sess-1", 0);
+    let recorder = ScriptedMiddleware::default();
+    let injector =
+        ScriptedMiddleware::default().turn_start([Act::Notice("injected", StepVerdict::Proceed)]);
+    let mut stack = stack_of(&[&recorder, &injector]);
 
-    let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall { context }, None)
+    let result = HookRig::new()
+        .turn_start(
+            &mut stack,
+            ExecutionState::BeforeLlmCall {
+                context: test_context("sess-1", 0),
+            },
+        )
         .await
         .unwrap();
 
-    assert_eq!(states.lock().unwrap().len(), 1);
-
-    if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.pending_notices.len(), 1);
-    } else {
+    assert_eq!(recorder.calls().len(), 1);
+    let ExecutionState::BeforeLlmCall { context } = result else {
         panic!("Expected BeforeLlmCall state");
-    }
-}
-
-#[tokio::test]
-async fn test_middleware_can_transform_call_llm() {
-    let composite = CompositeDriver::new(vec![Arc::new(BeforeLlmCallToCallLlmDriver)]);
-    let context = test_context("sess-1", 0);
-
-    let result = composite
-        .run_step_start(ExecutionState::BeforeLlmCall { context }, None)
-        .await
-        .unwrap();
-
-    assert!(matches!(result, ExecutionState::CallLlm { .. }));
+    };
+    assert_eq!(context.pending_notices.len(), 1);
 }
 
 #[tokio::test]
 async fn test_middleware_can_transform_to_stopped() {
-    let composite = CompositeDriver::new(vec![Arc::new(AlwaysStopDriver {
-        stop_type: StopType::Other,
-    })]);
+    let stopper = ScriptedMiddleware::default()
+        .turn_start([Act::Say(StepVerdict::Stop(Stop::new(
+            StopType::Other,
+            "stop",
+        )))])
+        .step_start([Act::Say(StepVerdict::Stop(Stop::new(
+            StopType::Other,
+            "stop",
+        )))])
+        .after_llm([Act::Say(ReplyVerdict::Stop(Stop::new(
+            StopType::Other,
+            "stop",
+        )))]);
+    let mut stack = stack_of(&[&stopper]);
+    let rig = HookRig::new();
     let context = test_context("sess-1", 0);
-    let response = Arc::new(LlmResponse::new(
-        "".to_string(),
-        vec![],
-        None,
-        Some(FinishReason::Stop),
-    ));
+    let before = || ExecutionState::BeforeLlmCall {
+        context: context.clone(),
+    };
 
-    let result = composite
-        .run_turn_start(
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    let result = rig.turn_start(&mut stack, before()).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 
-    let result = composite
-        .run_step_start(
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    let result = rig.step_start(&mut stack, before()).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 
-    let result = composite
-        .run_after_llm(
+    let result = rig
+        .after_llm(
+            &mut stack,
             ExecutionState::AfterLlm {
-                response,
+                response: response(),
                 context: context.clone(),
             },
-            None,
         )
         .await
         .unwrap();
@@ -166,8 +156,7 @@ async fn test_middleware_can_transform_to_stopped() {
 
 #[tokio::test]
 async fn test_stats_propagate_through_middleware() {
-    let (recorder, _) = StateRecordingDriver::new();
-    let composite = CompositeDriver::new(vec![Arc::new(recorder)]);
+    let mut stack = stack_of(&[&ScriptedMiddleware::default()]);
     let stats = Arc::new(AgentStats {
         steps: 42,
         total_input_tokens: 1000,
@@ -183,55 +172,40 @@ async fn test_stats_propagate_through_middleware() {
         "mock-model".into(),
     ));
 
-    let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall { context }, None)
+    let result = HookRig::new()
+        .turn_start(&mut stack, ExecutionState::BeforeLlmCall { context })
         .await
         .unwrap();
 
-    if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.stats.steps, 42);
-        assert_eq!(context.stats.total_input_tokens, 1000);
-    } else {
+    let ExecutionState::BeforeLlmCall { context } = result else {
         panic!("Expected BeforeLlmCall state");
-    }
+    };
+    assert_eq!(context.stats.steps, 42);
+    assert_eq!(context.stats.total_input_tokens, 1000);
 }
 
 #[tokio::test]
 async fn test_context_immutability() {
-    let injector = MessageInjectingDriver {
-        inject_content: "new message".to_string(),
-    };
-    let composite = CompositeDriver::new(vec![Arc::new(injector)]);
+    let injector = ScriptedMiddleware::default()
+        .turn_start([Act::Notice("new message", StepVerdict::Proceed)]);
+    let mut stack = stack_of(&[&injector]);
     let original = test_context("sess-1", 0);
     let original_len = original.messages.len();
 
-    let result = composite
-        .run_turn_start(
+    let result = HookRig::new()
+        .turn_start(
+            &mut stack,
             ExecutionState::BeforeLlmCall {
                 context: original.clone(),
             },
-            None,
         )
         .await
         .unwrap();
 
     assert_eq!(original.messages.len(), original_len);
     assert!(original.pending_notices.is_empty());
-
-    if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.pending_notices.len(), 1);
-    } else {
+    let ExecutionState::BeforeLlmCall { context } = result else {
         panic!("Expected BeforeLlmCall state");
-    }
-}
-
-#[tokio::test]
-async fn test_driver_name_returns_correct_value() {
-    let composite = CompositeDriver::new(vec![]);
-    assert_eq!(composite.name(), "CompositeDriver");
-
-    let driver = AlwaysStopDriver {
-        stop_type: StopType::Other,
     };
-    assert_eq!(driver.name(), "AlwaysStopDriver");
+    assert_eq!(context.pending_notices.len(), 1);
 }

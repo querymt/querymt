@@ -1,5 +1,5 @@
 use crate::middleware::{
-    ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware, MiddlewareDriver,
+    ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware, Middleware,
     OutputLimitRecoveryMiddleware,
 };
 use querymt_agent_services::model_info::ModelInfoSource;
@@ -9,7 +9,7 @@ pub struct MiddlewarePresets;
 
 impl MiddlewarePresets {
     /// Sensible defaults with dynamic model info lookup
-    pub fn defaults() -> Vec<Arc<dyn MiddlewareDriver>> {
+    pub fn defaults() -> Vec<Arc<dyn Middleware>> {
         vec![
             // Registered first so it sees a model-token-limit stop before any
             // other driver can publish it.
@@ -31,7 +31,7 @@ impl MiddlewarePresets {
     }
 
     /// Strict limits for cost control with dynamic model info
-    pub fn cost_conscious() -> Vec<Arc<dyn MiddlewareDriver>> {
+    pub fn cost_conscious() -> Vec<Arc<dyn Middleware>> {
         vec![
             Arc::new(LimitsMiddleware::new(LimitsConfig {
                 max_steps: Some(50),
@@ -50,7 +50,7 @@ impl MiddlewarePresets {
     }
 
     /// Minimal middleware for maximum speed
-    pub fn performance() -> Vec<Arc<dyn MiddlewareDriver>> {
+    pub fn performance() -> Vec<Arc<dyn Middleware>> {
         vec![Arc::new(LimitsMiddleware::new(LimitsConfig {
             max_steps: None,
             max_turns: None,
@@ -64,7 +64,7 @@ impl MiddlewarePresets {
         context_limit: usize,
         input_cost: f64,
         output_cost: f64,
-    ) -> Vec<Arc<dyn MiddlewareDriver>> {
+    ) -> Vec<Arc<dyn Middleware>> {
         let model_info_source = ModelInfoSource::manual()
             .context_limit(context_limit)
             .pricing(input_cost, output_cost);
@@ -154,11 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn preset_drivers_can_reset() {
+    fn preset_middleware_begins_a_run() {
         let drivers = MiddlewarePresets::defaults();
+        let info = crate::middleware::TurnInfo::new("s", crate::agent::core::AgentMode::Build);
         for d in &drivers {
-            // reset() should not panic
-            d.reset();
+            // A run's state is built from the middleware, never shared.
+            let _turn = d.begin_turn(&info);
         }
     }
 
@@ -168,7 +169,7 @@ mod tests {
         let drivers = MiddlewarePresets::defaults();
         use crate::middleware::CompositeDriver;
         let composite = CompositeDriver::new(drivers);
-        let limits = composite.get_limits();
+        let limits = composite.limits();
         // Should return Some since LimitsMiddleware provides limits
         assert!(
             limits.is_some(),
@@ -185,7 +186,7 @@ mod tests {
         let drivers = MiddlewarePresets::performance();
         use crate::middleware::CompositeDriver;
         let composite = CompositeDriver::new(drivers);
-        let limits = composite.get_limits();
+        let limits = composite.limits();
         if let Some(limits) = limits {
             assert!(limits.max_steps.is_none());
             assert!(limits.max_turns.is_none());

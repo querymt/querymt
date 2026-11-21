@@ -3320,14 +3320,9 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         env.cancellation_token.is_cancelled()
     );
 
-    // Changed files belong to one run: start from none, and drop what the run
-    // leaves (a review that did not run, or changes made after it).
-    *runtime.turn_diffs.lock() = Default::default();
-
     // Execute Agent Loop using State Machine
     let result =
         crate::agent::execution::execute_cycle_state_machine(&config, &env, &mut turn, mode).await;
-    *runtime.turn_diffs.lock() = Default::default();
 
     debug!(
         "Session {}: state machine returned: {:?}",

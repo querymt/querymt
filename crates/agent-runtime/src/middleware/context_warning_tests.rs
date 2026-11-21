@@ -2,7 +2,8 @@
 //! `agent-middleware`, "Context-usage warning is stored once per run").
 
 use crate::middleware::{
-    ContextConfig, ContextMiddleware, ExecutionState, MiddlewareDriver, Result,
+    ContextConfig, ContextMiddleware, HookCx, Middleware, Result, StepVerdict, TurnInfo,
+    TurnMiddleware,
 };
 use crate::test_utils::{
     MockChatResponse, MockLlmProvider, SharedLlmProvider, UndoTestFixture, mock_querymt_tool_call,
@@ -33,7 +34,7 @@ fn reply_using(used: u32, response: MockChatResponse) -> MockChatResponse {
 
 /// A provider that answers with a `write_file` call until the request holds
 /// `tool_steps` tool results, then with text. Every reply reports `used` tokens.
-fn stepping_provider(tool_steps: usize, used: u32) -> SharedLlmProvider {
+pub(super) fn stepping_provider(tool_steps: usize, used: u32) -> SharedLlmProvider {
     let respond = Arc::new(move |messages: &[ChatMessage]| {
         // Only the tool results of the current run count: it starts at the
         // last prompt, which every test words "run ...".
@@ -72,7 +73,7 @@ fn stepping_provider(tool_steps: usize, used: u32) -> SharedLlmProvider {
     SharedLlmProvider::new(mock, vec![WriteFileTool::new().definition()])
 }
 
-fn context_middleware(config: ContextConfig) -> Arc<dyn MiddlewareDriver> {
+fn context_middleware(config: ContextConfig) -> Arc<dyn Middleware> {
     Arc::new(ContextMiddleware::new(config))
 }
 
@@ -80,7 +81,11 @@ fn manual_limit() -> ContextConfig {
     ContextConfig::with_manual_limit(LIMIT)
 }
 
-async fn session_on_model(fixture: &UndoTestFixture, cwd: &std::path::Path, model: &str) -> String {
+pub(super) async fn session_on_model(
+    fixture: &UndoTestFixture,
+    cwd: &std::path::Path,
+    model: &str,
+) -> String {
     let session = fixture.create_session_with_cwd(cwd).await.expect("session");
     let store = fixture.storage.session_store();
     let llm_config = store
@@ -172,11 +177,12 @@ async fn warning_turned_off() {
 /// Makes two sessions take their steps in turn: A's step `k` starts after B's
 /// step `k - 1` has passed the context middleware, and B's step `k` after A's
 /// step `k` has. `role` places it before or after that middleware.
+#[derive(Clone)]
 struct Alternate {
     role: Role,
     a: Arc<OnceLock<String>>,
     done: Arc<Done>,
-    started: Mutex<HashMap<String, usize>>,
+    started: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -205,14 +211,20 @@ async fn reached(counter: &watch::Sender<usize>, steps: usize) {
         .expect("counter open");
 }
 
+impl Middleware for Alternate {
+    fn name(&self) -> &'static str {
+        "Alternate"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(self.clone())
+    }
+}
+
 #[async_trait]
-impl MiddlewareDriver for Alternate {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        let session = state.context().expect("context").session_id.to_string();
+impl TurnMiddleware for Alternate {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        let session = cx.session_id().to_string();
         let a = self.is_a(&session);
         match self.role {
             Role::BeforeContext => {
@@ -233,13 +245,7 @@ impl MiddlewareDriver for Alternate {
                 counter.send_modify(|done| *done += 1);
             }
         }
-        Ok(state)
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "Alternate"
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -250,12 +256,12 @@ async fn sessions_on_different_models_each_get_one_warning() {
         a: watch::channel(0).0,
         b: watch::channel(0).0,
     });
-    let alternate = |role| -> Arc<dyn MiddlewareDriver> {
+    let alternate = |role| -> Arc<dyn Middleware> {
         Arc::new(Alternate {
             role,
             a: a.clone(),
             done: done.clone(),
-            started: Mutex::default(),
+            started: Arc::default(),
         })
     };
     let fixture = UndoTestFixture::with_provider_and_middleware(

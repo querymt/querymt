@@ -27,9 +27,9 @@ use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, StopOnBeforeLlmCall,
-    TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
-    mock_session,
+    Act, MockChatResponse, MockLlmProvider, MockSessionStore, ScriptedMiddleware,
+    SharedLlmProvider, TestProviderFactory, mock_llm_config, mock_plugin_registry,
+    mock_querymt_tool_call, mock_session,
 };
 use crate::tools::{Tool as AgentTool, ToolContext, ToolError, ToolExecutionClass, ToolRegistry};
 use querymt_agent_core::events::AgentEventKind;
@@ -303,7 +303,7 @@ impl TestHarness {
     /// Rebuild the config with one extra middleware and a stop-recovery limit.
     fn install_stop_recovery(
         &mut self,
-        middleware: impl crate::middleware::MiddlewareDriver + 'static,
+        middleware: impl crate::middleware::Middleware + 'static,
         max_stop_recoveries: u8,
     ) {
         let mut policy = self.config.execution_policy.clone();
@@ -586,64 +586,26 @@ fn provider_tool(name: &str) -> Tool {
 
 /// Stops at step start (for the first `stop_steps` steps) with a model token
 /// limit, and recovers every stop it is offered.
-struct StopThenRecover {
-    stop_steps: usize,
-    steps: AtomicUsize,
-    recoveries_offered: AtomicUsize,
-}
-
-impl StopThenRecover {
-    fn new(stop_steps: usize) -> Self {
-        Self {
-            stop_steps,
-            steps: AtomicUsize::new(0),
-            recoveries_offered: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl crate::middleware::MiddlewareDriver for StopThenRecover {
-    async fn on_step_start(
-        &self,
-        state: crate::middleware::ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        let step = self.steps.fetch_add(1, Ordering::SeqCst);
-        match state {
-            crate::middleware::ExecutionState::BeforeLlmCall { context }
-                if step < self.stop_steps =>
-            {
-                Ok(crate::middleware::ExecutionState::Stopped {
-                    message: "cut off".into(),
-                    stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
-                    context: Some(context),
-                })
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn on_stopped(
-        &self,
-        state: crate::middleware::ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.recoveries_offered.fetch_add(1, Ordering::SeqCst);
-        match state {
-            crate::middleware::ExecutionState::Stopped {
-                context: Some(context),
-                ..
-            } => Ok(crate::middleware::ExecutionState::BeforeLlmCall { context }),
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "StopThenRecover"
-    }
+fn stop_then_recover(stop_steps: usize) -> ScriptedMiddleware {
+    use crate::middleware::{StepVerdict, Stop, StopVerdict};
+    let stop = || {
+        Act::Say(StepVerdict::Stop(Stop::new(
+            querymt_agent_core::events::StopType::ModelTokenLimit,
+            "cut off",
+        )))
+    };
+    // The last act repeats: the steps after the last stop proceed.
+    let steps: Vec<_> = if stop_steps == usize::MAX {
+        vec![stop()]
+    } else {
+        (0..stop_steps)
+            .map(|_| stop())
+            .chain([Act::Say(StepVerdict::Proceed)])
+            .collect()
+    };
+    ScriptedMiddleware::default()
+        .step_start(steps)
+        .stopped([Act::Say(StopVerdict::Recover)])
 }
 
 /// Count `MiddlewareStopped` events currently buffered on `events`.
@@ -665,8 +627,8 @@ async fn drain_middleware_stopped(
 #[tokio::test]
 async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
     let mut harness = TestHarness::new(vec![], None).await;
-    let middleware = Arc::new(StopThenRecover::new(1));
-    harness.install_stop_recovery(SharedDriver(middleware.clone()), 5);
+    let middleware = stop_then_recover(1);
+    harness.install_stop_recovery(middleware.clone(), 5);
     harness
         .provider_mut()
         .await
@@ -684,7 +646,7 @@ async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
-    assert_eq!(middleware.recoveries_offered.load(Ordering::SeqCst), 1);
+    assert_eq!(middleware.count("stopped"), 1);
     assert_eq!(
         drain_middleware_stopped(&mut events).await,
         0,
@@ -696,8 +658,8 @@ async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
 async fn recovery_guard_publishes_the_stop_after_the_limit() {
     let mut harness = TestHarness::new(vec![], None).await;
     // Stops on every step and recovers every time it is asked.
-    let middleware = Arc::new(StopThenRecover::new(usize::MAX));
-    harness.install_stop_recovery(SharedDriver(middleware.clone()), 2);
+    let middleware = stop_then_recover(usize::MAX);
+    harness.install_stop_recovery(middleware.clone(), 2);
     let mut events = harness.config.subscribe_events();
 
     let outcome = harness.run().await;
@@ -713,12 +675,12 @@ async fn recovery_guard_publishes_the_stop_after_the_limit() {
         "{outcome:?}"
     );
     assert_eq!(
-        middleware.recoveries_offered.load(Ordering::SeqCst),
+        middleware.count("stopped"),
         2,
         "middleware is consulted at most max_stop_recoveries times"
     );
     assert_eq!(
-        middleware.steps.load(Ordering::SeqCst),
+        middleware.count("step_start"),
         3,
         "the initial attempt plus one per recovery"
     );
@@ -728,7 +690,7 @@ async fn recovery_guard_publishes_the_stop_after_the_limit() {
 #[tokio::test]
 async fn stop_without_a_recovering_middleware_is_published_immediately() {
     let mut harness = TestHarness::new(vec![], None).await;
-    harness.install_stop_recovery(StopOnBeforeLlmCall, 5);
+    harness.install_stop_recovery(stop_at_every_step(), 5);
     let mut events = harness.config.subscribe_events();
 
     let outcome = harness.run().await;
@@ -737,36 +699,13 @@ async fn stop_without_a_recovering_middleware_is_published_immediately() {
     assert_eq!(drain_middleware_stopped(&mut events).await, 1);
 }
 
-/// Lets a test keep a handle on a middleware installed by value.
-struct SharedDriver<T>(Arc<T>);
-
-#[async_trait]
-impl<T: crate::middleware::MiddlewareDriver> crate::middleware::MiddlewareDriver
-    for SharedDriver<T>
-{
-    async fn on_step_start(
-        &self,
-        state: crate::middleware::ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.0.on_step_start(state, runtime).await
-    }
-
-    async fn on_stopped(
-        &self,
-        state: crate::middleware::ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.0.on_stopped(state, runtime).await
-    }
-
-    fn reset(&self) {
-        self.0.reset();
-    }
-
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
+/// Stops before every model request and recovers nothing.
+fn stop_at_every_step() -> ScriptedMiddleware {
+    use crate::middleware::{StepVerdict, Stop};
+    ScriptedMiddleware::default().step_start([Act::Say(StepVerdict::Stop(Stop::new(
+        querymt_agent_core::events::StopType::Other,
+        "stopped",
+    )))])
 }
 
 async fn run_completion_guard_case(
@@ -892,7 +831,7 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
         )
         .with_tool_policy(ToolPolicy::ProviderOnly)
         .with_execution_policy(policy)
-        .with_middleware(StopThenRecover::new(1))
+        .with_middleware(stop_then_recover(1))
         .with_hooks(hooks)
         .build(),
     );
@@ -1707,29 +1646,15 @@ async fn test_single_tool_call_cycle() {
 }
 
 /// Per-step bookkeeping spans that are exported only at debug level.
-const BOOKKEEPING_SPANS: [&str; 9] = [
+const BOOKKEEPING_SPANS: [&str; 7] = [
     "middleware.driver",
-    "middleware.phase",
     "agent.execution.middleware.turn_start",
     "agent.execution.middleware.step_start",
     "agent.execution.middleware.after_llm",
-    "agent.execution.middleware.processing_tool_calls",
     "agent.execution.middleware.turn_end",
     "agent.tool.side_effects",
     "agent.request.cache_breakpoints",
 ];
-
-/// A middleware that changes nothing, so the driver spans have a driver to name.
-struct NoopDriver;
-
-#[async_trait]
-impl crate::middleware::MiddlewareDriver for NoopDriver {
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "NoopDriver"
-    }
-}
 
 /// Run one turn with a tool call and a final answer and return the spans
 /// exported at info level (`info_level`) or at every level.
@@ -1737,7 +1662,8 @@ async fn spans_of_a_tool_turn(info_level: bool) -> Vec<opentelemetry_sdk::trace:
     use querymt_agent_services::tools::trace_support::genai_trace::{capture, capture_info};
 
     let mut harness = TestHarness::new(vec![], None).await;
-    harness.install_stop_recovery(NoopDriver, 5);
+    // A middleware that changes nothing, so the driver spans have a driver to name.
+    harness.install_stop_recovery(ScriptedMiddleware::default(), 5);
     let tool_call = mock_querymt_tool_call("call-1", "remote_tool", "{}");
     let mut seq = Sequence::new();
     harness
@@ -2015,7 +1941,7 @@ async fn test_middleware_stops_execution() {
             harness.config.event_sink.journal().clone(),
         )
         .with_tool_policy(ToolPolicy::ProviderOnly)
-        .with_middleware(StopOnBeforeLlmCall)
+        .with_middleware(stop_at_every_step())
         .build(),
     );
     harness
@@ -2037,6 +1963,134 @@ async fn test_middleware_stops_execution() {
         ),
         "{outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn stop_at_run_start_sends_no_model_request() {
+    use crate::middleware::{StepVerdict, Stop};
+    let stopper = ScriptedMiddleware::default().turn_start([Act::Say(StepVerdict::Stop(
+        Stop::new(querymt_agent_core::events::StopType::Other, "at start"),
+    ))]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(stopper.clone(), 5);
+    // No `expect_chat`: a model request would fail the run.
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert!(
+        matches!(
+            &outcome,
+            CycleOutcome::Stopped { reason, .. } if reason == "at start"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stopper.count("turn_start"), 1);
+    assert_eq!(
+        stopper.count("step_start"),
+        0,
+        "the run ended before its first step"
+    );
+}
+
+#[tokio::test]
+async fn continuation_at_the_end_of_a_run_sends_another_request() {
+    use crate::middleware::EndVerdict;
+    let continuer = ScriptedMiddleware::default().turn_end([
+        Act::Notice("one more check", EndVerdict::Continue),
+        Act::Say(EndVerdict::Finish),
+    ]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(continuer.clone(), 5);
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .returning(move |messages| {
+            recorded.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|message| message.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(2);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let seen = seen.lock().unwrap();
+    assert!(!seen[0].contains("one more check"));
+    assert!(
+        seen[1].contains("one more check"),
+        "the notice is sent with the continuation"
+    );
+}
+
+#[tokio::test]
+async fn notices_queued_before_a_stop_are_stored_when_the_stop_is_recovered() {
+    use crate::middleware::{StepVerdict, Stop, StopVerdict};
+    let queues = ScriptedMiddleware::default()
+        .step_start([Act::Notice("kept across the stop", StepVerdict::Proceed)]);
+    let stops_once = ScriptedMiddleware::default()
+        .step_start([
+            Act::Say(StepVerdict::Stop(Stop::new(
+                querymt_agent_core::events::StopType::ModelTokenLimit,
+                "cut off",
+            ))),
+            Act::Say(StepVerdict::Proceed),
+        ])
+        .stopped([Act::Say(StopVerdict::Recover)]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(queues, 5);
+    harness.config = {
+        let mut config = (*harness.config).clone();
+        config.middleware_drivers.push(Arc::new(stops_once));
+        Arc::new(config)
+    };
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .returning(move |messages| {
+            recorded.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|message| message.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert!(seen.lock().unwrap()[0].contains("kept across the stop"));
 }
 
 #[tokio::test]

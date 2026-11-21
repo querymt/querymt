@@ -59,7 +59,10 @@ use crate::acp::protocol::StopReason;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::utils::u32_from_usize;
 use crate::hooks::StopRequest;
-use crate::middleware::ExecutionState;
+use crate::middleware::{
+    EndVerdict, ExecutionState, Folded, HookCx, ReplyVerdict, StepVerdict, Stop, StopVerdict,
+    TurnInfo,
+};
 use log::{debug, info, trace, warn};
 use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
 use std::sync::Arc;
@@ -409,6 +412,31 @@ pub(crate) async fn prepare_model_request(
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
 
+/// The state a stop of middleware leads to. `context` carries what middleware
+/// queued before the stop, so a recovery still stores it.
+pub(crate) fn stopped_state(
+    stop: Stop,
+    context: Arc<crate::middleware::ConversationContext>,
+) -> ExecutionState {
+    ExecutionState::Stopped {
+        message: stop.message,
+        stop_type: stop.stop_type,
+        context: Some(context),
+    }
+}
+
+/// The state after the middleware of a stage that precedes a model request.
+pub(crate) fn step_state(
+    folded: Folded<StepVerdict>,
+    context: Arc<crate::middleware::ConversationContext>,
+) -> ExecutionState {
+    match folded {
+        Folded::Cancelled => ExecutionState::Cancelled,
+        Folded::Decided(StepVerdict::Proceed) => ExecutionState::BeforeLlmCall { context },
+        Folded::Decided(StepVerdict::Stop(stop)) => stopped_state(stop, context),
+    }
+}
+
 use crate::agent::agent_config::AgentConfig;
 
 /// Execute the cycle state machine using an `AgentConfig`.
@@ -440,7 +468,11 @@ pub(crate) async fn execute_cycle_state_machine(
         env.session_id
     );
 
-    let driver = info_span!("agent.execution.driver_create").in_scope(|| config.create_driver());
+    let mut stack = info_span!("agent.execution.driver_create").in_scope(|| {
+        config
+            .create_driver()
+            .begin_turn(&TurnInfo::new(&env.session_id, session_mode))
+    });
 
     debug!(
         "Session {}: state machine loading history, cancelled={}",
@@ -518,19 +550,21 @@ pub(crate) async fn execute_cycle_state_machine(
         )
     });
 
-    let mut state = ExecutionState::BeforeLlmCall {
-        context: initial_context.clone(),
-    };
     let mut event_rx = config.event_sink.fanout().subscribe();
 
-    state = driver
-        .run_turn_start_cancellable(state, Some(&env.runtime), &env.cancellation_token)
-        .instrument(debug_span!(
-            "agent.execution.middleware.turn_start",
-            session_id = %env.session_id
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+    let mut start_context = initial_context;
+    let started = {
+        let mut cx = HookCx::new(&mut start_context, &env.runtime, &turn.changed_paths);
+        stack
+            .turn_start(&mut cx, &env.cancellation_token)
+            .instrument(debug_span!(
+                "agent.execution.middleware.turn_start",
+                session_id = %env.session_id
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+    };
+    let mut state = step_state(started, start_context);
 
     debug!(
         "Session {}: run_turn_start done, state={}, cancelled={}",
@@ -617,15 +651,19 @@ pub(crate) async fn execute_cycle_state_machine(
                 let mut refreshed = (*context).clone();
                 refreshed.stats = Arc::new(stats);
                 let context = Arc::new(refreshed);
-                let state = ExecutionState::BeforeLlmCall { context };
-                let state = driver
-                    .run_step_start_cancellable(state, Some(&env.runtime), &env.cancellation_token)
-                    .instrument(debug_span!(
-                        "agent.execution.middleware.step_start",
-                        session_id = %env.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                let mut context = context;
+                let stepped = {
+                    let mut cx = HookCx::new(&mut context, &env.runtime, &turn.changed_paths);
+                    stack
+                        .step_start(&mut cx, &env.cancellation_token)
+                        .instrument(debug_span!(
+                            "agent.execution.middleware.step_start",
+                            session_id = %env.session_id
+                        ))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+                };
+                let state = step_state(stepped, context);
 
                 match state {
                     ExecutionState::BeforeLlmCall {
@@ -663,24 +701,35 @@ pub(crate) async fn execute_cycle_state_machine(
                 transitions::transition_call_llm(config, context, request, env, turn).await?
             }
 
-            ExecutionState::AfterLlm { .. } => {
-                let state = driver
-                    .run_after_llm_cancellable(state, Some(&env.runtime), &env.cancellation_token)
-                    .instrument(debug_span!(
-                        "agent.execution.middleware.after_llm",
-                        session_id = %env.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                match state {
-                    ExecutionState::AfterLlm {
-                        ref response,
-                        ref context,
-                    } => {
-                        transitions::transition_after_llm(config, response, context, env, turn)
+            ExecutionState::AfterLlm { response, context } => {
+                let mut context = context;
+                let reviewed = {
+                    let mut cx = HookCx::new(&mut context, &env.runtime, &turn.changed_paths);
+                    stack
+                        .after_llm(&mut cx, &response, &env.cancellation_token)
+                        .instrument(debug_span!(
+                            "agent.execution.middleware.after_llm",
+                            session_id = %env.session_id
+                        ))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+                };
+                match reviewed {
+                    Folded::Cancelled => ExecutionState::Cancelled,
+                    Folded::Decided(ReplyVerdict::Proceed) => {
+                        transitions::transition_after_llm(config, &response, &context, env, turn)
                             .await?
                     }
-                    other => other,
+                    Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop, context),
+                    Folded::Decided(ReplyVerdict::Retry) => {
+                        // The discarded reply was billed: its usage counts.
+                        let stats = &mut Arc::make_mut(&mut context).stats;
+                        crate::middleware::apply_usage_to_stats(
+                            Arc::make_mut(stats),
+                            response.usage.as_ref(),
+                        );
+                        ExecutionState::BeforeLlmCall { context }
+                    }
                 }
             }
 
@@ -718,7 +767,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         .collect::<Vec<_>>();
                     let next = transitions::transition_processing_tool_calls(
                         config,
-                        &driver,
+                        &mut stack,
                         &Arc::from(Vec::new().into_boxed_slice()),
                         &Arc::from(skipped.into_boxed_slice()),
                         &steered_context,
@@ -729,59 +778,16 @@ pub(crate) async fn execute_cycle_state_machine(
                     state = next;
                     continue;
                 }
-                let state = ExecutionState::ProcessingToolCalls {
-                    remaining_calls: remaining_calls.clone(),
-                    results: results.clone(),
-                    context: context.clone(),
-                };
-                // Cancellation must not discard the pending-call state: the
-                // transition below synthesizes and persists matching results.
-                let state = if env.cancellation_token.is_cancelled() {
-                    state
-                } else {
-                    let middleware_state = driver
-                        .run_processing_tool_calls_cancellable(
-                            state,
-                            Some(&env.runtime),
-                            &env.cancellation_token,
-                        )
-                        .instrument(debug_span!(
-                            "agent.execution.middleware.processing_tool_calls",
-                            session_id = %env.session_id
-                        ))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                    if matches!(middleware_state, ExecutionState::Cancelled)
-                        && env.cancellation_token.is_cancelled()
-                    {
-                        ExecutionState::ProcessingToolCalls {
-                            remaining_calls,
-                            results,
-                            context,
-                        }
-                    } else {
-                        middleware_state
-                    }
-                };
-                match state {
-                    ExecutionState::ProcessingToolCalls {
-                        ref remaining_calls,
-                        ref results,
-                        ref context,
-                    } => {
-                        transitions::transition_processing_tool_calls(
-                            config,
-                            &driver,
-                            remaining_calls,
-                            results,
-                            context,
-                            env,
-                            turn,
-                        )
-                        .await?
-                    }
-                    other => other,
-                }
+                transitions::transition_processing_tool_calls(
+                    config,
+                    &mut stack,
+                    &remaining_calls,
+                    &results,
+                    &context,
+                    env,
+                    turn,
+                )
+                .await?
             }
 
             ExecutionState::WaitingForEvent {
@@ -820,26 +826,33 @@ pub(crate) async fn execute_cycle_state_machine(
                     state = ExecutionState::BeforeLlmCall { context };
                     continue;
                 }
-                let turn_end_state = driver
-                    .run_turn_end_cancellable(
-                        ExecutionState::Complete {
-                            context: fallback_context,
-                        },
-                        Some(&env.runtime),
-                        &env.cancellation_token,
-                    )
-                    .instrument(debug_span!(
-                        "agent.execution.middleware.turn_end",
-                        session_id = %env.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                let mut completed_context = fallback_context;
+                let ended = {
+                    let mut cx =
+                        HookCx::new(&mut completed_context, &env.runtime, &turn.changed_paths);
+                    stack
+                        .turn_end(&mut cx, &env.cancellation_token)
+                        .instrument(debug_span!(
+                            "agent.execution.middleware.turn_end",
+                            session_id = %env.session_id
+                        ))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+                };
 
-                match turn_end_state {
-                    ExecutionState::BeforeLlmCall { .. } => turn_end_state,
-                    ExecutionState::Complete {
+                match ended {
+                    Folded::Cancelled => ExecutionState::Cancelled,
+                    Folded::Decided(EndVerdict::Continue) => ExecutionState::BeforeLlmCall {
                         context: completed_context,
-                    } => {
+                    },
+                    Folded::Decided(EndVerdict::Stop(stop)) => {
+                        info!(
+                            "Turn-end middleware stopped: {} ({:?})",
+                            stop.message, stop.stop_type
+                        );
+                        stopped_state(stop, completed_context)
+                    }
+                    Folded::Decided(EndVerdict::Finish) => {
                         debug!("State machine reached Complete state");
 
                         let stop_hook = run_stop_hook(config, env, "EndTurn").await?;
@@ -919,15 +932,6 @@ pub(crate) async fn execute_cycle_state_machine(
 
                         return Ok(CycleOutcome::Completed);
                     }
-                    ExecutionState::Stopped {
-                        ref message,
-                        stop_type,
-                        ..
-                    } => {
-                        info!("Turn-end middleware stopped: {} ({:?})", message, stop_type);
-                        turn_end_state
-                    }
-                    other => other,
                 }
             }
 
@@ -965,21 +969,29 @@ pub(crate) async fn execute_cycle_state_machine(
                             env.session_id, max_recoveries
                         );
                     } else {
-                        let stopped = std::mem::replace(&mut state, ExecutionState::Cancelled);
-                        let recovered = driver
-                            .run_stopped_cancellable(
-                                stopped,
-                                Some(&env.runtime),
-                                &env.cancellation_token,
-                            )
-                            .instrument(info_span!(
-                                "agent.execution.middleware.stopped",
-                                session_id = %env.session_id
-                            ))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                        let stop = Stop::new(stop_type, message.clone());
+                        let mut recovery_context = state
+                            .context()
+                            .cloned()
+                            .expect("a stop with a context was checked above");
+                        let recovered = {
+                            let mut cx = HookCx::new(
+                                &mut recovery_context,
+                                &env.runtime,
+                                &turn.changed_paths,
+                            );
+                            stack
+                                .stopped(&mut cx, &stop, &env.cancellation_token)
+                                .instrument(info_span!(
+                                    "agent.execution.middleware.stopped",
+                                    session_id = %env.session_id
+                                ))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+                        };
                         match recovered {
-                            ExecutionState::BeforeLlmCall { .. } => {
+                            Folded::Cancelled => return Ok(CycleOutcome::Cancelled),
+                            Folded::Decided(StopVerdict::Recover) => {
                                 turn.budgets.note_stop_recovery();
                                 debug!(
                                     "Session {}: stop recovered by middleware ({}/{})",
@@ -987,16 +999,14 @@ pub(crate) async fn execute_cycle_state_machine(
                                     turn.budgets.stop_recoveries(),
                                     max_recoveries
                                 );
-                                state = recovered;
+                                state = ExecutionState::BeforeLlmCall {
+                                    context: recovery_context,
+                                };
                                 continue;
                             }
-                            ExecutionState::Cancelled => return Ok(CycleOutcome::Cancelled),
-                            ExecutionState::Stopped { .. } => state = recovered,
-                            other => {
-                                // Not a documented outcome; let the state machine handle it.
-                                state = other;
-                                continue;
-                            }
+                            // Nobody recovered: what was queued while consulting is
+                            // dropped, and the stop goes on to publication unchanged.
+                            Folded::Decided(StopVerdict::Pass) => {}
                         }
                     }
                 }

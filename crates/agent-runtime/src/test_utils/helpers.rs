@@ -386,7 +386,7 @@ impl UndoTestFixture {
     /// in the given order.
     pub(crate) async fn with_provider_and_middleware(
         provider: crate::test_utils::SharedLlmProvider,
-        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
@@ -439,7 +439,7 @@ impl UndoTestFixture {
     pub(crate) async fn with_factory(
         factory: Arc<dyn querymt::plugin::LLMProviderFactory>,
         hooks: Option<crate::hooks::Hooks>,
-        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
     ) -> Result<Self> {
         let config_dir = TempDir::new()?;
         let registry = mock_plugin_registry_for(config_dir.path(), factory)?;
@@ -460,7 +460,7 @@ impl UndoTestFixture {
         registry: PluginRegistry,
         config_dir: TempDir,
         hooks: Option<crate::hooks::Hooks>,
-        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
     ) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
@@ -806,6 +806,15 @@ impl UndoTestFixture {
         SendAgent::prompt(&self.handle, request)
             .await
             .map_err(|e| anyhow::anyhow!("prompt failed: {e:?}"))
+    }
+
+    /// Cancel the active run of `session_id`.
+    pub(crate) async fn cancel(&self, session_id: &str) -> Result<()> {
+        use crate::send_agent::SendAgent;
+        let notification = crate::acp::protocol::CancelNotification::new(session_id.to_owned());
+        SendAgent::cancel(&self.handle, notification)
+            .await
+            .map_err(|e| anyhow::anyhow!("cancel failed: {e:?}"))
     }
 
     /// Like [`Self::prompt`], but also waits until the run this prompt started

@@ -244,8 +244,6 @@ pub struct SessionRuntime {
     pub turn_snapshot: ParkingMutex<Option<TurnSnapshot>>,
     /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
-    /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
-    pub turn_diffs: ParkingMutex<querymt_agent_index::DiffPaths>,
     /// Workspace tree after the last diff snapshot, keyed by root. Seeds the
     /// next pre-call scan so unchanged files (same size and mtime) are not
     /// re-hashed.
@@ -337,7 +335,6 @@ impl SessionRuntime {
             workspace_handle: Arc::new(OnceCell::new()),
             turn_snapshot: ParkingMutex::new(None),
             pre_turn_snapshot_task: ParkingMutex::new(None),
-            turn_diffs: ParkingMutex::new(Default::default()),
             last_snapshot_tree: ParkingMutex::new(None),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_gate: Arc::new(OnceCell::new()),

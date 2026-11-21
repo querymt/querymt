@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::agent::agent_config::AgentConfig;
 use crate::config::MiddlewareEntry;
 use crate::middleware::{
-    ContextConfig, ContextMiddleware, MIDDLEWARE_REGISTRY, MiddlewareDriver,
+    ContextConfig, ContextMiddleware, MIDDLEWARE_REGISTRY, Middleware,
     OutputLimitRecoveryMiddleware, ParallelEditGuard, ParallelEditMode,
 };
 
@@ -24,7 +24,7 @@ fn has_entry(entries: &[MiddlewareEntry], type_name: &str) -> bool {
     entries.iter().any(|e| e.middleware_type == type_name)
 }
 
-fn has_driver(drivers: &[Arc<dyn MiddlewareDriver>], name: &str) -> bool {
+fn has_driver(drivers: &[Arc<dyn Middleware>], name: &str) -> bool {
     drivers.iter().any(|d| d.name() == name)
 }
 
@@ -46,9 +46,9 @@ fn has_driver(drivers: &[Arc<dyn MiddlewareDriver>], name: &str) -> bool {
 /// naming the middleware type.
 pub fn build_from_entries(
     entries: &[MiddlewareEntry],
-    existing: &[Arc<dyn MiddlewareDriver>],
+    existing: &[Arc<dyn Middleware>],
     config: &AgentConfig,
-) -> Result<Vec<Arc<dyn MiddlewareDriver>>> {
+) -> Result<Vec<Arc<dyn Middleware>>> {
     let mut built = Vec::with_capacity(entries.len() + 3);
 
     for entry in entries {
@@ -58,7 +58,7 @@ pub fn build_from_entries(
         built.extend(driver);
     }
 
-    let present = |built: &[Arc<dyn MiddlewareDriver>], name: &str| {
+    let present = |built: &[Arc<dyn Middleware>], name: &str| {
         has_driver(existing, name) || has_driver(built, name)
     };
 
@@ -111,7 +111,7 @@ mod tests {
         )
     }
 
-    fn names(drivers: &[Arc<dyn MiddlewareDriver>]) -> Vec<&'static str> {
+    fn names(drivers: &[Arc<dyn Middleware>]) -> Vec<&'static str> {
         drivers.iter().map(|d| d.name()).collect()
     }
 
@@ -141,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn existing_driver_suppresses_the_matching_default() {
         let (config, _dir) = config().await;
-        let existing: Vec<Arc<dyn MiddlewareDriver>> =
+        let existing: Vec<Arc<dyn Middleware>> =
             vec![Arc::new(OutputLimitRecoveryMiddleware::default())];
         let built = build_from_entries(&[], &existing, &config).unwrap();
         assert_eq!(names(&built), [CONTEXT_DRIVER, GUARD_DRIVER]);

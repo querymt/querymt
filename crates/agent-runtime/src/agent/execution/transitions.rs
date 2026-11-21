@@ -13,9 +13,9 @@ use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::{genai, u32_from_usize};
 use crate::middleware::{
-    CompositeDriver, ExecutionState, LlmResponse, PreparedBatch, PreparedCallVerdict,
-    PreparedModelRequest, PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction,
-    ToolResult, apply_usage_to_stats, calculate_context_tokens,
+    ExecutionState, HookCx, LlmResponse, PreparedBatch, PreparedCallVerdict, PreparedModelRequest,
+    PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction, ToolResult, TurnStack,
+    apply_usage_to_stats, calculate_context_tokens,
 };
 use anyhow::Context as _;
 use futures_util::Stream;
@@ -2084,7 +2084,7 @@ pub(super) async fn transition_after_llm(
 /// history invariant is always maintained.
 #[instrument(
     name = "agent.transition.processing_tool_calls",
-    skip(config, driver, remaining_calls, results, context, env, turn),
+    skip(config, stack, remaining_calls, results, context, env, turn),
     fields(
         session_id = %env.session_id,
         remaining_calls = remaining_calls.len(),
@@ -2096,7 +2096,7 @@ pub(super) async fn transition_after_llm(
 )]
 pub(super) async fn transition_processing_tool_calls(
     config: &AgentConfig,
-    driver: &CompositeDriver,
+    stack: &mut TurnStack,
     remaining_calls: &Arc<[MiddlewareToolCall]>,
     results: &Arc<[ToolResult]>,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -2148,6 +2148,11 @@ pub(super) async fn transition_processing_tool_calls(
         env.session_id
     );
 
+    // Middleware reviewing the batch may queue notices; they travel with the
+    // context into the next request, after the tool results, and are dropped
+    // with it when the run is cancelled.
+    let mut working = context.clone();
+
     // One slot per call so results can be stored in the model's original order
     // regardless of the order in which waves completed.
     let mut slots: Vec<Option<ToolResult>> = (0..remaining_calls.len()).map(|_| None).collect();
@@ -2186,7 +2191,16 @@ pub(super) async fn transition_processing_tool_calls(
                 e
             );
         }
-        let segment_plan = prepare_segment(config, driver, remaining_calls, &indices, env).await?;
+        let segment_plan = prepare_segment(
+            config,
+            stack,
+            &mut working,
+            &turn.changed_paths,
+            remaining_calls,
+            &indices,
+            env,
+        )
+        .await?;
         // Preparation may resolve a call to a different target than the
         // pre-check saw (e.g. the MCP tool list reloaded); re-check the
         // prepared targets. A no-op when the snapshot is already resolved.
@@ -2313,7 +2327,7 @@ pub(super) async fn transition_processing_tool_calls(
     let next_state = super::tool_calls::store_all_tool_results(
         config,
         &Arc::from(all_results.into_boxed_slice()),
-        context,
+        &working,
         env,
         turn,
     )
@@ -2374,7 +2388,9 @@ struct SegmentPlan {
 /// pre-tool hooks do not run.
 async fn prepare_segment(
     config: &AgentConfig,
-    driver: &CompositeDriver,
+    stack: &mut TurnStack,
+    context: &mut Arc<crate::middleware::ConversationContext>,
+    changed: &querymt_agent_index::DiffPaths,
     calls: &[MiddlewareToolCall],
     indices: &[usize],
     env: &TurnEnv,
@@ -2443,12 +2459,16 @@ async fn prepare_segment(
                 access,
             })
             .collect();
-        driver
-            .run_prepared_tool_calls(&PreparedBatch {
-                session_id: &env.session_id,
-                cwd: cwd.as_deref(),
-                calls: &views,
-            })
+        let mut cx = HookCx::new(context, &env.runtime, changed);
+        stack
+            .prepared_tool_calls(
+                &mut cx,
+                &PreparedBatch {
+                    session_id: &env.session_id,
+                    cwd: cwd.as_deref(),
+                    calls: &views,
+                },
+            )
             .await
             .map_err(|error| anyhow::anyhow!("Middleware error: {error}"))?
     };
@@ -2649,13 +2669,13 @@ mod tests {
             )]);
             let results: Arc<[ToolResult]> = Arc::from(Vec::new());
             let context = crate::test_utils::test_context(&exec.session_id, 0);
-            let driver = CompositeDriver::new(vec![]);
+            let mut stack = TurnStack::default();
 
             tokio::time::timeout(
                 Duration::from_secs(10),
                 transition_processing_tool_calls(
                     &agent.config,
-                    &driver,
+                    &mut stack,
                     &calls,
                     &results,
                     &context,
@@ -2684,7 +2704,7 @@ mod tests {
             )]);
             let results: Arc<[ToolResult]> = Arc::from(Vec::new());
             let context = crate::test_utils::test_context(&exec.session_id, 0);
-            let driver = CompositeDriver::new(vec![]);
+            let mut stack = TurnStack::default();
 
             // The call itself may be blocked or fail (no workspace, approval);
             // only the ordering matters: the snapshot is resolved before it.
@@ -2692,7 +2712,7 @@ mod tests {
                 Duration::from_secs(10),
                 transition_processing_tool_calls(
                     &agent.config,
-                    &driver,
+                    &mut stack,
                     &calls,
                     &results,
                     &context,
@@ -2918,7 +2938,7 @@ mod tests {
                 .collect();
             let results: Arc<[ToolResult]> = Arc::from(Vec::new());
             let context = crate::test_utils::test_context(&exec.session_id, 0);
-            let driver = CompositeDriver::new(vec![]);
+            let mut stack = TurnStack::default();
 
             let canceller = async {
                 tokio::time::timeout(Duration::from_secs(10), async {
@@ -2935,7 +2955,7 @@ mod tests {
                     Duration::from_secs(10),
                     transition_processing_tool_calls(
                         &agent.config,
-                        &driver,
+                        &mut stack,
                         &calls,
                         &results,
                         &context,
@@ -4688,7 +4708,7 @@ mod tests {
 
         #[tokio::test]
         async fn escalated_request_uses_the_ceiling_and_history_keeps_only_the_second_reply() {
-            use crate::middleware::MiddlewareDriver;
+            use crate::test_utils::HookRig;
 
             let (fixture, factory) = timed_fixture(
                 true,
@@ -4702,7 +4722,9 @@ mod tests {
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             let (exec, mut turn) = fixture.turn().await;
-            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let mut stack =
+                HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
+            let rig = HookRig::new();
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
             let context = profiled_context(
@@ -4727,10 +4749,7 @@ mod tests {
             .await
             .expect("first request");
             assert_eq!(state.name(), "AfterLlm");
-            let state = middleware
-                .on_after_llm(state, Some(&exec.runtime))
-                .await
-                .expect("middleware");
+            let state = rig.after_llm(&mut stack, state).await.expect("middleware");
             let ExecutionState::BeforeLlmCall { context } = state else {
                 panic!("expected escalation to BeforeLlmCall, got {}", state.name());
             };
@@ -4751,10 +4770,7 @@ mod tests {
                 transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec, &turn)
                     .await
                     .expect("second request");
-            let state = middleware
-                .on_after_llm(state, Some(&exec.runtime))
-                .await
-                .expect("middleware");
+            let state = rig.after_llm(&mut stack, state).await.expect("middleware");
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
@@ -4796,7 +4812,7 @@ mod tests {
         /// ceiling, a continuation, and finally a normal reply.
         #[tokio::test]
         async fn thinking_only_cutoff_escalates_then_continues_then_succeeds() {
-            use crate::middleware::MiddlewareDriver;
+            use crate::test_utils::HookRig;
             use querymt::chat::{GenerationOptions, ReasoningEffort};
 
             let (fixture, factory) = timed_fixture(
@@ -4812,7 +4828,8 @@ mod tests {
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             let (exec, mut turn) = fixture.turn().await;
-            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let mut middleware =
+                HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let instruction_marker = "cut off by the output-token limit";
 
@@ -4833,8 +4850,8 @@ mod tests {
                 transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec, &turn)
                     .await
                     .expect("request 1");
-            let state = middleware
-                .on_after_llm(state, Some(&exec.runtime))
+            let state = HookRig::new()
+                .after_llm(&mut middleware, state)
                 .await
                 .expect("middleware 1");
             let ExecutionState::BeforeLlmCall { context } = state else {
@@ -4855,8 +4872,8 @@ mod tests {
                 transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec, &turn)
                     .await
                     .expect("request 2");
-            let state = middleware
-                .on_after_llm(state, Some(&exec.runtime))
+            let state = HookRig::new()
+                .after_llm(&mut middleware, state)
                 .await
                 .expect("middleware 2");
             let ExecutionState::AfterLlm { response, context } = state else {
@@ -4879,8 +4896,8 @@ mod tests {
             );
 
             // Stop -> continuation with instruction, ceiling and lowered effort.
-            let state = middleware
-                .on_stopped(state, Some(&exec.runtime))
+            let state = HookRig::new()
+                .stopped(&mut middleware, state)
                 .await
                 .expect("on_stopped");
             let ExecutionState::BeforeLlmCall { context } = state else {
@@ -4917,8 +4934,8 @@ mod tests {
                 transition_call_llm(&fixture.config, &context, &Arc::new(last), &exec, &turn)
                     .await
                     .expect("request 3");
-            let state = middleware
-                .on_after_llm(state, Some(&exec.runtime))
+            let state = HookRig::new()
+                .after_llm(&mut middleware, state)
                 .await
                 .expect("middleware 3");
             let ExecutionState::AfterLlm { response, context } = state else {
@@ -4970,13 +4987,13 @@ mod tests {
             config: &Arc<AgentConfig>,
             exec: &TurnEnv,
             turn: &Turn,
-            middleware: &crate::middleware::OutputLimitRecoveryMiddleware,
+            middleware: &mut crate::middleware::TurnStack,
             tools: &Arc<[querymt::chat::Tool]>,
             context: Arc<crate::middleware::ConversationContext>,
         ) -> ExecutionState {
-            use crate::middleware::MiddlewareDriver;
-            let state = middleware
-                .on_step_start(ExecutionState::BeforeLlmCall { context }, None)
+            let rig = crate::test_utils::HookRig::new();
+            let state = rig
+                .step_start(middleware, ExecutionState::BeforeLlmCall { context })
                 .await
                 .unwrap();
             let ExecutionState::BeforeLlmCall { context } = state else {
@@ -4999,7 +5016,7 @@ mod tests {
             let state = transition_call_llm(config, &context, &Arc::new(request), exec, turn)
                 .await
                 .expect("call llm");
-            middleware.on_after_llm(state, None).await.unwrap()
+            rig.after_llm(middleware, state).await.unwrap()
         }
 
         /// Replays session 01a16d18: escalation succeeds, a later step of the
@@ -5007,7 +5024,7 @@ mod tests {
         /// the continuation must keep the escalated cap and answer the call.
         #[tokio::test]
         async fn later_cutoff_in_an_escalated_turn_keeps_the_cap_and_answers_the_call() {
-            use crate::middleware::MiddlewareDriver;
+            use crate::test_utils::HookRig;
             use querymt::chat::GenerationOptions;
 
             let (fixture, factory) = timed_fixture(
@@ -5049,7 +5066,8 @@ mod tests {
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             let (exec, mut turn) = fixture.turn().await;
-            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let mut middleware =
+                HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let context = profiled_context(
                 &exec.session_id,
@@ -5063,7 +5081,7 @@ mod tests {
             );
 
             let config = fixture.config.clone();
-            let mw = &middleware;
+            let mw = &mut middleware;
 
             // 1: cut off at 32k -> escalate.
             let ExecutionState::BeforeLlmCall { context } =
@@ -5103,7 +5121,7 @@ mod tests {
             ));
             // 4: continuation at the escalated cap, with the call answered.
             let ExecutionState::BeforeLlmCall { context } =
-                middleware.on_stopped(state, None).await.unwrap()
+                HookRig::new().stopped(mw, state).await.unwrap()
             else {
                 panic!("expected continuation");
             };

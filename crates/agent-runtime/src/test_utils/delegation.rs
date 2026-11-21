@@ -8,14 +8,14 @@ use crate::agent::execution::CycleOutcome;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::delegation::roster::{Member, MemberAgent, MemberOrigin};
 use crate::delegation::{AgentInfo, DelegationOrchestrator};
-use crate::middleware::{ExecutionState, MiddlewareDriver};
+use crate::middleware::{HookCx, Middleware, StepVerdict, Stop, TurnInfo, TurnMiddleware};
 use crate::session::backend::StorageBackend;
 use crate::session::runtime::RuntimeContext;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{SessionExecutionConfig, SessionStore};
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
-    mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
+    Act, MockChatResponse, MockLlmProvider, ScriptedMiddleware, SharedLlmProvider,
+    TestProviderFactory, mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
 };
 use mockall::Sequence;
 use querymt::LLMParams;
@@ -27,107 +27,55 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify};
 
-/// A middleware that immediately stops execution with `StepLimit`,
-/// simulating what happens when a delegate is stopped by middleware before
-/// completing its work. Uses `StepLimit` (maps to `StopReason::MaxTurnRequests`)
-/// rather than `ContextThreshold` to avoid triggering the auto-compaction loop
-/// in the execution state machine.
-pub struct AlwaysStopMiddleware;
+/// Stops before the first model request with `StepLimit`, simulating a
+/// delegate stopped by middleware before completing its work. `StepLimit`
+/// (maps to `StopReason::MaxTurnRequests`) rather than `ContextThreshold`
+/// avoids triggering the auto-compaction loop.
+fn always_stop() -> ScriptedMiddleware {
+    ScriptedMiddleware::default().step_start([Act::Say(StepVerdict::Stop(Stop::new(
+        StopType::StepLimit,
+        "Step limit reached",
+    )))])
+}
 
-#[async_trait::async_trait]
-impl MiddlewareDriver for AlwaysStopMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => Ok(ExecutionState::Stopped {
-                message: "Step limit reached".into(),
-                stop_type: StopType::StepLimit,
-                context: Some(context.clone()),
-            }),
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "AlwaysStopMiddleware"
-    }
+/// Fires `ContextThreshold` on the first step, then passes through. This
+/// simulates a full context window that triggers AI compaction.
+fn context_threshold_once() -> ScriptedMiddleware {
+    ScriptedMiddleware::default().step_start([
+        Act::Say(StepVerdict::Stop(Stop::new(
+            StopType::ContextThreshold,
+            "Context token threshold reached, requesting compaction",
+        ))),
+        Act::Say(StepVerdict::Proceed),
+    ])
 }
 
 /// Hold a delegate before its first LLM call to make cancellation deterministic.
+#[derive(Clone)]
 pub struct CancellationGateMiddleware {
     pub entered: Arc<Notify>,
     pub release: Arc<Notify>,
 }
 
-#[async_trait::async_trait]
-impl MiddlewareDriver for CancellationGateMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            before @ ExecutionState::BeforeLlmCall { .. } => {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(before)
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
+impl Middleware for CancellationGateMiddleware {
     fn name(&self) -> &'static str {
         "CancellationGateMiddleware"
     }
-}
 
-/// Fires `ContextThreshold` on the first `BeforeLlmCall`, then passes through.
-/// This simulates a full context window that triggers AI compaction.
-#[derive(Default)]
-pub struct ContextThresholdOnceMiddleware {
-    pub fired: std::sync::atomic::AtomicBool,
-}
-
-impl ContextThresholdOnceMiddleware {
-    pub fn new() -> Self {
-        Self::default()
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(self.clone())
     }
 }
 
 #[async_trait::async_trait]
-impl MiddlewareDriver for ContextThresholdOnceMiddleware {
+impl TurnMiddleware for CancellationGateMiddleware {
     async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context }
-                if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) =>
-            {
-                Ok(ExecutionState::Stopped {
-                    message: "Context token threshold reached, requesting compaction".into(),
-                    stop_type: StopType::ContextThreshold,
-                    context: Some(context.clone()),
-                })
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {
-        self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn name(&self) -> &'static str {
-        "ContextThresholdOnceMiddleware"
+        &mut self,
+        _cx: &mut HookCx<'_>,
+    ) -> crate::middleware::Result<StepVerdict> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -578,7 +526,7 @@ pub async fn build_delegate_handle(
     }
 
     if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
-        builder = builder.with_middleware(AlwaysStopMiddleware);
+        builder = builder.with_middleware(always_stop());
     }
 
     if matches!(
@@ -587,7 +535,7 @@ pub async fn build_delegate_handle(
             | DelegateBehavior::ContextThresholdCompactionFails
     ) {
         // Install middleware that triggers ContextThreshold once, then passes through.
-        builder = builder.with_middleware(ContextThresholdOnceMiddleware::new());
+        builder = builder.with_middleware(context_threshold_once());
 
         // Enable auto-compaction with zero retries so the test doesn't sleep.
         builder = builder.with_compaction_config(crate::config::CompactionConfig {

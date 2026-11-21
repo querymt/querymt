@@ -234,6 +234,9 @@ pub(crate) struct Turn {
     pub budget_warnings: BudgetWarnings,
     /// The pre-turn snapshot of this run.
     pub snapshot: PreTurnSnapshot,
+    /// Files the run's tool calls changed. It starts empty and goes with the
+    /// run, so nothing of an earlier or another run is ever in it.
+    pub changed_paths: querymt_agent_index::DiffPaths,
     /// Counters and flags that bound the run.
     pub(super) budgets: TurnBudgets,
 }
@@ -251,6 +254,7 @@ impl Turn {
             delivery_budget: None,
             budget_warnings: BudgetWarnings::default(),
             snapshot: PreTurnSnapshot::None,
+            changed_paths: Default::default(),
             budgets: TurnBudgets::default(),
         }
     }

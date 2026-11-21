@@ -2,7 +2,10 @@
 //! session actor, tool calls change real files, and the review reads a real
 //! workspace index (spec `duplicate-code-review`).
 
-use crate::middleware::{DedupCheckMiddleware, ExecutionState, MiddlewareDriver, Result};
+use crate::middleware::{
+    DedupCheckMiddleware, EndVerdict, HookCx, LlmResponse, Middleware, ReplyVerdict, Result,
+    TurnInfo, TurnMiddleware,
+};
 use crate::test_utils::{
     MockChatResponse, MockLlmProvider, SharedLlmProvider, UndoTestFixture, mock_querymt_tool_call,
 };
@@ -409,13 +412,14 @@ async fn changes_made_after_the_review_are_dropped() {
 /// Holds the two sessions of the concurrent test in the order that exposes
 /// state shared between them. `role` places it before or after the review in
 /// the middleware order. Session A writes a duplicate, session B does not.
+#[derive(Clone)]
 struct Interleave {
     role: Role,
     a: Arc<OnceLock<String>>,
     b: Arc<OnceLock<String>>,
     signals: Arc<Signals>,
-    runs: Mutex<HashMap<usize, Who>>,
-    replies: Mutex<HashMap<usize, usize>>,
+    runs: Arc<Mutex<HashMap<usize, Who>>>,
+    replies: Arc<Mutex<HashMap<usize, usize>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -467,8 +471,8 @@ impl Interleave {
     /// Which session a run belongs to. A reply's context names its session;
     /// a context built later may be another session's (that is the defect), so
     /// the run is recognised by its runtime, learned at its first reply.
-    fn who(&self, runtime: Option<&Runtime>, replied_in: Option<&str>) -> Who {
-        let key = Arc::as_ptr(runtime.expect("runtime")) as usize;
+    fn who(&self, runtime: &Runtime, replied_in: Option<&str>) -> Who {
+        let key = Arc::as_ptr(runtime) as usize;
         let mut known = self.runs.lock().unwrap();
         if let Some(session) = replied_in {
             let who = if self.a.get().map(String::as_str) == Some(session) {
@@ -491,17 +495,28 @@ impl Interleave {
     }
 }
 
+impl Middleware for Interleave {
+    fn name(&self) -> &'static str {
+        "Interleave"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(self.clone())
+    }
+}
+
 #[async_trait]
-impl MiddlewareDriver for Interleave {
+impl TurnMiddleware for Interleave {
     async fn on_after_llm(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Runtime>,
-    ) -> Result<ExecutionState> {
-        let session = state.context().expect("context").session_id.to_string();
-        let who = self.who(runtime, Some(&session));
+        &mut self,
+        cx: &mut HookCx<'_>,
+        _reply: &LlmResponse,
+    ) -> Result<ReplyVerdict> {
+        let session = cx.session_id().to_string();
+        let runtime = cx.runtime().clone();
+        let who = self.who(&runtime, Some(&session));
         // Reply 1 is the tool call, reply 2 the one that ends the run.
-        if self.count_reply(runtime.expect("runtime")) == 2 {
+        if self.count_reply(&runtime) == 2 {
             match (self.role, who) {
                 // B's reply reaches the review after A's has.
                 (Role::BeforeReview, Who::B) => self.signals.a_replied.wait().await,
@@ -510,28 +525,18 @@ impl MiddlewareDriver for Interleave {
                 (Role::BeforeReview, Who::A) => {}
             }
         }
-        Ok(state)
+        Ok(ReplyVerdict::Proceed)
     }
 
-    async fn on_turn_end(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Runtime>,
-    ) -> Result<ExecutionState> {
-        match (self.role, self.who(runtime, None)) {
+    async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict> {
+        match (self.role, self.who(cx.runtime(), None)) {
             // A ends its run after both replies were seen; B after A's review.
             (Role::BeforeReview, Who::A) => self.signals.b_replied.wait().await,
             (Role::BeforeReview, Who::B) => self.signals.a_ended.wait().await,
             (Role::AfterReview, Who::A) => self.signals.a_ended.raise(),
             (Role::AfterReview, Who::B) => {}
         }
-        Ok(state)
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "Interleave"
+        Ok(EndVerdict::Finish)
     }
 }
 
@@ -540,14 +545,14 @@ async fn concurrent_sessions_each_continue_with_their_own_conversation() {
     let a = Arc::new(OnceLock::new());
     let b = Arc::new(OnceLock::new());
     let signals = Arc::new(Signals::default());
-    let gate = |role| -> Arc<dyn MiddlewareDriver> {
+    let gate = |role| -> Arc<dyn Middleware> {
         Arc::new(Interleave {
             role,
             a: a.clone(),
             b: b.clone(),
             signals: signals.clone(),
-            runs: Mutex::default(),
-            replies: Mutex::default(),
+            runs: Arc::default(),
+            replies: Arc::default(),
         })
     };
     let (provider, log) = writing_provider(&[

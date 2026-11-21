@@ -1,24 +1,19 @@
 use crate::agent::execution::CycleOutcome;
 use crate::delegation::DelegationOrchestrator;
-use crate::middleware::{
-    AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
-    MiddlewareDriver,
-};
-use querymt_agent_core::events::{AgentEventKind, StopType};
-use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::model::MessagePart;
 
 use crate::session::domain::{Delegation, DelegationStatus};
-use crate::session::store::SessionStore;
 use crate::test_utils::delegation::{DelegateBehavior, TestHarness};
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
+    MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
     mock_querymt_tool_call,
 };
 use kameo::actor::Spawn;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::FinishReason;
-use querymt::chat::{ChatRole, ReasoningEffort};
+use querymt::chat::ReasoningEffort;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -2110,162 +2105,6 @@ async fn test_delegation_failure_message_format() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
-}
-
-#[tokio::test]
-async fn test_delegation_guard_blocks_duplicate() {
-    let mut store = MockSessionStore::new();
-    let session_id = "sess-guard".to_string();
-    let history = vec![AgentMessage {
-        id: "msg-1".to_string(),
-        session_id: session_id.clone(),
-        role: ChatRole::Assistant,
-        parts: vec![MessagePart::ToolUse(mock_querymt_tool_call(
-            "call-1",
-            "delegate",
-            r#"{"target_agent_id":"agent","objective":"task"}"#,
-        ))],
-        created_at: OffsetDateTime::now_utc().unix_timestamp(),
-        parent_message_id: None,
-        source_provider: None,
-        source_model: None,
-    }];
-
-    let delegation = Delegation {
-        isolation: Default::default(),
-        id: 1,
-        public_id: "del-1".to_string(),
-        session_id: 1,
-        task_id: None,
-        target_agent_id: "agent".to_string(),
-        objective: "task".to_string(),
-        objective_hash: querymt_agent_core::hash::RapidHash::new(b"task"),
-        context: None,
-        constraints: None,
-        expected_output: None,
-        verification_spec: None,
-        status: DelegationStatus::Running,
-        retry_count: 0,
-        created_at: OffsetDateTime::now_utc(),
-        completed_at: None,
-        planning_summary: None,
-    };
-
-    store
-        .expect_get_history()
-        .returning(move |_| Ok(history.clone()))
-        .times(1);
-    store
-        .expect_list_delegations()
-        .returning(move |_| Ok(vec![delegation.clone()]))
-        .times(1);
-
-    let store: Arc<dyn SessionStore> = Arc::new(store);
-    let middleware = DelegationGuardMiddleware::new(store);
-
-    let state = ExecutionState::AfterLlm {
-        response: Arc::new(LlmResponse::new(
-            "".to_string(),
-            vec![],
-            None,
-            Some(FinishReason::Stop),
-        )),
-        context: Arc::new(ConversationContext::new(
-            session_id.into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock-model".into(),
-        )),
-    };
-
-    let result = middleware.on_after_llm(state, None).await.unwrap();
-
-    assert!(matches!(
-        result,
-        ExecutionState::Stopped {
-            stop_type: StopType::DelegationBlocked,
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn test_delegation_guard_blocks_max_retries() {
-    let mut store = MockSessionStore::new();
-    let session_id = "sess-guard".to_string();
-    let history = vec![AgentMessage {
-        id: "msg-1".to_string(),
-        session_id: session_id.clone(),
-        role: ChatRole::Assistant,
-        parts: vec![MessagePart::ToolUse(mock_querymt_tool_call(
-            "call-1",
-            "delegate",
-            r#"{"target_agent_id":"agent","objective":"task"}"#,
-        ))],
-        created_at: OffsetDateTime::now_utc().unix_timestamp(),
-        parent_message_id: None,
-        source_provider: None,
-        source_model: None,
-    }];
-
-    let delegation = Delegation {
-        isolation: Default::default(),
-        id: 1,
-        public_id: "del-1".to_string(),
-        session_id: 1,
-        task_id: None,
-        target_agent_id: "agent".to_string(),
-        objective: "task".to_string(),
-        objective_hash: querymt_agent_core::hash::RapidHash::new(b"task"),
-        context: None,
-        constraints: None,
-        expected_output: None,
-        verification_spec: None,
-        status: DelegationStatus::Failed,
-        retry_count: 3,
-        created_at: OffsetDateTime::now_utc(),
-        completed_at: Some(OffsetDateTime::now_utc() - time::Duration::seconds(10)),
-        planning_summary: None,
-    };
-
-    store
-        .expect_get_history()
-        .returning(move |_| Ok(history.clone()))
-        .times(1);
-    store
-        .expect_list_delegations()
-        .returning(move |_| Ok(vec![delegation.clone()]))
-        .times(1);
-
-    let store: Arc<dyn SessionStore> = Arc::new(store);
-    let middleware = DelegationGuardMiddleware::new(store);
-
-    let state = ExecutionState::AfterLlm {
-        response: Arc::new(LlmResponse::new(
-            "".to_string(),
-            vec![],
-            None,
-            Some(FinishReason::Stop),
-        )),
-        context: Arc::new(ConversationContext::new(
-            session_id.into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock-model".into(),
-        )),
-    };
-
-    let result = middleware.on_after_llm(state, None).await.unwrap();
-
-    assert!(matches!(
-        result,
-        ExecutionState::Stopped {
-            stop_type: StopType::DelegationBlocked,
-            ..
-        }
-    ));
 }
 
 /// When a delegate is stopped by middleware (e.g. context threshold after failed

@@ -32,10 +32,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{ConversationContext, ExecutionState, MiddlewareDriver, Result};
+use super::{HookCx, Middleware, Result, StepVerdict, TurnInfo, TurnMiddleware};
 use crate::agent::core::AgentMode;
 use crate::middleware::factory::MiddlewareFactory;
-use log::trace;
 use querymt_agent_core::model::NoticeSource;
 use serde::Deserialize;
 
@@ -45,9 +44,10 @@ use serde::Deserialize;
 /// has a reminder, it is stored once as a notice when the mode changes.
 /// Build mode typically has no reminder (full read/write).
 ///
-/// Mode is read from `ConversationContext.session_mode` (per-session).
+/// The mode is the session's, read through `HookCx::mode`.
+#[derive(Clone)]
 pub struct AgentModeMiddleware {
-    reminders: HashMap<AgentMode, String>,
+    reminders: Arc<HashMap<AgentMode, String>>,
 }
 
 impl AgentModeMiddleware {
@@ -55,33 +55,34 @@ impl AgentModeMiddleware {
     pub fn new(plan_reminder: String) -> Self {
         let mut reminders = HashMap::new();
         reminders.insert(AgentMode::Plan, plan_reminder);
-        Self { reminders }
+        Self::with_reminders(reminders)
     }
 
     /// Create with explicit per-mode reminders.
-    /// Mode is read from `ConversationContext.session_mode`.
     pub fn with_reminders(reminders: HashMap<AgentMode, String>) -> Self {
-        Self { reminders }
-    }
-
-    /// The notice to store before the next request, if any.
-    ///
-    /// Compares the session mode with the most recent `agent_mode` notice in
-    /// the effective history (stored or queued): a reminder is stored when the
-    /// mode has one and the last notice is missing or another mode's; a leave
-    /// notice is stored when the mode has none and the last notice is a
-    /// reminder. Any stored mode notice other than the leave notice counts as a
-    /// reminder, so one written under an earlier reminder text is still left.
-    /// Checked per request, not per switch, so switches without a request store
-    /// nothing and a reminder lost to compaction is stored again.
-    fn notice_for(&self, context: &ConversationContext) -> Option<String> {
-        let last = context.last_mode_notice();
-        match self.reminders.get(&context.session_mode) {
-            Some(reminder) => (last != Some(reminder.as_str())).then(|| reminder.clone()),
-            None => last
-                .filter(|last| *last != LEAVE_NOTICE)
-                .map(|_| LEAVE_NOTICE.to_string()),
+        Self {
+            reminders: Arc::new(reminders),
         }
+    }
+}
+
+/// The notice to store before the next request, if any.
+///
+/// Compares the session mode with the most recent `agent_mode` notice in
+/// the effective history (stored or queued): a reminder is stored when the
+/// mode has one and the last notice is missing or another mode's; a leave
+/// notice is stored when the mode has none and the last notice is a
+/// reminder. Any stored mode notice other than the leave notice counts as a
+/// reminder, so one written under an earlier reminder text is still left.
+/// Checked per request, not per switch, so switches without a request store
+/// nothing and a reminder lost to compaction is stored again.
+fn notice_for(reminders: &HashMap<AgentMode, String>, cx: &HookCx<'_>) -> Option<String> {
+    let last = cx.last_mode_notice();
+    match reminders.get(&cx.mode()) {
+        Some(reminder) => (last != Some(reminder.as_str())).then(|| reminder.clone()),
+        None => last
+            .filter(|last| *last != LEAVE_NOTICE)
+            .map(|_| LEAVE_NOTICE.to_string()),
     }
 }
 
@@ -89,41 +90,31 @@ impl AgentModeMiddleware {
 const LEAVE_NOTICE: &str =
     "The agent mode changed. The instructions from the earlier mode reminder no longer apply.";
 
-#[async_trait]
-impl MiddlewareDriver for AgentModeMiddleware {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(state)
-    }
-
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => match self.notice_for(context) {
-                Some(content) => {
-                    trace!("AgentModeMiddleware: queueing mode notice");
-                    Ok(ExecutionState::BeforeLlmCall {
-                        context: Arc::new(context.queue_notice(NoticeSource::AgentMode, content)),
-                    })
-                }
-                None => Ok(state),
-            },
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {
-        // No state to reset
-    }
-
+impl Middleware for AgentModeMiddleware {
     fn name(&self) -> &'static str {
         "AgentModeMiddleware"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(AgentModeTurn {
+            reminders: Arc::clone(&self.reminders),
+        })
+    }
+}
+
+/// The mode check of one run. It keeps no state of its own: what the last
+/// notice was is read from the history.
+struct AgentModeTurn {
+    reminders: Arc<HashMap<AgentMode, String>>,
+}
+
+#[async_trait]
+impl TurnMiddleware for AgentModeTurn {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        if let Some(content) = notice_for(&self.reminders, cx) {
+            cx.queue_notice(NoticeSource::AgentMode, content);
+        }
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -192,7 +183,7 @@ impl MiddlewareFactory for AgentModeFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config.clone())?;
 
         // Build reminders map
@@ -236,7 +227,7 @@ impl MiddlewareFactory for PlanModeCompatFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
         // Parse the old plan_mode config format
         #[derive(Debug, Deserialize)]
         struct LegacyConfig {
@@ -277,6 +268,8 @@ impl MiddlewareFactory for PlanModeCompatFactory {
 mod tests {
     use super::*;
     use crate::middleware::factory::MIDDLEWARE_REGISTRY;
+    use crate::middleware::{ConversationContext, ExecutionState};
+    use crate::test_utils::HookRig;
 
     fn middleware() -> AgentModeMiddleware {
         let mut reminders = HashMap::new();
@@ -304,8 +297,9 @@ mod tests {
         middleware: &AgentModeMiddleware,
         context: Arc<ConversationContext>,
     ) -> Arc<ConversationContext> {
-        let state = middleware
-            .on_step_start(ExecutionState::BeforeLlmCall { context }, None)
+        let mut stack = HookRig::stack_of(middleware.clone());
+        let state = HookRig::new()
+            .step_start(&mut stack, ExecutionState::BeforeLlmCall { context })
             .await
             .unwrap();
         let ExecutionState::BeforeLlmCall { context } = state else {

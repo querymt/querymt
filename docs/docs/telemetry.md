@@ -55,7 +55,7 @@ produces a tree of child spans describing every step that was executed.
 | `http_adapter.credential_refresh` | Refreshing the provider credential |
 | `http_adapter.prepare_request` | Building the HTTP request (`http.request.body.size`) |
 | `http_adapter.send` | Sending the request, up to response headers |
-| `agent.execution.middleware.*` | Middleware phases (`turn_start`, `step_start`, `after_llm`, `processing_tool_calls`, `turn_end`; debug level) |
+| `agent.execution.middleware.*` | Middleware stages (`turn_start`, `step_start`, `after_llm`, `turn_end`, `stopped`; debug level) |
 
 **Tool calls**
 
@@ -134,8 +134,7 @@ these operations (`operation`: `start`, `callback`, `logout`; `outcome`: `ok` or
 
 | Span name | Description |
 |---|---|
-| `middleware.phase` | Running a middleware phase (debug level) |
-| `middleware.driver` | Middleware driver orchestration (debug level) |
+| `middleware.driver` | One middleware's hook call, with its `name` and `phase` (debug level) |
 | `middleware.dedup_check.analyze` | Duplicate-content analysis |
 | `middleware.dedup_check.update_index` | Updating the dedup index |
 | `middleware.dedup_check.turn_end` | Dedup end-of-turn bookkeeping |
@@ -346,8 +345,8 @@ export QMT_TELEMETRY_LEVEL=debug
 
 Per-step bookkeeping spans are only exported at `debug` or more verbose, so a
 default trace describes work (model requests, tool calls) and not internals:
-`middleware.driver`, `middleware.phase`, `agent.execution.middleware.turn_start`,
-`.step_start`, `.after_llm`, `.processing_tool_calls`, `.turn_end`,
+`middleware.driver`, `agent.execution.middleware.turn_start`,
+`.step_start`, `.after_llm`, `.turn_end`, `.stopped`,
 `agent.tool.side_effects`, `agent.request.cache_breakpoints`,
 `model_inventory.get_snapshot` and `function_index.remove_file`. Model request,
 `execute_tool` and `agent.tool.invoke` spans are unchanged.

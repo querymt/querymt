@@ -9,23 +9,25 @@ pub mod state;
 // Keep existing exports during transition
 mod context;
 pub mod dedup_check;
-pub mod delegation_guard;
 mod limits;
 mod modes;
 pub mod output_limit;
 mod parallel_edit_guard;
 mod presets;
-mod specialized;
-mod tasks;
 
 #[doc(hidden)]
 pub use assembly::build_from_entries;
 
 // Re-export new architecture types
+pub(crate) use driver::Folded;
 pub use driver::{
-    CompositeDriver, MiddlewareDriver, PreparedBatch, PreparedCallVerdict, PreparedToolCall,
+    CompositeDriver, PreparedBatch, PreparedCallVerdict, PreparedToolCall, TurnStack,
 };
 pub use error::{MiddlewareError, Result};
+pub use middleware_driver::{
+    EndVerdict, HookCx, Middleware, ReplyVerdict, StepVerdict, Stop, StopVerdict, TurnInfo,
+    TurnMiddleware,
+};
 pub use state::{
     AgentStats, ConversationContext, ExecutionState, LlmResponse, ModelProfile, PendingNotice,
     PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason,
@@ -40,17 +42,14 @@ pub use context::{ContextConfig, ContextMiddleware};
 pub use dedup_check::{
     DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
 };
-pub use delegation_guard::DelegationGuardMiddleware;
 pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry, enabled_flag};
-pub use limits::{
-    LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
-};
+pub use limits::{LimitsConfig, LimitsMiddleware};
+pub use modes::AgentModeMiddleware;
 pub use output_limit::{
     OutputLimitConfig, OutputLimitRecoveryFactory, OutputLimitRecoveryMiddleware,
 };
 pub use parallel_edit_guard::{ParallelEditGuard, ParallelEditGuardFactory, ParallelEditMode};
 pub use presets::MiddlewarePresets;
-pub use specialized::{AgentModeMiddleware, DuplicateToolCallMiddleware};
 
 #[cfg(test)]
 mod context_warning_tests;
@@ -60,5 +59,7 @@ mod dedup_check_tests;
 mod driver_tests;
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod run_state_tests;
 #[cfg(test)]
 mod state_tests;

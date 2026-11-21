@@ -16,7 +16,7 @@
 //! The registry will look up the "dedup_check" factory and pass the config to it.
 
 use crate::agent::agent_config::AgentConfig;
-use crate::middleware::MiddlewareDriver;
+use crate::middleware::Middleware;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -59,7 +59,7 @@ pub trait MiddlewareFactory: Send + Sync {
         &self,
         config: &Value,
         agent_config: &AgentConfig,
-    ) -> Result<Option<Arc<dyn MiddlewareDriver>>>;
+    ) -> Result<Option<Arc<dyn Middleware>>>;
 }
 
 /// Global middleware registry (lazy singleton)
@@ -117,7 +117,7 @@ impl MiddlewareRegistry {
         type_name: &str,
         config: &Value,
         agent_config: &AgentConfig,
-    ) -> Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> Result<Option<Arc<dyn Middleware>>> {
         let factory = self
             .factories
             .get(type_name)

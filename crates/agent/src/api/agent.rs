@@ -19,7 +19,7 @@ use crate::config::{
     SkillsConfig, SlashCommandsConfig, ToolSpec,
 };
 use crate::event_fanout::EventFanout;
-use crate::middleware::MiddlewareDriver;
+use crate::middleware::Middleware;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "api")]
@@ -97,7 +97,7 @@ impl AgentInfra {
 }
 
 /// Type alias for middleware factory closures
-type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
+type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn Middleware> + Send>;
 
 pub struct AgentBuilder {
     pub(super) llm_config: Option<LLMParams>,
@@ -599,7 +599,7 @@ impl AgentBuilder {
     pub fn middleware<F, M>(mut self, factory: F) -> Self
     where
         F: FnOnce(&AgentHandle) -> M + Send + 'static,
-        M: MiddlewareDriver + 'static,
+        M: Middleware + 'static,
     {
         self.middleware_factories
             .push(Box::new(move |agent| Arc::new(factory(agent))));

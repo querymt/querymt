@@ -10,9 +10,9 @@
 use crate::agent::core::McpToolState;
 use crate::agent::execution::tool_history::without_tool_changes;
 use crate::hooks::{HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig};
-use crate::middleware::{ContextConfig, ContextMiddleware, MiddlewareDriver};
+use crate::middleware::{ContextConfig, ContextMiddleware, Middleware, StepVerdict};
 use crate::session::provider::SessionProvider;
-use crate::test_utils::{MessageInjectingDriver, UndoTestFixture, mock_querymt_tool_call};
+use crate::test_utils::{Act, ScriptedMiddleware, UndoTestFixture, mock_querymt_tool_call};
 use crate::tools::{Tool as _, builtins::WriteFileTool};
 use async_trait::async_trait;
 use querymt::chat::{
@@ -298,7 +298,7 @@ struct Run {
 #[derive(Default)]
 struct Setup {
     hooks: Option<Hooks>,
-    middleware: Vec<Arc<dyn MiddlewareDriver>>,
+    middleware: Vec<Arc<dyn Middleware>>,
     mcp: Option<Arc<McpToolState>>,
 }
 
@@ -593,9 +593,10 @@ async fn request_after_a_stored_notice_matches_a_reload() {
     let run = Run::new(
         provider,
         Setup {
-            middleware: vec![Arc::new(MessageInjectingDriver {
-                inject_content: "check the notice".into(),
-            })],
+            middleware: vec![Arc::new(
+                ScriptedMiddleware::default()
+                    .step_start([Act::Notice("check the notice", StepVerdict::Proceed)]),
+            )],
             ..Setup::default()
         },
     )

@@ -1,552 +1,149 @@
-//! Common test driver implementations for middleware testing
+//! A scripted middleware: each hook performs its acts in turn, the last one
+//! repeating, and passes when it has none. Every call is logged.
 
-use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
+use crate::middleware::{
+    EndVerdict, HookCx, LlmResponse, Middleware, MiddlewareError, ReplyVerdict, Result,
+    StepVerdict, Stop, StopVerdict, TurnInfo, TurnMiddleware,
+};
 use async_trait::async_trait;
-use querymt_agent_core::events::StopType;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use querymt_agent_core::model::NoticeSource;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-// ============================================================================
-// StateRecordingDriver - Records the names of states it sees
-// ============================================================================
-
-pub struct StateRecordingDriver {
-    seen_states: Arc<Mutex<Vec<String>>>,
+/// What a scripted hook does: say a verdict, queue a notice and say it, fail,
+/// or never return (until the run is cancelled).
+#[derive(Debug, Clone)]
+pub enum Act<V> {
+    Say(V),
+    Notice(&'static str, V),
+    Fail,
+    Hang,
 }
 
-impl StateRecordingDriver {
-    pub fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
-        let states = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                seen_states: states.clone(),
-            },
-            states,
-        )
-    }
+struct Script<V>(VecDeque<Act<V>>);
 
-    fn record(&self, state: &ExecutionState) {
-        self.seen_states
-            .lock()
-            .unwrap()
-            .push(state.name().to_string());
-    }
-}
-
-#[async_trait]
-impl MiddlewareDriver for StateRecordingDriver {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
-    async fn on_after_llm(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
-    fn reset(&self) {
-        self.seen_states.lock().unwrap().clear();
-    }
-
-    fn name(&self) -> &'static str {
-        "StateRecordingDriver"
-    }
-}
-
-// ============================================================================
-// MessageInjectingDriver - Injects a message into BeforeLlmCall state
-// ============================================================================
-
-pub struct MessageInjectingDriver {
-    pub inject_content: String,
-}
-
-#[async_trait]
-impl MiddlewareDriver for MessageInjectingDriver {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.inject(state)
-    }
-
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.inject(state)
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "MessageInjectingDriver"
-    }
-}
-
-impl MessageInjectingDriver {
-    fn inject(&self, state: ExecutionState) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::BeforeLlmCall {
-                context: Arc::new(context.queue_notice(
-                    querymt_agent_core::model::NoticeSource::DuplicateToolCall,
-                    self.inject_content.clone(),
-                )),
-            }),
-            other => Ok(other),
-        }
-    }
-}
-
-// ============================================================================
-// PassThroughDriver - Simply passes state through unchanged
-// ============================================================================
-
-pub struct PassThroughDriver;
-
-#[async_trait]
-impl MiddlewareDriver for PassThroughDriver {
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "PassThrough"
-    }
-}
-
-// ============================================================================
-// StopDriver - Always returns Stopped state
-// ============================================================================
-
-pub struct StopDriver {
-    pub stop_type: StopType,
-    pub message: &'static str,
-}
-
-impl StopDriver {
-    pub fn new(stop_type: StopType, message: &'static str) -> Self {
-        Self { stop_type, message }
-    }
-
-    fn stopped_state(&self) -> ExecutionState {
-        ExecutionState::Stopped {
-            message: self.message.into(),
-            stop_type: self.stop_type,
-            context: None,
-        }
-    }
-}
-
-#[async_trait]
-impl MiddlewareDriver for StopDriver {
-    async fn on_turn_start(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
-    async fn on_step_start(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
-    async fn on_after_llm(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "StopDriver"
-    }
-}
-
-// ============================================================================
-// AlwaysStopDriver - Alias for StopDriver (for backward compatibility)
-// ============================================================================
-
-pub struct AlwaysStopDriver {
-    pub stop_type: StopType,
-}
-
-#[async_trait]
-impl MiddlewareDriver for AlwaysStopDriver {
-    async fn on_turn_start(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(ExecutionState::Stopped {
-            message: "stopped by middleware".into(),
-            stop_type: self.stop_type,
-            context: None,
-        })
-    }
-
-    async fn on_step_start(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_after_llm(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "AlwaysStopDriver"
-    }
-}
-
-// ============================================================================
-// CompleteDriver - Always returns Complete state
-// ============================================================================
-
-pub struct CompleteDriver;
-
-#[async_trait]
-impl MiddlewareDriver for CompleteDriver {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        let context = state.context().cloned().ok_or_else(|| {
-            crate::middleware::error::MiddlewareError::Other(anyhow::anyhow!(
-                "CompleteDriver requires a conversation context"
-            ))
-        })?;
-        Ok(ExecutionState::Complete { context })
-    }
-
-    async fn on_step_start(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_after_llm(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "CompleteDriver"
-    }
-}
-
-// ============================================================================
-// CancelDriver - Always returns Cancelled state
-// ============================================================================
-
-pub struct CancelDriver;
-
-#[async_trait]
-impl MiddlewareDriver for CancelDriver {
-    async fn on_turn_start(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(ExecutionState::Cancelled)
-    }
-
-    async fn on_step_start(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_after_llm(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "CancelDriver"
-    }
-}
-
-// ============================================================================
-// CountingDriver - Counts how many times hook methods are called
-// ============================================================================
-
-pub struct CountingDriver {
-    pub count: AtomicUsize,
-}
-
-impl CountingDriver {
-    pub fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn with_initial(initial: usize) -> Self {
-        Self {
-            count: AtomicUsize::new(initial),
-        }
-    }
-
-    fn bump(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl Default for CountingDriver {
+impl<V> Default for Script<V> {
     fn default() -> Self {
-        Self::new()
+        Self(VecDeque::new())
     }
 }
 
-#[async_trait]
-impl MiddlewareDriver for CountingDriver {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
-    async fn on_after_llm(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
-    fn reset(&self) {
-        self.count.store(0, Ordering::SeqCst);
-    }
-
-    fn name(&self) -> &'static str {
-        "CountingDriver"
-    }
+#[derive(Default)]
+struct State {
+    turn_start: Script<StepVerdict>,
+    step_start: Script<StepVerdict>,
+    after_llm: Script<ReplyVerdict>,
+    turn_end: Script<EndVerdict>,
+    stopped: Script<StopVerdict>,
+    /// `(hook, session)` of every call, in order.
+    calls: Vec<(&'static str, String)>,
 }
 
-// ============================================================================
-// ErrorDriver - Always returns an error
-// ============================================================================
+/// A middleware that does what its scripts say. Clones share the scripts and the
+/// log, which every run of every session consumes and extends.
+#[derive(Clone, Default)]
+pub struct ScriptedMiddleware(Arc<Mutex<State>>);
 
-pub struct ErrorDriver;
-
-#[async_trait]
-impl MiddlewareDriver for ErrorDriver {
-    async fn on_turn_start(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Err(crate::middleware::MiddlewareError::ExecutionError(
-            "test error".into(),
-        ))
-    }
-
-    async fn on_step_start(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_after_llm(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    async fn on_processing_tool_calls(
-        &self,
-        _state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        self.on_turn_start(_state, runtime).await
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "ErrorDriver"
-    }
+macro_rules! script {
+    ($($hook:ident: $verdict:ty),*) => {$(
+        pub fn $hook(self, acts: impl IntoIterator<Item = Act<$verdict>>) -> Self {
+            self.0.lock().unwrap().$hook.0 = acts.into_iter().collect();
+            self
+        }
+    )*};
 }
 
-// ============================================================================
-// BeforeLlmCallToCallLlmDriver - Transforms BeforeLlmCall to CallLlm
-// ============================================================================
+impl ScriptedMiddleware {
+    script!(turn_start: StepVerdict, step_start: StepVerdict, after_llm: ReplyVerdict,
+        turn_end: EndVerdict, stopped: StopVerdict);
 
-pub struct BeforeLlmCallToCallLlmDriver;
+    /// `(hook, session)` of every call so far.
+    pub fn calls(&self) -> Vec<(&'static str, String)> {
+        self.0.lock().unwrap().calls.clone()
+    }
 
-#[async_trait]
-impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
-    async fn on_step_start(
+    /// How many times `hook` was called.
+    pub fn count(&self, hook: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|(name, _)| *name == hook)
+            .count()
+    }
+
+    async fn act<V: Clone>(
         &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::CallLlm {
-                context,
-                request: Arc::new(crate::middleware::PreparedModelRequest {
-                    messages: Arc::from([]),
-                    tools: Arc::from([]),
-                    offered_tools: Arc::from([]),
-                    estimated_tokens: 0,
-                    options: Default::default(),
-                }),
-            }),
-            other => Ok(other),
+        hook: &'static str,
+        cx: &mut HookCx<'_>,
+        pick: impl FnOnce(&mut State) -> &mut Script<V>,
+        pass: V,
+    ) -> Result<V> {
+        let act = {
+            let mut state = self.0.lock().unwrap();
+            state.calls.push((hook, cx.session_id().to_string()));
+            let script = &mut pick(&mut state).0;
+            if script.len() > 1 {
+                script.pop_front()
+            } else {
+                script.front().cloned()
+            }
+        };
+        match act {
+            None => Ok(pass),
+            Some(Act::Say(verdict)) => Ok(verdict),
+            Some(Act::Notice(text, verdict)) => {
+                cx.queue_notice(NoticeSource::DuplicateToolCall, text);
+                Ok(verdict)
+            }
+            Some(Act::Fail) => Err(MiddlewareError::ExecutionError("test error".into())),
+            Some(Act::Hang) => std::future::pending().await,
         }
     }
+}
 
-    fn reset(&self) {}
-
+impl Middleware for ScriptedMiddleware {
     fn name(&self) -> &'static str {
-        "BeforeLlmCallToCallLlmDriver"
+        "ScriptedMiddleware"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(self.clone())
     }
 }
 
-// ============================================================================
-// StopOnBeforeLlmCall - Stops execution when it sees BeforeLlmCall state
-// ============================================================================
-
-pub struct StopOnBeforeLlmCall;
-
 #[async_trait]
-impl MiddlewareDriver for StopOnBeforeLlmCall {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { .. } => Ok(ExecutionState::Stopped {
-                message: "stopped".into(),
-                stop_type: StopType::Other,
-                context: None,
-            }),
-            other => Ok(other),
-        }
+impl TurnMiddleware for ScriptedMiddleware {
+    async fn on_turn_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        self.act(
+            "turn_start",
+            cx,
+            |s| &mut s.turn_start,
+            StepVerdict::Proceed,
+        )
+        .await
     }
 
-    fn reset(&self) {}
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        self.act(
+            "step_start",
+            cx,
+            |s| &mut s.step_start,
+            StepVerdict::Proceed,
+        )
+        .await
+    }
 
-    fn name(&self) -> &'static str {
-        "StopOnBeforeLlmCall"
+    async fn on_after_llm(&mut self, cx: &mut HookCx<'_>, _: &LlmResponse) -> Result<ReplyVerdict> {
+        self.act("after_llm", cx, |s| &mut s.after_llm, ReplyVerdict::Proceed)
+            .await
+    }
+
+    async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict> {
+        self.act("turn_end", cx, |s| &mut s.turn_end, EndVerdict::Finish)
+            .await
+    }
+
+    async fn on_stopped(&mut self, cx: &mut HookCx<'_>, _: &Stop) -> Result<StopVerdict> {
+        self.act("stopped", cx, |s| &mut s.stopped, StopVerdict::Pass)
+            .await
     }
 }

@@ -2135,7 +2135,7 @@ pub(super) async fn store_all_tool_results(
     }
 
     if !combined.is_empty() {
-        env.runtime.turn_diffs.lock().merge(combined);
+        turn.changed_paths.merge(combined);
     }
 
     if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {

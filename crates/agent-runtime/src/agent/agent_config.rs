@@ -18,7 +18,7 @@ use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
 use crate::delegation::roster::AgentRoster;
 use crate::hooks::Hooks;
-use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::middleware::{CompositeDriver, Middleware};
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
@@ -85,7 +85,7 @@ pub struct AgentConfig {
     /// `skill` tool from it (see `ToolSet`); the tool is deliberately absent
     /// from `tool_registry`.
     pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
-    pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    pub middleware_drivers: Vec<Arc<dyn Middleware>>,
     pub auth_methods: Vec<AuthMethod>,
 
     // ── MCP servers (from TOML config, applied to every session) ────────
@@ -148,7 +148,7 @@ impl AgentConfig {
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
     #[doc(hidden)]
-    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn Middleware>>) -> Self {
         for driver in &drivers {
             driver.bind_agent(&self.tool_registry, &self.event_sink);
         }
@@ -160,7 +160,7 @@ impl AgentConfig {
     pub fn create_driver(&self) -> CompositeDriver {
         use crate::middleware::{LimitsConfig, LimitsMiddleware};
 
-        let mut drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
+        let mut drivers: Vec<Arc<dyn Middleware>> = Vec::new();
 
         // Add LimitsMiddleware if configured
         if let Some(max_steps) = self.max_steps {
@@ -188,13 +188,13 @@ impl AgentConfig {
     /// Enforced before every paid attempt, best effort.
     pub fn budget_cap_usd(&self) -> Option<f64> {
         self.create_driver()
-            .get_limits()
+            .limits()
             .and_then(|limits| limits.max_cost_usd)
     }
 
     /// Returns the session limits from configured middleware.
     pub fn get_session_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
-        self.create_driver().get_limits()
+        self.create_driver().limits()
     }
 
     /// Builds delegation metadata for ACP `AgentCapabilities._meta` field.

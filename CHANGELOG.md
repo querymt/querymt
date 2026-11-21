@@ -412,6 +412,82 @@
   the file (`mmap_size = 268435456`), with or without migrations. Older binaries
   can still open a migrated database.
 
+
+### Breaking
+
+- **BREAKING: the middleware trait is replaced by `Middleware` and
+  `TurnMiddleware`** (`querymt_agent::middleware`). A middleware is now an
+  agent-scoped `Middleware` (configuration and shared services) that creates one
+  `TurnMiddleware` per run; all state of a run lives in that instance, so it
+  cannot leak into another session or the next run (before, per-run state kept
+  in a shared driver was cleared by `reset`, which no run called). Hooks take a
+  `HookCx` (reads of the run, `queue_notice`, `set_request_overrides`) and
+  return a verdict that names only what the stage allows (`StepVerdict`,
+  `ReplyVerdict`, `EndVerdict`, `StopVerdict`) instead of any `ExecutionState`.
+  Before and after, a middleware that stops a run at its sixth request:
+
+  ```rust
+  // Before
+  struct Budget;
+  #[async_trait]
+  impl MiddlewareDriver for Budget {
+      async fn on_step_start(&self, state: ExecutionState, _rt: Option<&Arc<SessionRuntime>>)
+          -> Result<ExecutionState> {
+          match state {
+              ExecutionState::BeforeLlmCall { context } if context.stats.steps >= 5 =>
+                  Ok(ExecutionState::Stopped {
+                      message: "budget used".into(),
+                      stop_type: StopType::Other,
+                      context: Some(context),
+                  }),
+              other => Ok(other),
+          }
+      }
+      fn reset(&self) {}
+      fn name(&self) -> &'static str { "budget" }
+  }
+
+  // After
+  struct Budget;
+  impl Middleware for Budget {
+      fn name(&self) -> &'static str { "budget" }
+      fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> { Box::new(BudgetTurn) }
+  }
+  struct BudgetTurn;
+  #[async_trait]
+  impl TurnMiddleware for BudgetTurn {
+      async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+          if cx.stats().steps >= 5 {
+              return Ok(StepVerdict::Stop(Stop::new(StopType::Other, "budget used")));
+          }
+          Ok(StepVerdict::Proceed)
+      }
+  }
+  ```
+
+  Removed from the trait: `reset` (a run gets new instances), the
+  `on_processing_tool_calls` hook (only test code implemented it), the
+  `Option<&Arc<SessionRuntime>>` parameter (use `HookCx::runtime`), a hook's
+  freedom to return any `ExecutionState` (a middleware can no longer complete or
+  cancel a run), and `get_limits` (now `Middleware::limits`). `on_turn_start`
+  remains and returns a `StepVerdict`. `CompositeDriver::run_*` and `reset` are
+  gone; `CompositeDriver::begin_turn` returns the run's `TurnStack`.
+  `MiddlewareFactory::create`, `AgentBuilder::middleware`,
+  `AgentConfigBuilder::with_middleware(s)` and `AgentConfig::middleware_drivers`
+  take `Arc<dyn Middleware>` / `impl Middleware`. See the
+  [middleware guide](docs/docs/agent/middleware.md).
+- **BREAKING: five unused middleware types are removed:**
+  `DelegationGuardMiddleware`, `DuplicateToolCallMiddleware`,
+  `MaxStepsMiddleware`, `TurnLimitMiddleware` and `PriceLimitMiddleware`. None
+  was built by any preset, assembly or configuration entry. Use
+  `LimitsMiddleware` for the three limit types
+  (`LimitsConfig::default().max_steps(n)`, `.max_turns(n)`,
+  `LimitsConfig::with_manual_pricing(input, output).max_price_usd(cap)`); the
+  other two have no replacement. `StopType::DelegationBlocked`,
+  `NoticeSource::DuplicateToolCall` and `Delegation::retry_count` stay.
+- **`SessionRuntime::turn_diffs` is removed.** The files a run changed are held
+  by the run itself and reach middleware through `HookCx::changed_paths`.
+
 ### Fixed
 
 - **`shell` returns when its command exits.** A command that leaves a background
