@@ -58,6 +58,26 @@ pub enum RunPhase {
     Closing,
 }
 
+/// What a run tells its session actor about itself: the phase it is in and a
+/// revision that moves when something else the actor publishes changed (the
+/// steering inbox drained). Sent through a `watch` channel, so a burst of
+/// changes reaches the actor as the latest value, not as every step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSignal {
+    pub phase: RunPhase,
+    pub revision: u64,
+}
+
+impl RunSignal {
+    /// The signal of a run that has not reported yet.
+    pub fn starting() -> Self {
+        Self {
+            phase: RunPhase::Starting,
+            revision: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TurnControlError {
     #[error("there is no active run to steer")]

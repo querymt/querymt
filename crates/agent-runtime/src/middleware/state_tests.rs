@@ -1,6 +1,6 @@
+use crate::agent::execution::Stage;
 use crate::middleware::{
-    AgentStats, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult, WaitCondition,
-    WaitReason,
+    AgentStats, LlmResponse, PreparedModelRequest, Stop, ToolResult, WaitCondition, WaitReason,
 };
 use crate::test_utils::mock_tool_call;
 use querymt::chat::{FinishReason, ToolResultPart};
@@ -8,54 +8,46 @@ use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
 #[test]
-fn test_execution_state_name_all_variants() {
-    let response = Arc::new(LlmResponse::new(
+fn stage_names_all_variants() {
+    let response = Box::new(LlmResponse::new(
         "".to_string(),
         vec![],
         None,
         Some(FinishReason::Stop),
     ));
-    let states = vec![
-        (ExecutionState::BeforeLlmCall, "BeforeLlmCall"),
+    let stages = vec![
+        (Stage::BeforeRequest, "BeforeRequest"),
         (
-            ExecutionState::CallLlm {
-                request: Arc::new(PreparedModelRequest {
-                    messages: Arc::from([]),
-                    tools: Arc::from([]),
-                    offered_tools: Arc::from([]),
-                    estimated_tokens: 0,
-                    options: Default::default(),
-                }),
-            },
-            "CallLlm",
+            Stage::CallModel(Box::new(PreparedModelRequest {
+                messages: Arc::from([]),
+                tools: Arc::from([]),
+                offered_tools: Arc::from([]),
+                estimated_tokens: 0,
+                options: Default::default(),
+            })),
+            "CallModel",
         ),
-        (ExecutionState::AfterLlm { response }, "AfterLlm"),
+        (Stage::AfterReply(response), "AfterReply"),
         (
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls: Arc::from([]),
-                results: Arc::from([]),
+            Stage::ToolCalls {
+                calls: Vec::new(),
+                results: Vec::new(),
             },
-            "ProcessingToolCalls",
+            "ToolCalls",
         ),
         (
-            ExecutionState::WaitingForEvent {
-                wait: WaitCondition::delegation("del-1".to_string()),
-            },
-            "WaitingForEvent",
+            Stage::Waiting(WaitCondition::delegation("del-1".to_string())),
+            "Waiting",
         ),
-        (ExecutionState::Complete, "Complete"),
+        (Stage::Ending, "Ending"),
         (
-            ExecutionState::Stopped {
-                message: "done".into(),
-                stop_type: StopType::Other,
-            },
-            "Stopped",
+            Stage::Stopping(Stop::new(StopType::Other, "done")),
+            "Stopping",
         ),
-        (ExecutionState::Cancelled, "Cancelled"),
     ];
 
-    for (state, expected) in states {
-        assert_eq!(state.name(), expected);
+    for (stage, expected) in stages {
+        assert_eq!(<&'static str>::from(&stage), expected);
     }
 }
 

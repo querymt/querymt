@@ -208,18 +208,6 @@ pub struct TurnSnapshot {
     pub snapshot_id: querymt_agent_services::snapshot::SnapshotId,
 }
 
-/// Type alias for the in-flight pre-turn snapshot task handle.
-type PreTurnSnapshotTask = ParkingMutex<
-    Option<
-        tokio::task::JoinHandle<(
-            querymt_agent_core::model::TurnId,
-            querymt_agent_services::snapshot::SnapshotResult<
-                querymt_agent_services::snapshot::SnapshotId,
-            >,
-        )>,
-    >,
->;
-
 /// Runtime state for an active session.
 pub struct SessionRuntime {
     pub cwd: Option<std::path::PathBuf>,
@@ -240,10 +228,6 @@ pub struct SessionRuntime {
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<querymt_agent_index::WorkspaceHandle>>,
-    /// Turn snapshot taken at the start of the turn for undo/redo.
-    pub turn_snapshot: ParkingMutex<Option<TurnSnapshot>>,
-    /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
-    pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Workspace tree after the last diff snapshot, keyed by root. Seeds the
     /// next pre-call scan so unchanged files (same size and mtime) are not
     /// re-hashed.
@@ -333,8 +317,6 @@ impl SessionRuntime {
             skill_grants: Arc::new(ParkingMutex::new(HashSet::new())),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
-            turn_snapshot: ParkingMutex::new(None),
-            pre_turn_snapshot_task: ParkingMutex::new(None),
             last_snapshot_tree: ParkingMutex::new(None),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_gate: Arc::new(OnceCell::new()),

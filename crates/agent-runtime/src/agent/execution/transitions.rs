@@ -9,13 +9,15 @@
 use super::tool_calls::{Disposition, PreparedCall};
 use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
+use crate::agent::execution::{CycleOutcome, Stage, Step};
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::{genai, u32_from_usize};
 use crate::middleware::{
-    ExecutionState, LlmResponse, PreparedBatch, PreparedCallVerdict, PreparedModelRequest,
-    PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction, ToolResult, TurnStack,
-    apply_usage_to_stats, calculate_context_tokens,
+    LlmResponse, PreparedBatch, PreparedCallVerdict, PreparedModelRequest, PreparedToolCall,
+    ToolCall as MiddlewareToolCall, ToolFunction, ToolResult, TurnStack, apply_usage_to_stats,
+    calculate_context_tokens,
 };
 use anyhow::Context as _;
 use futures_util::Stream;
@@ -48,7 +50,7 @@ use uuid::Uuid;
 /// Read before the request's notices are stored, so a notice stored after a
 /// tool batch does not make the request a user-prompt request. Tool records
 /// stored after the tool results do not change what the request follows.
-pub(super) fn context_hook_trigger(history: &[AgentMessage]) -> &'static str {
+pub(super) fn context_hook_trigger(history: &[AgentMessage]) -> ContextTrigger {
     if history
         .iter()
         .rfind(|message| !message.is_tool_record())
@@ -59,10 +61,20 @@ pub(super) fn context_hook_trigger(history: &[AgentMessage]) -> &'static str {
                 .any(|part| matches!(part, MessagePart::ToolResult { .. }))
         })
     {
-        "after_tool_batch"
+        ContextTrigger::AfterToolBatch
     } else {
-        "user_prompt"
+        ContextTrigger::UserPrompt
     }
+}
+
+/// What a request follows, as the context hook's `trigger` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(super) enum ContextTrigger {
+    /// The request follows the results of a tool batch.
+    AfterToolBatch,
+    /// The request follows a user prompt.
+    UserPrompt,
 }
 
 /// Transition from BeforeLlmCall to CallLlm.
@@ -71,9 +83,10 @@ pub(super) fn context_hook_trigger(history: &[AgentMessage]) -> &'static str {
 /// if the tool set has changed. `trigger` is the context-hook trigger, from
 /// [`context_hook_trigger`] over the history before notices were stored.
 /// `objective` is the request-scoped run objective, sent in the request tail.
+/// `provider` is the run's provider, resolved once before its first hook.
 #[instrument(
     name = "agent.transition.before_llm_call",
-    skip(config, env, turn, trigger, objective),
+    skip(config, env, turn, provider, trigger, objective),
     fields(
         session_id = %env.session_id,
         provider = %env.provider_name(),
@@ -85,52 +98,20 @@ pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    trigger: &'static str,
+    provider: &Arc<dyn querymt::LLMProvider>,
+    trigger: ContextTrigger,
     objective: Option<&str>,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     debug!(
         "BeforeLlmCall: session={}, steps={}",
         env.session_id, turn.stats.steps
     );
 
     if env.cancellation_token.is_cancelled() {
-        return Ok(ExecutionState::Cancelled);
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
-    let provider = match super::llm_retry::call_with_retry(
-        config,
-        &env.session_id,
-        "provider_init",
-        &env.cancellation_token,
-        || {
-            let session_handle = env.session_handle.clone();
-            let cancel = env.cancellation_token.clone();
-            async move {
-                tokio::select! {
-                    result = session_handle.provider() => result.map_err(LLMError::from),
-                    _ = cancel.cancelled() => Err(LLMError::Cancelled),
-                }
-            }
-        },
-    )
-    .await
-    {
-        Ok(provider) => provider,
-        Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
-        Err(error) => {
-            return Err(contextualize_llm_error(
-                error,
-                "provider initialization",
-                env,
-            ));
-        }
-    };
-
-    // A failed eager initialization may have left the turn with an empty profile.
-    // Provider retries must refresh it before request options are filtered.
-    if turn.profile.capabilities != provider.capabilities() {
-        turn.profile = env.session_handle.profile().await;
-    }
+    let trigger: &'static str = trigger.into();
 
     let collect_span = info_span!(
         "agent.tools.collect",
@@ -149,7 +130,7 @@ pub(super) async fn transition_before_llm_call(
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
         let tools = config.collect_tools(
-            provider,
+            Arc::clone(provider),
             Some(env.runtime.as_ref()),
             Some(&env.tool_config),
             env.tool_set(),
@@ -302,14 +283,13 @@ pub(super) async fn transition_before_llm_call(
         .saturating_add(tool_tokens)
         .saturating_add(tail_tokens);
     if estimated_tokens >= context_window as usize {
-        return Ok(ExecutionState::Stopped {
-            message: format!(
+        return Ok(super::stopping(
+            StopType::ContextThreshold,
+            format!(
                 "Prepared request is approximately {} tokens, exceeding the {} token context window",
                 estimated_tokens, context_window
-            )
-            .into(),
-            stop_type: StopType::ContextThreshold,
-        });
+            ),
+        ));
     }
     // The two cache hints go in place on the messages as they are sent, after
     // any context hook has restructured them.
@@ -327,15 +307,15 @@ pub(super) async fn transition_before_llm_call(
         let room = context_window.saturating_sub(estimated_tokens as u32);
         options.max_tokens = Some(cap.min(room));
     }
-    Ok(ExecutionState::CallLlm {
-        request: Arc::new(PreparedModelRequest {
+    Ok(Step::Continue(Stage::CallModel(Box::new(
+        PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(leading.into_boxed_slice()),
             offered_tools: Arc::from(offered_tools.into_boxed_slice()),
             estimated_tokens,
             options,
-        }),
-    })
+        },
+    ))))
 }
 
 /// Hash of the system prompt the session's provider is configured with: the
@@ -382,18 +362,18 @@ fn request_tail(objective: Option<&str>, additional_context: &[String]) -> Optio
     Some(tail)
 }
 
-fn contextualize_llm_error(
+pub(super) fn contextualize_llm_error(
     error: LLMError,
     operation: &'static str,
     env: &TurnEnv,
-) -> anyhow::Error {
+) -> TurnError {
     genai::llm_error(&error);
-    let source_message = error.to_string();
-    anyhow::Error::new(error).context(format!(
-        "LLM {operation} error (provider={}, model={}): {source_message}",
-        env.provider_name(),
-        env.model_name()
-    ))
+    TurnError::Provider {
+        operation,
+        provider: env.provider_name().to_string(),
+        model: env.model_name().to_string(),
+        source: error,
+    }
 }
 
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
@@ -434,24 +414,18 @@ fn main_attempt_operation(
 
 /// A paid dispatch the cycle budget gate refused ends the cycle as a
 /// price-limit stop, not an execution failure. Nothing was sent.
-fn budget_stop(
-    operation: &querymt_agent_services::accounting::AttemptOperation,
-) -> Option<ExecutionState> {
-    operation
-        .budget_refusal()
-        .map(|(cap, spent)| ExecutionState::Stopped {
-            message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}").into(),
-            stop_type: StopType::PriceLimit,
-        })
+fn budget_stop(operation: &querymt_agent_services::accounting::AttemptOperation) -> Option<Step> {
+    operation.budget_refusal().map(|(cap, spent)| {
+        super::stopping(
+            StopType::PriceLimit,
+            format!("Price limit reached: ${spent:.4} >= ${cap:.2}"),
+        )
+    })
 }
 
-fn map_failed_llm_call(
-    error: LLMError,
-    streaming: bool,
-    env: &TurnEnv,
-) -> Result<ExecutionState, anyhow::Error> {
+fn map_failed_llm_call(error: LLMError, streaming: bool, env: &TurnEnv) -> Result<Step, TurnError> {
     match error {
-        LLMError::Cancelled => Ok(ExecutionState::Cancelled),
+        LLMError::Cancelled => Ok(Step::Break(CycleOutcome::Cancelled)),
         error => Err(contextualize_llm_error(
             error,
             if streaming { "streaming" } else { "chat" },
@@ -499,24 +473,21 @@ by the output token limit; split the write into smaller calls."
 /// tool_use/tool_result history invariant.
 async fn store_results_then_stop_on_length(
     config: &AgentConfig,
-    results: Arc<[ToolResult]>,
+    results: &[ToolResult],
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     let next = super::tool_calls::store_all_tool_results(
         config,
-        &results,
+        results,
         env,
         turn,
         crate::agent::execution::DrainedSteering::none(),
     )
     .await?;
     Ok(match next {
-        ExecutionState::BeforeLlmCall => ExecutionState::Stopped {
-            message: "Model hit token limit".into(),
-            stop_type: StopType::ModelTokenLimit,
-        },
-        other => other,
+        Stage::BeforeRequest => super::stopping(StopType::ModelTokenLimit, "Model hit token limit"),
+        waiting => Step::Continue(waiting),
     })
 }
 
@@ -823,7 +794,7 @@ fn gate_function_calls_for_execution(
 /// tracks usage/costs, and emits LlmRequestStart/End events.
 #[instrument(
     name = "agent.transition.call_llm",
-    skip(config, request, env, turn),
+    skip(config, request, env, turn, provider),
     fields(
         otel.name = %format!("chat {}", env.model_name()),
         otel.kind = "client",
@@ -844,10 +815,11 @@ fn gate_function_calls_for_execution(
 )]
 pub(super) async fn transition_call_llm(
     config: &AgentConfig,
-    request: &Arc<PreparedModelRequest>,
+    request: &PreparedModelRequest,
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+    provider: &Arc<dyn querymt::LLMProvider>,
+) -> Result<Step, TurnError> {
     // A single expected generation; early cancellation/drop retains an abnormal finish
     // without marking the span as an error. Successful canonical output replaces it.
     genai::finish_reason("error");
@@ -873,7 +845,7 @@ pub(super) async fn transition_call_llm(
     );
 
     if env.cancellation_token.is_cancelled() {
-        return Ok(ExecutionState::Cancelled);
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
     // Overrides last for exactly this request. Options the provider does not
@@ -901,6 +873,7 @@ pub(super) async fn transition_call_llm(
     );
 
     let session_handle = &env.session_handle;
+    let provider = Arc::clone(provider);
     let messages_with_cache = request_messages;
     // Recorded on every exit path (success, error, cancel) when dropped.
     let chat_timer = crate::agent::utils::llm_metrics::ChatTimer::start(
@@ -933,16 +906,9 @@ pub(super) async fn transition_call_llm(
                 let messages_with_cache = &messages_with_cache;
                 let cancel = cancel.clone();
                 let operation = &operation;
+                let provider = &provider;
                 async move {
-                    // Provider resolution is local: a failure here is not a
-                    // paid attempt. Billing is bound once it is resolved.
-                    let provider = tokio::select! {
-                        result = session_handle.provider() => result.map_err(LLMError::from)?,
-                        _ = cancel.cancelled() => return Err(LLMError::Cancelled),
-                    };
-                    // Per-request options the provider does not honour are dropped.
-                    let options =
-                        crate::session::provider::supported_overrides(provider.as_ref(), options);
+                    // `options` already holds only what the provider honours.
                     let call = ChatCall::new(messages_with_cache).options(options);
                     querymt_agent_services::accounting::run_attempt(
                         operation,
@@ -969,34 +935,6 @@ pub(super) async fn transition_call_llm(
             }
         }
     } else {
-        let provider = match super::llm_retry::call_with_retry(
-            config,
-            session_id,
-            "provider_init",
-            &env.cancellation_token,
-            || {
-                let cancel = env.cancellation_token.clone();
-                async move {
-                    tokio::select! {
-                        result = session_handle.provider() => result.map_err(LLMError::from),
-                        _ = cancel.cancelled() => Err(LLMError::Cancelled),
-                    }
-                }
-            },
-        )
-        .await
-        {
-            Ok(provider) => provider,
-            Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
-            Err(error) => {
-                return Err(contextualize_llm_error(
-                    error,
-                    "provider initialization",
-                    env,
-                ));
-            }
-        };
-
         session_handle.record_generation_settings(&chat_span, options);
         if provider.capabilities().streaming {
             tracing::Span::current().record("gen_ai.request.stream", true);
@@ -1120,7 +1058,7 @@ pub(super) async fn transition_call_llm(
                     config.execution_policy.rate_limit.max_attempts(),
                 );
                 if env.cancellation_token.is_cancelled() {
-                    return Ok(ExecutionState::Cancelled);
+                    return Ok(Step::Break(CycleOutcome::Cancelled));
                 }
 
                 // Durable start before the request is sent; a failure here
@@ -1137,7 +1075,7 @@ pub(super) async fn transition_call_llm(
                         if let Some(stop) = budget_stop(&operation) {
                             return Ok(stop);
                         }
-                        return Err(accounting_failure(error));
+                        return Err(accounting_failure(error).into());
                     }
                 };
                 let mut response_started = false;
@@ -1174,7 +1112,7 @@ pub(super) async fn transition_call_llm(
                     {
                         super::llm_retry::StreamFailureAction::Retry => continue 'stream,
                         super::llm_retry::StreamFailureAction::Cancelled => {
-                            return Ok(ExecutionState::Cancelled);
+                            return Ok(Step::Break(CycleOutcome::Cancelled));
                         }
                         super::llm_retry::StreamFailureAction::Terminal(error) => {
                             return map_failed_llm_call(error, true, env);
@@ -1236,7 +1174,7 @@ pub(super) async fn transition_call_llm(
                         {
                             super::llm_retry::StreamFailureAction::Retry => continue 'stream,
                             super::llm_retry::StreamFailureAction::Cancelled => {
-                                return Ok(ExecutionState::Cancelled);
+                                return Ok(Step::Break(CycleOutcome::Cancelled));
                             }
                             super::llm_retry::StreamFailureAction::Terminal(error) => {
                                 return Err(contextualize_llm_error(error, "streaming", env));
@@ -1275,7 +1213,7 @@ pub(super) async fn transition_call_llm(
                         {
                             super::llm_retry::StreamFailureAction::Retry => continue 'stream,
                             super::llm_retry::StreamFailureAction::Cancelled => {
-                                return Ok(ExecutionState::Cancelled);
+                                return Ok(Step::Break(CycleOutcome::Cancelled));
                             }
                             super::llm_retry::StreamFailureAction::Terminal(error) => {
                                 return Err(contextualize_llm_error(error, "streaming", env));
@@ -1334,7 +1272,7 @@ pub(super) async fn transition_call_llm(
                                         .settle_error(&LLMError::Cancelled, true, partial)
                                         .await
                                         .map_err(accounting_failure)?;
-                                    return Ok(ExecutionState::Cancelled);
+                                    return Ok(Step::Break(CycleOutcome::Cancelled));
                                 }
                                 break;
                             }
@@ -1431,7 +1369,7 @@ pub(super) async fn transition_call_llm(
                                         .settle_error(&LLMError::Cancelled, true, partial)
                                         .await
                                         .map_err(accounting_failure)?;
-                                    return Ok(ExecutionState::Cancelled);
+                                    return Ok(Step::Break(CycleOutcome::Cancelled));
                                 }
 
                                 let completed_calls =
@@ -1464,7 +1402,7 @@ pub(super) async fn transition_call_llm(
                                             continue 'stream;
                                         }
                                         super::llm_retry::StreamFailureAction::Cancelled => {
-                                            return Ok(ExecutionState::Cancelled);
+                                            return Ok(Step::Break(CycleOutcome::Cancelled));
                                         }
                                         super::llm_retry::StreamFailureAction::Terminal(error) => {
                                             return Err(contextualize_llm_error(
@@ -1544,7 +1482,7 @@ pub(super) async fn transition_call_llm(
                         {
                             super::llm_retry::StreamFailureAction::Retry => continue 'stream,
                             super::llm_retry::StreamFailureAction::Cancelled => {
-                                return Ok(ExecutionState::Cancelled);
+                                return Ok(Step::Break(CycleOutcome::Cancelled));
                             }
                             super::llm_retry::StreamFailureAction::Terminal(error) => {
                                 return Err(contextualize_llm_error(error, "streaming", env));
@@ -1588,7 +1526,7 @@ pub(super) async fn transition_call_llm(
             // so a cancel signal that arrived concurrently with the terminal chunk
             // is not missed — without this the state machine would advance to AfterLlm.
             if env.cancellation_token.is_cancelled() {
-                return Ok(ExecutionState::Cancelled);
+                return Ok(Step::Break(CycleOutcome::Cancelled));
             }
 
             streamed_output
@@ -1706,9 +1644,7 @@ pub(super) async fn transition_call_llm(
     turn.request_overrides = querymt::chat::GenerationOptions::NONE;
     turn.last_applied = options;
 
-    Ok(ExecutionState::AfterLlm {
-        response: Arc::new(llm_response),
-    })
+    Ok(Step::Continue(Stage::AfterReply(Box::new(llm_response))))
 }
 
 /// Transition from AfterLlm to ProcessingToolCalls or Complete.
@@ -1722,10 +1658,10 @@ pub(super) async fn transition_call_llm(
 )]
 pub(super) async fn transition_after_llm(
     config: &AgentConfig,
-    response: &Arc<LlmResponse>,
+    response: &LlmResponse,
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     debug!(
         "AfterLlm: session={}, has_tool_calls={}",
         env.session_id,
@@ -1733,7 +1669,7 @@ pub(super) async fn transition_after_llm(
     );
 
     if env.cancellation_token.is_cancelled() {
-        return Ok(ExecutionState::Cancelled);
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
     // The pre-turn snapshot is deliberately NOT awaited here: the response is
@@ -1840,7 +1776,7 @@ pub(super) async fn transition_after_llm(
         turn.history
             .commit(&env.session_handle, vec![assistant_msg])
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
+            .map_err(TurnError::history("Failed to store assistant message"))?;
 
         let reasoning_parts = response
             .output
@@ -1879,7 +1815,8 @@ pub(super) async fn transition_after_llm(
             "Provider reported a failed response (provider={}, model={})",
             env.provider_name(),
             env.model_name()
-        ));
+        )
+        .into());
     }
 
     // Gate local execution on response-level validation. Only calls with valid
@@ -1936,24 +1873,19 @@ pub(super) async fn transition_after_llm(
                 ),
                 _ => (format!("Response incomplete. {detail}"), StopType::Other),
             };
-            return Ok(ExecutionState::Stopped {
-                message: message.into(),
-                stop_type,
-            });
+            return Ok(super::stopping(stop_type, message));
         }
 
-        let results: Arc<[ToolResult]> = Arc::from(gated_results.into_boxed_slice());
-
         if response.finish_reason == Some(FinishReason::Length) {
-            return store_results_then_stop_on_length(config, results, env, turn).await;
+            return store_results_then_stop_on_length(config, &gated_results, env, turn).await;
         }
 
         // Store the synthesized results (no execution) by routing through the
         // tool-result storage step with no remaining calls.
-        return Ok(ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(Vec::new().into_boxed_slice()),
-            results,
-        });
+        return Ok(Step::Continue(Stage::ToolCalls {
+            calls: Vec::new(),
+            results: gated_results,
+        }));
     }
 
     let has_dispatchable_calls = !executable_calls.is_empty() || !gated_results.is_empty();
@@ -1961,42 +1893,42 @@ pub(super) async fn transition_after_llm(
     match response.finish_reason {
         Some(FinishReason::ToolCalls) => {
             if has_dispatchable_calls {
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls: Arc::from(executable_calls.into_boxed_slice()),
-                    results: Arc::from(gated_results.into_boxed_slice()),
-                })
+                Ok(Step::Continue(Stage::ToolCalls {
+                    calls: executable_calls,
+                    results: gated_results,
+                }))
             } else {
-                Ok(ExecutionState::Complete {})
+                Ok(Step::Continue(Stage::Ending))
             }
         }
 
-        Some(FinishReason::Stop) => Ok(ExecutionState::Complete {}),
+        Some(FinishReason::Stop) => Ok(Step::Continue(Stage::Ending)),
 
         Some(FinishReason::Length) => {
             // Cut-offs with tool calls were answered and stopped above.
             debug_assert!(!has_dispatchable_calls);
-            Ok(ExecutionState::Stopped {
-                message: "Model hit token limit".into(),
-                stop_type: StopType::ModelTokenLimit,
-            })
+            Ok(super::stopping(
+                StopType::ModelTokenLimit,
+                "Model hit token limit",
+            ))
         }
 
-        Some(FinishReason::ContentFilter) => Ok(ExecutionState::Stopped {
-            message: "Response blocked by content filter".into(),
-            stop_type: StopType::ContentFilter,
-        }),
+        Some(FinishReason::ContentFilter) => Ok(super::stopping(
+            StopType::ContentFilter,
+            "Response blocked by content filter",
+        )),
 
         Some(FinishReason::Error)
         | Some(FinishReason::Unknown)
         | Some(FinishReason::Other)
         | None => {
             if has_dispatchable_calls {
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls: Arc::from(executable_calls.into_boxed_slice()),
-                    results: Arc::from(gated_results.into_boxed_slice()),
-                })
+                Ok(Step::Continue(Stage::ToolCalls {
+                    calls: executable_calls,
+                    results: gated_results,
+                }))
             } else {
-                Ok(ExecutionState::Complete {})
+                Ok(Step::Continue(Stage::Ending))
             }
         }
     }
@@ -2039,12 +1971,12 @@ pub(super) async fn transition_after_llm(
 pub(super) async fn transition_processing_tool_calls(
     config: &AgentConfig,
     stack: &mut TurnStack,
-    remaining_calls: &Arc<[MiddlewareToolCall]>,
-    results: &Arc<[ToolResult]>,
+    remaining_calls: &[MiddlewareToolCall],
+    results: &[ToolResult],
     env: &TurnEnv,
     turn: &mut Turn,
     steering: super::DrainedSteering,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     debug!(
         "ProcessingToolCalls: session={}, remaining={}, completed={}",
         env.session_id,
@@ -2068,9 +2000,9 @@ pub(super) async fn transition_processing_tool_calls(
                 .await?;
 
         if already_cancelled {
-            return Ok(ExecutionState::Cancelled);
+            return Ok(Step::Break(CycleOutcome::Cancelled));
         }
-        return Ok(next_state);
+        return Ok(Step::Continue(next_state));
     }
 
     // Calls are prepared (normalised, hooked, validated, access-declared) one
@@ -2234,7 +2166,7 @@ pub(super) async fn transition_processing_tool_calls(
 
     // Exactly one result per call: calls that never started (cancellation, or
     // a clarification that changed the run objective) get a synthetic result.
-    let mut all_results = (**results).to_vec();
+    let mut all_results = results.to_vec();
     all_results.reserve(remaining_calls.len());
     for (call, slot) in remaining_calls.iter().zip(slots) {
         all_results.push(slot.unwrap_or_else(|| {
@@ -2259,7 +2191,7 @@ pub(super) async fn transition_processing_tool_calls(
     let session_id = env.session_id.clone();
     let next_state = super::tool_calls::store_all_tool_results(
         config,
-        &Arc::from(all_results.into_boxed_slice()),
+        &all_results,
         env,
         turn,
         crate::agent::execution::DrainedSteering::none(),
@@ -2272,10 +2204,10 @@ pub(super) async fn transition_processing_tool_calls(
     .await?;
 
     if was_cancelled {
-        return Ok(ExecutionState::Cancelled);
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
-    Ok(next_state)
+    Ok(Step::Continue(next_state))
 }
 
 /// A run of calls prepared together: either consecutive `ParallelSafe` calls or
@@ -2401,8 +2333,7 @@ async fn prepare_segment(
                     calls: &views,
                 },
             )
-            .await
-            .map_err(|error| anyhow::anyhow!("Middleware error: {error}"))?
+            .await?
     };
 
     let mut ready = Vec::with_capacity(prepared.len());
@@ -2556,14 +2487,30 @@ pub(super) async fn transition_before_llm_call_in_test(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     let trigger = context_hook_trigger(turn.history.as_slice());
-    transition_before_llm_call(config, env, turn, trigger, None).await
+    let provider = env.provider_for_test().await;
+    transition_before_llm_call(config, env, turn, &provider, trigger, None).await
+}
+
+/// [`transition_call_llm`] with the provider the session's handle resolves,
+/// as the run does before its first hook.
+#[cfg(test)]
+pub(super) async fn call_llm_in_test(
+    config: &AgentConfig,
+    request: &PreparedModelRequest,
+    env: &TurnEnv,
+    turn: &mut Turn,
+) -> Result<Step, TurnError> {
+    let provider = env.provider_for_test().await;
+    transition_call_llm(config, request, env, turn, &provider).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::execution::{CycleOutcome, Stage, Step};
+    use crate::middleware::Stop;
     use querymt::chat::CacheHint;
 
     /// The stored message a provider message stands for: what a test that
@@ -2661,7 +2608,7 @@ mod tests {
             let results: Arc<[ToolResult]> = Arc::from(Vec::new());
             let mut stack = TurnStack::default();
 
-            tokio::time::timeout(
+            let _ = tokio::time::timeout(
                 Duration::from_secs(10),
                 transition_processing_tool_calls(
                     &agent.config,
@@ -2747,7 +2694,7 @@ mod tests {
             .expect("after_llm must not block on the pending snapshot")
             .expect("after llm");
 
-            assert!(!matches!(state, ExecutionState::ProcessingToolCalls { .. }));
+            assert!(!matches!(state, Step::Continue(Stage::ToolCalls { .. })));
             let PreTurnSnapshot::Pending(pending) = std::mem::take(&mut turn.snapshot) else {
                 panic!("snapshot task still pending");
             };
@@ -2953,7 +2900,10 @@ mod tests {
                 canceller
             );
             let state = state.expect("cancelled batch returns").expect("transition");
-            assert!(matches!(state, ExecutionState::Cancelled), "{state:?}");
+            assert!(
+                matches!(state, Step::Break(CycleOutcome::Cancelled)),
+                "{state:?}"
+            );
 
             let mut published = Vec::new();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3044,8 +2994,8 @@ mod tests {
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        fn request() -> Arc<PreparedModelRequest> {
-            Arc::new(PreparedModelRequest {
+        fn request() -> Box<PreparedModelRequest> {
+            Box::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
                 tools: Arc::from([]),
                 offered_tools: Arc::from([]),
@@ -3206,7 +3156,7 @@ mod tests {
                 }
                 let (result, spans) = capture_info(async {
                     let request = if mode.starts_with("hook_") {
-                        let ExecutionState::CallLlm { request, .. } =
+                        let Step::Continue(Stage::CallModel(request)) =
                             transition_before_llm_call_in_test(&config, &exec, &mut turn)
                                 .await
                                 .unwrap()
@@ -3215,7 +3165,7 @@ mod tests {
                         };
                         request
                     } else {
-                        Arc::new(PreparedModelRequest {
+                        Box::new(PreparedModelRequest {
                             messages: Arc::from(messages),
                             tools: Arc::from([]),
                             offered_tools: Arc::from([]),
@@ -3223,11 +3173,11 @@ mod tests {
                             options: Default::default(),
                         })
                     };
-                    transition_call_llm(&config, &request, &exec, &mut turn).await
+                    call_llm_in_test(&config, &request, &exec, &mut turn).await
                 })
                 .await;
                 assert!(
-                    matches!(result.unwrap(), ExecutionState::AfterLlm { .. }),
+                    matches!(result.unwrap(), Step::Continue(Stage::AfterReply(_))),
                     "mode={mode}"
                 );
                 let chats: Vec<_> = spans
@@ -3449,7 +3399,7 @@ mod tests {
         async fn run_streamed_reply(
             chunks: Vec<StreamChunk>,
         ) -> (
-            ExecutionState,
+            Step,
             Vec<querymt_agent_core::events::AgentEventKind>,
             Arc<TimedFactory>,
             Vec<ChatMessage>,
@@ -3467,11 +3417,11 @@ mod tests {
             }))
             .unwrap()]
             .into();
-            let state = transition_call_llm(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
                 .await
                 .expect("call llm");
-            let ExecutionState::AfterLlm { response } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             let state = transition_after_llm(&fixture.config, &response, &exec, &mut turn)
                 .await
@@ -3548,8 +3498,8 @@ mod tests {
                 "exactly one physical attempt is expected"
             );
 
-            let ExecutionState::Stopped { stop_type, .. } = state else {
-                panic!("expected Stopped, got {}", state.name());
+            let Step::Continue(Stage::Stopping(Stop { stop_type, .. })) = state else {
+                panic!("expected Stopped, got {state:?}");
             };
             assert_eq!(stop_type, StopType::ModelTokenLimit);
 
@@ -3588,11 +3538,11 @@ mod tests {
 
         /// The stopped context's tool results, keyed by call id.
         fn stopped_results(
-            state: ExecutionState,
+            state: Step,
             messages: Vec<querymt::chat::ChatMessage>,
         ) -> (Vec<querymt::chat::ChatMessage>, HashMap<String, String>) {
-            let ExecutionState::Stopped { stop_type, .. } = state else {
-                panic!("expected Stopped, got {}", state.name());
+            let Step::Continue(Stage::Stopping(Stop { stop_type, .. })) = state else {
+                panic!("expected Stopped, got {state:?}");
             };
             assert_eq!(stop_type, StopType::ModelTokenLimit);
             let results = messages
@@ -3710,11 +3660,12 @@ mod tests {
 
             assert!(!has_retry_wait(&events), "no llm_retry_wait: {events:?}");
             assert!(factory.provider.attempts.lock().unwrap().is_empty());
-            let ExecutionState::ProcessingToolCalls {
-                remaining_calls, ..
-            } = state
+            let Step::Continue(Stage::ToolCalls {
+                calls: remaining_calls,
+                ..
+            }) = state
             else {
-                panic!("expected ProcessingToolCalls, got {}", state.name());
+                panic!("expected ToolCalls, got {state:?}");
             };
             let ids: Vec<&str> = remaining_calls
                 .iter()
@@ -3861,8 +3812,8 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                 .await
                 .expect("before llm call");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             assert_eq!(request.options, overrides);
             assert_eq!(
@@ -3888,8 +3839,8 @@ mod tests {
             tool_updates: bool,
         ) -> (
             Turn,
-            Arc<PreparedModelRequest>,
-            Arc<PreparedModelRequest>,
+            Box<PreparedModelRequest>,
+            Box<PreparedModelRequest>,
             TestAgent,
             TurnEnv,
             &'static str,
@@ -3909,7 +3860,7 @@ mod tests {
                 &exec.session_id,
                 &[ChatMessage::user().text("go").build()],
             );
-            let ExecutionState::CallLlm { request } =
+            let Step::Continue(Stage::CallModel(request)) =
                 transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                     .await
                     .expect("first request")
@@ -3927,7 +3878,7 @@ mod tests {
                 next.tool_defs.push(mcp_tool("beta", "B"));
                 next
             });
-            let ExecutionState::CallLlm { request: second } =
+            let Step::Continue(Stage::CallModel(second)) =
                 transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                     .await
                     .expect("second request")
@@ -4047,11 +3998,13 @@ mod tests {
         ) -> Vec<ChatMessage> {
             hold(turn, &exec.session_id, &messages);
             let trigger = context_hook_trigger(turn.history.as_slice());
-            let state = transition_before_llm_call(config, exec, turn, trigger, objective)
-                .await
-                .expect("before llm call");
-            let ExecutionState::CallLlm { request, .. } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let provider = exec.provider_for_test().await;
+            let state =
+                transition_before_llm_call(config, exec, turn, &provider, trigger, objective)
+                    .await
+                    .expect("before llm call");
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             request.messages.to_vec()
         }
@@ -4224,9 +4177,15 @@ mod tests {
             turn.queue_notice(NoticeSource::DuplicateToolCall, "same".into());
 
             let (_, spans) = capture(async {
-                crate::agent::execution::prepare_model_request(&fixture.config, &exec, &mut turn)
-                    .await
-                    .expect("prepare request");
+                let provider = exec.provider_for_test().await;
+                let _ = crate::agent::execution::prepare_model_request(
+                    &fixture.config,
+                    &exec,
+                    &mut turn,
+                    &provider,
+                )
+                .await
+                .expect("prepare request");
             })
             .await;
             let hook = spans
@@ -4393,7 +4352,7 @@ mod tests {
                 let (exec, mut turn) = fixture.turn().await;
                 let exec = exec.tools_from(config);
                 let mut events = config.subscribe_events();
-                transition_before_llm_call_in_test(config, &exec, &mut turn)
+                let _ = transition_before_llm_call_in_test(config, &exec, &mut turn)
                     .await
                     .expect("before llm call");
                 let deadline = std::time::Duration::from_secs(2);
@@ -4450,8 +4409,8 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                 .await
                 .unwrap();
-            let ExecutionState::CallLlm { request, .. } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             assert!(request.estimated_tokens > 0);
             assert_eq!(
@@ -4482,7 +4441,7 @@ mod tests {
             prepared.tools = vec![write_file_tool()].into();
             prepared.options = overrides;
 
-            let state = transition_call_llm(
+            let state = call_llm_in_test(
                 &fixture.config,
                 &Arc::new(prepared.clone()),
                 &exec,
@@ -4490,8 +4449,8 @@ mod tests {
             )
             .await
             .expect("first request");
-            let ExecutionState::AfterLlm { response } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             assert_eq!(response.applied, overrides);
             assert_eq!(turn.last_applied, overrides);
@@ -4502,11 +4461,11 @@ mod tests {
 
             // The follow-up request is prepared from the cleared run.
             prepared.options = turn.request_overrides;
-            let state = transition_call_llm(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
                 .await
                 .expect("second request");
-            let ExecutionState::AfterLlm { response, .. } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             assert_eq!(response.applied, querymt::chat::GenerationOptions::NONE);
 
@@ -4527,11 +4486,11 @@ mod tests {
             prepared.tools = vec![write_file_tool()].into();
             prepared.options = overrides;
 
-            let state = transition_call_llm(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
                 .await
                 .expect("request");
-            let ExecutionState::AfterLlm { response, .. } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
 
             assert_eq!(
@@ -4622,10 +4581,10 @@ mod tests {
             let escalated_request = Arc::new(prepared);
 
             let (_, spans) = capture(async {
-                transition_call_llm(&fixture.config, &escalated_request, &exec, &mut turn)
+                let _ = call_llm_in_test(&fixture.config, &escalated_request, &exec, &mut turn)
                     .await
                     .expect("escalated request");
-                transition_call_llm(&fixture.config, &plain_request, &exec, &mut turn)
+                let _ = call_llm_in_test(&fixture.config, &plain_request, &exec, &mut turn)
                     .await
                     .expect("plain request");
             })
@@ -4699,7 +4658,7 @@ mod tests {
             );
 
             // First request: cut off at the initial cap.
-            let state = transition_call_llm(
+            let state = call_llm_in_test(
                 &fixture.config,
                 &Arc::new(prepared.clone()),
                 &exec,
@@ -4707,14 +4666,16 @@ mod tests {
             )
             .await
             .expect("first request");
-            assert_eq!(state.name(), "AfterLlm");
+            assert!(
+                matches!(state, Step::Continue(Stage::AfterReply(_))),
+                "{state:?}"
+            );
             let state = in_run::after_llm(&mut stack, &exec, &mut turn, state)
                 .await
                 .expect("middleware");
             assert!(
-                matches!(state, ExecutionState::BeforeLlmCall),
-                "expected escalation to BeforeLlmCall, got {}",
-                state.name()
+                matches!(state, Step::Continue(Stage::BeforeRequest)),
+                "expected escalation to BeforeLlmCall, got {state:?}"
             );
             assert_eq!(turn.request_overrides.max_tokens, Some(128_000));
 
@@ -4722,21 +4683,21 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                 .await
                 .expect("before llm call");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             // The fixture config has no tools; restore the first request's so the
             // retry takes the same streaming path.
             let mut retry = (*request).clone();
             retry.tools = prepared.tools.clone();
-            let state = transition_call_llm(&fixture.config, &Arc::new(retry), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(retry), &exec, &mut turn)
                 .await
                 .expect("second request");
             let state = in_run::after_llm(&mut stack, &exec, &mut turn, state)
                 .await
                 .expect("middleware");
-            let ExecutionState::AfterLlm { response } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             let state = transition_after_llm(&fixture.config, &response, &exec, &mut turn)
                 .await
@@ -4749,7 +4710,7 @@ mod tests {
                     querymt::chat::GenerationOptions::NONE.with_max_tokens(128_000),
                 ]
             );
-            assert!(matches!(state, ExecutionState::Complete));
+            assert!(matches!(state, Step::Continue(Stage::Ending)));
             let history = turn
                 .history
                 .as_slice()
@@ -4807,16 +4768,15 @@ mod tests {
             );
             let mut prepared = (*request()).clone();
             prepared.tools = tools.clone();
-            let state = transition_call_llm(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(prepared), &exec, &mut turn)
                 .await
                 .expect("request 1");
             let state = in_run::after_llm(&mut middleware, &exec, &mut turn, state)
                 .await
                 .expect("middleware 1");
             assert!(
-                matches!(state, ExecutionState::BeforeLlmCall),
-                "expected escalation, got {}",
-                state.name()
+                matches!(state, Step::Continue(Stage::BeforeRequest)),
+                "expected escalation, got {state:?}"
             );
             assert_eq!(turn.request_overrides.max_tokens, Some(128_000));
 
@@ -4824,19 +4784,19 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                 .await
                 .expect("before 2");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             let mut retry = (*request).clone();
             retry.tools = tools.clone();
-            let state = transition_call_llm(&fixture.config, &Arc::new(retry), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(retry), &exec, &mut turn)
                 .await
                 .expect("request 2");
             let state = in_run::after_llm(&mut middleware, &exec, &mut turn, state)
                 .await
                 .expect("middleware 2");
-            let ExecutionState::AfterLlm { response } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             let state = transition_after_llm(&fixture.config, &response, &exec, &mut turn)
                 .await
@@ -4844,13 +4804,12 @@ mod tests {
             assert!(
                 matches!(
                     state,
-                    ExecutionState::Stopped {
+                    Step::Continue(Stage::Stopping(Stop {
                         stop_type: StopType::ModelTokenLimit,
                         ..
-                    }
+                    }))
                 ),
-                "got {}",
-                state.name()
+                "got {state:?}"
             );
 
             // Stop -> continuation with instruction, ceiling and lowered effort.
@@ -4858,9 +4817,8 @@ mod tests {
                 .await
                 .expect("on_stopped");
             assert!(
-                matches!(state, ExecutionState::BeforeLlmCall),
-                "expected continuation, got {}",
-                state.name()
+                matches!(state, Step::Continue(Stage::BeforeRequest)),
+                "expected continuation, got {state:?}"
             );
             assert_eq!(
                 turn.request_overrides,
@@ -4877,8 +4835,8 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, &exec, &mut turn)
                 .await
                 .expect("before 3");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             assert!(
                 request
@@ -4889,14 +4847,14 @@ mod tests {
             );
             let mut last = (*request).clone();
             last.tools = tools;
-            let state = transition_call_llm(&fixture.config, &Arc::new(last), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &Arc::new(last), &exec, &mut turn)
                 .await
                 .expect("request 3");
             let state = in_run::after_llm(&mut middleware, &exec, &mut turn, state)
                 .await
                 .expect("middleware 3");
-            let ExecutionState::AfterLlm { response } = state else {
-                panic!("expected AfterLlm, got {}", state.name());
+            let Step::Continue(Stage::AfterReply(response)) = state else {
+                panic!("expected AfterLlm, got {state:?}");
             };
             assert_eq!(
                 turn.history
@@ -4911,7 +4869,7 @@ mod tests {
                 .await
                 .expect("after 3");
 
-            assert_eq!(state.name(), "Complete");
+            assert!(matches!(state, Step::Continue(Stage::Ending)), "{state:?}");
             assert_eq!(
                 *factory.provider.options_seen.lock().unwrap(),
                 vec![
@@ -4944,16 +4902,16 @@ mod tests {
             turn: &mut Turn,
             middleware: &mut crate::middleware::TurnStack,
             tools: &Arc<[querymt::chat::Tool]>,
-        ) -> ExecutionState {
+        ) -> Step {
             let state = crate::test_utils::hook_rig::in_run::step_start(middleware, exec, turn)
                 .await
                 .unwrap();
-            assert!(matches!(state, ExecutionState::BeforeLlmCall));
+            assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
             let state = transition_before_llm_call_in_test(config, exec, turn)
                 .await
                 .expect("before llm call");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
             let mut probe = request.messages.to_vec();
             assert!(
@@ -4963,7 +4921,7 @@ mod tests {
             let mut request = (*request).clone();
             request.tools = tools.clone();
             request.offered_tools = tools.clone();
-            let state = transition_call_llm(config, &Arc::new(request), exec, turn)
+            let state = call_llm_in_test(config, &Arc::new(request), exec, turn)
                 .await
                 .expect("call llm");
             crate::test_utils::hook_rig::in_run::after_llm(middleware, exec, turn, state)
@@ -5036,11 +4994,11 @@ mod tests {
             // 1: cut off at 32k -> escalate.
             let state = model_step(&config, &exec, &mut turn, mw, &tools).await;
             assert!(
-                matches!(state, ExecutionState::BeforeLlmCall),
+                matches!(state, Step::Continue(Stage::BeforeRequest)),
                 "expected escalation"
             );
             // 2: escalated retry succeeds.
-            let ExecutionState::AfterLlm { response } =
+            let Step::Continue(Stage::AfterReply(response)) =
                 model_step(&config, &exec, &mut turn, mw, &tools).await
             else {
                 panic!("expected AfterLlm");
@@ -5048,11 +5006,11 @@ mod tests {
             let state = transition_after_llm(&fixture.config, &response, &exec, &mut turn)
                 .await
                 .unwrap();
-            assert!(matches!(state, ExecutionState::Complete));
+            assert!(matches!(state, Step::Continue(Stage::Ending)));
             // 3: a later step of the same turn starts without overrides, is sent at
             // 128k, and is cut off inside a flushed invalid call.
             assert!(turn.request_overrides.is_empty());
-            let ExecutionState::AfterLlm { response } =
+            let Step::Continue(Stage::AfterReply(response)) =
                 model_step(&config, &exec, &mut turn, mw, &tools).await
             else {
                 panic!("a second cut-off must not escalate again");
@@ -5062,18 +5020,18 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 state,
-                ExecutionState::Stopped {
+                Step::Continue(Stage::Stopping(Stop {
                     stop_type: StopType::ModelTokenLimit,
                     ..
-                }
+                }))
             ));
             // 4: continuation at the escalated cap, with the call answered.
             let state = in_run::stopped(mw, &exec, &mut turn, state).await.unwrap();
             assert!(
-                matches!(state, ExecutionState::BeforeLlmCall),
+                matches!(state, Step::Continue(Stage::BeforeRequest)),
                 "expected continuation"
             );
-            let ExecutionState::AfterLlm { .. } =
+            let Step::Continue(Stage::AfterReply(_)) =
                 model_step(&config, &exec, &mut turn, mw, &tools).await
             else {
                 panic!("expected AfterLlm");
@@ -5111,7 +5069,7 @@ mod tests {
             items: Vec<ChatOutputItem>,
             content: &str,
             thinking: Option<&str>,
-        ) -> (ExecutionState, bool, Turn) {
+        ) -> (Step, bool, Turn) {
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(
                 MockLlmProvider::new(),
                 vec![],
@@ -5166,8 +5124,8 @@ mod tests {
                 !stored,
                 "no AssistantMessageStored for a thinking-only cut-off"
             );
-            let ExecutionState::Stopped { stop_type, .. } = state else {
-                panic!("expected Stopped, got {}", state.name());
+            let Step::Continue(Stage::Stopping(Stop { stop_type, .. })) = state else {
+                panic!("expected Stopped, got {state:?}");
             };
             assert_eq!(stop_type, StopType::ModelTokenLimit);
             assert!(
@@ -5201,8 +5159,8 @@ mod tests {
             .await;
 
             assert!(stored, "a reply with visible text is kept");
-            let ExecutionState::Stopped { stop_type, .. } = state else {
-                panic!("expected Stopped, got {}", state.name());
+            let Step::Continue(Stage::Stopping(Stop { stop_type, .. })) = state else {
+                panic!("expected Stopped, got {state:?}");
             };
             assert_eq!(stop_type, StopType::ModelTokenLimit);
             assert_eq!(turn.history.as_slice().len(), 1);
@@ -5344,7 +5302,7 @@ mod tests {
                     let parent = info_span!("timing-parent");
                     async {
                         let request = Arc::new(request);
-                        let mut future = Box::pin(transition_call_llm(
+                        let mut future = Box::pin(call_llm_in_test(
                             &fixture.config,
                             &request,
                             &exec,
@@ -5358,7 +5316,10 @@ mod tests {
                             );
                             if mode.starts_with("cancel") {
                                 exec.cancellation_token.cancel();
-                                assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+                                assert!(matches!(
+                                    future.await.unwrap(),
+                                    Step::Break(CycleOutcome::Cancelled)
+                                ));
                             }
                         } else {
                             let result = future.await;
@@ -5476,19 +5437,20 @@ mod tests {
                     let (exec, mut turn) = fixture.turn().await;
                     let mut prepared = request();
                     if with_tools {
-                        Arc::make_mut(&mut prepared).tools = vec![serde_json::from_value(serde_json::json!({
+                        prepared.tools = vec![serde_json::from_value(serde_json::json!({
                             "type":"function", "function":{"name":"telemetry_tool", "description":"",
                             "parameters":{"type":"object"}}
                         })).unwrap()].into();
                     }
-                    // The actual transition must initialize the turn handle, not a prewarm.
-                    assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
-                    assert!(factory.configs.lock().unwrap().is_empty());
+                    // The run resolved its provider once, before the transitions
+                    // below; they reuse it.
+                    assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+                    assert_eq!(factory.configs.lock().unwrap().len(), 1);
                     let (_, spans) = capture(async {
                         async {
                             for call in 0..2 {
-                                let ExecutionState::AfterLlm { response, .. } =
-                                    transition_call_llm(&fixture.config, &prepared, &exec, &mut turn)
+                                let Step::Continue(Stage::AfterReply(response)) =
+                                    call_llm_in_test(&fixture.config, &prepared, &exec, &mut turn)
                                         .await
                                         .unwrap()
                                 else {
@@ -5604,7 +5566,8 @@ mod tests {
             )
             .await;
             let (exec, _turn) = fixture.turn().await;
-            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
+            // The run resolves its provider once, when it starts.
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
 
             // The state machine clones the handle on every step; each clone must
             // reuse the turn's provider instead of rebuilding it.
@@ -5624,16 +5587,24 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let (exec, _turn) = fixture.turn().await;
-            let early_clone = exec.session_handle.clone();
+            // `fixture.turn()` resolves the provider, so take a handle that has
+            // not: nothing is built until the first `provider()` call.
+            let handle = fixture
+                .config
+                .provider
+                .create_session(None, None, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
+            let early_clone = handle.clone();
             let from_clone = early_clone.provider().await.unwrap();
-            let from_original = exec.session_handle.provider().await.unwrap();
+            let from_original = handle.provider().await.unwrap();
             assert!(Arc::ptr_eq(&from_clone, &from_original));
             assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
         }
 
         #[tokio::test]
-        async fn pre_request_phases_are_traced_and_provider_init_is_not_a_chat_retry() {
+        async fn pre_request_phases_are_traced_and_resolve_no_provider() {
             let (fixture, _factory) = timed_fixture(
                 true,
                 vec![],
@@ -5649,18 +5620,17 @@ mod tests {
             let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
             for expected in [
                 "agent.transition.before_llm_call",
-                "agent.provider.build",
                 "agent.tools.collect",
                 "agent.hooks.context",
                 "agent.request.cache_breakpoints",
             ] {
                 assert!(names.contains(&expected), "missing {expected}: {names:?}");
             }
-            let init = spans
-                .iter()
-                .find(|s| s.name == "agent.llm.call_with_retry")
-                .expect("provider init retry span");
-            assert_eq!(attr(init, "operation"), Some(&Value::from("provider_init")));
+            // The provider was resolved when the run started: preparing a
+            // request builds and retries nothing.
+            for absent in ["agent.provider.build", "agent.llm.call_with_retry"] {
+                assert!(!names.contains(&absent), "unexpected {absent}: {names:?}");
+            }
             let tools = spans
                 .iter()
                 .find(|s| s.name == "agent.tools.collect")
@@ -5708,12 +5678,15 @@ mod tests {
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
             let (result, spans) = capture(async {
-                transition_call_llm(&fixture.config, &request(), &exec, &mut turn)
+                call_llm_in_test(&fixture.config, &request(), &exec, &mut turn)
                     .instrument(info_span!("test-parent"))
                     .await
             })
             .await;
-            assert!(matches!(result.unwrap(), ExecutionState::AfterLlm { .. }));
+            assert!(matches!(
+                result.unwrap(),
+                Step::Continue(Stage::AfterReply(_))
+            ));
             assert_eq!(attempts.load(Ordering::Relaxed), 2);
             let chats: Vec<_> = spans
                 .iter()
@@ -5791,7 +5764,7 @@ mod tests {
                 if cancelled {
                     exec.cancellation_token.cancel();
                 }
-                let (result, spans) = capture(transition_call_llm(
+                let (result, spans) = capture(call_llm_in_test(
                     &fixture.config,
                     &request(),
                     &exec,
@@ -5808,7 +5781,10 @@ mod tests {
                     attr(chat, "gen_ai.conversation.id")
                 );
                 if cancelled {
-                    assert!(matches!(result.unwrap(), ExecutionState::Cancelled));
+                    assert!(matches!(
+                        result.unwrap(),
+                        Step::Break(CycleOutcome::Cancelled)
+                    ));
                     assert_eq!(chat.status, Status::Unset);
                     assert!(attr(chat, "error.type").is_none());
                 } else {
@@ -5859,11 +5835,11 @@ mod tests {
         }
 
         /// A request with a tool, so the streaming path is used.
-        fn streaming_request() -> Arc<PreparedModelRequest> {
+        fn streaming_request() -> Box<PreparedModelRequest> {
             let mut request = (*request()).clone();
             request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
             request.offered_tools = request.tools.clone();
-            Arc::new(request)
+            Box::new(request)
         }
 
         fn rate_limited_now() -> LLMError {
@@ -5887,7 +5863,7 @@ mod tests {
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &request(),
                 &exec,
@@ -5905,7 +5881,7 @@ mod tests {
 
         /// Whether the one request `prepared` leads to was sent with a tool
         /// list (`Some(len)`) or without one (`None`).
-        async fn sent_tool_list(prepared: Arc<PreparedModelRequest>) -> Option<usize> {
+        async fn sent_tool_list(prepared: Box<PreparedModelRequest>) -> Option<usize> {
             let sent = Arc::new(std::sync::Mutex::new(None));
             let seen = sent.clone();
             let reply = || {
@@ -5931,7 +5907,7 @@ mod tests {
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            transition_call_llm(&fixture.config, &prepared, &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared, &exec, &mut turn)
                 .await
                 .expect("call llm");
             sent.lock().unwrap().take().expect("one request was sent")
@@ -5946,7 +5922,7 @@ mod tests {
             assert!(offered_by_change.tools.is_empty());
 
             assert_eq!(
-                sent_tool_list(Arc::new(offered_by_change)).await,
+                sent_tool_list(Box::new(offered_by_change)).await,
                 Some(0),
                 "sent as a request with tools, whose list is empty"
             );
@@ -5982,7 +5958,7 @@ mod tests {
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &request(),
                 &exec,
@@ -6015,7 +5991,7 @@ mod tests {
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &request(),
                 &exec,
@@ -6063,7 +6039,7 @@ mod tests {
             )
             .await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &streaming_request(),
                 &exec,
@@ -6095,7 +6071,7 @@ mod tests {
             )
             .await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &streaming_request(),
                 &exec,
@@ -6117,14 +6093,17 @@ mod tests {
             mock.expect_chat().returning(|_| Err(LLMError::Cancelled));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            let (result, spans) = capture(transition_call_llm(
+            let (result, spans) = capture(call_llm_in_test(
                 &fixture.config,
                 &request(),
                 &exec,
                 &mut turn,
             ))
             .await;
-            assert!(matches!(result.unwrap(), ExecutionState::Cancelled));
+            assert!(matches!(
+                result.unwrap(),
+                Step::Break(CycleOutcome::Cancelled)
+            ));
 
             // The attempt was started, so the count is right; it did not end in
             // a response or a failure, so there is no event.
@@ -6165,7 +6144,7 @@ mod tests {
             let _locked = lock.lock().await;
             let (_, spans) = capture(async {
                 let request = request();
-                let mut future = Box::pin(transition_call_llm(
+                let mut future = Box::pin(call_llm_in_test(
                     &fixture.config,
                     &request,
                     &exec,
@@ -6716,11 +6695,11 @@ mod tests {
         let env = llm_env().await;
         let non_stream = map_failed_llm_call(LLMError::Cancelled, false, &env)
             .expect("cancel must be Ok(Cancelled)");
-        assert!(matches!(non_stream, ExecutionState::Cancelled));
+        assert!(matches!(non_stream, Step::Break(CycleOutcome::Cancelled)));
 
         let stream = map_failed_llm_call(LLMError::Cancelled, true, &env)
             .expect("stream setup cancel must be Ok(Cancelled)");
-        assert!(matches!(stream, ExecutionState::Cancelled));
+        assert!(matches!(stream, Step::Break(CycleOutcome::Cancelled)));
     }
 
     #[test]
@@ -6750,7 +6729,7 @@ mod tests {
         assert!(chat_context.contains("model=mock"));
         assert!(chat_context.contains("Invalid Request: missing api_key"));
         assert!(matches!(
-            chat_err.downcast_ref::<LLMError>(),
+            chat_err.llm_error(),
             Some(LLMError::InvalidRequest(message)) if message == "missing api_key"
         ));
 
@@ -6758,7 +6737,7 @@ mod tests {
             .expect_err("stream failure is Err");
         assert!(stream_err.to_string().contains("LLM streaming error"));
         assert!(matches!(
-            stream_err.downcast_ref::<LLMError>(),
+            stream_err.llm_error(),
             Some(LLMError::GenericError(message)) if message == "boom"
         ));
     }
@@ -7110,7 +7089,7 @@ mod tests {
             });
             // First request: 1000 input + (100 + 900) output + 2000 reads + 500 writes.
             turn.stats = AgentStats::default();
-            transition_call_llm(&fixture.config, &request, &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &request, &exec, &mut turn)
                 .await
                 .unwrap();
             let first = request_end_costs(&mut events).await;
@@ -7139,7 +7118,7 @@ mod tests {
                 ..Default::default()
             };
             turn.stats = after_first;
-            transition_call_llm(&fixture.config, &request, &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &request, &exec, &mut turn)
                 .await
                 .unwrap();
             let second = request_end_costs(&mut events).await;
@@ -7199,10 +7178,10 @@ mod tests {
             let state = transition_before_llm_call_in_test(&fixture.config, exec, turn)
                 .await
                 .expect("before llm call");
-            let ExecutionState::CallLlm { request } = state else {
-                panic!("expected CallLlm, got {}", state.name());
+            let Step::Continue(Stage::CallModel(request)) = state else {
+                panic!("expected CallLlm, got {state:?}");
             };
-            transition_call_llm(&fixture.config, &request, exec, turn)
+            let _ = call_llm_in_test(&fixture.config, &request, exec, turn)
                 .await
                 .expect("call llm");
             loop {
@@ -7450,7 +7429,7 @@ mod tests {
             out
         }
 
-        fn prepared(with_tools: bool) -> Arc<PreparedModelRequest> {
+        fn prepared(with_tools: bool) -> Box<PreparedModelRequest> {
             let tools: Vec<querymt::chat::Tool> = if with_tools {
                 vec![
                     serde_json::from_value(serde_json::json!({"type":"function","function":{
@@ -7460,7 +7439,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Arc::new(PreparedModelRequest {
+            Box::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
                 tools: tools.clone().into(),
                 offered_tools: tools.into(),
@@ -7535,7 +7514,7 @@ mod tests {
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
 
@@ -7568,7 +7547,7 @@ mod tests {
             mock.expect_chat_with_tools().returning(|_, _| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            transition_call_llm(&fixture.config, &prepared(true), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(true), &exec, &mut turn)
                 .await
                 .unwrap();
             let totals = session_totals(&exec).await;
@@ -7596,7 +7575,7 @@ mod tests {
                     TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
                 let (exec, mut turn) = fixture.turn().await;
                 let result =
-                    transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn).await;
+                    call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn).await;
                 assert!(result.is_err());
                 let totals = session_totals(&exec).await;
                 assert_eq!(totals.unresolved_attempts, 0, "failure is settled");
@@ -7622,10 +7601,10 @@ mod tests {
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
             exec.cancellation_token.cancel();
-            let state = transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
-            assert!(matches!(state, ExecutionState::Cancelled));
+            assert!(matches!(state, Step::Break(CycleOutcome::Cancelled)));
             assert!(ledger(&fixture, &exec.session_id).await.is_empty());
         }
 
@@ -7645,13 +7624,10 @@ mod tests {
                         crate::middleware::LimitsConfig::default().max_price_usd(0.0),
                     )));
                 let (exec, mut turn) = fixture.turn().await;
-                let state = transition_call_llm(&config, &prepared(with_tools), &exec, &mut turn)
+                let state = call_llm_in_test(&config, &prepared(with_tools), &exec, &mut turn)
                     .await
                     .expect("a refused dispatch is a stop, not an error");
-                let ExecutionState::Stopped {
-                    stop_type, message, ..
-                } = state
-                else {
+                let Step::Continue(Stage::Stopping(Stop { stop_type, message })) = state else {
                     panic!("expected a price-limit stop, got {state:?}");
                 };
                 assert_eq!(stop_type, StopType::PriceLimit, "tools={with_tools}");
@@ -7672,7 +7648,7 @@ mod tests {
             let (exec, mut turn) = fixture.turn().await;
 
             let first_pricing = InjectedPricing::install(pricing());
-            transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
             let first_cost = cost();
@@ -7687,7 +7663,7 @@ mod tests {
                 ..Default::default()
             };
             let _second_pricing = InjectedPricing::install(doubled);
-            transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
 
@@ -7727,7 +7703,7 @@ mod tests {
             mock.expect_chat().returning(|_| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
-            transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
             let totals = session_totals(&exec).await;
@@ -7747,10 +7723,10 @@ mod tests {
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let (exec, mut turn) = fixture.turn().await;
 
-            let state = transition_call_llm(&fixture.config, &prepared(false), &exec, &mut turn)
+            let state = call_llm_in_test(&fixture.config, &prepared(false), &exec, &mut turn)
                 .await
                 .unwrap();
-            let ExecutionState::AfterLlm { response } = state else {
+            let Step::Continue(Stage::AfterReply(response)) = state else {
                 panic!("expected AfterLlm");
             };
             let recorded = session_totals(&exec).await;
@@ -7798,7 +7774,7 @@ mod tests {
                 .lock()
                 .execute_batch("DROP TABLE event_journal")
                 .unwrap();
-            let result = transition_call_llm(&config, &prepared(false), &exec, &mut turn).await;
+            let result = call_llm_in_test(&config, &prepared(false), &exec, &mut turn).await;
             let error = result.expect_err("storage failure must be an execution error");
             assert!(error.to_string().contains("accounting"), "{error:#}");
         }
@@ -7851,7 +7827,7 @@ mod tests {
             ])
             .await;
             let mut events = fixture.config.subscribe_events();
-            transition_call_llm(&fixture.config, &prepared(true), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(true), &exec, &mut turn)
                 .await
                 .unwrap();
 
@@ -7903,7 +7879,7 @@ mod tests {
             ])
             .await;
             let mut events = fixture.config.subscribe_events();
-            transition_call_llm(&fixture.config, &prepared(true), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(true), &exec, &mut turn)
                 .await
                 .unwrap();
 
@@ -7934,7 +7910,7 @@ mod tests {
             .await;
             let mut events = fixture.config.subscribe_events();
             let request = prepared(true);
-            let mut future = Box::pin(transition_call_llm(
+            let mut future = Box::pin(call_llm_in_test(
                 &fixture.config,
                 &request,
                 &exec,
@@ -7946,7 +7922,10 @@ mod tests {
                     .is_err()
             );
             exec.cancellation_token.cancel();
-            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+            assert!(matches!(
+                future.await.unwrap(),
+                Step::Break(CycleOutcome::Cancelled)
+            ));
 
             assert!(
                 next_request_end(&mut events, Duration::from_millis(300))
@@ -7988,7 +7967,7 @@ mod tests {
                 ]),
             ])
             .await;
-            transition_call_llm(&fixture.config, &prepared(true), &exec, &mut turn)
+            let _ = call_llm_in_test(&fixture.config, &prepared(true), &exec, &mut turn)
                 .await
                 .unwrap();
 
@@ -8013,8 +7992,7 @@ mod tests {
                 (0, Err(LLMError::ProviderError("stream broke".into()))),
             ])])
             .await;
-            let result =
-                transition_call_llm(&fixture.config, &prepared(true), &exec, &mut turn).await;
+            let result = call_llm_in_test(&fixture.config, &prepared(true), &exec, &mut turn).await;
             assert!(result.is_err());
 
             let ledger = ledger(&fixture, &exec.session_id).await;
@@ -8039,7 +8017,7 @@ mod tests {
             ])])
             .await;
             let request = prepared(true);
-            let mut future = Box::pin(transition_call_llm(
+            let mut future = Box::pin(call_llm_in_test(
                 &fixture.config,
                 &request,
                 &exec,
@@ -8051,7 +8029,10 @@ mod tests {
                     .is_err()
             );
             exec.cancellation_token.cancel();
-            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+            assert!(matches!(
+                future.await.unwrap(),
+                Step::Break(CycleOutcome::Cancelled)
+            ));
 
             let ledger = ledger(&fixture, &exec.session_id).await;
             let settled = settlements(&ledger);
@@ -8070,7 +8051,7 @@ mod tests {
                 stream_fixture(vec![Ok(vec![(0, Ok(chunk_usage()))])]).await;
             {
                 let request = prepared(true);
-                let mut future = Box::pin(transition_call_llm(
+                let mut future = Box::pin(call_llm_in_test(
                     &fixture.config,
                     &request,
                     &exec,

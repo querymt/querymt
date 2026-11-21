@@ -4,9 +4,11 @@
 //! to wait for external events (like delegation completions).
 
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
+use crate::agent::execution::{CycleOutcome, Stage, Step};
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
-use crate::middleware::{ExecutionState, WaitCondition, WaitReason};
+use crate::middleware::{WaitCondition, WaitReason};
 use log::{debug, warn};
 use querymt::chat::ChatRole;
 use querymt_agent_core::events::{AgentEventKind, StopType};
@@ -96,18 +98,18 @@ pub(super) async fn transition_waiting_for_event(
     env: &TurnEnv,
     turn: &mut Turn,
     event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     debug!(
         "WaitingForEvent: session={}, reason={:?}",
         env.session_id, wait.reason
     );
 
     if env.cancellation_token.is_cancelled() {
-        return Ok(ExecutionState::Cancelled);
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
     if wait.reason != WaitReason::Delegation {
-        return Ok(ExecutionState::BeforeLlmCall);
+        return Ok(Step::Continue(Stage::BeforeRequest));
     }
 
     if config.delegation_wait_policy == crate::config::DelegationWaitPolicy::Any {
@@ -120,7 +122,7 @@ pub(super) async fn transition_waiting_for_event(
             tokio::select! {
                 biased;
                 _ = env.cancellation_token.cancelled() => {
-                    return Ok(ExecutionState::Cancelled);
+                    return Ok(Step::Break(CycleOutcome::Cancelled));
                 }
                 _ = wait_for_pending_steering(env) => {
                     turn
@@ -131,7 +133,7 @@ pub(super) async fn transition_waiting_for_event(
                         "New user steering was received. Delegations still running and awaiting later reconciliation: {pending}"
                     );
                     inject_wait_message(config, env, &mut turn.history, message).await?;
-                    return Ok(ExecutionState::BeforeLlmCall);
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
                 recovered = recovery_outcomes(&mut recovery) => {
                     let dirty = recovery.take().is_some_and(|read| read.dirty);
@@ -140,7 +142,7 @@ pub(super) async fn transition_waiting_for_event(
                     }
                     if let Some(outcome) = recovered.into_iter().next() {
                         inject_wait_message(config, env, &mut turn.history, format_wait_outcome(&outcome)).await?;
-                        return Ok(ExecutionState::BeforeLlmCall);
+                        return Ok(Step::Continue(Stage::BeforeRequest));
                     }
                 }
                 event = event_rx.recv() => {
@@ -155,10 +157,10 @@ pub(super) async fn transition_waiting_for_event(
                             continue;
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Ok(ExecutionState::Stopped {
-                                message: "Event stream closed while waiting".into(),
-                                stop_type: StopType::Other,
-                            });
+                            return Ok(super::stopping(
+                                StopType::Other,
+                                "Event stream closed while waiting",
+                            ));
                         }
                     };
 
@@ -169,7 +171,7 @@ pub(super) async fn transition_waiting_for_event(
                     if let Some(outcome) = match_wait_event(wait, &event) {
                         let message = format_wait_outcome(&outcome);
                         inject_wait_message(config, env, &mut turn.history, message).await?;
-                        return Ok(ExecutionState::BeforeLlmCall);
+                        return Ok(Step::Continue(Stage::BeforeRequest));
                     }
                 }
             }
@@ -178,7 +180,7 @@ pub(super) async fn transition_waiting_for_event(
 
     let mut pending: HashSet<String> = wait.correlation_ids.iter().cloned().collect();
     if pending.is_empty() {
-        return Ok(ExecutionState::BeforeLlmCall);
+        return Ok(Step::Continue(Stage::BeforeRequest));
     }
 
     let mut outcomes: Vec<String> = Vec::new();
@@ -211,7 +213,7 @@ pub(super) async fn transition_waiting_for_event(
         tokio::select! {
             biased;
             _ = env.cancellation_token.cancelled() => {
-                return Ok(ExecutionState::Cancelled);
+                return Ok(Step::Break(CycleOutcome::Cancelled));
             }
             _ = wait_for_pending_steering(env) => {
                 turn
@@ -222,7 +224,7 @@ pub(super) async fn transition_waiting_for_event(
                     pending.iter().cloned().collect::<Vec<_>>().join(", ")
                 );
                 inject_wait_message(config, env, &mut turn.history, message).await?;
-                return Ok(ExecutionState::BeforeLlmCall);
+                return Ok(Step::Continue(Stage::BeforeRequest));
             }
             _ = &mut sleep, if timeout_secs > 0 => {
                 let timed_out_ids: Vec<String> = pending.iter().cloned().collect();
@@ -233,7 +235,7 @@ pub(super) async fn transition_waiting_for_event(
 
                 let message = format_wait_all_summary(&outcomes);
                 inject_wait_message(config, env, &mut turn.history, message).await?;
-                return Ok(ExecutionState::BeforeLlmCall);
+                return Ok(Step::Continue(Stage::BeforeRequest));
             }
             recovered = recovery_outcomes(&mut recovery) => {
                 let dirty = recovery.take().is_some_and(|read| read.dirty);
@@ -246,7 +248,7 @@ pub(super) async fn transition_waiting_for_event(
                 }
                 if pending.is_empty() {
                     inject_wait_message(config, env, &mut turn.history, format_wait_all_summary(&outcomes)).await?;
-                    return Ok(ExecutionState::BeforeLlmCall);
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
                 if progressed && timeout_secs > 0 {
                     sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs));
@@ -267,10 +269,10 @@ pub(super) async fn transition_waiting_for_event(
                         continue;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Ok(ExecutionState::Stopped {
-                            message: "Event stream closed while waiting".into(),
-                            stop_type: StopType::Other,
-                        });
+                        return Ok(super::stopping(
+                            StopType::Other,
+                            "Event stream closed while waiting",
+                        ));
                     }
                 };
 
@@ -296,7 +298,7 @@ pub(super) async fn transition_waiting_for_event(
                 if pending.is_empty() {
                     let message = format_wait_all_summary(&outcomes);
                     inject_wait_message(config, env, &mut turn.history, message).await?;
-                    return Ok(ExecutionState::BeforeLlmCall);
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
 
                 // Progress was made: reset the inactivity deadline so the next
@@ -612,7 +614,7 @@ async fn inject_wait_message(
     env: &TurnEnv,
     history: &mut super::turn::History,
     content: String,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), TurnError> {
     let agent_msg = AgentMessage {
         id: Uuid::new_v4().to_string(),
         session_id: env.session_id.clone(),
@@ -632,7 +634,7 @@ async fn inject_wait_message(
     history
         .commit(&env.session_handle, vec![agent_msg])
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to store wait message: {}", e))?;
+        .map_err(TurnError::history("Failed to store wait message"))?;
 
     config.emit_event(
         &env.session_id,
@@ -732,7 +734,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall))),
+                    matches!(result, Ok(Ok(Step::Continue(Stage::BeforeRequest)))),
                     "terminal outcome lost for {policy:?}, late_entry={late_entry}"
                 );
             }
@@ -790,7 +792,7 @@ mod tests {
             ));
             assert!(matches!(
                 tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting).await,
-                Ok(Ok(ExecutionState::BeforeLlmCall))
+                Ok(Ok(Step::Continue(Stage::BeforeRequest)))
             ));
         }
     }
@@ -978,10 +980,13 @@ mod tests {
             gate.release.notify_waiters();
             trigger.abort();
             if cancel {
-                assert!(matches!(result, Ok(Ok(ExecutionState::Cancelled))));
+                assert!(matches!(
+                    result,
+                    Ok(Ok(Step::Break(CycleOutcome::Cancelled)))
+                ));
             } else {
                 assert!(
-                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall))),
+                    matches!(result, Ok(Ok(Step::Continue(Stage::BeforeRequest)))),
                     "terminal read must not defeat existing inactivity timeout"
                 );
             }
@@ -1070,7 +1075,7 @@ mod tests {
                     matches!(
                         tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiting)
                             .await,
-                        Ok(Ok(ExecutionState::BeforeLlmCall))
+                        Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                     ),
                     "live completion blocked by recovery: {policy:?} lag={lag}"
                 );
@@ -1109,7 +1114,7 @@ mod tests {
         }
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiting).await,
-            Ok(Ok(ExecutionState::BeforeLlmCall))
+            Ok(Ok(Step::Continue(Stage::BeforeRequest)))
         ));
         let history = config
             .provider
@@ -1181,7 +1186,7 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiting).await,
-                    Ok(Ok(ExecutionState::BeforeLlmCall))
+                    Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                 ));
             }
         }
@@ -1303,7 +1308,7 @@ mod tests {
             assert!(
                 matches!(
                     tokio::time::timeout(std::time::Duration::from_millis(250), &mut waiting).await,
-                    Ok(Ok(ExecutionState::BeforeLlmCall))
+                    Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                 ),
                 "lag during a retained old read must not lose the durable wakeup"
             );
@@ -1422,7 +1427,7 @@ mod tests {
         assert!(
             matches!(
                 tokio::time::timeout(std::time::Duration::from_millis(650), waiting).await,
-                Ok(Ok(ExecutionState::BeforeLlmCall))
+                Ok(Ok(Step::Continue(Stage::BeforeRequest)))
             ),
             "duplicates must not postpone b's original inactivity deadline"
         );
@@ -1475,9 +1480,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if cancel {
-                assert!(matches!(result, ExecutionState::Cancelled));
+                assert!(matches!(result, Step::Break(CycleOutcome::Cancelled)));
             } else {
-                assert!(matches!(result, ExecutionState::BeforeLlmCall));
+                assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
                 assert!(
                     format!(
                         "{:?}",
@@ -1568,7 +1573,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                assert!(matches!(result, ExecutionState::BeforeLlmCall));
+                assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
             }
             let suspended = turn.suspended_delegations.clone();
             assert!(suspended.contains("b"));

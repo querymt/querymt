@@ -1,15 +1,15 @@
 //! Calls the hooks of a run's middleware without running a loop, and returns
-//! the state the loop would move to, so a test can assert on states. The rig
+//! the step the loop would take, so a test can assert on steps. The rig
 //! owns the run state a hook reads and writes (history, statistics, queued
 //! notices, overrides), so a test arranges it up front and reads it back.
 
 use crate::agent::core::{AgentMode, SessionRuntime};
+use crate::agent::execution::stage::{after_step, cancelled};
 use crate::agent::execution::turn::History;
-use crate::agent::execution::{step_state, stopped_state};
+use crate::agent::execution::{Stage, Step};
 use crate::middleware::{
-    AgentStats, CompositeDriver, EndVerdict, ExecutionState, Folded, HookCx, HookInputs,
-    LlmResponse, Middleware, ModelProfile, PendingNotice, ReplyVerdict, Result, Stop, StopVerdict,
-    TurnInfo, TurnStack,
+    AgentStats, CompositeDriver, EndVerdict, Folded, HookCx, HookInputs, LlmResponse, Middleware,
+    ModelProfile, PendingNotice, ReplyVerdict, Result, Stop, StopVerdict, TurnInfo, TurnStack,
 };
 use querymt::chat::GenerationOptions;
 use querymt_agent_core::events::StopType;
@@ -125,63 +125,63 @@ impl HookRig {
         })
     }
 
-    pub async fn turn_start(&mut self, stack: &mut TurnStack) -> Result<ExecutionState> {
+    pub(crate) async fn turn_start(&mut self, stack: &mut TurnStack) -> Result<Step> {
         let cancel = self.cancel.clone();
         let folded = stack.turn_start(&mut self.cx(), &cancel).await?;
-        Ok(step_state(folded))
+        Ok(after_step(folded))
     }
 
-    pub async fn step_start(&mut self, stack: &mut TurnStack) -> Result<ExecutionState> {
+    pub(crate) async fn step_start(&mut self, stack: &mut TurnStack) -> Result<Step> {
         let cancel = self.cancel.clone();
         let folded = stack.step_start(&mut self.cx(), &cancel).await?;
-        Ok(step_state(folded))
+        Ok(after_step(folded))
     }
 
     /// A retry leads to `BeforeLlmCall` with the reply's usage counted.
-    pub async fn after_llm(
+    pub(crate) async fn after_llm(
         &mut self,
         stack: &mut TurnStack,
-        response: Arc<LlmResponse>,
-    ) -> Result<ExecutionState> {
+        response: Box<LlmResponse>,
+    ) -> Result<Step> {
         let cancel = self.cancel.clone();
         let folded = stack.after_llm(&mut self.cx(), &response, &cancel).await?;
         Ok(match folded {
-            Folded::Cancelled => ExecutionState::Cancelled,
-            Folded::Decided(ReplyVerdict::Proceed) => ExecutionState::AfterLlm { response },
-            Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop),
+            Folded::Cancelled => cancelled(),
+            Folded::Decided(ReplyVerdict::Proceed) => Step::Continue(Stage::AfterReply(response)),
+            Folded::Decided(ReplyVerdict::Stop(stop)) => Step::Continue(Stage::Stopping(stop)),
             Folded::Decided(ReplyVerdict::Retry) => {
                 crate::middleware::apply_usage_to_stats(&mut self.stats, response.usage.as_ref());
-                ExecutionState::BeforeLlmCall
+                Step::Continue(Stage::BeforeRequest)
             }
         })
     }
 
-    pub async fn turn_end(&mut self, stack: &mut TurnStack) -> Result<ExecutionState> {
+    pub(crate) async fn turn_end(&mut self, stack: &mut TurnStack) -> Result<Step> {
         let cancel = self.cancel.clone();
         let folded = stack.turn_end(&mut self.cx(), &cancel).await?;
         Ok(match folded {
-            Folded::Cancelled => ExecutionState::Cancelled,
-            Folded::Decided(EndVerdict::Finish) => ExecutionState::Complete,
-            Folded::Decided(EndVerdict::Continue) => ExecutionState::BeforeLlmCall,
-            Folded::Decided(EndVerdict::Stop(stop)) => stopped_state(stop),
+            Folded::Cancelled => cancelled(),
+            Folded::Decided(EndVerdict::Finish) => Step::Continue(Stage::Ending),
+            Folded::Decided(EndVerdict::Continue) => Step::Continue(Stage::BeforeRequest),
+            Folded::Decided(EndVerdict::Stop(stop)) => Step::Continue(Stage::Stopping(stop)),
         })
     }
 
     /// A recovery leads to `BeforeLlmCall`; a pass leaves the stop as it was
     /// (the stack drops what the middleware queued while they were consulted).
-    pub async fn stopped(
+    pub(crate) async fn stopped(
         &mut self,
         stack: &mut TurnStack,
         stop_type: StopType,
         message: &str,
-    ) -> Result<ExecutionState> {
+    ) -> Result<Step> {
         let stop = Stop::new(stop_type, message);
         let cancel = self.cancel.clone();
         let folded = stack.stopped(&mut self.cx(), &stop, &cancel).await?;
         Ok(match folded {
-            Folded::Cancelled => ExecutionState::Cancelled,
-            Folded::Decided(StopVerdict::Recover) => ExecutionState::BeforeLlmCall,
-            Folded::Decided(StopVerdict::Pass) => stopped_state(stop),
+            Folded::Cancelled => cancelled(),
+            Folded::Decided(StopVerdict::Recover) => Step::Continue(Stage::BeforeRequest),
+            Folded::Decided(StopVerdict::Pass) => Step::Continue(Stage::Stopping(stop)),
         })
     }
 }
@@ -192,63 +192,59 @@ pub(crate) mod in_run {
     use super::*;
     use crate::agent::execution::turn::{Turn, TurnEnv};
 
-    pub async fn step_start(
+    pub(crate) async fn step_start(
         stack: &mut TurnStack,
         env: &TurnEnv,
         turn: &mut Turn,
-    ) -> Result<ExecutionState> {
+    ) -> Result<Step> {
         let folded = stack
             .step_start(&mut turn.hook_cx(env), &env.cancellation_token)
             .await?;
-        Ok(step_state(folded))
+        Ok(after_step(folded))
     }
 
-    /// `state` is `AfterLlm`; a retry leads to `BeforeLlmCall` with the reply's
+    /// `state` is `AfterReply`; a retry leads to `BeforeLlmCall` with the reply's
     /// usage counted.
-    pub async fn after_llm(
+    pub(crate) async fn after_llm(
         stack: &mut TurnStack,
         env: &TurnEnv,
         turn: &mut Turn,
-        state: ExecutionState,
-    ) -> Result<ExecutionState> {
-        let ExecutionState::AfterLlm { response } = state else {
-            panic!("after_llm needs an AfterLlm state, got {}", state.name());
+        state: Step,
+    ) -> Result<Step> {
+        let Step::Continue(Stage::AfterReply(response)) = state else {
+            panic!("after_llm needs an AfterReply stage, got {state:?}");
         };
         let folded = stack
             .after_llm(&mut turn.hook_cx(env), &response, &env.cancellation_token)
             .await?;
         Ok(match folded {
-            Folded::Cancelled => ExecutionState::Cancelled,
-            Folded::Decided(ReplyVerdict::Proceed) => ExecutionState::AfterLlm { response },
-            Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop),
+            Folded::Cancelled => cancelled(),
+            Folded::Decided(ReplyVerdict::Proceed) => Step::Continue(Stage::AfterReply(response)),
+            Folded::Decided(ReplyVerdict::Stop(stop)) => Step::Continue(Stage::Stopping(stop)),
             Folded::Decided(ReplyVerdict::Retry) => {
                 crate::middleware::apply_usage_to_stats(&mut turn.stats, response.usage.as_ref());
-                ExecutionState::BeforeLlmCall
+                Step::Continue(Stage::BeforeRequest)
             }
         })
     }
 
-    /// `state` is `Stopped`; a recovery leads to `BeforeLlmCall`, a pass leaves
+    /// `state` is `Stopping`; a recovery leads to `BeforeLlmCall`, a pass leaves
     /// the stop as it was.
-    pub async fn stopped(
+    pub(crate) async fn stopped(
         stack: &mut TurnStack,
         env: &TurnEnv,
         turn: &mut Turn,
-        state: ExecutionState,
-    ) -> Result<ExecutionState> {
-        let ExecutionState::Stopped {
-            message, stop_type, ..
-        } = &state
-        else {
-            panic!("stopped needs a Stopped state, got {}", state.name());
+        state: Step,
+    ) -> Result<Step> {
+        let Step::Continue(Stage::Stopping(stop)) = &state else {
+            panic!("stopped needs a Stopping stage, got {state:?}");
         };
-        let stop = Stop::new(*stop_type, message.clone());
         let folded = stack
-            .stopped(&mut turn.hook_cx(env), &stop, &env.cancellation_token)
+            .stopped(&mut turn.hook_cx(env), stop, &env.cancellation_token)
             .await?;
         Ok(match folded {
-            Folded::Cancelled => ExecutionState::Cancelled,
-            Folded::Decided(StopVerdict::Recover) => ExecutionState::BeforeLlmCall,
+            Folded::Cancelled => cancelled(),
+            Folded::Decided(StopVerdict::Recover) => Step::Continue(Stage::BeforeRequest),
             Folded::Decided(StopVerdict::Pass) => state,
         })
     }

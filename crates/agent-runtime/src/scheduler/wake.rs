@@ -127,6 +127,10 @@ impl EventAccumulator {
 /// so the schedule/session IDs are not duplicated here.
 #[derive(Debug)]
 pub(crate) struct ActiveCycle {
+    /// The run this cycle fired. Terminal events name their run, so one that
+    /// names another (an earlier cycle of the schedule, ended late) is told
+    /// apart from this cycle's.
+    pub turn_id: String,
     pub started_at: OffsetDateTime,
     /// Handle to the scheduled `CycleFailed` message.
     pub timeout_handle: AbortHandle,

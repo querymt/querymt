@@ -4,10 +4,12 @@
 //! context window size.
 
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::execution::Stage;
+use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::utils::u32_from_usize;
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
-use crate::middleware::ExecutionState;
+use crate::middleware::Stop;
 use crate::session::compaction::SessionCompaction;
 use log::{debug, info, warn};
 use querymt_agent_core::events::{AgentEventKind, StopType};
@@ -161,24 +163,21 @@ pub(super) async fn run_ai_compaction(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Stage, TurnError> {
     let outcome = compact_history(config, env, turn, TRIGGER_CONTEXT_THRESHOLD, None).await?;
     let new_context_tokens = match outcome {
         CompactionOutcome::Completed { context_tokens } => context_tokens,
         CompactionOutcome::Blocked { message } => {
-            return Ok(ExecutionState::Stopped {
-                message: message.into(),
-                stop_type: StopType::ContextThreshold,
-            });
+            return Ok(Stage::Stopping(Stop::new(
+                StopType::ContextThreshold,
+                message,
+            )));
         }
         CompactionOutcome::PriceLimit { message } => {
-            return Ok(ExecutionState::Stopped {
-                message: message.into(),
-                stop_type: StopType::PriceLimit,
-            });
+            return Ok(Stage::Stopping(Stop::new(StopType::PriceLimit, message)));
         }
         CompactionOutcome::NothingToCompact => {
-            return Err(anyhow::anyhow!("No history available for compaction"));
+            return Err(anyhow::anyhow!("No history available for compaction").into());
         }
     };
     debug!(
@@ -191,7 +190,7 @@ pub(super) async fn run_ai_compaction(
     // the history now holds what survived, so the next request stores them
     // again if needed.
     turn.stats.context_tokens = new_context_tokens;
-    Ok(ExecutionState::BeforeLlmCall)
+    Ok(Stage::BeforeRequest)
 }
 
 /// Summarize the effective history and store the summary boundary.
@@ -540,7 +539,7 @@ mod tests {
         config: &AgentConfig,
         env: &TurnEnv,
         turn: &mut Turn,
-    ) -> Result<ExecutionState, anyhow::Error> {
+    ) -> Result<Stage, TurnError> {
         turn.history = super::super::turn::History::load(&env.session_handle).await?;
         run_ai_compaction(config, env, turn).await
     }
@@ -827,7 +826,7 @@ mod tests {
             .unwrap();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::super::execute_cycle_state_machine(
+            super::super::run_turn(
                 &config,
                 &env,
                 &mut turn,
@@ -921,7 +920,7 @@ mod tests {
         assert!(
             matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
         );
-        assert!(matches!(result, ExecutionState::BeforeLlmCall));
+        assert!(matches!(result, Stage::BeforeRequest));
         assert!(turn.stats.context_tokens > 0);
         assert_eq!(
             serde_json::to_value(turn.history.as_slice()).unwrap(),
@@ -1274,7 +1273,7 @@ mod tests {
             assert_eq!(before.context_tokens, 100_000);
 
             let next = compact_stored(&config, &env, &mut turn).await.unwrap();
-            assert!(matches!(next, ExecutionState::BeforeLlmCall));
+            assert!(matches!(next, Stage::BeforeRequest));
             let after = turn.stats.clone();
 
             // Effective context shrinks to the post-compaction estimate ...
@@ -1367,10 +1366,7 @@ mod tests {
             let next = compact_stored(&config, &env, &mut turn)
                 .await
                 .expect("a refused dispatch is a stop, not an error");
-            let ExecutionState::Stopped {
-                stop_type, message, ..
-            } = next
-            else {
+            let Stage::Stopping(Stop { stop_type, message }) = next else {
                 panic!("expected a stop, got {next:?}");
             };
             assert_eq!(stop_type, StopType::PriceLimit);

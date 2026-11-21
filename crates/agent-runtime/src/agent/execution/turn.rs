@@ -16,7 +16,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig, TurnSnapshot};
 use crate::agent::execution::DelegationRecovery;
 use crate::agent::objective::RunObjective;
-use crate::agent::turn_control::{RunPhase, SteeringInbox};
+use crate::agent::turn_control::{RunPhase, RunSignal, SteeringInbox};
 use crate::knowledge::KnowledgeStore;
 use crate::knowledge::repository::RepositoryKnowledgeRegistry;
 use crate::knowledge::repository::budget::DeliveryBudget;
@@ -36,16 +36,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-/// Describes the origin of an execution cycle.
-///
-/// Used to correlate scheduled executions with the `SchedulerActor` so that
-/// terminal events (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`)
-/// carry the correct `schedule_public_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// How a run was started. It is the label of the `run_started` event and, for
+/// a scheduled run, correlates the run's terminal events with the
+/// `SchedulerActor` through the schedule's public id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ExecutionOrigin {
     /// Interactive prompt from a user or delegation.
     Interactive,
@@ -56,6 +54,13 @@ pub enum ExecutionOrigin {
         /// Public ID of the recurring task that triggered this execution.
         task_public_id: String,
     },
+}
+
+impl ExecutionOrigin {
+    /// The label of the `run_started` event.
+    pub(crate) fn label(&self) -> &'static str {
+        self.into()
+    }
 }
 
 /// What a run reads and never changes.
@@ -95,7 +100,7 @@ pub(crate) struct TurnEnv {
     /// Inbox bound to this run for boundary-safe steering.
     pub steering: Option<Arc<SteeringInbox>>,
     /// Reports execution phase changes back to the owning session actor.
-    pub phase_reporter: Option<UnboundedSender<Option<RunPhase>>>,
+    pub phase_reporter: Option<tokio::sync::watch::Sender<RunSignal>>,
     /// Accounting handle for this execution cycle, created at the cycle
     /// boundary. Cycle spend starts at zero; session spend is retained by the
     /// session-owned projection it points at.
@@ -132,14 +137,14 @@ impl TurnEnv {
     /// Tell the owning session actor that its runtime status changed.
     pub(crate) fn report_runtime_change(&self) {
         if let Some(reporter) = &self.phase_reporter {
-            let _ = reporter.send(None);
+            reporter.send_modify(|signal| signal.revision = signal.revision.saturating_add(1));
         }
     }
 
     /// Tell the owning session actor which phase the run entered.
     pub(crate) fn report_phase(&self, phase: RunPhase) {
         if let Some(reporter) = &self.phase_reporter {
-            let _ = reporter.send(Some(phase));
+            reporter.send_modify(|signal| signal.phase = phase);
         }
     }
 
@@ -353,7 +358,7 @@ impl History {
         &mut self,
         session: &SessionHandle,
         messages: Vec<AgentMessage>,
-    ) -> anyhow::Result<()> {
+    ) -> SessionResult<()> {
         self.messages.reserve(messages.len());
         for message in messages {
             session.add_message(message.clone()).await?;
@@ -369,7 +374,7 @@ impl History {
     /// # Errors
     ///
     /// Fails when the store cannot return the history.
-    pub(crate) async fn load(session: &SessionHandle) -> anyhow::Result<Self> {
+    pub(crate) async fn load(session: &SessionHandle) -> Result<Self, super::TurnError> {
         use tracing::Instrument as _;
         let span = tracing::info_span!(
             "agent.execution.history_load",
@@ -381,7 +386,7 @@ impl History {
             let messages = session
                 .get_effective_agent_history()
                 .await
-                .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
+                .map_err(super::TurnError::history("Failed to load session history"))?;
             let span = tracing::Span::current();
             span.record("history_ms", started.elapsed().as_millis() as u64);
             span.record("message_count", messages.len() as u64);
@@ -449,7 +454,7 @@ impl History {
 ///
 /// Counted per stop reason so token-limit cut-offs do not use up the budget
 /// for normal end-of-turn continuations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 pub(crate) enum StopHookKind {
     EndTurn,
     ModelTokenLimit,

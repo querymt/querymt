@@ -2,7 +2,7 @@ use crate::middleware::middleware_driver::{
     EndVerdict, HookCx, Middleware, ReplyVerdict, StepVerdict, Stop, StopVerdict, TurnInfo,
     TurnMiddleware,
 };
-use crate::middleware::{LlmResponse, Result, ToolCall, ToolResult};
+use crate::middleware::{LlmResponse, MiddlewareError, Result, ToolCall, ToolResult};
 use crate::tools::FileAccess;
 use querymt_agent_core::events::SessionLimits;
 use std::future::Future;
@@ -148,16 +148,37 @@ impl Verdict for StopVerdict {
     }
 }
 
+/// The error of a hook, with the name of the middleware that returned it.
+#[derive(Debug, thiserror::Error)]
+#[error("middleware {name} failed: {source}")]
+pub(crate) struct HookFailure {
+    /// The configured name of the middleware.
+    pub(crate) name: &'static str,
+    #[source]
+    pub(crate) source: MiddlewareError,
+}
+
+/// For the hook rig of the tests, whose steps return the bare
+/// [`MiddlewareError`]. It forgets the middleware's name, so the run does not
+/// use it: it converts to `TurnError::Middleware`, which keeps the name.
+#[cfg(any(test, feature = "test-support"))]
+impl From<HookFailure> for MiddlewareError {
+    fn from(failure: HookFailure) -> Self {
+        failure.source
+    }
+}
+
 /// Wait for `hook`, or for cancellation, whichever comes first. A hook that
 /// loses the race is dropped and its verdict discarded.
 async fn race<V>(
     cancel: &CancellationToken,
+    name: &'static str,
     hook: impl Future<Output = Result<V>>,
-) -> Result<Option<V>> {
+) -> std::result::Result<Option<V>, HookFailure> {
     tokio::select! {
         biased;
         () = cancel.cancelled() => Ok(None),
-        verdict = hook => verdict.map(Some),
+        verdict = hook => verdict.map(Some).map_err(|source| HookFailure { name, source }),
     }
 }
 
@@ -177,7 +198,7 @@ macro_rules! consult {
             }
             let span = debug_span!("middleware.driver", name = instance.name, phase = $phase);
             let $mw = &mut instance.inner;
-            match race($cancel, $call.instrument(span)).await? {
+            match race($cancel, instance.name, $call.instrument(span)).await? {
                 None => return Ok(Folded::Cancelled),
                 Some(verdict) if !Verdict::passes(&verdict) => return Ok(Folded::Decided(verdict)),
                 Some(_) => {}
@@ -198,7 +219,7 @@ impl TurnStack {
         &mut self,
         cx: &mut HookCx<'_>,
         cancel: &CancellationToken,
-    ) -> Result<Folded<StepVerdict>> {
+    ) -> std::result::Result<Folded<StepVerdict>, HookFailure> {
         consult!(self, cx, cancel, "turn_start", |mw| mw.on_turn_start(cx))
     }
 
@@ -207,7 +228,7 @@ impl TurnStack {
         &mut self,
         cx: &mut HookCx<'_>,
         cancel: &CancellationToken,
-    ) -> Result<Folded<StepVerdict>> {
+    ) -> std::result::Result<Folded<StepVerdict>, HookFailure> {
         consult!(self, cx, cancel, "step_start", |mw| mw.on_step_start(cx))
     }
 
@@ -217,7 +238,7 @@ impl TurnStack {
         cx: &mut HookCx<'_>,
         reply: &LlmResponse,
         cancel: &CancellationToken,
-    ) -> Result<Folded<ReplyVerdict>> {
+    ) -> std::result::Result<Folded<ReplyVerdict>, HookFailure> {
         consult!(self, cx, cancel, "after_llm", |mw| mw
             .on_after_llm(cx, reply))
     }
@@ -227,7 +248,7 @@ impl TurnStack {
         &mut self,
         cx: &mut HookCx<'_>,
         cancel: &CancellationToken,
-    ) -> Result<Folded<EndVerdict>> {
+    ) -> std::result::Result<Folded<EndVerdict>, HookFailure> {
         consult!(self, cx, cancel, "turn_end", |mw| mw.on_turn_end(cx))
     }
 
@@ -240,7 +261,7 @@ impl TurnStack {
         cx: &mut HookCx<'_>,
         stop: &Stop,
         cancel: &CancellationToken,
-    ) -> Result<Folded<StopVerdict>> {
+    ) -> std::result::Result<Folded<StopVerdict>, HookFailure> {
         let checkpoint = cx.checkpoint();
         let folded = self.consult_stopped(cx, stop, cancel).await?;
         if matches!(folded, Folded::Decided(StopVerdict::Pass)) {
@@ -254,7 +275,7 @@ impl TurnStack {
         cx: &mut HookCx<'_>,
         stop: &Stop,
         cancel: &CancellationToken,
-    ) -> Result<Folded<StopVerdict>> {
+    ) -> std::result::Result<Folded<StopVerdict>, HookFailure> {
         consult!(self, cx, cancel, "stopped", |mw| mw.on_stopped(cx, stop))
     }
 
@@ -265,7 +286,7 @@ impl TurnStack {
         &mut self,
         cx: &mut HookCx<'_>,
         batch: &PreparedBatch<'_>,
-    ) -> Result<Vec<PreparedCallVerdict>> {
+    ) -> std::result::Result<Vec<PreparedCallVerdict>, HookFailure> {
         let mut verdicts: Vec<PreparedCallVerdict> = batch
             .calls
             .iter()
@@ -298,7 +319,11 @@ impl TurnStack {
                     name = instance.name,
                     phase = "prepared_tool_calls"
                 ))
-                .await?;
+                .await
+                .map_err(|source| HookFailure {
+                    name: instance.name,
+                    source,
+                })?;
             for (&index, verdict) in live.iter().zip(reviewed) {
                 verdicts[index] = verdict;
             }

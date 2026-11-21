@@ -1,6 +1,7 @@
+use crate::agent::execution::{CycleOutcome, Stage, Step};
 use crate::middleware::{
-    CompositeDriver, EndVerdict, ExecutionState, LimitsConfig, LimitsMiddleware, Middleware,
-    ReplyVerdict, StepVerdict, Stop, StopVerdict,
+    CompositeDriver, EndVerdict, LimitsConfig, LimitsMiddleware, Middleware, ReplyVerdict,
+    StepVerdict, Stop, StopVerdict,
 };
 use crate::test_utils::{Act, HookRig, ScriptedMiddleware};
 use querymt_agent_core::events::StopType;
@@ -20,7 +21,7 @@ fn stack_of(middleware: &[&ScriptedMiddleware]) -> crate::middleware::TurnStack 
 }
 
 /// One step of `middleware` over the run `rig` holds, as the loop would take it.
-async fn step(middleware: &LimitsMiddleware, mut rig: HookRig) -> ExecutionState {
+async fn step(middleware: &LimitsMiddleware, mut rig: HookRig) -> Step {
     let mut stack = HookRig::stack_of(middleware.clone());
     rig.step_start(&mut stack).await.unwrap()
 }
@@ -32,7 +33,7 @@ async fn an_empty_stack_passes_every_stage() {
 
     let state = rig.step_start(&mut stack).await.unwrap();
 
-    assert!(matches!(state, ExecutionState::BeforeLlmCall));
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
     assert!(stack.is_empty());
 }
 
@@ -43,10 +44,7 @@ async fn stop_before_a_model_request() {
 
     let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    let ExecutionState::Stopped {
-        message, stop_type, ..
-    } = state
-    else {
+    let Step::Continue(Stage::Stopping(Stop { message, stop_type })) = state else {
         panic!("expected a stop");
     };
     assert_eq!((&*message, stop_type), ("enough", StopType::Other));
@@ -59,7 +57,7 @@ async fn stop_at_run_start_ends_the_stage() {
 
     let state = HookRig::new().turn_start(&mut stack).await.unwrap();
 
-    assert!(matches!(state, ExecutionState::Stopped { .. }));
+    assert!(matches!(state, Step::Continue(Stage::Stopping(_))));
     assert_eq!(stopper.count("turn_start"), 1);
 }
 
@@ -71,7 +69,7 @@ async fn earlier_stop_skips_later_middleware() {
 
     let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    assert!(matches!(state, ExecutionState::Stopped { .. }));
+    assert!(matches!(state, Step::Continue(Stage::Stopping(_))));
     assert_eq!(second.count("step_start"), 0);
 }
 
@@ -83,7 +81,7 @@ async fn every_middleware_is_consulted_when_all_pass() {
 
     let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    assert!(matches!(state, ExecutionState::BeforeLlmCall));
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
     assert_eq!(
         (first.count("step_start"), second.count("step_start")),
         (1, 1)
@@ -99,7 +97,7 @@ async fn reply_discarded_and_retried_by_middleware() {
         output_tokens: 40,
         ..Default::default()
     };
-    let response = Arc::new(crate::middleware::LlmResponse::new(
+    let response = Box::new(crate::middleware::LlmResponse::new(
         "cut".into(),
         vec![],
         Some(usage),
@@ -110,7 +108,7 @@ async fn reply_discarded_and_retried_by_middleware() {
     let state = rig.after_llm(&mut stack, response).await.unwrap();
 
     assert!(
-        matches!(state, ExecutionState::BeforeLlmCall),
+        matches!(state, Step::Continue(Stage::BeforeRequest)),
         "a retry sends the request again"
     );
     assert_eq!(
@@ -134,12 +132,12 @@ async fn continuation_at_the_end_of_a_run() {
     let second = rig.turn_end(&mut stack).await.unwrap();
 
     assert!(
-        matches!(first, ExecutionState::BeforeLlmCall),
+        matches!(first, Step::Continue(Stage::BeforeRequest)),
         "expected a continuation"
     );
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].content, "one more thing");
-    assert!(matches!(second, ExecutionState::Complete));
+    assert!(matches!(second, Step::Continue(Stage::Ending)));
 }
 
 #[tokio::test]
@@ -155,10 +153,10 @@ async fn stop_passed_on_by_every_middleware() {
 
     assert!(matches!(
         state,
-        ExecutionState::Stopped {
+        Step::Continue(Stage::Stopping(Stop {
             stop_type: StopType::ModelTokenLimit,
             ..
-        }
+        }))
     ));
     assert_eq!((first.count("stopped"), second.count("stopped")), (1, 1));
 }
@@ -175,7 +173,7 @@ async fn recovery_ends_the_stop_stage() {
         .await
         .unwrap();
 
-    assert!(matches!(state, ExecutionState::BeforeLlmCall));
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
     assert_eq!(never.count("stopped"), 0);
 }
 
@@ -188,14 +186,14 @@ async fn notices_queued_before_a_stop_survive_a_recovery() {
     let mut stack = stack_of(&[&queues, &stops, &recovers]);
     let mut rig = HookRig::new();
 
-    rig.step_start(&mut stack).await.unwrap();
+    let _ = rig.step_start(&mut stack).await.unwrap();
     let recovered = rig
         .stopped(&mut stack, StopType::Other, "stop")
         .await
         .unwrap();
 
     assert!(
-        matches!(recovered, ExecutionState::BeforeLlmCall),
+        matches!(recovered, Step::Continue(Stage::BeforeRequest)),
         "expected a recovery"
     );
     assert_eq!(rig.pending.len(), 1);
@@ -211,7 +209,7 @@ async fn notices_queued_before_a_published_stop_are_not_stored() {
     let mut stack = stack_of(&[&queues, &stops, &passes]);
     let mut rig = HookRig::new();
 
-    rig.step_start(&mut stack).await.unwrap();
+    let _ = rig.step_start(&mut stack).await.unwrap();
     let queued_before = rig.pending.len();
     let published = rig
         .stopped(&mut stack, StopType::Other, "stop")
@@ -220,7 +218,7 @@ async fn notices_queued_before_a_published_stop_are_not_stored() {
 
     // The stop is published as it was; the notice queued before it stays on
     // the run, which ends without storing it.
-    assert!(matches!(published, ExecutionState::Stopped { .. }));
+    assert!(matches!(published, Step::Continue(Stage::Stopping(_))));
     assert_eq!(queued_before, 1);
 }
 
@@ -242,7 +240,7 @@ async fn cancel_while_a_middleware_is_running() {
         .expect("middleware cancellation should be prompt")
         .expect("middleware task should not panic")
         .expect("middleware cancellation should not error");
-    assert!(matches!(state, ExecutionState::Cancelled));
+    assert!(matches!(state, Step::Break(CycleOutcome::Cancelled)));
 }
 
 #[tokio::test]
@@ -254,7 +252,7 @@ async fn already_cancelled_run_consults_nobody() {
 
     let state = rig.step_start(&mut stack).await.unwrap();
 
-    assert!(matches!(state, ExecutionState::Cancelled));
+    assert!(matches!(state, Step::Break(CycleOutcome::Cancelled)));
     assert_eq!(counter.count("step_start"), 0);
 }
 
@@ -290,10 +288,10 @@ async fn test_max_steps_at_limit_stops() {
 
     assert!(matches!(
         result,
-        ExecutionState::Stopped {
+        Step::Continue(Stage::Stopping(Stop {
             stop_type: StopType::StepLimit,
             ..
-        }
+        }))
     ));
 }
 
@@ -303,7 +301,7 @@ async fn test_max_steps_below_limit_continues() {
 
     let result = step(&middleware, HookRig::at_step("sess-1", 3)).await;
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -312,11 +310,11 @@ async fn test_turn_limit_middleware() {
 
     // With 2 user messages, should continue (2 < 3)
     let result = step(&middleware, HookRig::with_user_messages("sess-1", 2)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 
     // With 3 user messages, should stop (3 >= 3)
     let result = step(&middleware, HookRig::with_user_messages("sess-1", 3)).await;
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 }
 
 fn budget_rig(budget_cost_usd: f64) -> HookRig {
@@ -329,13 +327,13 @@ fn budget_rig(budget_cost_usd: f64) -> HookRig {
     rig
 }
 
-fn is_price_stop(state: &ExecutionState) -> bool {
+fn is_price_stop(state: &Step) -> bool {
     matches!(
         state,
-        ExecutionState::Stopped {
+        Step::Continue(Stage::Stopping(Stop {
             stop_type: StopType::PriceLimit,
             ..
-        }
+        }))
     )
 }
 
@@ -358,7 +356,7 @@ async fn test_price_limit_under_budget() {
     let middleware =
         LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(1.0));
     let result = step(&middleware, budget_rig(0.05)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -367,7 +365,7 @@ async fn test_new_cycle_with_zero_cycle_spend_is_not_exhausted() {
     let middleware =
         LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(0.10));
     let result = step(&middleware, budget_rig(0.0)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -375,7 +373,7 @@ async fn test_limits_middleware_enforces_the_same_cycle_budget() {
     let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
     assert!(is_price_stop(&step(&middleware, budget_rig(0.10)).await));
     let result = step(&middleware, budget_rig(0.09)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -383,7 +381,7 @@ async fn test_price_limit_without_known_spend_passes_through() {
     // No recorded charge (for example an all-unpriced cycle): nothing to stop on.
     let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
     let result = step(&middleware, budget_rig(0.0)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -395,8 +393,8 @@ async fn test_limits_middleware_combined() {
     let middleware = LimitsMiddleware::new(config);
 
     let result = step(&middleware, HookRig::at_step("sess-1", 2)).await;
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 
     let result = step(&middleware, HookRig::at_step("sess-1", 10)).await;
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 }

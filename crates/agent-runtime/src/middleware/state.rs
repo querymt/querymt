@@ -1,7 +1,6 @@
 use querymt::chat::{ChatMessage, ChatOutput, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
-use querymt_agent_core::events::StopType;
 use querymt_agent_core::model::{MessagePart, NoticeSource};
 
 /// Statistics about agent execution
@@ -356,60 +355,6 @@ impl WaitCondition {
             reason,
             correlation_ids,
         })
-    }
-}
-
-/// Where the loop is. The state of the run (history, statistics, queued
-/// notices) lives in the run's `Turn`; a position carries only what its step
-/// consumes.
-#[derive(Debug)]
-pub enum ExecutionState {
-    /// Before calling the LLM - middleware can inject messages or stop
-    BeforeLlmCall,
-
-    /// Ready to call the LLM with tools
-    CallLlm { request: Arc<PreparedModelRequest> },
-
-    /// After receiving LLM response
-    AfterLlm { response: Arc<LlmResponse> },
-
-    /// Processing multiple tool calls from a single LLM response
-    ProcessingToolCalls {
-        /// Remaining tool calls to process
-        remaining_calls: Arc<[ToolCall]>,
-        /// Tool results collected so far
-        results: Arc<[ToolResult]>,
-    },
-
-    /// Waiting for an external event before continuing
-    WaitingForEvent { wait: WaitCondition },
-
-    /// Execution completed successfully
-    Complete,
-
-    /// Execution stopped by middleware
-    Stopped {
-        message: Arc<str>,
-        stop_type: StopType,
-    },
-
-    /// Execution cancelled by user
-    Cancelled,
-}
-
-impl ExecutionState {
-    /// Returns a human-readable name for the state
-    pub fn name(&self) -> &'static str {
-        match self {
-            ExecutionState::BeforeLlmCall => "BeforeLlmCall",
-            ExecutionState::CallLlm { .. } => "CallLlm",
-            ExecutionState::AfterLlm { .. } => "AfterLlm",
-            ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
-            ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
-            ExecutionState::Complete => "Complete",
-            ExecutionState::Stopped { .. } => "Stopped",
-            ExecutionState::Cancelled => "Cancelled",
-        }
     }
 }
 

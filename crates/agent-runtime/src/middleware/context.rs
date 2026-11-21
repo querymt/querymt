@@ -267,7 +267,9 @@ impl MiddlewareFactory for ContextFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{ExecutionState, PendingNotice, TurnStack};
+    use crate::agent::execution::{Stage, Step};
+    use crate::middleware::Stop;
+    use crate::middleware::{PendingNotice, TurnStack};
     use crate::test_utils::HookRig;
 
     // ========================================================================
@@ -283,7 +285,7 @@ mod tests {
     /// What one step of a run came to: the state the loop moves to and the
     /// notices the middleware queued.
     struct Stepped {
-        state: ExecutionState,
+        state: Step,
         queued: Vec<PendingNotice>,
     }
 
@@ -494,7 +496,7 @@ mod tests {
     fn stops_for_context(stepped: &Stepped) -> bool {
         matches!(
             stepped.state,
-            ExecutionState::Stopped { stop_type, .. } if stop_type == StopType::ContextThreshold
+            Step::Continue(Stage::Stopping(Stop { stop_type, .. })) if stop_type == StopType::ContextThreshold
         )
     }
 
@@ -504,7 +506,7 @@ mod tests {
 
         // 5000 tokens: below the 80% threshold.
         let result = fixture.run_step(5000).await.unwrap();
-        assert!(matches!(result.state, ExecutionState::BeforeLlmCall));
+        assert!(matches!(result.state, Step::Continue(Stage::BeforeRequest)));
     }
 
     #[tokio::test]
@@ -546,7 +548,7 @@ mod tests {
 
         // Should queue a warning, not stop for compaction
         assert!(
-            matches!(result.state, ExecutionState::BeforeLlmCall),
+            matches!(result.state, Step::Continue(Stage::BeforeRequest)),
             "Should not compact below compact_at_percent threshold"
         );
         assert_eq!(
@@ -581,7 +583,7 @@ mod tests {
 
         // Should not stop, but should queue a warning instead
         assert!(
-            matches!(result.state, ExecutionState::BeforeLlmCall),
+            matches!(result.state, Step::Continue(Stage::BeforeRequest)),
             "Should not stop when auto_compact=false"
         );
         assert_eq!(result.queued.len(), 1, "Should queue warning notice");
@@ -595,7 +597,7 @@ mod tests {
         // 60% of 10000, exceeds the 50% threshold
         let result = fixture.run_step(6000).await.unwrap();
 
-        assert!(matches!(result.state, ExecutionState::BeforeLlmCall));
+        assert!(matches!(result.state, Step::Continue(Stage::BeforeRequest)));
         // The warning is queued as a `context_usage` notice.
         assert_eq!(result.queued.len(), 1);
         assert_eq!(

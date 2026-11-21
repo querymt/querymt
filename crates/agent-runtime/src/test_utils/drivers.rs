@@ -11,12 +11,17 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// What a scripted hook does: say a verdict, queue a notice and say it, fail,
-/// or never return (until the run is cancelled).
+/// panic (at once, or once a gate is opened), or never return (until the run
+/// is cancelled).
 #[derive(Debug, Clone)]
 pub enum Act<V> {
     Say(V),
     Notice(&'static str, V),
     Fail,
+    Panic,
+    /// Wait for the gate to be notified, then panic. A notification sent
+    /// before the hook runs is kept, so opening the gate early is safe.
+    PanicAfter(Arc<tokio::sync::Notify>),
     Hang,
 }
 
@@ -95,6 +100,12 @@ impl ScriptedMiddleware {
                 Ok(verdict)
             }
             Some(Act::Fail) => Err(MiddlewareError::ExecutionError("test error".into())),
+            // The script's lock is not held here, so the panic poisons nothing.
+            Some(Act::Panic) => panic!("scripted panic"),
+            Some(Act::PanicAfter(gate)) => {
+                gate.notified().await;
+                panic!("scripted panic")
+            }
             Some(Act::Hang) => std::future::pending().await,
         }
     }

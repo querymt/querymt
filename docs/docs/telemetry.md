@@ -43,7 +43,7 @@ produces a tree of child spans describing every step that was executed.
 | `agent.execution.turn` | A single execution turn |
 | `agent.execution.history_load` | Loading session history |
 | `agent.execution.driver_create` | Building the middleware driver for the turn |
-| `agent.execution.profile` | Resolving the turn's model profile (builds the provider on first use) |
+| `agent.execution.provider_init` | Resolving the run's provider before its first hook (builds it on first use) |
 | `agent.execution.context_init` | Building the initial conversation context |
 | `agent.provider.build` | Cold provider build for the turn (once per turn; later steps reuse it) |
 | `agent.llm.call_with_retry` | Retry wrapper; `operation` is `provider_init` or `chat` |

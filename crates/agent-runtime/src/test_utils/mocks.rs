@@ -235,6 +235,28 @@ impl LLMProviderFactory for TestProviderFactory {
     }
 }
 
+/// A factory named `mock` whose provider can never be built: for tests of what
+/// a run does when its provider fails at start.
+pub struct UnbuildableProviderFactory;
+
+impl LLMProviderFactory for UnbuildableProviderFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn config_schema(&self) -> String {
+        "{}".to_string()
+    }
+
+    fn from_config(&self, _cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+        Err(LLMError::InvalidRequest("cannot build the provider".into()))
+    }
+
+    fn list_models<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
+        Box::pin(async { Ok(vec!["mock-model".to_string()]) })
+    }
+}
+
 // ============================================================================
 // TestPluginLoader - Plugin loader for tests
 // ============================================================================

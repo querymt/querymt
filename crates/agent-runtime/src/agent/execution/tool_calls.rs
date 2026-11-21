@@ -5,6 +5,8 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SnapshotPolicy;
+use crate::agent::execution::Stage;
+use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::agent::utils::genai;
@@ -14,7 +16,7 @@ use crate::hooks::{
     UpdatedDelegation,
 };
 use crate::middleware::ToolCall as MiddlewareToolCall;
-use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
+use crate::middleware::{ToolResult, WaitCondition};
 use crate::session::domain::TaskStatus;
 use crate::tools::Tool;
 use crate::tools::args::{Repair, normalize_arguments};
@@ -2019,11 +2021,11 @@ fn resolved_isolation_label(resolved: crate::worktree::ResolvedIsolation) -> &'s
 )]
 pub(super) async fn store_all_tool_results(
     config: &AgentConfig,
-    results: &Arc<[ToolResult]>,
+    results: &[ToolResult],
     env: &TurnEnv,
     turn: &mut Turn,
     steering: super::DrainedSteering,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Stage, TurnError> {
     debug!(
         "Storing all tool results: session={}, count={}",
         env.session_id,
@@ -2104,9 +2106,15 @@ pub(super) async fn store_all_tool_results(
     // The results are stored directly after the assistant message that made
     // the calls. Steering accepted before the batch started is stored after
     // them, so the stored order is the order the model is sent.
-    super::commit_steering(config, env, turn, steering, vec![result_msg])
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
+    super::commit_steering(
+        config,
+        env,
+        turn,
+        steering,
+        vec![result_msg],
+        "Failed to store tool results",
+    )
+    .await?;
 
     // Aggregate changed file paths from tool results for dedup check
     let mut combined = querymt_agent_index::DiffPaths::default();
@@ -2123,12 +2131,10 @@ pub(super) async fn store_all_tool_results(
     }
 
     if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {
-        return Ok(ExecutionState::WaitingForEvent {
-            wait: wait_condition,
-        });
+        return Ok(Stage::Waiting(wait_condition));
     }
 
-    Ok(ExecutionState::BeforeLlmCall)
+    Ok(Stage::BeforeRequest)
 }
 
 #[cfg(test)]

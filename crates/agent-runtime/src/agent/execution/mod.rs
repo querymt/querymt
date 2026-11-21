@@ -1,11 +1,11 @@
 //! Core execution logic for the agent
 //!
-//! This module contains the main state machine loop (`execute_cycle_state_machine`)
-//! used by the kameo `SessionActor` via `ctx.spawn()`. The implementation is split
-//! across focused submodules:
+//! This module contains the run loop (`run_turn`, in `stage`) used by the kameo
+//! `SessionActor` via `ctx.spawn()`. The implementation is split across focused
+//! submodules:
 //!
-//! - `state_machine` (this file) — Main execution loop and middleware integration
-//! - `transitions` — State transition functions (BeforeLlmCall, CallLlm, AfterLlm, ProcessingToolCalls)
+//! - `stage` — The loop position (`Stage`) and the function that moves it
+//! - `transitions` — Step functions (before request, model call, after reply, tool calls)
 //! - `tool_calls` — Tool execution, permission checking, and result storage
 //! - `wait` — Event waiting and delegation completion handling
 //! - `llm_retry` — LLM retry logic with rate limit handling
@@ -40,11 +40,14 @@ fn format_stop_hook_continuation_message(
 }
 
 pub(crate) mod cache_hints;
+mod error;
+pub(crate) use error::TurnError;
 mod llm_retry;
 mod maintenance;
 pub(crate) mod prefix;
 pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
 mod progress_sink;
+pub(crate) mod stage;
 mod tool_calls;
 pub(crate) mod tool_history;
 mod transitions;
@@ -52,21 +55,16 @@ pub(crate) mod turn;
 pub use turn::ExecutionOrigin;
 mod wait;
 mod wave_plan;
+pub(crate) use stage::{Stage, Step, run_turn, stopping};
 pub(crate) use wait::DelegationRecovery;
 #[cfg(test)]
 pub(crate) use wait::cleanup_timed_out_delegations;
 
 use crate::acp::protocol::StopReason;
 use crate::agent::execution::turn::{Turn, TurnEnv};
-use crate::agent::utils::u32_from_usize;
 use crate::hooks::StopRequest;
-use crate::middleware::{
-    EndVerdict, ExecutionState, Folded, ReplyVerdict, StepVerdict, Stop, StopVerdict, TurnInfo,
-};
-use log::{debug, info, trace, warn};
-use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
-use std::sync::Arc;
-use tracing::{Instrument, debug_span, info_span, instrument};
+use log::warn;
+use querymt_agent_core::events::{AgentEventKind, StopType};
 
 /// Outcome of a single execution cycle
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,9 +118,10 @@ fn warn_incomplete_budget(
 fn emit_stop_hook_cap_notice(
     config: &crate::agent::agent_config::AgentConfig,
     env: &TurnEnv,
-    stop_reason: &str,
+    kind: turn::StopHookKind,
     max: u32,
 ) {
+    let stop_reason: &'static str = kind.into();
     warn!(
         "Session {}: stop hook requested more than {} continuation(s) ({}); ignoring",
         env.session_id, max, stop_reason
@@ -146,7 +145,7 @@ fn emit_stop_hook_cap_notice(
 async fn run_stop_hook(
     config: &crate::agent::agent_config::AgentConfig,
     env: &TurnEnv,
-    stop_reason: &str,
+    kind: turn::StopHookKind,
 ) -> Result<crate::hooks::StopResult, crate::hooks::HookError> {
     let stop_hook = config
         .hooks
@@ -159,7 +158,7 @@ async fn run_stop_hook(
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
             permission_mode: env.permission_mode().to_string(),
-            stop_reason: stop_reason.to_string(),
+            stop_reason: <&'static str>::from(kind).to_string(),
         })
         .await?;
     for notice in &stop_hook.notices {
@@ -195,14 +194,29 @@ fn has_effective_task_completion_tool(tools: &[querymt::chat::Tool]) -> bool {
 /// the skipped results of a batch before the steering that skipped them.
 pub(crate) struct DrainedSteering {
     inputs: Vec<crate::agent::turn_control::SteeringInput>,
-    boundary: &'static str,
+    boundary: Option<SteeringBoundary>,
+}
+
+/// Where in a run waiting steering is applied. The label is what events and
+/// the run objective record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+pub(crate) enum SteeringBoundary {
+    /// Before the next model request is prepared.
+    #[strum(serialize = "before_model_request")]
+    NextRequest,
+    /// Before a batch of tool calls starts.
+    #[strum(serialize = "before_tool_batch")]
+    ToolBatch,
+    /// When the reply ended the run, before the end-of-run checks.
+    #[strum(serialize = "before_completion")]
+    RunEnd,
 }
 
 impl DrainedSteering {
     pub(crate) fn none() -> Self {
         Self {
             inputs: Vec::new(),
-            boundary: "",
+            boundary: None,
         }
     }
 
@@ -215,7 +229,7 @@ impl DrainedSteering {
 /// inbox, so nothing accepted after this is applied to this run.
 pub(crate) async fn drain_steering(
     env: &TurnEnv,
-    boundary: &'static str,
+    boundary: SteeringBoundary,
     closing: bool,
 ) -> DrainedSteering {
     let Some(inbox) = env.steering.clone() else {
@@ -232,7 +246,10 @@ pub(crate) async fn drain_steering(
         // follows.
         env.report_runtime_change();
     }
-    DrainedSteering { inputs, boundary }
+    DrainedSteering {
+        inputs,
+        boundary: Some(boundary),
+    }
 }
 
 /// Store `preceding` and then one user message per drained input, in that
@@ -243,8 +260,10 @@ pub(crate) async fn commit_steering(
     turn: &mut Turn,
     drained: DrainedSteering,
     mut preceding: Vec<querymt_agent_core::model::AgentMessage>,
-) -> Result<(), anyhow::Error> {
+    what: &'static str,
+) -> Result<(), TurnError> {
     let DrainedSteering { inputs, boundary } = drained;
+    let boundary: &'static str = boundary.map_or("", <&'static str>::from);
     let mut applied = Vec::with_capacity(inputs.len());
     for input in inputs {
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -268,7 +287,10 @@ pub(crate) async fn commit_steering(
         preceding.push(message);
         applied.push((message_id, input));
     }
-    turn.history.commit(&env.session_handle, preceding).await?;
+    turn.history
+        .commit(&env.session_handle, preceding)
+        .await
+        .map_err(TurnError::history(what))?;
 
     for (message_id, input) in applied {
         let blocks = input.blocks;
@@ -316,7 +338,8 @@ pub(crate) async fn commit_steering(
                     "steering".to_string(),
                     Some(input.input_id.clone()),
                 )
-                .await?;
+                .await
+                .map_err(TurnError::history("Failed to update intent projection"))?;
         }
         if !display.trim().is_empty()
             && let Some(objective) = turn.run_objective.as_mut()
@@ -358,14 +381,22 @@ pub(crate) async fn apply_pending_steering(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    boundary: &'static str,
+    boundary: SteeringBoundary,
     closing: bool,
-) -> Result<bool, anyhow::Error> {
+) -> Result<bool, TurnError> {
     let drained = drain_steering(env, boundary, closing).await;
     if drained.is_empty() {
         return Ok(false);
     }
-    commit_steering(config, env, turn, drained, Vec::new()).await?;
+    commit_steering(
+        config,
+        env,
+        turn,
+        drained,
+        Vec::new(),
+        "Failed to store steering message",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -389,10 +420,7 @@ fn queue_progress_review(turn: &mut Turn) {
 ///
 /// Nothing is stored for a request that is never sent: the queue lives on the
 /// run and is dropped with it.
-pub(crate) async fn store_pending_notices(
-    env: &TurnEnv,
-    turn: &mut Turn,
-) -> Result<(), anyhow::Error> {
+pub(crate) async fn store_pending_notices(env: &TurnEnv, turn: &mut Turn) -> Result<(), TurnError> {
     use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     if turn.pending_notices.is_empty() {
@@ -412,7 +440,8 @@ pub(crate) async fn store_pending_notices(
         .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
     turn.history
         .commit(&env.session_handle, vec![message])
-        .await?;
+        .await
+        .map_err(TurnError::history("Failed to store notices"))?;
     turn.pending_notices.clear();
     Ok(())
 }
@@ -425,7 +454,8 @@ pub(crate) async fn prepare_model_request(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-) -> Result<ExecutionState, anyhow::Error> {
+    provider: &std::sync::Arc<dyn querymt::LLMProvider>,
+) -> Result<Step, TurnError> {
     // The run objective is request-scoped: sent in the request tail, never
     // stored. It is still built and amended, and its events are emitted,
     // whether or not it is sent.
@@ -435,537 +465,77 @@ pub(crate) async fn prepare_model_request(
         .then(|| render_run_objective(turn));
     let trigger = transitions::context_hook_trigger(turn.history.as_slice());
     store_pending_notices(env, turn).await?;
-    transitions::transition_before_llm_call(config, env, turn, trigger, objective.as_deref()).await
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-//  State machine implementation
-// ══════════════════════════════════════════════════════════════════════════
-
-/// The state a stop of middleware leads to. What middleware queued before the
-/// stop is on the run, so a recovery still stores it.
-pub(crate) fn stopped_state(stop: Stop) -> ExecutionState {
-    ExecutionState::Stopped {
-        message: stop.message,
-        stop_type: stop.stop_type,
-    }
-}
-
-/// The state after the middleware of a stage that precedes a model request.
-pub(crate) fn step_state(folded: Folded<StepVerdict>) -> ExecutionState {
-    match folded {
-        Folded::Cancelled => ExecutionState::Cancelled,
-        Folded::Decided(StepVerdict::Proceed) => ExecutionState::BeforeLlmCall,
-        Folded::Decided(StepVerdict::Stop(stop)) => stopped_state(stop),
-    }
+    transitions::transition_before_llm_call(
+        config,
+        env,
+        turn,
+        provider,
+        trigger,
+        objective.as_deref(),
+    )
+    .await
 }
 
 use crate::agent::agent_config::AgentConfig;
 
-/// Execute the cycle state machine using an `AgentConfig`.
-///
-/// This is the entry point for the kameo `SessionActor`'s `ctx.spawn()` task.
-/// It reads configuration from `AgentConfig` rather than requiring a full agent instance.
-///
-/// `session_mode` is the per-session `AgentMode` captured at turn start.
-/// Middleware reads it through its hook context.
-#[instrument(
-    name = "agent.execution.turn",
-    skip(config, env, turn),
-    fields(
-        session_id = %env.session_id,
-        mode = %session_mode,
-        llm_request_count = tracing::field::Empty,
-        completion_guard_available = tracing::field::Empty,
-        completion_guard_continuations = tracing::field::Empty,
-    )
-)]
-pub(crate) async fn execute_cycle_state_machine(
-    config: &AgentConfig,
-    env: &TurnEnv,
-    turn: &mut Turn,
-    session_mode: crate::agent::core::AgentMode,
-) -> Result<CycleOutcome, anyhow::Error> {
-    debug!(
-        "Starting state machine execution (free fn) for session: {}",
-        env.session_id
-    );
+/// The labels that events, hooks and the run objective carry are fixed by
+/// clients and hook scripts; the enums that replaced the string parameters
+/// must print what the literals did.
+#[cfg(test)]
+mod label_tests {
+    use super::turn::{ExecutionOrigin, StopHookKind};
+    use super::{SteeringBoundary, transitions::ContextTrigger};
 
-    let mut stack = info_span!("agent.execution.driver_create").in_scope(|| {
-        config
-            .create_driver()
-            .begin_turn(&TurnInfo::new(&env.session_id, session_mode))
-    });
+    fn label<'a>(value: impl Into<&'a str>) -> &'a str {
+        value.into()
+    }
 
-    // The run's history was loaded when the run was set up (`History::load`)
-    // and holds the prompt of this run.
-    debug!(
-        "Session {}: state machine starts with {} messages, cancelled={}",
-        env.session_id,
-        turn.history.as_slice().len(),
-        env.cancellation_token.is_cancelled()
-    );
-    turn.stats = crate::middleware::AgentStats {
-        turns: turn.history.user_turns(),
-        ..Default::default()
-    };
-
-    let llm_config = env
-        .llm_config()
-        .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
-
-    debug!(
-        "Session {}: llm_config provider={} model={}",
-        env.session_id, llm_config.provider, llm_config.model
-    );
-
-    // Builds the provider for the turn on first use, so this is where cold-start cost lands.
-    turn.profile = env
-        .session_handle
-        .profile()
-        .instrument(info_span!("agent.execution.profile"))
-        .await;
-
-    let mut event_rx = config.event_sink.fanout().subscribe();
-
-    let started = {
-        let mut cx = turn.hook_cx(env);
-        stack
-            .turn_start(&mut cx, &env.cancellation_token)
-            .instrument(debug_span!(
-                "agent.execution.middleware.turn_start",
-                session_id = %env.session_id
-            ))
-            .await
-            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-    };
-    let mut state = step_state(started);
-
-    debug!(
-        "Session {}: run_turn_start done, state={}, cancelled={}",
-        env.session_id,
-        state.name(),
-        env.cancellation_token.is_cancelled()
-    );
-
-    loop {
-        if env.cancellation_token.is_cancelled()
-            && !matches!(state, ExecutionState::ProcessingToolCalls { .. })
-        {
-            info!("Session {}: CANCELLED at loop top", env.session_id);
-            return Ok(CycleOutcome::Cancelled);
-        }
-
-        let state_name = state.name();
-        trace!(
-            "State machine iteration: {} for session {}",
-            state_name, env.session_id
+    #[test]
+    fn wire_labels_are_unchanged() {
+        assert_eq!(
+            [
+                label(SteeringBoundary::NextRequest),
+                label(SteeringBoundary::ToolBatch),
+                label(SteeringBoundary::RunEnd),
+            ],
+            [
+                "before_model_request",
+                "before_tool_batch",
+                "before_completion"
+            ]
         );
-
-        state = match state {
-            ExecutionState::BeforeLlmCall => {
-                // Everything from here to request dispatch is agent overhead, not model time.
-                let step_started = std::time::Instant::now();
-                env.report_phase(crate::agent::turn_control::RunPhase::Model);
-                wait::reconcile_suspended_delegations(config, env, turn, &mut event_rx).await?;
-                apply_pending_steering(config, env, turn, "before_model_request", false).await?;
-                let steps = turn.stats.steps;
-                let checkpoint_due = crate::agent::objective::progress_review_due(
-                    steps,
-                    turn.budgets.last_objective_checkpoint_step(),
-                );
-                if checkpoint_due {
-                    turn.budgets.set_last_objective_checkpoint_step(steps);
-                    // Stored as a notice whether or not the objective is sent.
-                    queue_progress_review(turn);
-                    config.emit_event(
-                        &env.session_id,
-                        AgentEventKind::ObjectiveCheckpoint {
-                            run_id: env.turn_id().to_string(),
-                            reason: "periodic_progress_review".to_string(),
-                            action: "review_progress".to_string(),
-                            objective_revision: turn.run_objective.as_ref().map(|o| o.revision),
-                            current_task_id: turn
-                                .state
-                                .active_task
-                                .as_ref()
-                                .map(|t| t.public_id.clone()),
-                            current_task_revision: turn
-                                .state
-                                .active_task
-                                .as_ref()
-                                .map(|t| t.revision),
-                        },
-                    );
-                }
-                // Price limits read this cycle's committed accounting, which
-                // includes cache and auxiliary (compaction/summary) attempts
-                // that settled since the last main response.
-                let totals = env.cycle_accounting.cycle_totals();
-                warn_incomplete_budget(config, env, turn, &totals);
-                turn.stats.apply_recorded_costs(&totals);
-                let stepped = {
-                    let mut cx = turn.hook_cx(env);
-                    stack
-                        .step_start(&mut cx, &env.cancellation_token)
-                        .instrument(debug_span!(
-                            "agent.execution.middleware.step_start",
-                            session_id = %env.session_id
-                        ))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-                };
-                match step_state(stepped) {
-                    ExecutionState::BeforeLlmCall => {
-                        // Middleware queued its notices during step start; store
-                        // them now, after any tool results and before the request.
-                        let next = prepare_model_request(config, env, turn).await?;
-                        crate::agent::utils::llm_metrics::step_overhead(
-                            "pre_request",
-                            step_started.elapsed().as_secs_f64(),
-                            crate::agent::utils::genai::provider_name(env.provider_name()),
-                            env.model_name(),
-                        );
-                        next
-                    }
-                    other => other,
-                }
-            }
-
-            ExecutionState::CallLlm { ref request } => {
-                // The tools the model can call, not the request's tool list:
-                // a tool change in the messages adds to or removes from that.
-                turn.budgets
-                    .note_llm_request(has_effective_task_completion_tool(&request.offered_tools));
-                let span = tracing::Span::current();
-                span.record("llm_request_count", u64::from(turn.budgets.llm_requests()));
-                span.record(
-                    "completion_guard_available",
-                    turn.budgets.task_completion_tool_available(),
-                );
-                transitions::transition_call_llm(config, request, env, turn).await?
-            }
-
-            ExecutionState::AfterLlm { response } => {
-                let reviewed = {
-                    let mut cx = turn.hook_cx(env);
-                    stack
-                        .after_llm(&mut cx, &response, &env.cancellation_token)
-                        .instrument(debug_span!(
-                            "agent.execution.middleware.after_llm",
-                            session_id = %env.session_id
-                        ))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-                };
-                match reviewed {
-                    Folded::Cancelled => ExecutionState::Cancelled,
-                    Folded::Decided(ReplyVerdict::Proceed) => {
-                        transitions::transition_after_llm(config, &response, env, turn).await?
-                    }
-                    Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop),
-                    Folded::Decided(ReplyVerdict::Retry) => {
-                        // The discarded reply was billed: its usage counts.
-                        crate::middleware::apply_usage_to_stats(
-                            &mut turn.stats,
-                            response.usage.as_ref(),
-                        );
-                        ExecutionState::BeforeLlmCall
-                    }
-                }
-            }
-
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-            } => {
-                env.report_phase(crate::agent::turn_control::RunPhase::Tools);
-                let steering = if results.is_empty() {
-                    drain_steering(env, "before_tool_batch", false).await
-                } else {
-                    DrainedSteering::none()
-                };
-                if !steering.is_empty() {
-                    // Steering arrived before the batch started: every call is
-                    // skipped, and the skipped results are stored directly
-                    // after the assistant message, before the steering.
-                    let skipped = remaining_calls
-                        .iter()
-                        .map(|call| {
-                            crate::middleware::ToolResult::new(
-                                call.id.clone(),
-                                vec![querymt::chat::ToolResultPart::Text {
-                                    text: "Skipped because new user steering was received"
-                                        .to_string(),
-                                }],
-                                true,
-                                Some(call.function.name.clone()),
-                                Some(call.function.arguments.clone()),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let next = transitions::transition_processing_tool_calls(
-                        config,
-                        &mut stack,
-                        &Arc::from(Vec::new().into_boxed_slice()),
-                        &Arc::from(skipped.into_boxed_slice()),
-                        env,
-                        turn,
-                        steering,
-                    )
-                    .await?;
-                    state = next;
-                    continue;
-                }
-                transitions::transition_processing_tool_calls(
-                    config,
-                    &mut stack,
-                    &remaining_calls,
-                    &results,
-                    env,
-                    turn,
-                    DrainedSteering::none(),
-                )
-                .await?
-            }
-
-            ExecutionState::WaitingForEvent { ref wait } => {
-                env.report_phase(crate::agent::turn_control::RunPhase::Waiting);
-                wait::transition_waiting_for_event(config, wait, env, turn, &mut event_rx).await?
-            }
-
-            ExecutionState::Complete => {
-                env.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                turn.last_applied = querymt::chat::GenerationOptions::NONE;
-                if apply_pending_steering(config, env, turn, "before_completion", true).await? {
-                    state = ExecutionState::BeforeLlmCall;
-                    continue;
-                }
-                let ended = {
-                    let mut cx = turn.hook_cx(env);
-                    stack
-                        .turn_end(&mut cx, &env.cancellation_token)
-                        .instrument(debug_span!(
-                            "agent.execution.middleware.turn_end",
-                            session_id = %env.session_id
-                        ))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-                };
-
-                match ended {
-                    Folded::Cancelled => ExecutionState::Cancelled,
-                    Folded::Decided(EndVerdict::Continue) => ExecutionState::BeforeLlmCall,
-                    Folded::Decided(EndVerdict::Stop(stop)) => {
-                        info!(
-                            "Turn-end middleware stopped: {} ({:?})",
-                            stop.message, stop.stop_type
-                        );
-                        stopped_state(stop)
-                    }
-                    Folded::Decided(EndVerdict::Finish) => {
-                        debug!("State machine reached Complete state");
-
-                        let stop_hook = run_stop_hook(config, env, "EndTurn").await?;
-                        if stop_hook.should_continue {
-                            let max_stop_hook_continuations =
-                                config.execution_policy.max_stop_hook_continuations;
-                            if turn
-                                .budgets
-                                .stop_hook_continuations(turn::StopHookKind::EndTurn)
-                                >= max_stop_hook_continuations
-                            {
-                                emit_stop_hook_cap_notice(
-                                    config,
-                                    env,
-                                    "EndTurn",
-                                    max_stop_hook_continuations,
-                                );
-                            } else {
-                                turn.budgets
-                                    .note_stop_hook_continuation(turn::StopHookKind::EndTurn);
-                                let message = format_stop_hook_continuation_message(
-                                    stop_hook.stop_reason.or(stop_hook.block_reason),
-                                    &stop_hook.additional_contexts,
-                                );
-                                turn.queue_notice(
-                                    querymt_agent_core::model::NoticeSource::StopHook,
-                                    message,
-                                );
-                                state = ExecutionState::BeforeLlmCall;
-                                continue;
-                            }
-                        }
-
-                        if config.execution_policy.task_completion_guard
-                            && turn.budgets.task_completion_tool_available()
-                            && let Some(task) = turn.state.active_task.as_ref()
-                            && task.status == crate::session::domain::TaskStatus::Active
-                            && task.kind == crate::session::domain::TaskKind::Finite
-                        {
-                            if turn.budgets.completion_guard_continuations() == 0 {
-                                turn.budgets.note_completion_guard_continuation();
-                                tracing::Span::current().record(
-                                    "completion_guard_continuations",
-                                    u64::from(turn.budgets.completion_guard_continuations()),
-                                );
-                                config.emit_event(
-                                    &env.session_id,
-                                    AgentEventKind::TaskCompletionGuardTriggered {
-                                        run_id: env.turn_id().to_string(),
-                                        task_id: task.public_id.clone(),
-                                    },
-                                );
-                                turn.queue_notice(
-                                    querymt_agent_core::model::NoticeSource::TaskCompletion,
-                                    "<system-reminder>\nThe current finite task remains active. Continue the work and call complete_task with concrete evidence when it is done, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
-                                );
-                                state = ExecutionState::BeforeLlmCall;
-                                continue;
-                            }
-                            config.emit_event(
-                                &env.session_id,
-                                AgentEventKind::TaskCompletionGuardExhausted {
-                                    run_id: env.turn_id().to_string(),
-                                    task_id: task.public_id.clone(),
-                                },
-                            );
-                        }
-
-                        if config.execution_policy.pruning.enabled
-                            && let Err(e) = maintenance::run_pruning(config, env).await
-                        {
-                            warn!("Pruning failed: {}", e);
-                        }
-
-                        return Ok(CycleOutcome::Completed);
-                    }
-                }
-            }
-
-            ExecutionState::Stopped {
-                ref message,
-                stop_type,
-            } => {
-                info!("State machine stopped: {} ({:?})", message, stop_type);
-
-                if stop_type == StopType::ContextThreshold
-                    && config.execution_policy.compaction.auto
-                {
-                    turn.budgets.mark_automatic_compaction()?;
-                    info!("Context threshold reached, triggering AI compaction");
-
-                    match maintenance::run_ai_compaction(config, env, turn).await {
-                        Ok(new_state) => {
-                            state = new_state;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!("AI compaction failed: {}", e);
-                        }
-                    }
-                }
-
-                // Give middleware the chance to replace the stop with a
-                // continuation. The per-turn guard bounds any recovery loop.
-                let max_recoveries = config.execution_policy.max_stop_recoveries;
-                if turn.budgets.stop_recoveries() >= max_recoveries {
-                    warn!(
-                        "Session {}: stop recovery limit ({}) reached; publishing stop",
-                        env.session_id, max_recoveries
-                    );
-                } else {
-                    let stop = Stop::new(stop_type, message.clone());
-                    let recovered = {
-                        let mut cx = turn.hook_cx(env);
-                        stack
-                            .stopped(&mut cx, &stop, &env.cancellation_token)
-                            .instrument(info_span!(
-                                "agent.execution.middleware.stopped",
-                                session_id = %env.session_id
-                            ))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-                    };
-                    match recovered {
-                        Folded::Cancelled => return Ok(CycleOutcome::Cancelled),
-                        Folded::Decided(StopVerdict::Recover) => {
-                            turn.budgets.note_stop_recovery();
-                            debug!(
-                                "Session {}: stop recovered by middleware ({}/{})",
-                                env.session_id,
-                                turn.budgets.stop_recoveries(),
-                                max_recoveries
-                            );
-                            state = ExecutionState::BeforeLlmCall;
-                            continue;
-                        }
-                        // Nobody recovered: the stop goes on to publication
-                        // unchanged (the stack dropped what was queued).
-                        Folded::Decided(StopVerdict::Pass) => {}
-                    }
-                }
-                // A token-limit stop that middleware could not recover still
-                // gives Stop hooks a say, so unattended loops can carry on.
-                if stop_type == StopType::ModelTokenLimit {
-                    let stop_hook = run_stop_hook(config, env, "ModelTokenLimit").await?;
-                    if stop_hook.should_continue {
-                        let max = config.execution_policy.max_stop_hook_continuations;
-                        if turn
-                            .budgets
-                            .stop_hook_continuations(turn::StopHookKind::ModelTokenLimit)
-                            >= max
-                        {
-                            emit_stop_hook_cap_notice(config, env, "ModelTokenLimit", max);
-                        } else {
-                            turn.budgets
-                                .note_stop_hook_continuation(turn::StopHookKind::ModelTokenLimit);
-                            let message = format_stop_hook_continuation_message(
-                                stop_hook.stop_reason.or(stop_hook.block_reason),
-                                &stop_hook.additional_contexts,
-                            );
-                            turn.queue_notice(
-                                querymt_agent_core::model::NoticeSource::StopHook,
-                                message,
-                            );
-                            state = ExecutionState::BeforeLlmCall;
-                            continue;
-                        }
-                    }
-                }
-
-                let metrics = ExecutionMetrics {
-                    steps: u32_from_usize(turn.stats.steps, "stats.steps", Some(&env.session_id)),
-                    turns: u32_from_usize(turn.stats.turns, "stats.turns", Some(&env.session_id)),
-                };
-
-                config.emit_event(
-                    &env.session_id,
-                    AgentEventKind::MiddlewareStopped {
-                        stop_type,
-                        reason: message.to_string(),
-                        metrics,
-                    },
-                );
-
-                return Ok(CycleOutcome::Stopped {
-                    stop_reason: StopReason::from(stop_type),
-                    stop_type,
-                    reason: message.to_string(),
-                });
-            }
-
-            ExecutionState::Cancelled => {
-                debug!("State machine cancelled");
-                return Ok(CycleOutcome::Cancelled);
-            }
-        };
+        assert_eq!(
+            [
+                label(ContextTrigger::AfterToolBatch),
+                label(ContextTrigger::UserPrompt)
+            ],
+            ["after_tool_batch", "user_prompt"]
+        );
+        assert_eq!(
+            [
+                label(StopHookKind::EndTurn),
+                label(StopHookKind::ModelTokenLimit)
+            ],
+            ["EndTurn", "ModelTokenLimit"]
+        );
+        assert_eq!(
+            [
+                label(&ExecutionOrigin::Interactive),
+                label(&ExecutionOrigin::Scheduled {
+                    schedule_public_id: String::new(),
+                    task_public_id: String::new(),
+                }),
+            ],
+            ["interactive", "scheduled"]
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::SteeringBoundary;
     use super::turn::Turn;
+    use super::{Stage, Step};
     use super::{
         apply_pending_steering, drain_steering, format_stop_hook_continuation_message,
         has_effective_task_completion_tool,
@@ -1186,7 +756,7 @@ mod tests {
             &fixture.config,
             &env,
             &mut turn,
-            "before_model_request",
+            SteeringBoundary::NextRequest,
             false,
         )
         .await
@@ -1345,7 +915,7 @@ mod tests {
             .commit(&env.session_handle, vec![calls])
             .await
             .unwrap();
-        let drained = drain_steering(&env, "before_tool_batch", false).await;
+        let drained = drain_steering(&env, SteeringBoundary::ToolBatch, false).await;
         assert!(!drained.is_empty());
         let results = Arc::from(vec![crate::middleware::ToolResult::new(
             "call-1".into(),
@@ -1368,7 +938,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(next, crate::middleware::ExecutionState::BeforeLlmCall),
+            matches!(next, Stage::BeforeRequest),
             "expected another model request"
         );
         // The run holds the stored order: the call, its results, then the steering.
@@ -1582,17 +1152,18 @@ mod tests {
             .commit(&env.session_handle, vec![user])
             .await
             .unwrap();
-        let request_tail = |state: crate::middleware::ExecutionState| match state {
-            crate::middleware::ExecutionState::CallLlm { request } => request
+        let request_tail = |state: Step| match state {
+            Step::Continue(Stage::CallModel(request)) => request
                 .messages
                 .last()
                 .map(|message| (request.messages.len(), message.text())),
-            other => panic!("expected a prepared request, got {}", other.name()),
+            other => panic!("expected a prepared request, got {other:?}"),
         };
 
         // Default configuration: nothing is attached to the request.
         assert!(!fixture.config.execution_policy.run_objective);
-        let off = super::prepare_model_request(&fixture.config, &env, &mut turn)
+        let provider = env.provider_for_test().await;
+        let off = super::prepare_model_request(&fixture.config, &env, &mut turn, &provider)
             .await
             .unwrap();
         let (off_len, _) = request_tail(off).expect("a request");
@@ -1602,7 +1173,7 @@ mod tests {
         // the durable messages are untouched.
         let mut config = (*fixture.config).clone();
         config.execution_policy.run_objective = true;
-        let on = super::prepare_model_request(&config, &env, &mut turn)
+        let on = super::prepare_model_request(&config, &env, &mut turn, &provider)
             .await
             .unwrap();
         let (on_len, tail) = request_tail(on).expect("a request");
@@ -1638,7 +1209,7 @@ mod tests {
             &fixture.config,
             &env,
             &mut turn,
-            "before_model_request",
+            SteeringBoundary::NextRequest,
             false,
         )
         .await

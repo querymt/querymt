@@ -11,7 +11,7 @@ use crate::agent::core::McpToolState;
 use crate::hooks::{HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig};
 use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, HookCx, Middleware, PreparedBatch,
-    PreparedCallVerdict, StepVerdict, TurnInfo, TurnMiddleware,
+    PreparedCallVerdict, ReplyVerdict, StepVerdict, TurnInfo, TurnMiddleware,
 };
 use crate::session::provider::SessionProvider;
 use crate::test_utils::{Act, ScriptedMiddleware, UndoTestFixture, mock_querymt_tool_call};
@@ -994,4 +994,385 @@ async fn history_in_the_old_steering_order_still_loads() {
     assert!(request[1].has_tool_use());
     assert!(request[2].has_tool_result());
     assert!(request[2].text().contains("use another file name"));
+}
+
+/// The provider is resolved when the run starts, after the user's prompt is
+/// stored: a provider that cannot be built fails the run with a provider
+/// failure, and the prompt is still in the session's history.
+#[tokio::test]
+async fn provider_failure_at_run_start_is_reported_after_the_prompt_is_stored() {
+    use crate::send_agent::SendAgent;
+    use agent_client_protocol::ErrorCode;
+
+    let fixture = UndoTestFixture::with_factory(
+        Arc::new(crate::test_utils::UnbuildableProviderFactory),
+        None,
+        vec![],
+    )
+    .await
+    .expect("fixture");
+    let store = fixture.storage.session_store();
+    let cwd = fixture.worktree.path().to_path_buf();
+    let session = store
+        .create_session(None, Some(cwd.clone()), None, None)
+        .await
+        .expect("session")
+        .public_id;
+    let llm_config = store
+        .create_or_get_llm_config(
+            &querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .await
+        .expect("llm config");
+    store
+        .set_session_llm_config(&session, llm_config.id)
+        .await
+        .expect("bind llm config");
+    fixture
+        .register_session_actor_with_mcp(&session, &cwd, McpToolState::empty())
+        .await;
+
+    let request = crate::acp::protocol::PromptRequest::new(
+        session.clone(),
+        vec![crate::acp::protocol::ContentBlock::Text(
+            crate::acp::protocol::TextContent::new("hello"),
+        )],
+    );
+    let error = SendAgent::prompt(&fixture.handle, request)
+        .await
+        .expect_err("a provider that cannot be built fails the run");
+
+    // The structured provider failure reaches the client, not a plain
+    // internal error.
+    assert_eq!(error.code, ErrorCode::new(-32010), "{error:?}");
+    let history = store.get_history(&session).await.expect("history");
+    let prompts: Vec<_> = history
+        .iter()
+        .filter(|message| message.role == ChatRole::User)
+        .collect();
+    assert_eq!(prompts.len(), 1, "the prompt was stored: {history:?}");
+}
+
+// ---- a run that panics ----
+
+/// The `outcome` of every `RunCompleted` of `session`, in order, once `count`
+/// of them were published.
+async fn run_outcomes(
+    events: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    session: &str,
+    count: usize,
+) -> Vec<String> {
+    use querymt_agent_core::events::AgentEventKind;
+
+    let mut outcomes = Vec::new();
+    let wait = async {
+        while outcomes.len() < count {
+            let envelope = events.recv().await.expect("event stream");
+            if envelope.session_id() == session
+                && let AgentEventKind::RunCompleted { outcome, .. } = envelope.kind()
+            {
+                outcomes.push(outcome.clone());
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .unwrap_or_else(|_| panic!("timed out; saw {outcomes:?}"));
+    outcomes
+}
+
+/// A run whose middleware panics at its start.
+async fn run_that_panics_once() -> Run {
+    let panics_once =
+        ScriptedMiddleware::default().turn_start([Act::Panic, Act::Say(StepVerdict::Proceed)]);
+    Run::new(
+        ScriptedProvider::new(false, |_| done(10)),
+        Setup {
+            middleware: vec![Arc::new(panics_once)],
+            ..Setup::default()
+        },
+    )
+    .await
+}
+
+/// A panic is the run's failure: the client gets an error, the run is closed
+/// as failed, and the session takes the next prompt.
+#[tokio::test]
+async fn a_panicking_run_fails_and_the_session_takes_the_next_prompt() {
+    let run = run_that_panics_once().await;
+    let mut events = run.fixture.handle.config.subscribe_events();
+
+    let error = run
+        .fixture
+        .prompt(&run.session, "boom")
+        .await
+        .expect_err("a panicking run fails its prompt");
+    assert!(format!("{error:#}").contains("run panicked"), "{error:#}");
+    assert!(
+        !format!("{error:#}").contains("dropped"),
+        "the run was not lost: {error:#}"
+    );
+    assert_eq!(run_outcomes(&mut events, &run.session, 1).await, ["failed"]);
+
+    // The slot is free again: a second prompt runs to completion.
+    run.prompt("after").await;
+    assert_eq!(run.provider.seen().len(), 1, "one model request, by run 2");
+}
+
+/// A prompt queued behind the run that panics starts when it is closed.
+#[tokio::test]
+async fn a_panicking_run_hands_over_to_the_queued_prompt() {
+    use crate::send_agent::SendAgent;
+
+    use querymt_agent_core::events::AgentEventKind;
+
+    // The first run is held at its start until the second prompt is queued
+    // behind it, then released to panic.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let panics_once = ScriptedMiddleware::default().turn_start([
+        Act::PanicAfter(gate.clone()),
+        Act::Say(StepVerdict::Proceed),
+    ]);
+    let run = Run::new(
+        ScriptedProvider::new(false, |_| done(10)),
+        Setup {
+            middleware: vec![Arc::new(panics_once)],
+            ..Setup::default()
+        },
+    )
+    .await;
+    let mut events = run.fixture.handle.config.subscribe_events();
+    let request = |text: &str| {
+        crate::acp::protocol::PromptRequest::new(
+            run.session.clone(),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        )
+    };
+
+    let release_once_queued = async {
+        while let Ok(envelope) = events.recv().await {
+            if envelope.session_id() == run.session
+                && matches!(envelope.kind(), AgentEventKind::InputQueued { .. })
+            {
+                gate.notify_one();
+                return;
+            }
+        }
+        panic!("the event stream ended before a prompt was queued");
+    };
+    let (first, second, ()) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::join!(
+            SendAgent::prompt(&run.fixture.handle, request("boom")),
+            SendAgent::prompt(&run.fixture.handle, request("queued")),
+            release_once_queued,
+        )
+    })
+    .await
+    .expect("both prompts finish: the queued one is started when the run fails");
+
+    let results = [first.is_ok(), second.is_ok()];
+    assert_eq!(
+        results.iter().filter(|ok| **ok).count(),
+        1,
+        "one run panicked and one completed: {first:?} {second:?}"
+    );
+    assert_eq!(
+        run.provider.seen().len(),
+        1,
+        "the queued prompt made the one model request"
+    );
+}
+
+/// A run that changed files and then panicked still records its workspace
+/// changes, so the turn can be undone.
+#[tokio::test]
+async fn a_panicking_run_still_records_its_workspace_changes() {
+    use querymt_agent_core::model::MessagePart;
+
+    // The first reply writes a file; the panic comes after the second reply.
+    let panics_later =
+        ScriptedMiddleware::default().after_llm([Act::Say(ReplyVerdict::Proceed), Act::Panic]);
+    let run = Run::new(
+        ScriptedProvider::new(false, |index| match index {
+            0 => write_call(0, 10),
+            _ => done(10),
+        }),
+        Setup {
+            middleware: vec![Arc::new(panics_later)],
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    let error = run
+        .fixture
+        .prompt(&run.session, "write then panic")
+        .await
+        .expect_err("the run panics");
+    assert!(format!("{error:#}").contains("run panicked"), "{error:#}");
+    assert!(run.fixture.worktree.path().join("step-0.txt").exists());
+
+    let patches: Vec<Vec<String>> = run
+        .stored()
+        .await
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            MessagePart::TurnSnapshotPatch { changed_paths, .. } => Some(changed_paths.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(patches.len(), 1, "one patch for the turn: {patches:?}");
+    assert!(
+        patches[0].iter().any(|path| path.ends_with("step-0.txt")),
+        "the patch lists the written file: {patches:?}"
+    );
+}
+
+/// Steering that a failed run accepted but did not apply is discarded, not
+/// left without a terminal event.
+#[tokio::test]
+async fn steering_a_failed_run_did_not_apply_is_discarded() {
+    use querymt_agent_core::events::AgentEventKind;
+
+    // The reply is followed by a panic before the run's next steering boundary.
+    let panics = ScriptedMiddleware::default().after_llm([Act::Panic]);
+    let run = Run::new(
+        ScriptedProvider::new(false, |_| done(10)),
+        Setup {
+            middleware: vec![Arc::new(panics)],
+            ..Setup::default()
+        },
+    )
+    .await;
+    run.steer_at_request(0, "too late").await;
+    let mut events = run.fixture.handle.config.subscribe_events();
+
+    run.fixture
+        .prompt(&run.session, "boom")
+        .await
+        .expect_err("the run panics");
+
+    let mut accepted = Vec::new();
+    let mut terminal = Vec::new();
+    let mut run_completed = false;
+    let drain = async {
+        while !run_completed {
+            let envelope = events.recv().await.expect("event stream");
+            if envelope.session_id() != run.session {
+                continue;
+            }
+            match envelope.kind() {
+                AgentEventKind::SteeringAccepted { input_id, .. } => {
+                    accepted.push(input_id.clone())
+                }
+                AgentEventKind::SteeringApplied { input_id, .. } => {
+                    terminal.push((input_id.clone(), "applied".to_string()))
+                }
+                AgentEventKind::SteeringDiscarded {
+                    input_id, reason, ..
+                } => terminal.push((input_id.clone(), reason.clone())),
+                AgentEventKind::RunCompleted { .. } => run_completed = true,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+        .await
+        .expect("the run completes");
+
+    assert_eq!(accepted.len(), 1, "one steering input was accepted");
+    assert_eq!(
+        terminal,
+        [(accepted[0].clone(), "run_failed".to_string())],
+        "the accepted input ends with exactly one terminal event"
+    );
+}
+
+/// A scheduled run reports a panic like any failure: the scheduler is told,
+/// and the run is closed.
+#[tokio::test]
+async fn a_panicking_scheduled_run_emits_scheduled_failed() {
+    use querymt_agent_core::events::AgentEventKind;
+
+    let run = run_that_panics_once().await;
+    // A scheduled run needs the active task it was fired for.
+    let store = run.fixture.storage.session_store();
+    let internal_id = store
+        .get_session(&run.session)
+        .await
+        .expect("session lookup")
+        .expect("session exists")
+        .id;
+    let now = time::OffsetDateTime::now_utc();
+    store
+        .create_task(crate::session::domain::Task {
+            id: 0,
+            public_id: "task-1".into(),
+            session_id: internal_id,
+            kind: crate::session::domain::TaskKind::Recurring,
+            status: crate::session::domain::TaskStatus::Active,
+            expected_deliverable: Some("scheduled work".into()),
+            acceptance_criteria: None,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("task is created");
+    let mut events = run.fixture.handle.config.subscribe_events();
+    let actor = run
+        .fixture
+        .handle
+        .session_ref_for_agent_session(&run.session)
+        .await
+        .expect("session actor");
+
+    let cycle_run = querymt_agent_core::model::TurnId::new();
+    actor
+        .tell_scheduled_prompt(crate::agent::messages::ScheduledPrompt {
+            schedule_public_id: "schedule-1".into(),
+            turn_id: cycle_run,
+            task_public_id: "task-1".into(),
+            prompt_text: "scheduled work".into(),
+            execution_limits: None,
+        })
+        .await
+        .expect("scheduled prompt is accepted");
+
+    let mut failure = None;
+    let wait = async {
+        loop {
+            let envelope = events.recv().await.expect("event stream");
+            if envelope.session_id() != run.session {
+                continue;
+            }
+            if let AgentEventKind::ScheduledExecutionFailed {
+                schedule_public_id,
+                turn_id,
+                error,
+            } = envelope.kind()
+            {
+                failure = Some((schedule_public_id.clone(), turn_id.clone(), error.clone()));
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("a scheduled failure is published");
+    let (schedule, turn_id, error) = failure.unwrap();
+    assert_eq!(schedule, "schedule-1");
+    // The failure names the run the scheduler fired, so it cannot be taken
+    // for the outcome of another cycle.
+    assert_eq!(turn_id, Some(cycle_run.to_string()));
+    assert!(error.contains("run panicked"), "{error}");
+    assert_eq!(run_outcomes(&mut events, &run.session, 1).await, ["failed"]);
 }

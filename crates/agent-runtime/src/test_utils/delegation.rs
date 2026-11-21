@@ -238,7 +238,7 @@ impl TestHarness {
         self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
             .await
             .expect("history loads");
-        crate::agent::execution::execute_cycle_state_machine(
+        crate::agent::execution::run_turn(
             &self.config,
             &self.env,
             &mut self.turn,

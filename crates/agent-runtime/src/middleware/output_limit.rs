@@ -357,7 +357,9 @@ impl MiddlewareFactory for OutputLimitRecoveryFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{ExecutionState, TurnStack};
+    use crate::agent::execution::{Stage, Step};
+    use crate::middleware::Stop;
+    use crate::middleware::TurnStack;
     use crate::test_utils::HookRig;
     use serde_json::json;
 
@@ -384,15 +386,15 @@ mod tests {
             }
         }
 
-        async fn on_after_llm(&mut self, response: Arc<LlmResponse>) -> Result<ExecutionState> {
+        async fn on_after_llm(&mut self, response: Box<LlmResponse>) -> Result<Step> {
             self.rig.after_llm(&mut self.stack, response).await
         }
 
-        async fn on_step_start(&mut self) -> Result<ExecutionState> {
+        async fn on_step_start(&mut self) -> Result<Step> {
             self.rig.step_start(&mut self.stack).await
         }
 
-        async fn on_stopped(&mut self, stop_type: StopType) -> Result<ExecutionState> {
+        async fn on_stopped(&mut self, stop_type: StopType) -> Result<Step> {
             self.rig
                 .stopped(&mut self.stack, stop_type, "cut off")
                 .await
@@ -466,8 +468,8 @@ mod tests {
         })
     }
 
-    fn reply(finish: FinishReason) -> Arc<LlmResponse> {
-        Arc::new(LlmResponse::new(
+    fn reply(finish: FinishReason) -> Box<LlmResponse> {
+        Box::new(LlmResponse::new(
             "partial".into(),
             Vec::new(),
             Some(querymt::Usage {
@@ -482,11 +484,7 @@ mod tests {
         ))
     }
 
-    async fn after_llm(
-        mw: &mut Run,
-        finish: FinishReason,
-        profile: &Arc<ModelProfile>,
-    ) -> ExecutionState {
+    async fn after_llm(mw: &mut Run, finish: FinishReason, profile: &Arc<ModelProfile>) -> Step {
         mw.rig.profile = profile.clone();
         mw.on_after_llm(reply(finish)).await.unwrap()
     }
@@ -533,9 +531,8 @@ mod tests {
         let state = after_llm(&mut mw, FinishReason::Length, &runtime).await;
 
         assert!(
-            matches!(state, ExecutionState::BeforeLlmCall),
-            "expected BeforeLlmCall, got {}",
-            state.name()
+            matches!(state, Step::Continue(Stage::BeforeRequest)),
+            "expected BeforeLlmCall, got {state:?}"
         );
         assert_eq!(mw.rig.overrides.max_tokens, Some(128_000));
         assert_eq!(mw.rig.stats.total_output_tokens, 32_000);
@@ -546,8 +543,8 @@ mod tests {
     async fn step_start(mw: &mut Run, profile: &Arc<ModelProfile>) -> GenerationOptions {
         mw.rig.profile = profile.clone();
         match mw.on_step_start().await.unwrap() {
-            ExecutionState::BeforeLlmCall => mw.rig.overrides,
-            other => panic!("expected BeforeLlmCall, got {}", other.name()),
+            Step::Continue(Stage::BeforeRequest) => mw.rig.overrides,
+            other => panic!("expected BeforeLlmCall, got {other:?}"),
         }
     }
 
@@ -559,21 +556,21 @@ mod tests {
         let fresh = step_start(&mut mw, &profile).await;
         assert_eq!(fresh.max_tokens, None);
 
-        after_llm(&mut mw, FinishReason::Length, &profile).await;
+        let _ = after_llm(&mut mw, FinishReason::Length, &profile).await;
         // A later tool-loop step starts without overrides.
         mw.consume_request_overrides();
         let next = step_start(&mut mw, &profile).await;
         assert_eq!(next.max_tokens, Some(128_000));
 
         // A cut-off of that step can't escalate again: it goes to continuation.
-        let response = Arc::new(
+        let response = Box::new(
             (*reply(FinishReason::Length))
                 .clone()
                 .with_applied(GenerationOptions::NONE.with_max_tokens(128_000)),
         );
         assert!(matches!(
             mw.on_after_llm(response).await.unwrap(),
-            ExecutionState::AfterLlm { .. }
+            Step::Continue(Stage::AfterReply(_))
         ));
     }
 
@@ -581,7 +578,7 @@ mod tests {
     async fn explicit_cap_override_wins_over_the_escalated_cap() {
         let mut mw = Run::default();
         let profile = profile_for(32_000, 128_000);
-        after_llm(&mut mw, FinishReason::Length, &profile).await;
+        let _ = after_llm(&mut mw, FinishReason::Length, &profile).await;
         mw.consume_request_overrides();
         // Another middleware set an explicit cap for this request.
         mw.rig.overrides = GenerationOptions::NONE.with_max_tokens(1_000);
@@ -592,7 +589,7 @@ mod tests {
     async fn next_run_starts_at_the_initial_cap() {
         let mut mw = Run::default();
         let profile = profile_for(32_000, 128_000);
-        after_llm(&mut mw, FinishReason::Length, &profile).await;
+        let _ = after_llm(&mut mw, FinishReason::Length, &profile).await;
 
         // The next run gets its own instance.
         let mut next_run = Run::default();
@@ -606,13 +603,13 @@ mod tests {
         let runtime = profile_for(32_000, 128_000);
         assert!(matches!(
             after_llm(&mut mw, FinishReason::Length, &runtime).await,
-            ExecutionState::BeforeLlmCall
+            Step::Continue(Stage::BeforeRequest)
         ));
 
         // Second cut-off in the same turn passes through to the normal path.
         assert!(matches!(
             after_llm(&mut mw, FinishReason::Length, &runtime).await,
-            ExecutionState::AfterLlm { .. }
+            Step::Continue(Stage::AfterReply(_))
         ));
     }
 
@@ -622,7 +619,7 @@ mod tests {
         let runtime = profile_for(128_000, 128_000);
         assert!(matches!(
             after_llm(&mut mw, FinishReason::Length, &runtime).await,
-            ExecutionState::AfterLlm { .. }
+            Step::Continue(Stage::AfterReply(_))
         ));
         // The escalation is still unspent, so later steps get no raised cap.
         mw.consume_request_overrides();
@@ -632,11 +629,7 @@ mod tests {
 
     // ── continuation (5.3) ──────────────────────────────────────────────
 
-    async fn stop(
-        mw: &mut Run,
-        profile: &Arc<ModelProfile>,
-        stop_type: StopType,
-    ) -> ExecutionState {
+    async fn stop(mw: &mut Run, profile: &Arc<ModelProfile>, stop_type: StopType) -> Step {
         stop_with(mw, profile, GenerationOptions::NONE, stop_type).await
     }
 
@@ -645,17 +638,16 @@ mod tests {
         profile: &Arc<ModelProfile>,
         applied: GenerationOptions,
         stop_type: StopType,
-    ) -> ExecutionState {
+    ) -> Step {
         mw.rig.profile = profile.clone();
         mw.rig.last_applied = applied;
         mw.on_stopped(stop_type).await.unwrap()
     }
 
-    fn recovered(state: ExecutionState) {
+    fn recovered(state: Step) {
         assert!(
-            matches!(state, ExecutionState::BeforeLlmCall),
-            "expected BeforeLlmCall, got {}",
-            state.name()
+            matches!(state, Step::Continue(Stage::BeforeRequest)),
+            "expected BeforeLlmCall, got {state:?}"
         );
     }
 
@@ -707,7 +699,7 @@ mod tests {
         let runtime = profile_for(128_000, 128_000);
         for stop_type in [StopType::ContextThreshold, StopType::ContentFilter] {
             let state = stop(&mut mw, &runtime, stop_type).await;
-            assert!(matches!(state, ExecutionState::Stopped { .. }));
+            assert!(matches!(state, Step::Continue(Stage::Stopping(_))));
         }
         // Nothing was spent: the one continuation is still available.
         recovered(stop(&mut mw, &runtime, StopType::ModelTokenLimit).await);
@@ -773,13 +765,14 @@ mod tests {
         let profile = profile_for(128_000, 128_000);
         for _ in 1..=2 {
             recovered(stop(&mut mw, &profile, StopType::ModelTokenLimit).await);
-            mw.on_after_llm(reply(FinishReason::ToolCalls))
+            let _ = mw
+                .on_after_llm(reply(FinishReason::ToolCalls))
                 .await
                 .unwrap();
         }
         assert!(matches!(
             stop(&mut mw, &profile, StopType::ModelTokenLimit).await,
-            ExecutionState::Stopped { .. }
+            Step::Continue(Stage::Stopping(_))
         ));
     }
 
@@ -788,7 +781,7 @@ mod tests {
         let mut mw = Run::default();
         let runtime = profile_for(32_000, 128_000);
         // Spend the escalation, then hit the ceiling and stop.
-        after_llm(&mut mw, FinishReason::Length, &runtime).await;
+        let _ = after_llm(&mut mw, FinishReason::Length, &runtime).await;
         let at_ceiling = GenerationOptions::NONE.with_max_tokens(128_000);
 
         recovered(stop_with(&mut mw, &runtime, at_ceiling, StopType::ModelTokenLimit).await);
@@ -803,14 +796,15 @@ mod tests {
         with_effort.reasoning_effort = Some(ReasoningEffort::High);
         let with_effort = Arc::new(with_effort);
         mw.rig.profile = with_effort.clone();
-        mw.on_after_llm(Arc::new(LlmResponse::new(
-            String::new(),
-            Vec::new(),
-            None,
-            Some(FinishReason::Length),
-        )))
-        .await
-        .unwrap();
+        let _ = mw
+            .on_after_llm(Box::new(LlmResponse::new(
+                String::new(),
+                Vec::new(),
+                None,
+                Some(FinishReason::Length),
+            )))
+            .await
+            .unwrap();
 
         mw.consume_request_overrides();
         recovered(stop(&mut mw, &with_effort, StopType::ModelTokenLimit).await);
@@ -832,7 +826,7 @@ mod tests {
         let mut mw = Run::default();
         let runtime = profile_for(128_000, 128_000);
         // `reply` carries text, so it is not thinking-only.
-        after_llm(&mut mw, FinishReason::Length, &runtime).await;
+        let _ = after_llm(&mut mw, FinishReason::Length, &runtime).await;
 
         mw.consume_request_overrides();
         recovered(stop(&mut mw, &runtime, StopType::ModelTokenLimit).await);
@@ -851,9 +845,8 @@ mod tests {
         let state = mw.on_after_llm(reply(FinishReason::Stop)).await.unwrap();
 
         assert!(
-            matches!(state, ExecutionState::AfterLlm { .. }),
-            "expected AfterLlm, got {}",
-            state.name()
+            matches!(state, Step::Continue(Stage::AfterReply(_))),
+            "expected AfterLlm, got {state:?}"
         );
         // Nothing removes or rewrites the notice, and no second copy appears.
         assert_eq!(mw.rig.pending, with_notice);
@@ -875,10 +868,10 @@ mod tests {
 
         assert!(matches!(
             state,
-            ExecutionState::Stopped {
+            Step::Continue(Stage::Stopping(Stop {
                 stop_type: StopType::ModelTokenLimit,
                 ..
-            }
+            }))
         ));
     }
 
@@ -916,13 +909,13 @@ mod tests {
     async fn escalation_publishes_a_durable_recovery_event() {
         let (mut mw, mut rx, _agent) = bound_middleware().await;
         let runtime = profile_for(32_000, 128_000);
-        let response = Arc::new(
+        let response = Box::new(
             LlmResponse::new(String::new(), Vec::new(), None, Some(FinishReason::Length))
                 .with_message_id("m-1".into()),
         );
         mw.rig.profile = runtime;
 
-        mw.on_after_llm(response).await.unwrap();
+        let _ = mw.on_after_llm(response).await.unwrap();
 
         let (kind, durable) = next_recovery(&mut rx).await;
         assert!(durable, "recovery events belong in the session journal");
@@ -983,8 +976,8 @@ mod tests {
         });
         capped.bind_agent(&agent.config.tool_registry, &agent.config.event_sink);
         let mut capped = Run::new(capped);
-        stop(&mut capped, &runtime, StopType::ModelTokenLimit).await;
-        after_llm(&mut capped, FinishReason::Stop, &runtime).await;
+        let _ = stop(&mut capped, &runtime, StopType::ModelTokenLimit).await;
+        let _ = after_llm(&mut capped, FinishReason::Stop, &runtime).await;
 
         let quiet = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             loop {
@@ -1006,7 +999,7 @@ mod tests {
         mw.rig.session_id = session_id.clone();
         mw.rig.profile = runtime;
 
-        mw.on_stopped(StopType::ModelTokenLimit).await.unwrap();
+        let _ = mw.on_stopped(StopType::ModelTokenLimit).await.unwrap();
 
         // Emission is detached from the caller, so wait for the journal write.
         let journal = agent.config.event_sink.journal().clone();
@@ -1055,13 +1048,13 @@ mod tests {
         }));
         assert!(matches!(
             after_llm(&mut off, FinishReason::Length, &runtime).await,
-            ExecutionState::AfterLlm { .. }
+            Step::Continue(Stage::AfterReply(_))
         ));
 
         let mut on = Run::default();
         assert!(matches!(
             after_llm(&mut on, FinishReason::Stop, &runtime).await,
-            ExecutionState::AfterLlm { .. }
+            Step::Continue(Stage::AfterReply(_))
         ));
     }
 }

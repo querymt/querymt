@@ -102,6 +102,10 @@ pub(crate) struct RunPhaseChanged {
 pub struct ScheduledPrompt {
     /// Public ID of the schedule that triggered this execution.
     pub schedule_public_id: String,
+    /// The id of the run this fires. The scheduler picks it so that it can
+    /// tell the cycle's terminal events from those of an earlier cycle of the
+    /// same schedule; the session uses it as the run's id.
+    pub turn_id: querymt_agent_core::model::TurnId,
     /// Public ID of the recurring task that triggered this execution.
     pub task_public_id: String,
     /// Prompt text derived from the task's `expected_deliverable`.

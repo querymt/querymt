@@ -1011,6 +1011,10 @@ impl SchedulerActor {
             return;
         }
 
+        // The cycle's run id. The session runs the prompt under it, and every
+        // terminal event of the cycle (its run's, or the timeout's) names it.
+        let turn_id = querymt_agent_core::model::TurnId::new();
+
         // Load the schedule to get session info and config
         let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
             Ok(Some(s)) => s,
@@ -1044,7 +1048,7 @@ impl SchedulerActor {
             // Fail the cycle — session not available
             self.handle_cycle_failed_inner(
                 schedule_public_id,
-                None,
+                Some(&turn_id.to_string()),
                 "session not found in registry",
             )
             .await;
@@ -1087,6 +1091,7 @@ impl SchedulerActor {
         // Send ScheduledPrompt to the SessionActor
         let scheduled_prompt = ScheduledPrompt {
             schedule_public_id: schedule_public_id.to_string(),
+            turn_id,
             task_public_id: schedule.task_public_id.clone(),
             prompt_text,
             execution_limits: schedule.config.execution_limits.clone(),
@@ -1107,7 +1112,7 @@ impl SchedulerActor {
                 );
                 self.handle_cycle_failed_inner(
                     schedule_public_id,
-                    None,
+                    Some(&turn_id.to_string()),
                     &format!("failed to send ScheduledPrompt: {}", e),
                 )
                 .await;
@@ -1129,7 +1134,7 @@ impl SchedulerActor {
             Duration::from_secs(max_runtime),
             CycleFailed {
                 schedule_public_id: schedule_public_id.to_string(),
-                turn_id: None,
+                turn_id: Some(turn_id.to_string()),
                 error: format!("cycle exceeded max_runtime_seconds ({})", max_runtime),
             },
         );
@@ -1151,6 +1156,7 @@ impl SchedulerActor {
         self.active_cycles.insert(
             schedule_public_id.to_string(),
             ActiveCycle {
+                turn_id: turn_id.to_string(),
                 started_at: OffsetDateTime::now_utc(),
                 timeout_handle,
             },
@@ -1169,6 +1175,17 @@ impl SchedulerActor {
 
     // ── Completion flow ──────────────────────────────────────────────────
 
+    /// Whether a terminal event naming `turn_id` belongs to an earlier cycle
+    /// of the schedule than the one in flight: an earlier cycle that the
+    /// scheduler already ended (its timeout fired) and whose run ended late.
+    /// It must not end the current cycle or count against the schedule.
+    fn ends_an_earlier_cycle(&self, schedule_public_id: &str, turn_id: Option<&str>) -> bool {
+        match (self.active_cycles.get(schedule_public_id), turn_id) {
+            (Some(cycle), Some(turn_id)) => cycle.turn_id != turn_id,
+            _ => false,
+        }
+    }
+
     /// Handle successful cycle completion.
     pub async fn handle_cycle_completed(&mut self, schedule_public_id: &str, turn_id: &str) {
         // Idempotency guard
@@ -1182,6 +1199,15 @@ impl SchedulerActor {
             return;
         }
         self.processed_terminals.insert(key);
+
+        if self.ends_an_earlier_cycle(schedule_public_id, Some(turn_id)) {
+            self.metrics.idempotent_drops_total += 1;
+            debug!(
+                "SchedulerActor: CycleCompleted of an earlier cycle dropped (schedule={}, turn={})",
+                schedule_public_id, turn_id
+            );
+            return;
+        }
 
         // Remove active cycle, abort timeout, and track runtime
         if let Some(cycle) = self.active_cycles.remove(schedule_public_id) {
@@ -1300,20 +1326,30 @@ impl SchedulerActor {
         turn_id: Option<&str>,
         error: &str,
     ) {
-        // Idempotency guard
-        let key = (
-            schedule_public_id.to_string(),
-            turn_id.map(|s| s.to_string()),
-        );
-        if self.processed_terminals.contains(&key) {
+        // Idempotency guard. A failure that names no run (startup recovery, a
+        // reconciliation sweep) has nothing to be a duplicate of, and recording
+        // it would drop every later such failure of the schedule.
+        if let Some(turn_id) = turn_id {
+            let key = (schedule_public_id.to_string(), Some(turn_id.to_string()));
+            if self.processed_terminals.contains(&key) {
+                self.metrics.idempotent_drops_total += 1;
+                debug!(
+                    "SchedulerActor: duplicate CycleFailed dropped (schedule={}, turn={}, idempotent_drops_total={})",
+                    schedule_public_id, turn_id, self.metrics.idempotent_drops_total
+                );
+                return;
+            }
+            self.processed_terminals.insert(key);
+        }
+
+        if self.ends_an_earlier_cycle(schedule_public_id, turn_id) {
             self.metrics.idempotent_drops_total += 1;
             debug!(
-                "SchedulerActor: duplicate CycleFailed dropped (schedule={}, turn={:?}, idempotent_drops_total={})",
-                schedule_public_id, turn_id, self.metrics.idempotent_drops_total
+                "SchedulerActor: CycleFailed of an earlier cycle dropped (schedule={}, turn={:?})",
+                schedule_public_id, turn_id
             );
             return;
         }
-        self.processed_terminals.insert(key);
 
         // Remove active cycle, abort timeout, and track runtime
         if let Some(cycle) = self.active_cycles.remove(schedule_public_id) {
@@ -2018,6 +2054,184 @@ mod unit_tests {
             result.unwrap().is_ok(),
             "background loop task should complete without panic"
         );
+    }
+
+    /// A scheduler (not spawned) over an in-memory store holding one schedule,
+    /// `"sched"`, in the `Running` state.
+    async fn scheduler_with_running_schedule() -> (SchedulerActor, Arc<dyn ScheduleRepository>) {
+        use crate::session::domain_schedule::ScheduleConfig;
+        use crate::session::repo_schedule::SqliteScheduleRepository;
+        use crate::session::schema;
+        use crate::test_utils::{
+            MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
+        };
+        use querymt::LLMParams;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        let (session_id, task_id) = {
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (public_id, created_at, updated_at) VALUES (?, ?, ?)",
+                rusqlite::params!["sess-1", now, now],
+            )
+            .unwrap();
+            let session_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tasks (public_id, session_id, kind, status, created_at, updated_at) VALUES (?, ?, 'recurring', 'active', ?, ?)",
+                rusqlite::params!["task-1", session_id, now, now],
+            )
+            .unwrap();
+            (session_id, conn.last_insert_rowid())
+        };
+        let db = Arc::new(parking_lot::Mutex::new(conn));
+        let schedule_store = Arc::new(SqliteScheduleRepository::new(db))
+            as Arc<dyn crate::session::repository::ScheduleRepository>;
+        schedule_store
+            .create_schedule(Schedule {
+                id: 0,
+                public_id: "sched".to_string(),
+                task_id,
+                task_public_id: "task-1".to_string(),
+                session_id,
+                session_public_id: "sess-1".to_string(),
+                trigger: ScheduleTrigger::Interval { seconds: 3600 },
+                state: ScheduleState::Running,
+                last_run_at: None,
+                next_run_at: None,
+                run_count: 0,
+                consecutive_failures: 0,
+                config: ScheduleConfig::default(),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+
+        let session_store: Arc<dyn crate::session::store::SessionStore> =
+            Arc::new(MockSessionStore::new());
+        let provider = Arc::new(tokio::sync::Mutex::new(
+            crate::test_utils::MockLlmProvider::new(),
+        ));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory::new(shared));
+        let (plugin_registry, _temp_dir) = mock_plugin_registry(factory).unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create storage"),
+        );
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::new(
+                Arc::new(plugin_registry),
+                storage,
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .build(),
+        );
+        let registry = Arc::new(tokio::sync::Mutex::new(
+            crate::agent::session_registry::SessionRegistry::new(config.clone()),
+        ));
+        let actor = SchedulerActor::new(
+            schedule_store.clone(),
+            session_store,
+            registry,
+            config,
+            SchedulerConfig::default(),
+        );
+        (actor, schedule_store)
+    }
+
+    /// Put a cycle of `"sched"` in flight, running as `turn_id`.
+    fn start_cycle(actor: &mut SchedulerActor, turn_id: &str) {
+        actor.active_cycles.insert(
+            "sched".to_string(),
+            ActiveCycle {
+                turn_id: turn_id.to_string(),
+                started_at: OffsetDateTime::now_utc(),
+                timeout_handle: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            },
+        );
+    }
+
+    /// An earlier cycle that the scheduler already ended (its timeout fired)
+    /// and whose run ends late must not end the cycle that follows it.
+    #[tokio::test]
+    async fn a_late_failure_of_an_earlier_cycle_leaves_the_current_cycle_alone() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        start_cycle(&mut actor, "cycle-b");
+
+        actor
+            .handle_cycle_failed_inner("sched", Some("cycle-a"), "run of cycle a failed late")
+            .await;
+
+        assert!(
+            actor.active_cycles.contains_key("sched"),
+            "cycle b is still in flight"
+        );
+        let schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(schedule.consecutive_failures, 0);
+        assert_eq!(schedule.state, ScheduleState::Running);
+
+        // Its own failure is applied.
+        actor
+            .handle_cycle_failed_inner("sched", Some("cycle-b"), "run of cycle b failed")
+            .await;
+        assert!(!actor.active_cycles.contains_key("sched"));
+        let schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(schedule.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn a_late_completion_of_an_earlier_cycle_leaves_the_current_cycle_alone() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        start_cycle(&mut actor, "cycle-b");
+
+        actor.handle_cycle_completed("sched", "cycle-a").await;
+
+        assert!(actor.active_cycles.contains_key("sched"));
+        let schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(schedule.run_count, 0);
+        assert_eq!(schedule.state, ScheduleState::Running);
+    }
+
+    /// A failure that names no run (startup recovery, a reconciliation sweep)
+    /// is applied every time; it is not a duplicate of the one before it.
+    #[tokio::test]
+    async fn failures_that_name_no_run_are_each_applied() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+
+        actor
+            .handle_cycle_failed_inner("sched", None, "recovered by reconciliation sweep")
+            .await;
+        actor
+            .handle_cycle_failed_inner("sched", None, "recovered by reconciliation sweep")
+            .await;
+
+        let schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(schedule.consecutive_failures, 2);
+    }
+
+    /// The cycle's own run is reported once: a repeat of its terminal event
+    /// is dropped.
+    #[tokio::test]
+    async fn the_terminal_event_of_a_cycle_is_applied_once() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        start_cycle(&mut actor, "cycle-a");
+
+        for _ in 0..2 {
+            actor
+                .handle_cycle_failed_inner("sched", Some("cycle-a"), "failed")
+                .await;
+        }
+
+        let schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(schedule.consecutive_failures, 1);
     }
 }
 

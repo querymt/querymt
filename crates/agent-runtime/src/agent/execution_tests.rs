@@ -64,6 +64,20 @@ impl TestHarness {
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
     ) -> Self {
+        Self::assemble(history, delegation_sender, tools, false).await
+    }
+
+    /// A harness whose session's provider cannot be built.
+    async fn with_unbuildable_provider() -> Self {
+        Self::assemble(vec![], None, Vec::new(), true).await
+    }
+
+    async fn assemble(
+        history: Vec<querymt_agent_core::model::AgentMessage>,
+        delegation_sender: Option<oneshot::Sender<String>>,
+        tools: Vec<Tool>,
+        unbuildable_provider: bool,
+    ) -> Self {
         let session_id = "sess-test".to_string();
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared_provider = SharedLlmProvider {
@@ -73,7 +87,17 @@ impl TestHarness {
         let factory = Arc::new(TestProviderFactory::new(shared_provider));
 
         // Use shared helper to create mock plugin registry
-        let (registry, temp_dir) = mock_plugin_registry(factory).expect("mock registry");
+        let (registry, temp_dir) = if unbuildable_provider {
+            let dir = TempDir::new().expect("temp dir");
+            let registry = crate::test_utils::mock_plugin_registry_for(
+                dir.path(),
+                Arc::new(crate::test_utils::UnbuildableProviderFactory),
+            )
+            .expect("mock registry");
+            (registry, dir)
+        } else {
+            mock_plugin_registry(factory).expect("mock registry")
+        };
         let registry = Arc::new(registry);
 
         let mut store = MockSessionStore::new();
@@ -257,18 +281,21 @@ impl TestHarness {
     }
 
     async fn run(&mut self) -> CycleOutcome {
+        self.run_result().await.expect("state machine")
+    }
+
+    async fn run_result(&mut self) -> Result<CycleOutcome, crate::agent::execution::TurnError> {
         self.refresh_env().await;
         self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
             .await
             .expect("history loads");
-        crate::agent::execution::execute_cycle_state_machine(
+        crate::agent::execution::run_turn(
             &self.config,
             &self.env,
             &mut self.turn,
             crate::agent::core::AgentMode::Build,
         )
         .await
-        .expect("state machine")
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
@@ -1042,7 +1069,7 @@ async fn invalid_steering_conversion_does_not_persist_history() {
         &harness.config,
         &harness.env,
         &mut harness.turn,
-        "test",
+        crate::agent::execution::SteeringBoundary::NextRequest,
         false,
     )
     .await;
@@ -1083,7 +1110,7 @@ async fn storing_an_assistant_reply_fails() {
         crate::agent::execution::turn::History::load(&harness.env.session_handle)
             .await
             .unwrap();
-    let result = crate::agent::execution::execute_cycle_state_machine(
+    let result = crate::agent::execution::run_turn(
         &harness.config,
         &harness.env,
         &mut harness.turn,
@@ -1092,11 +1119,23 @@ async fn storing_an_assistant_reply_fails() {
     .await;
 
     let error = result.expect_err("the run fails with the store's error");
-    assert!(
-        format!("{error:#}").contains("Failed to store assistant message")
-            && format!("{error:#}").contains("disk full"),
-        "{error:#}"
+    // The text is what it always was; the store's error is the typed source.
+    assert_eq!(
+        error.to_string(),
+        "Failed to store assistant message: disk full"
     );
+    match &error {
+        crate::agent::execution::TurnError::History { what, source } => {
+            assert_eq!(*what, "Failed to store assistant message");
+            assert!(
+                matches!(source, crate::session::error::SessionError::Other(message) if message == "disk full"),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected a history error, got {other:?}"),
+    }
+    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.llm_error().is_none());
     // One request was sent; the unstored reply is not in what a next one would carry.
     assert!(
         harness
@@ -1986,7 +2025,7 @@ async fn test_llm_error_returns_err() {
         crate::agent::execution::turn::History::load(&harness.env.session_handle)
             .await
             .unwrap();
-    let result = crate::agent::execution::execute_cycle_state_machine(
+    let result = crate::agent::execution::run_turn(
         &harness.config,
         &harness.env,
         &mut harness.turn,
@@ -2063,6 +2102,147 @@ async fn stop_at_run_start_sends_no_model_request() {
         0,
         "the run ended before its first step"
     );
+}
+
+#[tokio::test]
+async fn middleware_error_keeps_its_source() {
+    use crate::agent::execution::TurnError;
+    use crate::middleware::{MiddlewareError, StepVerdict};
+    let failing = ScriptedMiddleware::default().step_start([Act::<StepVerdict>::Fail]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(failing.clone(), 5);
+    // No `expect_chat`: the run fails before a model request.
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let error = harness
+        .run_result()
+        .await
+        .expect_err("a failing hook fails the run");
+
+    match &error {
+        TurnError::Middleware { name, source } => {
+            assert_eq!(*name, "ScriptedMiddleware");
+            assert!(
+                matches!(source, MiddlewareError::ExecutionError(message) if message == "test error"),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected a middleware error, got {other:?}"),
+    }
+    // The source is reachable through the standard chain, not only in the text.
+    let source = std::error::Error::source(&error).expect("the error has a source");
+    assert!(source.downcast_ref::<MiddlewareError>().is_some());
+    assert!(error.llm_error().is_none());
+}
+
+/// A provider that cannot be built fails the run at its start: before any
+/// hook, with the provider's error kept as the source.
+#[tokio::test]
+async fn provider_failure_at_run_start_runs_no_hook_and_sends_no_request() {
+    use crate::agent::execution::TurnError;
+    let watching = ScriptedMiddleware::default();
+    let mut harness = TestHarness::with_unbuildable_provider().await;
+    harness.install_stop_recovery(watching.clone(), 5);
+
+    let error = harness
+        .run_result()
+        .await
+        .expect_err("a provider that cannot be built fails the run");
+
+    match &error {
+        TurnError::Provider {
+            operation,
+            provider,
+            model,
+            source,
+        } => {
+            assert_eq!(*operation, "provider initialization");
+            assert_eq!((provider.as_str(), model.as_str()), ("mock", "mock-model"));
+            assert!(matches!(source, LLMError::InvalidRequest(_)), "{source:?}");
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+    assert!(error.llm_error().is_some());
+    assert!(
+        watching.calls().is_empty(),
+        "no hook runs before the provider exists: {:?}",
+        watching.calls()
+    );
+}
+
+/// The provider is resolved before the first hook, once: a run cancelled
+/// before it starts ends as cancelled without a hook or a request.
+#[tokio::test]
+async fn cancel_during_provider_init_runs_no_hook() {
+    let watching = ScriptedMiddleware::default();
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(watching.clone(), 5);
+    // No `expect_chat`: a request would fail the test.
+    harness.env.cancellation_token.cancel();
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Cancelled);
+    assert!(watching.calls().is_empty(), "{:?}", watching.calls());
+}
+
+/// Provider setup is its own span, not an attempt of a request, and it
+/// happens once per run, before the first hook.
+#[tokio::test]
+async fn provider_init_is_traced_once_and_is_not_a_chat_retry() {
+    use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
+
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .returning(|_| Ok(MockChatResponse::text_only("done").into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let (outcome, spans) = capture(harness.run()).await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let retries: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "agent.llm.call_with_retry")
+        .collect();
+    let operations: Vec<_> = retries
+        .iter()
+        .map(|span| attr(span, "operation").cloned())
+        .collect();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == Some(opentelemetry::Value::from("provider_init")))
+            .count(),
+        1,
+        "{operations:?}"
+    );
+    let init = spans
+        .iter()
+        .find(|span| span.name == "agent.execution.provider_init")
+        .expect("provider init span");
+    let first_hook = spans
+        .iter()
+        .find(|span| span.name == "agent.execution.middleware.turn_start");
+    if let Some(hook) = first_hook {
+        assert!(
+            init.end_time <= hook.start_time,
+            "init precedes the first hook"
+        );
+    }
 }
 
 #[tokio::test]

@@ -515,8 +515,58 @@
   of its history, and a model or compaction request is projected from the stored
   messages in one place. Public `SessionRuntime` fields `turn_snapshot` and
   `pre_turn_snapshot_task` are removed with `turn_diffs`.
+- **BREAKING (Rust API): the removed public `SessionRuntime` fields.**
+  `SessionRuntime::turn_snapshot`, `pre_turn_snapshot_task` and `turn_diffs` no
+  longer exist: they were state of one run kept on the session. The pre-turn
+  snapshot and the changed paths belong to the run, and a reader fails to
+  compile instead of reading a value of another run.
+- **BREAKING (Rust API): `BudgetWarnings::take_new` takes `&mut self`**
+  (`querymt_agent_services::accounting::BudgetWarnings`). It held a mutex only
+  because the run shared it; the run now owns it.
+- **BREAKING (Rust API): `ExecutionState` is removed** from
+  `querymt_agent::middleware`. It was the loop's position, and middleware stopped
+  using it when hooks got typed verdicts; the loop's position is now internal.
+  `ExecutionOrigin` is exported from `querymt_agent_runtime::agent::execution`
+  (the module `execution_context` is gone), and a run's failure is the internal
+  `TurnError`, which keeps its source (a provider error, or the name and source
+  of a failed middleware) where the loop used to wrap it in a string.
+- **A scheduled run executes like an interactive one.** Both start through one
+  `SessionActor::start_run`, and the run reports its phase through a `watch`
+  channel, so a burst of phase changes publishes the latest phase instead of
+  every step. Events and their order are unchanged. A provider that cannot be
+  built now fails the run before the first middleware hook and before the model
+  is asked, the provider is built once per run, and a middleware error names the
+  middleware.
+  A failed write of the stored conversation keeps the store's error as its
+  source; the messages that were already prefixed (`Failed to store assistant
+  message: ...`, `... wait message: ...`, `... tool results: ...`) are unchanged,
+  and the writes that reported the store's bare error (queued notices, steering,
+  tool baseline and change records, intent projection) now carry the same kind of
+  prefix.
+- **A run that panics fails instead of leaving its session stuck.** The panic
+  is caught where the run is started and becomes the run's failure: the client
+  gets an `Internal` error (`run panicked: ...`), an `Error` event is emitted,
+  a scheduled run emits `ScheduledExecutionFailed`, and the run is closed as
+  `failed`, so the run lease is released or handed to the next queued prompt.
+  Before, the session kept a run that never ended: later prompts queued behind
+  it for good and the client was told `prompt execution dropped`. The workspace
+  changes a panicking run made are still recorded for undo, and steering the
+  run had accepted but not applied gets a `SteeringDiscarded` event
+  (`run_failed`) instead of none; a run that fails by an error ends the same
+  way.
 
 ### Fixed
+
+- **A failed scheduled run is attributed to its own cycle.** The scheduler now
+  names the run it fires, and the run's terminal events (including a failure
+  and the cycle timeout) carry that id. Before, every failure was reported
+  without a run id and the scheduler remembered it per schedule, so after a
+  schedule's first failure its later failures were dropped as duplicates (the
+  schedule was never re-armed with backoff or marked failed), and the late
+  failure of a cycle that had timed out could end the cycle that followed it.
+  A terminal event of an earlier cycle is now ignored while a later one is in
+  flight, and failures that name no run (startup recovery, the reconciliation
+  sweep) are each applied.
 
 - **`shell` returns when its command exits.** A command that leaves a background
   process holding its output (for example `server & echo started`) no longer

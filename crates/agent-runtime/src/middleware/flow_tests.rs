@@ -1,4 +1,5 @@
-use crate::middleware::{ExecutionState, LlmResponse, Middleware, ReplyVerdict, StepVerdict, Stop};
+use crate::agent::execution::{Stage, Step};
+use crate::middleware::{LlmResponse, Middleware, ReplyVerdict, StepVerdict, Stop};
 use crate::test_utils::{Act, HookRig, ScriptedMiddleware};
 use querymt::chat::FinishReason;
 use querymt_agent_core::events::StopType;
@@ -13,8 +14,8 @@ fn stack_of(middleware: &[&ScriptedMiddleware]) -> crate::middleware::TurnStack 
     )
 }
 
-fn response() -> Arc<LlmResponse> {
-    Arc::new(LlmResponse::new(
+fn response() -> Box<LlmResponse> {
+    Box::new(LlmResponse::new(
         "".to_string(),
         vec![],
         None,
@@ -28,9 +29,9 @@ async fn every_hook_is_called_in_run_order() {
     let mut stack = stack_of(&[&recorder]);
     let mut rig = HookRig::at_step("sess-1", 0);
 
-    rig.turn_start(&mut stack).await.unwrap();
-    rig.step_start(&mut stack).await.unwrap();
-    rig.after_llm(&mut stack, response()).await.unwrap();
+    let _ = rig.turn_start(&mut stack).await.unwrap();
+    let _ = rig.step_start(&mut stack).await.unwrap();
+    let _ = rig.after_llm(&mut stack, response()).await.unwrap();
 
     let hooks: Vec<_> = recorder.calls().into_iter().map(|(hook, _)| hook).collect();
     assert_eq!(hooks, ["turn_start", "step_start", "after_llm"]);
@@ -45,7 +46,7 @@ async fn test_message_injection_flow() {
 
     let result = rig.turn_start(&mut stack).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
     assert_eq!(rig.pending.len(), 1);
     assert!(rig.pending[0].content.contains("Remember to be helpful"));
 }
@@ -61,7 +62,7 @@ async fn test_multiple_middleware_interaction() {
     let result = rig.turn_start(&mut stack).await.unwrap();
 
     assert_eq!(recorder.calls().len(), 1);
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
     assert_eq!(rig.pending.len(), 1);
 }
 
@@ -84,13 +85,13 @@ async fn test_middleware_can_transform_to_stopped() {
     let mut rig = HookRig::at_step("sess-1", 0);
 
     let result = rig.turn_start(&mut stack).await.unwrap();
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 
     let result = rig.step_start(&mut stack).await.unwrap();
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 
     let result = rig.after_llm(&mut stack, response()).await.unwrap();
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 }
 
 #[tokio::test]
@@ -103,7 +104,7 @@ async fn test_stats_propagate_through_middleware() {
 
     let result = rig.turn_start(&mut stack).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
     assert_eq!(rig.stats.steps, 42);
     assert_eq!(rig.stats.total_input_tokens, 1000);
 }
@@ -116,7 +117,7 @@ async fn a_hook_queues_notices_without_touching_the_history() {
     let mut rig = HookRig::with_user_messages("sess-1", 2);
     assert!(rig.pending.is_empty());
 
-    rig.turn_start(&mut stack).await.unwrap();
+    let _ = rig.turn_start(&mut stack).await.unwrap();
 
     assert_eq!(rig.cx().history().len(), 2, "stored only at the request");
     assert_eq!(rig.pending.len(), 1);

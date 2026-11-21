@@ -30,8 +30,8 @@ pub use middleware_driver::{
     TurnMiddleware,
 };
 pub use state::{
-    AgentStats, ExecutionState, LlmResponse, ModelProfile, PendingNotice, PreparedModelRequest,
-    ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason, apply_usage_to_stats,
+    AgentStats, LlmResponse, ModelProfile, PendingNotice, PreparedModelRequest, ToolCall,
+    ToolFunction, ToolResult, WaitCondition, WaitReason, apply_usage_to_stats,
     calculate_context_tokens,
 };
 

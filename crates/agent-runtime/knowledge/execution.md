@@ -1,28 +1,85 @@
 ---
 id: pilot-execution
 title: Agent execution loop
-description: The execution state machine, tool-call lifecycle, parallel waves, LLM retry and compaction trigger behind one prompt turn.
-tags: execution, state-machine, tool-calls, retry, compaction
+description: The execution stages, tool-call lifecycle, parallel waves, LLM retry and compaction trigger behind one prompt turn.
+tags: execution, stages, tool-calls, retry, compaction
 knowledge_paths: ["crates/agent-runtime/src/agent/execution/**"]
 knowledge_sources: ["crates/agent-runtime/src/agent/execution/wave_plan.rs", "crates/agent-runtime/src/agent/execution/llm_retry.rs"]
 ---
 
 # Agent execution loop
 
-A prompt turn is driven by `execute_cycle_state_machine` in `crates/agent-runtime/src/agent/execution/mod.rs`,
-started by the session actor through `ctx.spawn()` so the actor stays responsive to
-cancel and mode changes while a turn runs.
+A prompt turn is driven by `run_turn` in `crates/agent-runtime/src/agent/execution/stage.rs`,
+started by the session actor (`SessionActor::start_run`) in a task of its own so the actor
+stays responsive to cancel and mode changes while a turn runs.
 
-## States and transitions
+## Stages and steps
 
-The loop moves an `ExecutionState` (`crates/agent-runtime/src/middleware/state.rs`; a position
-that carries only what its step consumes, never run state) through
-`BeforeLlmCall`, `CallLlm`, `AfterLlm` and `ProcessingToolCalls`. After tool results are
-stored it returns to `BeforeLlmCall`, or enters `WaitingForEvent` when a delegation must
-finish first. A turn ends in `Complete`, `Stopped` (a middleware stop) or `Cancelled`.
-The transition functions live in `crates/agent-runtime/src/agent/execution/transitions.rs`.
+`run_turn` resolves the run's provider once (`provider_init` retry), runs the first middleware
+hook, then moves a `Stage` until a step returns the run's `CycleOutcome`. A `Stage` is a loop
+position that owns the data its step consumes (`stage.rs`): `BeforeRequest`,
+`CallModel(request)`, `AfterReply(reply)`, `ToolCalls { calls, results }`, `Waiting(wait)`,
+`Ending` and `Stopping(stop)`. `Stage::advance` takes the stage by value and returns a
+`Step`, which is `ControlFlow<CycleOutcome, Stage>`: the next stage, or the end of the run
+(`Completed`, `Cancelled` or `Stopped`). Cancelled is an outcome and not a stage, so there is
+no placeholder value, and cancellation is checked at the top of each iteration except in
+`ToolCalls`, which must store one result per pending call first.
 
-Source: `crates/agent-runtime/src/agent/execution/mod.rs`, `crates/agent-runtime/src/agent/execution/transitions.rs`.
+```mermaid
+stateDiagram-v2
+  [*] --> BeforeRequest
+  BeforeRequest --> CallModel: request prepared
+  BeforeRequest --> Stopping: middleware stop / request too large
+  CallModel --> AfterReply
+  AfterReply --> BeforeRequest: middleware retry
+  AfterReply --> ToolCalls: reply has calls
+  AfterReply --> Ending: reply ended the turn
+  AfterReply --> Stopping: length / filter / middleware stop
+  ToolCalls --> BeforeRequest: results stored
+  ToolCalls --> Waiting: delegation started
+  Waiting --> BeforeRequest
+  Ending --> BeforeRequest: steering / middleware / Stop hook / completion guard
+  Ending --> Stopping: middleware stop
+  Stopping --> BeforeRequest: compaction / recovery / Stop hook
+  Ending --> [*]: Completed
+  Stopping --> [*]: Stopped
+  BeforeRequest --> [*]: Cancelled (any stage but ToolCalls)
+```
+
+`Ending` holds what a finished reply leads to (drain steering, end-of-run middleware, the Stop
+hook, the task-completion guard, pruning); `Stopping` holds what a stop leads to (automatic
+compaction, stop recovery, the token-limit Stop hook, publication). The step functions are in
+`transitions.rs` (`transition_before_llm_call`, `transition_call_llm`, `transition_after_llm`,
+`transition_processing_tool_calls`) and `wait.rs`. Every one returns `Result<Step, TurnError>`
+(`error.rs`): `TurnError::Provider` carries the provider's error, `Middleware` names the
+middleware that failed and keeps its source, `History` carries a failed read or write of the
+stored conversation with the store's error as its source, and `Other` wraps anything else. The session
+actor classifies a failed run by matching on it (`provider_failure_from_execution_error`).
+
+The labels that events and hooks carry are enums deriving `strum::IntoStaticStr`:
+`SteeringBoundary`, `ContextTrigger`, `StopHookKind` and `ExecutionOrigin`.
+
+Source: `crates/agent-runtime/src/agent/execution/stage.rs`, `crates/agent-runtime/src/agent/execution/error.rs`,
+`crates/agent-runtime/src/agent/execution/transitions.rs`.
+
+## Run slot
+
+`SessionActor` holds `run: RunSlot` (`Idle` or `Running(ActiveRun)`) and a generation counter that
+advances with each run, so a stale `PromptFinished` is ignored. The run's cancellation token is
+`ActiveRun::cancellation`; an idle session has nothing to cancel. `SessionActor::start_run` is the
+only place that fills the slot, for interactive, queued and scheduled prompts alike: it emits
+`RunStarted` with the origin's label, spawns the execution task and one forwarder for the run's
+phase. The run's `ExecutionOrigin` (`Interactive` or `Scheduled { .. }`) gives the `RunStarted`
+label and decides what the run emits when it ends (an interactive run replies once its last event
+is delivered, a scheduled run emits `ScheduledExecutionCompleted` or `ScheduledExecutionFailed`);
+its `Completion` carries the reply and the queued input id. The execution runs under
+`execute_prompt_guarded`, which turns a panic of the run into its failure (`run panicked: ...`):
+everything that ends a run (reply, scheduled terminal events, `PromptFinished`) comes after
+the execution returns, so a panic that escaped would leave the slot, the lease and the queued
+prompts waiting for a run that is gone. This relies on `panic = "unwind"`. The run reports through a `watch` channel carrying a `RunSignal`
+(phase and a revision), so a burst of changes reaches the actor as the latest phase.
+
+Source: `crates/agent-runtime/src/agent/session_actor.rs`, `crates/agent-runtime/src/agent/turn_control.rs`.
 
 ## Run state: one owner per lifetime
 
@@ -43,6 +100,12 @@ The state of a run is split by mutability in `crates/agent-runtime/src/agent/exe
   progress-review positions). It has one owner, the loop, and is borrowed `&mut` by the
   steps that change it. It holds no lock, atomic or cell, so a new run starts from
   `Turn::new` and nothing run-scoped is reachable from another session or a later run.
+- The provider is neither: it never changes, and it is not known when `TurnEnv` is built (that
+  happens before the prompt is stored, and a provider failure must not move ahead of storing
+  it or into the `/compact` path). `run_turn` resolves it once, before the first hook, under the
+  `provider_init` retry, and holds it in `Run` (`stage.rs`); `prepare_model_request` and
+  `transition_call_llm` take it as a parameter. `unify-model-call-path` can move it to
+  `TurnEnv`.
 - `SessionRuntime` keeps only session-scoped caches and grants (session grants, MCP tool
   state, accounting, cache prefix) behind short synchronous locks.
 

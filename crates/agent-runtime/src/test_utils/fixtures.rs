@@ -216,10 +216,22 @@ pub(crate) async fn turn_parts(
         cycle_accounting,
         tool_set,
     };
-    (env, Turn::new(state))
+    let mut turn = Turn::new(state);
+    // A run reads the profile of its model once, as `run_turn` does.
+    turn.profile = env.session_handle.profile().await;
+    (env, turn)
 }
 
 impl TurnEnv {
+    /// The provider the run would resolve before its first hook. A fixture
+    /// whose provider cannot be built fails here, in the test that needs it.
+    pub(crate) async fn provider_for_test(&self) -> std::sync::Arc<dyn querymt::LLMProvider> {
+        self.session_handle
+            .provider()
+            .await
+            .expect("the fixture's provider can be built")
+    }
+
     /// This env with its tool set built from `config`, for tests that run a
     /// step under a config other than the one the fixture was created with.
     pub(crate) fn tools_from(mut self, config: &crate::agent::agent_config::AgentConfig) -> Self {

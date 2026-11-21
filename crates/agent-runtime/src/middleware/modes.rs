@@ -319,7 +319,7 @@ mod tests {
             });
             rig.set_history(vec![message]);
         }
-        rig.step_start(&mut stack).await.unwrap();
+        let _ = rig.step_start(&mut stack).await.unwrap();
         Stepped {
             last_mode_notice: rig.cx().last_mode_notice().map(str::to_string),
             pending_notices: rig.pending,

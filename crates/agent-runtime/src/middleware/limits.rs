@@ -215,7 +215,8 @@ impl TurnMiddleware for LimitsTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::ExecutionState;
+    use crate::agent::execution::{Stage, Step};
+    use crate::middleware::Stop;
     use crate::test_utils::HookRig;
 
     #[test]
@@ -364,10 +365,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            ExecutionState::Stopped {
+            Step::Continue(Stage::Stopping(Stop {
                 stop_type: StopType::StepLimit,
                 ..
-            }
+            }))
         ));
     }
 
@@ -380,7 +381,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, ExecutionState::BeforeLlmCall));
+        assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
     }
 }
 

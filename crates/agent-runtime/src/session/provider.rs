@@ -44,25 +44,6 @@ type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
 /// the API key). Lets a rebuild of a known configuration skip the probe.
 type DeclarationCache = Arc<Mutex<HashMap<u64, PromptCacheCapabilities>>>;
 
-/// Keeps the requested per-request overrides the provider honours.
-///
-/// Dropped overrides are logged at debug level; the request then runs with the
-/// provider's configured values.
-pub(crate) fn supported_overrides(
-    provider: &dyn LLMProvider,
-    requested: GenerationOptions,
-) -> GenerationOptions {
-    let supported = provider.capabilities().options.retain_supported(requested);
-    if supported != requested {
-        tracing::debug!(
-            ?requested,
-            ?supported,
-            "provider does not honour some per-request generation options; skipping them"
-        );
-    }
-    supported
-}
-
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 ///
 /// # Provider Caching

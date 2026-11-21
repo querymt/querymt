@@ -276,7 +276,7 @@ Porting the rest:
 
 - `enum RunSlot { Idle, Running(ActiveRun) }` replaces `prompt_running`, `active_run: Option<ActiveRun>` and `TurnState`. The generation counter stays on the actor; the cancellation token is `ActiveRun::cancellation`. `SessionActor::on_stop` and `impl Message<Cancel>` cancel the running slot's token.
 - `SessionActor::start_run(origin, request, completion)` is the only place that fills the slot. It emits `RunStarted` with the origin's label, then `QueuedInputStarted` for a queued input, spawns the one phase forwarder and the execution task. `launch_prompt` and the `ScheduledPrompt` handler call it. How the result is delivered stays origin-specific (`completion`): an interactive run holds the reply until its last event is delivered; a scheduled run emits `ScheduledExecutionCompleted` or `ScheduledExecutionFailed`.
-- `RunOrigin` (`Interactive`, `Scheduled { … }`) gets its wire label from one place. `add-background-commands` (split out of `reduce-agent-harness-overhead`, not yet proposed) adds its `background_command` origin here.
+- The run's origin is `ExecutionOrigin` (`Interactive`, `Scheduled { … }`); its wire label comes from one place (`label()`). `add-background-commands` (split out of `reduce-agent-harness-overhead`, not yet proposed) adds its `background_command` origin here.
 - Phase reporting: `tokio::sync::watch<RunSignal>` (`phase` plus a revision counter that `report_runtime_change` bumps) replaces the unbounded `mpsc` channel (rules `async-watch-latest`, `async-bounded-channel`). The actor publishes the phase it reads when it handles `RunPhaseChanged`, so intermediate values already coalesce when messages queue; `watch` makes that explicit.
 
 ### D8. Dependencies

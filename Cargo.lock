@@ -12203,6 +12203,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2 0.11.1",
+ "strum 0.28.0",
  "sync_wrapper 1.0.2",
  "tempfile",
  "thiserror 2.0.21",

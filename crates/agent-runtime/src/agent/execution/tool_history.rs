@@ -18,6 +18,7 @@
 //! baseline in effect is sent as a message when the provider takes them. This
 //! module decides only when a record is stored.
 
+use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use querymt::chat::{Tool, ToolChange};
 use querymt_agent_core::model::{AgentMessage, MessagePart};
@@ -102,7 +103,7 @@ pub(crate) async fn resolve(
     origin: &str,
     tool_updates: bool,
     tools: &[Tool],
-) -> Result<bool, anyhow::Error> {
+) -> Result<bool, TurnError> {
     if !tool_updates {
         return Ok(false);
     }
@@ -138,7 +139,8 @@ pub(crate) async fn resolve(
         });
         turn.history
             .commit(&env.session_handle, vec![message])
-            .await?;
+            .await
+            .map_err(TurnError::history("Failed to store tool baseline"))?;
     }
 
     if change_allowed && let Some(change) = diff(&offered(turn.history.as_slice()), tools) {
@@ -149,7 +151,8 @@ pub(crate) async fn resolve(
         });
         turn.history
             .commit(&env.session_handle, vec![message])
-            .await?;
+            .await
+            .map_err(TurnError::history("Failed to store tool change"))?;
     }
     Ok(true)
 }
