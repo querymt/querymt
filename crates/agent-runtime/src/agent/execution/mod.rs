@@ -656,9 +656,6 @@ pub(crate) async fn execute_cycle_state_machine(
                 results,
                 context,
             } => {
-                if exec_ctx.restricted_mesh_turn() {
-                    return Err(crate::error::AgentError::MeshAccessDenied.into());
-                }
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Tools);
                 if results.is_empty()
                     && let Some(steered_context) = apply_pending_steering(

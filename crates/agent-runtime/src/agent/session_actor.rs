@@ -3485,6 +3485,12 @@ async fn execute_prompt_inner(
         .is_some_and(|(_, grant)| *grant != querymt_remote::peer_access::PeerGrant::Full);
     #[cfg(not(feature = "remote"))]
     let restricted = false;
+    #[cfg(feature = "remote")]
+    let filesystem = peer_grant
+        .as_ref()
+        .is_some_and(|(peer, grant)| grant.allows_filesystem(peer.protocol));
+    #[cfg(not(feature = "remote"))]
+    let filesystem = false;
     // Unclassified owner hooks can implement mandatory admission rules, so do
     // not silently bypass them for a restricted turn.
     if restricted
@@ -3565,7 +3571,7 @@ async fn execute_prompt_inner(
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
     .with_turn_authority(authority.clone())
-    .with_restricted_mesh_turn(restricted)
+    .with_restricted_mesh_turn(restricted, filesystem)
     .with_knowledge_store(config.knowledge_store())
     .with_repository_knowledge(config.repository_knowledge())
     .with_event_sink(config.event_sink.clone())

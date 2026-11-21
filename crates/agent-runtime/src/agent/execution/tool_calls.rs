@@ -267,8 +267,28 @@ async fn prepare_tool_call_inner(
         ));
     }
     let tool = exec_ctx.tool_set(config).find(&call.function.name);
-    let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
-    let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
+    let (tool, target, schema) = if exec_ctx.restricted_mesh_turn() {
+        if tool.is_none() || !exec_ctx.tool_config.allows(ToolRef::builtin("read_tool")) {
+            return Ok(reject(
+                args,
+                Vec::new(),
+                "Error: confined read is unavailable".into(),
+                "blocked",
+                Vec::new(),
+            ));
+        }
+        let reader: Arc<dyn Tool> = Arc::new(crate::tools::builtins::ReadTool::new());
+        let schema = confined_read_definition().function.parameters;
+        (
+            Some(reader.clone()),
+            ToolTarget::Builtin(reader),
+            Some(schema),
+        )
+    } else {
+        let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
+        let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
+        (tool, target, schema)
+    };
     let mut repairs: Vec<Repair> = Vec::new();
 
     // Hooks must see canonical names, so normalise before running them.
@@ -501,32 +521,33 @@ async fn execute_prepared_inner(
     let mut result_blocks = raw_result_blocks;
     let mut is_error = is_error;
     // Preserve the result of an already executed tool, but do not start another hook after revocation.
-    let post_hook = if exec_ctx.require_turn_authority().await.is_ok() {
-        config
-            .hooks
-            .run_post_tool_use(PostToolUseRequest {
-                session_id: exec_ctx.session_id.clone(),
-                mcp_server: target.server().map(str::to_owned),
-                mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-                turn_id: exec_ctx.turn_id().to_string(),
-                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-                model: exec_ctx
-                    .llm_config()
-                    .map(|cfg| cfg.model.clone())
-                    .unwrap_or_default(),
-                permission_mode: exec_ctx.permission_mode().to_string(),
-                tool_name: call.function.name.clone(),
-                tool_input: args.clone(),
-                content: result_blocks.clone(),
-                is_error,
-                execution_is_error,
-                tool_source: tool_source.as_str().to_string(),
-                tool_use_id: call.id.clone(),
-            })
-            .await?
-    } else {
-        Default::default()
-    };
+    let post_hook =
+        if !exec_ctx.restricted_mesh_turn() && exec_ctx.require_turn_authority().await.is_ok() {
+            config
+                .hooks
+                .run_post_tool_use(PostToolUseRequest {
+                    session_id: exec_ctx.session_id.clone(),
+                    mcp_server: target.server().map(str::to_owned),
+                    mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+                    turn_id: exec_ctx.turn_id().to_string(),
+                    cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+                    model: exec_ctx
+                        .llm_config()
+                        .map(|cfg| cfg.model.clone())
+                        .unwrap_or_default(),
+                    permission_mode: exec_ctx.permission_mode().to_string(),
+                    tool_name: call.function.name.clone(),
+                    tool_input: args.clone(),
+                    content: result_blocks.clone(),
+                    is_error,
+                    execution_is_error,
+                    tool_source: tool_source.as_str().to_string(),
+                    tool_use_id: call.id.clone(),
+                })
+                .await?
+        } else {
+            Default::default()
+        };
     // A blocked or suppressed result must not regain information through
     // enrichment; decided before the hook result is consumed.
     // Redaction (a rewritten output or error flag) counts the same as a block:
@@ -636,22 +657,24 @@ async fn execute_prepared_inner(
     // truncation. Purely additive context; the result blocks and error flag
     // above are never touched. Contributions already present (for example from
     // a command-hook wrapper) are not delivered again.
-    let enrichment = crate::agent::repository_delivery::index_contexts(
-        config,
-        exec_ctx,
-        &crate::agent::repository_delivery::FinishedCall {
-            tool_name: &call.function.name,
-            tool_source: tool_source.as_str(),
-            execution_is_error,
-            result_is_error: is_error,
-            output_suppressed,
-            tool_use_id: &call.id,
-            args: &args,
-        },
-        &hook_contexts,
-    )
-    .await;
-    hook_contexts.extend(enrichment);
+    if !exec_ctx.restricted_mesh_turn() {
+        let enrichment = crate::agent::repository_delivery::index_contexts(
+            config,
+            exec_ctx,
+            &crate::agent::repository_delivery::FinishedCall {
+                tool_name: &call.function.name,
+                tool_source: tool_source.as_str(),
+                execution_is_error,
+                result_is_error: is_error,
+                output_suppressed,
+                tool_use_id: &call.id,
+                args: &args,
+            },
+            &hook_contexts,
+        )
+        .await;
+        hook_contexts.extend(enrichment);
+    }
     let mut tool_result = ToolResult::new(
         call.id.clone(),
         result_blocks,
@@ -1025,6 +1048,12 @@ async fn dispatch(
     }
 
     exec_ctx.require_turn_authority().await?;
+    if exec_ctx.restricted_mesh_turn() {
+        return Ok((
+            dispatch_confined_read(exec_ctx, args).await,
+            SnapshotState::None,
+        ));
+    }
     let snapshot = if target.is_read_only() {
         SnapshotState::None
     } else {
@@ -1082,6 +1111,49 @@ fn begin_snapshot(
 }
 
 /// Invoke the resolved target.
+pub(super) fn confined_read_definition() -> querymt::chat::Tool {
+    let mut definition = crate::tools::builtins::ReadTool::new().definition();
+    definition.function.description = "Read a visible regular file under this session's workspace. Use a relative path and optional offset and limit.".into();
+    if let Some(properties) = definition.function.parameters["properties"].as_object_mut() {
+        properties.remove("root");
+    }
+    definition
+}
+
+async fn dispatch_confined_read(exec: &ExecutionContext, args: &serde_json::Value) -> ToolOutcome {
+    #[cfg(feature = "remote")]
+    if let Some(cwd) = exec.cwd()
+        && let Some(relative) = args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::Path::new)
+        && args.get("root").is_none()
+        && crate::agent::file_proxy::is_shareable_path(relative)
+    {
+        use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_confined_file};
+        let offset = args
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_default();
+        let limit = args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_READ_LIMIT)
+            .min(DEFAULT_READ_LIMIT);
+        if let Ok(parts) = render_confined_file(cwd, relative, offset, limit).await {
+            return ToolOutcome::new(parts, false, ToolSource::Builtin, Execution::Executed);
+        }
+    }
+    let _ = (exec, args);
+    ToolOutcome::error_text(
+        "Error: workspace file unavailable".into(),
+        ToolSource::Blocked,
+        Execution::PolicyBlocked,
+    )
+}
+
 async fn run_tool(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
@@ -2039,7 +2111,9 @@ pub(super) async fn store_all_tool_results(
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
     let batch_id = Uuid::new_v4().to_string();
-    crate::agent::repository_delivery::restore_state(config, exec_ctx).await;
+    if !exec_ctx.restricted_mesh_turn() {
+        crate::agent::repository_delivery::restore_state(config, exec_ctx).await;
+    }
     let mut adjusted_results = Vec::with_capacity(ordered_results.len());
     for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
@@ -2050,9 +2124,11 @@ pub(super) async fn store_all_tool_results(
         // Native repository cards draw from the turn's shared budget in
         // stable tool-call order (not completion order). Cards that do not
         // fit are dropped whole, so they are never recorded as delivered.
-        let contexts = std::mem::take(&mut result.hook_contexts);
-        result.hook_contexts =
-            crate::agent::repository_delivery::allocate(config, exec_ctx, contexts);
+        if !exec_ctx.restricted_mesh_turn() {
+            let contexts = std::mem::take(&mut result.hook_contexts);
+            result.hook_contexts =
+                crate::agent::repository_delivery::allocate(config, exec_ctx, contexts);
+        }
         adjusted_results.push(result);
     }
 
@@ -3479,6 +3555,46 @@ mod prepared_call_tests {
         let exec = fixture.agent.execution_context().await;
         let call = mock_tool_call("call-1", "rec_edit", &args.to_string());
         execute_tool_call(config, &call, &exec).await.unwrap()
+    }
+
+    #[cfg(all(feature = "remote", target_os = "linux"))]
+    #[tokio::test]
+    async fn custom_read_uses_confined_path_and_never_reaches_general_tools() {
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        let mut registry = ToolRegistry::new();
+        registry.add(Arc::new(crate::tools::builtins::ReadTool::new()));
+        config.tool_registry = Arc::new(registry);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("visible.txt"), "safe fixture").unwrap();
+        std::fs::write(workspace.path().join(".secret"), "must not read").unwrap();
+        let mut exec = fx
+            .agent
+            .execution_context()
+            .await
+            .with_restricted_mesh_turn(true, true);
+        exec.runtime = crate::agent::core::SessionRuntime::new(
+            Some(workspace.path().canonicalize().unwrap()),
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let call = mock_tool_call("read", "read_tool", r#"{"path":"visible.txt"}"#);
+        let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(text(&result).contains("safe fixture"));
+        for (tool, args) in [
+            ("read_tool", r#"{"path":".secret"}"#),
+            ("read_tool", r#"{"path":"../visible.txt"}"#),
+            ("read_tool", r#"{"path":"visible.txt","root":"/tmp"}"#),
+            ("shell", "{}"),
+        ] {
+            let call = mock_tool_call("bad", tool, args);
+            let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+            assert!(result.is_error, "unexpected success for {tool}: {args}");
+        }
+        let disabled = exec.with_restricted_mesh_turn(true, false);
+        let result = execute_tool_call(&config, &call, &disabled).await.unwrap();
+        assert!(result.is_error);
     }
 
     #[cfg(feature = "remote")]

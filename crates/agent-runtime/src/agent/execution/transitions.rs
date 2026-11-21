@@ -128,6 +128,14 @@ pub(super) async fn transition_before_llm_call(
             exec_ctx.tool_set(config),
         );
         tools.retain(|tool| exec_ctx.allows_workflow_tool(&tool.function.name));
+        if exec_ctx.restricted_mesh_turn() {
+            let available =
+                !tools.is_empty() && exec_ctx.tool_set(config).find("read_tool").is_some();
+            tools.clear();
+            if available {
+                tools.push(super::tool_calls::confined_read_definition());
+            }
+        }
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
         let new_hash = querymt_agent_core::hash::RapidHash::new(&tools_json);
@@ -1566,9 +1574,6 @@ pub(super) async fn transition_call_llm(
     let response_thinking = output.thinking();
     let response_thinking_signature = output.signature();
     let llm_tool_calls = middleware_calls_from_output(&output);
-    if exec_ctx.restricted_mesh_turn() && !llm_tool_calls.is_empty() {
-        return Err(crate::error::AgentError::MeshAccessDenied.into());
-    }
     let tool_calls = &llm_tool_calls;
     let usage = output.usage.clone();
     let finish_reason = output.finish_reason;

@@ -79,6 +79,7 @@ pub(crate) struct ExecutionContext {
     pub execution_origin: ExecutionOrigin,
     turn_authority: TurnAuthority,
     restricted_mesh_turn: bool,
+    confined_mesh_read: bool,
 
     /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
@@ -147,6 +148,7 @@ impl ExecutionContext {
             execution_origin: ExecutionOrigin::Interactive,
             turn_authority: TurnAuthority::Local,
             restricted_mesh_turn: false,
+            confined_mesh_read: false,
             knowledge_store: None,
             repository_knowledge: None,
             delivery_budget: std::sync::Mutex::new(None),
@@ -210,8 +212,10 @@ impl ExecutionContext {
         &self.turn_authority
     }
 
-    pub(crate) fn with_restricted_mesh_turn(mut self, restricted: bool) -> Self {
+    pub(crate) fn with_restricted_mesh_turn(mut self, restricted: bool, filesystem: bool) -> Self {
         self.restricted_mesh_turn = restricted;
+        self.confined_mesh_read =
+            restricted && filesystem && cfg!(all(feature = "remote", target_os = "linux"));
         self
     }
 
@@ -221,7 +225,7 @@ impl ExecutionContext {
 
     pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
         if self.restricted_mesh_turn() {
-            return false;
+            return self.confined_mesh_read && name == "read_tool";
         }
         // The delegation orchestrator and routing tools can outlive this turn.
         // Until they preserve its origin, do not let them borrow host authority.
