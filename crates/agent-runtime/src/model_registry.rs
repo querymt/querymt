@@ -172,11 +172,8 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
     let registry = config.provider.plugin_registry();
     registry.load_all_plugins().await;
 
-    let factories = registry.list();
-    let provider_names: Vec<String> = factories
-        .iter()
-        .map(|factory| factory.name().to_string())
-        .collect();
+    let factories = registry.list_bindings();
+    let provider_names: Vec<_> = factories.iter().map(|(name, _)| name.as_str()).collect();
     log::debug!(
         "enumerate_local_models: loaded {} providers: {:?}",
         provider_names.len(),
@@ -185,10 +182,9 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
 
     let futures: Vec<_> = factories
         .into_iter()
-        .map(|factory| {
+        .map(|(provider_name, factory)| {
             let config = config.clone();
             async move {
-                let provider_name = factory.name().to_string();
                 let mut models = fetch_catalog_models(&config, &provider_name).await;
                 let catalog_count = models.len();
 

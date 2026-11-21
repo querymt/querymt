@@ -273,12 +273,24 @@ mod access {
         router: &querymt_remote::mesh_ingress::InboundRouter,
         store: Arc<dyn querymt_remote::peer_access::quota::QuotaStore>,
         actor: &kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
-        inventory: crate::model_inventory::ModelInventory,
+        handle: &LocalAgentHandle,
     ) {
-        use crate::agent::remote::node_manager::GetPeerSharing;
+        use crate::agent::remote::node_manager::{GetPeerSharing, PeerAccessInvalidated};
         use crate::error::AgentError;
         use querymt_remote::mesh_ingress::{InboundAccess, PeerRequest};
 
+        let notifications = handle.ext_notifications.clone();
+        router.register_v1_ask::<crate::agent::remote::RemoteNodeManager, PeerAccessInvalidated, _, _, _, _>(
+            actor.id(), InboundAccess::PeerAccess, move |peer: PeerRequest, reason: PeerAccessInvalidated| {
+                let notifications = notifications.clone();
+                async move {
+                    notify(&notifications, &peer.key().peer, "incoming", reason);
+                    Ok::<_, AgentError>(())
+                }
+            },
+        );
+
+        let inventory = handle.model_inventory.clone();
         router.register_v1_ask::<crate::agent::remote::RemoteNodeManager, GetPeerSharing, _, _, _, _>(
             actor.id(), InboundAccess::PeerAccess, move |peer: PeerRequest, _| {
                 let store = store.clone();
@@ -305,6 +317,53 @@ mod access {
                 }
             },
         );
+    }
+
+    fn notify(
+        sender: &tokio::sync::broadcast::Sender<ExtNotification>,
+        peer: &NodeId,
+        direction: &'static str,
+        reason: crate::agent::remote::node_manager::PeerAccessInvalidated,
+    ) {
+        let params = json!({"version": 1, "peer_id": peer.to_string(), "direction": direction, "reason": reason.as_str()});
+        if let Ok(params) = serde_json::value::to_raw_value(&params) {
+            let _ = sender.send(ExtNotification::new(
+                crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED,
+                Arc::from(params),
+            ));
+        }
+    }
+
+    fn notify_peer(
+        mesh: querymt_remote::MeshHandle,
+        peer: NodeId,
+        reason: crate::agent::remote::node_manager::PeerAccessInvalidated,
+    ) {
+        use crate::agent::remote::{
+            MeshRuntimeHandle, RemoteNodeManager, scope::scoped_node_manager_for_peer,
+        };
+        use querymt_remote::request_timeout::ask_sharing_v1;
+        tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(3);
+            let _ = tokio::time::timeout(timeout, async {
+                let runtime = MeshRuntimeHandle::from(mesh.clone());
+                for scope in runtime.active_scopes() {
+                    let name = scoped_node_manager_for_peer(&scope, peer.as_peer_id());
+                    if let Ok(Some(manager)) = runtime
+                        .lookup_actor_no_retry::<RemoteNodeManager>(name)
+                        .await
+                        && manager.id().peer_id() == Some(peer.as_peer_id())
+                    {
+                        let _ = ask_sharing_v1::<_, _, (), crate::error::AgentError>(
+                            &mesh, &manager, &reason, timeout,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            })
+            .await;
+        });
     }
 
     async fn incoming(
@@ -481,24 +540,22 @@ mod access {
                     .replace_grant(&key, expected, grant)
                     .await
                     .map_err(grant_error)?;
-                (state.revision != expected).then_some("policy")
+                (state.revision != expected)
+                    .then_some(crate::agent::remote::node_manager::PeerAccessInvalidated::Policy)
             }
             Some(Edit::Quota(expected, scope, edit)) => {
                 let revision = store
                     .edit_quota(&key, expected, &scope, edit, now)
                     .await
                     .map_err(|error| quota_error(error, Some(&scope)))?;
-                (revision != expected).then_some("quota")
+                (revision != expected)
+                    .then_some(crate::agent::remote::node_manager::PeerAccessInvalidated::Quota)
             }
             None => None,
         };
         if let Some(reason) = change {
-            let params = serde_json::value::to_raw_value(&json!({"version": 1, "peer_id": peer_id, "direction": "outgoing", "reason": reason}))
-                .map_err(Error::into_internal_error)?;
-            agent.broadcast_ext_notification(ExtNotification::new(
-                crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED,
-                Arc::from(params),
-            ));
+            notify(&agent.ext_notifications, &key.peer, "outgoing", reason);
+            notify_peer(mesh.clone(), key.peer.clone(), reason);
         }
         let (state, statuses) = store
             .access_snapshot(&key, now)

@@ -98,7 +98,7 @@ pub use remote_impl::{
 };
 
 #[cfg(feature = "remote")]
-pub(crate) use remote_impl::GetPeerSharing;
+pub(crate) use remote_impl::{GetPeerSharing, PeerAccessInvalidated};
 
 #[cfg(feature = "remote")]
 mod remote_impl {
@@ -134,6 +134,26 @@ mod remote_impl {
 
     impl kameo::remote::RemoteMessage<GetPeerSharing> for RemoteNodeManager {
         const REMOTE_ID: &'static str = "querymt::GetPeerSharing.v1";
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum PeerAccessInvalidated {
+        Policy,
+        Quota,
+    }
+
+    impl PeerAccessInvalidated {
+        pub(crate) const fn as_str(self) -> &'static str {
+            match self {
+                Self::Policy => "policy",
+                Self::Quota => "quota",
+            }
+        }
+    }
+
+    impl kameo::remote::RemoteMessage<PeerAccessInvalidated> for RemoteNodeManager {
+        const REMOTE_ID: &'static str = "querymt::PeerAccessInvalidated.v1";
     }
 
     /// Create a new session on this node.

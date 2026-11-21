@@ -93,7 +93,7 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
             router,
             store.clone(),
             &node_manager_ref,
-            handle.model_inventory.clone(),
+            handle,
         );
     }
 
