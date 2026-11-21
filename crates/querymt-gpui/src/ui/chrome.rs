@@ -167,6 +167,7 @@ impl QmtApp {
             Page::Mesh => "Mesh",
             Page::Automations => "Automations",
             Page::Session => "Session",
+            Page::Setup => "Setup",
             Page::Settings => "Settings",
         };
         let slot = self.header_slot(&p, cx);

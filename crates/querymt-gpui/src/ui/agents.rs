@@ -51,7 +51,7 @@ impl QmtApp {
         cx.notify();
     }
 
-    fn open_edit_dialog(
+    pub(super) fn open_edit_dialog(
         &mut self,
         config: &AgentConfig,
         window: &mut Window,
@@ -634,6 +634,8 @@ impl QmtApp {
                                 this.page = Page::Start;
                                 this.store.update(cx, |s, cx| s.reset_app_data(cx));
                                 this.apply_theme(window, cx);
+                                // Like a fresh install: setup opens once agents settle.
+                                this.watch_first_run(cx);
                             }),
                         )),
                 );

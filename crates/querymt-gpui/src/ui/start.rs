@@ -811,8 +811,10 @@ impl QmtApp {
                     )),
             );
 
-        // ---- no agent yet
-        let no_agent = agent.is_none().then(|| {
+        // ---- setup left to finish; it covers a missing agent too
+        let checklist = self.setup_checklist(&p, cx);
+        // ---- no agent yet (while agents are still connecting)
+        let no_agent = (agent.is_none() && checklist.is_none()).then(|| {
             let (title, detail) = if !connecting.is_empty() {
                 (
                     format!("Connecting to {}…", connecting.join(", ")),
@@ -1183,6 +1185,7 @@ impl QmtApp {
                             .items_center()
                             .gap_6()
                             .child(heading)
+                            .children(checklist)
                             .children(no_agent)
                             .children(banner)
                             .children(started_note),
@@ -1299,54 +1302,25 @@ impl QmtApp {
             })
     }
 
-    /// Model picker modal: search, "Recent", then models grouped by provider.
-    /// Model picker modal (shared by Start and the session composer): search +
-    /// refresh, "Recent", models grouped by provider with context size, input
-    /// modalities and mesh node, then the reasoning-effort control and Done.
-    pub(super) fn render_model_modal(
-        &mut self,
-        radii: Corners<Pixels>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.model_open {
-            return None;
-        }
+    /// The picker's rows: "Recent", then models grouped by provider (and
+    /// node), with context size, modalities and mesh node. Shared by the
+    /// model picker and setup.
+    pub(super) fn model_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = *palette(cx);
         let searching = !self.model_query.read(cx).value().trim().is_empty();
         let sections = self.model_sections(cx);
-        let agent = self.picker_agent(cx)?;
-        let in_session = self.page == Page::Session;
+        let Some(agent) = self.picker_agent(cx) else {
+            return Vec::new();
+        };
         let store = self.store.read(cx);
         let refreshing = store
             .runtime(&agent)
             .is_some_and(|rt| rt.pending.contains("models"));
         // Selection keys: the same model on two machines is two rows.
-        let selected = if in_session {
+        let selected = if self.page == Page::Session {
             store.session_model_key()
         } else {
             store.launch_model(&agent).map(Model::key)
-        };
-        // Reasoning effort: the session's config option, or the launch preference on Start.
-        let reasoning: Option<ReasoningControl> = if in_session {
-            store.session.as_ref().and_then(|v| {
-                let r = v.reasoning_option()?;
-                Some(ReasoningControl {
-                    config_id: Some(r.id.clone()),
-                    current: r.current.clone(),
-                    choices: r.choices.clone(),
-                    pending: v.pending_options.contains(&r.id),
-                })
-            })
-        } else {
-            Some(ReasoningControl {
-                config_id: None,
-                current: store.prefs.reasoning().to_string(),
-                choices: LAUNCH_REASONING
-                    .iter()
-                    .map(|(v, l, _)| (v.to_string(), l.to_string()))
-                    .collect(),
-                pending: false,
-            })
         };
         let total: usize = sections.iter().map(|(_, m)| m.len()).sum();
 
@@ -1536,6 +1510,79 @@ impl QmtApp {
                     .into_any_element(),
             );
         }
+        rows
+    }
+
+    /// Search field with the refresh button, above the model rows.
+    pub(super) fn model_search(&self, agent: &str, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let refreshing = self
+            .store
+            .read(cx)
+            .runtime(agent)
+            .is_some_and(|rt| rt.pending.contains("models"));
+        let agent = agent.to_owned();
+        h_flex()
+            .pl_2p5()
+            .pr_1()
+            .rounded(px(10.))
+            .bg(p.card)
+            .border_1()
+            .border_color(p.border)
+            .child(kit::icon(IconName::Search, 15., p.dim))
+            .child(Input::new(&self.model_query).appearance(false).flex_1())
+            .child(if refreshing {
+                div()
+                    .p_1()
+                    .child(kit::spinner("models-refreshing", 14., p.muted))
+                    .into_any_element()
+            } else {
+                kit::icon_button("model-refresh", IconName::RefreshCw, "Refresh models")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |s, cx| s.refresh_models(&agent, cx))
+                    }))
+                    .into_any_element()
+            })
+    }
+
+    /// Model picker modal (shared by Start and the session composer): search +
+    /// refresh, "Recent", models grouped by provider with context size, input
+    /// modalities and mesh node, then the reasoning-effort control and Done.
+    pub(super) fn render_model_modal(
+        &mut self,
+        radii: Corners<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.model_open {
+            return None;
+        }
+        let p = *palette(cx);
+        let agent = self.picker_agent(cx)?;
+        let in_session = self.page == Page::Session;
+        let rows = self.model_rows(cx);
+        let search = self.model_search(&agent, &p, cx);
+        let store = self.store.read(cx);
+        // Reasoning effort: the session's config option, or the launch preference on Start.
+        let reasoning: Option<ReasoningControl> = if in_session {
+            store.session.as_ref().and_then(|v| {
+                let r = v.reasoning_option()?;
+                Some(ReasoningControl {
+                    config_id: Some(r.id.clone()),
+                    current: r.current.clone(),
+                    choices: r.choices.clone(),
+                    pending: v.pending_options.contains(&r.id),
+                })
+            })
+        } else {
+            Some(ReasoningControl {
+                config_id: None,
+                current: store.prefs.reasoning().to_string(),
+                choices: LAUNCH_REASONING
+                    .iter()
+                    .map(|(v, l, _)| (v.to_string(), l.to_string()))
+                    .collect(),
+                pending: false,
+            })
+        };
 
         // Segmented control like the Options popover: one pill per effort level,
         // with the selected level's description underneath.
@@ -1598,7 +1645,6 @@ impl QmtApp {
             this.model_open = false;
             cx.notify();
         };
-        let agent_for_refresh = agent.clone();
         let card = v_flex()
             .id("model-card")
             .w(px(620.))
@@ -1635,33 +1681,7 @@ impl QmtApp {
                             .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                     ),
             )
-            .child(
-                div().px_4().child(
-                    h_flex()
-                        .pl_2p5()
-                        .pr_1()
-                        .rounded(px(10.))
-                        .bg(p.card)
-                        .border_1()
-                        .border_color(p.border)
-                        .child(kit::icon(IconName::Search, 15., p.dim))
-                        .child(Input::new(&self.model_query).appearance(false).flex_1())
-                        .child(if refreshing {
-                            div()
-                                .p_1()
-                                .child(kit::spinner("models-refreshing", 14., p.muted))
-                                .into_any_element()
-                        } else {
-                            kit::icon_button("model-refresh", IconName::RefreshCw, "Refresh models")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |s, cx| {
-                                        s.refresh_models(&agent_for_refresh, cx)
-                                    })
-                                }))
-                                .into_any_element()
-                        }),
-                ),
-            )
+            .child(div().px_4().child(search))
             .child(
                 v_flex()
                     .id("model-list")

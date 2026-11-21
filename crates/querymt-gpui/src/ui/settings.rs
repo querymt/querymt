@@ -403,7 +403,7 @@ impl QmtApp {
             SettingsTab::General => self.settings_general(&p, cx).into_any_element(),
             SettingsTab::Appearance => self.settings_appearance(&p, cx).into_any_element(),
             SettingsTab::Keybindings => self.settings_keys(&p, cx).into_any_element(),
-            SettingsTab::Providers => self.settings_providers(&p, cx).into_any_element(),
+            SettingsTab::Providers => self.settings_providers(false, &p, cx).into_any_element(),
             SettingsTab::Profiles => self.settings_profiles(&p, cx).into_any_element(),
         };
         let (title, desc) = TABS
@@ -592,14 +592,27 @@ impl QmtApp {
             p,
         );
 
+        let setup = settings_card(p).child(simple_row(
+            "Setup",
+            "Walk through appearance, agent, providers and model again.",
+            flat_btn("run-setup", true, true, p)
+                .child("Run setup again")
+                .on_click(cx.listener(|this, _, _, cx| this.open_setup(None, cx))),
+            true,
+            p,
+        ));
+
         v_flex()
             .gap(px(12.8))
             .child(sidebar)
+            .child(setup)
             .child(advanced)
             .child(danger)
     }
 
-    fn settings_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Theme mode cards and accent swatches (desktop `AppearanceControls`),
+    /// shared by Settings and setup.
+    pub(super) fn appearance_controls(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let prefs = self.store.read(cx).prefs.clone();
         let accent = if prefs.accent.is_empty() {
             "orange".to_string()
@@ -678,15 +691,31 @@ impl QmtApp {
                             this.apply_theme(window, cx);
                         }))
                 }));
-        let accent_card = settings_card(p)
-            .child(simple_row(
+
+        v_flex()
+            .gap(px(12.8))
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_heading(
+                        "Application theme",
+                        "Follow the system or pick a fixed theme.",
+                        p,
+                    ))
+                    .child(theme_cards),
+            )
+            .child(settings_card(p).child(simple_row(
                 "Accent color",
                 "Highlights buttons, prompts and selections. Applies instantly.",
                 swatches,
                 true,
                 p,
-            ))
-            .child(simple_row(
+            )))
+    }
+
+    fn settings_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let prefs = self.store.read(cx).prefs.clone();
+        let motion_card = settings_card(p).child(simple_row(
                 "Fade in streamed text",
                 "Replies and reasoning fade in word by word as they arrive. Off when the system reduces motion.",
                 kit::switch("sw-stream-fade")
@@ -696,7 +725,7 @@ impl QmtApp {
                         this.store
                             .update(cx, |s, cx| s.update_prefs(|p| p.stream_fade = Some(v), cx));
                     })),
-                false,
+                true,
                 p,
             ));
 
@@ -798,17 +827,8 @@ impl QmtApp {
 
         v_flex()
             .gap(px(12.8))
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_heading(
-                        "Application theme",
-                        "Follow the system or pick a fixed theme.",
-                        p,
-                    ))
-                    .child(theme_cards),
-            )
-            .child(accent_card)
+            .child(self.appearance_controls(p, cx))
+            .child(motion_card)
             .child(scroll)
     }
 
@@ -941,7 +961,14 @@ impl QmtApp {
             }))
     }
 
-    fn settings_providers(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Provider sign-in and API keys; `list_only` (setup) leaves out the
+    /// overview and maintenance.
+    pub(super) fn settings_providers(
+        &self,
+        list_only: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let store = self.store.read(cx);
         let not_running = |p: &Palette| {
             panel(p)
@@ -1635,7 +1662,7 @@ impl QmtApp {
 
         v_flex()
             .gap(px(12.8))
-            .child(overview)
+            .when(!list_only, |el| el.child(overview))
             .when_some(error, |el, err| {
                 let a = agent.clone();
                 el.child(
@@ -1658,7 +1685,7 @@ impl QmtApp {
                 )
             })
             .child(list)
-            .child(maintenance_el)
+            .when(!list_only, |el| el.child(maintenance_el))
             .into_any_element()
     }
 
@@ -1941,10 +1968,7 @@ impl ProviderState {
 
 /// Desktop `providerConnectionState`.
 fn provider_state(pr: &ProviderAuth) -> ProviderState {
-    if matches!(pr.oauth_status.as_deref(), Some("connected"))
-        || pr.has_stored_api_key
-        || pr.has_env_api_key
-    {
+    if pr.usable() {
         ProviderState::Connected
     } else if pr.oauth_status.as_deref() == Some("expired") {
         ProviderState::Attention
