@@ -131,7 +131,16 @@ impl Mesh {
 impl MeshRuntime {
     /// Starts or reuses the process-wide shared mesh runtime.
     pub async fn shared(spec: MeshSpec) -> Result<Self> {
-        let runtime = runtime::start_shared_runtime(spec, crate::mesh_access::open_store).await?;
+        let identity_file = match &spec {
+            MeshSpec::Toml(config) => config
+                .identity_file
+                .as_deref()
+                .map(std::path::PathBuf::from),
+            _ => None,
+        };
+        let runtime =
+            runtime::start_shared_runtime(spec, crate::mesh_access::open_store(identity_file))
+                .await?;
         Ok(Self { runtime })
     }
 

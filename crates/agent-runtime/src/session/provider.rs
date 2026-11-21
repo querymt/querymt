@@ -92,11 +92,9 @@ pub struct SessionProvider {
     /// Passed through to `build_provider` to enable `MeshChatProvider`
     /// routing and mesh-fallback discovery.
     ///
-    /// Uses `ArcSwap` so the mesh can be injected *after* the
-    /// `Arc<SessionProvider>` is already shared (e.g. via `AgentHandle::set_mesh`
-    /// which is called after `AgentConfigBuilder::build()`). Lock-free reads.
+    /// A watch lets deferred peer work wake when policy becomes available.
     #[cfg(feature = "remote")]
-    mesh: Arc<arc_swap::ArcSwapOption<crate::agent::remote::MeshHandle>>,
+    pub(crate) mesh: tokio::sync::watch::Sender<Option<Arc<crate::agent::remote::MeshHandle>>>,
     /// Whether to scan the mesh when a provider is missing locally and
     /// `provider_node_id` is not explicitly set. Defaults to false.
     #[cfg(feature = "remote")]
@@ -118,7 +116,7 @@ impl SessionProvider {
             cached_provider: Arc::new(ArcSwap::from_pointee(None)),
             agent_id: None,
             #[cfg(feature = "remote")]
-            mesh: Arc::new(arc_swap::ArcSwapOption::empty()),
+            mesh: tokio::sync::watch::Sender::new(None),
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::new(AtomicBool::new(false)),
         }
@@ -157,19 +155,11 @@ impl SessionProvider {
     /// `Arc<SessionProvider>` is shared), use `set_mesh` instead.
     #[cfg(feature = "remote")]
     pub fn with_mesh(self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
-        match mesh {
-            Some(m) => self.mesh.store(Some(Arc::new(m))),
-            None => self.mesh.store(None),
-        }
+        self.set_mesh(mesh);
         self
     }
 
     /// Inject or replace the mesh handle after construction.
-    ///
-    /// Because `mesh` uses `ArcSwapOption`, this works even when the
-    /// `SessionProvider` is already shared behind an `Arc`. All clones of
-    /// this `SessionProvider` share the same `Arc` and therefore see the update
-    /// immediately — no restart or rebuild is required.
     ///
     /// Called by `AgentHandle::set_mesh` so that sessions created by a
     /// `RemoteNodeManager` (which holds `Arc<AgentConfig>` with this provider)
@@ -177,12 +167,12 @@ impl SessionProvider {
     /// after the config was built.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: Option<crate::agent::remote::MeshHandle>) {
-        self.mesh.store(mesh.map(Arc::new));
+        self.mesh.send_replace(mesh.map(Arc::new));
     }
 
     #[cfg(feature = "remote")]
     pub(crate) fn mesh_handle(&self) -> Option<Arc<crate::agent::remote::MeshHandle>> {
-        self.mesh.load_full()
+        self.mesh.borrow().clone()
     }
 
     /// Enable/disable automatic mesh fallback when `provider_node_id` is not set.
@@ -274,7 +264,7 @@ impl SessionProvider {
             }
             #[cfg(feature = "remote")]
             {
-                if self.mesh.load().is_some() {
+                if self.mesh.borrow().is_some() {
                     builder = builder.has_mesh(true);
                 }
             }
@@ -510,7 +500,7 @@ impl SessionProvider {
                 node == LOCAL_PROVIDER_NODE
                     || self
                         .mesh
-                        .load()
+                        .borrow()
                         .as_deref()
                         .is_some_and(|mesh| mesh.peer_id().to_string() == node)
             });
@@ -526,7 +516,7 @@ impl SessionProvider {
                     provider_name, node_id
                 )));
             }
-            let mesh_guard = self.mesh.load();
+            let mesh_guard = self.mesh_handle();
             let mesh = mesh_guard.as_deref().ok_or_else(|| {
                 SessionError::InvalidOperation(format!(
                     "provider_node_id='{}' specified but no mesh handle available",
@@ -578,7 +568,7 @@ impl SessionProvider {
             Err(local_error) => {
                 // ── Case 3: Not available locally → optional mesh fallback ─────
                 let allow_mesh_fallback = self.allow_mesh_fallback.load(Ordering::Relaxed);
-                let mesh_guard = self.mesh.load();
+                let mesh_guard = self.mesh_handle();
                 let mesh_handle = mesh_guard.as_deref();
 
                 if !explicitly_local
@@ -778,7 +768,7 @@ impl Clone for SessionProvider {
             agent_id: self.agent_id.clone(),
             // Share the same Arcs/atomics so all clones see runtime updates.
             #[cfg(feature = "remote")]
-            mesh: Arc::clone(&self.mesh),
+            mesh: self.mesh.clone(),
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::clone(&self.allow_mesh_fallback),
         }
@@ -962,8 +952,7 @@ impl SessionHandle {
                     node != LOCAL_PROVIDER_NODE
                         && self
                             .provider
-                            .mesh
-                            .load()
+                            .mesh_handle()
                             .as_deref()
                             .is_none_or(|mesh| mesh.peer_id().to_string() != node)
                 })
@@ -1017,7 +1006,7 @@ impl SessionHandle {
                 .await?;
                 #[cfg(feature = "remote")]
                 if let Some(peer) = &self.mesh_turn {
-                    let mesh = self.provider.mesh.load_full().ok_or_else(|| {
+                    let mesh = self.provider.mesh_handle().ok_or_else(|| {
                         SessionError::InvalidOperation("mesh access store unavailable".into())
                     })?;
                     let store = mesh

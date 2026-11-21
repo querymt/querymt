@@ -272,6 +272,8 @@ pub struct SchedulerActor {
 
     // Runtime state (rebuilt from schedule_store on startup)
     deadline_queue: DeadlineQueue,
+    #[cfg(feature = "remote")]
+    waiting_for_policy: HashSet<String>,
     event_counters: HashMap<String, EventAccumulator>,
     active_cycles: HashMap<String, ActiveCycle>,
     /// Schedules marked for deletion while running. Cleaned up after terminal event.
@@ -575,6 +577,8 @@ impl SchedulerActor {
             scheduler_config,
             owner_id,
             deadline_queue: DeadlineQueue::new(),
+            #[cfg(feature = "remote")]
+            waiting_for_policy: HashSet::new(),
             event_counters: HashMap::new(),
             active_cycles: HashMap::new(),
             pending_deletes: HashSet::new(),
@@ -708,7 +712,13 @@ impl SchedulerActor {
             shutdown_token,
         );
         Self::start_event_subscription_loop(actor_ref, agent_config, shutdown_token);
-        Self::start_reconciliation_loop(actor_ref, scheduler_config, shutdown_token);
+        Self::start_reconciliation_loop(
+            actor_ref,
+            scheduler_config,
+            shutdown_token,
+            #[cfg(feature = "remote")]
+            agent_config.provider.mesh.subscribe(),
+        );
         // Deadline wakes are handled by `reschedule_wake()` inside the actor
         // (triggered via the SetSelfRef message after spawn).
     }
@@ -817,6 +827,9 @@ impl SchedulerActor {
         actor_ref: &ActorRef<Self>,
         scheduler_config: &SchedulerConfig,
         shutdown_token: &CancellationToken,
+        #[cfg(feature = "remote")] mut mesh: tokio::sync::watch::Receiver<
+            Option<Arc<querymt_remote::MeshHandle>>,
+        >,
     ) {
         let interval_secs = scheduler_config.reconcile_interval_secs;
         let actor = actor_ref.clone();
@@ -828,6 +841,13 @@ impl SchedulerActor {
 
             loop {
                 tokio::select! {
+                    _ = async {
+                        #[cfg(feature = "remote")]
+                        if mesh.changed().await.is_ok() {
+                            return;
+                        }
+                        std::future::pending::<()>().await;
+                    } => {}
                     _ = interval.tick() => {}
                     _ = token.cancelled() => {
                         debug!("SchedulerActor: reconciliation loop cancelled by shutdown token");
@@ -1003,13 +1023,8 @@ impl SchedulerActor {
                 .mesh_handle()
                 .is_some_and(|mesh| mesh.quota_store().is_some())
         {
-            // Startup may restore armed jobs before installing mesh policy.
-            // Retry without starting the cycle or consuming a failure.
-            self.deadline_queue.insert(
-                OffsetDateTime::now_utc() + time::Duration::seconds(1),
-                schedule_public_id.to_owned(),
-            );
-            self.reschedule_wake().await;
+            self.waiting_for_policy
+                .insert(schedule_public_id.to_owned());
             return;
         }
 
@@ -1473,6 +1488,8 @@ impl SchedulerActor {
         }
 
         // Remove from in-memory queues
+        #[cfg(feature = "remote")]
+        self.waiting_for_policy.remove(schedule_public_id);
         self.deadline_queue.remove(schedule_public_id);
         self.event_counters.remove(schedule_public_id);
         self.metrics.armed_interval_schedules = self.deadline_queue.len() as u64;
@@ -1521,6 +1538,8 @@ impl SchedulerActor {
         }
 
         // Remove from in-memory queues
+        #[cfg(feature = "remote")]
+        self.waiting_for_policy.remove(schedule_public_id);
         self.deadline_queue.remove(schedule_public_id);
         if let Some(acc) = self.event_counters.get_mut(schedule_public_id) {
             acc.reset();
@@ -1744,6 +1763,18 @@ impl SchedulerActor {
                     )
                     .await;
                 }
+            }
+        }
+
+        #[cfg(feature = "remote")]
+        if self
+            .config
+            .provider
+            .mesh_handle()
+            .is_some_and(|mesh| mesh.quota_store().is_some())
+        {
+            for id in std::mem::take(&mut self.waiting_for_policy) {
+                self.fire_schedule(&id).await;
             }
         }
 

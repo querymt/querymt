@@ -75,7 +75,7 @@ fn recovery_transport_accepts_only_loopback_websocket_peers() {
 #[tokio::test]
 async fn plain_websocket_connections_share_the_mesh_access_contract() {
     use crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED;
-    use crate::agent::remote::bootstrap_mesh_runtime;
+    use crate::mesh_access::bootstrap_mesh_runtime;
     use futures_util::{SinkExt, StreamExt};
     use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
     use serde_json::{Value, json};

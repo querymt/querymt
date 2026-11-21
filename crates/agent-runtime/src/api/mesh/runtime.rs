@@ -2,10 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use querymt_remote::peer_access::quota::QuotaStore;
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
 
 use super::runtime_config::{MeshRuntimeConfig, from_toml_config};
@@ -26,7 +23,7 @@ static SHARED_MESH: OnceLock<OnceCell<SharedMeshState>> = OnceLock::new();
 /// when starting a new runtime, not on reuse or a configuration mismatch.
 pub async fn start_shared_runtime(
     spec: MeshSpec,
-    initialize_store: impl AsyncFnOnce(Option<PathBuf>) -> Result<Arc<dyn QuotaStore>, MeshError>,
+    store: impl Future<Output = Result<Arc<dyn QuotaStore>, MeshError>>,
 ) -> Result<MeshRuntimeHandle> {
     // The public API exposes a singleton shared remote runtime, so repeat starts must
     // either reuse an equivalent config or fail with a clear mismatch error.
@@ -42,8 +39,7 @@ pub async fn start_shared_runtime(
         .get_or_try_init(|| {
             let requested_cfg = requested_cfg.clone();
             async move {
-                let store = initialize_store(requested_cfg.identity_file.clone()).await?;
-                let runtime = bootstrap_mesh_runtime(&requested_cfg, store).await?;
+                let runtime = bootstrap_mesh_runtime(&requested_cfg, store.await?).await?;
                 Ok::<SharedMeshState, anyhow::Error>(SharedMeshState {
                     runtime,
                     config: requested_cfg,

@@ -23,13 +23,13 @@ use std::{path::PathBuf, sync::Arc};
 /// - `invite` - a decoded `SignedInviteGrant` (signature verified offline)
 /// - `identity_file` - optional path to the persistent ed25519 identity file
 /// - `iroh_gso` - whether to enable GSO on the actor endpoint
-/// - `initialize_store` - opens and reconciles the policy store for this identity after invite verification
+/// - `store` - policy store, awaited only after invite verification
 pub async fn join_mesh_via_invite(
     invite: &crate::agent::remote::invite::SignedInviteGrant,
     identity_file: Option<PathBuf>,
     iroh_gso: bool,
     iroh_dns: Option<querymt_remote::IrohDnsConfig>,
-    initialize_store: impl AsyncFnOnce(Option<PathBuf>) -> Result<Arc<dyn QuotaStore>, MeshError>,
+    store: impl Future<Output = Result<Arc<dyn QuotaStore>, MeshError>>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
     use crate::agent::remote::invite::{PeerEntry, mesh_id_for};
     use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
@@ -61,8 +61,7 @@ pub async fn join_mesh_via_invite(
         peers: Vec::new(),
         auto_fallback: false,
     };
-    let store = initialize_store(config.identity_file.clone()).await?;
-    let runtime = super::bootstrap_mesh_runtime(&config, store).await?;
+    let runtime = super::bootstrap_mesh_runtime(&config, store.await?).await?;
     let mesh = runtime.as_mesh_handle();
     let mesh_state = mesh
         .mesh_state_store()

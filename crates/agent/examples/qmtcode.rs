@@ -614,7 +614,7 @@ async fn run(
     #[cfg(feature = "remote")]
     if let Some(ref token) = cli.mesh_join {
         use querymt_agent::agent::remote::invite::SignedInviteGrant;
-        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_dns;
+        use querymt_agent::mesh_access::join_mesh_via_invite_with_dns;
 
         let invite =
             SignedInviteGrant::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
@@ -666,10 +666,10 @@ async fn run(
     if let Some(ref mesh_addr) = effective_mesh
         && cli.mesh_join.is_none()
     {
-        use querymt_agent::agent::remote::bootstrap_mesh_runtime;
         use querymt_agent::agent::remote::{
             IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
         };
+        use querymt_agent::mesh_access::bootstrap_mesh_runtime;
 
         let mut iroh_scopes = load_stored_iroh_scopes()?;
         if cli.mesh_invite.is_some() && iroh_scopes.is_empty() {

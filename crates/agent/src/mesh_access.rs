@@ -77,12 +77,14 @@ pub async fn join_mesh_via_invite_with_dns(
     iroh_gso: bool,
     iroh_dns: Option<IrohDnsConfig>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
-    mesh::join_mesh_via_invite(invite, identity_file, iroh_gso, iroh_dns, open_store).await
+    let store = open_store(identity_file.clone());
+    mesh::join_mesh_via_invite(invite, identity_file, iroh_gso, iroh_dns, store).await
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::remote::mesh::join_mesh_via_invite_with_dns;
+    use super::join_mesh_via_invite_with_dns;
+
     use querymt_remote::invite::InviteStore;
 
     use super::{NodeId, SqliteMeshAccess, open_store};
