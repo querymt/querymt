@@ -1708,7 +1708,6 @@ mod tests {
         let message = ChatMessage::from_tool_change(ToolChange {
             added: vec![sample_tool("deploy"), sample_tool("skill")],
             removed: vec!["old".into()],
-            ..ToolChange::default()
         });
         assert!(message.has_tool_change());
         let json = serde_json::to_string(&message).unwrap();
@@ -1721,29 +1720,11 @@ mod tests {
     }
 
     #[test]
-    fn baseline_round_trips_and_plain_changes_omit_the_baseline_fields() {
-        let baseline = ChatMessage::from_tool_change(ToolChange::baseline(
-            vec![sample_tool("deploy")],
-            "anthropic/claude-sonnet-5-5",
-        ));
-        let json = serde_json::to_string(&baseline).unwrap();
-        let back: ChatMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, baseline);
-        let change = back.input().unwrap()[0].as_tool_change().unwrap();
-        assert!(change.baseline && change.removed.is_empty());
-        assert_eq!(
-            change.origin.as_deref(),
-            Some("anthropic/claude-sonnet-5-5")
-        );
-
-        let plain = serde_json::to_string(&ToolChange::new(Vec::new(), vec!["x".into()])).unwrap();
-        assert!(
-            !plain.contains("baseline") && !plain.contains("origin"),
-            "{plain}"
-        );
-        // A record written before the fields existed still loads.
-        let old: ToolChange = serde_json::from_str(r#"{"added":[],"removed":["x"]}"#).unwrap();
-        assert!(!old.baseline && old.origin.is_none());
+    fn tool_change_has_no_fields_besides_the_definitions_and_names() {
+        // The type crosses the plugin boundary: only what a provider is sent
+        // belongs on it.
+        let json = serde_json::to_value(ToolChange::new(Vec::new(), vec!["x".into()])).unwrap();
+        assert_eq!(json, serde_json::json!({"added": [], "removed": ["x"]}));
     }
 
     #[test]
@@ -1753,7 +1734,6 @@ mod tests {
             ChatMessage::from_tool_change(ToolChange {
                 added: vec![sample_tool("deploy")],
                 removed: Vec::new(),
-                ..ToolChange::default()
             }),
         ];
         let err = reject_tool_changes("acme", &messages).unwrap_err();

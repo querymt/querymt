@@ -1100,27 +1100,32 @@ impl SessionHandle {
 
     /// Get the session history converted to standard ChatMessages for the LLM.
     pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
-        let agent_msgs = self.get_effective_agent_history().await?;
-        self.project_history(&agent_msgs)
+        Ok(self.history_view().await?.messages)
     }
 
-    /// Effective history, its compaction summaries, the content of the most
-    /// recent stored `agent_mode` notice, and the number of user turns in it.
-    /// A `ChatMessage` does not carry its notice source, so the last two are
-    /// read here from the stored messages.
-    pub(crate) async fn history_with_notice_state(
-        &self,
-    ) -> SessionResult<(
-        Vec<ChatMessage>,
-        Vec<ChatMessage>,
-        Option<std::sync::Arc<str>>,
-        usize,
-    )> {
+    /// The effective history as a run reads it (see [`HistoryView`]).
+    pub(crate) async fn history_view(&self) -> SessionResult<HistoryView> {
         let agent_msgs = self.get_effective_agent_history().await?;
+        self.view_of(agent_msgs)
+    }
+
+    /// The view of an effective history that is already loaded. Every place
+    /// that turns stored messages into a run's history goes through here, so
+    /// they agree on what is sent and on what is read next to it.
+    pub(crate) fn view_of(&self, mut agent_msgs: Vec<AgentMessage>) -> SessionResult<HistoryView> {
+        // A baseline has no chat form: it is taken out before the projection.
+        let tool_baseline =
+            querymt_agent_core::history::take_tool_baseline(&mut agent_msgs).map(Arc::new);
         let messages = self.project_history(&agent_msgs)?;
         let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
         let turns = user_turns(&agent_msgs, &messages);
-        Ok((messages, summaries, last_mode_notice(&agent_msgs), turns))
+        Ok(HistoryView {
+            messages,
+            summaries,
+            mode_notice: last_mode_notice(&agent_msgs),
+            tool_baseline,
+            turns,
+        })
     }
 
     fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
@@ -1416,7 +1421,7 @@ pub(crate) fn record_auth_source(source: AuthSource) {
 
 /// True when `error` means stored OAuth tokens could not be refreshed.
 /// Content of the most recent `agent_mode` notice in `messages`.
-pub(crate) fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
+fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
     messages
         .iter()
         .rev()
@@ -1430,6 +1435,25 @@ pub(crate) fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
         })
 }
 
+/// What a load of a session's stored history gives a run: the messages a
+/// request is built from and what is read from the stored parts next to them.
+/// A `ChatMessage` carries neither a notice's source nor a tool baseline, so
+/// those are read here.
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryView {
+    /// The projected messages. They hold no tool baseline and no tool change
+    /// from before the baseline in effect.
+    pub messages: Vec<ChatMessage>,
+    /// The compaction summaries among `messages`.
+    pub summaries: Vec<ChatMessage>,
+    /// Content of the most recent stored `agent_mode` notice.
+    pub mode_notice: Option<Arc<str>>,
+    /// The tool baseline in effect (the most recent one stored).
+    pub tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
+    /// The number of user turns.
+    pub turns: usize,
+}
+
 /// User turns in a history: user messages that carry no tool result and are
 /// not made only of harness notices. `messages` is the one-to-one projection
 /// of `agent_msgs`.
@@ -1440,12 +1464,7 @@ fn user_turns(agent_msgs: &[AgentMessage], messages: &[ChatMessage]) -> usize {
         .filter(|(stored, message)| {
             let notice_only = !stored.parts.is_empty()
                 && stored.parts.iter().all(|part| {
-                    matches!(
-                        part,
-                        MessagePart::Notice { .. }
-                            | MessagePart::ToolBaseline { .. }
-                            | MessagePart::ToolChange { .. }
-                    )
+                    matches!(part, MessagePart::Notice { .. }) || part.is_tool_record()
                 });
             message.role == ChatRole::User && !message.has_tool_result() && !notice_only
         })
@@ -2036,7 +2055,7 @@ pub mod tests {
         };
 
         // The agent cycle loads history this way before it builds a request.
-        let error = handle.history_with_notice_state().await.unwrap_err();
+        let error = handle.history_view().await.unwrap_err();
 
         assert!(matches!(error, SessionError::InvalidOperation(_)));
         // The failure comes before any provider is built.

@@ -118,7 +118,14 @@ pub struct PendingNotice {
 #[derive(Debug, Clone)]
 pub struct PreparedModelRequest {
     pub messages: Arc<[ChatMessage]>,
+    /// The request's tool list. For a provider that takes tool changes as
+    /// messages this is the list the session's tool baseline recorded, which
+    /// later tool changes in `messages` add to and remove from: it is not the
+    /// set of tools the model can call. Read `offered_tools` for that.
     pub tools: Arc<[querymt::chat::Tool]>,
+    /// The tools the model can call in this request: `tools` with the tool
+    /// changes in `messages` applied. Equal to `tools` when there are none.
+    pub offered_tools: Arc<[querymt::chat::Tool]>,
     pub estimated_tokens: usize,
     /// Per-request generation overrides copied from
     /// [`ConversationContext::request_overrides`].
@@ -157,6 +164,10 @@ pub struct ConversationContext {
     /// history, `None` when there is none. A `ChatMessage` does not carry its
     /// notice source, so the mode comparison reads this instead.
     pub stored_mode_notice: Option<Arc<str>>,
+    /// The tool baseline in effect in the stored history, `None` when there is
+    /// none. A baseline has no chat form, so it is not in `messages`; every
+    /// tool-change message in `messages` was stored after it.
+    pub(crate) tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
     pub stats: Arc<AgentStats>,
     /// Current provider for the session (for dynamic model info lookup)
     pub provider: Arc<str>,
@@ -195,6 +206,7 @@ impl ConversationContext {
             request_objective: None,
             pending_notices: Arc::from([]),
             stored_mode_notice: None,
+            tool_baseline: None,
             stats,
             provider,
             model,
@@ -240,7 +252,9 @@ impl ConversationContext {
     /// A context over a new history with new stats.
     ///
     /// Everything else carries over, notice state included (queued notices,
-    /// stored mode notice), so a rebuild cannot silently drop it. The two
+    /// stored mode notice) and the tool baseline, so a rebuild cannot silently
+    /// drop it. A history loaded from the store replaces those too: use
+    /// `with_stored_state` on the result. The two
     /// request-scoped values are reset: the run objective is attached again
     /// for every request, and request overrides are consumed by exactly one
     /// request. Chain `with_request_overrides` / `with_last_applied` /
@@ -260,6 +274,21 @@ impl ConversationContext {
     #[must_use]
     pub fn with_stored_mode_notice(mut self, content: Option<Arc<str>>) -> Self {
         self.stored_mode_notice = content;
+        self
+    }
+
+    /// Set what a load of the stored history found next to its messages: the
+    /// most recent mode notice and the tool baseline in effect. Every site
+    /// that replaces `messages` with a loaded history calls this, so neither
+    /// can be left describing the previous history.
+    #[must_use]
+    pub(crate) fn with_stored_state(
+        mut self,
+        mode_notice: Option<Arc<str>>,
+        tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
+    ) -> Self {
+        self.stored_mode_notice = mode_notice;
+        self.tool_baseline = tool_baseline;
         self
     }
 

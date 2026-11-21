@@ -23,19 +23,6 @@ fn change(added: Vec<Tool>, removed: &[&str]) -> ChatMessage {
     ))
 }
 
-#[test]
-fn a_baseline_is_never_sent_to_the_provider() {
-    let messages = [
-        user("go"),
-        ChatMessage::from_tool_change(ToolChange::baseline(vec![test_tool("deploy")], "x")),
-    ];
-    let err = supported()
-        .prepare_chat_request(&ChatCall::new(&messages), false)
-        .err()
-        .expect("must fail");
-    assert!(err.to_string().contains("baseline"), "{err}");
-}
-
 fn user(text: &str) -> ChatMessage {
     ChatMessage::user().text(text).build()
 }

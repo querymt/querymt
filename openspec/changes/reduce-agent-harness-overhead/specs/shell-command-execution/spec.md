@@ -22,6 +22,10 @@ A `shell` call SHALL return within 2 seconds of its command's process exiting, w
 - **WHEN** a command prints 1 MiB of output and exits immediately
 - **THEN** the result is built from all of that output
 
+#### Scenario: Call abandoned while a left-over process still writes
+- **WHEN** a `shell` call is abandoned after its command exited, while a process the command left running keeps writing to the command's output
+- **THEN** the output written after that point is discarded and not held in memory
+
 ### Requirement: Every shell call has exactly one end event
 For every tool-call start event of a `shell` call, the session's event stream SHALL contain exactly one matching tool-call end event. A call ended by run cancellation SHALL have an end event marked as an error whose result reports the cancellation, emitted before the run's completion event. A call still running when its process died SHALL be closed when the interrupted run is reconciled, with a result reporting the interruption.
 

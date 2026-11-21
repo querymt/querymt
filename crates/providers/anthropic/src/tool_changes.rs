@@ -100,12 +100,6 @@ impl Anthropic {
                     "A tool-change part must be the only part of its message".into(),
                 ));
             };
-            if change.baseline {
-                return Err(LLMError::InvalidRequest(
-                    "A tool baseline is a request's tool list, not a message; it is never sent as one"
-                        .into(),
-                ));
-            }
             let removed: Vec<String> = change
                 .removed
                 .iter()

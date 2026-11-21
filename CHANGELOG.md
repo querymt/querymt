@@ -504,6 +504,16 @@
   with stored tool lists or tool changes; the other two had no other caller.
   Send prompts with `AgentSession::chat`, `Agent::chat` or ACP
   `session/prompt`.
+- **`querymt_agent::middleware::PreparedModelRequest` has a new public field
+  `offered_tools`**; struct literals must add it. It holds the tools the model
+  can call in the request. `tools` is the request's tool list, which on a
+  provider that takes tool changes as messages is the list stored when the
+  session started on that model: tools added or removed since are not in it.
+  Middleware that asks "can the model call X" must read `offered_tools`.
+- **`querymt_agent::middleware::ConversationContext` can no longer be built
+  with a struct literal outside its crate**: it has a crate-private field (the
+  tool baseline in effect). Use `ConversationContext::new` and the `with_*`
+  methods.
 - **`qmt_llama_cpp::LlamaCppConfig` has a new public field
   `grammar_backend: Option<GrammarBackend>`**; struct literals must add it
   (`None` keeps the default). `qmt_llama_cpp::GrammarBackend` is a new exported

@@ -838,7 +838,6 @@ fn tool_change_messages() -> Vec<crate::chat::ChatMessage> {
                 },
             }],
             removed: Vec::new(),
-            ..Default::default()
         }),
     ]
 }

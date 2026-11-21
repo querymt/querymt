@@ -459,20 +459,26 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.cancellation_token.is_cancelled()
     );
 
-    let (messages, stored_mode_notice, turns): (Arc<[querymt::chat::ChatMessage]>, _, _) = async {
+    let (messages, stored_mode_notice, tool_baseline, turns): (
+        Arc<[querymt::chat::ChatMessage]>,
+        _,
+        _,
+        _,
+    ) = async {
         let started = std::time::Instant::now();
-        let (history, summaries, stored_mode_notice, turns) = exec_ctx
+        let view = exec_ctx
             .session_handle
-            .history_with_notice_state()
+            .history_view()
             .await
             .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
-        exec_ctx.compaction_summaries = summaries;
-        let messages: Arc<[querymt::chat::ChatMessage]> = Arc::from(history.into_boxed_slice());
+        exec_ctx.compaction_summaries = view.summaries;
+        let messages: Arc<[querymt::chat::ChatMessage]> =
+            Arc::from(view.messages.into_boxed_slice());
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let span = tracing::Span::current();
         span.record("history_ms", elapsed_ms);
         span.record("message_count", messages.len() as u64);
-        Ok::<_, anyhow::Error>((messages, stored_mode_notice, turns))
+        Ok::<_, anyhow::Error>((messages, view.mode_notice, view.tool_baseline, view.turns))
     }
     .instrument(info_span!(
         "agent.execution.history_load",
@@ -518,7 +524,7 @@ pub(crate) async fn execute_cycle_state_machine(
                 llm_config.model.as_str().into(),
             )
             .with_session_mode(session_mode)
-            .with_stored_mode_notice(stored_mode_notice)
+            .with_stored_state(stored_mode_notice, tool_baseline)
             .with_profile(profile),
         )
     });
@@ -674,11 +680,10 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref request,
             } => {
                 llm_request_count = llm_request_count.saturating_add(1);
-                // `request.tools` is the baseline's list; tool changes in the
-                // messages add or remove tools after it, so read them too.
-                task_completion_tool_available = has_effective_task_completion_tool(
-                    &tool_history::effective_tools(&request.tools, &request.messages),
-                );
+                // The tools the model can call, not the request's tool list:
+                // a tool change in the messages adds to or removes from that.
+                task_completion_tool_available =
+                    has_effective_task_completion_tool(&request.offered_tools);
                 let span = tracing::Span::current();
                 span.record("llm_request_count", llm_request_count as u64);
                 span.record("completion_guard_available", task_completion_tool_available);
@@ -818,18 +823,18 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let (history, summaries, stored_mode_notice, _) = exec_ctx
+                let view = exec_ctx
                     .session_handle
-                    .history_with_notice_state()
+                    .history_view()
                     .await
                     .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
-                exec_ctx.compaction_summaries = summaries;
-                let history = Arc::from(history.into_boxed_slice());
+                exec_ctx.compaction_summaries = view.summaries;
+                let history = Arc::from(view.messages.into_boxed_slice());
                 let fallback_context = Arc::new(
                     context
                         .with_history(history, context.stats.clone())
                         .with_last_applied(querymt::chat::GenerationOptions::NONE)
-                        .with_stored_mode_notice(stored_mode_notice),
+                        .with_stored_state(view.mode_notice, view.tool_baseline),
                 );
                 if let Some(context) = apply_pending_steering(
                     config,
@@ -1707,12 +1712,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, _, _, turns) = exec_ctx
-            .session_handle
-            .history_with_notice_state()
-            .await
-            .unwrap();
-        assert_eq!(turns, 1);
+        let view = exec_ctx.session_handle.history_view().await.unwrap();
+        assert_eq!(view.turns, 1);
     }
 
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {

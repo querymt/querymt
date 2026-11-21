@@ -6,51 +6,43 @@
 //! (definitions added or redefined, names removed) whenever the tools offered
 //! now differ from the baseline folded with the changes stored after it.
 //!
-//! A request then starts from the most recent baseline's tool list, so a tool
-//! that appears or disappears mid-session never edits the head of the request
-//! and the provider's prompt cache stays valid. Baselines are never sent as
-//! messages; changes after the latest baseline are. Other providers get the
-//! tools offered now and none of these records; the stored records stay in
-//! history and are left out of their requests.
+//! A request then starts from the baseline's tool list, so a tool that appears
+//! or disappears mid-session never edits the head of the request and the
+//! provider's prompt cache stays valid. Other providers get the tools offered
+//! now and none of these records; the stored records stay in history and are
+//! left out of their requests.
 //!
-//! In a [`ChatMessage`] both records are a tool-change part
-//! ([`ToolChange`], with `baseline` set for a baseline), so this module
-//! reads them from the same history the request is built from.
+//! The two records differ in kind. A change is conversation content: it is a
+//! [`ChatMessage`] made of one tool-change part, sent at its position. A
+//! baseline is a request's tool list and has no chat form: the run reads the
+//! one in effect from the stored history when it loads it
+//! ([`ConversationContext::tool_baseline`]), and the messages it holds contain
+//! only the tool changes stored after that baseline.
 
 use crate::agent::execution_context::ExecutionContext;
 use crate::middleware::ConversationContext;
 use querymt::chat::{ChatInputPart, ChatMessage, ChatRole, Tool, ToolChange};
-use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_core::model::{AgentMessage, MessagePart, ToolBaseline};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The tool list a baseline recorded and what it was built for.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Baseline {
-    pub tools: Vec<Tool>,
-    pub origin: String,
+/// Whether `message` is a tool-change message: made only of tool-change
+/// parts. A message that mixes one with other content is not; it is left in
+/// place for the provider to refuse.
+pub(crate) fn is_tool_change(message: &ChatMessage) -> bool {
+    message
+        .input()
+        .is_some_and(|parts| !parts.is_empty() && parts.iter().all(ChatInputPart::is_tool_change))
 }
 
-/// A history read for one request.
-#[derive(Debug)]
-pub(crate) struct SplitHistory {
-    /// The most recent baseline, if any.
-    pub baseline: Option<Baseline>,
-    /// The tools offered after the baseline and the changes stored after it,
-    /// ordered by name. Empty when there is no baseline.
-    pub offered: Vec<Tool>,
-    /// The history as the provider sees it: no baseline, and no tool change
-    /// stored before the most recent baseline.
-    pub sent: Vec<ChatMessage>,
-}
-
-/// The tool-change record of a message made only of such records.
-fn tool_record(message: &ChatMessage) -> Option<&ToolChange> {
-    let parts = message.input()?;
-    if parts.is_empty() || !parts.iter().all(ChatInputPart::is_tool_change) {
-        return None;
-    }
-    parts.iter().find_map(ChatInputPart::as_tool_change)
+/// The tool changes of the tool-change messages in `messages`, in order.
+fn tool_changes(messages: &[ChatMessage]) -> impl Iterator<Item = &ToolChange> {
+    messages
+        .iter()
+        .filter(|message| is_tool_change(message))
+        .filter_map(ChatMessage::input)
+        .flatten()
+        .filter_map(ChatInputPart::as_tool_change)
 }
 
 /// The origin tag of a baseline for the session's provider and model.
@@ -58,88 +50,33 @@ pub(crate) fn origin(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
 }
 
-/// Reads the baseline, the folded offered tools and the messages to send.
-pub(crate) fn split(messages: &[ChatMessage]) -> SplitHistory {
-    let latest = messages
+/// The tools the model can call after `baseline` and the tool changes in
+/// `messages`, ordered by name: each change applied in order to the list.
+pub(crate) fn offered(baseline: &[Tool], messages: &[ChatMessage]) -> Vec<Tool> {
+    let mut offered: BTreeMap<&str, &Tool> = baseline
         .iter()
-        .rposition(|message| tool_record(message).is_some_and(|record| record.baseline));
-
-    let baseline = latest
-        .and_then(|index| tool_record(&messages[index]))
-        .map(|record| Baseline {
-            tools: record.added.clone(),
-            origin: record.origin.clone().unwrap_or_default(),
-        });
-
-    let mut offered: BTreeMap<String, Tool> = BTreeMap::new();
-    if let Some(baseline) = &baseline {
-        for tool in &baseline.tools {
-            offered.insert(tool.function.name.clone(), tool.clone());
+        .map(|tool| (tool.function.name.as_str(), tool))
+        .collect();
+    for change in tool_changes(messages) {
+        for tool in &change.added {
+            offered.insert(tool.function.name.as_str(), tool);
+        }
+        for name in &change.removed {
+            offered.remove(name.as_str());
         }
     }
-
-    let mut sent = Vec::with_capacity(messages.len());
-    for (index, message) in messages.iter().enumerate() {
-        match tool_record(message) {
-            None => sent.push(message.clone()),
-            Some(record) if record.baseline => {}
-            // A change before the latest baseline is already part of it, and
-            // a change with no baseline has nothing to change: neither is sent.
-            Some(record) if latest.is_some_and(|baseline_index| index > baseline_index) => {
-                for tool in &record.added {
-                    offered.insert(tool.function.name.clone(), tool.clone());
-                }
-                for name in &record.removed {
-                    offered.remove(name);
-                }
-                sent.push(message.clone());
-            }
-            Some(_) => {}
-        }
-    }
-
-    SplitHistory {
-        baseline,
-        offered: offered.into_values().collect(),
-        sent,
-    }
+    offered.into_values().cloned().collect()
 }
 
-/// The history without baselines and tool changes, for a provider that does
-/// not declare `tool_updates`. The records stay in the stored history.
-pub(crate) fn without_tool_records(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+/// The history without tool-change messages: what a provider that does not
+/// declare `tool_updates` is sent, and what remains once a new baseline has
+/// taken the earlier changes in. The records stay in the stored history.
+pub(crate) fn without_tool_changes(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .filter(|message| tool_record(message).is_none())
+        .filter(|message| !is_tool_change(message))
         .cloned()
         .collect()
-}
-
-/// The tools in effect once the request's messages are read: the request's
-/// tool list (the latest baseline's) with every tool change in `messages`
-/// applied in order. The messages are those that are sent, so a baseline or a
-/// change from before the latest baseline is not among them.
-///
-/// Anything that depends on which tools the model can call must use this and
-/// not the request's tool list alone, which leaves out later changes.
-pub(crate) fn effective_tools(leading: &[Tool], messages: &[ChatMessage]) -> Vec<Tool> {
-    let mut in_effect: BTreeMap<String, Tool> = leading
-        .iter()
-        .map(|tool| (tool.function.name.clone(), tool.clone()))
-        .collect();
-    for record in messages
-        .iter()
-        .filter_map(tool_record)
-        .filter(|record| !record.baseline)
-    {
-        for tool in &record.added {
-            in_effect.insert(tool.function.name.clone(), tool.clone());
-        }
-        for name in &record.removed {
-            in_effect.remove(name);
-        }
-    }
-    in_effect.into_values().collect()
 }
 
 /// What the tools offered now add, redefine and remove compared with
@@ -172,24 +109,56 @@ pub(crate) fn diff(offered: &[Tool], current: &[Tool]) -> Option<ToolChange> {
 pub(crate) struct ToolRequestState {
     /// The conversation, including any record stored for this request.
     pub context: Arc<ConversationContext>,
-    /// The messages to send (see [`SplitHistory::sent`]).
+    /// The messages to send: the conversation, with its tool-change messages
+    /// only for a provider that takes them.
     pub messages: Vec<ChatMessage>,
-    /// The request's tool list.
+    /// The request's tool list: the baseline's, or the tools offered now for
+    /// a provider without `tool_updates`.
     pub leading: Vec<Tool>,
+    /// The tools the model can call in this request: `leading` with the tool
+    /// changes in `messages` applied.
+    pub offered: Vec<Tool>,
 }
 
-/// Stores `part` as one user message after the conversation so far and
-/// returns the context that includes it.
-async fn store_record(
+/// Stores `baseline` after the conversation so far and returns the context it
+/// is in effect for. The tool changes stored before it are part of its list,
+/// so they leave the conversation; a later load of the history drops them the
+/// same way.
+async fn store_baseline(
     exec_ctx: &ExecutionContext,
     context: &Arc<ConversationContext>,
-    part: MessagePart,
+    baseline: Arc<ToolBaseline>,
 ) -> Result<Arc<ConversationContext>, anyhow::Error> {
     let mut message = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
-    message.parts.push(part);
+    message.parts.push(MessagePart::ToolBaseline {
+        tools: baseline.tools.clone(),
+        origin: baseline.origin.clone(),
+    });
+    exec_ctx.add_message(message).await?;
+
+    let mut next = (**context).clone();
+    if context.messages.iter().any(is_tool_change) {
+        next.messages = Arc::from(without_tool_changes(&context.messages).into_boxed_slice());
+    }
+    next.tool_baseline = Some(baseline);
+    Ok(Arc::new(next))
+}
+
+/// Stores `change` as one user message after the conversation so far and
+/// returns the context that includes it.
+async fn store_change(
+    exec_ctx: &ExecutionContext,
+    context: &Arc<ConversationContext>,
+    change: ToolChange,
+) -> Result<Arc<ConversationContext>, anyhow::Error> {
+    let mut message = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+    message.parts.push(MessagePart::ToolChange {
+        added: change.added,
+        removed: change.removed,
+    });
     let chat_message = message
         .to_chat_message()
-        .map_err(|error| anyhow::anyhow!("Invalid tool record: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Invalid tool change: {error}"))?;
     exec_ctx.add_message(message).await?;
 
     let mut messages = context.messages.to_vec();
@@ -214,15 +183,19 @@ pub(crate) async fn resolve(
     tool_updates: bool,
     tools: &[Tool],
 ) -> Result<ToolRequestState, anyhow::Error> {
+    // A request for a provider without `tool_updates`: the tools offered now
+    // as the list, and no tool-change message.
+    let plain = || ToolRequestState {
+        context: context.clone(),
+        messages: without_tool_changes(&context.messages),
+        leading: tools.to_vec(),
+        offered: tools.to_vec(),
+    };
     if !tool_updates {
-        return Ok(ToolRequestState {
-            context: context.clone(),
-            messages: without_tool_records(&context.messages),
-            leading: tools.to_vec(),
-        });
+        return Ok(plain());
     }
 
-    // The newest message that is not a tool record decides where a record may
+    // The newest message that is not a tool change decides where a record may
     // go. A record is never stored between a tool call and its result: a
     // history reload moves the results into the first user message after the
     // call, which would then be the record. A call without a result is an
@@ -231,13 +204,9 @@ pub(crate) async fn resolve(
     let last_real = context
         .messages
         .iter()
-        .rfind(|message| tool_record(message).is_none());
+        .rfind(|message| !is_tool_change(message));
     if last_real.is_some_and(ChatMessage::has_tool_use) {
-        return Ok(ToolRequestState {
-            context: context.clone(),
-            messages: without_tool_records(&context.messages),
-            leading: tools.to_vec(),
-        });
+        return Ok(plain());
     }
     // The API accepts a tool change only directly after a user message, so one
     // waits for a request that follows a user message (a prompt or results).
@@ -245,48 +214,33 @@ pub(crate) async fn resolve(
 
     let wanted = origin(&context.provider, &context.model);
     let mut context = context.clone();
-    let state = split(&context.messages);
-
-    let needs_baseline = state
-        .baseline
-        .as_ref()
-        .is_none_or(|baseline| baseline.origin != wanted);
-    let offered = if needs_baseline {
-        context = store_record(
-            exec_ctx,
-            &context,
-            MessagePart::ToolBaseline {
+    let baseline = match context
+        .tool_baseline
+        .clone()
+        .filter(|baseline| baseline.origin == wanted)
+    {
+        Some(baseline) => baseline,
+        None => {
+            let baseline = Arc::new(ToolBaseline {
                 tools: tools.to_vec(),
                 origin: wanted,
-            },
-        )
-        .await?;
-        tools.to_vec()
-    } else {
-        state.offered
+            });
+            context = store_baseline(exec_ctx, &context, baseline.clone()).await?;
+            baseline
+        }
     };
 
-    if change_allowed && let Some(change) = diff(&offered, tools) {
-        context = store_record(
-            exec_ctx,
-            &context,
-            MessagePart::ToolChange {
-                added: change.added,
-                removed: change.removed,
-            },
-        )
-        .await?;
+    if change_allowed
+        && let Some(change) = diff(&offered(&baseline.tools, &context.messages), tools)
+    {
+        context = store_change(exec_ctx, &context, change).await?;
     }
 
-    let split = split(&context.messages);
-    let leading = split
-        .baseline
-        .map(|baseline| baseline.tools)
-        .unwrap_or_else(|| tools.to_vec());
     Ok(ToolRequestState {
+        messages: context.messages.to_vec(),
+        leading: baseline.tools.clone(),
+        offered: offered(&baseline.tools, &context.messages),
         context,
-        messages: split.sent,
-        leading,
     })
 }
 
@@ -310,10 +264,6 @@ mod tests {
         ChatMessage::user().text(text).build()
     }
 
-    fn baseline(tools: Vec<Tool>, origin: &str) -> ChatMessage {
-        ChatMessage::from_tool_change(ToolChange::baseline(tools, origin))
-    }
-
     fn change(added: Vec<Tool>, removed: &[&str]) -> ChatMessage {
         ChatMessage::from_tool_change(ToolChange::new(
             added,
@@ -325,106 +275,51 @@ mod tests {
         tools.iter().map(|t| t.function.name.as_str()).collect()
     }
 
+    // What a load of the stored history does with baselines and with changes
+    // from before one is tested with `take_tool_baseline` in `agent-core`.
+
     #[test]
-    fn history_without_records_is_sent_unchanged() {
+    fn history_without_changes_offers_the_baseline_list() {
+        let baseline = vec![tool("a", "A"), tool("b", "B")];
         let messages = vec![user("a"), user("b")];
-        let state = split(&messages);
-        assert!(state.baseline.is_none() && state.offered.is_empty());
-        assert_eq!(state.sent, messages);
+        assert_eq!(names(&offered(&baseline, &messages)), ["a", "b"]);
+        assert!(offered(&[], &messages).is_empty());
+        assert_eq!(without_tool_changes(&messages), messages);
     }
 
     #[test]
-    fn baseline_is_not_sent_and_provides_the_tool_list() {
+    fn changes_are_applied_in_order_to_the_baseline_list() {
+        let baseline = vec![tool("a", "A"), tool("b", "B")];
         let messages = vec![
-            user("go"),
-            baseline(vec![tool("a", "A"), tool("b", "B")], "p/m"),
-        ];
-        let state = split(&messages);
-        assert_eq!(state.sent, vec![user("go")]);
-        let baseline = state.baseline.expect("baseline");
-        assert_eq!(names(&baseline.tools), ["a", "b"]);
-        assert_eq!(baseline.origin, "p/m");
-        assert_eq!(names(&state.offered), ["a", "b"]);
-    }
-
-    #[test]
-    fn changes_after_the_baseline_are_sent_and_folded() {
-        let messages = vec![
-            user("go"),
-            baseline(vec![tool("a", "A"), tool("b", "B")], "p/m"),
-            change(vec![tool("c", "C"), tool("a", "A2")], &["b"]),
-        ];
-        let state = split(&messages);
-        assert_eq!(state.sent.len(), 2, "the change is sent, the baseline not");
-        assert!(state.sent[1].has_tool_change());
-        assert_eq!(names(&state.offered), ["a", "c"]);
-        let a = state
-            .offered
-            .iter()
-            .find(|t| t.function.name == "a")
-            .unwrap();
-        assert_eq!(a.function.description, "A2");
-        // The leading list is the baseline's, not the folded one.
-        assert_eq!(names(&state.baseline.unwrap().tools), ["a", "b"]);
-    }
-
-    #[test]
-    fn effective_tools_apply_the_changes_to_the_baseline_list() {
-        let leading = vec![tool("a", "A"), tool("b", "B")];
-        let sent = vec![
             user("go"),
             change(vec![tool("complete_task", "C"), tool("a", "A2")], &["b"]),
         ];
-        let effective = effective_tools(&leading, &sent);
-        assert_eq!(names(&effective), ["a", "complete_task"]);
-        assert_eq!(effective[0].function.description, "A2");
+        let now = offered(&baseline, &messages);
+        assert_eq!(names(&now), ["a", "complete_task"]);
+        assert_eq!(now[0].function.description, "A2", "redefined");
 
         // A later change can take a tool away again.
-        let sent = vec![
+        let messages = vec![
             user("go"),
             change(vec![tool("complete_task", "C")], &[]),
             user("more"),
             change(vec![], &["complete_task"]),
         ];
-        assert_eq!(names(&effective_tools(&leading, &sent)), ["a", "b"]);
-
-        // No changes: the request's list.
-        assert_eq!(names(&effective_tools(&leading, &[user("go")])), ["a", "b"]);
+        assert_eq!(names(&offered(&baseline, &messages)), ["a", "b"]);
     }
 
     #[test]
-    fn changes_before_the_latest_baseline_are_not_sent() {
-        let messages = vec![
-            user("go"),
-            baseline(vec![tool("a", "A")], "p/m"),
-            change(vec![tool("deploy", "D")], &[]),
-            user("more"),
-            baseline(vec![tool("a", "A"), tool("deploy", "D")], "q/n"),
-        ];
-        let state = split(&messages);
-        assert_eq!(state.sent, vec![user("go"), user("more")]);
-        assert_eq!(state.baseline.unwrap().origin, "q/n");
-        assert_eq!(names(&state.offered), ["a", "deploy"]);
+    fn tools_can_be_offered_by_a_change_alone() {
+        // The list a request leads with can be empty while tools are offered.
+        let messages = vec![user("go"), change(vec![tool("late", "L")], &[])];
+        assert_eq!(names(&offered(&[], &messages)), ["late"]);
     }
 
     #[test]
-    fn change_with_no_baseline_is_not_sent() {
-        let messages = vec![user("go"), change(vec![tool("a", "A")], &[])];
-        let state = split(&messages);
-        assert_eq!(state.sent, vec![user("go")]);
-        assert!(state.baseline.is_none());
-    }
-
-    #[test]
-    fn records_are_left_out_for_a_provider_without_tool_updates() {
-        let messages = vec![
-            user("go"),
-            baseline(vec![tool("a", "A")], "p/m"),
-            change(vec![tool("b", "B")], &[]),
-            user("more"),
-        ];
+    fn tool_changes_are_left_out_for_a_provider_without_tool_updates() {
+        let messages = vec![user("go"), change(vec![tool("b", "B")], &[]), user("more")];
         assert_eq!(
-            without_tool_records(&messages),
+            without_tool_changes(&messages),
             vec![user("go"), user("more")]
         );
     }
@@ -441,7 +336,6 @@ mod tests {
         let change = diff(&offered, &current).expect("difference");
         assert_eq!(names(&change.added), ["b", "d", "e"]);
         assert_eq!(change.removed, vec!["c".to_string()]);
-        assert!(!change.baseline);
     }
 
     #[test]
@@ -476,6 +370,17 @@ mod tests {
         Arc::new(context)
     }
 
+    /// The same run a step later: `context` over `messages`. The baseline in
+    /// effect is carried, as the loop carries it.
+    fn continued(
+        context: &Arc<ConversationContext>,
+        messages: Vec<ChatMessage>,
+    ) -> Arc<ConversationContext> {
+        let mut next = (**context).clone();
+        next.messages = Arc::from(messages.into_boxed_slice());
+        Arc::new(next)
+    }
+
     /// Kinds of the stored tool records, in order: `baseline` or `change`.
     async fn stored_records(agent: &TestAgent, exec: &ExecutionContext) -> Vec<&'static str> {
         agent
@@ -508,12 +413,16 @@ mod tests {
 
         assert_eq!(stored_records(&agent, &exec).await, ["baseline"]);
         assert_eq!(names(&state.leading), ["a", "b"]);
+        assert_eq!(names(&state.offered), ["a", "b"]);
         assert_eq!(state.messages, vec![user("go")], "the baseline is not sent");
         assert_eq!(
-            state.context.messages.len(),
-            2,
-            "the context holds the record"
+            state.context.messages.as_ref(),
+            [user("go")],
+            "a baseline is not a message"
         );
+        let baseline = state.context.tool_baseline.as_ref().expect("in effect");
+        assert_eq!(baseline.origin, "anthropic/claude-sonnet-5-5");
+        assert_eq!(names(&baseline.tools), ["a", "b"]);
     }
 
     #[tokio::test]
@@ -547,7 +456,12 @@ mod tests {
             .as_tool_change()
             .expect("change is sent");
         assert_eq!(names(&change.added), ["deploy"]);
-        assert!(change.removed.is_empty() && !change.baseline);
+        assert!(change.removed.is_empty());
+        assert_eq!(
+            names(&second.offered),
+            ["a", "b", "deploy"],
+            "the model can call the added tool"
+        );
     }
 
     #[tokio::test]
@@ -690,18 +604,23 @@ mod tests {
         // The newest message is a reply with no tool call.
         let mut messages = first.context.messages.to_vec();
         messages.push(ChatMessage::assistant().text("done").build());
-        let replied = context_for(&exec, "anthropic", "claude-sonnet-5-5", messages);
+        let replied = continued(&first.context, messages);
         let mut now = tools_ab();
         now.push(tool("deploy", "D"));
         let waiting = resolve(&exec, &replied, true, &now).await.unwrap();
 
         assert_eq!(stored_records(&agent, &exec).await, ["baseline"]);
         assert!(!waiting.messages.iter().any(ChatMessage::has_tool_change));
+        assert_eq!(
+            names(&waiting.offered),
+            ["a", "b"],
+            "not yet offered to the model"
+        );
 
         // The next user message lets the change follow it.
         let mut messages = waiting.context.messages.to_vec();
         messages.push(user("next"));
-        let prompted = context_for(&exec, "anthropic", "claude-sonnet-5-5", messages);
+        let prompted = continued(&waiting.context, messages);
         let after = resolve(&exec, &prompted, true, &now).await.unwrap();
 
         assert_eq!(stored_records(&agent, &exec).await, ["baseline", "change"]);
@@ -734,6 +653,18 @@ mod tests {
             !third.messages.iter().any(ChatMessage::has_tool_change),
             "the earlier change is part of the new baseline"
         );
+        assert!(
+            !third
+                .context
+                .messages
+                .iter()
+                .any(ChatMessage::has_tool_change),
+            "and has left the conversation, as a reload would leave it out"
+        );
+        assert_eq!(
+            third.context.tool_baseline.as_ref().unwrap().origin,
+            "anthropic/claude-opus-4-8"
+        );
     }
 
     #[tokio::test]
@@ -747,7 +678,7 @@ mod tests {
         assert!(second.messages.last().unwrap().has_tool_change());
 
         // After compaction the effective history starts from the summary and
-        // holds neither the baseline nor the change.
+        // holds neither the baseline nor the change, so a load finds none.
         let compacted = context_for(
             &exec,
             "anthropic",
@@ -781,16 +712,22 @@ mod tests {
         let second = resolve(&exec, &first.context, true, &now).await.unwrap();
 
         // A new process reads the history back from the store.
-        let (history, _, _, _) = exec
-            .session_handle
-            .history_with_notice_state()
+        let view = exec.session_handle.history_view().await.unwrap();
+        assert_eq!(
+            view.messages,
+            second.context.messages.as_ref(),
+            "a load gives the messages the run held"
+        );
+        let mut reloaded =
+            (*context_for(&exec, "anthropic", "claude-sonnet-5-5", view.messages)).clone();
+        reloaded.tool_baseline = view.tool_baseline;
+        let after = resolve(&exec, &Arc::new(reloaded), true, &now)
             .await
             .unwrap();
-        let reloaded = context_for(&exec, "anthropic", "claude-sonnet-5-5", history);
-        let after = resolve(&exec, &reloaded, true, &now).await.unwrap();
 
         assert_eq!(after.leading, second.leading);
-        assert_eq!(after.messages.len(), second.messages.len());
+        assert_eq!(after.offered, second.offered);
+        assert_eq!(after.messages, second.messages);
         assert!(after.messages.last().unwrap().has_tool_change());
         assert_eq!(stored_records(&agent, &exec).await, ["baseline", "change"]);
     }
@@ -840,12 +777,7 @@ mod tests {
         assert!(second.messages.last().unwrap().has_tool_change());
 
         // Undo removed the change message but `deploy` is still offered.
-        let undone = context_for(
-            &exec,
-            "anthropic",
-            "claude-sonnet-5-5",
-            first.context.messages.to_vec(),
-        );
+        let undone = continued(&first.context, first.context.messages.to_vec());
         let third = resolve(&exec, &undone, true, &now).await.unwrap();
 
         let change = third.messages.last().unwrap().input().unwrap()[0]
@@ -931,7 +863,11 @@ mod tests {
             Vec::new(),
         )));
         // A message that mixes text and a change is left alone.
-        assert!(tool_record(&message).is_none());
-        assert_eq!(without_tool_records(&[message]).len(), 1);
+        assert!(!is_tool_change(&message));
+        assert_eq!(
+            without_tool_changes(std::slice::from_ref(&message)).len(),
+            1
+        );
+        assert!(offered(&[], &[message]).is_empty());
     }
 }

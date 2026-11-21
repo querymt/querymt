@@ -793,6 +793,15 @@ impl MessagePart {
         }
     }
 
+    /// Whether this part records the offered tools (a baseline or a change)
+    /// and no conversation content.
+    pub fn is_tool_record(&self) -> bool {
+        matches!(
+            self,
+            MessagePart::ToolBaseline { .. } | MessagePart::ToolChange { .. }
+        )
+    }
+
     /// Get the diff summary for a Snapshot part, or None for other part types
     pub fn diff_summary(&self) -> Option<String> {
         match self {
@@ -838,6 +847,12 @@ impl AgentMessage {
             source_provider: None,
             source_model: None,
         }
+    }
+
+    /// Whether the message holds only tool records (see
+    /// [`MessagePart::is_tool_record`]): it carries no conversation content.
+    pub fn is_tool_record(&self) -> bool {
+        !self.parts.is_empty() && self.parts.iter().all(MessagePart::is_tool_record)
     }
 
     pub fn to_chat_message(&self) -> Result<ChatMessage, PromptContentError> {
@@ -1035,12 +1050,11 @@ impl AgentMessage {
                 MessagePart::Notice { content, .. } => {
                     input_parts.push(ChatInputPart::text(content.clone()))
                 }
-                // Both project to a tool-change record that names itself, so
-                // the request builder can fold the history without the stored
-                // parts. A baseline is never sent as a message.
-                MessagePart::ToolBaseline { tools, origin } => input_parts.push(
-                    ChatInputPart::tool_change(ToolChange::baseline(tools.clone(), origin.clone())),
-                ),
+                // A baseline is a request's tool list, never a message: it has
+                // no chat form. A history is read with
+                // `history::take_tool_baseline` before it is projected, which
+                // removes the baselines and returns the one in effect.
+                MessagePart::ToolBaseline { .. } => {}
                 MessagePart::ToolChange { added, removed } => input_parts.push(
                     ChatInputPart::tool_change(ToolChange::new(added.clone(), removed.clone())),
                 ),
@@ -1062,6 +1076,16 @@ impl AgentMessage {
         }
         Ok(ChatMessage::from_user_parts(input_parts))
     }
+}
+
+/// The tool list a request starts from and what it was built for: the content
+/// of a stored [`MessagePart::ToolBaseline`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolBaseline {
+    /// The offered tools, in the order the request lists them.
+    pub tools: Vec<querymt::chat::Tool>,
+    /// The provider and model the baseline was built for, `provider/model`.
+    pub origin: String,
 }
 
 /// Normalize tool-result batches across intervening user messages and synthesize

@@ -87,6 +87,14 @@ The API accepts a `system` entry with tool blocks only directly after a `user` e
 - **WHEN** a request would start with a tool-change message
 - **THEN** no HTTP request is made and the error says a tool change cannot be the first message
 
+### Requirement: Tool changes at the same position share one entry
+Tool-change messages that are sent at the same position SHALL be sent as one `system` entry holding their blocks in the stored order. A second `system` entry there would not directly follow a `user` entry.
+
+#### Scenario: Several tool changes wait for the same position
+- **WHEN** two tool-change messages are stored before the next assistant reply, each after a user message
+- **THEN** one `system` entry is sent after the last of those `user` entries
+- **AND** it holds the blocks of both changes in the order the changes were stored
+
 ### Requirement: Tool-change entries carry no cache marker
 A tool-change entry SHALL carry no `cache_control`, and a cache hint on a tool-change message SHALL NOT count toward the four-breakpoint limit.
 

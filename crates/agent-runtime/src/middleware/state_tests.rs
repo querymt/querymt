@@ -29,6 +29,7 @@ fn test_execution_state_name_all_variants() {
                 request: Arc::new(PreparedModelRequest {
                     messages: Arc::from([]),
                     tools: Arc::from([]),
+                    offered_tools: Arc::from([]),
                     estimated_tokens: 0,
                     options: Default::default(),
                 }),
@@ -98,6 +99,7 @@ fn test_execution_state_context_accessors() {
             request: Arc::new(PreparedModelRequest {
                 messages: Arc::from([]),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 0,
                 options: Default::default(),
             }),

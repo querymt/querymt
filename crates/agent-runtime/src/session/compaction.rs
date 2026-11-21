@@ -37,17 +37,6 @@ This brief will replace the conversation history. Write it for the work that rem
 
 If needed output was cleared or truncated, name the `session_history` call_id or a narrow command to retrieve it. Do not invent observations."#;
 
-/// Whether a stored message holds only tool baseline / tool change records.
-fn is_tool_record_only(message: &AgentMessage) -> bool {
-    !message.parts.is_empty()
-        && message.parts.iter().all(|part| {
-            matches!(
-                part,
-                MessagePart::ToolBaseline { .. } | MessagePart::ToolChange { .. }
-            )
-        })
-}
-
 /// The compaction prompt, extended with the user's focus instructions when given.
 pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
     match instructions.map(str::trim).filter(|s| !s.is_empty()) {
@@ -310,7 +299,7 @@ impl SessionCompaction {
         // list, and a provider rejects such a record as a message.
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
-            .filter(|message| !is_tool_record_only(message))
+            .filter(|message| !message.is_tool_record())
             .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
             .collect::<std::result::Result<_, _>>()?;
 

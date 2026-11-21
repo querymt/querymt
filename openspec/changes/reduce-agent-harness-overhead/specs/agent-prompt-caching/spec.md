@@ -340,6 +340,48 @@ Baselines and tool-change messages already in session history, for example store
 - **WHEN** a session whose history holds a tool-change message adding `deploy` switches to a model whose provider does not declare `tool_updates`
 - **THEN** the next request contains no tool-change message, its tool list is the tools offered now, and the stored tool-change message is still in session history
 
+### Requirement: A baseline is not a provider message
+A baseline SHALL exist only as a stored session-history part. It SHALL have no form in the provider message type: the `querymt` tool-change message kind SHALL carry only the definitions added or redefined and the names removed. The messages a run holds, and the messages given to a request, a `context` hook or a compaction request, SHALL contain no baseline on any provider.
+
+#### Scenario: Loaded history holds no baseline message
+- **WHEN** a session whose history holds a baseline followed by a tool-change message is loaded
+- **THEN** the loaded messages contain the tool-change message and no message for the baseline
+- **AND** the baseline's tool list is the next request's tool list
+
+#### Scenario: Tool-change message kind carries no baseline
+- **WHEN** a tool-change message is serialized for a provider
+- **THEN** it holds only the definitions added or redefined and the names removed
+
+#### Scenario: Compaction drops a baseline the history no longer holds
+- **WHEN** a run that holds a baseline compacts its history, and the effective history after the compaction holds no baseline
+- **THEN** the run holds none either, and the next request stores a new one
+
+### Requirement: Decisions about callable tools use the tools in effect
+What depends on which tools the model can call in a request SHALL read the request's tool list with the request's tool-change messages applied, not the tool list alone. This covers the task-completion guard, the choice between a request with a tool list and one without, and the tool count reported on the model request span.
+
+#### Scenario: Tool added by a tool change is in effect
+- **WHEN** a tool is added by a tool-change message after the baseline was stored
+- **THEN** the tools in effect for the request include it, and the request's tool list does not
+
+#### Scenario: Tools offered only by a tool change
+- **WHEN** the request's tool list is empty and a tool-change message in the request adds a tool
+- **THEN** the request is sent with a tool list
+
+#### Scenario: Change waiting for a user message is not in effect
+- **WHEN** the tools differ and the newest conversation message is an assistant reply, so no tool-change message is stored yet
+- **THEN** the tools in effect for that request do not include the added tool
+
+### Requirement: Context hooks keep tool-change messages
+A replacement history returned by a `context` hook SHALL contain exactly the tool-change messages of the history the hook was given, unchanged and in the same order. A replacement that drops, edits or reorders one SHALL be ignored with a notice, and the request SHALL be built from the history the hook was given.
+
+#### Scenario: Replacement drops a tool-change message
+- **WHEN** a `context` hook returns a replacement history without a tool-change message it was given
+- **THEN** the replacement is ignored, a notice names tool-change messages, and the request contains the tool-change message
+
+#### Scenario: Replacement keeps the tool-change messages
+- **WHEN** a `context` hook returns a replacement history that rewrites other messages and keeps every tool-change message in place
+- **THEN** the replacement is used and no notice is emitted
+
 ### Requirement: Providers declare prompt-cache support
 A provider's chat capabilities SHALL include a `prompt_cache` declaration for the configured model and endpoint with two fields: `explicit_breakpoints` (boolean) and `max_ttl_secs` (the longest cache lifetime in seconds the provider accepts; absent when the lifetime cannot be chosen). A provider or plugin that reports no declaration, or a declaration without a field, SHALL be treated as `explicit_breakpoints = false` with no selectable lifetime.
 
@@ -358,6 +400,10 @@ A provider's chat capabilities SHALL include a `prompt_cache` declaration for th
 #### Scenario: Plugin built before the declaration existed
 - **WHEN** a provider plugin returns capabilities without a `prompt_cache` field
 - **THEN** the plugin loads and is treated as declaring no explicit breakpoints and no selectable lifetime
+
+#### Scenario: Two providers with the same configuration text
+- **WHEN** a provider that declares explicit breakpoints and one that declares none are configured with the same model and system prompt, so that their configurations are the same text
+- **THEN** each gets default hints according to its own declaration
 
 ### Requirement: Prompt cache settings are validated
 `[agent.execution.prompt_cache]` SHALL accept `ttl_secs` (integer seconds, 0 to 86400, default 0, where 0 means the provider's default lifetime). A value outside the range, a non-integer value or an unknown key in the table SHALL be a load error naming the key.

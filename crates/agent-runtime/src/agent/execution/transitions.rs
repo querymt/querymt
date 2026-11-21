@@ -48,11 +48,11 @@ use uuid::Uuid;
 /// Read before the request's notices are stored, so a notice stored after a
 /// tool batch does not make the request a user-prompt request.
 pub(super) fn context_hook_trigger(messages: &[ChatMessage]) -> &'static str {
-    // Tool records stored after the tool results do not change what the
+    // Tool changes stored after the tool results do not change what the
     // request follows.
     if messages
         .iter()
-        .rfind(|message| !message.has_tool_change())
+        .rfind(|message| !super::tool_history::is_tool_change(message))
         .is_some_and(|message| message.has_tool_result())
     {
         "after_tool_batch"
@@ -189,6 +189,7 @@ pub(super) async fn transition_before_llm_call(
     let tool_state = super::tool_history::resolve(exec_ctx, &context, tool_updates, &tools).await?;
     let context = tool_state.context;
     let leading = tool_state.leading;
+    let offered_tools = tool_state.offered;
     let leading_json = if leading == tools {
         tools_json
     } else {
@@ -310,6 +311,7 @@ pub(super) async fn transition_before_llm_call(
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(leading.into_boxed_slice()),
+            offered_tools: Arc::from(offered_tools.into_boxed_slice()),
             estimated_tokens,
             options,
         }),
@@ -377,7 +379,7 @@ pub(super) fn apply_cache_breakpoints(
     let eligible: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, message)| !message.has_tool_change())
+        .filter(|(_, message)| !super::tool_history::is_tool_change(message))
         .map(|(index, _)| index)
         .collect();
     let first_hinted = eligible
@@ -857,7 +859,7 @@ fn gate_function_calls_for_execution(
         provider = %context.provider,
         model = %context.model,
         message_count = context.messages.len(),
-        tool_count = request.tools.len()
+        tool_count = request.offered_tools.len()
     )
 )]
 pub(super) async fn transition_call_llm(
@@ -937,7 +939,10 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    let output: ChatOutput = if tools.is_empty() {
+    // `tools` is the request's tool list, which for a provider that takes tool
+    // changes as messages is the baseline's: tools can be offered through a
+    // change while that list is empty, so both are read.
+    let output: ChatOutput = if tools.is_empty() && request.offered_tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
         match super::llm_retry::call_chat_with_retry(
@@ -3054,6 +3059,7 @@ mod tests {
             Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 1,
                 options: Default::default(),
             })
@@ -3135,12 +3141,9 @@ mod tests {
                     );
                     exec.add_message(orphan).await.unwrap();
                 }
-                let (mut messages, summaries, _, _) = exec
-                    .session_handle
-                    .history_with_notice_state()
-                    .await
-                    .unwrap();
-                exec.compaction_summaries = summaries;
+                let view = exec.session_handle.history_view().await.unwrap();
+                let mut messages = view.messages;
+                exec.compaction_summaries = view.summaries;
                 if mode == "reload_removed" {
                     assert_eq!(exec.compaction_summaries.len(), 1);
                     fixture
@@ -3150,12 +3153,8 @@ mod tests {
                         .delete_messages_after(&exec.session_id, &boundary_id)
                         .await
                         .unwrap();
-                    let (_, refreshed, _, _) = exec
-                        .session_handle
-                        .history_with_notice_state()
-                        .await
-                        .unwrap();
-                    exec.compaction_summaries = refreshed;
+                    exec.compaction_summaries =
+                        exec.session_handle.history_view().await.unwrap().summaries;
                 }
                 let context = Arc::new(crate::middleware::ConversationContext::new(
                     exec.session_id.as_str().into(),
@@ -3213,6 +3212,7 @@ mod tests {
                         Arc::new(PreparedModelRequest {
                             messages: Arc::from(messages),
                             tools: Arc::from([]),
+                            offered_tools: Arc::from([]),
                             estimated_tokens: 1,
                             options: Default::default(),
                         })
@@ -3988,15 +3988,27 @@ mod tests {
                 .expect("a tool change");
             assert_eq!(change.added.len(), 1);
             assert_eq!(change.added[0].function.name, "beta");
-            assert!(
-                second.messages.iter().all(|m| m
-                    .input()
-                    .and_then(|parts| parts.first())
-                    .and_then(|part| part.as_tool_change())
-                    .is_none_or(|change| !change.baseline)),
-                "a baseline is never sent as a message"
+            assert_eq!(
+                second
+                    .messages
+                    .iter()
+                    .filter(|m| m.has_tool_change())
+                    .count(),
+                1,
+                "the change is the only tool record sent: a baseline is not a message"
             );
+            // The model can call the added tool although the list does not
+            // name it.
+            assert!(
+                second
+                    .offered_tools
+                    .iter()
+                    .any(|t| t.function.name == "beta")
+            );
+            assert_eq!(second.offered_tools.len(), second.tools.len() + 1);
+            assert_eq!(first.offered_tools, first.tools);
             assert!(context.messages.iter().any(ChatMessage::has_tool_change));
+            assert!(context.tool_baseline.is_some());
         }
 
         #[tokio::test]
@@ -4009,6 +4021,7 @@ mod tests {
                 "the current list carries the new tool"
             );
             assert_eq!(second.tools.len(), first.tools.len() + 1);
+            assert_eq!(second.offered_tools, second.tools);
             assert!(!second.messages.iter().any(ChatMessage::has_tool_change));
             assert!(!context.messages.iter().any(ChatMessage::has_tool_change));
             let stored = fixture
@@ -4978,6 +4991,7 @@ mod tests {
             );
             let mut request = (*request).clone();
             request.tools = tools.clone();
+            request.offered_tools = tools.clone();
             let state = transition_call_llm(config, &context, &Arc::new(request), exec)
                 .await
                 .expect("call llm");
@@ -5362,6 +5376,7 @@ mod tests {
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
                 let mut request = (*request()).clone();
                 request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
+                request.offered_tools = request.tools.clone();
                 let (_, spans) = capture(async {
                     let parent = info_span!("timing-parent");
                     async {
@@ -5888,6 +5903,7 @@ mod tests {
         fn streaming_request() -> Arc<PreparedModelRequest> {
             let mut request = (*request()).clone();
             request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
+            request.offered_tools = request.tools.clone();
             Arc::new(request)
         }
 
@@ -5927,6 +5943,62 @@ mod tests {
             assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
             assert_eq!(attempt_events(chat), [(1, None)]);
             assert_private(&spans);
+        }
+
+        /// Whether the one request `prepared` leads to was sent with a tool
+        /// list (`Some(len)`) or without one (`None`).
+        async fn sent_tool_list(prepared: Arc<PreparedModelRequest>) -> Option<usize> {
+            let sent = Arc::new(std::sync::Mutex::new(None));
+            let seen = sent.clone();
+            let reply = || {
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("ok".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            };
+            // The mock takes a call without a tool list as `chat` and one
+            // with a list as `chat_with_tools`.
+            let mut mock = MockLlmProvider::new();
+            let without = seen.clone();
+            mock.expect_chat().returning(move |_| {
+                *without.lock().unwrap() = Some(None);
+                reply()
+            });
+            mock.expect_chat_with_tools().returning(move |_, tools| {
+                *seen.lock().unwrap() = Some(tools.map(<[_]>::len));
+                reply()
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            transition_call_llm(&fixture.config, &context, &prepared, &exec)
+                .await
+                .expect("call llm");
+            sent.lock().unwrap().take().expect("one request was sent")
+        }
+
+        #[tokio::test]
+        async fn tools_offered_only_by_a_change_are_sent_with_a_tool_list() {
+            // The request's tool list is the baseline's: it can be empty while
+            // a tool change in the messages offers tools.
+            let mut offered_by_change = (*request()).clone();
+            offered_by_change.offered_tools = streaming_request().tools.clone();
+            assert!(offered_by_change.tools.is_empty());
+
+            assert_eq!(
+                sent_tool_list(Arc::new(offered_by_change)).await,
+                Some(0),
+                "sent as a request with tools, whose list is empty"
+            );
+            assert_eq!(
+                sent_tool_list(request()).await,
+                None,
+                "no tools at all: no tool list"
+            );
+            assert_eq!(sent_tool_list(streaming_request()).await, Some(1));
         }
 
         #[tokio::test]
@@ -7087,6 +7159,7 @@ mod tests {
             let request = Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 1,
                 options: querymt::chat::GenerationOptions::NONE,
             });
@@ -7403,7 +7476,8 @@ mod tests {
             };
             Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
-                tools: tools.into(),
+                tools: tools.clone().into(),
+                offered_tools: tools.into(),
                 estimated_tokens: 1,
                 options: querymt::chat::GenerationOptions::NONE,
             })
