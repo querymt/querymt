@@ -29,6 +29,31 @@
 
 ### Behavior changes
 
+- **Duplicate-code review runs in every run that changed files (middleware
+  `dedup_check`).** Before, its "already reviewed" flag was cleared only by
+  `MiddlewareDriver::reset`, which no run called, so after the first review of
+  a process no later run of any session was reviewed; and it continued a run
+  from the last context any session had stored, so with concurrent sessions a
+  continuation could carry another session's conversation. Now the review
+  runs once per run that added or modified files, considers only that run's
+  changes (`SessionRuntime::turn_diffs` is cleared when a run starts and when
+  it ends), and continues with the reviewed session's own conversation. It is
+  still opt-in (`type = "dedup_check"`) and can be turned off with
+  `enabled = false`.
+- **The context-usage warning is stored at most once per run (middleware
+  `context`).** Before, the "already warned" state was reset whenever any
+  session used a different model than the one before it, so concurrent
+  sessions on different models could store a `context_usage` notice on every
+  step, and a session that stayed above the threshold was warned once until
+  the model changed. Now each run stores one notice, at the first request at
+  or above `warn_at_percent`, and the next run warns again.
+- **Scheduled runs record `run_started`.** A run started by a schedule now
+  records a durable `run_started` event with `origin = "scheduled"` after the
+  run lease is acquired and before its other events, with the same `run_id` as
+  its `run_completed`. Before, only interactive and queued runs did. It is one
+  more durable event per scheduled run. Follow-up in `querymt-desktop`:
+  confirm nothing assumes `run_started.origin` is always `interactive` and
+  that a scheduled run renders as a run.
 - **BREAKING (Rust API, llama-cpp):** `qmt_llama_cpp::LlamaCppConfig` has a new
   public field `lora: Vec<LoraAdapterConfig>`. Struct literals must add
   `lora: Vec::new()`, or better `..LlamaCppConfig::new(model)` /

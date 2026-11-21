@@ -2507,6 +2507,16 @@ impl Message<ScheduledPrompt> for SessionActor {
         self.active_run = Some(scheduled_run);
         self.emit_runtime_changed(0);
 
+        // After the lease is held and before any other event of the run, as
+        // for an interactive run.
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::RunStarted {
+                run_id: run_id.to_string(),
+                origin: "scheduled".to_string(),
+            },
+        );
+
         // Build a PromptRequest from the schedule's prompt text
         let prompt_request = crate::acp::protocol::PromptRequest::new(
             crate::acp::protocol::SessionId::from(self.session_id.clone()),
@@ -3317,9 +3327,14 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         exec_ctx.cancellation_token.is_cancelled()
     );
 
+    // Changed files belong to one run: start from none, and drop what the run
+    // leaves (a review that did not run, or changes made after it).
+    *runtime.turn_diffs.lock() = Default::default();
+
     // Execute Agent Loop using State Machine
     let result =
         crate::agent::execution::execute_cycle_state_machine(&config, &mut exec_ctx, mode).await;
+    *runtime.turn_diffs.lock() = Default::default();
 
     debug!(
         "Session {}: state machine returned: {:?}",
@@ -4016,7 +4031,32 @@ mod tests {
                 .expect_list_sessions()
                 .returning(|| Ok(vec![]))
                 .times(0..);
-            store.expect_get_task().returning(|_| Ok(None)).times(0..);
+            // The one task a scheduled run asks for (`scheduled_prompt`) is active.
+            let task_session_id = session.id;
+            store
+                .expect_get_task()
+                .returning(move |task_public_id| {
+                    if task_public_id != "task-1" {
+                        return Ok(None);
+                    }
+                    let now = time::OffsetDateTime::now_utc();
+                    Ok(Some(crate::session::domain::Task {
+                        id: 1,
+                        public_id: task_public_id.to_string(),
+                        session_id: task_session_id,
+                        kind: crate::session::domain::TaskKind::Recurring,
+                        status: crate::session::domain::TaskStatus::Active,
+                        expected_deliverable: Some("scheduled work".to_string()),
+                        acceptance_criteria: None,
+                        revision: 1,
+                        creation_key: None,
+                        completion_evidence: None,
+                        completed_at: None,
+                        created_at: now,
+                        updated_at: now,
+                    }))
+                })
+                .times(0..);
             store
                 .expect_get_remote_session_bookmark()
                 .returning(|_| Ok(None))
@@ -4205,6 +4245,242 @@ mod tests {
         assert!(f.run_lifecycle().await.is_empty());
         let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
         assert_eq!(status.phase, SessionRuntimePhase::Idle);
+    }
+
+    fn scheduled_prompt() -> ScheduledPrompt {
+        ScheduledPrompt {
+            schedule_public_id: "schedule-1".to_string(),
+            task_public_id: "task-1".to_string(),
+            prompt_text: "scheduled work".to_string(),
+            execution_limits: None,
+        }
+    }
+
+    /// Durable events of the session, as `(event name, run id if it has one)`,
+    /// in journal order, with the `origin` of each `run_started`.
+    async fn journal_overview(f: &ActorFixture) -> Vec<(String, Option<String>, Option<String>)> {
+        f.config
+            .event_sink
+            .session_stream(&f._session_id)
+            .flush()
+            .await;
+        f.config
+            .storage
+            .event_journal()
+            .load_session_stream(&f._session_id, None, None)
+            .await
+            .expect("load journal")
+            .into_iter()
+            .map(|event| {
+                let name = event.kind.tag().to_string();
+                match event.kind {
+                    AgentEventKind::RunStarted { run_id, origin } => {
+                        (name, Some(run_id), Some(origin))
+                    }
+                    AgentEventKind::RunCompleted { run_id, .. } => (name, Some(run_id), None),
+                    AgentEventKind::QueuedInputStarted { run_id, .. } => (name, Some(run_id), None),
+                    _ => (name, None, None),
+                }
+            })
+            .collect()
+    }
+
+    fn run_starts(overview: &[(String, Option<String>, Option<String>)]) -> Vec<(String, String)> {
+        overview
+            .iter()
+            .filter(|(name, ..)| name == "run_started")
+            .map(|(_, run_id, origin)| (run_id.clone().unwrap(), origin.clone().unwrap()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_has_a_start_and_a_completion() {
+        let f = ActorFixture::new().await;
+
+        f.actor_ref
+            .ask(scheduled_prompt())
+            .await
+            .expect("scheduled run completes");
+        f.wait_for_completed_runs(1).await;
+
+        let overview = journal_overview(&f).await;
+        let starts = run_starts(&overview);
+        assert_eq!(starts.len(), 1, "one run start: {overview:?}");
+        assert_eq!(starts[0].1, "scheduled");
+        let completions: Vec<_> = overview
+            .iter()
+            .filter(|(name, ..)| name == "run_completed")
+            .collect();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].1.as_ref(), Some(&starts[0].0));
+        let started_at = overview
+            .iter()
+            .position(|(name, ..)| name == "run_started")
+            .unwrap();
+        assert_eq!(
+            started_at, 0,
+            "the start precedes every other event: {overview:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_run_start_is_unchanged() {
+        let f = ActorFixture::new().await;
+
+        let SubmitInputResult::Started { run_id, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Started");
+        };
+        f.wait_for_completed_runs(1).await;
+
+        let starts = run_starts(&journal_overview(&f).await);
+        assert_eq!(starts, vec![(run_id, "interactive".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_run_start_is_unchanged() {
+        let f = ActorFixture::new().await;
+        // Hold the first run open so the second input is queued behind it.
+        let permit = f.execution_permit.acquire().await.unwrap();
+        let SubmitInputResult::Started { run_id: first, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "first"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Started");
+        };
+        let SubmitInputResult::Queued { .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "second"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+        drop(permit);
+        f.wait_for_completed_runs(2).await;
+
+        let overview = journal_overview(&f).await;
+        let starts = run_starts(&overview);
+        assert_eq!(starts.len(), 2, "{overview:?}");
+        assert_eq!(starts[0], (first, "interactive".to_string()));
+        assert_eq!(starts[1].1, "interactive");
+        let second_start = overview
+            .iter()
+            .position(|(name, run_id, _)| {
+                name == "run_started" && run_id.as_ref() == Some(&starts[1].0)
+            })
+            .unwrap();
+        assert_eq!(
+            overview[second_start + 1],
+            (
+                "queued_input_started".to_string(),
+                Some(starts[1].0.clone()),
+                None
+            ),
+            "the queued-input event follows its run start"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_execution_rejected_while_a_run_is_active() {
+        let f = ActorFixture::new().await;
+        let execution = f.execution_permit.acquire().await.unwrap();
+        let SubmitInputResult::Started { run_id, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Started");
+        };
+
+        let result = f.actor_ref.ask(scheduled_prompt()).await;
+
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::AdmissionRejected { .. }
+            ))
+        ));
+        let starts = run_starts(&journal_overview(&f).await);
+        assert_eq!(starts, vec![(run_id, "interactive".to_string())]);
+
+        // Let the held run finish so no task outlives the test.
+        drop(execution);
+        f.wait_for_completed_runs(1).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_execution_rejected_by_the_run_lease() {
+        let f = ActorFixture::new().await;
+        let _held = f
+            .lease_root()
+            .try_acquire(&f._session_id)
+            .unwrap()
+            .expect("lease free");
+
+        let result = f.actor_ref.ask(scheduled_prompt()).await;
+
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::SessionRunningElsewhere { .. }
+            ))
+        ));
+        let overview = journal_overview(&f).await;
+        assert!(run_starts(&overview).is_empty(), "{overview:?}");
+        assert!(
+            overview
+                .iter()
+                .any(|(name, ..)| name == "scheduled_execution_failed"),
+            "{overview:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crashed_scheduled_run_is_reconciled() {
+        let f = ActorFixture::new().await;
+        f.config
+            .storage
+            .event_journal()
+            .append_durable(&crate::session::projection::NewDurableEvent {
+                session_seq: None,
+                session_id: f._session_id.clone(),
+                origin: querymt_agent_core::events::EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                kind: AgentEventKind::RunStarted {
+                    run_id: "crashed".to_string(),
+                    origin: "scheduled".to_string(),
+                },
+            })
+            .await
+            .expect("seed crashed scheduled run");
+
+        f.actor_ref.tell(Cancel).await.unwrap();
+        f.wait_for_completed_runs(1).await;
+
+        let completed: Vec<_> = f
+            .run_lifecycle()
+            .await
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == "run_completed")
+            .collect();
+        assert_eq!(
+            completed,
+            vec![(
+                "run_completed",
+                "crashed".to_string(),
+                Some("interrupted".to_string())
+            )]
+        );
     }
 
     #[tokio::test]

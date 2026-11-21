@@ -352,13 +352,15 @@ pub struct UndoTestFixture {
     pub storage: Arc<SqliteStorage>,
     pub(crate) handle: AgentHandle,
     pub backend: GitSnapshotBackend,
+    /// Workspace index handed to every session actor registered afterwards.
+    workspace: Option<querymt_agent_index::WorkspaceHandle>,
 }
 
 impl UndoTestFixture {
     /// Creates a new test fixture with snapshot support enabled.
     pub async fn new() -> Result<Self> {
         let (registry, config_dir) = empty_plugin_registry()?;
-        Self::with_registry(registry, config_dir, None).await
+        Self::with_registry(registry, config_dir, None, Vec::new()).await
     }
 
     /// Creates a fixture whose LLM is `provider`, so prompts run end to end
@@ -368,7 +370,59 @@ impl UndoTestFixture {
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
-        Self::with_registry(registry, config_dir, None).await
+        Self::with_registry(registry, config_dir, None, Vec::new()).await
+    }
+
+    /// Like [`Self::with_provider`], with `middleware` installed on the agent,
+    /// in the given order.
+    pub(crate) async fn with_provider_and_middleware(
+        provider: crate::test_utils::SharedLlmProvider,
+        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
+    ) -> Result<Self> {
+        let (registry, config_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
+        Self::with_registry(registry, config_dir, None, middleware).await
+    }
+
+    /// Index the worktree as it is now.
+    pub(crate) async fn build_workspace_index(
+        &self,
+    ) -> Result<querymt_agent_index::WorkspaceHandle> {
+        use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+        Ok(WorkspaceIndexActor::create(
+            self.worktree.path().to_path_buf(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await?)
+    }
+
+    /// Index the worktree as it is now and give the index to every session
+    /// created afterwards, as a materialized session gets its own.
+    pub(crate) async fn index_workspace(&mut self) -> Result<()> {
+        self.workspace = Some(self.build_workspace_index().await?);
+        Ok(())
+    }
+
+    /// Create a session in the worktree whose runtime has no workspace index
+    /// yet. Setting the returned cell later makes the index ready, as the
+    /// background build of a materialized session does.
+    pub(crate) async fn create_session_with_pending_index(
+        &self,
+    ) -> Result<(
+        String,
+        Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>>,
+    )> {
+        let cwd = self.worktree.path();
+        let session = self
+            .storage
+            .session_store()
+            .create_session(None, Some(cwd.to_path_buf()), None, None)
+            .await?;
+        let cell = self
+            .register_session_actor_with_cwd(&session.public_id, cwd)
+            .await;
+        Ok((session.public_id, cell))
     }
 
     /// Like [`Self::with_provider`], with `hooks` installed on the agent.
@@ -378,13 +432,14 @@ impl UndoTestFixture {
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
-        Self::with_registry(registry, config_dir, Some(hooks)).await
+        Self::with_registry(registry, config_dir, Some(hooks), Vec::new()).await
     }
 
     async fn with_registry(
         registry: PluginRegistry,
         config_dir: TempDir,
         hooks: Option<crate::hooks::Hooks>,
+        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
     ) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
@@ -404,6 +459,9 @@ impl UndoTestFixture {
         if let Some(hooks) = hooks {
             builder = builder.with_hooks(hooks);
         }
+        if !middleware.is_empty() {
+            builder = builder.with_middlewares(middleware);
+        }
 
         let config = Arc::new(builder.build());
         let handle = AgentHandle::from_config(config);
@@ -415,6 +473,7 @@ impl UndoTestFixture {
             storage,
             handle,
             backend: GitSnapshotBackend::new().with_snapshot_base(snapshot_base_path),
+            workspace: None,
         })
     }
 
@@ -470,7 +529,7 @@ impl UndoTestFixture {
         &self,
         session_id: &str,
         cwd: &std::path::Path,
-    ) {
+    ) -> Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>> {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
@@ -479,12 +538,21 @@ impl UndoTestFixture {
             std::collections::HashMap::new(),
             crate::agent::core::McpToolState::empty(),
         );
+        if let Some(workspace) = &self.workspace {
+            assert!(
+                runtime.workspace_handle.set(workspace.clone()).is_ok(),
+                "a new runtime has no workspace index"
+            );
+        }
+
+        let workspace_cell = runtime.workspace_handle.clone();
 
         let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);
         let actor_ref = SessionActor::spawn(actor);
 
         let mut registry = self.handle.registry.lock().await;
         registry.insert(session_id.to_string(), actor_ref);
+        workspace_cell
     }
 
     /// Simulate a user message and return its ID

@@ -132,7 +132,7 @@ fallback_max_tokens = 128000
 **Behavior:**
 - Monitors token usage
 - Triggers compaction when approaching limits
-- Emits warnings for monitoring
+- Stores one `context_usage` notice per run, before the first model request at which usage is at or above `warn_at_percent` of the model's context limit. The next run of the session warns again if it is still above the threshold, so a long session is reminded once per run, not on every step. Sessions are independent: one session's warning never silences another's, whatever model each uses. `warn_at_percent = 0` turns the warning off.
 
 ### AgentModeMiddleware
 
@@ -179,9 +179,10 @@ min_lines = 10
 - `min_lines`: Minimum lines to consider
 
 **Behavior:**
-- Analyzes code before writing
-- Warns about similar existing code
-- Helps avoid code duplication
+- Runs when a run is about to complete and its tool calls added or modified files; a run that changed no files is not reviewed
+- Reviews once per run, in every run of every session, and considers only the files changed by that run. Changes of an earlier run (for example one that ended while the workspace index was still being built) and changes made after the review are dropped, not carried into a later run
+- If functions in the changed files are similar to indexed code above `threshold`, stores a `duplicate_code` notice in that session and continues the run with another model request, so the model can reuse the existing code. The request holds the reviewed session's conversation followed by the notice
+- When the review cannot run (`enabled = false`, or the workspace index is not ready yet) the run completes as if it were not configured
 
 ### ParallelEditGuard
 

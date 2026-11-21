@@ -30,10 +30,10 @@
 //! min_lines = 5
 //! ```
 
+#[cfg(test)]
+use crate::middleware::ToolResult;
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{
-    ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult,
-};
+use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 pub use querymt_agent_core::dedup::{DuplicateWarning, FunctionLocation, SimilarMatch};
@@ -42,9 +42,8 @@ use querymt_agent_index::workspace_actor::{FindSimilarToCode, RemoveFile, Update
 use querymt_agent_index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
 use querymt_agent_services::event_sink::EventSink;
 use serde_json::Value;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tracing::instrument;
 
 /// Maximum number of warnings shown inline in the injected summary message.
@@ -96,14 +95,12 @@ pub struct DedupCheckMiddleware {
     threshold: f64,
     /// Minimum number of lines for a function to be analyzed
     min_lines: usize,
-    /// Accumulated tool results from the current batch (reset each cycle)
-    pending_results: Arc<Mutex<Vec<ToolResult>>>,
     /// Optional event sink for emitting duplicate detection events
     event_sink: Option<Arc<EventSink>>,
-    /// Guard to prevent multiple reviews in the same turn
-    already_reviewed_this_turn: AtomicBool,
-    /// Last context seen, used for building BeforeLlmCall state in on_turn_end
-    last_context: Arc<Mutex<Option<Arc<ConversationContext>>>>,
+    /// Sessions whose current run was already reviewed. One middleware object
+    /// serves every session of an agent, so the guard is kept per session and
+    /// cleared when the session's next run starts.
+    reviewed_runs: Mutex<HashSet<String>>,
 }
 
 impl Default for DedupCheckMiddleware {
@@ -124,10 +121,8 @@ impl DedupCheckMiddleware {
             enabled: true,
             threshold: 0.8,
             min_lines: 5,
-            pending_results: Arc::new(Mutex::new(Vec::new())),
             event_sink: None,
-            already_reviewed_this_turn: AtomicBool::new(false),
-            last_context: Arc::new(Mutex::new(None)),
+            reviewed_runs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -601,15 +596,17 @@ impl DedupCheckMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DedupCheckMiddleware {
-    /// Capture the latest context for use in on_turn_end
-    async fn on_after_llm(
+    /// A new run of the session may be reviewed again.
+    async fn on_turn_start(
         &self,
         state: ExecutionState,
         _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        // Capture the latest context for use in on_turn_end
-        if let Some(ctx) = state.context() {
-            *self.last_context.lock().await = Some(ctx.clone());
+        if let Some(context) = state.context() {
+            self.reviewed_runs
+                .lock()
+                .expect("reviewed runs lock")
+                .remove(context.session_id.as_ref());
         }
         Ok(state)
     }
@@ -641,30 +638,29 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             return Ok(state);
         }
 
-        // Only run on Complete state
-        if !matches!(state, ExecutionState::Complete { .. }) {
+        // Only run on Complete state; the context it carries is the reviewed
+        // run's own conversation, which a continuation extends.
+        let ExecutionState::Complete { context } = &state else {
             log::debug!(
                 "DedupCheckMiddleware: skipping — state is {} (not Complete)",
                 state.name()
             );
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
-        }
-
-        // Guard: only review once per turn
-        if self.already_reviewed_this_turn.swap(true, Ordering::SeqCst) {
-            log::debug!("DedupCheckMiddleware: skipping — already reviewed this turn");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
-        }
-
-        // Get the last context for building BeforeLlmCall state
-        let last_context = self.last_context.lock().await.clone();
-        let Some(context) = last_context else {
-            log::debug!("DedupCheckMiddleware: skipping — no last_context captured");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
         };
+        let context = context.clone();
+
+        // Guard: only review once per run of the session
+        let first_review = self
+            .reviewed_runs
+            .lock()
+            .expect("reviewed runs lock")
+            .insert(context.session_id.to_string());
+        if !first_review {
+            log::debug!("DedupCheckMiddleware: skipping — already reviewed this run");
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        }
 
         // Get function_index and turn_diffs from the runtime parameter
         let Some(runtime) = runtime else {
@@ -788,12 +784,10 @@ impl MiddlewareDriver for DedupCheckMiddleware {
     }
 
     fn reset(&self) {
-        // Reset review guard and clear accumulated results
-        self.already_reviewed_this_turn
-            .store(false, Ordering::SeqCst);
-        if let Ok(mut pending) = self.pending_results.try_lock() {
-            pending.clear();
-        }
+        self.reviewed_runs
+            .lock()
+            .expect("reviewed runs lock")
+            .clear();
     }
 
     fn name(&self) -> &'static str {

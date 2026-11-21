@@ -53,6 +53,10 @@ pub use presets::MiddlewarePresets;
 pub use specialized::{AgentModeMiddleware, DuplicateToolCallMiddleware};
 
 #[cfg(test)]
+mod context_warning_tests;
+#[cfg(test)]
+mod dedup_check_tests;
+#[cfg(test)]
 mod driver_tests;
 #[cfg(test)]
 mod flow_tests;

@@ -84,8 +84,10 @@ impl ContextConfig {
 /// Middleware that handles context warnings and optional auto-compaction
 pub struct ContextMiddleware {
     config: ContextConfig,
+    /// Sessions that were warned in their current run. One middleware object
+    /// serves every session of an agent, so the state is kept per session and
+    /// cleared when the session's next run starts.
     warned_sessions: Mutex<std::collections::HashSet<Arc<str>>>,
-    last_model: Mutex<Option<(String, String)>>, // (provider, model)
 }
 
 impl ContextMiddleware {
@@ -97,7 +99,6 @@ impl ContextMiddleware {
         Self {
             config,
             warned_sessions: Mutex::new(std::collections::HashSet::new()),
-            last_model: Mutex::new(None),
         }
     }
 
@@ -120,23 +121,6 @@ impl ContextMiddleware {
             ModelInfoSource::Manual { context_limit, .. } => {
                 context_limit.unwrap_or(self.config.fallback_max_tokens)
             }
-        }
-    }
-
-    /// Check if provider changed and reset state if needed
-    fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock();
-        let current = (context.provider.to_string(), context.model.to_string());
-
-        if last.as_ref() != Some(&current) {
-            // Provider changed - reset warned sessions
-            let mut warned = self.warned_sessions.lock();
-            warned.clear();
-            *last = Some(current.clone());
-            debug!(
-                "Provider changed to {}/{}, reset context warnings",
-                current.0, current.1
-            );
         }
     }
 
@@ -172,6 +156,18 @@ impl ContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for ContextMiddleware {
+    /// A new run of the session may warn again.
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        if let Some(context) = state.context() {
+            self.warned_sessions.lock().remove(&context.session_id);
+        }
+        Ok(state)
+    }
+
     async fn on_step_start(
         &self,
         state: ExecutionState,
@@ -184,9 +180,6 @@ impl MiddlewareDriver for ContextMiddleware {
 
         match state {
             ExecutionState::BeforeLlmCall { ref context } => {
-                // Check if provider changed
-                self.check_provider_changed(context);
-
                 // Get max tokens dynamically
                 let max_tokens = self.get_max_tokens(context);
 
@@ -242,11 +235,8 @@ impl MiddlewareDriver for ContextMiddleware {
     }
 
     fn reset(&self) {
-        debug!("ContextMiddleware::reset - clearing warned sessions and model cache");
-        let mut warned = self.warned_sessions.lock();
-        warned.clear();
-        let mut last = self.last_model.lock();
-        *last = None;
+        debug!("ContextMiddleware::reset - clearing warned sessions");
+        self.warned_sessions.lock().clear();
     }
 
     fn name(&self) -> &'static str {
@@ -496,42 +486,6 @@ mod tests {
         assert!(
             second_warning.is_none(),
             "Should only warn once per session"
-        );
-    }
-
-    #[test]
-    fn test_should_warn_reset_on_provider_change() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let session_id: Arc<str> = "test-session".into();
-
-        // Warn for provider1/model1
-        let ctx1 = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "provider1".into(),
-                model: "model1".into(),
-                ..(*ctx1).clone()
-            }));
-
-        let first_warning = fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(first_warning.is_some());
-
-        // Check provider change to provider2/model2
-        let ctx2 = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "provider2".into(),
-                model: "model2".into(),
-                ..(*ctx2).clone()
-            }));
-
-        // Second call should warn again (session warned set was cleared)
-        let second_warning = fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(
-            second_warning.is_some(),
-            "Should reset warnings on provider change"
         );
     }
 
@@ -819,30 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_clears_model_cache() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-
-        // Set model info
-        let ctx = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "test-provider".into(),
-                model: "test-model".into(),
-                ..(*ctx).clone()
-            }));
-
-        // Verify it was set
-        assert!(fixture.middleware.last_model.lock().is_some());
-
-        // Reset
-        fixture.middleware.reset();
-
-        // Verify it was cleared
-        assert!(fixture.middleware.last_model.lock().is_none());
-    }
-
-    #[test]
     fn test_middleware_name() {
         let fixture = ContextMiddlewareFixture::with_defaults();
         assert_eq!(fixture.middleware.name(), "ContextMiddleware");
@@ -895,61 +825,54 @@ mod tests {
         assert_eq!(max_tokens, ContextConfig::default().fallback_max_tokens);
     }
 
-    #[test]
-    fn test_check_provider_changed_detects_change() {
+    #[tokio::test]
+    async fn on_turn_start_clears_only_its_own_session() {
         let fixture = ContextMiddlewareFixture::with_defaults();
-        let ctx = test_context("test", 0);
+        let mine: Arc<str> = "mine".into();
+        let other: Arc<str> = "other".into();
+        fixture.middleware.should_warn(&mine, 8000, 10000);
+        fixture.middleware.should_warn(&other, 8000, 10000);
 
-        let ctx1 = Arc::new(ConversationContext {
-            provider: "provider1".into(),
-            model: "model1".into(),
-            ..(*ctx).clone()
-        });
+        let state = ExecutionState::BeforeLlmCall {
+            context: test_context("mine", 0),
+        };
+        fixture.middleware.on_turn_start(state, None).await.unwrap();
 
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let ctx2 = Arc::new(ConversationContext {
-            provider: "provider2".into(),
-            model: "model2".into(),
-            ..(*ctx).clone()
-        });
-
-        // Before calling check_provider_changed with ctx2, add a warned session
-        let session_id: Arc<str> = "test".into();
-        fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(!fixture.middleware.warned_sessions.lock().is_empty());
-
-        fixture.middleware.check_provider_changed(&ctx2);
-
-        // Warned sessions should be cleared on provider change
-        assert!(fixture.middleware.warned_sessions.lock().is_empty());
+        let warned = fixture.middleware.warned_sessions.lock();
+        assert!(!warned.contains(&mine));
+        assert!(warned.contains(&other));
     }
 
-    #[test]
-    fn test_check_provider_not_changed_preserves_state() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let ctx = test_context("test", 0);
+    #[tokio::test]
+    async fn model_change_within_a_run_does_not_warn_again() {
+        let fixture = ContextMiddlewareFixture::with_manual_limit(10_000);
+        let step_on = |model: &str| {
+            let base = test_context("mine", 0);
+            let mut stats = (*base.stats).clone();
+            stats.context_tokens = 8_200;
+            Arc::new(ConversationContext {
+                model: model.into(),
+                stats: Arc::new(stats),
+                ..(*base).clone()
+            })
+        };
 
-        let ctx1 = Arc::new(ConversationContext {
-            provider: "provider1".into(),
-            model: "model1".into(),
-            ..(*ctx).clone()
-        });
+        let first = fixture
+            .run_step(ExecutionState::BeforeLlmCall {
+                context: step_on("model-1"),
+            })
+            .await
+            .unwrap();
+        let second = fixture
+            .run_step(ExecutionState::BeforeLlmCall {
+                context: step_on("model-2"),
+            })
+            .await
+            .unwrap();
 
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let session_id: Arc<str> = "test".into();
-        fixture.middleware.should_warn(&session_id, 8000, 10000);
-        let warned_count_before = fixture.middleware.warned_sessions.lock().len();
-
-        // Check same provider again
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let warned_count_after = fixture.middleware.warned_sessions.lock().len();
-
-        assert_eq!(
-            warned_count_before, warned_count_after,
-            "State should be preserved if provider didn't change"
-        );
+        let queued =
+            |state: &ExecutionState| state.context().expect("context").pending_notices.len();
+        assert_eq!(queued(&first), 1);
+        assert_eq!(queued(&second), 0, "one warning per run");
     }
 }
