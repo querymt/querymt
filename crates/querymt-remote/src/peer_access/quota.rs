@@ -146,7 +146,7 @@ pub struct QuotaAttempt {
 pub struct ReservationId(pub Uuid);
 
 /// One limiting scope reported by preflight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitingQuota {
     pub scope: QuotaScope,
     pub available_tokens: i64,
@@ -216,4 +216,74 @@ pub enum QuotaError {
     DuplicateAttempt,
     #[error("invalid accounting attempt transition")]
     InvalidAttempt,
+}
+
+/// Details retained across the provider wire and promoted to the ACP error.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum QuotaDenialDetails {
+    Limits { limits: Vec<LimitingQuota> },
+    Scope { scope: QuotaScope },
+}
+
+const DENIAL_DETAILS_PREFIX: &str = "querymt.mesh.quota.v1:";
+
+impl QuotaDenialDetails {
+    /// Decode only the metadata matching this mesh policy error's code.
+    pub fn from_provider_metadata(code: &str, error_type: Option<&str>) -> Option<Self> {
+        let payload = error_type?.strip_prefix(DENIAL_DETAILS_PREFIX)?;
+        let details = serde_json::from_str(payload).ok()?;
+        match (code, &details) {
+            ("mesh_quota_exhausted", Self::Limits { .. })
+            | ("mesh_quota_unsupported", Self::Scope { .. }) => Some(details),
+            _ => None,
+        }
+    }
+}
+
+impl QuotaError {
+    /// Preserve the same classification and limiting scopes for direct and hosted dispatch.
+    pub fn into_provider_error(self) -> querymt::error::LLMError {
+        use querymt::error::{ProviderErrorKind, ProviderFailure};
+        let (kind, code) = match &self {
+            Self::Denied | Self::InvalidAttempt => {
+                (ProviderErrorKind::Authentication, "mesh_access_denied")
+            }
+            Self::Exhausted(_) => (ProviderErrorKind::QuotaExceeded, "mesh_quota_exhausted"),
+            Self::Unsupported(_) => (
+                ProviderErrorKind::UnsupportedOperation,
+                "mesh_quota_unsupported",
+            ),
+            Self::DuplicateAttempt => (
+                ProviderErrorKind::InvalidRequest,
+                "mesh_quota_duplicate_attempt",
+            ),
+            _ => {
+                tracing::warn!(error = %self, "mesh quota operation failed");
+                (
+                    ProviderErrorKind::UnknownPermanent,
+                    "mesh_access_unavailable",
+                )
+            }
+        };
+        let message = if code == "mesh_access_unavailable" {
+            "mesh policy unavailable".into()
+        } else {
+            self.to_string()
+        };
+        let details = match self {
+            Self::Exhausted(limits) => Some(QuotaDenialDetails::Limits { limits }),
+            Self::Unsupported(scope) => Some(QuotaDenialDetails::Scope { scope }),
+            _ => None,
+        };
+        // Keep the native provider error layout unchanged. The existing optional
+        // metadata field carries a namespaced wire value, not display text.
+        let metadata = details
+            .and_then(|details| serde_json::to_string(&details).ok())
+            .map(|encoded| format!("{DENIAL_DETAILS_PREFIX}{encoded}"));
+        ProviderFailure::new(kind, message)
+            .with_code(Some(code.into()))
+            .with_error_type(metadata)
+            .into()
+    }
 }

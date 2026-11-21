@@ -221,31 +221,7 @@ impl HostedProvider {
 }
 
 fn quota_failure(error: QuotaError) -> LLMError {
-    let (kind, code, message) = match &error {
-        QuotaError::Denied | QuotaError::InvalidAttempt => (
-            ProviderErrorKind::Authentication,
-            "mesh_access_denied",
-            error.to_string(),
-        ),
-        QuotaError::Exhausted(_) => (
-            ProviderErrorKind::QuotaExceeded,
-            "mesh_quota_exhausted",
-            error.to_string(),
-        ),
-        QuotaError::Unsupported(_) => (
-            ProviderErrorKind::UnsupportedOperation,
-            "mesh_quota_unsupported",
-            error.to_string(),
-        ),
-        _ => (
-            ProviderErrorKind::UnknownPermanent,
-            "mesh_access_unavailable",
-            "mesh usage accounting unavailable".into(),
-        ),
-    };
-    ProviderFailure::new(kind, message)
-        .with_code(Some(code.into()))
-        .into()
+    error.into_provider_error()
 }
 
 async fn settle_hosted(attempt: DispatchedAttempt, usage: AttemptUsage) -> Result<(), LLMError> {

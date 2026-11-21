@@ -326,36 +326,7 @@ fn enforce_settlement(outcome: QuotaSettlement) -> Result<(), RemoteProviderHost
 }
 
 fn quota_error(error: QuotaError) -> RemoteProviderHostError {
-    let (kind, code) = match &error {
-        QuotaError::Denied | QuotaError::InvalidAttempt => {
-            (ProviderErrorKind::Authentication, "mesh_access_denied")
-        }
-        QuotaError::Exhausted(_) => (ProviderErrorKind::QuotaExceeded, "mesh_quota_exhausted"),
-        QuotaError::Unsupported(_) => (
-            ProviderErrorKind::UnsupportedOperation,
-            "mesh_quota_unsupported",
-        ),
-        QuotaError::DuplicateAttempt => (
-            ProviderErrorKind::InvalidRequest,
-            "mesh_quota_duplicate_attempt",
-        ),
-        _ => {
-            tracing::warn!(%error, "mesh quota operation failed");
-            (
-                ProviderErrorKind::UnknownPermanent,
-                "mesh_access_unavailable",
-            )
-        }
-    };
-    failure(
-        kind,
-        code,
-        if code == "mesh_access_unavailable" {
-            "mesh policy unavailable".to_owned()
-        } else {
-            error.to_string()
-        },
-    )
+    RemoteProviderHostError::provider_chat("mesh_policy", &error.into_provider_error())
 }
 
 fn failure(
