@@ -64,6 +64,22 @@ Each protected operation, including deferred work after restart, SHALL use the c
 - **WHEN** a restricted peer tries to steer an owner-initiated run or resolve an interaction outside the peer's authority
 - **THEN** the host refuses it without applying the input or changing the run's authority
 
+### Requirement: Scheduled work keeps its origin across restart
+
+A host SHALL record authenticated peer origin before accepting a new remote schedule, and SHALL reject a new remote schedule request with no authenticated origin. Schedules without a stored origin SHALL run as Local for compatibility. When a peer schedule becomes due before the host policy store is initialized, the host SHALL wait or retry without counting this as a denied run.
+
+#### Scenario: Origin-less schedules still run after restart
+- **WHEN** a host restarts with an existing schedule that has no stored origin
+- **THEN** the schedule runs as Local using the usual scheduler behavior
+
+#### Scenario: A remote schedule cannot be created without a peer origin
+- **WHEN** a new remote schedule request lacks authenticated peer origin
+- **THEN** the host rejects creation without persisting an unusable schedule
+
+#### Scenario: A peer schedule becomes due during startup
+- **WHEN** a persisted peer schedule becomes due before the host policy store is ready
+- **THEN** the host waits or retries and applies the peer's current grant when it is ready
+
 ### Requirement: Discovery reports access in the right direction
 
 The owner view SHALL distinguish what this host shares from what the selected peer shares in return. Peer-facing data SHALL be limited to the caller's effective grant and permitted metadata. The service SHALL distinguish denied, unavailable, and incompatible peers, invalidate known stale access, and never infer access from a legacy capability badge.

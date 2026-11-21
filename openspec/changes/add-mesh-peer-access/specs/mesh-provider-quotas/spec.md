@@ -60,6 +60,14 @@ Before any attempt subject to a finite cap, including an auxiliary attempt, the 
 - **WHEN** an otherwise allowed request has no reliable token bound and neither scope has a finite cap
 - **THEN** it may dispatch without a quota reservation
 
+### Requirement: Metering uses existing deadlines
+
+Metering SHALL NOT add a separate inference or preparation timeout to existing provider and session deadlines and cancellation.
+
+#### Scenario: A slow provider can complete an authorized request
+- **WHEN** a peer's authorized attempt runs longer than the former mesh-only deadline but the caller and provider are still waiting
+- **THEN** metering does not stop the request solely because of elapsed time
+
 ### Requirement: Settlement uses host-observed attempt usage
 
 The host SHALL settle each dispatched attempt once using its authoritative normalized token total. It SHALL release confirmed pre-dispatch failures and charge missing or incomplete finite usage at the reserved amount as estimated. Missing unlimited usage SHALL be reported as unknown. If reported usage exceeds the bound, the host SHALL record the actual usage, report a fault, and suspend finite dispatch for that binding until a bound can be enforced.
@@ -84,6 +92,14 @@ Reservations and usage SHALL survive restart. Editing access or the amount of an
 - **WHEN** the owner edits the amount of an existing finite provider or model cap without changing its schedule
 - **THEN** the new amount applies to new attempts but settled usage and outstanding reservations remain in the same window; a reduction below consumption leaves no available capacity
 
+#### Scenario: A quota edit preserves authorized work with capacity
+- **WHEN** the owner raises a cap or otherwise changes quota without exhausting the applicable allowance or removing permission
+- **THEN** the host does not cancel turns, streams, subscriptions, or schedules because of the edit
+
+#### Scenario: A cap edit exhausts an allowance
+- **WHEN** an edit leaves no capacity under a quota applicable to the peer's work
+- **THEN** the host stops affected work and continues to enforce quota on subsequent dispatches; unrelated work is unaffected
+
 #### Scenario: Changing a schedule requires explicit reconfiguration
 - **WHEN** the owner tries to change an existing model cap from weekly to daily as an ordinary grant edit, then explicitly reconfigures that scope after outstanding attempts finish
 - **THEN** the ordinary edit is refused, and the explicit reconfiguration opens a fresh daily allowance with the next UTC midnight as its renewal, retaining prior usage and leaving the provider schedule and balance unchanged
@@ -95,6 +111,14 @@ A reset, first finite cap, or reconfiguration to a new finite period SHALL targe
 #### Scenario: Reset waits for outstanding attempts
 - **WHEN** the owner requests a model reset with an attempt outstanding and retries after it settles
 - **THEN** the first reset is refused and the second opens a fresh model allowance without changing provider or other model usage, previous records, or the next scheduled renewal
+
+### Requirement: Quota ledger prunes expired history
+
+The host SHALL retain the current and previous quota period for status and all open reservations regardless of age. It SHALL prune older settled attempt and replay records once replay is no longer possible. Pruning SHALL run automatically at startup and when a quota period rolls over without a new setting.
+
+#### Scenario: Pruning preserves late settlement and status
+- **WHEN** the host starts or quota renews with older settled history and an outstanding reservation from an older period
+- **THEN** the reservation can still settle in its original period, the current and previous period remain visible, and expired history not needed for settlement or replay is removed
 
 ### Requirement: Quota status identifies the relevant limits
 
