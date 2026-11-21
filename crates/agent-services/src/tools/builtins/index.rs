@@ -109,7 +109,7 @@ impl ToolTrait for IndexTool {
             .ok_or_else(|| ToolError::InvalidRequest("path is required".to_string()))?;
 
         let root = resolve_root(&args, context)?;
-        let target = resolve_target(path_str, &root);
+        let target = resolve_target("path", path_str, &root)?;
 
         if !target.exists() {
             return Err(ToolError::InvalidRequest(format!(

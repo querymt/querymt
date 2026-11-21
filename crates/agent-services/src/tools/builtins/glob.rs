@@ -160,7 +160,7 @@ impl Tool for GlobTool {
 
         // Extract path (optional, defaults to cwd)
         let root = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
-            context.resolve_path(path_str)?
+            context.resolve_path_arg("path", path_str)?
         } else {
             context
                 .cwd()

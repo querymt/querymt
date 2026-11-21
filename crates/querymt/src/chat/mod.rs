@@ -32,7 +32,7 @@ pub use output::{
     ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
     ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatTextAnnotation, Extensions,
     INVALID_INPUT_EXTENSION, MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType,
-    MediaTypeError, ToolResult, ToolResultPart, empty_message_part,
+    MediaTypeError, ToolChange, ToolResult, ToolResultPart, empty_message_part,
 };
 pub use streaming::{
     ANTHROPIC_BLOCK_EXTENSION, ANTHROPIC_REDACTED_THINKING, ChatMessagePartDelta,
@@ -279,7 +279,7 @@ impl GenerationOptionSupport {
 /// (user/tool-result turns) or structured output (assistant turns). Portable and
 /// display projections are derived on demand from structured output and are
 /// never stored as an independently mutable second source of truth.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     /// The role of who sent this message (user or assistant)
     pub role: ChatRole,
@@ -347,7 +347,7 @@ pub struct ParametersSchema {
 
 /// Represents a function definition for a tool
 #[cfg_attr(feature = "type-generation", typeshare::typeshare)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FunctionTool {
     /// The name of the function
     pub name: String,
@@ -411,7 +411,7 @@ pub struct StructuredOutputFormat {
 
 /// Represents a tool that can be used in chat
 #[cfg_attr(feature = "type-generation", typeshare::typeshare)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Tool {
     /// The type of tool (e.g. "function")
     #[serde(rename = "type")]
@@ -834,9 +834,60 @@ impl<'a> ChatCall<'a> {
     }
 }
 
+/// How a provider's prompt cache can be steered, for the configured model and
+/// endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PromptCacheCapabilities {
+    /// The provider honours explicit cache breakpoints (hints) on system
+    /// sections and messages.
+    #[serde(default)]
+    pub explicit_breakpoints: bool,
+    /// The longest cache lifetime in seconds the provider accepts; `None` when
+    /// the lifetime cannot be chosen. A requested lifetime is sent as the
+    /// shortest one the provider supports that is at least as long.
+    #[serde(default)]
+    pub max_ttl_secs: Option<u32>,
+}
+
+impl PromptCacheCapabilities {
+    /// No explicit breakpoints and no selectable lifetime.
+    pub const NONE: Self = Self {
+        explicit_breakpoints: false,
+        max_ttl_secs: None,
+    };
+
+    /// Explicit breakpoints whose lifetime cannot be chosen.
+    pub const BREAKPOINTS: Self = Self {
+        explicit_breakpoints: true,
+        max_ttl_secs: None,
+    };
+
+    /// Sets the longest selectable lifetime in seconds.
+    #[must_use]
+    pub const fn with_max_ttl_secs(mut self, secs: u32) -> Self {
+        self.max_ttl_secs = Some(secs);
+        self
+    }
+
+    /// The lifetime a default hint requests for a configured `ttl_secs`:
+    /// `min(ttl_secs, max_ttl_secs)`, or `None` when `ttl_secs` is 0 or the
+    /// provider declares no selectable lifetime.
+    #[must_use]
+    pub fn default_hint_ttl(&self, ttl_secs: u32) -> Option<u32> {
+        match (ttl_secs, self.max_ttl_secs) {
+            (0, _) | (_, None) => None,
+            (wanted, Some(max)) => Some(wanted.min(max)),
+        }
+    }
+}
+
 /// What a provider supports for chat calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatCapabilities {
+    /// Prompt-cache support for the configured model and endpoint. A provider
+    /// or plugin that reports no declaration gets no default cache hints.
+    #[serde(default)]
+    pub prompt_cache: PromptCacheCapabilities,
     /// The provider supports streaming responses.
     #[serde(default)]
     pub streaming: bool,
@@ -844,14 +895,36 @@ pub struct ChatCapabilities {
     /// outside this set are ignored without failing the request.
     #[serde(default)]
     pub options: GenerationOptionSupport,
+    /// Tools can be added, removed and redefined by a message inside the
+    /// conversation (a [`ToolChange`] input part) for the configured model and
+    /// endpoint. A provider or plugin that reports no value does not support
+    /// it, and the caller never sends it a tool-change message.
+    #[serde(default)]
+    pub tool_updates: bool,
 }
 
 impl ChatCapabilities {
-    /// No streaming and no per-request options.
+    /// No streaming, no per-request options and no tool updates.
     pub const NONE: Self = Self {
+        prompt_cache: PromptCacheCapabilities::NONE,
         streaming: false,
         options: GenerationOptionSupport::NONE,
+        tool_updates: false,
     };
+
+    /// Sets the prompt-cache declaration.
+    #[must_use]
+    pub const fn with_prompt_cache(mut self, prompt_cache: PromptCacheCapabilities) -> Self {
+        self.prompt_cache = prompt_cache;
+        self
+    }
+
+    /// Sets whether tool changes inside the conversation are supported.
+    #[must_use]
+    pub const fn with_tool_updates(mut self, tool_updates: bool) -> Self {
+        self.tool_updates = tool_updates;
+        self
+    }
 
     /// Sets whether streaming is supported.
     #[must_use]
@@ -866,6 +939,20 @@ impl ChatCapabilities {
         self.options = options;
         self
     }
+}
+
+/// Fails a request that contains a [`ToolChange`] part, for a provider that
+/// does not support tool changes inside the conversation.
+///
+/// Adapters call this before building a request so a tool-change message is
+/// never silently dropped.
+pub fn reject_tool_changes(provider: &str, messages: &[ChatMessage]) -> Result<(), LLMError> {
+    if messages.iter().any(ChatMessage::has_tool_change) {
+        return Err(LLMError::InvalidRequest(format!(
+            "provider `{provider}` does not support tool-change messages"
+        )));
+    }
+    Ok(())
 }
 
 /// Unified chat interface for synchronous and streaming interactions, with or
@@ -1139,6 +1226,20 @@ impl ChatMessage {
         self.output()
             .into_iter()
             .flat_map(|output| output.function_calls())
+    }
+
+    /// Create a user-role message that changes the offered tools from this
+    /// point of the conversation on.
+    pub fn from_tool_change(change: ToolChange) -> Self {
+        Self::from_user_parts(vec![ChatInputPart::ToolChange(change)])
+    }
+
+    /// Whether any input part of this message is a [`ToolChange`].
+    pub fn has_tool_change(&self) -> bool {
+        match &self.payload {
+            ChatMessagePayload::Input(parts) => parts.iter().any(ChatInputPart::is_tool_change),
+            ChatMessagePayload::Output(_) => false,
+        }
     }
 
     /// Check whether the message carries any tool result input part.
@@ -1517,6 +1618,127 @@ mod tests {
     fn chat_capabilities_deserialize_with_missing_fields() {
         let caps: ChatCapabilities = serde_json::from_str("{}").unwrap();
         assert_eq!(caps, ChatCapabilities::NONE);
+    }
+
+    #[test]
+    fn capabilities_without_tool_updates_are_read_as_false() {
+        // A plugin built before the declaration existed reports no value.
+        let caps: ChatCapabilities = serde_json::from_str(
+            r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#,
+        )
+        .unwrap();
+        assert!(caps.streaming);
+        assert!(!caps.tool_updates);
+    }
+
+    #[test]
+    fn prompt_cache_defaults_to_nothing_declared() {
+        let caps = ChatCapabilities::default();
+        assert!(!caps.prompt_cache.explicit_breakpoints);
+        assert_eq!(caps.prompt_cache.max_ttl_secs, None);
+        assert_eq!(caps.prompt_cache, PromptCacheCapabilities::NONE);
+    }
+
+    #[test]
+    fn prompt_cache_round_trips_through_json() {
+        let caps = ChatCapabilities::NONE
+            .with_prompt_cache(PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600));
+        let json = serde_json::to_value(caps).unwrap();
+        assert_eq!(
+            json["prompt_cache"],
+            serde_json::json!({"explicit_breakpoints": true, "max_ttl_secs": 3600})
+        );
+        let back: ChatCapabilities = serde_json::from_value(json).unwrap();
+        assert_eq!(back, caps);
+    }
+
+    #[test]
+    fn capabilities_without_prompt_cache_are_read_as_nothing_declared() {
+        // A plugin built before the declaration existed omits the field.
+        let caps: ChatCapabilities = serde_json::from_str(
+            r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(caps.prompt_cache, PromptCacheCapabilities::NONE);
+        // A partial declaration defaults the missing field.
+        let caps: ChatCapabilities =
+            serde_json::from_str(r#"{"prompt_cache":{"explicit_breakpoints":true}}"#).unwrap();
+        assert_eq!(caps.prompt_cache, PromptCacheCapabilities::BREAKPOINTS);
+    }
+
+    #[test]
+    fn default_hint_ttl_is_the_configured_lifetime_capped_at_the_maximum() {
+        let anthropic = PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600);
+        let responses = PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(1800);
+        assert_eq!(anthropic.default_hint_ttl(3600), Some(3600));
+        assert_eq!(anthropic.default_hint_ttl(600), Some(600));
+        assert_eq!(responses.default_hint_ttl(3600), Some(1800));
+        // The default lifetime and a fixed lifetime request nothing.
+        assert_eq!(anthropic.default_hint_ttl(0), None);
+        assert_eq!(
+            PromptCacheCapabilities::BREAKPOINTS.default_hint_ttl(3600),
+            None
+        );
+        assert_eq!(PromptCacheCapabilities::NONE.default_hint_ttl(3600), None);
+    }
+
+    #[test]
+    fn tool_updates_round_trip_through_json() {
+        let caps = ChatCapabilities::NONE.with_tool_updates(true);
+        let json = serde_json::to_string(&caps).unwrap();
+        let back: ChatCapabilities = serde_json::from_str(&json).unwrap();
+        assert!(back.tool_updates);
+        assert_eq!(back, caps);
+    }
+
+    fn sample_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: "function".into(),
+            function: FunctionTool {
+                name: name.into(),
+                description: format!("{name} tool"),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                strict: Some(true),
+            },
+        }
+    }
+
+    #[test]
+    fn tool_change_message_round_trips_through_json() {
+        let message = ChatMessage::from_tool_change(ToolChange {
+            added: vec![sample_tool("deploy"), sample_tool("skill")],
+            removed: vec!["old".into()],
+        });
+        assert!(message.has_tool_change());
+        let json = serde_json::to_string(&message).unwrap();
+        let back: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+        let change = back.input().unwrap()[0].as_tool_change().unwrap();
+        assert_eq!(change.added.len(), 2);
+        assert_eq!(change.removed, vec!["old".to_string()]);
+        assert!(!ChatMessage::from_user_parts(vec![ChatInputPart::text("x")]).has_tool_change());
+    }
+
+    #[test]
+    fn tool_change_has_no_fields_besides_the_definitions_and_names() {
+        // The type crosses the plugin boundary: only what a provider is sent
+        // belongs on it.
+        let json = serde_json::to_value(ToolChange::new(Vec::new(), vec!["x".into()])).unwrap();
+        assert_eq!(json, serde_json::json!({"added": [], "removed": ["x"]}));
+    }
+
+    #[test]
+    fn provider_without_the_declaration_rejects_a_tool_change() {
+        let messages = vec![
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("hi")]),
+            ChatMessage::from_tool_change(ToolChange {
+                added: vec![sample_tool("deploy")],
+                removed: Vec::new(),
+            }),
+        ];
+        let err = reject_tool_changes("acme", &messages).unwrap_err();
+        assert!(err.to_string().contains("acme"), "{err}");
+        assert!(reject_tool_changes("acme", &messages[..1]).is_ok());
     }
 
     struct ChatOnly;

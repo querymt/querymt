@@ -646,7 +646,7 @@ impl Tool for EditTool {
             ));
         }
 
-        let file_path = context.resolve_path(file_path_str)?;
+        let file_path = context.resolve_path_arg("file_path", file_path_str)?;
 
         // Mutating phase runs under the checkout mutation gate when the
         // session has one, so baseline capture never observes a half-applied
@@ -712,6 +712,34 @@ mod tests {
 
         assert_eq!(relative, FileAccess::writes([root.join("a.md")]));
         assert_eq!(relative, absolute);
+    }
+
+    /// `~/x` and the absolute spelling of the same file are one file for
+    /// scheduling and approval, and the model's own arguments are not rewritten.
+    #[test]
+    fn file_access_expands_a_leading_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let cwd = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(cwd.path()).unwrap();
+        let tool = EditTool::new();
+
+        // The file does not exist, so nothing in the real home directory is touched.
+        let args = json!({"file_path": "~/qmt-tilde-test-nonexistent/a.md"});
+        let tilde = tool.file_access(&args, Some(&cwd));
+        let absolute = tool.file_access(
+            &json!({"file_path": home.join("qmt-tilde-test-nonexistent/a.md").to_str().unwrap()}),
+            Some(&cwd),
+        );
+
+        assert_eq!(tilde, absolute);
+        assert_ne!(
+            tilde,
+            FileAccess::writes([cwd.join("~/qmt-tilde-test-nonexistent/a.md")])
+        );
+        // `file_access` only reads the arguments.
+        assert_eq!(args["file_path"], "~/qmt-tilde-test-nonexistent/a.md");
     }
 
     #[test]

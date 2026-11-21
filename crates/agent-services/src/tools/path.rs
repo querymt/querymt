@@ -4,14 +4,28 @@
 //! tool calls refer to the same file, regardless of how the model spelled the
 //! path (`a.md`, `./a.md`, an absolute path, or through a symlinked directory).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use super::context::FileAccess;
+use super::context::{FileAccess, ToolError};
 use super::read_scope::{ReadFilter, ReadScope};
 
 pub use querymt_agent_core::path::{
     effective_root, normalize_tool_path, paths_overlap, resolve_arg_path,
 };
+
+/// Expand a leading `~` or `~/` in the value of the path argument `arg` against
+/// the home directory of the user running the agent process.
+///
+/// Fails with an error naming `arg` when the value needs expanding and no home
+/// directory is known, so the tool does not run on a literal `~` directory.
+pub fn expand_tilde_arg<'a>(arg: &str, raw: &'a str) -> Result<Cow<'a, Path>, ToolError> {
+    querymt_agent_core::path::expand_tilde(raw).map_err(|_| {
+        ToolError::InvalidRequest(format!(
+            "{arg}: `{raw}` starts with `~` but no home directory is known"
+        ))
+    })
+}
 
 /// Whether the optional `root` argument (or, when absent, the `cwd`) resolves.
 ///

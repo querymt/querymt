@@ -13,5 +13,6 @@ mod strict_tools;
 mod system;
 mod thinking;
 mod thinking_items;
+mod tool_changes;
 mod tool_names;
 mod usage;

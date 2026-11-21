@@ -1252,6 +1252,8 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
                 context_tokens: 0,
                 metrics: ExecutionMetrics::default(),
                 accounting: None,
+                prefix_change: None,
+                idle_secs: None,
             },
         })
         .await?;

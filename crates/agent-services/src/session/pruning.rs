@@ -410,6 +410,16 @@ pub fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
                                     .map_or(0, |name| estimator.estimate_text(name)),
                             )
                         }
+                        // The definitions it adds plus the names it removes.
+                        ChatInputPart::ToolChange(change) => {
+                            let added = change.added.iter().fold(0usize, |sum, tool| {
+                                let definition = serde_json::to_string(tool).unwrap_or_default();
+                                sum.saturating_add(estimator.estimate_text(&definition))
+                            });
+                            change.removed.iter().fold(added, |sum, name| {
+                                sum.saturating_add(estimator.estimate_text(name))
+                            })
+                        }
                     };
                     total.saturating_add(tokens)
                 })

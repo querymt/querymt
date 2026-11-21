@@ -551,6 +551,7 @@ impl FunctionIndex {
     /// Remove a file from the index
     #[instrument(
         name = "function_index.remove_file",
+        level = "debug",
         skip(self),
         fields(file = %file_path.display())
     )]

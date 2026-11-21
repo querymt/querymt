@@ -1457,7 +1457,8 @@ fn convert_chat_messages_to_responses<'a>(
                         }
                     });
                 }
-                ChatInputPart::Text { .. } => {}
+                // Tool changes are rejected by the host adapter (no `tool_updates`).
+                ChatInputPart::Text { .. } | ChatInputPart::ToolChange(_) => {}
                 ChatInputPart::Attachment(media) => match media.source() {
                     MediaSource::Inline { data } => {
                         let content_type = media
@@ -2701,7 +2702,7 @@ fn input_parts_text_with_fallbacks<'a>(
                     Some(format!("[Provider file: {file_id}]"))
                 }
             },
-            ChatInputPart::ToolResult(_) => None,
+            ChatInputPart::ToolResult(_) | ChatInputPart::ToolChange(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2877,7 +2878,7 @@ fn convert_chat_message_to_openai<'a>(
                         Some(text_message_content("[Provider attachment]"))
                     }
                 },
-                ChatInputPart::ToolResult(_) => None,
+                ChatInputPart::ToolResult(_) | ChatInputPart::ToolChange(_) => None,
             })
             .collect();
 
@@ -4109,7 +4110,7 @@ mod tests {
                 ChatMessage::user()
                     .text("reference")
                     .cache(CacheHint::Ephemeral {
-                        ttl_seconds: Some(300),
+                        ttl_seconds: Some(3600),
                     })
                     .build(),
             ];
@@ -4120,7 +4121,7 @@ mod tests {
                 ChatMessage::assistant()
                     .text("answer")
                     .cache(CacheHint::Ephemeral {
-                        ttl_seconds: Some(300),
+                        ttl_seconds: Some(3600),
                     })
                     .build(),
             ];

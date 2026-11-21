@@ -17,6 +17,16 @@
   reloads the model; changing only the scale does not. New exports
   `LoraAdapterConfig`, `LoraScale` and `LoraScaleError`.
 
+- **Providers declare prompt-cache support; new `[agent.execution.prompt_cache]
+  ttl_secs`.** `ChatCapabilities` has a new `prompt_cache` field
+  (`explicit_breakpoints`, `max_ttl_secs`), `Copy` and defaulted, so a plugin that
+  omits it reads as declaring nothing. New exports `PromptCacheCapabilities`.
+  `ttl_secs` (0 to 86400, default 0 for the provider's default) sets the lifetime
+  of the agent's default cache hints, capped at the provider's `max_ttl_secs`.
+  Anthropic declares 3600 and OpenAI Responses, on a model and endpoint with
+  breakpoint support, 1800. A value out of range, not an integer, or an unknown
+  key in the table fails the load naming the key.
+
 ### Behavior changes
 
 - **BREAKING (Rust API, llama-cpp):** `qmt_llama_cpp::LlamaCppConfig` has a new
@@ -25,6 +35,100 @@
   `..Default::default()`: `LlamaCppConfig` now implements `Default` and has
   `LlamaCppConfig::new(model)`, so later new options won't break callers again.
   Config files are unaffected.
+- **BREAKING (model requests, prompt caching):** the model request is now an
+  append-only prefix of stored history plus one trailing request message.
+  - The run objective is no longer sent with every request by default. Set
+    `[agent.execution] run_objective = true` to restore it (new key, default
+    `false`). When on, it is sent in the trailing message, so it no longer
+    changes the cached prefix.
+  - Reminders (agent mode, output limit, progress review, Stop-hook and
+    task-completion messages, duplicate-call and duplicate-code guidance,
+    parallel-edit and context-usage warnings, background-command notices) are
+    stored once as `notice` message parts instead of being added to every
+    model call. A mode reminder is stored when the mode changes, with a leave
+    notice when the session moves to a mode without one.
+  - Context hooks now receive durable history only (no run objective and no
+    other hooks' `additional_context`). Their `additional_context` is sent in
+    the trailing request message and is not stored.
+  - Rollback: a session that holds a `notice` part cannot be loaded by a build
+    from before this change (unknown message part kind).
+- **BREAKING (provider plugins, prompt caching):** the agent now adds default
+  system cache hints from the provider's declaration, not from a list of provider
+  names. A provider plugin built before this change declares nothing and gets no
+  default system hints until it is rebuilt against this version. `qmt-codex`
+  declares nothing either: its backend rejects explicit breakpoints and the
+  adapter dropped every hint, so no request changes. `qmt-openai` Responses now
+  sends a 30-minute lifetime for any cache hint asking for 1800 seconds or less
+  (it failed for anything but 1800) and still fails for longer.
+- **Retries after transport failures wait 10 seconds, not 60.** A model request
+  that fails without an answer from the provider (connection refused or reset,
+  DNS failure, timeout, a stream that breaks or cannot be decoded) is retried
+  after `[agent.execution.rate_limit] transport_wait_secs` (new key, 0 to 300,
+  default 10; then doubled by `backoff_multiplier`). Failures the provider
+  answered keep the provider's own retry delay, or `default_wait_secs` (60) when
+  it gave none. Set `transport_wait_secs = 60` for the old behaviour. Rollback:
+  after a revert the new key is an unknown key in `[agent.execution.rate_limit]`
+  and fails the load until removed.
+- **Higher starting output cap at high reasoning effort.** With no `max_tokens`
+  configured and reasoning effort `high` or `max`, requests start at
+  `min(64000, model output limit)` instead of `min(32000, ...)`; the ceiling for
+  escalation is unchanged. An unknown output limit stays at 32,000 and an
+  explicit `max_tokens` still wins.
+- **Path arguments expand a leading `~`.** Every built-in tool argument that
+  names a file or directory (`path`, `file_path`, `root`, `paths`, and `workdir`
+  of `shell`) treats `~` and `~/...` as the home directory of the user running
+  the agent. Before, the path was taken relative to the working directory, so
+  `~/x` named a directory called `~`. `~name/...` and a `~` that is not first are
+  unchanged. Approval prompts and file-conflict detection use the expanded path;
+  the arguments stored in the assistant message are not rewritten. If no home
+  directory is known the call fails with an error naming the argument. New
+  `ToolContext::resolve_path_arg(arg, value)` (default method; `resolve_path`
+  calls it with `path`); `resolve_target` in the built-in helpers takes the
+  argument name and returns a `Result`.
+- **Fewer exported spans by default (telemetry).** Actor message dispatch spans
+  (`kameo`, about 60% of exported spans) are no longer exported unless
+  `QMT_TELEMETRY_LEVEL` names `kameo` (for example `info,kameo=info`), and
+  eleven per-step bookkeeping spans (`middleware.driver`, `middleware.phase`,
+  the `agent.execution.middleware.*` spans, `agent.tool.side_effects`,
+  `agent.request.cache_breakpoints`, `model_inventory.get_snapshot`,
+  `function_index.remove_file`) are exported only at `debug`. Model request and
+  tool call spans are unchanged.
+- **Model request spans report their attempts (telemetry).** The `chat {model}`
+  span carries `gen_ai.request.attempt` (attempts started) and one event of that
+  name per attempt that ended, with `error.type` on failed attempts. Error
+  messages are not exported. `otelite retries` lists a request
+  retried this way with its final attempt number (checked against a local
+  otelite).
+- **llama-cpp:** adjacent plain user messages are joined (with a blank line)
+  before the chat template is applied, because the agent now stores notices as
+  user messages and strict templates (Gemma, Mistral) reject two user messages
+  in a row. Media markers keep their order; a message with several nested tool
+  result images now yields one user message holding all markers.
+- **Request attribution:** `llm_request_end` events carry `prefix_change`
+  (`first_request`, `model`, `tools`, `system`, `history` or `none`) and
+  `idle_secs`, and the model request span carries `qmt.cache.prefix_change` and
+  `qmt.cache.idle_secs`.
+- **Tool order:** the tool list sent to the model is sorted by name, and
+  `ToolRegistry` keeps its tools in name order too, so the tool prefix is
+  byte-stable between requests.
+- **Tool changes inside the conversation (Anthropic):** a tool that appears,
+  disappears or changes mid-session (an MCP server connecting, `tools/list_changed`,
+  a changed `skill` description) no longer rewrites the prompt cache on models
+  that accept in-conversation tool changes (Opus 4.8, 5 and 5.5, Sonnet 5.5,
+  Haiku 5.5, Fable 5 and Mythos 5 families). The agent stores the offered tools
+  as a `tool_baseline` message part (before the first request, after a
+  compaction and after a model change; never sent as a message) and later
+  differences as `tool_change` parts, sent as `tool_addition` / `tool_removal`
+  entries with the `inline-tools-2026-09-15` beta header. The request keeps the
+  baseline's tool list and records `prefix_change = "none"`. Other providers are
+  unchanged. New `querymt` API: `ChatCapabilities::tool_updates` (default
+  `false`, so older provider plugins keep working), `ChatInputPart::ToolChange`,
+  `ToolChange`, `ChatMessage::from_tool_change`, `reject_tool_changes`, and
+  `LLMProviderFromHTTP::with_name`. Rollback: a session holding a `tool_baseline`
+  or `tool_change` part cannot be loaded by a build from before this change
+  (unknown message part kind), like `notice` above.
+- **Compaction:** the summary is followed by the session's active task, so a
+  compacted session keeps its task commitment.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /
@@ -285,6 +389,18 @@
 
 ### Fixed
 
+- **`shell` returns when its command exits.** A command that leaves a background
+  process holding its output (for example `server & echo started`) no longer
+  keeps the call open until that process ends: the call waits at most one second
+  for the remaining output after the command exits. The leftover process keeps
+  running, and output it writes afterwards is not part of the result. The result
+  format and its truncation are unchanged.
+- **Every started tool call gets one end event.** When a run was cancelled, a
+  running tool call could be dropped without a `tool_call_end` event, depending
+  on whether the cancel signal or the tool's own cancellation was observed first.
+  Such a call now always ends with an error event reporting the cancellation. A
+  call that was running when the agent process died is closed as interrupted when
+  the run is reconciled on the next load.
 - **Faster prompt records, and corrupt non-prompt parts no longer fail loads.**
   Structured user prompt records (remote and local session loads, older-history
   pages, peer prompt requests and history replay for clients without snapshot
@@ -381,6 +497,23 @@
 
 ### Breaking
 
+- **`SessionHandle::chat`, `SessionHandle::submit_request` and
+  `SessionHandle::convert_chat_to_agent` removed** from
+  `querymt_agent_runtime::session`. `chat` sent the stored history as it was
+  and skipped the agent's per-request tool handling, so it failed on any session
+  with stored tool lists or tool changes; the other two had no other caller.
+  Send prompts with `AgentSession::chat`, `Agent::chat` or ACP
+  `session/prompt`.
+- **`querymt_agent::middleware::PreparedModelRequest` has a new public field
+  `offered_tools`**; struct literals must add it. It holds the tools the model
+  can call in the request. `tools` is the request's tool list, which on a
+  provider that takes tool changes as messages is the list stored when the
+  session started on that model: tools added or removed since are not in it.
+  Middleware that asks "can the model call X" must read `offered_tools`.
+- **`querymt_agent::middleware::ConversationContext` can no longer be built
+  with a struct literal outside its crate**: it has a crate-private field (the
+  tool baseline in effect). Use `ConversationContext::new` and the `with_*`
+  methods.
 - **`qmt_llama_cpp::LlamaCppConfig` has a new public field
   `grammar_backend: Option<GrammarBackend>`**; struct literals must add it
   (`None` keeps the default). `qmt_llama_cpp::GrammarBackend` is a new exported

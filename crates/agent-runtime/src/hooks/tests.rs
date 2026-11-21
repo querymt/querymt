@@ -839,12 +839,131 @@ async fn context_replacement_is_request_only_and_chained() {
         projected[0].portable_input_parts()[0].as_text(),
         Some("projected")
     );
+    // `additional_context` is request-scoped: returned separately, never merged
+    // into a durable message.
+    assert_eq!(projected[0].portable_input_parts().len(), 1);
+    assert_eq!(result.additional_context.len(), 1);
+    assert!(result.additional_context[0].contains("memory"));
+    assert!(result.additional_context[0].contains("<hook-context event=context"));
+}
+
+/// Runs one `context` hook that answers with `replacement` over `stored`.
+async fn run_context_replacement(
+    stored: Vec<querymt::chat::ChatMessage>,
+    replacement: Vec<querymt::chat::ChatMessage>,
+) -> super::engine::ContextHookResult {
+    let output = json!({"hook_specific_output": {
+        "hook_event_name": "context",
+        "messages": replacement,
+    }});
+    let config = HooksConfig {
+        enabled: true,
+        context: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook(format!("printf '%s' '{output}'"))],
+        }],
+        ..HooksConfig::default()
+    };
+    Hooks::new(config)
+        .unwrap()
+        .run_context(ContextHookRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            trigger: "user_prompt".into(),
+            context_window: 1000,
+            messages: stored,
+        })
+        .await
+        .unwrap()
+}
+
+fn tool_change_message() -> querymt::chat::ChatMessage {
+    let tool = querymt::chat::Tool {
+        tool_type: "function".into(),
+        function: querymt::chat::FunctionTool {
+            name: "deploy".into(),
+            description: "Deploy".into(),
+            parameters: json!({"type": "object"}),
+            strict: None,
+        },
+    };
+    querymt::chat::ChatMessage::from_tool_change(querymt::chat::ToolChange::new(
+        vec![tool],
+        Vec::new(),
+    ))
+}
+
+#[tokio::test]
+async fn context_replacement_that_drops_a_tool_change_is_ignored() {
+    // A tool change is stored once and never generated again, so a request
+    // without it would keep offering the old tools.
+    let stored = vec![
+        querymt::chat::ChatMessage::user().text("go").build(),
+        tool_change_message(),
+    ];
+    let replacement = vec![querymt::chat::ChatMessage::user().text("projected").build()];
+
+    let result = run_context_replacement(stored.clone(), replacement).await;
+
+    assert_eq!(result.messages.unwrap(), stored);
     assert!(
-        projected[0].portable_input_parts()[1]
-            .as_text()
-            .unwrap()
-            .contains("memory")
+        result
+            .notices
+            .iter()
+            .any(|notice| notice.message.contains("tool-change")),
+        "notices: {:?}",
+        result.notices
     );
+}
+
+#[tokio::test]
+async fn context_replacement_that_keeps_the_tool_change_is_applied() {
+    let stored = vec![
+        querymt::chat::ChatMessage::user().text("go").build(),
+        tool_change_message(),
+    ];
+    let replacement = vec![
+        querymt::chat::ChatMessage::user().text("projected").build(),
+        tool_change_message(),
+    ];
+
+    let result = run_context_replacement(stored, replacement.clone()).await;
+
+    assert_eq!(result.messages.unwrap(), replacement);
+    assert!(result.notices.is_empty(), "notices: {:?}", result.notices);
+}
+
+#[tokio::test]
+async fn context_hook_without_additional_context_returns_none() {
+    let config = HooksConfig {
+        enabled: true,
+        context: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook("printf '{}'".into())],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_context(ContextHookRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            trigger: "user_prompt".into(),
+            context_window: 1000,
+            messages: vec![querymt::chat::ChatMessage::user().text("stored").build()],
+        })
+        .await
+        .unwrap();
+    assert!(result.additional_context.is_empty());
+    assert_eq!(result.messages.unwrap().len(), 1);
 }
 
 #[tokio::test]

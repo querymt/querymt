@@ -144,7 +144,7 @@ impl Tool for GetSymbolTool {
         let mut file_results: Vec<(String, Vec<String>)> = Vec::new();
 
         for req in &requests {
-            let target = resolve_target(&req.path, &root);
+            let target = resolve_target("path", &req.path, &root)?;
             let content = match tokio::fs::read_to_string(&target).await {
                 Ok(c) => c,
                 Err(e) => {

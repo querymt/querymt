@@ -349,6 +349,8 @@ mod tests {
                     context_tokens: 15,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -388,6 +390,8 @@ mod tests {
                         complete: true,
                         reasons: vec![],
                     }),
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -452,6 +456,8 @@ mod tests {
                     context_tokens: 50,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -524,6 +530,8 @@ mod tests {
                     context_tokens: 50,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -640,6 +648,8 @@ mod tests {
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
             // Model changes
@@ -685,6 +695,8 @@ mod tests {
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -722,6 +734,8 @@ mod tests {
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];
@@ -769,6 +783,8 @@ mod tests {
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];

@@ -178,24 +178,37 @@ impl Anthropic {
     }
 
     /// Adds authentication headers to the request builder based on auth type
+    ///
+    /// `extra_betas` are added to the `anthropic-beta` header, comma separated
+    /// after the OAuth values when there are any; no header is sent when there
+    /// are none and the key is an API key.
     pub(crate) fn add_auth_headers(
         &self,
         builder: http::request::Builder,
+        extra_betas: &[&str],
     ) -> http::request::Builder {
         let key = self.resolved_key();
         let auth_type = self.determine_auth_type();
         let builder = match auth_type {
-            AuthType::OAuth => builder
-                .header(AUTHORIZATION, format!("Bearer {}", key))
-                .header(
-                    "anthropic-beta",
-                    "oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                )
-                .header(
-                    USER_AGENT,
-                    format!("claude-cli/{} (external, cli)", self.oauth_version()),
-                ),
-            AuthType::ApiKey => builder.header("x-api-key", &key),
+            AuthType::OAuth => {
+                let mut betas = vec!["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
+                betas.extend_from_slice(extra_betas);
+                builder
+                    .header(AUTHORIZATION, format!("Bearer {}", key))
+                    .header("anthropic-beta", betas.join(","))
+                    .header(
+                        USER_AGENT,
+                        format!("claude-cli/{} (external, cli)", self.oauth_version()),
+                    )
+            }
+            AuthType::ApiKey => {
+                let builder = builder.header("x-api-key", &key);
+                if extra_betas.is_empty() {
+                    builder
+                } else {
+                    builder.header("anthropic-beta", extra_betas.join(","))
+                }
+            }
         };
         builder.header("anthropic-version", "2023-06-01")
     }

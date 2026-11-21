@@ -8,6 +8,7 @@
 //! (Qwen, Gemini, GLM, MiniMax, Kimi, GPT-5, Claude, etc.) and provider-specific
 //! API requirements (OpenAI store flag, Google thinkingConfig, etc.).
 
+use querymt::chat::PromptCacheCapabilities;
 use querymt::providers::ModelInfo;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -15,6 +16,11 @@ use std::collections::HashMap;
 /// Output-token cap used when the configuration does not set `max_tokens`
 /// and the model does not advertise a smaller output limit.
 const DEFAULT_OUTPUT_CAP: u32 = 32_000;
+
+/// Output-token cap used instead of [`DEFAULT_OUTPUT_CAP`] at reasoning effort
+/// `high` or `max`, where reasoning tokens count against the cap and replies
+/// were cut off (and discarded) at 32,000 often enough to matter.
+const HIGH_EFFORT_OUTPUT_CAP: u32 = 64_000;
 
 /// Output-token caps for a session: where requests start and how far an
 /// escalation may go.
@@ -64,6 +70,24 @@ impl ModelDefaults {
             provider_options: default_provider_options(provider, model),
             provider: provider.to_string(),
         }
+    }
+
+    /// Raise the initial output cap for reasoning effort `high` or `max`.
+    ///
+    /// The cap becomes `min(64000, model output limit)`. It only applies when a
+    /// default cap exists (the provider requires one) and the model's output
+    /// limit is known: with no known limit the cap stays at 32,000 at every
+    /// effort. An explicit `max_tokens` in the configuration still wins, in
+    /// both [`Self::output_caps`] and [`Self::apply_to`].
+    pub fn with_reasoning_effort(mut self, effort: Option<querymt::chat::ReasoningEffort>) -> Self {
+        use querymt::chat::ReasoningEffort;
+        if matches!(effort, Some(ReasoningEffort::High | ReasoningEffort::Max))
+            && self.max_tokens.is_some()
+            && let Some(limit) = self.output_limit
+        {
+            self.max_tokens = Some(limit.min(HIGH_EFFORT_OUTPUT_CAP));
+        }
+        self
     }
 
     /// Whether model metadata can change the output caps for `provider`.
@@ -151,56 +175,6 @@ impl ModelDefaults {
                 obj.insert(key.clone(), v);
             }
         }
-
-        // Configured instructions normally form stable prefixes. Providers own
-        // capability checks and TTL translation; unsupported endpoints skip hints.
-        if self.provider == "anthropic"
-            || self.provider == "codex"
-            || (self.provider == "openai"
-                && obj.get("api_mode").and_then(Value::as_str) == Some("responses"))
-        {
-            self.apply_system_cache_defaults(obj);
-        }
-    }
-
-    /// Default the first and last configured instruction sections to the
-    /// provider-default lifetime. The last section's prefix already covers the
-    /// ones in between, and Anthropic allows only four breakpoints per request,
-    /// so middle sections get no default boundary of their own.
-    /// Explicit hints (including null) and native controls always take
-    /// precedence, at every position.
-    fn apply_system_cache_defaults(&self, obj: &mut serde_json::Map<String, Value>) {
-        let Some(system) = obj.get("system") else {
-            return;
-        };
-        let parts = match system {
-            Value::Array(parts) => parts.clone(),
-            Value::String(text) => vec![Value::String(text.clone())],
-            Value::Object(_) => vec![system.clone()],
-            _ => return,
-        };
-        let last = parts.len().saturating_sub(1);
-        let parts = parts
-            .into_iter()
-            .enumerate()
-            .map(|(index, part)| {
-                let is_boundary = index == 0 || index == last;
-                match part {
-                    Value::String(text) if is_boundary => {
-                        json!({"text": text, "cache": {"ephemeral": {}}})
-                    }
-                    Value::Object(mut part) if is_boundary => {
-                        // Explicit legacy provider controls remain an escape hatch.
-                        if !part.contains_key("cache_control") {
-                            part.entry("cache").or_insert(json!({"ephemeral": {}}));
-                        }
-                        Value::Object(part)
-                    }
-                    other => other,
-                }
-            })
-            .collect();
-        obj.insert("system".into(), Value::Array(parts));
     }
 
     /// Returns true if all fields are None/empty (no heuristics apply).
@@ -211,6 +185,79 @@ impl ModelDefaults {
             && self.max_tokens.is_none()
             && self.provider_options.is_empty()
         // provider is metadata, not a default value, so don't check it
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default system cache hints (declaration-driven)
+// ---------------------------------------------------------------------------
+
+/// Add default cache hints to the first and last system section of `config`.
+///
+/// The decision depends on the provider's declaration only, never on its
+/// name: a provider that does not declare explicit breakpoints leaves
+/// `config` untouched. The last section's prefix already covers the ones in
+/// between, and Anthropic allows only four breakpoints per request, so middle
+/// sections get no default boundary of their own. Explicit hints (including
+/// `null`) and native controls always take precedence, at every position.
+///
+/// With `ttl_secs > 0` each default hint requests `min(ttl_secs,
+/// max_ttl_secs)` (see [`PromptCacheCapabilities::default_hint_ttl`]) and the
+/// provider rounds it to a lifetime it supports; with a provider that declares
+/// no selectable lifetime, or `ttl_secs == 0`, the hint requests no lifetime.
+///
+/// Returns whether `config` was changed.
+pub fn apply_system_cache_defaults(
+    config: &mut Value,
+    cache: &PromptCacheCapabilities,
+    ttl_secs: u32,
+) -> bool {
+    if !cache.explicit_breakpoints {
+        return false;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return false;
+    };
+    let Some(system) = obj.get("system") else {
+        return false;
+    };
+    let parts = match system {
+        Value::Array(parts) => parts.clone(),
+        Value::String(text) => vec![Value::String(text.clone())],
+        Value::Object(_) => vec![system.clone()],
+        _ => return false,
+    };
+    let hint = default_cache_hint(cache, ttl_secs);
+    let last = parts.len().saturating_sub(1);
+    let parts = parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let is_boundary = index == 0 || index == last;
+            match part {
+                Value::String(text) if is_boundary => {
+                    json!({"text": text, "cache": hint.clone()})
+                }
+                Value::Object(mut part) if is_boundary => {
+                    // Explicit legacy provider controls remain an escape hatch.
+                    if !part.contains_key("cache_control") {
+                        part.entry("cache").or_insert_with(|| hint.clone());
+                    }
+                    Value::Object(part)
+                }
+                other => other,
+            }
+        })
+        .collect();
+    obj.insert("system".into(), Value::Array(parts));
+    true
+}
+
+/// The portable hint the agent adds by default, as configuration JSON.
+fn default_cache_hint(cache: &PromptCacheCapabilities, ttl_secs: u32) -> Value {
+    match cache.default_hint_ttl(ttl_secs) {
+        Some(ttl) => json!({"ephemeral": {"ttl_seconds": ttl}}),
+        None => json!({"ephemeral": {}}),
     }
 }
 
@@ -406,6 +453,116 @@ mod tests {
                 ceiling: 128_000
             })
         );
+    }
+
+    fn caps_at(
+        effort: Option<querymt::chat::ReasoningEffort>,
+        limit: Option<u64>,
+        config: Value,
+    ) -> Option<OutputCaps> {
+        let info = limit.map(info_with_output_limit);
+        ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", info.as_ref())
+            .with_reasoning_effort(effort)
+            .output_caps(&config)
+    }
+
+    #[test]
+    fn medium_effort_on_a_large_output_model_starts_at_32k() {
+        use querymt::chat::ReasoningEffort::Medium;
+        assert_eq!(
+            caps_at(Some(Medium), Some(128_000), json!({})),
+            Some(OutputCaps {
+                initial: 32_000,
+                ceiling: 128_000
+            })
+        );
+    }
+
+    #[test]
+    fn high_and_max_effort_start_at_64k_with_the_model_ceiling() {
+        use querymt::chat::ReasoningEffort::{High, Max};
+        for effort in [High, Max] {
+            assert_eq!(
+                caps_at(Some(effort), Some(128_000), json!({})),
+                Some(OutputCaps {
+                    initial: 64_000,
+                    ceiling: 128_000
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn high_effort_on_a_small_output_model_starts_at_the_limit() {
+        use querymt::chat::ReasoningEffort::Max;
+        assert_eq!(
+            caps_at(Some(Max), Some(40_000), json!({})),
+            Some(OutputCaps {
+                initial: 40_000,
+                ceiling: 40_000
+            })
+        );
+    }
+
+    #[test]
+    fn low_or_unset_effort_keeps_the_32k_start() {
+        use querymt::chat::ReasoningEffort::Low;
+        for effort in [Some(Low), None] {
+            assert_eq!(
+                caps_at(effort, Some(128_000), json!({})),
+                Some(OutputCaps {
+                    initial: 32_000,
+                    ceiling: 128_000
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_max_tokens_wins_at_high_effort() {
+        use querymt::chat::ReasoningEffort::Max;
+        assert_eq!(
+            caps_at(Some(Max), Some(128_000), json!({"max_tokens": 20_000})),
+            Some(OutputCaps {
+                initial: 20_000,
+                ceiling: 20_000
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_output_limit_stays_at_32k_at_every_effort() {
+        use querymt::chat::ReasoningEffort::{High, Max};
+        for effort in [High, Max] {
+            assert_eq!(
+                caps_at(Some(effort), None, json!({})),
+                Some(OutputCaps {
+                    initial: 32_000,
+                    ceiling: 32_000
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn high_effort_cap_is_written_into_the_request_config() {
+        use querymt::chat::ReasoningEffort::High;
+        let info = info_with_output_limit(128_000);
+        let defaults = ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", Some(&info))
+            .with_reasoning_effort(Some(High));
+        let mut config = json!({});
+        defaults.apply_to(&mut config, "s");
+        assert_eq!(config["max_tokens"], 64_000);
+    }
+
+    #[test]
+    fn providers_without_a_default_cap_are_not_given_one_at_high_effort() {
+        use querymt::chat::ReasoningEffort::High;
+        let info = info_with_output_limit(128_000);
+        let defaults = ModelDefaults::for_model("openai", "gpt-5", Some(&info))
+            .with_reasoning_effort(Some(High));
+        assert_eq!(defaults.max_tokens, None);
+        assert_eq!(defaults.output_caps(&json!({})), None);
     }
 
     #[test]
@@ -937,14 +1094,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Anthropic system prompt caching tests
+    // Default system cache hints (driven by the provider's declaration)
     // -----------------------------------------------------------------------
 
+    use querymt::chat::PromptCacheCapabilities;
+
+    /// What `qmt-anthropic` declares.
+    fn breakpoints() -> PromptCacheCapabilities {
+        PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600)
+    }
+
+    fn hints(config: &Value) -> Vec<bool> {
+        let sections: Vec<querymt::params::SystemPrompt> =
+            serde_json::from_value(config["system"].clone()).unwrap();
+        sections.iter().map(|s| s.cache().is_some()).collect()
+    }
+
     #[test]
-    fn test_anthropic_system_caching_string() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+    fn single_plain_string_gets_one_default_hint() {
         let mut config = json!({"system": "You are a helpful assistant."});
-        defaults.apply_to(&mut config, "session-1");
+        assert!(apply_system_cache_defaults(&mut config, &breakpoints(), 0));
         assert_eq!(
             config["system"],
             json!([{
@@ -954,10 +1123,9 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_system_caching_string_array() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+    fn string_array_gets_hints_on_first_and_last() {
         let mut config = json!({"system": ["Part 1", "Part 2"]});
-        defaults.apply_to(&mut config, "session-1");
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(
             config["system"],
             json!([
@@ -968,42 +1136,44 @@ mod tests {
     }
 
     #[test]
-    fn single_section_gets_one_default_hint() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
-        let mut config = json!({"system": "Only section"});
-        defaults.apply_to(&mut config, "session");
-        let sections: Vec<querymt::params::SystemPrompt> =
-            serde_json::from_value(config["system"].clone()).unwrap();
-        assert_eq!(sections.len(), 1);
-        assert!(sections[0].cache().is_some());
-    }
-
-    #[test]
     fn four_sections_get_two_default_hints() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({"system": ["one", "two", {"text": "three"}, "four"]});
-        defaults.apply_to(&mut config, "session");
-        let sections: Vec<querymt::params::SystemPrompt> =
-            serde_json::from_value(config["system"].clone()).unwrap();
-        let hinted: Vec<bool> = sections.iter().map(|s| s.cache().is_some()).collect();
-        assert_eq!(hinted, [true, false, false, true]);
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
+        assert_eq!(hints(&config), [true, false, false, true]);
     }
 
     #[test]
-    fn providers_without_cache_defaults_are_untouched() {
-        let defaults = ModelDefaults::for_model("openai", "gpt-4o", None);
+    fn provider_without_explicit_breakpoints_is_untouched() {
+        // For example OpenAI Chat Completions, or a plugin built before the
+        // declaration existed: both report `PromptCacheCapabilities::NONE`.
         let original = json!({"model": "gpt-4o", "system": ["one", "two", "three"]});
         let mut config = original.clone();
-        defaults.apply_to(&mut config, "session");
-        assert_eq!(config["system"], original["system"]);
+        assert!(!apply_system_cache_defaults(
+            &mut config,
+            &PromptCacheCapabilities::NONE,
+            0
+        ));
+        assert_eq!(config, original);
+
+        let mut config = json!({"system": "You are a helpful assistant."});
+        apply_system_cache_defaults(&mut config, &PromptCacheCapabilities::NONE, 3600);
+        assert_eq!(config["system"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn declaration_decides_for_an_unknown_provider_name() {
+        // The function never sees a provider name; an `acme` plugin that
+        // declares breakpoints gets the same defaults as any other.
+        let mut config = json!({"provider": "acme", "system": ["one", "two"]});
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
+        assert_eq!(hints(&config), [true, true]);
     }
 
     #[test]
     fn explicit_middle_hint_is_kept() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let middle = json!({"text": "two", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
         let mut config = json!({"system": ["one", middle.clone(), "three"]});
-        defaults.apply_to(&mut config, "session");
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(config["system"][1], middle);
         assert_eq!(
             config["system"][0],
@@ -1017,30 +1187,24 @@ mod tests {
 
     #[test]
     fn explicit_null_opts_the_last_section_out() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({"system": ["one", {"text": "two", "cache": null}]});
-        defaults.apply_to(&mut config, "session");
-        let sections: Vec<querymt::params::SystemPrompt> =
-            serde_json::from_value(config["system"].clone()).unwrap();
-        assert!(sections[0].cache().is_some());
-        assert!(sections[1].cache().is_none());
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
+        assert_eq!(hints(&config), [true, false]);
     }
 
     #[test]
-    fn anthropic_defaults_preserve_portable_instruction_hints() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+    fn default_hints_preserve_portable_instruction_hints() {
         let instruction = json!({"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
         let mut config = json!({"system": [instruction.clone()]});
-        defaults.apply_to(&mut config, "session");
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(config["system"][0], instruction);
         assert!(config["system"][0].get("cache_control").is_none());
     }
 
     #[test]
-    fn test_anthropic_system_caching_existing_blocks() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+    fn existing_blocks_get_the_default_hint() {
         let mut config = json!({"system": [{"type": "text", "text": "Already a block"}]});
-        defaults.apply_to(&mut config, "session-1");
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(
             config["system"][0],
             json!({
@@ -1050,48 +1214,29 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_system_caching_preserves_existing_cache_control() {
-        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+    fn existing_native_cache_control_is_preserved() {
         let mut config = json!({
             "model": "claude-3-7-sonnet-20250219",
-            "system": [
-                {
-                    "type": "text",
-                    "text": "Block with existing cache",
-                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
-                }
-            ]
+            "system": [{
+                "type": "text",
+                "text": "Block with existing cache",
+                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+            }]
         });
-        d.apply_to(&mut config, "session-1");
-
-        // Should preserve existing cache_control with ttl
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         let blocks = config["system"].as_array().unwrap();
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert!(blocks[0].get("cache").is_none());
     }
 
     #[test]
-    fn stable_system_sections_get_portable_defaults_for_responses_and_codex() {
-        for provider in ["openai", "codex"] {
-            let defaults = ModelDefaults::for_model(provider, "gpt-6.1-sol", None);
-            let explicit =
-                json!({"text": "explicit", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
-            let mut config = json!({
-                "api_mode": "responses",
-                "system": ["file contents", "later instructions", explicit.clone()]
-            });
-            defaults.apply_to(&mut config, "session");
-            assert_eq!(
-                config["system"][0],
-                json!({"text": "file contents", "cache": {"ephemeral": {}}})
-            );
-            // Middle sections get no default boundary of their own.
-            assert_eq!(config["system"][1], json!("later instructions"));
-            assert_eq!(config["system"][2], explicit);
-            let original = config.clone();
-            defaults.apply_to(&mut config, "session");
-            assert_eq!(config, original);
-        }
+    fn defaults_are_idempotent() {
+        let mut config = json!({"system": ["file contents", "later", "last"]});
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
+        let original = config.clone();
+        apply_system_cache_defaults(&mut config, &breakpoints(), 0);
+        assert_eq!(config, original);
     }
 
     #[test]
@@ -1099,6 +1244,10 @@ mod tests {
         let defaults = ModelDefaults::for_model("openai", "gpt-5.6", None);
         let mut config = json!({"api_key": "sk-test", "model": "gpt-5.6", "api_mode": "responses", "system": ["stable", "later"]});
         defaults.apply_to(&mut config, "session");
+        // `apply_to` adds no system hints; the declaration-driven step does.
+        assert_eq!(config["system"], json!(["stable", "later"]));
+        let responses = PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(1800);
+        apply_system_cache_defaults(&mut config, &responses, 0);
         let provider: qmt_openai::OpenAI = serde_json::from_value(config).unwrap();
         let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
         let request =
@@ -1115,17 +1264,82 @@ mod tests {
     }
 
     #[test]
-    fn test_non_anthropic_no_system_transformation() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
-        let mut config = json!({
-            "model": "gpt-4o",
-            "system": "You are a helpful assistant."
-        });
-        d.apply_to(&mut config, "session-1");
+    fn apply_to_never_transforms_the_system_prompt() {
+        for provider in ["anthropic", "openai", "codex"] {
+            let d = ModelDefaults::for_model(provider, "gpt-4o", None);
+            let mut config = json!({
+                "model": "gpt-4o",
+                "api_mode": "responses",
+                "system": "You are a helpful assistant."
+            });
+            d.apply_to(&mut config, "session-1");
+            assert_eq!(
+                config["system"], "You are a helpful assistant.",
+                "{provider}"
+            );
+        }
+    }
 
-        // Non-Anthropic providers should not transform system prompt
-        assert!(config["system"].is_string());
-        assert_eq!(config["system"], "You are a helpful assistant.");
+    // -----------------------------------------------------------------------
+    // Requested lifetime
+    // -----------------------------------------------------------------------
+
+    fn first_hint(ttl_secs: u32, cache: &PromptCacheCapabilities) -> Value {
+        let mut config = json!({"system": ["one", "two"]});
+        apply_system_cache_defaults(&mut config, cache, ttl_secs);
+        config["system"][0]["cache"].clone()
+    }
+
+    #[test]
+    fn requested_lifetime_is_within_the_provider_maximum() {
+        assert_eq!(
+            first_hint(3600, &breakpoints()),
+            json!({"ephemeral": {"ttl_seconds": 3600}})
+        );
+        // Shorter requests stay as asked; the provider rounds them up.
+        assert_eq!(
+            first_hint(600, &breakpoints()),
+            json!({"ephemeral": {"ttl_seconds": 600}})
+        );
+    }
+
+    #[test]
+    fn lifetime_beyond_the_provider_offer_is_capped_at_the_maximum() {
+        let responses = PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(1800);
+        assert_eq!(
+            first_hint(3600, &responses),
+            json!({"ephemeral": {"ttl_seconds": 1800}})
+        );
+    }
+
+    #[test]
+    fn provider_without_a_selectable_lifetime_requests_none() {
+        assert_eq!(
+            first_hint(3600, &PromptCacheCapabilities::BREAKPOINTS),
+            json!({"ephemeral": {}})
+        );
+    }
+
+    #[test]
+    fn zero_lifetime_requests_the_provider_default() {
+        assert_eq!(first_hint(0, &breakpoints()), json!({"ephemeral": {}}));
+    }
+
+    #[test]
+    fn explicit_hint_lifetime_wins_over_the_configured_one() {
+        let mut config = json!({"system": [
+            {"text": "one", "cache": {"ephemeral": {"ttl_seconds": 300}}},
+            "two"
+        ]});
+        apply_system_cache_defaults(&mut config, &breakpoints(), 3600);
+        assert_eq!(
+            config["system"][0]["cache"],
+            json!({"ephemeral": {"ttl_seconds": 300}})
+        );
+        assert_eq!(
+            config["system"][1]["cache"],
+            json!({"ephemeral": {"ttl_seconds": 3600}})
+        );
     }
 
     #[test]

@@ -887,6 +887,89 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
     assert_eq!(harness.run().await, CycleOutcome::Completed);
 }
 
+/// "Prefix is stable after a reload": a Stop-hook continuation is sent to the
+/// model, so a session loaded from storage must contain it at the same place.
+/// Storage is what a reload reads, so the continuation has to be stored.
+#[tokio::test]
+async fn durable_prefix_is_stable_after_a_reload() {
+    use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let output = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "keep going"}
+    });
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{
+                "type": "command",
+                "command": format!("cat >/dev/null; printf '%s' '{output}'"),
+                "timeout_sec": 5
+            }]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(harness.config.execution_policy.clone())
+        .with_hooks(hooks)
+        .build(),
+    );
+    let sent: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sent_for_mock = sent.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(move |messages, _| {
+            sent_for_mock
+                .lock()
+                .unwrap()
+                .push(messages.iter().map(|message| message.text()).collect());
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(2);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    // The second request carried the continuation message.
+    let sent = sent.lock().unwrap().clone();
+    let continuation = sent[1]
+        .iter()
+        .find(|text| text.contains("budget remains"))
+        .expect("second request carries the Stop-hook continuation")
+        .clone();
+
+    // A reload reads storage: the continuation must be there, as a notice.
+    let stored_notice = harness
+        .stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            MessagePart::Notice {
+                source: NoticeSource::StopHook,
+                content,
+            } => Some(content.clone()),
+            _ => None,
+        });
+    assert_eq!(
+        stored_notice.as_deref(),
+        Some(continuation.as_str()),
+        "the continuation sent to the model is not in stored history"
+    );
+}
+
 #[tokio::test]
 async fn stop_hook_continues_once_by_default() {
     // The hook keeps asking, so the default cap of 1 is hit and the user is told.
@@ -1601,6 +1684,119 @@ async fn test_single_tool_call_cycle() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+/// Per-step bookkeeping spans that are exported only at debug level.
+const BOOKKEEPING_SPANS: [&str; 9] = [
+    "middleware.driver",
+    "middleware.phase",
+    "agent.execution.middleware.turn_start",
+    "agent.execution.middleware.step_start",
+    "agent.execution.middleware.after_llm",
+    "agent.execution.middleware.processing_tool_calls",
+    "agent.execution.middleware.turn_end",
+    "agent.tool.side_effects",
+    "agent.request.cache_breakpoints",
+];
+
+/// A middleware that changes nothing, so the driver spans have a driver to name.
+struct NoopDriver;
+
+#[async_trait]
+impl crate::middleware::MiddlewareDriver for NoopDriver {
+    fn reset(&self) {}
+
+    fn name(&self) -> &'static str {
+        "NoopDriver"
+    }
+}
+
+/// Run one turn with a tool call and a final answer and return the spans
+/// exported at info level (`info_level`) or at every level.
+async fn spans_of_a_tool_turn(info_level: bool) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    use querymt_agent_services::tools::trace_support::genai_trace::{capture, capture_info};
+
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(NoopDriver, 5);
+    let tool_call = mock_querymt_tool_call("call-1", "remote_tool", "{}");
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|_| Ok(MockChatResponse::text_only("done").into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok(vec![ToolResultPart::text("tool output")]))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+    let turn = harness.run();
+    let (outcome, spans) = if info_level {
+        capture_info(turn).await
+    } else {
+        capture(turn).await
+    };
+    assert_eq!(outcome, CycleOutcome::Completed);
+    spans
+}
+
+/// Default telemetry level (info): the per-step bookkeeping spans are not
+/// exported, the work spans are.
+#[tokio::test]
+async fn default_level_omits_bookkeeping_spans_and_keeps_work_spans() {
+    use querymt_agent_services::tools::trace_support::genai_trace::attr;
+
+    let spans = spans_of_a_tool_turn(true).await;
+    let names: Vec<&str> = spans.iter().map(|span| span.name.as_ref()).collect();
+    for name in BOOKKEEPING_SPANS {
+        assert!(!names.contains(&name), "{name} exported at info: {names:?}");
+    }
+    let operation = |wanted: &str| {
+        spans.iter().any(|span| {
+            attr(span, "gen_ai.operation.name")
+                == Some(&opentelemetry::Value::from(wanted.to_string()))
+        })
+    };
+    assert!(
+        names.contains(&"agent.tool.invoke"),
+        "agent.tool.invoke span missing: {names:?}"
+    );
+    assert!(operation("chat"), "model request span missing: {names:?}");
+    assert!(
+        operation("execute_tool"),
+        "execute_tool span missing: {names:?}"
+    );
+}
+
+/// Debug level: the same turn exports the bookkeeping spans again.
+#[tokio::test]
+async fn debug_level_exports_bookkeeping_spans() {
+    let spans = spans_of_a_tool_turn(false).await;
+    let names: Vec<&str> = spans.iter().map(|span| span.name.as_ref()).collect();
+    for name in [
+        "middleware.driver",
+        "agent.tool.side_effects",
+        "agent.request.cache_breakpoints",
+        "agent.execution.middleware.step_start",
+    ] {
+        assert!(names.contains(&name), "{name} missing at debug: {names:?}");
+    }
 }
 
 /// Same-turn tool loop must keep encrypted reasoning on the second request.

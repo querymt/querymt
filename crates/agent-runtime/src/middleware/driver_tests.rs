@@ -263,6 +263,7 @@ async fn test_max_steps_ignores_other_states() {
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from([]),
             tools: Arc::from([]),
+            offered_tools: Arc::from([]),
             estimated_tokens: 0,
             options: Default::default(),
         }),

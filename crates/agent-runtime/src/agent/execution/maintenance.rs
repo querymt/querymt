@@ -5,7 +5,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
-use crate::agent::utils::{genai, u32_from_usize};
+use crate::agent::utils::u32_from_usize;
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
 use crate::session::compaction::SessionCompaction;
@@ -195,17 +195,6 @@ pub(super) async fn run_ai_compaction(
             return Err(anyhow::anyhow!("No history available for compaction"));
         }
     };
-    let prompt_limit = exec_ctx
-        .execution_config()
-        .and_then(|cfg| cfg.max_prompt_bytes);
-
-    // Convert AgentMessages to ChatMessages for the ConversationContext
-    let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
-        .iter()
-        .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
-        .collect::<Result<_, _>>()
-        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
-
     debug!(
         "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",
         current_state
@@ -216,27 +205,32 @@ pub(super) async fn run_ai_compaction(
         filtered_messages.len()
     );
 
+    // The same read of the stored history as a turn start, so the rest of the
+    // run continues from what a reload would give it.
+    let view = exec_ctx
+        .session_handle
+        .view_of(filtered_messages)
+        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
+
     let new_context = if let Some(ctx) = current_state.context() {
         let mut new_stats = crate::middleware::AgentStats::clone(&ctx.stats);
         new_stats.context_tokens = new_context_tokens;
 
         Arc::new(
-            crate::middleware::ConversationContext::new(
-                ctx.session_id.clone(),
-                Arc::from(chat_messages.into_boxed_slice()),
+            ctx.with_history(
+                Arc::from(view.messages.into_boxed_slice()),
                 Arc::new(new_stats),
-                ctx.provider.clone(),
-                ctx.model.clone(),
             )
-            .with_session_mode(ctx.session_mode)
-            .with_profile(ctx.profile.clone()),
+            // Compaction may have removed the stored reminder and the tool
+            // baseline; read the surviving ones so the next request stores
+            // them again if needed.
+            .with_stored_state(view.mode_notice, view.tool_baseline),
         )
     } else {
         return Err(anyhow::anyhow!("No context available for compaction"));
     };
 
-    exec_ctx.compaction_summaries =
-        genai::compaction_summaries(&filtered_messages, &new_context.messages);
+    exec_ctx.compaction_summaries = view.summaries;
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
@@ -274,7 +268,9 @@ pub(crate) async fn compact_history(
             m.parts
                 .iter()
                 .map(|p| match p {
-                    MessagePart::Text { content } => content.len() / 4,
+                    MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
+                        content.len() / 4
+                    }
                     MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
                         crate::agent::utils::render_prompt_for_llm(blocks, prompt_limit).len() / 4
                     }
@@ -442,6 +438,19 @@ pub(crate) async fn compact_history(
         let error = anyhow::Error::from(error);
         emit_compaction_failure(config, session_id, &compaction_id, &error).await;
         return Err(error);
+    }
+
+    // Appended after validation, like the verbatim prompts, so it can never
+    // rescue an empty summary.
+    if let Some(section) =
+        crate::session::compaction::active_task_section(exec_ctx.state.active_task.as_ref())
+    {
+        use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
+        result.summary_token_count = result
+            .summary_token_count
+            .saturating_add(SimpleTokenEstimator.estimate(&section));
+        result.summary.push_str("\n\n");
+        result.summary.push_str(&section);
     }
 
     let post_hook = match config
@@ -928,6 +937,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_drops_a_tool_baseline_the_history_no_longer_holds() {
+        let (config, mut exec_ctx, state, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        // The run holds a baseline that was stored before the compaction, and
+        // a tool change stored after it.
+        let ExecutionState::Stopped {
+            message,
+            stop_type,
+            context: Some(context),
+        } = state
+        else {
+            panic!("fixture state is a stop with a context");
+        };
+        let mut held = (*context).clone();
+        held.tool_baseline = Some(Arc::new(querymt_agent_core::model::ToolBaseline {
+            tools: Vec::new(),
+            origin: "mock/mock".into(),
+        }));
+        let mut messages = held.messages.to_vec();
+        messages.push(ChatMessage::from_tool_change(
+            querymt::chat::ToolChange::new(Vec::new(), vec!["gone".into()]),
+        ));
+        held.messages = Arc::from(messages.into_boxed_slice());
+        let state = ExecutionState::Stopped {
+            message,
+            stop_type,
+            context: Some(Arc::new(held)),
+        };
+
+        let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+
+        // The effective history starts at the summary, so a load finds no
+        // baseline: the run must not keep the old one, or the next request
+        // would lead with a list no stored baseline records.
+        let context = next.context().unwrap();
+        assert!(context.tool_baseline.is_none());
+        assert!(!context.messages.iter().any(ChatMessage::has_tool_change));
+        let view = exec_ctx.session_handle.history_view().await.unwrap();
+        assert_eq!(context.messages.as_ref(), view.messages);
+        assert!(view.tool_baseline.is_none());
+    }
+
+    #[tokio::test]
     async fn valid_custom_summary_is_stored_and_emitted_as_success() {
         let (config, mut exec_ctx, state, _tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", Some("Keep the tests passing")),
@@ -987,6 +1041,34 @@ mod tests {
         assert_eq!(summary, expected);
         assert!(context_tokens.unwrap() > 0);
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_start_counts_stored_notices() {
+        let (config, mut exec_ctx, state, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        let notice_text = "The instructions from the earlier mode no longer apply. ".repeat(10);
+        let mut notice = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        notice.parts.push(MessagePart::Notice {
+            source: querymt_agent_core::model::NoticeSource::AgentMode,
+            content: notice_text.clone(),
+        });
+        exec_ctx.session_handle.add_message(notice).await.unwrap();
+
+        let mut events = config.subscribe_events();
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        let compaction_events = take_compaction_events(&mut events);
+        let AgentEventKind::CompactionStart { token_estimate, .. } = &compaction_events[0].kind
+        else {
+            panic!("first compaction event must be a start: {compaction_events:?}");
+        };
+        let original = "Keep the implemented shader and verified test results.";
+        assert_eq!(
+            *token_estimate as usize,
+            original.len() / 4 + notice_text.len() / 4
+        );
     }
 
     mod accounting_tests {

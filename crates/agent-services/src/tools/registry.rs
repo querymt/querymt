@@ -1,21 +1,22 @@
 //! Tool registry for managing and finding tools
 
 use crate::tools::context::{FileAccess, Tool};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Registry for managing available tools
+/// Registry for managing available tools.
+///
+/// Tools are kept sorted by name (byte order), so `definitions()` and
+/// `names()` are deterministic regardless of registration order or process.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self {
-            tools: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn add(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
@@ -30,6 +31,7 @@ impl ToolRegistry {
         self
     }
 
+    /// Definitions of all tools, ordered by name.
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
@@ -96,6 +98,7 @@ impl ToolRegistry {
         self.tools.remove(name)
     }
 
+    /// Names of all tools, ordered by name.
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
@@ -161,6 +164,75 @@ mod tests {
         ) -> Result<Vec<ToolResultPart>, ToolError> {
             Ok(Vec::new())
         }
+    }
+
+    struct NamedTool(String);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn definition(&self) -> ChatTool {
+            ChatTool {
+                tool_type: "function".to_string(),
+                function: FunctionTool {
+                    name: self.0.clone(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }
+        }
+
+        async fn call(
+            &self,
+            _args: serde_json::Value,
+            _context: &dyn ToolContext,
+        ) -> Result<Vec<ToolResultPart>, ToolError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn registry_of(names: &[&str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.add(Arc::new(NamedTool((*name).to_string())));
+        }
+        registry
+    }
+
+    fn definition_names(registry: &ToolRegistry) -> Vec<String> {
+        registry
+            .definitions()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect()
+    }
+
+    /// Listing is ordered by name (bytes) and does not depend on the order
+    /// tools were registered in.
+    #[test]
+    fn listing_is_ordered_by_name_whatever_the_registration_order() {
+        let names = ["write_file", "shell", "Zed", "read_tool", "edit", "glob"];
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let mut reversed = names;
+        reversed.reverse();
+
+        for order in [names, reversed] {
+            let registry = registry_of(&order);
+            assert_eq!(definition_names(&registry), sorted);
+            assert_eq!(registry.names(), sorted);
+        }
+    }
+
+    #[test]
+    fn removing_a_tool_keeps_the_order_of_the_rest() {
+        let mut registry = registry_of(&["c", "a", "b", "d"]);
+        registry.remove("a");
+        assert_eq!(registry.names(), ["b", "c", "d"]);
     }
 
     #[tokio::test]

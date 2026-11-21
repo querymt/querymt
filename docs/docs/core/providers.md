@@ -162,8 +162,13 @@ system = [
 ```
 
 In the agent runtime, plain system strings and `{ file = "..." }` entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses, but only on
-the **first and last** section (a single section gets one hint). Sections in between
+default cache hints for every provider that declares explicit cache breakpoints in its
+chat capabilities (`prompt_cache.explicit_breakpoints`: Anthropic, and OpenAI Responses
+on a model and endpoint that support them), but only on
+the **first and last** section (a single section gets one hint). A provider or plugin
+that declares nothing gets no default system hints; the decision never depends on the
+provider's name. `[agent.execution.prompt_cache] ttl_secs` sets the lifetime these
+hints request (see the agent configuration reference). Sections in between
 are still cached, because the last section's prefix covers them; they just have no
 reuse boundary of their own. To keep a boundary on a middle section, give it an
 explicit `cache` hint. Explicit hints/TTLs (including `cache = null`) and native
@@ -176,13 +181,14 @@ the provider keeps the most useful ones and drops the rest with a warning; see
 [Prompt cache breakpoints](available-providers.md#prompt-cache-breakpoints).
 
 Responses currently defaults to `30m`, not unlimited session retention. Codex's
-unsupported translation remains disabled, so annotations do not guarantee reuse.
+unsupported translation remains disabled and Codex declares no breakpoints, so it
+gets no default hints.
 
 Programmatic callers can pass `querymt::params::SystemPrompt::with_cache(text, hint)`
 to `.system(...)`. File references are resolved by the agent, not provider plugins.
 Providers translate hints; unsupported endpoints may skip them. Responses supports
-only a 1,800-second (`30m`) request-wide minimum lifetime: applied hints must agree
-with the provider's configured TTL. Omit `ttl_seconds` for the provider default.
+only a 1,800-second (`30m`) request-wide lifetime: a hint asking for 1,800 seconds or
+less is sent as `30m`, and a hint asking for more fails the request. Omit `ttl_seconds` for the provider default.
 A lifetime is not a deletion deadline, and cache hits are not guaranteed.
 
 On supported OpenAI Responses models, hints become explicit prefix breakpoints;

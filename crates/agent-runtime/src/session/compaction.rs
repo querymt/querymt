@@ -47,6 +47,38 @@ pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
     }
 }
 
+/// The active task's identifier, deliverable and acceptance criteria, verbatim,
+/// for appending to a compaction summary.
+///
+/// With the run objective off by default, compaction is the one place that can
+/// lose these. Returns `None` when there is no active task, or it has neither a
+/// deliverable nor acceptance criteria.
+pub(crate) fn active_task_section(task: Option<&crate::session::domain::Task>) -> Option<String> {
+    let task = task.filter(|task| task.status == crate::session::domain::TaskStatus::Active)?;
+    let deliverable = task
+        .expected_deliverable
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let criteria = task
+        .acceptance_criteria
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    if deliverable.is_none() && criteria.is_none() {
+        return None;
+    }
+    let mut lines = vec![format!("Task: {}", task.public_id)];
+    if let Some(deliverable) = deliverable {
+        lines.push(format!("Deliverable: {deliverable}"));
+    }
+    if let Some(criteria) = criteria {
+        lines.push(format!("Acceptance criteria: {criteria}"));
+    }
+    Some(format!(
+        "<active_task note=\"verbatim, still in force after this summary\">\n{}\n</active_task>",
+        lines.join("\n")
+    ))
+}
+
 /// Upper bound on the verbatim user prompts carried across a compaction.
 const ORIGINAL_TASK_MAX_BYTES: usize = 16 * 1024;
 /// Most recent user prompts carried across a compaction.
@@ -262,8 +294,12 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         instructions: Option<&str>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
+        // The summary needs the conversation, not the tool definitions: tool
+        // baselines and tool changes are left out. The request carries no tool
+        // list, and a provider rejects such a record as a message.
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
+            .filter(|message| !message.is_tool_record())
             .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
             .collect::<std::result::Result<_, _>>()?;
 
@@ -585,7 +621,9 @@ impl SessionCompaction {
                 m.parts
                     .iter()
                     .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
+                        MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
+                            self.estimator.estimate(content)
+                        }
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
@@ -1369,6 +1407,56 @@ mod tests {
         assert_eq!(provider.call_count(), 2);
     }
 
+    fn task_with(
+        status: crate::session::domain::TaskStatus,
+        deliverable: Option<&str>,
+        criteria: Option<&str>,
+    ) -> crate::session::domain::Task {
+        let now = time::OffsetDateTime::now_utc();
+        crate::session::domain::Task {
+            id: 1,
+            public_id: "task-7".into(),
+            session_id: 1,
+            kind: crate::session::domain::TaskKind::Finite,
+            status,
+            expected_deliverable: deliverable.map(str::to_owned),
+            acceptance_criteria: criteria.map(str::to_owned),
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn compaction_with_an_active_task_carries_its_identifier_and_criteria() {
+        use crate::session::domain::TaskStatus;
+        let task = task_with(
+            TaskStatus::Active,
+            Some("a parser fix"),
+            Some("all tests pass"),
+        );
+
+        let section = active_task_section(Some(&task)).expect("task section");
+
+        assert!(section.contains("task-7"));
+        assert!(section.contains("Deliverable: a parser fix"));
+        assert!(section.contains("Acceptance criteria: all tests pass"));
+    }
+
+    #[test]
+    fn compaction_without_an_active_task_has_no_task_section() {
+        use crate::session::domain::TaskStatus;
+        assert!(active_task_section(None).is_none());
+        // Finished, and active-but-empty tasks add nothing either.
+        let done = task_with(TaskStatus::Done, Some("x"), Some("y"));
+        assert!(active_task_section(Some(&done)).is_none());
+        let empty = task_with(TaskStatus::Active, None, None);
+        assert!(active_task_section(Some(&empty)).is_none());
+    }
+
     #[tokio::test]
     async fn compaction_appends_verbatim_user_prompts_after_the_summary() {
         use crate::acp::protocol::{ContentBlock, TextContent};
@@ -1955,6 +2043,25 @@ mod tests {
     }
 
     #[test]
+    fn notice_is_estimated_like_text_of_the_same_content() {
+        let fixture = CompactionFixture::new();
+        let content = "The agent mode changed. ".repeat(20);
+        let text = MessageFixture::user_message("1", "s1", &content);
+        let mut notice = text.clone();
+        notice.parts = vec![MessagePart::Notice {
+            source: querymt_agent_core::model::NoticeSource::AgentMode,
+            content: content.clone(),
+        }];
+
+        let notice_tokens = fixture.service.estimate_messages_tokens(&[notice], None);
+        assert!(notice_tokens > 0);
+        assert_eq!(
+            notice_tokens,
+            fixture.service.estimate_messages_tokens(&[text], None)
+        );
+    }
+
+    #[test]
     fn test_estimate_messages_tokens_empty() {
         let fixture = CompactionFixture::new();
         let messages: Vec<AgentMessage> = vec![];
@@ -2028,6 +2135,47 @@ mod tests {
                 .text()
                 .contains("conversation")
         );
+    }
+
+    #[test]
+    fn compaction_request_leaves_out_tool_baselines_and_changes() {
+        let fixture = CompactionFixture::new();
+        let mut messages = MessageFixture::simple_conversation("s1");
+        let tool = querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "deploy".into(),
+                description: "Deploy".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        };
+        let record = |part: MessagePart| {
+            let mut message = MessageFixture::user_message("r", "s1", "");
+            message.parts = vec![part];
+            message
+        };
+        messages.insert(
+            1,
+            record(MessagePart::ToolBaseline {
+                tools: vec![tool.clone()],
+                origin: "anthropic/claude-sonnet-5-5".into(),
+            }),
+        );
+        messages.push(record(MessagePart::ToolChange {
+            added: vec![tool],
+            removed: vec!["old".into()],
+        }));
+
+        let chat = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
+
+        assert_eq!(chat.len(), messages.len() - 2 + 1, "records are left out");
+        assert!(!chat.iter().any(|m| m.has_tool_change()));
+        // A provider that rejects tool-change messages accepts the request.
+        querymt::chat::reject_tool_changes("acme", &chat).unwrap();
     }
 
     #[test]

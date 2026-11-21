@@ -643,6 +643,11 @@ async fn inject_wait_message(
         source_provider: None,
         source_model: None,
     };
+    // Convert before storing so the live message is exactly what history
+    // will reload as.
+    let chat_message = agent_msg
+        .to_chat_message()
+        .map_err(|e| anyhow::anyhow!("Invalid wait message content: {}", e))?;
 
     exec_ctx
         .add_message(agent_msg)
@@ -656,7 +661,12 @@ async fn inject_wait_message(
         },
     );
 
-    Ok(Arc::new(context.inject_message(content)))
+    let mut messages = context.messages.to_vec();
+    messages.push(chat_message);
+    Ok(Arc::new(context.with_history(
+        Arc::from(messages.into_boxed_slice()),
+        context.stats.clone(),
+    )))
 }
 
 #[cfg(test)]

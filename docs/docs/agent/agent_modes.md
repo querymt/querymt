@@ -305,7 +305,7 @@ Modes change what the agent is *told*, not what it is *allowed* to do.
 
 ### System Prompt Injection
 
-In Plan and Review mode the `AgentModeMiddleware` injects the configured reminder before each model call. The reminder is the only effect of the mode on the model.
+In Plan and Review mode the `AgentModeMiddleware` stores the configured reminder in the session history the first time a model request is sent in that mode, and stores it again only if it is no longer the latest mode notice (for example after compaction removed it). When the session switches to a mode without a reminder, it stores a short notice that the earlier mode's instructions no longer apply. Stored notices are part of the history, so they stay in the cached prefix and survive a reload. The notice is the only effect of the mode on the model.
 
 ### Enforcement
 

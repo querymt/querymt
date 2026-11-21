@@ -6,8 +6,8 @@ use http::{Request, Response};
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, StructuredOutputFormat, Tool,
-        ToolChoice,
+        ChatCall, ChatCapabilities, ChatOutput, PromptCacheCapabilities, StreamChunk,
+        StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -273,7 +273,26 @@ impl HTTPChatProvider for OpenAI {
     }
 
     fn capabilities(&self) -> ChatCapabilities {
-        ChatCapabilities::NONE.with_streaming(true)
+        ChatCapabilities::NONE
+            .with_prompt_cache(self.prompt_cache_capabilities())
+            .with_streaming(true)
+    }
+}
+
+/// The only cache lifetime the Responses API accepts (`prompt_cache_options.ttl`).
+const RESPONSES_MAX_TTL_SECS: u32 = 1800;
+
+impl OpenAI {
+    /// Explicit breakpoints exist in Responses mode only, on an endpoint and
+    /// model that support them. Chat Completions declares nothing.
+    fn prompt_cache_capabilities(&self) -> PromptCacheCapabilities {
+        if self.api_mode == ApiMode::Responses
+            && api::OpenAIProviderConfig::supports_cache_breakpoints(self)
+        {
+            PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(RESPONSES_MAX_TTL_SECS)
+        } else {
+            PromptCacheCapabilities::NONE
+        }
     }
 }
 
@@ -393,6 +412,59 @@ mod tests {
         error::LLMError,
     };
     use serde_json::Value;
+
+    fn provider_with(model: &str, extra: serde_json::Value) -> OpenAI {
+        let mut cfg = serde_json::json!({"api_key": "test-key", "model": model});
+        cfg.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(cfg).unwrap()
+    }
+
+    #[test]
+    fn responses_declaration_follows_the_model() {
+        let provider = provider_with("gpt-5.6", serde_json::json!({"api_mode": "responses"}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(cache.explicit_breakpoints);
+        assert_eq!(cache.max_ttl_secs, Some(1800));
+    }
+
+    #[test]
+    fn model_without_breakpoint_support_declares_none() {
+        let provider = provider_with("gpt-5.4", serde_json::json!({"api_mode": "responses"}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(!cache.explicit_breakpoints);
+        assert_eq!(cache.max_ttl_secs, None);
+    }
+
+    #[test]
+    fn chat_completions_declares_no_breakpoints_even_for_a_new_model() {
+        let provider = provider_with("gpt-5.6", serde_json::json!({}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert_eq!(cache, super::PromptCacheCapabilities::NONE);
+    }
+
+    #[test]
+    fn compatible_endpoint_declares_no_breakpoints_unless_overridden() {
+        let url = "https://llm.example.test/v1";
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({"api_mode": "responses", "base_url": url}),
+        );
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(!cache.explicit_breakpoints);
+
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({
+                "api_mode": "responses",
+                "base_url": url,
+                "supports_prompt_cache_breakpoints": true
+            }),
+        );
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(cache.explicit_breakpoints);
+    }
 
     #[test]
     fn api_mode_defaults_to_chat_completions_when_omitted() {

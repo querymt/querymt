@@ -23,8 +23,6 @@ const SITES: &[(&str, usize, Class)] = &[
     // Auxiliary generation.
     ("session/compaction.rs", 2, Class::Recorded),
     ("delegation/summarizer.rs", 2, Class::Recorded),
-    // `SessionHandle::submit_request`, which requires a `DispatchLedger`.
-    ("session/provider.rs", 1, Class::Recorded),
     // `Agent::chat` / `AgentRunner::chat` run a normal prompt cycle.
     ("runner.rs", 1, Class::AgentApi),
 ];
@@ -118,8 +116,6 @@ fn recorded_sites_require_a_ledger_by_signature() {
     // only accept a ledger / operation.
     let compaction = include_str!("../session/compaction.rs");
     assert!(compaction.contains("ledger: &DispatchLedger"));
-    let provider = include_str!("../session/provider.rs");
-    assert!(provider.contains("ledger: &querymt_agent_services::accounting::DispatchLedger"));
     let summarizer = include_str!("../delegation/summarizer.rs");
     assert!(summarizer.contains("operation: &AttemptOperation"));
 }

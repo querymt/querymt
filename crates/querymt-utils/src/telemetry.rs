@@ -380,25 +380,43 @@ pub fn try_setup_telemetry_with_layers(
 fn telemetry_trace_filter(level: &str) -> EnvFilter {
     use tracing_subscriber::filter::LevelFilter;
 
-    let explicit_iroh = level.split(',').map(str::trim).any(|directive| {
-        let target = directive
-            .split(['=', '['])
-            .next()
-            .unwrap_or_default()
-            .trim();
-        target == "iroh" || target.starts_with("iroh::")
-    });
+    let names_target = |name: &str| {
+        level.split(',').map(str::trim).any(|directive| {
+            let target = directive
+                .split(['=', '['])
+                .next()
+                .unwrap_or_default()
+                .trim();
+            target == name
+                || target
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
+    };
     let global_level = level
         .split(',')
         .filter_map(|directive| directive.trim().parse::<LevelFilter>().ok())
         .next_back();
     // Default suppression must not enable spans disabled by a stricter global level.
-    if explicit_iroh || global_level.is_some_and(|level| level <= LevelFilter::WARN) {
-        EnvFilter::new(level)
-    } else {
-        EnvFilter::new(format!("iroh=warn,{level}"))
+    if global_level.is_some_and(|level| level <= LevelFilter::WARN) {
+        return EnvFilter::new(level);
     }
+    // Targets whose spans are exported at `info` but describe machinery, not
+    // work: iroh's transport and kameo's per-message actor dispatch (about 60%
+    // of exported spans, most under a millisecond). A directive that names the
+    // target, such as `kameo=info`, is applied as written.
+    let mut directives = String::new();
+    for target in DEFAULT_QUIET_TARGETS {
+        if !names_target(target) {
+            directives.push_str(target);
+            directives.push_str("=warn,");
+        }
+    }
+    EnvFilter::new(format!("{directives}{level}"))
 }
+
+/// Targets limited to `warn` in the trace filter unless the user names them.
+const DEFAULT_QUIET_TARGETS: [&str; 2] = ["iroh", "kameo"];
 
 // ─── Convenience wrapper (panics on failure) ───────────────────────────────────
 // ─── Provider storage for shutdown flush ──────────────────────────────────────
@@ -481,7 +499,8 @@ mod tests {
     use opentelemetry_sdk::logs::InMemoryLogExporter;
 
     #[test]
-    fn trace_filter_preserves_strict_global_levels_and_explicit_iroh_directives() {
+    fn trace_filter_preserves_strict_global_levels_and_explicit_directives() {
+        // A stricter global level already limits both targets: applied as written.
         for level in [
             "off",
             "OFF",
@@ -489,10 +508,8 @@ mod tests {
             "error",
             "error,my_adapter=trace",
             "warn",
-            "info,iroh=trace",
             "off,iroh=trace",
-            "info,iroh::endpoint=debug",
-            "info,iroh[transport]=trace",
+            "off,kameo=info",
         ] {
             assert_eq!(
                 telemetry_trace_filter(level).to_string(),
@@ -500,6 +517,29 @@ mod tests {
                 "{level}"
             );
         }
+        // A named target is applied as written; the other still gets its default.
+        for level in [
+            "info,iroh=trace",
+            "info,iroh::endpoint=debug",
+            "info,iroh[transport]=trace",
+        ] {
+            assert_eq!(
+                telemetry_trace_filter(level).to_string(),
+                EnvFilter::new(format!("kameo=warn,{level}")).to_string(),
+                "{level}"
+            );
+        }
+        for level in ["info,kameo=info", "info,kameo::actor=debug"] {
+            assert_eq!(
+                telemetry_trace_filter(level).to_string(),
+                EnvFilter::new(format!("iroh=warn,{level}")).to_string(),
+                "{level}"
+            );
+        }
+        assert_eq!(
+            telemetry_trace_filter("info,iroh=trace,kameo=info").to_string(),
+            EnvFilter::new("info,iroh=trace,kameo=info").to_string()
+        );
         let subscriber =
             tracing_subscriber::registry().with(telemetry_trace_filter("off,my_adapter=debug"));
         tracing::subscriber::with_default(subscriber, || {
@@ -536,8 +576,66 @@ mod tests {
         let level = "info,other[span{field=iroh}]=debug";
         assert_eq!(
             telemetry_trace_filter(level).to_string(),
-            EnvFilter::new(format!("iroh=warn,{level}")).to_string()
+            EnvFilter::new(format!("iroh=warn,kameo=warn,{level}")).to_string()
         );
+    }
+
+    #[test]
+    fn default_level_exports_no_actor_dispatch_spans() {
+        for level in ["info", "debug", "info,other=trace"] {
+            let subscriber = tracing_subscriber::registry().with(telemetry_trace_filter(level));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !tracing::enabled!(target: "kameo::actor::kind", tracing::Level::INFO),
+                    "{level}"
+                );
+                assert!(
+                    !tracing::enabled!(target: "kameo", tracing::Level::INFO),
+                    "{level}"
+                );
+                // Work spans of the agent are unaffected, and so is kameo's own
+                // warning output.
+                assert!(
+                    tracing::enabled!(target: "querymt_agent_runtime", tracing::Level::INFO),
+                    "{level}"
+                );
+                assert!(
+                    tracing::enabled!(target: "kameo::actor::kind", tracing::Level::WARN),
+                    "{level}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn explicit_kameo_directive_exports_dispatch_spans() {
+        for level in ["info,kameo=info", "info,kameo::actor=info"] {
+            let subscriber = tracing_subscriber::registry().with(telemetry_trace_filter(level));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    tracing::enabled!(target: "kameo::actor::kind", tracing::Level::INFO),
+                    "{level}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn kameo_lookalike_targets_are_not_mistaken_for_kameo() {
+        let level = "info,kameo_extras=debug";
+        assert_eq!(
+            telemetry_trace_filter(level).to_string(),
+            EnvFilter::new(format!("iroh=warn,kameo=warn,{level}")).to_string()
+        );
+    }
+
+    #[test]
+    fn stricter_global_level_exports_no_info_spans_at_all() {
+        let subscriber = tracing_subscriber::registry().with(telemetry_trace_filter("error"));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "kameo::actor::kind", tracing::Level::INFO));
+            assert!(!tracing::enabled!(target: "querymt_agent_runtime", tracing::Level::INFO));
+        });
     }
 
     #[test]

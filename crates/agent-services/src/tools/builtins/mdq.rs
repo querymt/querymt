@@ -90,7 +90,7 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidRequest("selector is required".to_string()))?;
 
-        let resolved_path = context.resolve_path(path)?;
+        let resolved_path = context.resolve_path_arg("path", path)?;
         let markdown = tokio::fs::read_to_string(&resolved_path)
             .await
             .map_err(|e| ToolError::ProviderError(format!("read failed: {}", e)))?;

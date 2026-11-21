@@ -11,23 +11,25 @@ pub fn resolve_root(
 ) -> Result<PathBuf, ToolError> {
     args.get("root")
         .and_then(serde_json::Value::as_str)
-        .map(|s| context.resolve_path(s))
+        .map(|s| context.resolve_path_arg("root", s))
         .transpose()?
         .or_else(|| context.cwd().map(|p| p.to_path_buf()))
         .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))
 }
-/// Resolve a tool target path: absolute paths are used as written; relative
-/// paths are joined with `root` (the caller's `root` argument, or the cwd).
+/// Resolve a tool target path: a leading `~` or `~/` is the user's home
+/// directory (an error naming `arg` when none is known), other absolute paths
+/// are used as written, and relative paths are joined with `root` (the caller's
+/// `root` argument, or the cwd).
 ///
 /// Must stay in sync with the tools' `file_access`, which resolves targets
 /// against `crate::tools::effective_root` to predict the same path.
-pub fn resolve_target(path_str: &str, root: &Path) -> PathBuf {
-    let path = Path::new(path_str);
-    if path.is_absolute() {
-        path.to_path_buf()
+pub fn resolve_target(arg: &str, path_str: &str, root: &Path) -> Result<PathBuf, ToolError> {
+    let path = crate::tools::expand_tilde_arg(arg, path_str)?;
+    Ok(if path.is_absolute() {
+        path.into_owned()
     } else {
         root.join(path)
-    }
+    })
 }
 
 /// Parse a required `"paths"` JSON array argument into a `Vec<String>`.

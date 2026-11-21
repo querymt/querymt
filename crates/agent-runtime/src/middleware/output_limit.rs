@@ -8,8 +8,9 @@
 //!    The escalated cap then applies to every later request of the turn
 //!    (`on_step_start`), because request overrides last one request only.
 //! 2. **Continue** (`on_stopped`): when the reply is still cut off, resume with a
-//!    temporary instruction (no recap, split large writes), up to
-//!    `max_continuations` times per turn.
+//!    stored `output_limit` notice (no recap, split large writes), once per
+//!    continuation, up to `max_continuations` times per turn. The notice stays
+//!    in history.
 //!
 //! # TOML
 //!
@@ -27,8 +28,8 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
-    ContextPriority, ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver,
-    ModelProfile, Result, apply_usage_to_stats,
+    ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver, ModelProfile, Result,
+    apply_usage_to_stats,
 };
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
@@ -36,14 +37,12 @@ use log::debug;
 use parking_lot::Mutex;
 use querymt::chat::{FinishReason, GenerationOptions, ReasoningEffort};
 use querymt_agent_core::events::{AgentEventKind, OutputLimitRecoveryAction, StopType};
+use querymt_agent_core::model::NoticeSource;
 use querymt_agent_services::event_sink::EventSink;
 use querymt_agent_services::model_info::get_model_info;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Key under which the continuation instruction is stored as a context fragment.
-pub(crate) const FRAGMENT_KEY: &str = "output_limit_recovery";
 
 /// Default continuation instruction. `{cap}` expands to the cap that was hit.
 pub const DEFAULT_INSTRUCTION: &str = "Your previous response was cut off by the output-token limit ({cap} tokens). \
@@ -87,8 +86,6 @@ pub(crate) struct TurnState {
     escalated_cap: Option<u32>,
     /// Continuations issued so far.
     pub(crate) continuations: u8,
-    /// The continuation instruction is currently part of the context.
-    pub(crate) fragment_active: bool,
     /// The most recent reply was cut off and carried only reasoning. Such a
     /// reply is never stored, so this is the only record of it.
     pub(crate) last_cut_thinking_only: bool,
@@ -264,16 +261,9 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
             turn.last_cut_thinking_only = thinking_only;
         });
 
-        // A reply that finished normally ends any continuation: drop the instruction.
+        // The continuation instruction is a stored notice and stays in history,
+        // so a reply that finished normally changes nothing.
         if !cut {
-            let was_active = self.with_turn(&context.session_id, |turn| {
-                std::mem::take(&mut turn.fragment_active)
-            });
-            let context = if was_active {
-                Arc::new(context.remove_fragment(FRAGMENT_KEY))
-            } else {
-                context
-            };
             return Ok(ExecutionState::AfterLlm { response, context });
         }
 
@@ -357,7 +347,6 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
         let plan = self.with_turn(&context.session_id, |turn| {
             (turn.continuations < max_continuations).then(|| {
                 turn.continuations += 1;
-                turn.fragment_active = true;
                 (
                     turn.continuations,
                     turn.escalated_cap,
@@ -388,8 +377,9 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
             thinking_only,
             discarded_message_id: None,
         });
+        // Stored once per continuation, after any retained partial reply.
         let next = context
-            .upsert_fragment(FRAGMENT_KEY, instruction, ContextPriority::High)
+            .queue_notice(NoticeSource::OutputLimit, instruction)
             .with_request_overrides(options);
         Ok(ExecutionState::BeforeLlmCall {
             context: Arc::new(next),
@@ -549,9 +539,9 @@ mod tests {
     fn reset_clears_every_session() {
         let mw = OutputLimitRecoveryMiddleware::default();
         let a: Arc<str> = "a".into();
-        mw.with_turn(&a, |t| t.fragment_active = true);
+        mw.with_turn(&a, |t| t.continuations = 2);
         mw.reset();
-        assert!(!mw.with_turn(&a, |t| t.fragment_active));
+        assert_eq!(mw.with_turn(&a, |t| t.continuations), 0);
     }
 
     // ── escalation (5.2) ────────────────────────────────────────────────
@@ -804,17 +794,14 @@ mod tests {
 
         let context = recovered(stop(&mw, &runtime, StopType::ModelTokenLimit).await);
 
-        let fragment = context
-            .fragments
-            .iter()
-            .find(|fragment| fragment.key == FRAGMENT_KEY)
-            .expect("instruction fragment");
+        assert_eq!(context.pending_notices.len(), 1);
+        let notice = &context.pending_notices[0];
+        assert_eq!(notice.source, NoticeSource::OutputLimit);
         assert!(
-            fragment.content.contains("128000 tokens"),
+            notice.content.contains("128000 tokens"),
             "{}",
-            fragment.content
+            notice.content
         );
-        assert_eq!(fragment.priority, ContextPriority::High);
         assert!(
             context.request_overrides.is_empty(),
             "no escalation, plain reply"
@@ -833,7 +820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_continuation_follows_the_retained_assistant_reply() {
+    async fn guidance_after_a_retained_partial_reply() {
         let mw = OutputLimitRecoveryMiddleware::default();
         let profile = profile_for(128_000, 128_000);
         let mut context = (*context_with("s", profile)).clone();
@@ -851,11 +838,15 @@ mod tests {
             context: Some(Arc::new(context)),
         };
         let context = recovered(mw.on_stopped(state, None).await.unwrap());
-        let messages = context.request_messages();
-        assert_eq!(messages[1].text(), "partial report");
-        assert_eq!(messages[2].role, querymt::chat::ChatRole::User);
-        assert!(messages[2].text().contains("Continue directly"));
-        assert_eq!(context.messages.len(), 2, "guidance stays temporary");
+        // The reply is sent unchanged; the guidance is queued to be stored after it.
+        assert_eq!(context.messages.len(), 2);
+        assert_eq!(context.messages[1].text(), "partial report");
+        assert_eq!(context.pending_notices.len(), 1);
+        assert!(
+            context.pending_notices[0]
+                .content
+                .contains("Continue directly")
+        );
     }
 
     #[tokio::test]
@@ -964,14 +955,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn instruction_is_removed_after_the_next_normal_reply() {
+    async fn instruction_stays_in_history_after_the_next_normal_reply() {
         let mw = OutputLimitRecoveryMiddleware::default();
         let runtime = profile_for(128_000, 128_000);
-        let with_fragment = recovered(stop(&mw, &runtime, StopType::ModelTokenLimit).await);
+        let with_notice = recovered(stop(&mw, &runtime, StopType::ModelTokenLimit).await);
         // `stop` used session "s", the same one `after_llm` below replies for.
         let state = ExecutionState::AfterLlm {
             response: reply(FinishReason::Stop),
-            context: with_fragment,
+            context: with_notice.clone(),
         };
 
         let state = mw.on_after_llm(state, None).await.unwrap();
@@ -979,7 +970,9 @@ mod tests {
         let ExecutionState::AfterLlm { context, .. } = state else {
             panic!("expected AfterLlm, got {}", state.name());
         };
-        assert!(context.fragments.iter().all(|f| f.key != FRAGMENT_KEY));
+        // Nothing removes or rewrites the notice, and no second copy appears.
+        assert_eq!(context.pending_notices, with_notice.pending_notices);
+        assert_eq!(context.messages.len(), with_notice.messages.len());
         assert_eq!(mw.with_turn(&"s".into(), |t| t.continuations), 1);
     }
 

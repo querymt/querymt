@@ -156,7 +156,9 @@ You are in review mode. Provide feedback only.
 - `review_reminder`: System message for review mode
 
 **Behavior:**
-- Injects mode-specific reminders
+- Stores the mode's reminder in the history once, when a request is first sent in that mode (or when the mode's last stored reminder is no longer in the history, for example after compaction). It is not added again to every model call, so it does not change the cached prefix.
+- When the session leaves a mode that had a reminder for a mode without one, stores a short notice that the earlier reminder no longer applies.
+- Switching modes without sending a request stores nothing
 - Restricts tool access based on mode
 - Allows runtime mode switching
 
@@ -277,8 +279,13 @@ type `model_token_limit`. A reply that is cut off in the middle of a tool call n
 runs that call; the model is told to split the write into smaller calls.
 
 **Initial cap and ceiling.** With no `max_tokens` configured, Anthropic requests start at
-`min(32000, model output limit)` and the model's output limit is the ceiling. If the
-limit is unknown, 32,000 is used for both.
+`min(32000, model output limit)` and the model's output limit is the ceiling. At
+reasoning effort `high` or `max` the requests start at `min(64000, model output limit)`
+instead, because reasoning tokens count against the cap and long replies were being cut
+off and discarded at 32,000. The effort is read when the provider is built for a request,
+so a change of effort applies from the next request. If the limit is unknown, 32,000 is
+used for both at every effort. An explicit `max_tokens` is used as it is and is also the
+ceiling.
 
 **Default instruction.** `{cap}` expands to the cap that was hit:
 

@@ -117,7 +117,10 @@ impl MessageInjectingDriver {
     fn inject(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::BeforeLlmCall {
-                context: Arc::new(context.inject_message(self.inject_content.clone())),
+                context: Arc::new(context.queue_notice(
+                    querymt_agent_core::model::NoticeSource::DuplicateToolCall,
+                    self.inject_content.clone(),
+                )),
             }),
             other => Ok(other),
         }
@@ -502,6 +505,7 @@ impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
                 request: Arc::new(crate::middleware::PreparedModelRequest {
                     messages: Arc::from([]),
                     tools: Arc::from([]),
+                    offered_tools: Arc::from([]),
                     estimated_tokens: 0,
                     options: Default::default(),
                 }),

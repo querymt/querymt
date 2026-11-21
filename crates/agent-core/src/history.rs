@@ -1,6 +1,6 @@
 //! Effective-history filtering: the messages that follow the last compaction.
 
-use crate::model::{AgentMessage, MessagePart};
+use crate::model::{AgentMessage, MessagePart, ToolBaseline};
 use querymt::chat::ChatRole;
 
 /// Filter messages to return only the "effective" history after the last compaction.
@@ -51,6 +51,59 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
     // which violates the LLM API contract that all tool_results for a batch
     // of tool_use calls appear in a single user message.
     merge_consecutive_tool_result_messages(without_snapshots)
+}
+
+/// Takes the tool baselines out of a loaded history and returns the one in
+/// effect (the most recent), leaving the messages a request is built from.
+///
+/// A baseline is a request's tool list, not conversation content, so it has no
+/// chat form and must not reach a provider as a message. Removed with it is
+/// every tool change that is not after the most recent baseline: a change
+/// before it is already part of that list, and a change with no baseline has
+/// nothing to change. Tool changes after the baseline stay; they are sent as
+/// messages. A message left without parts is dropped.
+///
+/// Call this on the effective history before projecting it to chat messages.
+pub fn take_tool_baseline(messages: &mut Vec<AgentMessage>) -> Option<ToolBaseline> {
+    let is_baseline = |part: &MessagePart| matches!(part, MessagePart::ToolBaseline { .. });
+    let latest = messages
+        .iter()
+        .rposition(|message| message.parts.iter().any(is_baseline));
+    if latest.is_none() && !messages.iter().any(has_tool_record) {
+        return None;
+    }
+
+    let mut baseline = None;
+    let mut kept = Vec::with_capacity(messages.len());
+    for (index, mut message) in std::mem::take(messages).into_iter().enumerate() {
+        if !has_tool_record(&message) {
+            kept.push(message);
+            continue;
+        }
+        let changes_count = latest.is_some_and(|latest| index > latest);
+        let mut parts = Vec::with_capacity(message.parts.len());
+        for part in std::mem::take(&mut message.parts) {
+            match part {
+                MessagePart::ToolBaseline { tools, origin } => {
+                    if latest == Some(index) {
+                        baseline = Some(ToolBaseline { tools, origin });
+                    }
+                }
+                MessagePart::ToolChange { .. } if !changes_count => {}
+                other => parts.push(other),
+            }
+        }
+        if !parts.is_empty() {
+            message.parts = parts;
+            kept.push(message);
+        }
+    }
+    *messages = kept;
+    baseline
+}
+
+fn has_tool_record(message: &AgentMessage) -> bool {
+    message.parts.iter().any(MessagePart::is_tool_record)
 }
 
 /// Merge runs of consecutive `User` messages where **every** message in the
@@ -157,6 +210,112 @@ mod tests {
                 }],
             )
         }
+    }
+
+    fn tool(name: &str) -> querymt::chat::Tool {
+        querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: name.into(),
+                description: name.into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    fn record(id: &str, part: MessagePart) -> AgentMessage {
+        let mut message = AgentMessage::new("s".into(), ChatRole::User);
+        message.id = id.into();
+        message.parts.push(part);
+        message
+    }
+
+    fn baseline(id: &str, tools: &[&str], origin: &str) -> AgentMessage {
+        record(
+            id,
+            MessagePart::ToolBaseline {
+                tools: tools.iter().map(|name| tool(name)).collect(),
+                origin: origin.into(),
+            },
+        )
+    }
+
+    fn change(id: &str, added: &[&str]) -> AgentMessage {
+        record(
+            id,
+            MessagePart::ToolChange {
+                added: added.iter().map(|name| tool(name)).collect(),
+                removed: Vec::new(),
+            },
+        )
+    }
+
+    fn ids(messages: &[AgentMessage]) -> Vec<&str> {
+        messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    #[test]
+    fn baseline_is_taken_out_and_later_changes_stay() {
+        let mut messages = vec![
+            make_text_message("u1", "s", ChatRole::User, "go"),
+            baseline("b1", &["a"], "p/m"),
+            make_text_message("a1", "s", ChatRole::Assistant, "ok"),
+            change("c1", &["b"]),
+        ];
+
+        let taken = take_tool_baseline(&mut messages).unwrap();
+
+        assert_eq!(taken.origin, "p/m");
+        assert_eq!(taken.tools, vec![tool("a")]);
+        assert_eq!(ids(&messages), ["u1", "a1", "c1"]);
+    }
+
+    #[test]
+    fn changes_before_the_most_recent_baseline_are_dropped() {
+        let mut messages = vec![
+            baseline("b1", &["a"], "p/m"),
+            change("c1", &["b"]),
+            make_text_message("u1", "s", ChatRole::User, "go"),
+            baseline("b2", &["a", "b"], "p/n"),
+            change("c2", &["c"]),
+        ];
+
+        let taken = take_tool_baseline(&mut messages).unwrap();
+
+        assert_eq!(taken.origin, "p/n");
+        assert_eq!(ids(&messages), ["u1", "c2"]);
+    }
+
+    #[test]
+    fn change_with_no_baseline_is_dropped() {
+        let mut messages = vec![
+            make_text_message("u1", "s", ChatRole::User, "go"),
+            change("c1", &["b"]),
+        ];
+
+        assert_eq!(take_tool_baseline(&mut messages), None);
+        assert_eq!(ids(&messages), ["u1"]);
+    }
+
+    #[test]
+    fn history_without_tool_records_is_unchanged() {
+        let mut messages = vec![
+            make_text_message("u1", "s", ChatRole::User, "go"),
+            make_text_message("a1", "s", ChatRole::Assistant, "ok"),
+        ];
+
+        assert_eq!(take_tool_baseline(&mut messages), None);
+        assert_eq!(ids(&messages), ["u1", "a1"]);
+    }
+
+    #[test]
+    fn a_baseline_has_no_chat_form() {
+        // A message that still holds one projects to nothing a provider could
+        // mistake for a tool change.
+        let chat = baseline("b1", &["a"], "p/m").to_chat_message().unwrap();
+        assert!(!chat.has_tool_change());
+        assert!(chat.input().unwrap().is_empty());
     }
 
     fn make_text_message(id: &str, session_id: &str, role: ChatRole, text: &str) -> AgentMessage {

@@ -41,6 +41,9 @@ impl<T> CachedContent<T> {
     }
 }
 
+/// The only cache lifetime the Responses API accepts, in seconds (`30m`).
+pub const RESPONSES_TTL_SECONDS: u64 = 1800;
+
 /// Only successfully placed hints participate in request-wide TTL resolution.
 #[derive(Default)]
 pub struct CacheHints {
@@ -52,20 +55,14 @@ impl CacheHints {
         let CacheHint::Ephemeral { ttl_seconds } = hint;
         log::debug!("Responses CacheHint requested: ttl_seconds={ttl_seconds:?}");
         if let Some(seconds) = ttl_seconds {
-            if *seconds != 1800 {
+            // A shorter lifetime is rounded up to the one the API offers; a
+            // longer one cannot be honoured and fails loudly.
+            if *seconds > RESPONSES_TTL_SECONDS {
                 return Err(LLMError::InvalidRequest(format!(
-                    "Responses cache hints support only ttl_seconds=1800 (30m), got {seconds}"
+                    "Responses cache hints support at most ttl_seconds={RESPONSES_TTL_SECONDS} (30m), got {seconds}"
                 )));
             }
-            if self
-                .ttl_seconds
-                .is_some_and(|previous| previous != *seconds)
-            {
-                return Err(LLMError::InvalidRequest(
-                    "conflicting Responses cache hint TTLs".into(),
-                ));
-            }
-            self.ttl_seconds = Some(*seconds);
+            self.ttl_seconds = Some(RESPONSES_TTL_SECONDS);
         }
         self.applied += 1;
         Ok(())
@@ -135,6 +132,40 @@ mod tests {
         );
     }
     #[test]
+    fn shorter_lifetimes_round_up_to_thirty_minutes_and_longer_ones_fail() {
+        for seconds in [60, 600, 1800] {
+            let mut hints = CacheHints::default();
+            hints
+                .applied(&CacheHint::Ephemeral {
+                    ttl_seconds: Some(seconds),
+                })
+                .unwrap();
+            let mut extra = Map::new();
+            hints.finish(&mut extra).unwrap();
+            assert_eq!(extra["prompt_cache_options"]["ttl"], "30m", "{seconds}");
+        }
+        let err = CacheHints::default()
+            .applied(&CacheHint::Ephemeral {
+                ttl_seconds: Some(3600),
+            })
+            .expect_err("a lifetime beyond 30 minutes cannot be honoured");
+        assert!(err.to_string().contains("3600"), "{err}");
+    }
+    #[test]
+    fn mixed_lifetimes_resolve_to_one_request_wide_value() {
+        let mut hints = CacheHints::default();
+        for seconds in [Some(600), Some(1800), None] {
+            hints
+                .applied(&CacheHint::Ephemeral {
+                    ttl_seconds: seconds,
+                })
+                .unwrap();
+        }
+        let mut extra = Map::new();
+        hints.finish(&mut extra).unwrap();
+        assert_eq!(extra["prompt_cache_options"]["ttl"], "30m");
+    }
+    #[test]
     fn defaults_emit_nothing_and_invalid_ttls_fail() {
         let mut hints = CacheHints::default();
         hints
@@ -143,13 +174,6 @@ mod tests {
         let mut extra = Map::new();
         hints.finish(&mut extra).unwrap();
         assert!(extra.is_empty());
-        assert!(
-            CacheHints::default()
-                .applied(&CacheHint::Ephemeral {
-                    ttl_seconds: Some(300)
-                })
-                .is_err()
-        );
         let mut extra = serde_json::json!({"prompt_cache_options": {"ttl": "1h"}})
             .as_object()
             .unwrap()

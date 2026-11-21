@@ -69,10 +69,10 @@ async fn test_message_injection_flow() {
     let result = composite.run_turn_start(state, None).await.unwrap();
 
     if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.pending_notices.len(), 1);
         assert!(
-            context.messages[0]
-                .text()
+            context.pending_notices[0]
+                .content
                 .contains("Remember to be helpful")
         );
     } else {
@@ -97,7 +97,7 @@ async fn test_multiple_middleware_interaction() {
     assert_eq!(states.lock().unwrap().len(), 1);
 
     if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.pending_notices.len(), 1);
     } else {
         panic!("Expected BeforeLlmCall state");
     }
@@ -216,9 +216,10 @@ async fn test_context_immutability() {
         .unwrap();
 
     assert_eq!(original.messages.len(), original_len);
+    assert!(original.pending_notices.is_empty());
 
     if let ExecutionState::BeforeLlmCall { context } = result {
-        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.pending_notices.len(), 1);
     } else {
         panic!("Expected BeforeLlmCall state");
     }

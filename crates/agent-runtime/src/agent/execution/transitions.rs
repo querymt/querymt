@@ -40,16 +40,35 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span, instrument};
+use tracing::{Instrument, debug_span, info_span, instrument};
 use uuid::Uuid;
+
+/// Context-hook trigger for a request over `messages`.
+///
+/// Read before the request's notices are stored, so a notice stored after a
+/// tool batch does not make the request a user-prompt request.
+pub(super) fn context_hook_trigger(messages: &[ChatMessage]) -> &'static str {
+    // Tool changes stored after the tool results do not change what the
+    // request follows.
+    if messages
+        .iter()
+        .rfind(|message| !super::tool_history::is_tool_change(message))
+        .is_some_and(|message| message.has_tool_result())
+    {
+        "after_tool_batch"
+    } else {
+        "user_prompt"
+    }
+}
 
 /// Transition from BeforeLlmCall to CallLlm.
 ///
 /// This collects available tools, computes their hash, and emits a ToolsAvailable event
-/// if the tool set has changed.
+/// if the tool set has changed. `trigger` is the context-hook trigger, from
+/// [`context_hook_trigger`] over the history before notices were stored.
 #[instrument(
     name = "agent.transition.before_llm_call",
-    skip(config, context, exec_ctx),
+    skip(config, context, exec_ctx, trigger),
     fields(
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
@@ -61,6 +80,7 @@ pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
+    trigger: &'static str,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "BeforeLlmCall: session={}, steps={}",
@@ -117,6 +137,14 @@ pub(super) async fn transition_before_llm_call(
         tool_count = tracing::field::Empty,
         tools_bytes = tracing::field::Empty
     );
+    let capabilities = provider.capabilities();
+    let tool_updates = capabilities.tool_updates;
+    // Default message hints request the configured lifetime, capped at what
+    // the provider offers; the provider rounds it to one it supports.
+    let hint_ttl_seconds = capabilities
+        .prompt_cache
+        .default_hint_ttl(config.execution_policy.prompt_cache.ttl_secs)
+        .map(u64::from);
     let (tools, tools_json, new_hash) = {
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
@@ -154,15 +182,23 @@ pub(super) async fn transition_before_llm_call(
         );
     }
 
-    let mut messages = context.request_messages();
-    let trigger = if messages
-        .last()
-        .is_some_and(|message| message.has_tool_result())
-    {
-        "after_tool_batch"
+    // The request's tool list and history. For a provider that declares
+    // `tool_updates` this stores a baseline or a tool change when due, and the
+    // list is the most recent baseline's; otherwise it is the tools offered now
+    // and the stored tool records are left out.
+    let tool_state = super::tool_history::resolve(exec_ctx, &context, tool_updates, &tools).await?;
+    let context = tool_state.context;
+    let leading = tool_state.leading;
+    let offered_tools = tool_state.offered;
+    let leading_json = if leading == tools {
+        tools_json
     } else {
-        "user_prompt"
+        serde_json::to_vec(&leading).context("Failed to serialize tools for hash computation")?
     };
+    let leading_hash = querymt_agent_core::hash::RapidHash::new(&leading_json);
+
+    // The context hook sees durable history only (stored notices included).
+    let mut messages = tool_state.messages;
     let context_window =
         querymt_agent_services::model_info::get_model_info(&context.provider, &context.model)
             .and_then(|info| info.limits.context)
@@ -199,6 +235,10 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
+    let request_tail = request_tail(
+        context.request_objective.as_deref(),
+        &hook_result.additional_context,
+    );
     // Providers reject a tool call without its result. Reaching this point
     // with one is a bug upstream; answer it so the run survives, and make it loud.
     let unanswered = querymt_agent_core::model::answer_unanswered_tool_calls(&mut messages);
@@ -213,14 +253,34 @@ pub(super) async fn transition_before_llm_call(
             "request had unanswered tool calls: {unanswered:?}"
         );
     }
+    // Attribute any cache prefix change against the last completed request.
+    // Durable history only: the request tail is rebuilt every time.
+    let prefix_fingerprint = super::prefix::PrefixFingerprint::new(
+        &context.provider,
+        &context.model,
+        leading_hash,
+        system_prompt_hash(config, exec_ctx),
+        &messages,
+    );
+    exec_ctx
+        .runtime
+        .cache_prefix
+        .lock()
+        .begin(prefix_fingerprint, std::time::Instant::now());
     // Tool definitions are model input; reuse the serialization already used for their hash.
-    let tool_tokens = if tools.is_empty() {
+    let tool_tokens = if leading.is_empty() {
         0
     } else {
-        tools_json.len().div_ceil(4)
+        leading_json.len().div_ceil(4)
     };
     validate_tool_context_budget(tool_tokens, context_window)?;
-    let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
+    let tail_tokens = request_tail.as_ref().map_or(0, |tail| {
+        crate::session::pruning::estimate_chat_tokens(std::slice::from_ref(tail))
+    });
+    let estimated_tokens = hook_result
+        .estimated_tokens
+        .saturating_add(tool_tokens)
+        .saturating_add(tail_tokens);
     if estimated_tokens >= context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
@@ -233,11 +293,13 @@ pub(super) async fn transition_before_llm_call(
         });
     }
     // Clones the whole history, so its cost grows with the conversation.
-    let messages = info_span!(
+    let mut messages = debug_span!(
         "agent.request.cache_breakpoints",
         message_count = messages.len() as u64
     )
-    .in_scope(|| apply_cache_breakpoints(&messages));
+    .in_scope(|| apply_cache_breakpoints(&messages, hint_ttl_seconds));
+    // The tail follows the hinted durable messages and carries no hint.
+    messages.extend(request_tail);
     // Re-evaluate room after history, steering, tools, and context hooks are prepared.
     let mut options = context.request_overrides;
     if let Some(cap) = options.max_tokens {
@@ -248,11 +310,32 @@ pub(super) async fn transition_before_llm_call(
         context: context.clone(),
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
-            tools: Arc::from(tools.into_boxed_slice()),
+            tools: Arc::from(leading.into_boxed_slice()),
+            offered_tools: Arc::from(offered_tools.into_boxed_slice()),
             estimated_tokens,
             options,
         }),
     })
+}
+
+/// Hash of the system prompt the session's provider is configured with: the
+/// turn-pinned session config when it carries one, else the agent's initial
+/// config.
+fn system_prompt_hash(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+) -> querymt_agent_core::hash::RapidHash {
+    let pinned = exec_ctx
+        .llm_config()
+        .and_then(|llm| llm.params.as_ref())
+        .and_then(|params| params.get("system"));
+    // A JSON value and an optional string always serialize.
+    let bytes = match pinned {
+        Some(system) => serde_json::to_vec(system),
+        None => serde_json::to_vec(&config.provider.initial_config().system),
+    }
+    .expect("system prompt serializes to JSON");
+    querymt_agent_core::hash::RapidHash::new(&bytes)
 }
 
 /// Reject fixed tool overhead that history compaction cannot reduce.
@@ -265,18 +348,55 @@ fn validate_tool_context_budget(tool_tokens: usize, context_window: u32) -> anyh
     Ok(())
 }
 
-/// Apply cache breakpoints to the last 2 messages in the conversation.
+/// The request tail: at most one user message holding the run objective (when
+/// enabled) followed by hook `additional_context`. Never stored, rebuilt for
+/// every request, and the only place text that is not in history may go.
+fn request_tail(objective: Option<&str>, additional_context: &[String]) -> Option<ChatMessage> {
+    let mut parts = objective
+        .into_iter()
+        .map(str::to_owned)
+        .chain(additional_context.iter().cloned())
+        .filter(|text| !text.trim().is_empty());
+    let first = parts.next()?;
+    let mut tail = ChatMessage::user().text(first).build();
+    for part in parts {
+        tail.push_input_part(querymt::chat::ChatInputPart::text(part));
+    }
+    Some(tail)
+}
+
+/// Apply cache breakpoints to the last 2 durable messages of the conversation.
+/// A default hint requests `ttl_seconds` (`None`: the provider's default
+/// lifetime); hints already on a message keep their own.
 ///
-/// This enables prompt caching for the most recent context.
-pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let len = messages.len();
+/// This enables prompt caching for the most recent context. A tool-change
+/// message carries no default hint and does not count as one of the two: the
+/// provider places no marker on it, so a hint there would be lost.
+pub(super) fn apply_cache_breakpoints(
+    messages: &[ChatMessage],
+    ttl_seconds: Option<u64>,
+) -> Vec<ChatMessage> {
+    let eligible: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| !super::tool_history::is_tool_change(message))
+        .map(|(index, _)| index)
+        .collect();
+    let first_hinted = eligible
+        .len()
+        .checked_sub(2)
+        .map(|from| eligible[from..].to_vec());
     messages
         .iter()
         .enumerate()
         .map(|(i, msg)| {
             let mut m = msg.clone();
-            if len >= 2 && i >= len - 2 && m.cache.is_none() {
-                m.cache = Some(CacheHint::Ephemeral { ttl_seconds: None });
+            if first_hinted
+                .as_ref()
+                .is_some_and(|hinted| hinted.contains(&i))
+                && m.cache.is_none()
+            {
+                m.cache = Some(CacheHint::Ephemeral { ttl_seconds });
             }
             m
         })
@@ -733,11 +853,13 @@ fn gate_function_calls_for_execution(
         gen_ai.conversation.id = %exec_ctx.session_id,
         session.id = %exec_ctx.session_id,
         gen_ai.request.stream = tracing::field::Empty,
+        qmt.cache.prefix_change = tracing::field::Empty,
+        qmt.cache.idle_secs = tracing::field::Empty,
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
         model = %context.model,
         message_count = context.messages.len(),
-        tool_count = request.tools.len()
+        tool_count = request.offered_tools.len()
     )
 )]
 pub(super) async fn transition_call_llm(
@@ -750,11 +872,20 @@ pub(super) async fn transition_call_llm(
     // without marking the span as an error. Successful canonical output replaces it.
     genai::finish_reason("error");
     let chat_span = tracing::Span::current();
+    // Attempts of this request, streaming or not, are reported on the span.
+    let request_attempts = genai::RequestAttempts::new(&chat_span);
     genai::agent_id(&chat_span, config.provider.agent_id.as_deref());
     let session_id = &exec_ctx.session_id;
     let request_messages = request.messages.as_ref();
     genai::conversation_compacted(&chat_span, &exec_ctx.compaction_summaries, request_messages);
     let tools = &request.tools;
+    let prefix = exec_ctx.runtime.cache_prefix.lock().pending_attribution();
+    if let Some(prefix) = prefix {
+        chat_span.record("qmt.cache.prefix_change", prefix.change.as_str());
+        if let Some(idle) = prefix.idle_secs {
+            chat_span.record("qmt.cache.idle_secs", idle);
+        }
+    }
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
@@ -808,13 +939,16 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    let output: ChatOutput = if tools.is_empty() {
+    // `tools` is the request's tool list, which for a provider that takes tool
+    // changes as messages is the baseline's: tools can be offered through a
+    // change while that list is empty, so both are read.
+    let output: ChatOutput = if tools.is_empty() && request.offered_tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
-        match super::llm_retry::call_with_retry(
+        match super::llm_retry::call_chat_with_retry(
             config,
             session_id,
-            "chat",
+            &request_attempts,
             &exec_ctx.cancellation_token,
             || {
                 let messages_with_cache = &messages_with_cache;
@@ -975,7 +1109,8 @@ pub(super) async fn transition_call_llm(
             let mut retry_budget = super::llm_retry::StreamRetryBudget::new(
                 max_stream_retries,
                 config.execution_policy.rate_limit.max_attempts(),
-            );
+            )
+            .with_attempts(request_attempts.clone());
             let mut timing = genai::StreamTiming::default();
             let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
@@ -1442,6 +1577,7 @@ pub(super) async fn transition_call_llm(
                 }
             }; // end outer retry loop ('stream)
 
+            request_attempts.succeeded();
             timing.finish(&chat_span);
             crate::agent::utils::llm_metrics::stream_latency(
                 genai::provider_name(&context.provider),
@@ -1482,10 +1618,10 @@ pub(super) async fn transition_call_llm(
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
-            match super::llm_retry::call_with_retry(
+            match super::llm_retry::call_chat_with_retry(
                 config,
                 session_id,
-                "chat",
+                &request_attempts,
                 &exec_ctx.cancellation_token,
                 || {
                     let provider = &provider;
@@ -1574,8 +1710,16 @@ pub(super) async fn transition_call_llm(
                 turns: u32_from_usize(context.stats.turns, "context.stats.turns", Some(session_id)),
             },
             accounting: Some(operation.request_accounting()),
+            prefix_change: prefix.map(|p| p.change),
+            idle_secs: prefix.and_then(|p| p.idle_secs),
         },
     );
+    // The request completed, so its prefix is now what the provider cached.
+    exec_ctx
+        .runtime
+        .cache_prefix
+        .lock()
+        .commit(std::time::Instant::now());
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
         .with_applied(options)
@@ -1781,17 +1925,12 @@ pub(super) async fn transition_after_llm(
     }
 
     let new_context = Arc::new(
-        crate::middleware::ConversationContext::new(
-            context.session_id.clone(),
-            Arc::from(messages.into_boxed_slice()),
-            Arc::new(updated_stats),
-            context.provider.clone(),
-            context.model.clone(),
-        )
-        .with_session_mode(context.session_mode)
-        .with_profile(context.profile.clone())
-        .with_last_applied(response.applied)
-        .with_fragments(context.fragments.clone()),
+        context
+            .with_history(
+                Arc::from(messages.into_boxed_slice()),
+                Arc::new(updated_stats),
+            )
+            .with_last_applied(response.applied),
     );
 
     let output_status = structured_output.as_ref().and_then(|output| output.status);
@@ -2479,6 +2618,18 @@ async fn apply_clarification_answer(
 //  Tests
 // ══════════════════════════════════════════════════════════════════════════
 
+/// [`transition_before_llm_call`] over a history that has no notices stored
+/// for this request, so the trigger can be read from it.
+#[cfg(test)]
+pub(super) async fn transition_before_llm_call_in_test(
+    config: &AgentConfig,
+    context: &Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &ExecutionContext,
+) -> Result<ExecutionState, anyhow::Error> {
+    let trigger = context_hook_trigger(&context.messages);
+    transition_before_llm_call(config, context, exec_ctx, trigger).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2673,8 +2824,8 @@ mod tests {
                 canceller
             );
 
-            // A cancelled call is dropped, so it never emits ToolCallEnd; what
-            // matters is that nothing for it is published after the cancel.
+            // A cancelled call is dropped and ends with one cancellation
+            // ToolCallEnd; no progress for it is published after the cancel.
             let mut after_cancel = Vec::new();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
             while let Ok(Ok(e)) = tokio::time::timeout_at(deadline, events.recv()).await {
@@ -2747,6 +2898,150 @@ mod tests {
         }
     }
 
+    /// Every started `shell` call gets exactly one end event, however the run
+    /// is cancelled.
+    #[cfg(unix)]
+    mod shell_cancel_tests {
+        use super::*;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+        use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        /// Cancel the batch of `(tool, arguments)` calls, with ids `c1`, `c2`, ...,
+        /// once a command has created `{marker}`, and return every event
+        /// published for the batch.
+        async fn cancel_batch(batch: &[(&str, serde_json::Value)]) -> Vec<EventEnvelope> {
+            let agent = TestAgent::with_mock_provider(SharedLlmProvider::new(
+                MockLlmProvider::new(),
+                vec![],
+            ))
+            .await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let token = CancellationToken::new();
+            let mut exec = agent
+                .execution_context_in(dir.path().to_path_buf())
+                .await
+                .with_cancellation_token(token.clone());
+            let mut events = agent.config.event_sink.fanout().subscribe();
+            let pid_file = dir.path().join("running");
+            let calls: Arc<[MiddlewareToolCall]> = batch
+                .iter()
+                .enumerate()
+                .map(|(index, (tool, args))| {
+                    let args = args
+                        .to_string()
+                        .replace("{marker}", &pid_file.display().to_string());
+                    mock_tool_call(&format!("c{}", index + 1), tool, &args)
+                })
+                .collect();
+            let results: Arc<[ToolResult]> = Arc::from(Vec::new());
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let driver = CompositeDriver::new(vec![]);
+
+            let canceller = async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !pid_file.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("first command started");
+                token.cancel();
+            };
+            let (state, ()) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    transition_processing_tool_calls(
+                        &agent.config,
+                        &driver,
+                        &calls,
+                        &results,
+                        &context,
+                        &mut exec,
+                    ),
+                ),
+                canceller
+            );
+            let state = state.expect("cancelled batch returns").expect("transition");
+            assert!(matches!(state, ExecutionState::Cancelled), "{state:?}");
+
+            let mut published = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+                published.push(event);
+            }
+            published
+        }
+
+        fn starts(events: &[EventEnvelope], id: &str) -> usize {
+            events
+                .iter()
+                .filter(|e| matches!(e.kind(), AgentEventKind::ToolCallStart { tool_call_id, .. } if tool_call_id == id))
+                .count()
+        }
+
+        fn ends<'a>(events: &'a [EventEnvelope], id: &str) -> Vec<(&'a bool, &'a String)> {
+            events
+                .iter()
+                .filter_map(|e| match e.kind() {
+                    AgentEventKind::ToolCallEnd {
+                        tool_call_id,
+                        is_error,
+                        result,
+                        ..
+                    } if tool_call_id == id => Some((is_error, result)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The cancel signal races the tool's own cancellation, so the
+        /// batch is repeated to hit both outcomes.
+        #[tokio::test]
+        async fn cancelled_while_running_has_one_end_event() {
+            for attempt in 0..10 {
+                let events = cancel_batch(&[sleeping_shell()]).await;
+
+                assert_eq!(starts(&events, "c1"), 1, "attempt {attempt}");
+                let ends = ends(&events, "c1");
+                assert_eq!(ends.len(), 1, "attempt {attempt}: {ends:?}");
+                let (is_error, result) = ends[0];
+                assert!(*is_error, "attempt {attempt}");
+                assert!(
+                    result.contains("Cancelled by user"),
+                    "attempt {attempt}: {result}"
+                );
+            }
+        }
+
+        fn sleeping_shell() -> (&'static str, serde_json::Value) {
+            (
+                "shell",
+                serde_json::json!({"command": "touch {marker}; exec sleep 600"}),
+            )
+        }
+
+        /// `create_task` is an execution barrier, so the last call waits in a
+        /// later segment while the first one runs.
+        #[tokio::test]
+        async fn call_cancelled_before_its_command_started_has_no_events() {
+            let events = cancel_batch(&[
+                sleeping_shell(),
+                ("create_task", serde_json::json!({"title": "t"})),
+                ("shell", serde_json::json!({"command": "echo never-runs"})),
+            ])
+            .await;
+
+            assert_eq!(starts(&events, "c1"), 1);
+            assert_eq!(ends(&events, "c1").len(), 1);
+            for waiting in ["c2", "c3"] {
+                assert_eq!(starts(&events, waiting), 0, "{waiting} never started");
+                assert!(ends(&events, waiting).is_empty(), "{waiting}");
+            }
+        }
+    }
+
     mod genai_trace_tests {
         use super::*;
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
@@ -2764,6 +3059,7 @@ mod tests {
             Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 1,
                 options: Default::default(),
             })
@@ -2845,9 +3141,9 @@ mod tests {
                     );
                     exec.add_message(orphan).await.unwrap();
                 }
-                let (mut messages, summaries) =
-                    exec.session_handle.history_with_compaction().await.unwrap();
-                exec.compaction_summaries = summaries;
+                let view = exec.session_handle.history_view().await.unwrap();
+                let mut messages = view.messages;
+                exec.compaction_summaries = view.summaries;
                 if mode == "reload_removed" {
                     assert_eq!(exec.compaction_summaries.len(), 1);
                     fixture
@@ -2857,9 +3153,8 @@ mod tests {
                         .delete_messages_after(&exec.session_id, &boundary_id)
                         .await
                         .unwrap();
-                    let (_, refreshed) =
-                        exec.session_handle.history_with_compaction().await.unwrap();
-                    exec.compaction_summaries = refreshed;
+                    exec.compaction_summaries =
+                        exec.session_handle.history_view().await.unwrap().summaries;
                 }
                 let context = Arc::new(crate::middleware::ConversationContext::new(
                     exec.session_id.as_str().into(),
@@ -2890,7 +3185,7 @@ mod tests {
                 }
                 let config = builder.build();
                 match mode {
-                    "cached" => messages = apply_cache_breakpoints(&messages),
+                    "cached" => messages = apply_cache_breakpoints(&messages, None),
                     "removed" => {
                         messages.pop();
                     }
@@ -2906,7 +3201,7 @@ mod tests {
                 let (result, spans) = capture_info(async {
                     let request = if mode.starts_with("hook_") {
                         let ExecutionState::CallLlm { request, .. } =
-                            transition_before_llm_call(&config, &context, &exec)
+                            transition_before_llm_call_in_test(&config, &context, &exec)
                                 .await
                                 .unwrap()
                         else {
@@ -2917,6 +3212,7 @@ mod tests {
                         Arc::new(PreparedModelRequest {
                             messages: Arc::from(messages),
                             tools: Arc::from([]),
+                            offered_tools: Arc::from([]),
                             estimated_tokens: 1,
                             options: Default::default(),
                         })
@@ -2955,6 +3251,8 @@ mod tests {
             options_seen: Arc<std::sync::Mutex<Vec<querymt::chat::GenerationOptions>>>,
             /// Options the provider claims to honour.
             support: Arc<std::sync::Mutex<querymt::chat::GenerationOptionSupport>>,
+            /// Whether the provider declares `tool_updates`.
+            tool_updates: Arc<std::sync::atomic::AtomicBool>,
         }
 
         #[async_trait::async_trait]
@@ -2963,6 +3261,7 @@ mod tests {
                 querymt::chat::ChatCapabilities::NONE
                     .with_streaming(self.streaming)
                     .with_options(*self.support.lock().unwrap())
+                    .with_tool_updates(self.tool_updates.load(std::sync::atomic::Ordering::Relaxed))
             }
             async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
                 self.options_seen.lock().unwrap().push(call.options);
@@ -3098,6 +3397,7 @@ mod tests {
                     clock: Default::default(),
                     options_seen: Default::default(),
                     support: Default::default(),
+                    tool_updates: Default::default(),
                 },
                 binding: std::sync::Mutex::new(
                     serde_json::json!({"temperature":0.25, "max_tokens":123, "top_p":0.75}),
@@ -3129,6 +3429,7 @@ mod tests {
             .build();
             config.execution_policy.rate_limit.jitter_ratio = 0.0;
             config.execution_policy.rate_limit.default_wait_secs = 0;
+            config.execution_policy.rate_limit.transport_wait_secs = 0;
             fixture.config = Arc::new(config);
             fixture.handle = Arc::new(crate::agent::LocalAgentHandle::from_config(
                 fixture.config.clone(),
@@ -3564,7 +3865,7 @@ mod tests {
                     .with_request_overrides(overrides),
             );
 
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { request, context } = state else {
@@ -3575,6 +3876,516 @@ mod tests {
                 context.profile.capabilities,
                 exec.session_handle.provider().await.unwrap().capabilities(),
                 "successful initialization must replace a stale or empty profile"
+            );
+        }
+
+        fn mcp_tool(name: &str, description: &str) -> querymt::chat::Tool {
+            querymt::chat::Tool {
+                tool_type: "function".into(),
+                function: querymt::chat::FunctionTool {
+                    name: name.into(),
+                    description: description.into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }
+        }
+
+        async fn declared_run(
+            tool_updates: bool,
+        ) -> (
+            Arc<ConversationContext>,
+            Arc<PreparedModelRequest>,
+            Arc<PreparedModelRequest>,
+            TestAgent,
+            ExecutionContext,
+            &'static str,
+        ) {
+            let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            factory
+                .provider
+                .tool_updates
+                .store(tool_updates, std::sync::atomic::Ordering::Relaxed);
+            let state = crate::agent::core::McpToolState::new(
+                Default::default(),
+                vec![mcp_tool("alpha", "A")],
+            );
+            let exec = fixture.execution_context_with_mcp(state).await;
+            let context = Arc::new(
+                (*crate::test_utils::test_context(&exec.session_id, 0))
+                    .clone()
+                    .with_history(
+                        Arc::from([ChatMessage::user().text("go").build()]),
+                        Arc::new(Default::default()),
+                    ),
+            );
+            let ExecutionState::CallLlm { context, request } =
+                transition_before_llm_call_in_test(&fixture.config, &context, &exec)
+                    .await
+                    .expect("first request")
+            else {
+                panic!("expected CallLlm");
+            };
+            // The first request completed, so it is the reference for the next.
+            exec.runtime
+                .cache_prefix
+                .lock()
+                .commit(std::time::Instant::now());
+            // An MCP server adds a tool between the two requests.
+            exec.runtime.mcp_tool_state.rcu(|snapshot| {
+                let mut next = snapshot.clone();
+                next.tool_defs.push(mcp_tool("beta", "B"));
+                next
+            });
+            let ExecutionState::CallLlm {
+                context: second_context,
+                request: second,
+            } = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
+                .await
+                .expect("second request")
+            else {
+                panic!("expected CallLlm");
+            };
+            let prefix_change = exec
+                .runtime
+                .cache_prefix
+                .lock()
+                .pending_attribution()
+                .expect("the second request is attributed")
+                .change
+                .as_str();
+            (
+                second_context,
+                request,
+                second,
+                fixture,
+                exec,
+                prefix_change,
+            )
+        }
+
+        #[tokio::test]
+        async fn mcp_tool_added_mid_session_is_sent_as_a_change_when_the_provider_declares_it() {
+            let (context, first, second, _fixture, _exec, prefix_change) = declared_run(true).await;
+            assert_eq!(prefix_change, "none", "the request keeps the cached prefix");
+
+            let names = |request: &PreparedModelRequest| -> Vec<String> {
+                request
+                    .tools
+                    .iter()
+                    .map(|t| t.function.name.clone())
+                    .collect()
+            };
+            assert!(names(&first).contains(&"alpha".to_string()));
+            assert_eq!(
+                names(&second),
+                names(&first),
+                "the tool list does not change"
+            );
+            let last = second.messages.last().expect("messages");
+            let change = last.input().unwrap()[0]
+                .as_tool_change()
+                .expect("a tool change");
+            assert_eq!(change.added.len(), 1);
+            assert_eq!(change.added[0].function.name, "beta");
+            assert_eq!(
+                second
+                    .messages
+                    .iter()
+                    .filter(|m| m.has_tool_change())
+                    .count(),
+                1,
+                "the change is the only tool record sent: a baseline is not a message"
+            );
+            // The model can call the added tool although the list does not
+            // name it.
+            assert!(
+                second
+                    .offered_tools
+                    .iter()
+                    .any(|t| t.function.name == "beta")
+            );
+            assert_eq!(second.offered_tools.len(), second.tools.len() + 1);
+            assert_eq!(first.offered_tools, first.tools);
+            assert!(context.messages.iter().any(ChatMessage::has_tool_change));
+            assert!(context.tool_baseline.is_some());
+        }
+
+        #[tokio::test]
+        async fn mcp_tool_added_mid_session_changes_the_list_without_tool_updates() {
+            let (context, first, second, fixture, exec, prefix_change) = declared_run(false).await;
+            assert_eq!(prefix_change, "tools", "the list change rewrites the cache");
+
+            assert!(
+                second.tools.iter().any(|t| t.function.name == "beta"),
+                "the current list carries the new tool"
+            );
+            assert_eq!(second.tools.len(), first.tools.len() + 1);
+            assert_eq!(second.offered_tools, second.tools);
+            assert!(!second.messages.iter().any(ChatMessage::has_tool_change));
+            assert!(!context.messages.iter().any(ChatMessage::has_tool_change));
+            let stored = fixture
+                .config
+                .provider
+                .history_store()
+                .get_history(&exec.session_id)
+                .await
+                .unwrap();
+            assert!(stored.iter().flat_map(|m| &m.parts).all(|part| !matches!(
+                part,
+                MessagePart::ToolBaseline { .. } | MessagePart::ToolChange { .. }
+            )));
+        }
+
+        const OBJECTIVE: &str = "[Run objective revision 1]\nOBJECTIVE";
+
+        /// Prepare one request for `messages`, as the execution loop does before
+        /// every model request. `objective` is `Some` when `run_objective = true`.
+        async fn prepared(
+            fixture: &TestAgent,
+            exec: &ExecutionContext,
+            messages: Vec<ChatMessage>,
+            objective: Option<&str>,
+        ) -> Vec<ChatMessage> {
+            prepared_in(&fixture.config, exec, messages, objective).await
+        }
+
+        async fn prepared_in(
+            config: &AgentConfig,
+            exec: &ExecutionContext,
+            messages: Vec<ChatMessage>,
+            objective: Option<&str>,
+        ) -> Vec<ChatMessage> {
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(messages.into_boxed_slice());
+            let context = context.with_request_objective(objective.map(Arc::from));
+            let state = transition_before_llm_call_in_test(config, &Arc::new(context), exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { request, .. } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            request.messages.to_vec()
+        }
+
+        /// A config whose only context hook prints `additional_context`, naming
+        /// whether the objective text reached the hook's input.
+        fn config_with_context_hook(config: &AgentConfig) -> AgentConfig {
+            let command = r#"if grep -q OBJECTIVE; then t='saw objective'; else t='durable only'; fi; printf '{"hook_specific_output":{"hook_event_name":"context","additional_context":"%s"}}' "$t""#;
+            let hooks = crate::hooks::Hooks::new(
+                serde_json::from_value::<crate::hooks::HooksConfig>(serde_json::json!({
+                    "enabled": true,
+                    "context": [{"hooks": [{
+                        "type": "command", "command": command, "timeout_sec": 5
+                    }]}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut config = config.clone();
+            config.hooks = hooks;
+            config
+        }
+
+        fn hinted(message: &ChatMessage) -> bool {
+            message.cache.is_some()
+        }
+
+        /// Assert that `next` begins with every durable message of `previous`,
+        /// compared without cache hints: the prefix a provider cache written by
+        /// `previous` could serve to `next`. `previous_tail` says whether the
+        /// last message of `previous` is request-scoped context.
+        fn assert_durable_prefix(
+            previous: &[ChatMessage],
+            previous_tail: bool,
+            next: &[ChatMessage],
+        ) {
+            let strip = |messages: &[ChatMessage]| -> Vec<serde_json::Value> {
+                messages
+                    .iter()
+                    .map(|message| {
+                        let mut message = message.clone();
+                        message.cache = None;
+                        serde_json::to_value(message).unwrap()
+                    })
+                    .collect()
+            };
+            let durable_len = previous.len() - usize::from(previous_tail);
+            let (previous, next) = (strip(&previous[..durable_len]), strip(next));
+            assert!(next.len() >= previous.len(), "next request is shorter");
+            for (i, (before, after)) in previous.iter().zip(&next).enumerate() {
+                assert_eq!(
+                    before, after,
+                    "durable prefix differs at message {i} of {durable_len}"
+                );
+            }
+        }
+
+        fn tool_step(call_id: &str) -> [ChatMessage; 2] {
+            [
+                ChatMessage::assistant()
+                    .tool_use(call_id, "read_tool", serde_json::json!({"path": call_id}))
+                    .build(),
+                ChatMessage::user()
+                    .part(querymt::chat::ChatInputPart::tool_result(
+                        querymt::chat::ToolResult::text(call_id, format!("contents of {call_id}")),
+                    ))
+                    .build(),
+            ]
+        }
+
+        /// First request of a turn, then one tool step.
+        async fn prompt_to_first_tool_step(objective: Option<&str>) {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let first = prepared(&fixture, &exec, vec![prompt.clone()], objective).await;
+            let mut history = vec![prompt];
+            history.extend(tool_step("call-1"));
+            let second = prepared(&fixture, &exec, history, objective).await;
+
+            assert_durable_prefix(&first, objective.is_some(), &second);
+        }
+
+        /// Two consecutive tool steps of one turn.
+        async fn across_a_tool_step(objective: Option<&str>) {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let first = prepared(&fixture, &exec, history.clone(), objective).await;
+            history.extend(tool_step("call-2"));
+            let second = prepared(&fixture, &exec, history, objective).await;
+
+            assert_durable_prefix(&first, objective.is_some(), &second);
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_from_prompt_to_first_tool_step() {
+            prompt_to_first_tool_step(None).await;
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_a_tool_step() {
+            across_a_tool_step(None).await;
+        }
+
+        /// "Prefix is stable with the run objective enabled".
+        #[tokio::test]
+        async fn durable_prefix_is_stable_with_the_run_objective_enabled() {
+            prompt_to_first_tool_step(Some(OBJECTIVE)).await;
+            across_a_tool_step(Some(OBJECTIVE)).await;
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_turns() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let last_of_turn_one = prepared(&fixture, &exec, history.clone(), None).await;
+            history.push(ChatMessage::assistant().text("done").build());
+            history.push(ChatMessage::user().text("now the tests").build());
+            let first_of_turn_two = prepared(&fixture, &exec, history, None).await;
+
+            assert_durable_prefix(&last_of_turn_one, false, &first_of_turn_two);
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_a_mode_switch() {
+            use querymt_agent_core::model::NoticeSource;
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let before = prepared(&fixture, &exec, history.clone(), None).await;
+            // Build -> plan between requests: the reminder is stored as a notice,
+            // appended after the tool results.
+            let context = crate::test_utils::test_context(&exec.session_id, 0)
+                .queue_notice(NoticeSource::AgentMode, "plan reminder".into());
+            let mut stored = context.clone();
+            stored.messages = Arc::from(history.clone().into_boxed_slice());
+            let stored = crate::agent::execution::store_pending_notices(&exec, &Arc::new(stored))
+                .await
+                .unwrap();
+            let after = prepared(&fixture, &exec, stored.messages.to_vec(), None).await;
+
+            assert_durable_prefix(&before, false, &after);
+            assert_eq!(after.last().unwrap().text(), "plan reminder");
+        }
+
+        /// A notice stored after a tool batch does not turn the request into a
+        /// user-prompt request for context hooks.
+        #[tokio::test]
+        async fn notice_after_a_tool_batch_keeps_the_after_tool_batch_trigger() {
+            use querymt_agent_core::model::NoticeSource;
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(history.into_boxed_slice());
+            let context =
+                Arc::new(context.queue_notice(NoticeSource::DuplicateToolCall, "same".into()));
+
+            let (_, spans) = capture(async {
+                crate::agent::execution::prepare_model_request(&fixture.config, &exec, &context)
+                    .await
+                    .expect("prepare request");
+            })
+            .await;
+            let hook = spans
+                .iter()
+                .find(|span| span.name == "agent.hooks.context")
+                .expect("context hook span");
+            assert_eq!(
+                attr(hook, "trigger"),
+                Some(&Value::from("after_tool_batch"))
+            );
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_for_a_provider_without_breakpoints() {
+            // A local provider: hints are compared away, content must still match.
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "llama_cpp", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let first = prepared(&fixture, &exec, history.clone(), None).await;
+            history.extend(tool_step("call-2"));
+            let second = prepared(&fixture, &exec, history, None).await;
+
+            assert_durable_prefix(&first, false, &second);
+        }
+
+        #[tokio::test]
+        async fn request_without_request_scoped_context_ends_with_a_durable_message() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared(&fixture, &exec, vec![prompt], None).await;
+
+            assert_eq!(request.len(), 1);
+            assert_eq!(request[0].text(), "fix the build");
+        }
+
+        #[tokio::test]
+        async fn context_after_the_user_prompt_follows_it() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared(&fixture, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            assert_eq!(request.len(), 2);
+            assert_eq!(request[0].text(), "fix the build");
+            assert_eq!(request[1].text(), OBJECTIVE);
+        }
+
+        #[tokio::test]
+        async fn context_after_a_tool_batch_leaves_the_tool_result_message_unchanged() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            let stored_result = serde_json::to_value(history.last().unwrap()).unwrap();
+
+            let request = prepared_in(&config, &exec, history, None).await;
+
+            assert_eq!(request.len(), 4);
+            let mut result = request[2].clone();
+            result.cache = None;
+            assert_eq!(serde_json::to_value(result).unwrap(), stored_result);
+            assert!(request[3].text().contains("durable only"));
+            assert!(request[3].text().contains("<hook-context event=context"));
+        }
+
+        #[tokio::test]
+        async fn context_hook_sees_durable_history_only() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared_in(&config, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            let tail = request.last().unwrap().text();
+            assert!(tail.contains("durable only"), "{tail}");
+            assert!(!tail.contains("saw objective"), "{tail}");
+        }
+
+        #[tokio::test]
+        async fn objective_and_hook_text_share_one_message_objective_first() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared_in(&config, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            assert_eq!(request.len(), 2, "one tail message");
+            let tail = request[1].text();
+            assert!(tail.find("OBJECTIVE").unwrap() < tail.find("durable only").unwrap());
+        }
+
+        #[tokio::test]
+        async fn context_hook_contribution_is_request_scoped() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let with_hook = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let first = prepared_in(&with_hook, &exec, vec![prompt.clone()], None).await;
+            let second = prepared_in(&fixture.config, &exec, vec![prompt], None).await;
+
+            assert_eq!(first.len(), 2);
+            assert_eq!(second.len(), 1, "the next request does not carry the text");
+            assert!(!second[0].text().contains("durable only"));
+        }
+
+        #[tokio::test]
+        async fn last_two_durable_messages_are_hinted_and_the_tail_is_not() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            history.extend(tool_step("call-2"));
+
+            let request = prepared(&fixture, &exec, history, Some(OBJECTIVE)).await;
+
+            // Five durable messages followed by the unhinted tail.
+            assert_eq!(request.len(), 6);
+            let flags: Vec<bool> = request.iter().map(hinted).collect();
+            assert_eq!(flags, [false, false, false, true, true, false]);
+        }
+
+        #[tokio::test]
+        async fn existing_history_hints_are_kept_and_hinting_is_idempotent() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut first = ChatMessage::user().text("fix the build").build();
+            first.cache = Some(querymt::chat::CacheHint::Ephemeral {
+                ttl_seconds: Some(300),
+            });
+            let mut history = vec![first];
+            history.extend(tool_step("call-1"));
+            history.extend(tool_step("call-2"));
+
+            let request = prepared(&fixture, &exec, history, None).await;
+
+            let flags: Vec<bool> = request.iter().map(hinted).collect();
+            assert_eq!(flags, [true, false, false, true, true]);
+            assert_eq!(
+                serde_json::to_value(apply_cache_breakpoints(&request, None)).unwrap(),
+                serde_json::to_value(&request).unwrap(),
+                "applying hints twice gives the same request"
             );
         }
 
@@ -3593,7 +4404,7 @@ mod tests {
                 let exec = fixture.execution_context().await;
                 let mut events = config.subscribe_events();
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
-                transition_before_llm_call(config, &context, &exec)
+                transition_before_llm_call_in_test(config, &context, &exec)
                     .await
                     .expect("before llm call");
                 let deadline = std::time::Duration::from_secs(2);
@@ -3644,9 +4455,10 @@ mod tests {
             .and_then(|info| info.limits.context)
             .unwrap_or(u64::from(u32::MAX))
             .min(u64::from(u32::MAX)) as u32;
-            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), &exec)
-                .await
-                .unwrap();
+            let state =
+                transition_before_llm_call_in_test(&fixture.config, &Arc::new(context), &exec)
+                    .await
+                    .unwrap();
             let ExecutionState::CallLlm { request, .. } = state else {
                 panic!("expected CallLlm, got {}", state.name());
             };
@@ -3841,9 +4653,23 @@ mod tests {
             })
             .await;
 
-            let max_tokens: Vec<_> = spans
+            let chats: Vec<_> = spans
                 .iter()
                 .filter(|span| attr(span, "gen_ai.operation.name") == Some(&Value::from("chat")))
+                .collect();
+            // A reply asked for again at a higher cap is a new request, not a
+            // retry: each request has its own span with one attempt.
+            for chat in &chats {
+                assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
+                let events = chat
+                    .events
+                    .iter()
+                    .filter(|event| event.name == "gen_ai.request.attempt")
+                    .count();
+                assert_eq!(events, 1);
+            }
+            let max_tokens: Vec<_> = chats
+                .iter()
                 .map(|span| attr(span, "gen_ai.request.max_tokens").cloned())
                 .collect();
             assert_eq!(max_tokens.len(), 2);
@@ -3915,7 +4741,7 @@ mod tests {
             assert_eq!(context.request_overrides.max_tokens, Some(128_000));
 
             // Retry: same request at the ceiling.
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4018,7 +4844,7 @@ mod tests {
             assert_eq!(context.request_overrides.max_tokens, Some(128_000));
 
             // Request 2: ceiling, thinking only again -> not escalated twice, stops.
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before 2");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4066,8 +4892,12 @@ mod tests {
                     .with_reasoning_effort(ReasoningEffort::Medium)
             );
 
-            // Request 3: carries the instruction and succeeds.
-            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+            // Request 3: carries the stored instruction and succeeds. The loop
+            // stores queued notices right before the request.
+            let context = crate::agent::execution::store_pending_notices(&exec, &context)
+                .await
+                .expect("store notice");
+            let state = transition_before_llm_call_in_test(&fixture.config, &context, &exec)
                 .await
                 .expect("before 3");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4092,12 +4922,14 @@ mod tests {
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
-            assert!(
+            assert_eq!(
                 context
-                    .fragments
+                    .messages
                     .iter()
-                    .all(|f| f.key != "output_limit_recovery"),
-                "instruction must be gone after the normal reply"
+                    .filter(|message| format!("{message:?}").contains(instruction_marker))
+                    .count(),
+                1,
+                "instruction stays in history after the normal reply, once"
             );
             let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
                 .await
@@ -4146,7 +4978,7 @@ mod tests {
             let ExecutionState::BeforeLlmCall { context } = state else {
                 panic!("expected BeforeLlmCall");
             };
-            let state = transition_before_llm_call(config, &context, exec)
+            let state = transition_before_llm_call_in_test(config, &context, exec)
                 .await
                 .expect("before llm call");
             let ExecutionState::CallLlm { context, request } = state else {
@@ -4159,6 +4991,7 @@ mod tests {
             );
             let mut request = (*request).clone();
             request.tools = tools.clone();
+            request.offered_tools = tools.clone();
             let state = transition_call_llm(config, &context, &Arc::new(request), exec)
                 .await
                 .expect("call llm");
@@ -4543,6 +5376,7 @@ mod tests {
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
                 let mut request = (*request()).clone();
                 request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
+                request.offered_tools = request.tools.clone();
                 let (_, spans) = capture(async {
                     let parent = info_span!("timing-parent");
                     async {
@@ -4848,7 +5682,7 @@ mod tests {
             let exec = fixture.execution_context().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (_, spans) = capture(async {
-                let _ = transition_before_llm_call(&fixture.config, &context, &exec).await;
+                let _ = transition_before_llm_call_in_test(&fixture.config, &context, &exec).await;
             })
             .await;
             let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
@@ -5028,6 +5862,341 @@ mod tests {
                 }
                 assert_private(&spans);
             }
+        }
+
+        // ── gen_ai.request.attempt ───────────────────────────────────────────
+
+        /// `(attempt, error.type)` of each `gen_ai.request.attempt` event, in order.
+        fn attempt_events(span: &opentelemetry_sdk::trace::SpanData) -> Vec<(i64, Option<String>)> {
+            span.events
+                .iter()
+                .filter(|event| event.name == "gen_ai.request.attempt")
+                .map(|event| {
+                    let attribute = |key: &str| {
+                        event
+                            .attributes
+                            .iter()
+                            .find(|kv| kv.key.as_str() == key)
+                            .map(|kv| kv.value.clone())
+                    };
+                    let attempt = match attribute("gen_ai.request.attempt") {
+                        Some(Value::I64(attempt)) => attempt,
+                        other => panic!("event without an integer attempt: {other:?}"),
+                    };
+                    (attempt, attribute("error.type").map(|v| v.to_string()))
+                })
+                .collect()
+        }
+
+        fn chat_span(
+            spans: &[opentelemetry_sdk::trace::SpanData],
+        ) -> &opentelemetry_sdk::trace::SpanData {
+            let mut chats = spans
+                .iter()
+                .filter(|s| attr(s, "gen_ai.operation.name") == Some(&Value::from("chat")));
+            let chat = chats.next().expect("a model request span");
+            assert!(chats.next().is_none(), "exactly one model request span");
+            chat
+        }
+
+        /// A request with a tool, so the streaming path is used.
+        fn streaming_request() -> Arc<PreparedModelRequest> {
+            let mut request = (*request()).clone();
+            request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
+            request.offered_tools = request.tools.clone();
+            Arc::new(request)
+        }
+
+        fn rate_limited_now() -> LLMError {
+            LLMError::RateLimited {
+                message: "SECRET_ERROR".into(),
+                retry_after_secs: Some(0),
+            }
+        }
+
+        #[tokio::test]
+        async fn request_without_a_retry_reports_one_attempt() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().times(1).returning(|_| {
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("SECRET_RESPONSE".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request(),
+                &exec,
+            ))
+            .await;
+            assert!(result.is_ok());
+
+            // Provider setup (`provider_init`) is not an attempt of the request.
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
+            assert_eq!(attempt_events(chat), [(1, None)]);
+            assert_private(&spans);
+        }
+
+        /// Whether the one request `prepared` leads to was sent with a tool
+        /// list (`Some(len)`) or without one (`None`).
+        async fn sent_tool_list(prepared: Arc<PreparedModelRequest>) -> Option<usize> {
+            let sent = Arc::new(std::sync::Mutex::new(None));
+            let seen = sent.clone();
+            let reply = || {
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("ok".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            };
+            // The mock takes a call without a tool list as `chat` and one
+            // with a list as `chat_with_tools`.
+            let mut mock = MockLlmProvider::new();
+            let without = seen.clone();
+            mock.expect_chat().returning(move |_| {
+                *without.lock().unwrap() = Some(None);
+                reply()
+            });
+            mock.expect_chat_with_tools().returning(move |_, tools| {
+                *seen.lock().unwrap() = Some(tools.map(<[_]>::len));
+                reply()
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            transition_call_llm(&fixture.config, &context, &prepared, &exec)
+                .await
+                .expect("call llm");
+            sent.lock().unwrap().take().expect("one request was sent")
+        }
+
+        #[tokio::test]
+        async fn tools_offered_only_by_a_change_are_sent_with_a_tool_list() {
+            // The request's tool list is the baseline's: it can be empty while
+            // a tool change in the messages offers tools.
+            let mut offered_by_change = (*request()).clone();
+            offered_by_change.offered_tools = streaming_request().tools.clone();
+            assert!(offered_by_change.tools.is_empty());
+
+            assert_eq!(
+                sent_tool_list(Arc::new(offered_by_change)).await,
+                Some(0),
+                "sent as a request with tools, whose list is empty"
+            );
+            assert_eq!(
+                sent_tool_list(request()).await,
+                None,
+                "no tools at all: no tool list"
+            );
+            assert_eq!(sent_tool_list(streaming_request()).await, Some(1));
+        }
+
+        #[tokio::test]
+        async fn retry_after_an_overloaded_error_reports_two_attempts() {
+            use querymt::error::{ProviderErrorKind, ProviderFailure};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Err(LLMError::from(
+                        ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "SECRET_ERROR")
+                            .with_retry_after_secs(Some(0)),
+                    ));
+                }
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("SECRET_RESPONSE".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request(),
+                &exec,
+            ))
+            .await;
+            assert!(result.is_ok());
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(2)));
+            let events = attempt_events(chat);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[0].0, 1);
+            // The failure is identified by its type; the message is never exported.
+            assert!(events[0].1.is_some(), "{events:?}");
+            assert_eq!(events[1], (2, None));
+            assert_eq!(chat.status, Status::Unset);
+            assert_private(&spans);
+        }
+
+        #[tokio::test]
+        async fn request_failing_every_attempt_reports_all_three_and_error_status() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Err(rate_limited_now())
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request(),
+                &exec,
+            ))
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(3)));
+            let limited = || Some("rate_limited".to_string());
+            assert_eq!(
+                attempt_events(chat),
+                [(1, limited()), (2, limited()), (3, limited())]
+            );
+            assert_eq!(chat.status, Status::error(""));
+            assert_private(&spans);
+        }
+
+        #[tokio::test]
+        async fn stream_recreated_after_a_failure_reports_two_attempts() {
+            let chunks = vec![
+                (20, Ok(metadata_event())),
+                (100, Ok(StreamChunk::Text("SECRET_RESPONSE".into()))),
+                (
+                    0,
+                    Ok(terminal_event(
+                        ChatOutputStatus::Completed,
+                        Some(FinishReason::Stop),
+                    )),
+                ),
+                (
+                    0,
+                    Ok(StreamChunk::Done {
+                        finish_reason: FinishReason::Stop,
+                    }),
+                ),
+            ];
+            let (fixture, _factory) = timed_fixture(
+                true,
+                vec![Err(rate_limited_now()), Ok(chunks)],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &streaming_request(),
+                &exec,
+            ))
+            .await;
+            assert!(result.is_ok());
+
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(2)));
+            assert_eq!(
+                attempt_events(chat),
+                [(1, Some("rate_limited".to_string())), (2, None)]
+            );
+            assert_private(&spans);
+        }
+
+        #[tokio::test]
+        async fn stream_failing_every_attempt_reports_all_three_and_error_status() {
+            let (fixture, _factory) = timed_fixture(
+                true,
+                vec![
+                    Err(rate_limited_now()),
+                    Err(rate_limited_now()),
+                    Err(rate_limited_now()),
+                ],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &streaming_request(),
+                &exec,
+            ))
+            .await;
+            assert!(result.is_err());
+
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(3)));
+            assert_eq!(attempt_events(chat).len(), 3);
+            assert_eq!(chat.status, Status::error(""));
+            assert_private(&spans);
+        }
+
+        #[tokio::test]
+        async fn cancelled_request_adds_no_attempt_event() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Err(LLMError::Cancelled));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request(),
+                &exec,
+            ))
+            .await;
+            assert!(matches!(result.unwrap(), ExecutionState::Cancelled));
+
+            // The attempt was started, so the count is right; it did not end in
+            // a response or a failure, so there is no event.
+            let chat = chat_span(&spans);
+            assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
+            assert!(attempt_events(chat).is_empty());
+            assert_eq!(chat.status, Status::Unset);
+        }
+
+        #[tokio::test]
+        async fn request_attempts_helper_skips_cancellation() {
+            let (_, spans) = capture(async {
+                let span = info_span!("chat holder");
+                let attempts = crate::agent::utils::genai::RequestAttempts::new(&span);
+                attempts.start();
+                attempts.failed(&LLMError::Cancelled);
+                attempts.start();
+                attempts.succeeded();
+                drop(span);
+            })
+            .await;
+            let holder = spans.iter().find(|s| s.name == "chat holder").unwrap();
+            assert_eq!(attr(holder, "gen_ai.request.attempt"), Some(&Value::I64(2)));
+            assert_eq!(attempt_events(holder), [(2, None)]);
         }
 
         #[tokio::test]
@@ -5663,7 +6832,7 @@ mod tests {
                 .build(),
             ChatMessage::user().text("current").build(),
         ];
-        let result = apply_cache_breakpoints(&messages);
+        let result = apply_cache_breakpoints(&messages, None);
         assert_eq!(result[0].cache, Some(hint));
         assert_eq!(
             result[1].cache,
@@ -5671,20 +6840,42 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&result).unwrap(),
-            serde_json::to_value(apply_cache_breakpoints(&result)).unwrap()
+            serde_json::to_value(apply_cache_breakpoints(&result, None)).unwrap()
+        );
+    }
+
+    #[test]
+    fn tool_change_message_is_not_hinted_and_does_not_count() {
+        use querymt::chat::ToolChange;
+        let change = ChatMessage::from_tool_change(ToolChange::new(Vec::new(), vec!["x".into()]));
+        let msgs = vec![
+            make_message(ChatRole::User, "prompt"),
+            make_message(ChatRole::Assistant, "call"),
+            make_message(ChatRole::User, "result"),
+            change,
+        ];
+        let result = apply_cache_breakpoints(&msgs, None);
+        assert!(result[0].cache.is_none());
+        assert!(result[1].cache.is_some(), "the call is hinted");
+        assert!(result[2].cache.is_some(), "the result is hinted");
+        assert!(result[3].cache.is_none(), "the tool change is not hinted");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(apply_cache_breakpoints(&result, None)).unwrap(),
+            "applying twice changes nothing"
         );
     }
 
     #[test]
     fn test_cache_breakpoints_empty_slice() {
-        let result = apply_cache_breakpoints(&[]);
+        let result = apply_cache_breakpoints(&[], None);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_cache_breakpoints_single_message_gets_cache_hint() {
         let msgs = vec![make_message(ChatRole::User, "hello")];
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         assert_eq!(result.len(), 1);
         // With len < 2, the guard `len >= 2` is false — no cache hint applied
         assert!(
@@ -5699,7 +6890,7 @@ mod tests {
             make_message(ChatRole::User, "msg-0"),
             make_message(ChatRole::Assistant, "msg-1"),
         ];
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         assert_eq!(result.len(), 2);
         // Both are within last 2, so both get cache hints
         assert!(result[0].cache.is_some(), "msg-0 should be cached");
@@ -5713,7 +6904,7 @@ mod tests {
             make_message(ChatRole::Assistant, "msg-1"),
             make_message(ChatRole::User, "msg-2"),
         ];
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         assert_eq!(result.len(), 3);
         assert!(
             result[0].cache.is_none(),
@@ -5728,7 +6919,7 @@ mod tests {
         let msgs: Vec<ChatMessage> = (0..5)
             .map(|i| make_message(ChatRole::User, &format!("msg-{i}")))
             .collect();
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         assert_eq!(result.len(), 5);
         for (i, msg) in result.iter().enumerate().take(3) {
             assert!(msg.cache.is_none(), "msg-{i} should NOT have cache hint");
@@ -5747,7 +6938,7 @@ mod tests {
             .collect();
         msgs[1].cache = Some(hint.clone());
 
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         let hinted: Vec<bool> = result.iter().map(|m| m.cache.is_some()).collect();
         assert_eq!(hinted, [false, true, false, true, true]);
         assert_eq!(result[1].cache, Some(hint));
@@ -5755,7 +6946,7 @@ mod tests {
         // Applying twice yields the same request as applying once.
         assert_eq!(
             serde_json::to_value(&result).unwrap(),
-            serde_json::to_value(apply_cache_breakpoints(&result)).unwrap()
+            serde_json::to_value(apply_cache_breakpoints(&result, None)).unwrap()
         );
     }
 
@@ -5766,10 +6957,34 @@ mod tests {
             make_message(ChatRole::Assistant, "response text"),
             make_message(ChatRole::User, "follow-up"),
         ];
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         assert_eq!(result[0].text(), "important content");
         assert_eq!(result[1].text(), "response text");
         assert_eq!(result[2].text(), "follow-up");
+    }
+
+    #[test]
+    fn default_hints_request_the_given_lifetime_and_keep_explicit_ones() {
+        let explicit = CacheHint::Ephemeral {
+            ttl_seconds: Some(300),
+        };
+        let mut msgs: Vec<ChatMessage> = (0..4)
+            .map(|i| make_message(ChatRole::User, &format!("msg-{i}")))
+            .collect();
+        msgs[3].cache = Some(explicit.clone());
+
+        let result = apply_cache_breakpoints(&msgs, Some(1800));
+
+        // Message 2 gets the default hint with the requested lifetime;
+        // message 3 keeps the lifetime it already had.
+        assert_eq!(
+            result[2].cache,
+            Some(CacheHint::Ephemeral {
+                ttl_seconds: Some(1800)
+            })
+        );
+        assert_eq!(result[3].cache, Some(explicit));
+        assert!(result[0].cache.is_none() && result[1].cache.is_none());
     }
 
     #[test]
@@ -5779,7 +6994,7 @@ mod tests {
             make_message(ChatRole::User, "test"),
             make_message(ChatRole::Assistant, "reply"),
         ];
-        let result = apply_cache_breakpoints(&msgs);
+        let result = apply_cache_breakpoints(&msgs, None);
         match &result[1].cache {
             Some(CacheHint::Ephemeral { ttl_seconds }) => {
                 assert!(ttl_seconds.is_none(), "ttl should be None");
@@ -5944,6 +7159,7 @@ mod tests {
             let request = Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 1,
                 options: querymt::chat::GenerationOptions::NONE,
             });
@@ -6016,6 +7232,184 @@ mod tests {
         }
     }
 
+    mod prefix_attribution_tests {
+        use super::*;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::chat::{ChatOutput, FinishReason};
+        use querymt_agent_core::events::CachePrefixChange;
+
+        fn ok_response() -> ChatOutput {
+            ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            )
+        }
+
+        /// Prepare and send one request; returns what its `LlmRequestEnd`
+        /// recorded.
+        async fn send(
+            fixture: &TestAgent,
+            exec: &ExecutionContext,
+            events: &mut tokio::sync::broadcast::Receiver<
+                querymt_agent_core::events::EventEnvelope,
+            >,
+            model: &str,
+            messages: Vec<ChatMessage>,
+        ) -> (Option<CachePrefixChange>, Option<u64>) {
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(messages.into_boxed_slice());
+            context.model = model.into();
+            let state =
+                transition_before_llm_call_in_test(&fixture.config, &Arc::new(context), exec)
+                    .await
+                    .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            transition_call_llm(&fixture.config, &context, &request, exec)
+                .await
+                .expect("call llm");
+            loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for LlmRequestEnd")
+                    .expect("event channel closed");
+                if let AgentEventKind::LlmRequestEnd {
+                    prefix_change,
+                    idle_secs,
+                    ..
+                } = envelope.kind()
+                {
+                    return (*prefix_change, *idle_secs);
+                }
+            }
+        }
+
+        fn user(text: &str) -> ChatMessage {
+            ChatMessage::user().text(text).build()
+        }
+
+        async fn fixture() -> TestAgent {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat_with_tools()
+                .returning(|_, _| Ok(ok_response()));
+            TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await
+        }
+
+        #[tokio::test]
+        async fn request_end_attributes_each_prefix_change() {
+            let fixture = fixture().await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            let base = vec![user("a"), user("b")];
+
+            let (change, idle) =
+                send(&fixture, &exec, &mut events, "mock-model", base.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::FirstRequest));
+            assert_eq!(idle, None, "no idle for the first request");
+
+            let mut grown = base.clone();
+            grown.push(user("c"));
+            let (change, idle) =
+                send(&fixture, &exec, &mut events, "mock-model", grown.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::Unchanged));
+            assert!(idle.is_some_and(|secs| secs < 5), "idle: {idle:?}");
+
+            let (change, _) =
+                send(&fixture, &exec, &mut events, "other-model", grown.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::Model));
+
+            // Compaction replaced the older messages.
+            let compacted = vec![user("summary"), user("c"), user("d")];
+            let (change, _) = send(&fixture, &exec, &mut events, "other-model", compacted).await;
+            assert_eq!(change, Some(CachePrefixChange::History));
+        }
+
+        #[tokio::test]
+        async fn a_new_runtime_reports_first_request_again() {
+            let fixture = fixture().await;
+            let mut events = fixture.config.subscribe_events();
+            let messages = vec![user("a")];
+
+            let exec = fixture.execution_context().await;
+            send(&fixture, &exec, &mut events, "mock-model", messages.clone()).await;
+
+            // A loaded session gets a fresh runtime, and with it no fingerprint.
+            let reloaded = fixture.execution_context().await;
+            let (change, idle) =
+                send(&fixture, &reloaded, &mut events, "mock-model", messages).await;
+            assert_eq!(change, Some(CachePrefixChange::FirstRequest));
+            assert_eq!(idle, None);
+        }
+
+        #[tokio::test]
+        async fn the_model_request_span_carries_the_attribution() {
+            use std::sync::Mutex;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            #[derive(Default)]
+            struct Recorded(Mutex<Vec<(String, String)>>);
+            struct Capture(Arc<Recorded>);
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push((f.name().to_string(), format!("{v:?}")));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+            }
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+                fn on_record(
+                    &self,
+                    _id: &tracing::span::Id,
+                    values: &tracing::span::Record<'_>,
+                    _ctx: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    values.record(&mut Visit(&mut self.0.0.lock().unwrap()));
+                }
+            }
+
+            let recorded = Arc::new(Recorded::default());
+            let subscriber = tracing_subscriber::registry().with(Capture(recorded.clone()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let fixture = fixture().await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            send(&fixture, &exec, &mut events, "mock-model", vec![user("a")]).await;
+            send(
+                &fixture,
+                &exec,
+                &mut events,
+                "mock-model",
+                vec![user("a"), user("b")],
+            )
+            .await;
+
+            let fields = recorded.0.lock().unwrap().clone();
+            let value = |name: &str| -> Vec<&str> {
+                fields
+                    .iter()
+                    .filter(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+                    .collect()
+            };
+            assert_eq!(value("qmt.cache.prefix_change"), ["first_request", "none"]);
+            assert_eq!(
+                value("qmt.cache.idle_secs").len(),
+                1,
+                "only the second request"
+            );
+        }
+    }
+
     mod attempt_accounting_tests {
         use super::cost_accounting_tests::{CACHE_ENV_LOCK, InjectedPricing};
         use super::genai_trace_tests::{TimedChunks, timed_fixture};
@@ -6082,7 +7476,8 @@ mod tests {
             };
             Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
-                tools: tools.into(),
+                tools: tools.clone().into(),
+                offered_tools: tools.into(),
                 estimated_tokens: 1,
                 options: querymt::chat::GenerationOptions::NONE,
             })

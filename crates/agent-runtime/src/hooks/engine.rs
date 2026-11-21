@@ -238,7 +238,12 @@ pub struct ContextHookRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextHookResult {
+    /// Durable messages for this request, possibly replaced by a hook.
     pub messages: Option<Vec<querymt::chat::ChatMessage>>,
+    /// Rendered `additional_context` from the hooks, in handler order. It is
+    /// request-scoped: the caller sends it in the request tail and never
+    /// stores it or merges it into a durable message.
+    pub additional_context: Vec<String>,
     pub estimated_tokens: usize,
     pub notices: Vec<HookNotice>,
 }
@@ -910,11 +915,13 @@ impl Hooks {
             return Ok(ContextHookResult {
                 estimated_tokens: estimate_chat_tokens(&request.messages),
                 messages: Some(request.messages),
+                additional_context: Vec::new(),
                 notices: Vec::new(),
             });
         }
 
         let mut messages = request.messages.clone();
+        let mut additional_context = Vec::new();
         let mut notices = Vec::new();
         for handler in self.matching_handlers(HookEventConfig::Context, &[]) {
             let input = ContextCommandInput {
@@ -963,7 +970,8 @@ impl Hooks {
                         {
                             Ok(candidate)
                                 if validate_message_projection(&candidate).is_ok()
-                                    && preserves_tool_identities(&messages, &candidate) =>
+                                    && preserves_tool_identities(&messages, &candidate)
+                                    && preserves_tool_changes(&messages, &candidate) =>
                             {
                                 messages = candidate;
                             }
@@ -972,8 +980,12 @@ impl Hooks {
                                     .err()
                                     .map(|error| error.to_string())
                                     .unwrap_or_else(|| {
-                                        "projection changed or removed tool-call identities"
-                                            .to_string()
+                                        if preserves_tool_identities(&messages, &candidate) {
+                                            "projection changed, removed or reordered tool-change messages"
+                                        } else {
+                                            "projection changed or removed tool-call identities"
+                                        }
+                                        .to_string()
                                     });
                                 notices.push(control_notice(
                                     HookEventConfig::Context,
@@ -996,7 +1008,8 @@ impl Hooks {
                         parsed.additional_context,
                         handler.additional_context_limit(),
                     ) {
-                        append_request_context(&mut messages, &outcome.handler_id, &context);
+                        additional_context
+                            .push(render_request_context(&outcome.handler_id, &context));
                     }
                 }
                 Ok(None) => {}
@@ -1006,6 +1019,7 @@ impl Hooks {
         let estimated_tokens = estimate_chat_tokens(&messages);
         Ok(ContextHookResult {
             messages: Some(messages),
+            additional_context,
             estimated_tokens,
             notices,
         })
@@ -1948,22 +1962,11 @@ fn limit_context(context: Option<String>, token_limit: Option<u32>) -> Option<St
     ))
 }
 
-fn append_request_context(
-    messages: &mut Vec<querymt::chat::ChatMessage>,
-    handler_id: &str,
-    content: &str,
-) {
-    let rendered = format!(
+fn render_request_context(handler_id: &str, content: &str) -> String {
+    format!(
         "<hook-context event=context handler={}>\n{}\n</hook-context>",
         handler_id, content
-    );
-    if let Some(last) = messages.last_mut()
-        && last.role == querymt::chat::ChatRole::User
-    {
-        last.push_input_part(querymt::chat::ChatInputPart::text(rendered));
-    } else {
-        messages.push(querymt::chat::ChatMessage::user().text(rendered).build());
-    }
+    )
 }
 
 fn validate_message_projection(messages: &[querymt::chat::ChatMessage]) -> anyhow::Result<()> {
@@ -2029,6 +2032,24 @@ fn preserves_tool_identities(
         ids
     }
     identities(candidate).is_subset(&identities(current))
+}
+
+/// Whether `candidate` holds exactly the tool changes `current` holds, in the
+/// same order. A tool change is stored once, when the tools change, and is
+/// never generated again; a request that lacks one keeps the old tool list.
+fn preserves_tool_changes(
+    current: &[querymt::chat::ChatMessage],
+    candidate: &[querymt::chat::ChatMessage],
+) -> bool {
+    fn changes(messages: &[querymt::chat::ChatMessage]) -> Vec<&querymt::chat::ToolChange> {
+        messages
+            .iter()
+            .filter_map(querymt::chat::ChatMessage::input)
+            .flatten()
+            .filter_map(querymt::chat::ChatInputPart::as_tool_change)
+            .collect()
+    }
+    changes(current) == changes(candidate)
 }
 
 fn flatten_content(content: &[querymt::chat::ToolResultPart]) -> String {

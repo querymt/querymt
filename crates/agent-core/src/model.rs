@@ -5,6 +5,7 @@ use crate::snapshot_id::SnapshotId;
 use base64::Engine as _;
 use querymt::chat::{
     ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
+    ToolChange,
 };
 use querymt::{
     ToolCall,
@@ -614,6 +615,30 @@ where
     Ok(item)
 }
 
+/// Who raised a stored [`MessagePart::Notice`].
+///
+/// A source this build does not know (written by a newer build) loads as
+/// [`Unknown`](Self::Unknown) instead of failing the whole history load; the
+/// notice text is still sent to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum NoticeSource {
+    AgentMode,
+    OutputLimit,
+    ProgressReview,
+    StopHook,
+    TaskCompletion,
+    DuplicateToolCall,
+    DuplicateCode,
+    ParallelEdit,
+    ContextUsage,
+    BackgroundCommand,
+    /// Any source added by a later build.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum MessagePart {
@@ -693,6 +718,31 @@ pub enum MessagePart {
     CompactionRequest {
         original_token_count: usize,
     },
+    /// Text the harness sends the model on its own behalf (mode reminders,
+    /// guidance, warnings). Stored so every later request carries it at the
+    /// same position; sent to the model as user text.
+    Notice {
+        source: NoticeSource,
+        content: String,
+    },
+    /// The tool list a request starts from, stored before the first request
+    /// of a session, after a compaction and after a model change, for a
+    /// provider that declares `tool_updates`. It is not sent as a message: the
+    /// most recent baseline is the request's leading tool list, and tool
+    /// changes stored after it are sent as messages.
+    ToolBaseline {
+        /// The offered tools, in the order the request lists them.
+        tools: Vec<querymt::chat::Tool>,
+        /// The provider and model the baseline was built for, `provider/model`.
+        origin: String,
+    },
+    /// A change to the offered tools since the baseline and the earlier tool
+    /// changes: definitions added or redefined, in name order, and names
+    /// removed. Sent to the provider as a tool-change message at its position.
+    ToolChange {
+        added: Vec<querymt::chat::Tool>,
+        removed: Vec<String>,
+    },
     /// Turn snapshot start: worktree state before turn (user prompt)
     TurnSnapshotStart {
         turn_id: TurnId,
@@ -735,9 +785,21 @@ impl MessagePart {
             MessagePart::Snapshot { .. } => "snapshot",
             MessagePart::Compaction { .. } => "compaction",
             MessagePart::CompactionRequest { .. } => "compaction_request",
+            MessagePart::Notice { .. } => "notice",
+            MessagePart::ToolBaseline { .. } => "tool_baseline",
+            MessagePart::ToolChange { .. } => "tool_change",
             MessagePart::TurnSnapshotStart { .. } => "turn_snapshot_start",
             MessagePart::TurnSnapshotPatch { .. } => "turn_snapshot_patch",
         }
+    }
+
+    /// Whether this part records the offered tools (a baseline or a change)
+    /// and no conversation content.
+    pub fn is_tool_record(&self) -> bool {
+        matches!(
+            self,
+            MessagePart::ToolBaseline { .. } | MessagePart::ToolChange { .. }
+        )
     }
 
     /// Get the diff summary for a Snapshot part, or None for other part types
@@ -785,6 +847,12 @@ impl AgentMessage {
             source_provider: None,
             source_model: None,
         }
+    }
+
+    /// Whether the message holds only tool records (see
+    /// [`MessagePart::is_tool_record`]): it carries no conversation content.
+    pub fn is_tool_record(&self) -> bool {
+        !self.parts.is_empty() && self.parts.iter().all(MessagePart::is_tool_record)
     }
 
     pub fn to_chat_message(&self) -> Result<ChatMessage, PromptContentError> {
@@ -979,6 +1047,17 @@ impl AgentMessage {
                 MessagePart::CompactionRequest { .. } => {
                     input_parts.push(ChatInputPart::text("Summarize our conversation so far."))
                 }
+                MessagePart::Notice { content, .. } => {
+                    input_parts.push(ChatInputPart::text(content.clone()))
+                }
+                // A baseline is a request's tool list, never a message: it has
+                // no chat form. A history is read with
+                // `history::take_tool_baseline` before it is projected, which
+                // removes the baselines and returns the one in effect.
+                MessagePart::ToolBaseline { .. } => {}
+                MessagePart::ToolChange { added, removed } => input_parts.push(
+                    ChatInputPart::tool_change(ToolChange::new(added.clone(), removed.clone())),
+                ),
                 _ => {}
             }
         }
@@ -997,6 +1076,16 @@ impl AgentMessage {
         }
         Ok(ChatMessage::from_user_parts(input_parts))
     }
+}
+
+/// The tool list a request starts from and what it was built for: the content
+/// of a stored [`MessagePart::ToolBaseline`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolBaseline {
+    /// The offered tools, in the order the request lists them.
+    pub tools: Vec<querymt::chat::Tool>,
+    /// The provider and model the baseline was built for, `provider/model`.
+    pub origin: String,
 }
 
 /// Normalize tool-result batches across intervening user messages and synthesize
@@ -1150,7 +1239,8 @@ fn cancelled_tool_result_parts(calls: &[ToolCall]) -> Vec<MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentMessage, MessagePart, OutputTarget, PromptContentError, repair_unmatched_tool_calls,
+        AgentMessage, MessagePart, NoticeSource, OutputTarget, PromptContentError,
+        repair_unmatched_tool_calls,
     };
     use crate::protocol::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
@@ -1196,6 +1286,56 @@ mod tests {
         let back: super::TurnId = rmp_serde::from_slice(&rmp_serde::to_vec_named(&turn).unwrap())
             .expect("msgpack round trip");
         assert_eq!(back, turn);
+    }
+
+    /// Rollback risk for stored notices: a reader built before the `notice`
+    /// kind existed has no variant for it and rejects the whole part. The
+    /// storage layer turns that into a failed history load.
+    #[test]
+    fn unknown_part_kind_is_rejected_by_the_deserializer() {
+        let error =
+            serde_json::from_str::<MessagePart>(r#"{"type":"future_kind","data":{"content":"x"}}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn notice_part_round_trips_and_is_sent_as_user_text() {
+        let part = MessagePart::Notice {
+            source: NoticeSource::AgentMode,
+            content: "plan mode".into(),
+        };
+        let encoded = serde_json::to_string(&part).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"type":"Notice","data":{"source":"agent_mode","content":"plan mode"}}"#
+        );
+        assert_eq!(serde_json::from_str::<MessagePart>(&encoded).unwrap(), part);
+        assert_eq!(part.type_name(), "notice");
+
+        let mut message = AgentMessage::new("s".into(), ChatRole::User);
+        message.parts.push(part);
+        assert_eq!(message.to_chat_message().unwrap().text(), "plan mode");
+    }
+
+    /// A notice source added by a later build must not fail loading.
+    #[test]
+    fn unknown_notice_source_loads_as_unknown_and_keeps_its_text() {
+        let part: MessagePart = serde_json::from_str(
+            r#"{"type":"Notice","data":{"source":"tool_change","content":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            part,
+            MessagePart::Notice {
+                source: NoticeSource::Unknown,
+                content: "x".into(),
+            }
+        );
+        let mut message = AgentMessage::new("s".into(), ChatRole::User);
+        message.parts.push(part);
+        assert_eq!(message.to_chat_message().unwrap().text(), "x");
     }
 
     /// A stored turn id that is not a UUID must not fail loading, and records

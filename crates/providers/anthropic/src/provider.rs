@@ -8,7 +8,9 @@ use http::{Request, Response};
 use querymt::HTTPLLMProvider;
 use querymt::auth::ApiKeyResolver;
 use querymt::chat::http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest};
-use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, GenerationOptionSupport, Tool};
+use querymt::chat::{
+    ChatCall, ChatCapabilities, ChatOutput, GenerationOptionSupport, PromptCacheCapabilities, Tool,
+};
 use querymt::completion::http::HTTPCompletionProvider;
 use querymt::completion::{CompletionRequest, CompletionResponse};
 use querymt::embedding::http::HTTPEmbeddingProvider;
@@ -17,11 +19,18 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Anthropic accepts explicit breakpoints on every model and caches for at
+/// most one hour (the 5-minute and 1-hour lifetimes).
+const PROMPT_CACHE: PromptCacheCapabilities =
+    PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600);
+
 impl HTTPChatProvider for Anthropic {
     fn capabilities(&self) -> ChatCapabilities {
         ChatCapabilities::NONE
+            .with_prompt_cache(PROMPT_CACHE)
             .with_streaming(true)
             .with_options(GenerationOptionSupport::ALL)
+            .with_tool_updates(self.supports_tool_updates())
     }
 
     fn prepare_chat_request(
@@ -37,7 +46,7 @@ impl HTTPChatProvider for Anthropic {
         if stream {
             cfg.stream = Some(true);
         }
-        let names = cfg.declared_tool_names(call.tools)?;
+        let names = cfg.request_tool_names(call.tools, call.messages)?;
         let request = cfg.build_chat_request(call.messages, call.tools)?;
         Ok(PreparedChatRequest {
             request,

@@ -120,6 +120,7 @@ impl ChatProvider for MistralRS {
     }
 
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        querymt::chat::reject_tool_changes("mrs", call.messages)?;
         let req = build_chat_request(self, call.messages, call.tools)?;
         let response = self
             .mrs_model
@@ -132,6 +133,7 @@ impl ChatProvider for MistralRS {
     }
 
     async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        querymt::chat::reject_tool_changes("mrs", call.messages)?;
         let req = build_chat_request(self, call.messages, call.tools)?;
 
         let model = std::sync::Arc::clone(&self.mrs_model);

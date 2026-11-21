@@ -99,6 +99,13 @@ pub(crate) enum MessageContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
+    /// `tool_addition` or `tool_removal` block of a `system` entry. Never
+    /// carries `cache_control`.
+    ToolChange {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "tool_addition" | "tool_removal"
+        tool: Value,
+    },
 }
 
 /// Content block inside a tool_result (Anthropic supports text + image).
@@ -128,7 +135,9 @@ impl MessageContent {
             | MessageContent::Document { cache_control, .. }
             | MessageContent::ToolUse { cache_control, .. }
             | MessageContent::ToolResult { cache_control, .. } => Some(cache_control),
-            MessageContent::Thinking { .. } | MessageContent::RedactedThinking { .. } => None,
+            MessageContent::Thinking { .. }
+            | MessageContent::RedactedThinking { .. }
+            | MessageContent::ToolChange { .. } => None,
         }
     }
 }

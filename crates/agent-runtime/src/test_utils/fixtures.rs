@@ -39,6 +39,7 @@ impl TestAgent {
         )
         .build();
         config.execution_policy.rate_limit.default_wait_secs = 1;
+        config.execution_policy.rate_limit.transport_wait_secs = 1;
         config.execution_policy.rate_limit.jitter_ratio = 0.0;
         let config = Arc::new(config);
         let handle = Arc::new(AgentHandle::from_config(config.clone()));
