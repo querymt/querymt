@@ -141,6 +141,7 @@ mod remote_impl {
     pub(crate) enum PeerAccessInvalidated {
         Policy,
         Quota,
+        Catalog,
     }
 
     impl PeerAccessInvalidated {
@@ -148,6 +149,7 @@ mod remote_impl {
             match self {
                 Self::Policy => "policy",
                 Self::Quota => "quota",
+                Self::Catalog => "catalog",
             }
         }
     }
