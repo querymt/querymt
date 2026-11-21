@@ -327,9 +327,10 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
             tokio::task::yield_now().await;
             (parent_id, children[0].clone())
         }
+        // Keep the two large fixture futures off the debug-build test thread stack.
         let (first, second) = tokio::join!(
-            run("11111111111111111111111111111111", false),
-            run("22222222222222222222222222222222", true)
+            Box::pin(run("11111111111111111111111111111111", false)),
+            Box::pin(run("22222222222222222222222222222222", true))
         );
         ([first.0, second.0], [first.1, second.1])
     })
