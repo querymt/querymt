@@ -140,12 +140,43 @@ fn open_period(
     conn.execute("INSERT INTO quota_periods (scope_id,cap,cadence,started_at,next_reset_at,current) VALUES (?1,?2,?3,?4,?5,1)",
         params![scope, cap, cadence(window), started_at, next_reset_at],
     ).map_err(backend)?;
+    let id = conn.last_insert_rowid();
+    prune_periods(conn, scope)?;
     Ok(Period {
-        id: conn.last_insert_rowid(),
+        id,
         limit,
         started_at,
         next_reset_at,
     })
+}
+
+fn prune_periods(conn: &Connection, scope: i64) -> Result<(), GrantStoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id FROM quota_periods p WHERE p.scope_id = ?1 AND p.id < (
+                SELECT id FROM quota_periods WHERE scope_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET 1
+             ) AND NOT EXISTS (
+                SELECT 1 FROM quota_reservations r JOIN quota_attempts a ON a.id = r.attempt_id
+                WHERE r.period_id = p.id AND a.state IN ('reserved', 'dispatched')
+             )",
+        )
+        .map_err(backend)?;
+    let expired = stmt
+        .query_map([scope], |row| row.get::<_, i64>(0))
+        .map_err(backend)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(backend)?;
+    for period in expired {
+        // Client request IDs remain replayable independently of the period.
+        conn.execute(
+            "DELETE FROM quota_reservations WHERE period_id = ?1",
+            [period],
+        )
+        .map_err(backend)?;
+        conn.execute("DELETE FROM quota_periods WHERE id = ?1", [period])
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 fn roll_forward(
@@ -587,13 +618,25 @@ impl QuotaStore for SqliteMeshAccess {
                     )
                     .map_err(backend)?;
                 let rows = stmt
-                    .query_map([host], |row| row.get::<_, String>(0))
+                    .query_map([&host], |row| row.get::<_, String>(0))
                     .map_err(backend)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(backend)?
             };
             for attempt in dispatched {
                 settle_attempt(&tx, &attempt, AttemptUsage::Unknown)?;
+            }
+            let scopes = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM quota_scopes WHERE host_id = ?1")
+                    .map_err(backend)?;
+                stmt.query_map([host], |row| row.get::<_, i64>(0))
+                    .map_err(backend)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(backend)?
+            };
+            for scope in scopes {
+                prune_periods(&tx, scope)?;
             }
             tx.commit().map_err(backend)?;
             Ok(())

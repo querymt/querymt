@@ -247,6 +247,49 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
 }
 
 #[tokio::test]
+async fn quota_rollover_keeps_two_periods_and_an_older_open_reservation() {
+    let f = Fixture::new().await;
+    let model = scope(Some("a"));
+    f.limit(&model, 30, QuotaWindow::Daily).await;
+    let request = f.request("a", Some(15), TUESDAY).await;
+    let attempt = f.store.reserve(request.clone()).await.unwrap();
+    f.store.mark_dispatched(attempt).await.unwrap();
+    for now in [WEDNESDAY, FRIDAY, MONDAY] {
+        assert_eq!(f.status(&model, now).await.available_tokens, Some(30));
+    }
+    let periods = |sql: &'static str| {
+        f.store.with_conn(move |conn| {
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map_err(backend)
+        })
+    };
+    let count = "SELECT count(*) FROM quota_periods p JOIN quota_scopes s ON s.id=p.scope_id WHERE s.model_id='a'";
+    assert_eq!(periods(count).await.unwrap(), 3);
+    assert_eq!(
+        f.store
+            .settle(attempt, AttemptUsage::Observed(8))
+            .await
+            .unwrap(),
+        QuotaSettlement::Recorded
+    );
+    assert_eq!(
+        periods("SELECT sum(known) FROM quota_reservations")
+            .await
+            .unwrap(),
+        16
+    );
+
+    let reopened = SqliteMeshAccess::open(&f.path).await.unwrap();
+    reopened.reconcile_startup(&f.key.host).await.unwrap();
+    assert_eq!(periods(count).await.unwrap(), 2);
+    assert_eq!(f.status(&model, MONDAY).await.known_tokens, 0);
+    assert!(matches!(
+        reopened.reserve(request).await,
+        Err(QuotaError::DuplicateAttempt)
+    ));
+}
+
+#[tokio::test]
 async fn committed_settlement_notifies_only_its_peer_without_changing_revision() {
     let f = Fixture::new().await;
     f.limit(&scope(None), 20, QuotaWindow::Weekly).await;
