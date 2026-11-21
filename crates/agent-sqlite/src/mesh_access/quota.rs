@@ -132,16 +132,27 @@ fn open_period(
         QuotaLimit::Unlimited => (None, QuotaWindow::Manual),
         QuotaLimit::Finite { tokens, window } => (Some(tokens), window),
     };
-    conn.execute(
-        "UPDATE quota_periods SET current=0 WHERE scope_id=?1 AND current=1",
-        [scope],
-    )
-    .map_err(backend)?;
+    let closed = conn
+        .execute(
+            "UPDATE quota_periods SET current=0 WHERE scope_id=?1 AND current=1",
+            [scope],
+        )
+        .map_err(backend)?;
     conn.execute("INSERT INTO quota_periods (scope_id,cap,cadence,started_at,next_reset_at,current) VALUES (?1,?2,?3,?4,?5,1)",
         params![scope, cap, cadence(window), started_at, next_reset_at],
     ).map_err(backend)?;
     let id = conn.last_insert_rowid();
-    prune_periods(conn, scope)?;
+    if closed != 0 {
+        prune_periods(conn, scope)?;
+        let host: String = conn
+            .query_row(
+                "SELECT host_id FROM quota_scopes WHERE id=?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        prune_attempts(conn, &host)?;
+    }
     Ok(Period {
         id,
         limit,
@@ -151,31 +162,44 @@ fn open_period(
 }
 
 fn prune_periods(conn: &Connection, scope: i64) -> Result<(), GrantStoreError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT p.id FROM quota_periods p WHERE p.scope_id = ?1 AND p.id < (
-                SELECT id FROM quota_periods WHERE scope_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET 1
-             ) AND NOT EXISTS (
-                SELECT 1 FROM quota_reservations r JOIN quota_attempts a ON a.id = r.attempt_id
-                WHERE r.period_id = p.id AND a.state IN ('reserved', 'dispatched')
-             )",
+    let previous: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM quota_periods WHERE scope_id=?1 ORDER BY id DESC LIMIT 1 OFFSET 1",
+            [scope],
+            |row| row.get(0),
         )
+        .optional()
         .map_err(backend)?;
-    let expired = stmt
-        .query_map([scope], |row| row.get::<_, i64>(0))
-        .map_err(backend)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(backend)?;
-    for period in expired {
-        // Client request IDs remain replayable independently of the period.
-        conn.execute(
-            "DELETE FROM quota_reservations WHERE period_id = ?1",
-            [period],
-        )
-        .map_err(backend)?;
-        conn.execute("DELETE FROM quota_periods WHERE id = ?1", [period])
-            .map_err(backend)?;
-    }
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM quota_reservations AS r WHERE r.period_id IN (
+            SELECT id FROM quota_periods WHERE scope_id=?1 AND id<?2
+         ) AND EXISTS (
+            SELECT 1 FROM quota_attempts a WHERE a.id=r.attempt_id AND a.state IN ('settled','released')
+         )",
+        params![scope, previous],
+    )
+    .map_err(backend)?;
+    conn.execute(
+        "DELETE FROM quota_periods AS p WHERE p.scope_id=?1 AND p.id<?2 AND NOT EXISTS (
+            SELECT 1 FROM quota_reservations r WHERE r.period_id=p.id
+         )",
+        params![scope, previous],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+fn prune_attempts(conn: &Connection, host: &str) -> Result<(), GrantStoreError> {
+    // Either quota scope can still retain the attempt and its replay ID.
+    conn.execute(
+        "DELETE FROM quota_attempts AS a WHERE a.host_id=?1 AND a.state IN ('settled','released')
+         AND NOT EXISTS (SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id)",
+        [host],
+    )
+    .map_err(backend)?;
     Ok(())
 }
 
@@ -676,7 +700,7 @@ impl QuotaStore for SqliteMeshAccess {
                 let mut stmt = tx
                     .prepare("SELECT id FROM quota_scopes WHERE host_id = ?1")
                     .map_err(backend)?;
-                stmt.query_map([host], |row| row.get::<_, i64>(0))
+                stmt.query_map([&host], |row| row.get::<_, i64>(0))
                     .map_err(backend)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(backend)?
@@ -684,6 +708,7 @@ impl QuotaStore for SqliteMeshAccess {
             for scope in scopes {
                 prune_periods(&tx, scope)?;
             }
+            prune_attempts(&tx, &host)?;
             tx.commit().map_err(backend)?;
             Ok(())
         })

@@ -114,7 +114,7 @@ A reset, first finite cap, or reconfiguration to a new finite period SHALL targe
 
 ### Requirement: Quota ledger prunes expired history
 
-The host SHALL retain the current and previous quota period for status and all open reservations regardless of age. It SHALL prune older settled attempt and replay records once replay is no longer possible. Pruning SHALL run automatically at startup and when a quota period rolls over without a new setting.
+The host SHALL retain the current and previous quota period for each scope and all open reservations regardless of age. Completed attempt records and their replay IDs expire once they no longer belong to a retained quota period. The host SHALL prune them at startup and on period rollover without a new setting.
 
 #### Scenario: Pruning preserves late settlement and status
 - **WHEN** the host starts or quota renews with older settled history and an outstanding reservation from an older period

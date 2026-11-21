@@ -250,12 +250,15 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
 async fn quota_rollover_keeps_two_periods_and_an_older_open_reservation() {
     let f = Fixture::new().await;
     let model = scope(Some("a"));
+    let provider = scope(None);
     f.limit(&model, 30, QuotaWindow::Daily).await;
-    let request = f.request("a", Some(15), TUESDAY).await;
+    f.limit(&provider, 30, QuotaWindow::Daily).await;
+    let mut request = f.request("a", Some(15), TUESDAY).await;
     let attempt = f.store.reserve(request.clone()).await.unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
     for now in [WEDNESDAY, FRIDAY, MONDAY] {
         assert_eq!(f.status(&model, now).await.available_tokens, Some(30));
+        assert_eq!(f.status(&provider, now).await.available_tokens, Some(30));
     }
     let periods = |sql: &'static str| {
         f.store.with_conn(move |conn| {
@@ -279,14 +282,69 @@ async fn quota_rollover_keeps_two_periods_and_an_older_open_reservation() {
         16
     );
 
+    let current = f.request("a", Some(1), MONDAY).await;
+    let unused = f.store.reserve(current.clone()).await.unwrap();
+    f.store.release_unused(unused).await.unwrap();
+
     let reopened = SqliteMeshAccess::open(&f.path).await.unwrap();
     reopened.reconcile_startup(&f.key.host).await.unwrap();
     assert_eq!(periods(count).await.unwrap(), 2);
     assert_eq!(f.status(&model, MONDAY).await.known_tokens, 0);
     assert!(matches!(
-        reopened.reserve(request).await,
+        reopened.reserve(current).await,
         Err(QuotaError::DuplicateAttempt)
     ));
+    request.now = MONDAY;
+    reopened.reserve(request).await.expect("expired replay ID");
+}
+
+#[tokio::test]
+async fn replay_id_expires_only_after_both_scopes_age_out() {
+    let f = Fixture::new().await;
+    let model = scope(Some("a"));
+    let provider = scope(None);
+    f.limit(&model, 30, QuotaWindow::Daily).await;
+    f.limit(&provider, 30, QuotaWindow::Daily).await;
+
+    let mut expired = f.request("a", Some(10), TUESDAY).await;
+    let settled = f.store.reserve(expired.clone()).await.unwrap();
+    f.store.mark_dispatched(settled).await.unwrap();
+    f.store
+        .settle(settled, AttemptUsage::Observed(8))
+        .await
+        .unwrap();
+    let open = f
+        .store
+        .reserve(f.request("a", Some(1), TUESDAY).await)
+        .await
+        .unwrap();
+
+    f.status(&model, WEDNESDAY).await;
+    let mut previous = f.request("a", Some(10), FRIDAY).await;
+    let unused = f.store.reserve(previous.clone()).await.unwrap();
+    f.store.release_unused(unused).await.unwrap();
+    f.status(&model, MONDAY).await;
+
+    expired.now = MONDAY;
+    assert!(matches!(
+        f.store.reserve(expired.clone()).await,
+        Err(QuotaError::DuplicateAttempt)
+    ));
+    f.status(&provider, MONDAY).await;
+    previous.now = MONDAY;
+    assert!(matches!(
+        f.store.reserve(previous).await,
+        Err(QuotaError::DuplicateAttempt)
+    ));
+    f.store.reserve(expired).await.expect("expired replay ID");
+    f.store.mark_dispatched(open).await.unwrap();
+    assert_eq!(
+        f.store
+            .settle(open, AttemptUsage::Observed(1))
+            .await
+            .unwrap(),
+        QuotaSettlement::Recorded
+    );
 }
 
 #[tokio::test]
