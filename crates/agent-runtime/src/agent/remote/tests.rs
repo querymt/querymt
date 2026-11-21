@@ -1468,30 +1468,26 @@ mod node_manager_tests {
             ingress.handle_v1(peer, pause()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
-        // Regranting does not adopt work that belonged to the previous revision.
+        // The CAS revision is not the identity of the schedule's owner.
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
             grant: PeerGrant::Full,
         };
         let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, list_schedules()).await
         else {
-            panic!("peer list after regrant must succeed");
+            panic!("peer list after a CAS revision change must succeed");
         };
-        let Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(error)))) =
-            ingress.handle_v1(peer, pause()).await
-        else {
-            panic!("retained schedule ID must not control the previous grant's work");
-        };
-        assert!(matches!(
-            rmp_serde::from_slice::<crate::error::AgentError>(&error).unwrap(),
-            crate::error::AgentError::MeshAccessDenied
-        ));
-        assert!(
+        assert_eq!(
             rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
                 .unwrap()
-                .schedules
-                .is_empty()
+                .schedules[0]
+                .public_id,
+            schedules[0].public_id
         );
+        assert!(matches!(
+            ingress.handle_v1(peer, pause()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
 
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
@@ -1905,7 +1901,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn v1_unsubscribe_and_grant_revision_retire_the_forwarder() {
+    async fn v1_subscription_survives_quota_edits_but_not_revocation() {
         use crate::agent::messages::{
             EventStreamPage, GetEventStreamSince, SubscribeEvents, UnsubscribeEvents,
         };
@@ -2021,8 +2017,33 @@ mod node_manager_tests {
             ingress.handle_v1(peer, subscribe()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
+        use querymt_remote::peer_access::quota::{QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow};
+        let revision = store
+            .edit_quota(
+                &key,
+                allowed.revision,
+                &QuotaScope {
+                    provider_id: "mock".into(),
+                    model_id: None,
+                },
+                QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                    tokens: 20,
+                    window: QuotaWindow::Manual,
+                }),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await
+            .unwrap();
+        // This fixture uses a process-local relay identity; measure the host's
+        // held subscription rather than requiring the LAN transport to dial itself.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), wait_for_retirement())
+                .await
+                .is_err()
+        );
+        assert_eq!(fanout.subscriber_count(), baseline + 1);
         let revoked = store
-            .replace_grant(&key, allowed.revision, PeerGrant::None)
+            .replace_grant(&key, revision, PeerGrant::None)
             .await
             .unwrap();
         assert!(matches!(
@@ -2468,6 +2489,27 @@ mod node_manager_tests {
                 protocol: SchedulePeerProtocol::V1,
             };
             repo.update_schedule(schedule).await.unwrap();
+            use querymt_remote::peer_access::quota::{
+                QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow,
+            };
+            let scope = QuotaScope {
+                provider_id: "mock".into(),
+                model_id: None,
+            };
+            let revision = store
+                .edit_quota(
+                    &key,
+                    grant.revision,
+                    &scope,
+                    QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                        tokens: 100,
+                        window: QuotaWindow::Manual,
+                    }),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(revision, grant.revision);
         }
         config.provider.set_mesh(None);
 
@@ -2512,7 +2554,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn persisted_schedule_authority_is_bound_to_host_protocol_and_revision() {
+    async fn held_scheduled_turn_survives_quota_edit_but_not_revocation() {
         use crate::agent::messages::{GetRuntimeStatus, ScheduledPrompt};
         use crate::error::AgentError;
         use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
@@ -2529,7 +2571,10 @@ mod node_manager_tests {
         let custom = PeerGrant::Custom {
             sessions: true,
             filesystem: false,
-            providers: Vec::new(),
+            providers: vec![querymt_remote::peer_access::ProviderGrant {
+                provider_id: "mock".into(),
+                models: querymt_remote::peer_access::ModelSelection::All,
+            }],
         };
         let initial = store.grant(&key).await.unwrap();
         let granted = store
@@ -2537,11 +2582,14 @@ mod node_manager_tests {
             .await
             .unwrap();
         let history = config.provider.history_store();
-        let sid = history
-            .create_session(None, None, None, None)
+        let sid = config
+            .provider
+            .create_session(None, None, &Default::default())
             .await
             .unwrap()
-            .public_id;
+            .session()
+            .public_id
+            .clone();
         let runtime = SessionRuntime::new(
             None,
             HashMap::new(),
@@ -2626,8 +2674,31 @@ mod node_manager_tests {
         })
         .await
         .expect("current V1 schedule must begin under its peer authority");
+        use querymt_remote::peer_access::quota::{QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow};
+        let revision = store
+            .edit_quota(
+                &key,
+                granted.revision,
+                &QuotaScope {
+                    provider_id: "mock".into(),
+                    model_id: None,
+                },
+                QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                    tokens: 20,
+                    window: QuotaWindow::Manual,
+                }),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await
+            .unwrap();
+        let mut running = running;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), &mut running)
+                .await
+                .is_err()
+        );
         let revoked = store
-            .replace_grant(&key, granted.revision, PeerGrant::None)
+            .replace_grant(&key, revision, PeerGrant::None)
             .await
             .unwrap();
         let regranted = store
@@ -2635,13 +2706,17 @@ mod node_manager_tests {
             .await
             .unwrap();
         assert_ne!(regranted.revision, granted.revision);
-        // Even immediate regrant does not resurrect an admitted or persisted old turn.
+        // Even immediate regrant does not resurrect this admitted turn.
         denied(
             tokio::time::timeout(Duration::from_secs(3), running)
                 .await
                 .expect("revoked scheduled run must stop while waiting")
                 .unwrap(),
         );
+        store
+            .replace_grant(&key, regranted.revision, PeerGrant::None)
+            .await
+            .unwrap();
         denied(
             actor
                 .ask(message(origin(

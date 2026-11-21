@@ -586,9 +586,6 @@ mod access {
                         .access_snapshot(peer.key(), now)
                         .await
                         .map_err(|_| AgentError::MeshNotBootstrapped)?;
-                    if peer.revision() != Some(state.revision) {
-                        return Err(AgentError::MeshAccessDenied);
-                    }
                     let cargo_catalog = local_catalog(&inventory);
                     let effective = match &state.grant {
                         PeerGrant::None => return Ok(MeshPeerIncomingAccess::Denied),
@@ -622,7 +619,7 @@ mod access {
                         .map(|quota| quota_wire(&state.grant, quota))
                         .filter(|quota| quota.active)
                         .collect();
-                    Ok(MeshPeerIncomingAccess::Granted { effective, quotas })
+                    Ok::<_, AgentError>(MeshPeerIncomingAccess::Granted { effective, quotas })
                 }
             },
         );

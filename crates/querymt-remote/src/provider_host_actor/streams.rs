@@ -34,21 +34,18 @@ const MAX_BATCH_SIZE: usize = 16;
 pub(super) enum Owner {
     Local,
     #[cfg(feature = "kameo-mesh")]
-    Peer(PeerGrantKey, uuid::Uuid, SharingProtocol),
+    Peer(PeerGrantKey, SharingProtocol),
 }
 
 impl Owner {
     #[cfg(feature = "kameo-mesh")]
     pub(super) fn peer(peer: &PeerRequest) -> Result<Self, RemoteProviderHostError> {
-        Ok(Self::Peer(
-            peer.key().clone(),
-            peer.revision().ok_or_else(|| {
-                super::policy_error(
-                    crate::peer_access::quota::QuotaError::Denied.into_provider_error(),
-                )
-            })?,
-            peer.protocol(),
-        ))
+        if peer.grant().is_none() {
+            return Err(super::quota_error(
+                crate::peer_access::quota::QuotaError::Denied,
+            ));
+        }
+        Ok(Self::Peer(peer.key().clone(), peer.protocol()))
     }
 
     fn guarded(&self) -> bool {
@@ -611,7 +608,7 @@ impl Relay {
 
     async fn send(&self, frame: RoutedStreamRelayMessage, ack: bool) -> Result<(), String> {
         #[cfg(feature = "kameo-mesh")]
-        if let Owner::Peer(_, _, SharingProtocol::V1) = &self.active.key.owner {
+        if let Owner::Peer(_, SharingProtocol::V1) = &self.active.key.owner {
             let mesh = self.mesh.as_ref().expect("V1 relay has a mesh handle");
             return ask_sharing_v1::<_, _, (), String>(mesh, &self.receiver, &frame, RELAY_TIMEOUT)
                 .await

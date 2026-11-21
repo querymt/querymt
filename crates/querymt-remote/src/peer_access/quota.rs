@@ -60,6 +60,11 @@ pub struct QuotaScope {
 }
 
 impl QuotaScope {
+    /// Whether this scope covers the resolved binding.
+    pub fn covers(&self, provider: &str, model: &str) -> bool {
+        self.provider_id == provider && self.model_id.as_deref().is_none_or(|id| id == model)
+    }
+
     /// Check identifiers before using them as storage keys.
     pub fn validate(&self) -> Result<(), QuotaError> {
         if valid_id(&self.provider_id) && self.model_id.as_deref().is_none_or(valid_id) {

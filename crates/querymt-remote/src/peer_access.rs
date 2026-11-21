@@ -9,7 +9,9 @@ use crate::NodeId;
 
 pub mod quota;
 mod store;
-pub use store::{GrantStore, GrantStoreError, PeerGrantState, wait_for_revision_loss};
+pub use store::{
+    GrantStore, GrantStoreError, PeerGrantState, PolicyChange, PolicyEffect, wait_for_policy_loss,
+};
 
 /// Wire contract under which a protected operation was received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

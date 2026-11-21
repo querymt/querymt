@@ -562,6 +562,47 @@ async fn revocation_invalidates_reserved_but_undispatched_attempt() {
 }
 
 #[tokio::test]
+async fn cap_edit_between_reserve_and_dispatch_only_stops_the_exhausted_scope() {
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    let model = scope(Some("a"));
+    f.limit(&provider, 100, QuotaWindow::Manual).await;
+    f.limit(&model, 50, QuotaWindow::Manual).await;
+    let a = f
+        .store
+        .reserve(f.request("a", Some(40), TUESDAY).await)
+        .await
+        .unwrap();
+    let b = f
+        .store
+        .reserve(f.request("b", Some(60), TUESDAY).await)
+        .await
+        .unwrap();
+    assert_eq!(f.status(&provider, TUESDAY).await.available_tokens, Some(0));
+    let update = |tokens| {
+        QuotaEdit::Update(QuotaLimit::Finite {
+            tokens,
+            window: QuotaWindow::Manual,
+        })
+    };
+    // Raising the shared cap and tightening the model cap without exhausting it
+    // must not discard the attempts. A subsequent reduction to zero available does.
+    f.edit(&provider, update(101), TUESDAY).await.unwrap();
+    f.edit(&model, update(41), TUESDAY).await.unwrap();
+    f.store.mark_dispatched(b).await.unwrap();
+    f.edit(&model, update(40), TUESDAY).await.unwrap();
+    assert!(matches!(
+        f.store.mark_dispatched(a).await,
+        Err(QuotaError::InvalidAttempt)
+    ));
+    assert_eq!(
+        f.status(&provider, TUESDAY).await.available_tokens,
+        Some(41)
+    );
+    assert_eq!(f.status(&model, TUESDAY).await.reserved_tokens, 0);
+}
+
+#[tokio::test]
 async fn settled_requests_cannot_replay_across_restart_and_quota_reset() {
     let f = Fixture::new().await;
     let provider = scope(None);

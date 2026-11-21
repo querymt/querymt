@@ -32,8 +32,7 @@ pub(crate) struct PeerSubscription {
 impl PeerSubscription {
     pub(crate) async fn is_current(&self) -> bool {
         matches!(self.store.grant(self.origin.key()).await, Ok(state)
-            if Some(state.revision) == self.origin.revision()
-                && state.grant.allows_sessions(self.origin.protocol()))
+            if state.grant.allows_sessions(self.origin.protocol()))
     }
 }
 
@@ -141,20 +140,26 @@ impl EventForwarder {
     ) -> EventForwarderHandle {
         let mut rx = fanout.subscribe();
         let relay_actor_id = relay_ref.id();
+        let changes = subscriber
+            .as_ref()
+            .and_then(|subscriber| subscriber.store.subscribe_changes());
         let task = tokio::spawn(async move {
             let revoked = async {
                 if let Some(subscriber) = &subscriber {
-                    if !subscriber.is_current().await {
-                        return;
-                    }
-                    if let Some(revision) = subscriber.origin.revision() {
-                        querymt_remote::peer_access::wait_for_revision_loss(
-                            subscriber.store.as_ref(),
-                            subscriber.origin.key(),
-                            revision,
-                        )
-                        .await;
-                    }
+                    querymt_remote::peer_access::wait_for_policy_loss(
+                        subscriber.store.as_ref(),
+                        subscriber.origin.key(),
+                        changes,
+                        |grant| {
+                            grant
+                                .allows_sessions(subscriber.origin.protocol())
+                                .then_some(())
+                                .ok_or(())
+                        },
+                        |_| None,
+                        || (),
+                    )
+                    .await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -191,9 +196,13 @@ impl EventForwarder {
                             "forwarding event to relay actor"
                         );
 
-                        if let Err((error, terminal)) =
-                            deliver(&relay_ref, &RelayedEvent { event }, subscriber.as_ref()).await
-                        {
+                        let message = RelayedEvent { event };
+                        let result = tokio::select! {
+                            biased;
+                            _ = &mut revoked => break,
+                            result = deliver(&relay_ref, &message, subscriber.as_ref()) => result,
+                        };
+                        if let Err((error, terminal)) = result {
                             tracing::warn!(
                                 target: "remote::event_forwarder",
                                 source = %source_label,
@@ -218,16 +227,16 @@ impl EventForwarder {
                         // Tell the relay so it fetches the durable tail now;
                         // it cannot see a loss at the end of a burst itself.
                         // Best effort: a later event still reveals the gap.
-                        if let Err((error, terminal)) = deliver(
-                            &relay_ref,
-                            &RelayLagged {
-                                session_id: filter_session_id.clone(),
-                                skipped: n,
-                            },
-                            subscriber.as_ref(),
-                        )
-                        .await
-                        {
+                        let message = RelayLagged {
+                            session_id: filter_session_id.clone(),
+                            skipped: n,
+                        };
+                        let result = tokio::select! {
+                            biased;
+                            _ = &mut revoked => break,
+                            result = deliver(&relay_ref, &message, subscriber.as_ref()) => result,
+                        };
+                        if let Err((error, terminal)) = result {
                             if terminal {
                                 break;
                             }

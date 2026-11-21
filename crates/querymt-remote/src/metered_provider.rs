@@ -21,7 +21,7 @@ use crate::peer_access::quota::{
     ReservedAttempt, StreamMeter,
 };
 use crate::peer_access::{
-    PeerGrant, PeerGrantKey, PeerGrantState, SharingProtocol, wait_for_revision_loss,
+    PeerGrant, PeerGrantKey, PeerGrantState, SharingProtocol, wait_for_policy_loss,
 };
 
 type Bound = dyn Fn(&ChatCall<'_>, bool) -> Option<i64> + Send + Sync;
@@ -31,7 +31,6 @@ type Revocation = Pin<Box<dyn Future<Output = LLMError> + Send>>;
 pub(crate) struct MeteredAccess {
     store: Arc<dyn QuotaStore>,
     peer: PeerGrantKey,
-    revision: Uuid,
     protocol: SharingProtocol,
     provider: String,
     model: String,
@@ -48,18 +47,24 @@ impl MeteredAccess {
         model: String,
         catalog: Arc<dyn ProviderCatalogBackend>,
     ) -> Result<Self, LLMError> {
-        Ok(Self {
+        let grant = peer.grant().ok_or_else(denied)?;
+        let access = Self {
             store,
             peer: peer.key().clone(),
-            revision: peer.revision().ok_or_else(denied)?,
             protocol: peer.protocol(),
             provider,
             model,
             catalog: Some(catalog),
-        })
+        };
+        access.check_grant(grant)?;
+        Ok(access)
     }
 
     pub(crate) async fn check(&self) -> Result<(), LLMError> {
+        self.current().await.map(|_| ())
+    }
+
+    async fn current(&self) -> Result<PeerGrantState, LLMError> {
         let state = self.store.grant(&self.peer).await.map_err(|error| {
             if self.catalog.is_none() {
                 return denied();
@@ -71,10 +76,11 @@ impl MeteredAccess {
                 "mesh policy unavailable",
             )
         })?;
-        if state.revision != self.revision {
-            return Err(denied());
-        }
-        let PeerGrantState { grant, .. } = state;
+        self.check_grant(&state.grant)?;
+        Ok(state)
+    }
+
+    fn check_grant(&self, grant: &PeerGrant) -> Result<(), LLMError> {
         let allowed = grant.allows_model(self.protocol, &self.provider, &self.model);
         match &self.catalog {
             Some(catalog)
@@ -82,7 +88,7 @@ impl MeteredAccess {
                     || !catalog.snapshot().providers.iter().any(|entry| {
                         entry.provider == self.provider
                             && (entry.model.as_deref() == Some(self.model.as_str())
-                                || (entry.model.is_none() && grant == PeerGrant::Full))
+                                || (entry.model.is_none() && *grant == PeerGrant::Full))
                     }) =>
             {
                 Err(failure(
@@ -98,14 +104,27 @@ impl MeteredAccess {
 
     pub(crate) fn revocation(&self) -> Revocation {
         let access = self.clone();
+        let changes = access.store.subscribe_changes();
         Box::pin(async move {
-            wait_for_revision_loss(access.store.as_ref(), &access.peer, access.revision).await;
-            denied()
+            wait_for_policy_loss(
+                access.store.as_ref(),
+                &access.peer,
+                changes,
+                |grant| access.check_grant(grant),
+                |limit| {
+                    limit
+                        .scope
+                        .covers(&access.provider, &access.model)
+                        .then(|| QuotaError::Exhausted(vec![limit.clone()]).into_provider_error())
+                },
+                denied,
+            )
+            .await
         })
     }
 }
 
-/// A provider binding pinned to the initiating peer and grant revision. It is
+/// A provider binding pinned to the initiating peer and resolved model. It is
 /// request/turn-local and must not be cached as an unguarded local provider.
 #[derive(Clone)]
 pub struct MeteredProvider {
@@ -122,7 +141,6 @@ impl MeteredProvider {
         inner: Arc<dyn LLMProvider>,
         store: Arc<dyn QuotaStore>,
         peer: PeerGrantKey,
-        revision: Uuid,
         protocol: SharingProtocol,
         binding: (String, String),
         bound: impl Fn(&ChatCall<'_>, bool) -> Option<i64> + Send + Sync + 'static,
@@ -133,7 +151,6 @@ impl MeteredProvider {
             access: MeteredAccess {
                 store,
                 peer,
-                revision,
                 protocol,
                 provider,
                 model,
@@ -164,28 +181,48 @@ impl MeteredProvider {
         call: &ChatCall<'_>,
         streaming: bool,
     ) -> Result<ReservedAttempt, LLMError> {
-        self.access.check().await?;
+        let request_id = self.request_id.unwrap_or_else(Uuid::new_v4);
+        let bound_tokens = (self.bound)(call, streaming);
+        let mut state = self.access.current().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|time| i64::try_from(time.as_secs()).ok())
             .ok_or_else(|| QuotaError::InvalidTime.into_provider_error())?;
-        let reserved = ReservedAttempt::reserve(
-            self.access.store.clone(),
-            QuotaAttempt {
-                peer: self.access.peer.clone(),
-                grant_revision: self.access.revision,
-                protocol: self.access.protocol,
-                provider_id: self.access.provider.clone(),
-                model_id: self.access.model.clone(),
-                request_id: self.request_id.unwrap_or_else(Uuid::new_v4),
-                bound_tokens: (self.bound)(call, streaming),
-                now,
-            },
-        )
-        .await
-        .map_err(QuotaError::into_provider_error)?;
-        self.check_reserved(reserved).await
+        let revoked = self.access.revocation();
+        tokio::select! {
+            biased;
+            error = revoked => Err(error),
+            result = async {
+                loop {
+                    let result = ReservedAttempt::reserve(
+                        self.access.store.clone(),
+                        QuotaAttempt {
+                            peer: self.access.peer.clone(),
+                            grant_revision: state.revision,
+                            protocol: self.access.protocol,
+                            provider_id: self.access.provider.clone(),
+                            model_id: self.access.model.clone(),
+                            request_id,
+                            bound_tokens,
+                            now,
+                        },
+                    ).await;
+                    match result {
+                        Ok(reserved) => return self.check_reserved(reserved).await,
+                        Err(QuotaError::Denied) => {
+                            // Re-read permission and retry only a lost admission race.
+                            let current = self.access.current().await?;
+                            if current.revision == state.revision {
+                                return Err(denied());
+                            }
+                            state = current;
+                        }
+                        Err(error) => return Err(error.into_provider_error()),
+                    }
+                }
+            } => result,
+        }
     }
 
     async fn check_reserved(&self, reserved: ReservedAttempt) -> Result<ReservedAttempt, LLMError> {
@@ -218,8 +255,12 @@ impl MeteredProvider {
         call: &ChatCall<'_>,
         reserved: ReservedAttempt,
     ) -> Result<ChatStream, LLMError> {
-        let attempt = self.begin(reserved).await?;
         let mut revoked = self.access.revocation();
+        let attempt = tokio::select! {
+            biased;
+            error = &mut revoked => return Err(error),
+            result = self.begin(reserved) => result?,
+        };
         let opened = tokio::select! {
             biased;
             error = &mut revoked => Err(error),
@@ -314,10 +355,15 @@ impl ChatProvider for MeteredProvider {
     }
 
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
-        let attempt = self.begin(self.reserve(call, false).await?).await?;
+        let mut revoked = self.access.revocation();
+        let attempt = tokio::select! {
+            biased;
+            error = &mut revoked => return Err(error),
+            result = async { self.begin(self.reserve(call, false).await?).await } => result?,
+        };
         let output = tokio::select! {
             biased;
-            error = self.access.revocation() => Err(error),
+            error = &mut revoked => Err(error),
             result = self.inner.chat(call) => result,
         };
         let usage = output

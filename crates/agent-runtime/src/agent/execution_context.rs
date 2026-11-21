@@ -205,6 +205,14 @@ impl ExecutionContext {
     }
 
     pub(crate) async fn require_turn_authority(&self) -> Result<(), AgentError> {
+        #[cfg(feature = "remote")]
+        if let TurnAuthority::Peer(peer) = &self.turn_authority {
+            let binding = self
+                .session_handle
+                .llm_config()
+                .map(|config| (config.provider.as_str(), config.model.as_str()));
+            return peer.grant_for(binding).await.map(|_| ());
+        }
         self.turn_authority.check().await
     }
 

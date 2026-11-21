@@ -27,6 +27,19 @@ pub enum GrantStoreError {
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// A committed policy change that can invalidate admitted work.
+#[derive(Debug, Clone)]
+pub struct PolicyChange {
+    pub key: PeerGrantKey,
+    pub effect: PolicyEffect,
+}
+
+#[derive(Debug, Clone)]
+pub enum PolicyEffect {
+    Grant(PeerGrant),
+    Exhausted(super::quota::LimitingQuota),
+}
+
 /// Durable owner policy reads and compare-and-swap edits.
 #[async_trait]
 pub trait GrantStore: Send + Sync {
@@ -41,9 +54,9 @@ pub trait GrantStore: Send + Sync {
         grant: PeerGrant,
     ) -> Result<PeerGrantState, GrantStoreError>;
 
-    /// Subscribe to committed revision changes. Stores with out-of-process
-    /// writers should return `None` unless they also observe those writers.
-    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+    /// Subscribe to committed permission changes and cap reductions that exhausted a scope.
+    /// Stores with out-of-process writers should return `None` unless they observe those writers.
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PolicyChange>> {
         None
     }
 
@@ -51,23 +64,50 @@ pub trait GrantStore: Send + Sync {
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError>;
 }
 
-/// Wait until the pinned revision is invalid or can no longer be verified.
-/// Subscribe before checking to avoid missing a concurrent committed edit.
-pub async fn wait_for_revision_loss(store: &dyn GrantStore, key: &PeerGrantKey, revision: Uuid) {
+/// Observe policy effects since admission, checking the live grant at use time.
+/// A subsequent regrant cannot hide a revocation already delivered to the watcher.
+pub async fn wait_for_policy_loss<E>(
+    store: &dyn GrantStore,
+    key: &PeerGrantKey,
+    mut changes: Option<tokio::sync::broadcast::Receiver<PolicyChange>>,
+    check: impl Fn(&PeerGrant) -> Result<(), E>,
+    exhausted: impl Fn(&super::quota::LimitingQuota) -> Option<E>,
+    unavailable: impl Fn() -> E,
+) -> E {
     use tokio::sync::broadcast::error::RecvError;
 
-    let mut changes = store.subscribe_changes();
-    while store
-        .grant(key)
-        .await
-        .is_ok_and(|state| state.revision == revision)
-    {
+    loop {
+        match store.grant(key).await {
+            Ok(state) => {
+                if let Err(error) = check(&state.grant) {
+                    return error;
+                }
+            }
+            Err(_) => return unavailable(),
+        }
         if let Some(rx) = &mut changes {
             loop {
                 match rx.recv().await {
-                    Ok(changed) if &changed != key => continue,
-                    Ok(_) | Err(RecvError::Lagged(_)) => break,
-                    Err(RecvError::Closed) => return,
+                    Ok(change) if &change.key != key => continue,
+                    Ok(PolicyChange {
+                        effect: PolicyEffect::Grant(grant),
+                        ..
+                    }) => {
+                        if let Err(error) = check(&grant) {
+                            return error;
+                        }
+                        break;
+                    }
+                    Ok(PolicyChange {
+                        effect: PolicyEffect::Exhausted(limit),
+                        ..
+                    }) => {
+                        if let Some(error) = exhausted(&limit) {
+                            return error;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => return unavailable(),
                 }
             }
         } else {

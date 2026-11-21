@@ -2063,12 +2063,12 @@ mod remote_impl {
         ) -> Self::Reply {
             let state = self.shared_state.clone();
             ctx.spawn(async move {
-                let origin = msg.authority.schedule_origin();
-                TurnAuthority::Peer(msg.authority).check().await?;
+                let authority = TurnAuthority::Peer(msg.authority);
+                authority.check().await?;
                 let mut schedules = state
                     .list_schedules(msg.request.session_id.as_deref())
                     .await?;
-                schedules.retain(|schedule| schedule.config.origin == origin);
+                schedules.retain(|schedule| authority.owns_schedule(&schedule.config.origin));
                 Ok(ListRemoteSchedulesResponse { schedules })
             })
         }
@@ -2084,7 +2084,6 @@ mod remote_impl {
         ) -> Self::Reply {
             let state = self.shared_state.clone();
             ctx.spawn(async move {
-                let origin = msg.authority.schedule_origin();
                 let authority = TurnAuthority::Peer(msg.authority);
                 authority.check().await?;
                 let scheduler = state
@@ -2097,7 +2096,7 @@ mod remote_impl {
                     .await
                     .map_err(|error| AgentError::Internal(error.to_string()))?
                     .ok_or(AgentError::MeshAccessDenied)?;
-                if schedule.config.origin != origin {
+                if !authority.owns_schedule(&schedule.config.origin) {
                     return Err(AgentError::MeshAccessDenied);
                 }
                 authority.check().await?;

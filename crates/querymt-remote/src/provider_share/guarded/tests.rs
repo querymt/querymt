@@ -45,7 +45,7 @@ struct Store {
     pause_reserve: Mutex<Option<PauseReserve>>,
     released: Notify,
     fail_next_grant_read: AtomicBool,
-    changes: broadcast::Sender<PeerGrantKey>,
+    changes: broadcast::Sender<crate::peer_access::PolicyChange>,
 }
 
 impl Default for Store {
@@ -92,10 +92,13 @@ impl GrantStore for Store {
         };
         let state = state.clone();
         drop(grants);
-        let _ = self.changes.send(key.clone());
+        let _ = self.changes.send(crate::peer_access::PolicyChange {
+            key: key.clone(),
+            effect: crate::peer_access::PolicyEffect::Grant(state.grant.clone()),
+        });
         Ok(state)
     }
-    fn subscribe_changes(&self) -> Option<broadcast::Receiver<PeerGrantKey>> {
+    fn subscribe_changes(&self) -> Option<broadcast::Receiver<crate::peer_access::PolicyChange>> {
         Some(self.changes.subscribe())
     }
     async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
@@ -733,8 +736,9 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
         assert!(!ask::<ProviderHostActor, _, bool, RemoteProviderHostError>(&ingress, other, provider_id, &renew).await.unwrap());
         let cancel = CancelProviderStreamRequest { session_id: request.session_id.clone(), request_id: None, reason: None };
         assert_eq!(ask::<ProviderHostActor, _, usize, RemoteProviderHostError>(&ingress, other, provider_id, &cancel).await.unwrap(), 0);
-        assert!(ask::<ProviderHostActor, _, bool, RemoteProviderHostError>(&ingress, peer, provider_id, &renew).await.unwrap());
         assert_eq!(relays.recv().await.unwrap().0, peer);
+        let revision = store.replace_grant(&key(host, peer), revision, allowed()).await.unwrap().revision;
+        assert!(ask::<ProviderHostActor, _, bool, RemoteProviderHostError>(&ingress, peer, provider_id, &renew).await.unwrap());
 
         // Identical claimed session/request IDs are independent for different peers.
         request.stream_router_ref.id = ActorId::new_with_peer_id(2, other);
@@ -1499,7 +1503,7 @@ async fn guarded_stream_settles_an_open_failure_before_delivering_it() {
 async fn hosted_provider_requires_session_access_and_never_passes_unmetered_methods_through() {
     let store = Arc::new(Store::default());
     let peer = key(PeerId::random(), PeerId::random());
-    let grant = store
+    store
         .replace_grant(&peer, Uuid::nil(), allowed())
         .await
         .unwrap();
@@ -1512,7 +1516,6 @@ async fn hosted_provider_requires_session_access_and_never_passes_unmetered_meth
         }),
         store.clone(),
         peer,
-        grant.revision,
         SharingProtocol::V1,
         ("fixture".into(), "allowed".into()),
         |_, _| Some(25),
@@ -1540,7 +1543,7 @@ async fn hosted_stream_never_reports_success_when_usage_exceeds_the_bound() {
 
     let store = Arc::new(Store::default());
     let peer = key(PeerId::random(), PeerId::random());
-    let grant = store
+    store
         .replace_grant(&peer, Uuid::nil(), PeerGrant::Full)
         .await
         .unwrap();
@@ -1553,7 +1556,6 @@ async fn hosted_stream_never_reports_success_when_usage_exceeds_the_bound() {
         }),
         store.clone(),
         peer,
-        grant.revision,
         SharingProtocol::V1,
         ("fixture".into(), "allowed".into()),
         |_, streaming| {

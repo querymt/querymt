@@ -391,13 +391,14 @@ impl QuotaStore for SqliteMeshAccess {
             let current = current_period(&tx, id)?
                 .map(|period| roll_forward(&tx, id, period, now))
                 .transpose()?;
+            let mut exhausted = None;
             match edit {
                 QuotaEdit::Update(limit) => {
                     let Some(period) = current else {
                         return Err(QuotaError::ReconfigureRequired);
                     };
                     let (
-                        QuotaLimit::Finite { window, .. },
+                        QuotaLimit::Finite { window, tokens: previous },
                         QuotaLimit::Finite {
                             window: proposed,
                             tokens,
@@ -418,6 +419,26 @@ impl QuotaStore for SqliteMeshAccess {
                         params![period.id, tokens],
                     )
                     .map_err(backend)?;
+                    // Only the edit can trigger cancellation, not subsequent reservations.
+                    if tokens < previous && grant.grant != PeerGrant::Full {
+                        let balance = status(&tx, scope.clone(), Some(Period { limit, ..period }))?;
+                        if balance.available_tokens == Some(0) {
+                            exhausted = Some(LimitingQuota {
+                                scope: scope.clone(),
+                                available_tokens: 0,
+                                next_reset_at: balance.next_reset_at,
+                            });
+                            // Prevent the reserve/dispatch race from sending an upstream call
+                            // after this edit, even before the live watcher wakes up.
+                            tx.execute(
+                                "UPDATE quota_attempts SET state='released' WHERE state='reserved'
+                                 AND host_id=?1 AND peer_id=?2 AND provider_id=?3
+                                 AND (?4 IS NULL OR model_id=?4)
+                                 AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=quota_attempts.id)",
+                                params![key.host.to_string(), key.peer.to_string(), scope.provider_id, scope.model_id],
+                            ).map_err(backend)?;
+                        }
+                    }
                 }
                 QuotaEdit::Reset | QuotaEdit::Reconfigure(_) => {
                     let clock = current.map_or(now, |period| now.max(period.started_at));
@@ -447,7 +468,9 @@ impl QuotaStore for SqliteMeshAccess {
             }
             let revision = save_grant(&tx, &key, &grant.grant)?;
             tx.commit().map_err(backend)?;
-            let _ = changes.send(key);
+            if let Some(limit) = exhausted {
+                let _ = changes.send(PolicyChange { key, effect: PolicyEffect::Exhausted(limit) });
+            }
             Ok(revision)
         })
         .await
@@ -544,14 +567,37 @@ impl QuotaStore for SqliteMeshAccess {
 
     async fn mark_dispatched(&self, attempt: ReservationId) -> Result<(), QuotaError> {
         self.with_conn(move |conn| {
-            let changed = conn.execute(
+            let tx = begin(conn)?;
+            let id = attempt.0.to_string();
+            let (host, peer, provider, model, custom): (String, String, String, String, bool) = tx.query_row(
+                "SELECT host_id, peer_id, provider_id, model_id,
+                     EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id)
+                 FROM quota_attempts a WHERE id=?1 AND state='reserved'",
+                [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).optional().map_err(backend)?.ok_or(QuotaError::InvalidAttempt)?;
+            let key = PeerGrantKey {
+                host: NodeId::parse(&host).map_err(|error| backend(std::io::Error::other(error)))?,
+                peer: NodeId::parse(&peer).map_err(|error| backend(std::io::Error::other(error)))?,
+            };
+            let grant = load_grant(&tx, &key)?.grant;
+            // An attempt admitted as Full has no reservations and cannot start
+            // under a subsequent Custom grant. Custom attempts are always V1.
+            if !grant.allows_model(querymt_remote::peer_access::SharingProtocol::V1, &provider, &model)
+                || (!custom && grant != PeerGrant::Full)
+            {
+                return Err(QuotaError::InvalidAttempt);
+            }
+            let changed = tx.execute(
                 "UPDATE quota_attempts AS a SET state='dispatched' WHERE id=?1 AND state='reserved'
-                 AND EXISTS(SELECT 1 FROM peer_grants g WHERE g.host_id=a.host_id AND g.peer_id=a.peer_id AND g.revision=a.grant_revision)
                  AND NOT (EXISTS(SELECT 1 FROM quota_binding_faults f WHERE f.host_id=a.host_id AND f.provider_id=a.provider_id AND f.model_id=a.model_id)
-                     AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id AND r.reserved IS NOT NULL))",
-                [attempt.0.to_string()],
+                      AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id AND r.reserved IS NOT NULL))",
+                [&id],
             ).map_err(backend)?;
-            if changed == 1 { Ok(()) } else { Err(QuotaError::InvalidAttempt) }
+            if changed != 1 {
+                return Err(QuotaError::InvalidAttempt);
+            }
+            tx.commit().map_err(backend)?;
+            Ok(())
         }).await
     }
 

@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use super::{MeshIngress, SharingRejection};
 use crate::NodeId;
-use crate::peer_access::{GrantStore, PeerGrant, PeerGrantKey, SharingProtocol};
+use crate::peer_access::{
+    GrantStore, PeerGrant, PeerGrantKey, PeerGrantState, PolicyEffect, SharingProtocol,
+};
 
 #[cfg(test)]
 mod tests;
@@ -68,13 +70,18 @@ impl InboundDelivery {
 pub struct PeerRequest {
     key: PeerGrantKey,
     protocol: SharingProtocol,
-    revision: Option<Uuid>,
+    state: Option<PeerGrantState>,
 }
 
 impl PeerRequest {
-    /// Revision authorized at ingress, absent for identity-only routes.
+    /// Grant authorized at ingress, absent for identity-only routes.
+    pub fn grant(&self) -> Option<&PeerGrant> {
+        self.state.as_ref().map(|state| &state.grant)
+    }
+
+    /// Revision recorded in the existing durable origin format, not a permission.
     pub fn revision(&self) -> Option<Uuid> {
-        self.revision
+        self.state.as_ref().map(|state| state.revision)
     }
 
     /// Host and authenticated caller in the direction of resource access.
@@ -206,16 +213,16 @@ impl InboundRouter {
         self.routes.write().remove(&actor);
     }
 
-    async fn grant_revision(
+    async fn authorize(
         &self,
         peer: &PeerRequest,
         access: InboundAccess,
-    ) -> Result<Option<Uuid>, SharingRejection> {
+    ) -> Result<Option<PeerGrantState>, SharingRejection> {
         if access == InboundAccess::Identity {
             return Ok(None);
         }
         match self.store.grant(peer.key()).await {
-            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state.revision)),
+            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state)),
             Ok(_) => Err(SharingRejection::Denied),
             Err(error) => {
                 tracing::warn!(%error, "cannot authorize mesh request");
@@ -282,10 +289,12 @@ impl InboundRouter {
                 peer: NodeId::from_peer_id(peer),
             },
             protocol,
-            revision: None,
+            state: None,
         };
-        let revision = self.grant_revision(&origin, route.access).await?;
-        origin.revision = revision;
+        let mut changes = (route.access != InboundAccess::Identity)
+            .then(|| self.store.subscribe_changes())
+            .flatten();
+        origin.state = self.authorize(&origin, route.access).await?;
         let is_current = || {
             self.routes
                 .read()
@@ -297,10 +306,24 @@ impl InboundRouter {
             return Ok(Err(RemoteSendError::ActorNotRunning));
         }
         let result = (route.handler)(origin.clone(), payload).await;
-        if revision.is_some()
-            && !matches!(self.grant_revision(&origin, route.access).await, Ok(current) if current == revision)
-        {
+        if origin.state.is_some() && self.authorize(&origin, route.access).await.is_err() {
             return Err(SharingRejection::Changed);
+        }
+        if let Some(changes) = &mut changes {
+            use tokio::sync::broadcast::error::TryRecvError;
+            loop {
+                match changes.try_recv() {
+                    Ok(change) if &change.key == origin.key() => {
+                        if let PolicyEffect::Grant(grant) = change.effect
+                            && !route.access.permits(&grant, protocol)
+                        {
+                            return Err(SharingRejection::Changed);
+                        }
+                    }
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
         }
         if !is_current() {
             return Err(SharingRejection::Changed);

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use querymt_remote::NodeId;
 use querymt_remote::peer_access::{
-    GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+    GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+    PolicyEffect,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
@@ -27,7 +28,7 @@ mod quota;
 pub struct SqliteMeshAccess {
     conn: Arc<Mutex<Connection>>,
     lease: Option<Arc<std::fs::File>>,
-    changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
+    changes: tokio::sync::broadcast::Sender<PolicyChange>,
     usage_changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
 }
 
@@ -175,7 +176,7 @@ fn save_grant(
 
 #[async_trait]
 impl GrantStore for SqliteMeshAccess {
-    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PolicyChange>> {
         self.lease.as_ref().map(|_| self.changes.subscribe())
     }
 
@@ -209,7 +210,10 @@ impl GrantStore for SqliteMeshAccess {
             }
             let revision = save_grant(&tx, &key, &grant)?;
             tx.commit().map_err(backend)?;
-            let _ = changes.send(key);
+            let _ = changes.send(PolicyChange {
+                key,
+                effect: PolicyEffect::Grant(grant.clone()),
+            });
             Ok(PeerGrantState { revision, grant })
         })
         .await

@@ -122,7 +122,9 @@ impl GuardedProvider {
                 "mesh policy unavailable",
             )
         })?;
-        if peer.revision() != Some(state.revision) {
+        if peer.protocol() == crate::peer_access::SharingProtocol::Legacy
+            && state.grant != PeerGrant::Full
+        {
             return Err(quota_error(QuotaError::Denied));
         }
         Ok(state)
@@ -148,18 +150,6 @@ impl GuardedProvider {
         // Discovery of provider sharing is not evidence of session or shell access.
         snapshot.node.capabilities.clear();
         Ok(snapshot)
-    }
-
-    async fn binding(
-        &self,
-        peer: &PeerRequest,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), RemoteProviderHostError> {
-        self.access(peer, provider, model)?
-            .check()
-            .await
-            .map_err(policy_error)
     }
 
     pub(crate) fn access(
@@ -207,9 +197,12 @@ impl GuardedProvider {
         peer: &PeerRequest,
         msg: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, RemoteProviderHostError> {
-        self.binding(peer, &msg.provider, &msg.model).await?;
+        let access = self.access(peer, &msg.provider, &msg.model)?;
+        access.check().await.map_err(policy_error)?;
         let request = self.build_request(&msg.provider, &msg.model, msg.params)?;
-        self.backend.contract_info(request).await
+        let contract = self.backend.contract_info(request).await?;
+        access.check().await.map_err(policy_error)?;
+        Ok(contract)
     }
 
     async fn chat(

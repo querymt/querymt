@@ -164,7 +164,6 @@ pub(crate) fn hosted_provider(
         inner,
         store,
         peer.key.clone(),
-        peer.revision,
         peer.protocol,
         (provider, model),
         move |call, streaming| text_stream_bound(text_stream_limit, call, streaming),
@@ -576,6 +575,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((status.known_tokens, status.estimated_tokens), (0, 10));
+    }
+
+    #[tokio::test]
+    async fn held_stream_survives_cap_edits_with_capacity_and_stops_on_exhaustion() {
+        use std::time::Duration;
+
+        let (_dir, store, key, scope, mut revision, now) = finite_quota_fixture(16).await;
+        let provider = hosted_stream(
+            Ok(Box::pin(futures_util::stream::pending())),
+            &key,
+            revision,
+            store.clone(),
+        );
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        let mut pending = stream.next();
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        for tokens in [25, 11, 10] {
+            revision = store
+                .edit_quota(
+                    &key,
+                    revision,
+                    &scope,
+                    QuotaEdit::Update(QuotaLimit::Finite {
+                        tokens,
+                        window: QuotaWindow::Manual,
+                    }),
+                    now,
+                )
+                .await
+                .unwrap();
+            if tokens > 10 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(75), &mut pending)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(3), pending).await.unwrap(),
+            Some(Err(LLMError::ProviderResponseError(failure))) if failure.code() == Some("mesh_quota_exhausted"))
+        );
+        let status = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!((status.reserved_tokens, status.estimated_tokens), (0, 10));
     }
 
     #[tokio::test]

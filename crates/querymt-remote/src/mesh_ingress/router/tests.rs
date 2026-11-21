@@ -1,13 +1,24 @@
 use super::*;
-use crate::peer_access::{GrantStoreError, PeerGrantState};
+use crate::peer_access::{GrantStoreError, PeerGrantState, PolicyChange};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
+use tokio::sync::broadcast;
 
-#[derive(Default)]
 struct TestStore {
     entries: RwLock<HashMap<PeerGrantKey, PeerGrantState>>,
     unavailable: AtomicBool,
+    changes: broadcast::Sender<PolicyChange>,
+}
+
+impl Default for TestStore {
+    fn default() -> Self {
+        Self {
+            entries: Default::default(),
+            unavailable: Default::default(),
+            changes: broadcast::channel(8).0,
+        }
+    }
 }
 
 #[async_trait]
@@ -37,7 +48,15 @@ impl GrantStore for TestStore {
             revision: Uuid::now_v7(),
         };
         entries.insert(key.clone(), state.clone());
+        let _ = self.changes.send(PolicyChange {
+            key: key.clone(),
+            effect: PolicyEffect::Grant(state.grant.clone()),
+        });
         Ok(state)
+    }
+
+    fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+        Some(self.changes.subscribe())
     }
 
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {

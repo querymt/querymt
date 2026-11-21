@@ -1020,7 +1020,8 @@ async fn execute_delegation(
             origin,
             #[cfg(feature = "remote")]
             mesh.as_ref(),
-        )?;
+        )
+        .await?;
         #[cfg(not(feature = "remote"))]
         let restricted = false;
         #[cfg(feature = "remote")]
@@ -1091,7 +1092,7 @@ async fn execute_delegation(
         tokio::pin!(run);
         tokio::select! {
             biased;
-            () = peer.revoked() => {
+            _ = peer.revoked(None) => {
                 cancel_token.cancel();
                 run.await;
             }
