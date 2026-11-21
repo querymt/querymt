@@ -114,7 +114,7 @@ pub fn provider_backend_from_config(
 
 pub(crate) fn qualified_text_stream_limit(schema: &str, resolved_config: &str) -> Option<i64> {
     let schema: serde_json::Value = serde_json::from_str(schema).ok()?;
-    if schema["x-querymt-chat-token-bound"] != "llama-cpp-text-stream-n-ctx-v1" {
+    if schema["x-querymt-chat-token-bound"] != "llama-cpp-text-stream-n-ctx-v2" {
         return None;
     }
     let config: serde_json::Value = serde_json::from_str(resolved_config).ok()?;
@@ -123,14 +123,22 @@ pub(crate) fn qualified_text_stream_limit(schema: &str, resolved_config: &str) -
 }
 
 fn text_stream_bound(limit: Option<i64>, call: &ChatCall<'_>, streaming: bool) -> Option<i64> {
-    use querymt::chat::ChatInputPart;
+    use querymt::chat::{ChatInputPart, ToolResultPart};
+    // The native checker runs after template rendering, so tool definitions and
+    // text tool results are included in the enforced prompt length.
     if !streaming
-        || call.tools.is_some_and(|tools| !tools.is_empty())
         || call.messages.iter().any(|message| {
             message
                 .portable_input_parts()
                 .iter()
-                .any(|part| !matches!(part, ChatInputPart::Text { .. }))
+                .any(|part| match part {
+                    ChatInputPart::Text { .. } => false,
+                    ChatInputPart::Attachment(_) => true,
+                    ChatInputPart::ToolResult(result) => result
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, ToolResultPart::Attachment(_))),
+                })
         })
     {
         return None;
@@ -361,7 +369,7 @@ mod tests {
 
     #[test]
     fn finite_support_requires_a_qualified_binding_and_streaming_text() {
-        let schema = r#"{"x-querymt-chat-token-bound":"llama-cpp-text-stream-n-ctx-v1"}"#;
+        let schema = r#"{"x-querymt-chat-token-bound":"llama-cpp-text-stream-n-ctx-v2"}"#;
         assert_eq!(qualified_text_stream_limit("{}", r#"{"n_ctx":4096}"#), None);
         assert_eq!(
             qualified_text_stream_limit(schema, r#"{"n_ctx":4096,"speculative":{}}"#),
@@ -378,6 +386,19 @@ mod tests {
             Some(4096)
         );
         assert_eq!(text_stream_bound(limit, &ChatCall::new(&[]), false), None);
+        let tools = [querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "fixture".into(),
+                description: "Inert fixture".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }];
+        assert_eq!(
+            text_stream_bound(limit, &ChatCall::new(&[]).tools(&tools), true),
+            Some(4096)
+        );
     }
 
     #[tokio::test]
