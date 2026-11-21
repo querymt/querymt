@@ -1115,13 +1115,14 @@ mod remote_impl {
         /// 1. Prepare (NO lock): DB creation, MCP init, actor spawn
         /// 2. Register (lock held): Insert into in-memory maps (microseconds)
         /// 3. Finalize (NO lock): DHT registration, event emission
-        pub async fn materialize_remote_session(
+        async fn materialize_remote_session(
             &self,
             session_id: String,
             cwd_path: Option<PathBuf>,
             cwd: Option<String>,
             title: Option<String>,
             created_at: i64,
+            peer: Option<&PeerTurn>,
         ) -> Result<SessionHandoff, AgentError> {
             // ── Per-session single-flight lock ──────────────────────────────
             // Prevents two concurrent callers from materializing the same
@@ -1151,6 +1152,14 @@ mod remote_impl {
                 self.cleanup_materialization_lock(&session_id, &session_lock)
                     .await;
                 return Ok(handoff);
+            }
+
+            let restricted = match peer {
+                Some(peer) => peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full,
+                None => false,
+            };
+            if restricted && !materializer.supports_restricted_cold_resume() {
+                return Err(AgentError::MeshAccessDenied);
             }
 
             // ── Phase 1: Prepare (NO lock held) ─────────────────────────────
@@ -1200,7 +1209,7 @@ mod remote_impl {
 
                 // ── Phase 3: Finalize (NO lock held) ────────────────────────────
                 materializer
-                    .finalize_session(prepared)
+                    .finalize_session_with_index(prepared, !restricted)
                     .await
                     .map_err(|e| AgentError::Internal(e.to_string()))?;
             }
@@ -1351,6 +1360,7 @@ mod remote_impl {
                     cwd.clone(),
                     title.clone(),
                     created_at,
+                    None,
                 )
                 .await?;
 
@@ -1533,6 +1543,7 @@ mod remote_impl {
                         cwd.clone(),
                         title.clone(),
                         created_at,
+                        None,
                     )
                     .await?;
 
@@ -2359,11 +2370,9 @@ mod remote_impl {
             session_id: String,
             peer: Option<&PeerTurn>,
         ) -> Result<CreateRemoteSessionResponse, AgentError> {
-            let restricted = if let Some(peer) = peer {
-                peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full
-            } else {
-                false
-            };
+            if let Some(peer) = peer {
+                peer.grant().await?;
+            }
             let session = self
                 .config
                 .provider
@@ -2381,32 +2390,16 @@ mod remote_impl {
                 .created_at
                 .unwrap_or_else(time::OffsetDateTime::now_utc)
                 .unix_timestamp();
-            let handoff = if restricted {
-                // A Custom resume may export an existing runtime without
-                // triggering workspace materialization, MCP startup, or owner hooks.
-                let registry = self
-                    .bound_session_runtime(&session_id)
-                    .await?
-                    .map_or_else(|| self.registry.clone(), |(registry, _)| registry);
-                let Some(crate::agent::remote::SessionActorRef::Local(actor)) =
-                    crate::agent::session_registry::live_session(&registry, &session_id).await
-                else {
-                    return Err(AgentError::MeshAccessDenied);
-                };
-                self.handoff_for_local_actor(&session_id, actor).await
-            } else {
-                if let Some(peer) = peer {
-                    peer.grant().await?;
-                }
-                self.materialize_remote_session(
+            let handoff = self
+                .materialize_remote_session(
                     session_id.clone(),
                     cwd_path,
                     cwd.clone(),
                     title.clone(),
                     created_at,
+                    peer,
                 )
-                .await?
-            };
+                .await?;
             Ok(CreateRemoteSessionResponse {
                 session_id,
                 handoff,

@@ -1375,7 +1375,7 @@ mod node_manager_tests {
         };
         assert!(matches!(
             ingress.handle_v1(peer, resume()).await,
-            Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+            Ok(SwarmResponse::Ask(Ok(_)))
         ));
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
@@ -1478,6 +1478,10 @@ mod node_manager_tests {
         ));
         assert!(matches!(
             ingress.handle_v1(peer, listing()).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(matches!(
+            ingress.handle_v1(peer, resume()).await,
             Err(SharingRejection::Denied)
         ));
         assert!(

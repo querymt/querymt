@@ -1498,6 +1498,25 @@ impl SessionMaterializer {
     /// This is called AFTER the session has been inserted into the registry.
     /// It does NOT hold the registry lock.
     pub async fn finalize_session(&self, prepared: &PreparedSession) -> Result<(), Error> {
+        self.finalize_session_with_index(prepared, true).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn supports_restricted_cold_resume(&self) -> bool {
+        !self.config.hooks.is_enabled()
+            && self.config.mcp_servers.is_empty()
+            && self
+                .config
+                .session_mcp_attachment_source
+                .is_statically_empty()
+            && self.workspace_service().is_none()
+    }
+
+    pub(crate) async fn finalize_session_with_index(
+        &self,
+        prepared: &PreparedSession,
+        initialize_workspace_index: bool,
+    ) -> Result<(), Error> {
         // Register in DHT if requested (for remote sessions)
         #[cfg(feature = "remote")]
         if prepared.register_in_dht
@@ -1623,7 +1642,7 @@ impl SessionMaterializer {
         }
 
         // Background: initialize workspace index (only if the path exists on this machine)
-        if let Some(ref cwd_path) = prepared.cwd {
+        if initialize_workspace_index && let Some(ref cwd_path) = prepared.cwd {
             if cwd_path.exists() {
                 let manager_actor = self.config.workspace_manager_actor.clone();
                 let runtime_clone = prepared.runtime.clone();
