@@ -37,7 +37,11 @@ use tokio::sync::Mutex;
 /// the duration of the test.
 #[doc(hidden)]
 pub async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
-    let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+    let mut provider = MockLlmProvider::new();
+    provider.expect_chat_with_tools().returning(|_, _| {
+        Ok(crate::test_utils::MockChatResponse::text_only("scheduled fixture reply").into())
+    });
+    let provider = Arc::new(Mutex::new(provider));
     let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider {
         inner: provider,
         tools: vec![].into_boxed_slice(),
@@ -2319,20 +2323,13 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_remote_schedule_create_rejects_missing_persisted_session() {
-        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+    async fn test_remote_schedule_create_rejects_missing_peer_origin() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let session = nm_ref
             .ask(CreateRemoteSession { cwd: None })
             .await
             .expect("create session");
-
-        config
-            .provider
-            .history_store()
-            .delete_session(&session.session_id)
-            .await
-            .expect("delete persisted session row");
 
         let result = nm_ref
             .ask(CreateRemoteSchedule {
@@ -2349,13 +2346,23 @@ mod node_manager_tests {
             Err(SendError::HandlerError(err)) => {
                 let message = err.to_string();
                 assert!(
-                    message.contains(&session.session_id),
-                    "missing-session error should include session id: {message}"
+                    message.contains("requires an authenticated peer origin"),
+                    "missing origin should be reported at creation: {message}"
                 );
             }
-            Ok(_) => panic!("expected missing persisted session to reject schedule creation"),
+            Ok(_) => panic!("expected missing peer origin to reject schedule creation"),
             Err(e) => panic!("unexpected error variant: {e:?}"),
         }
+        assert!(
+            nm_ref
+                .ask(ListRemoteSchedules {
+                    session_id: Some(session.session_id),
+                })
+                .await
+                .unwrap()
+                .schedules
+                .is_empty()
+        );
     }
 
     async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {
@@ -2383,6 +2390,117 @@ mod node_manager_tests {
         .unwrap()
         .as_mesh_handle()
         .clone()
+    }
+
+    #[tokio::test]
+    async fn due_peer_schedule_waits_for_mesh_after_scheduler_restart() {
+        verify_schedule_after_scheduler_restart(true).await;
+    }
+
+    #[tokio::test]
+    async fn local_schedule_fires_after_scheduler_restart_without_mesh() {
+        verify_schedule_after_scheduler_restart(false).await;
+    }
+
+    async fn verify_schedule_after_scheduler_restart(peer_origin: bool) {
+        use crate::scheduler::{SchedulerActor, SchedulerConfig};
+        use crate::session::domain_schedule::{
+            ScheduleOrigin, SchedulePeerProtocol, ScheduleState,
+        };
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = crate::agent::LocalAgentHandle::from_config(config.clone());
+        let refs = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+            &handle, &mesh,
+        )
+        .await;
+        let session_id = refs
+            .node_manager
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .unwrap()
+            .session_id;
+        let id = handle
+            .create_scheduled_task(
+                &session_id,
+                "scheduled restart fixture",
+                crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 3600 },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let original_scheduler = handle.scheduler_handle.lock().take().unwrap();
+        original_scheduler.shutdown().await;
+
+        let store = mesh.quota_store().unwrap();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let grant = store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                PeerGrant::Full,
+            )
+            .await
+            .unwrap();
+        let repo = config.schedule_repository.as_ref().unwrap().clone();
+        let mut schedule = repo.get_schedule(&id).await.unwrap().unwrap();
+        assert_eq!(schedule.config.origin, ScheduleOrigin::Local);
+        if peer_origin {
+            schedule.config.origin = ScheduleOrigin::Peer {
+                host: key.host.to_string(),
+                peer: key.peer.to_string(),
+                revision: grant.revision,
+                protocol: SchedulePeerProtocol::V1,
+            };
+            repo.update_schedule(schedule).await.unwrap();
+        }
+        config.provider.set_mesh(None);
+
+        let scheduler = SchedulerActor::spawn(
+            repo.clone(),
+            config.provider.history_store(),
+            handle.registry.clone(),
+            config.clone(),
+            SchedulerConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut events = config.subscribe_events();
+        scheduler.trigger_now(&id).await.unwrap();
+        if peer_origin {
+            assert_eq!(scheduler.metrics().await.fires_total, 0);
+            assert_eq!(
+                repo.get_schedule(&id).await.unwrap().unwrap().state,
+                ScheduleState::Armed
+            );
+            config.provider.set_mesh(Some(mesh.clone()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap().kind() {
+                    AgentEventKind::ScheduledExecutionCompleted {
+                        schedule_public_id, ..
+                    } if schedule_public_id == &id => break,
+                    AgentEventKind::ScheduledExecutionFailed {
+                        schedule_public_id,
+                        error,
+                        ..
+                    } if schedule_public_id == &id => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("deferred schedule should fire without a second trigger");
+        scheduler.shutdown().await;
+        mesh.shutdown().await;
     }
 
     #[tokio::test]
@@ -2685,24 +2803,61 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_remote_schedule_lifecycle() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::mesh_ingress::MeshIngress;
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = crate::agent::LocalAgentHandle::from_config(config);
+        handle.set_mesh(mesh.clone());
+        let nm_ref = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+            &handle, &mesh,
+        )
+        .await
+        .node_manager;
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(peer),
+        };
+        let store = mesh.quota_store().unwrap();
+        store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                PeerGrant::Full,
+            )
+            .await
+            .unwrap();
 
         let session = nm_ref
             .ask(CreateRemoteSession { cwd: None })
             .await
             .expect("create session");
 
-        let created = nm_ref
-            .ask(CreateRemoteSchedule {
-                session_id: session.session_id.clone(),
-                prompt: "run every minute".to_string(),
-                trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 60 },
-                max_steps: Some(5),
-                max_cost_usd: Some(1.5),
-                max_runs: Some(3),
-            })
+        let request = CreateRemoteSchedule {
+            session_id: session.session_id.clone(),
+            prompt: "run every minute".into(),
+            trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 60 },
+            max_steps: Some(5),
+            max_cost_usd: Some(1.5),
+            max_runs: Some(3),
+        };
+        let SwarmResponse::Ask(Ok(bytes)) = mesh
+            .inbound_router()
+            .unwrap()
+            .handle_v1(
+                peer,
+                node_ask::<RemoteNodeManager, _>(nm_ref.id(), &request),
+            )
             .await
-            .expect("create schedule");
+            .unwrap()
+        else {
+            panic!("authenticated remote schedule creation must succeed");
+        };
+        let created: crate::agent::remote::CreateRemoteScheduleResponse =
+            rmp_serde::from_slice(&bytes).unwrap();
 
         let list = nm_ref
             .ask(ListRemoteSchedules {
@@ -2755,6 +2910,7 @@ mod node_manager_tests {
             .await
             .expect("list after delete");
         assert!(after_delete.schedules.is_empty());
+        mesh.shutdown().await;
     }
 
     #[tokio::test]

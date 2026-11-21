@@ -46,9 +46,6 @@
 - **Mesh sharing:** Agent mesh runtimes start with no sharing grants. Joining a
   scope does not grant access in either direction. Use ACP to grant access
   explicitly; pre-upgrade clients require Full access on an upgraded host.
-- **Scheduled execution:** Schedules with no recorded origin no longer run as
-  the owner. Recreate older jobs you trust from the host to record their local
-  origin. A peer-origin job needs its original host and current grant revision.
 - Configuration: `[agent]` accepts `[[delegates]]`, `[agent.delegation]`
   (`wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`,
   `verification`, `summary`) and `snapshot_policy`. `[quorum]` / `[planner]` is

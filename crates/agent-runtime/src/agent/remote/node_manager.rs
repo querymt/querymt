@@ -112,9 +112,7 @@ mod remote_impl {
     use crate::agent::session_actor::{PeerTurn, SessionActor, TurnAuthority};
     use crate::agent::session_registry::SessionRegistry;
     use crate::error::AgentError;
-    use crate::session::domain_schedule::{
-        Schedule, ScheduleExecutionLimits, ScheduleOrigin, ScheduleTrigger,
-    };
+    use crate::session::domain_schedule::{Schedule, ScheduleExecutionLimits, ScheduleTrigger};
     use futures_util::FutureExt;
     use kameo::Actor;
     use kameo::message::{Context, Message};
@@ -912,7 +910,7 @@ mod remote_impl {
         async fn create_schedule(
             &self,
             request: CreateRemoteSchedule,
-            origin: Option<Arc<PeerTurn>>,
+            origin: Arc<PeerTurn>,
         ) -> Result<CreateRemoteScheduleResponse, AgentError> {
             use crate::session::domain::{Task, TaskKind, TaskStatus};
             let CreateRemoteSchedule {
@@ -923,9 +921,7 @@ mod remote_impl {
                 max_cost_usd,
                 max_runs,
             } = request;
-            if let Some(origin) = &origin {
-                TurnAuthority::Peer(origin.clone()).check().await?;
-            }
+            TurnAuthority::Peer(origin.clone()).check().await?;
 
             let store = self.config.provider.history_store();
             let session = store
@@ -965,9 +961,7 @@ mod remote_impl {
             let mut schedule = Schedule::new(task.public_id.clone(), session_public_id, trigger);
             schedule.task_id = task.id;
             schedule.session_id = session.id;
-            schedule.config.origin = origin
-                .as_ref()
-                .map_or(ScheduleOrigin::Unknown, |peer| peer.schedule_origin());
+            schedule.config.origin = origin.schedule_origin();
 
             if max_runs.is_some() {
                 schedule.config.max_runs = max_runs;
@@ -2045,11 +2039,14 @@ mod remote_impl {
 
         async fn handle(
             &mut self,
-            msg: CreateRemoteSchedule,
+            _: CreateRemoteSchedule,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let shared_state = self.shared_state.clone();
-            ctx.spawn(async move { shared_state.create_schedule(msg, None).await })
+            ctx.spawn(async {
+                Err(AgentError::AdmissionRejected {
+                    reason: "remote schedule creation requires an authenticated peer origin".into(),
+                })
+            })
         }
     }
 
@@ -2062,11 +2059,7 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
-            ctx.spawn(async move {
-                state
-                    .create_schedule(msg.request, Some(msg.authority))
-                    .await
-            })
+            ctx.spawn(async move { state.create_schedule(msg.request, msg.authority).await })
         }
     }
 

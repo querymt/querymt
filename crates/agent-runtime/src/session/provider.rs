@@ -173,10 +173,12 @@ impl SessionProvider {
     /// after the config was built.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: Option<crate::agent::remote::MeshHandle>) {
-        match mesh {
-            Some(m) => self.mesh.store(Some(Arc::new(m))),
-            None => self.mesh.store(None),
-        }
+        self.mesh.store(mesh.map(Arc::new));
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn mesh_handle(&self) -> Option<Arc<crate::agent::remote::MeshHandle>> {
+        self.mesh.load_full()
     }
 
     /// Enable/disable automatic mesh fallback when `provider_node_id` is not set.

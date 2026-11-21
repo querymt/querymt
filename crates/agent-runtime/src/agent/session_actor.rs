@@ -2934,7 +2934,8 @@ impl TurnAuthority {
                     store,
                 })))
             }
-            _ => Err(AgentError::MeshAccessDenied),
+            #[cfg(not(feature = "remote"))]
+            ScheduleOrigin::Peer { .. } => Err(AgentError::MeshAccessDenied),
         }
     }
 }
@@ -2965,10 +2966,12 @@ impl Message<ScheduledPrompt> for SessionActor {
             self.session_id, msg.schedule_public_id
         );
 
+        #[cfg(feature = "remote")]
+        let current_mesh = self.config.provider.mesh_handle();
         let authority = match TurnAuthority::from_stored_origin(
             msg.origin,
             #[cfg(feature = "remote")]
-            self.mesh.as_ref(),
+            current_mesh.as_deref().or(self.mesh.as_ref()),
         ) {
             Ok(authority) => match authority.check().await {
                 Ok(()) => Ok(authority),
@@ -5943,20 +5946,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduled_prompt_without_verifiable_origin_cannot_run_as_owner() {
+    async fn scheduled_prompt_with_unverifiable_peer_origin_cannot_run_as_owner() {
         use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
 
         let fixture = ActorFixture::new().await;
         let mut events = fixture.config.subscribe_events();
-        for origin in [
-            ScheduleOrigin::Unknown,
-            ScheduleOrigin::Peer {
-                host: "persisted-host".into(),
-                peer: "persisted-peer".into(),
-                revision: Uuid::now_v7(),
-                protocol: SchedulePeerProtocol::V1,
-            },
-        ] {
+        for origin in [ScheduleOrigin::Peer {
+            host: "persisted-host".into(),
+            peer: "persisted-peer".into(),
+            revision: Uuid::now_v7(),
+            protocol: SchedulePeerProtocol::V1,
+        }] {
             let result = fixture
                 .actor_ref
                 .ask(ScheduledPrompt {
@@ -5975,10 +5975,9 @@ mod tests {
             ));
         }
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let mut refused = 0;
-            while refused < 2 {
+            loop {
                 if matches!(events.recv().await.unwrap().kind(), AgentEventKind::ScheduledExecutionFailed { schedule_public_id, .. } if schedule_public_id == "schedule-1") {
-                    refused += 1;
+                    break;
                 }
             }
         }).await.unwrap();

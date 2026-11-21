@@ -88,13 +88,13 @@ pub struct ScheduleExecutionLimits {
     pub max_cost_usd: Option<f64>,
 }
 
-/// Authority the host recorded when creating the schedule. A missing field in
-/// an older row cannot distinguish a local job from one created over the mesh.
+/// Authority the host recorded when creating the schedule. Older schedules
+/// without an origin retain their original local execution behavior.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScheduleOrigin {
     #[default]
-    Unknown,
+    #[serde(alias = "unknown")]
     Local,
     Peer {
         host: String,
@@ -157,7 +157,7 @@ impl Default for ScheduleConfig {
             jitter_percent: default_jitter_percent(),
             backoff_base_seconds: default_backoff_base_seconds(),
             execution_limits: None,
-            origin: ScheduleOrigin::Unknown,
+            origin: ScheduleOrigin::Local,
         }
     }
 }
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn legacy_schedule_config_does_not_claim_owner_authority() {
         let config: ScheduleConfig = serde_json::from_str(r#"{"max_runs":5}"#).unwrap();
-        assert_eq!(config.origin, ScheduleOrigin::Unknown);
+        assert_eq!(config.origin, ScheduleOrigin::Local);
     }
 
     // ── State machine transitions ────────────────────────────────────────

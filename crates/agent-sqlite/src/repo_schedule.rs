@@ -681,7 +681,7 @@ mod tests {
         ).unwrap();
         assert_eq!(
             repo.get_schedule(&id).await.unwrap().unwrap().config.origin,
-            ScheduleOrigin::Unknown
+            ScheduleOrigin::Local
         );
     }
 

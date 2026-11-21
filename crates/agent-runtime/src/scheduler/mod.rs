@@ -982,6 +982,37 @@ impl SchedulerActor {
 
     /// Attempt to fire a schedule. Performs CAS, sends ScheduledPrompt, sets up timeout.
     pub async fn fire_schedule(&mut self, schedule_public_id: &str) {
+        let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
+            Ok(Some(schedule)) => schedule,
+            Ok(None) => return,
+            Err(error) => {
+                warn!("SchedulerActor: failed to load {schedule_public_id}: {error}");
+                return;
+            }
+        };
+
+        #[cfg(feature = "remote")]
+        if schedule.state == ScheduleState::Armed
+            && matches!(
+                schedule.config.origin,
+                crate::session::domain_schedule::ScheduleOrigin::Peer { .. }
+            )
+            && !self
+                .config
+                .provider
+                .mesh_handle()
+                .is_some_and(|mesh| mesh.quota_store().is_some())
+        {
+            // Startup may restore armed jobs before installing mesh policy.
+            // Retry without starting the cycle or consuming a failure.
+            self.deadline_queue.insert(
+                OffsetDateTime::now_utc() + time::Duration::seconds(1),
+                schedule_public_id.to_owned(),
+            );
+            self.reschedule_wake().await;
+            return;
+        }
+
         // CAS: Armed -> Running
         let cas_ok = match self
             .schedule_store
@@ -1010,25 +1041,6 @@ impl SchedulerActor {
             );
             return;
         }
-
-        // Load the schedule to get session info and config
-        let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                warn!(
-                    "SchedulerActor: schedule {} not found after CAS",
-                    schedule_public_id
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "SchedulerActor: failed to load schedule {}: {}",
-                    schedule_public_id, e
-                );
-                return;
-            }
-        };
 
         // Look up SessionActorRef from registry
         let session_actor_ref = {
