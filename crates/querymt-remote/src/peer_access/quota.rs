@@ -355,4 +355,39 @@ mod tests {
             .is_none()
         );
     }
+
+    #[test]
+    fn quota_store_failures_hide_backend_diagnostics_without_hiding_replays() {
+        let backend = QuotaError::Store(GrantStoreError::Backend(Box::new(std::io::Error::other(
+            "fixture database path and internal SQL",
+        ))));
+        for (error, kind, code) in [
+            (
+                backend,
+                ProviderErrorKind::UnknownPermanent,
+                "mesh_access_unavailable",
+            ),
+            (
+                QuotaError::DuplicateAttempt,
+                ProviderErrorKind::InvalidRequest,
+                "mesh_quota_duplicate_attempt",
+            ),
+            (
+                QuotaError::InvalidAttempt,
+                ProviderErrorKind::Authentication,
+                "mesh_access_denied",
+            ),
+        ] {
+            let payload = error.into_provider_error().to_payload();
+            let LLMError::ProviderResponseError(error) = LLMError::from_payload(payload) else {
+                panic!("quota error lost its wire classification");
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.code(), Some(code));
+            assert!(error.error_type().is_none());
+            if code == "mesh_access_unavailable" {
+                assert_eq!(error.message(), "mesh policy unavailable");
+            }
+        }
+    }
 }

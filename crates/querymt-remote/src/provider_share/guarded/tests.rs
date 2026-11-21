@@ -321,6 +321,126 @@ fn allowed() -> PeerGrant {
 }
 
 #[tokio::test]
+async fn registered_provider_share_gates_catalog_independently_of_discovery() {
+    use crate::provider_share::ProviderShare;
+    use crate::{
+        LanDiscovery, LanMeshConfig, MeshRuntimeConfig, bootstrap_mesh_runtime_with_policy,
+    };
+
+    let cache = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::default());
+    let runtime = bootstrap_mesh_runtime_with_policy(
+        &MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(LanMeshConfig {
+                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                discovery: LanDiscovery::None,
+                directory: Default::default(),
+            }),
+            identity_file: Some(cache.path().join("identity")),
+            iroh_enabled: false,
+            iroh_gso: false,
+            iroh_dns: None,
+            iroh_scopes: vec![],
+            request_timeout: Duration::from_secs(3),
+            stream_reconnect_grace: Duration::from_secs(3),
+            node_name: Some("catalog-fixture".into()),
+            peers: vec![],
+            auto_fallback: false,
+        },
+        store.clone(),
+    )
+    .await
+    .unwrap();
+    let host = *runtime.peer_id();
+    let peer = PeerId::random();
+    let backend = Arc::new(Backend::default());
+    let share = ProviderShare::new(
+        backend,
+        Arc::new(StaticCatalogBackend::provider_models(
+            host.to_string(),
+            None,
+            "fixture",
+            ["allowed".into(), "denied".into()],
+        )),
+    );
+    let mesh = runtime.as_mesh_handle();
+    share.register_on_mesh(&runtime).await;
+    let router = mesh.inbound_router().unwrap();
+    let catalog = share.provider_catalog().id();
+    let read = || ask_request::<ProviderCatalogActor, _>(catalog, &GetProviderCatalog);
+    assert!(matches!(
+        router.handle_v1(peer, read()).await,
+        Err(crate::mesh_ingress::SharingRejection::Denied)
+    ));
+
+    let binding = key(host, peer);
+    let grant = store
+        .replace_grant(&binding, Uuid::nil(), allowed())
+        .await
+        .unwrap();
+    // Publishing the same share again must preserve its guarded routes and
+    // must not make the legacy actor available to the Custom recipient.
+    share.register_on_mesh(&runtime).await;
+    let response = router.handle_v1(peer, read()).await.unwrap();
+    let result = decode_ask::<ProviderCatalogSnapshot, String>(response).unwrap();
+    assert_eq!(
+        result
+            .providers
+            .iter()
+            .filter_map(|entry| entry.model.as_deref())
+            .collect::<Vec<_>>(),
+        ["allowed"]
+    );
+    assert!(matches!(
+        router.handle_legacy(peer, read()).await,
+        SwarmResponse::Ask(Err(_))
+    ));
+
+    let mut chat = MeteredChat {
+        request_id: Uuid::now_v7(),
+        request: ProviderChatRequest {
+            provider: "fixture".into(),
+            model: "denied".into(),
+            messages: vec![],
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        },
+    };
+    let provider = share.provider_host().id();
+    let forbidden = ask::<ProviderHostActor, _, ProviderChatResponse, RemoteProviderHostError>(
+        router, peer, provider, &chat,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(forbidden), "mesh_access_denied");
+    assert!(store.attempts.lock().is_empty());
+    chat.request.model = "allowed".into();
+    let served = ask::<ProviderHostActor, _, ProviderChatResponse, RemoteProviderHostError>(
+        router, peer, provider, &chat,
+    )
+    .await
+    .unwrap();
+    assert_eq!(served.output.usage.unwrap().input_tokens, 8);
+    assert_eq!(store.attempts.lock().len(), 1);
+
+    store
+        .replace_grant(&binding, grant.revision, PeerGrant::None)
+        .await
+        .unwrap();
+    for request in [read(), ask_request::<ProviderHostActor, _>(provider, &chat)] {
+        assert!(matches!(
+            router.handle_v1(peer, request).await,
+            Err(crate::mesh_ingress::SharingRejection::Denied)
+        ));
+    }
+    assert_eq!(store.attempts.lock().len(), 1);
+    mesh.shutdown().await;
+}
+
+#[tokio::test]
 async fn guarded_catalog_and_chat_enforce_grants_host_binding_and_attempt_identity() {
     let host = PeerId::random();
     let peer = PeerId::random();
