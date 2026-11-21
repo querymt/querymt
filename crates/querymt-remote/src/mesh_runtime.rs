@@ -42,12 +42,12 @@ mod unified_behaviour {
     use kameo::remote;
     use libp2p::swarm::{NetworkBehaviour, behaviour::toggle::Toggle, derive_prelude::Either};
 
-    use crate::mesh_ingress::{Egress, Inbound, SharingWire};
+    use crate::mesh_ingress::{Egress, LegacyWire, SharingWire};
 
     #[derive(NetworkBehaviour)]
     pub(super) struct GuardedMessaging {
         pub(super) egress: Egress,
-        pub(super) ingress: Inbound,
+        pub(super) ingress: LegacyWire,
         pub(super) sharing: SharingWire,
     }
 
@@ -64,7 +64,7 @@ use unified_behaviour::{
 
 use crate::mesh_handle::MeshPolicy;
 use crate::mesh_ingress::{
-    Egress, Inbound, InboundRouter, MeshIngress, SharingCallError, SharingWire,
+    Egress, InboundRouter, LegacyWire, MeshIngress, SharingCallError, SharingWire,
 };
 use crate::peer_access::quota::QuotaStore;
 
@@ -78,7 +78,7 @@ fn kameo_behaviour(
         None => Either::Left(kameo),
         Some(gate) => Either::Right(GuardedMessaging {
             egress: Egress(kameo),
-            ingress: Inbound::new(Arc::clone(gate), timeout),
+            ingress: LegacyWire::new(Arc::clone(gate), timeout),
             sharing: SharingWire::new(Arc::clone(gate), timeout),
         }),
     }

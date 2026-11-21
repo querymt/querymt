@@ -101,9 +101,10 @@ async fn legacy_router_requires_transport_bound_full_grant() {
         router.ask(allowed, request(actor, allowed)).await,
         Err(RemoteSendError::UnknownMessage { .. })
     ));
-    router.register_ask::<FixtureActor, Echo, _, String, _, _>(
+    router.register::<FixtureActor, Echo, _, String, _, _>(
         actor,
-        InboundAccess::LegacyFull,
+        InboundDelivery::LegacyAsk,
+        InboundAccess::Full,
         |origin, _| async move { Ok(origin.key().peer.to_string()) },
     );
     let allowed_key = key(host, allowed);
@@ -173,8 +174,9 @@ async fn grant_aware_route_authorizes_custom_sessions_only_on_v1() {
     let actor = ActorId::new_with_peer_id(17, host);
     let store = Arc::new(TestStore::default());
     let router = InboundRouter::new(host, store.clone());
-    router.register_v1_ask::<FixtureActor, Echo, _, String, _, _>(
+    router.register::<FixtureActor, Echo, _, String, _, _>(
         actor,
+        InboundDelivery::V1Ask,
         InboundAccess::Sessions,
         |origin, _| async move {
             assert_eq!(origin.protocol(), SharingProtocol::V1);
@@ -284,6 +286,108 @@ async fn provider_relay_requires_expected_host_and_active_request_without_revers
 }
 
 #[tokio::test]
+async fn shared_ask_uses_the_negotiated_protocol_for_access() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(17, host);
+    let store = Arc::new(TestStore::default());
+    let router = InboundRouter::new(host, store.clone());
+    let peer_key = key(host, peer);
+    let custom = store
+        .replace_grant(
+            &peer_key,
+            Uuid::nil(),
+            PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                providers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        actor,
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        |origin, _| async move { Ok(origin.protocol() == SharingProtocol::V1) },
+    );
+    assert!(matches!(
+        router.handle_legacy(peer, request(actor, peer)).await,
+        SwarmResponse::Ask(Err(RemoteSendError::DeserializeMessage(_)))
+    ));
+    let Ok(SwarmResponse::Ask(Ok(reply))) = router.handle_v1(peer, request(actor, peer)).await
+    else {
+        panic!("expected v1 to honor a custom session grant");
+    };
+    assert!(rmp_serde::from_slice::<bool>(&reply).unwrap());
+
+    store
+        .replace_grant(&peer_key, custom.revision, PeerGrant::Full)
+        .await
+        .unwrap();
+    let SwarmResponse::Ask(Ok(reply)) = router.handle_legacy(peer, request(actor, peer)).await
+    else {
+        panic!("expected legacy to honor a full grant");
+    };
+    assert!(!rmp_serde::from_slice::<bool>(&reply).unwrap());
+}
+
+#[tokio::test]
+async fn legacy_only_ask_and_mixed_delivery_preserve_their_envelopes() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let legacy = ActorId::new_with_peer_id(17, host);
+    let mixed = ActorId::new_with_peer_id(18, host);
+    let router = InboundRouter::new(host, Arc::new(TestStore::default()));
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        legacy,
+        InboundDelivery::LegacyAsk,
+        InboundAccess::Identity,
+        |_, _| async { Ok(()) },
+    );
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        mixed,
+        InboundDelivery::LegacyTellV1Ask,
+        InboundAccess::Identity,
+        |_, _| async { Ok(()) },
+    );
+    let tell = || SwarmRequest::Tell {
+        actor_id: mixed,
+        actor_remote_id: <FixtureActor as RemoteActor>::REMOTE_ID.into(),
+        message_remote_id: <FixtureActor as RemoteMessage<Echo>>::REMOTE_ID.into(),
+        payload: rmp_serde::to_vec_named(&Echo {
+            claimed: String::new(),
+        })
+        .unwrap(),
+        mailbox_timeout: None,
+        immediate: false,
+    };
+    assert!(matches!(
+        router.handle_v1(peer, request(legacy, peer)).await,
+        Ok(SwarmResponse::Ask(Err(
+            RemoteSendError::UnknownMessage { .. }
+        )))
+    ));
+    assert!(matches!(
+        router.handle_legacy(peer, request(mixed, peer)).await,
+        SwarmResponse::Ask(Err(RemoteSendError::UnknownMessage { .. }))
+    ));
+    assert!(matches!(
+        router.handle_v1(peer, tell()).await,
+        Err(SharingRejection::UnsupportedOperation)
+    ));
+    assert!(matches!(
+        router.handle_legacy(peer, tell()).await,
+        SwarmResponse::Tell(Ok(()))
+    ));
+    let Ok(SwarmResponse::Ask(Ok(reply))) = router.handle_v1(peer, request(mixed, peer)).await
+    else {
+        panic!("expected v1 Ask to carry the callback acknowledgement");
+    };
+    rmp_serde::from_slice::<()>(&reply).unwrap();
+}
+
+#[tokio::test]
 async fn legacy_router_suppresses_reply_after_grant_changes() {
     let host = PeerId::random();
     let peer = PeerId::random();
@@ -297,19 +401,24 @@ async fn legacy_router_suppresses_reply_after_grant_changes() {
         .unwrap();
     let started = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
-    router.register_ask::<FixtureActor, Echo, _, String, _, _>(actor, InboundAccess::LegacyFull, {
-        let started = Arc::clone(&started);
-        let finish = Arc::clone(&finish);
-        move |_, _| {
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        actor,
+        InboundDelivery::LegacyAsk,
+        InboundAccess::Full,
+        {
             let started = Arc::clone(&started);
             let finish = Arc::clone(&finish);
-            async move {
-                started.notify_one();
-                finish.notified().await;
-                Ok("protected".to_owned())
+            move |_, _| {
+                let started = Arc::clone(&started);
+                let finish = Arc::clone(&finish);
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Ok("protected".to_owned())
+                }
             }
-        }
-    });
+        },
+    );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let task = tokio::spawn(async move { router.ask(peer, request(actor, peer)).await });
         started.notified().await;

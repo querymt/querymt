@@ -117,7 +117,9 @@ mod remote_impl {
     use kameo::Actor;
     use kameo::message::{Context, Message};
     use kameo::remote::_internal;
-    use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
+    use querymt_remote::mesh_ingress::{
+        InboundAccess, InboundDelivery, InboundRouter, PeerRequest,
+    };
     use serde::{Deserialize, Serialize};
 
     use std::collections::HashMap;
@@ -590,37 +592,37 @@ mod remote_impl {
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             Self::register_peer_ask::<ListRemoteSchedules, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             Self::register_peer_ask::<PauseRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             Self::register_peer_ask::<ResumeRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             Self::register_peer_ask::<TriggerRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             Self::register_peer_ask::<DeleteRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             use crate::agent::remote::remote_actor_impl::{
                 register_session_read, register_session_request,
@@ -631,15 +633,11 @@ mod remote_impl {
                 actor,
                 InboundAccess::Sessions,
             );
-            register_session_request::<_, CreateRemoteSession>(
-                router,
-                actor,
-                InboundAccess::LegacyFull,
-            );
+            register_session_request::<_, CreateRemoteSession>(router, actor, InboundAccess::Full);
             register_session_request::<_, CreateRemoteSessionWithProfile>(
                 router,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Full,
             );
             register_session_read::<_, GetRemoteSessionProfile>(router, actor);
             register_session_read::<_, ListRemoteSessions>(router, actor);
@@ -672,13 +670,9 @@ mod remote_impl {
                     Ok::<_, AgentError>(info)
                 }
             };
-            router.register_ask::<Self, GetNodeInfo, _, _, _, _>(
+            router.register::<Self, GetNodeInfo, _, _, _, _>(
                 actor.id(),
-                InboundAccess::Identity,
-                describe.clone(),
-            );
-            router.register_v1_ask::<Self, GetNodeInfo, _, _, _, _>(
-                actor.id(),
+                InboundDelivery::Ask,
                 InboundAccess::Identity,
                 describe,
             );
@@ -713,12 +707,12 @@ mod remote_impl {
                         })
                 }
             };
-            router.register_ask::<Self, M, _, _, _, _>(
+            router.register::<Self, M, _, _, _, _>(
                 actor.id(),
-                InboundAccess::LegacyFull,
-                handle.clone(),
+                InboundDelivery::Ask,
+                v1_access,
+                handle,
             );
-            router.register_v1_ask::<Self, M, _, _, _, _>(actor.id(), v1_access, handle);
         }
 
         fn register_admission(router: &InboundRouter, actor: &kameo::actor::ActorRef<Self>) {
@@ -740,13 +734,9 @@ mod remote_impl {
                     })
                 }
             };
-            router.register_ask::<Self, AdmissionRequest, _, _, _, _>(
+            router.register::<Self, AdmissionRequest, _, _, _, _>(
                 actor.id(),
-                InboundAccess::Identity,
-                admit.clone(),
-            );
-            router.register_v1_ask::<Self, AdmissionRequest, _, _, _, _>(
-                actor.id(),
+                InboundDelivery::Ask,
                 InboundAccess::Identity,
                 admit,
             );

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
+use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use crate::peer_access::quota::{
     AttemptUsage, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore, ReservedAttempt,
 };
@@ -81,17 +81,9 @@ impl GuardedProvider {
         macro_rules! register {
             ($actor:ty, $message:ty, $id:expr, $handle:ident) => {{
                 let service = self.clone();
-                router.register_ask::<$actor, $message, _, _, _, _>(
+                router.register::<$actor, $message, _, _, _, _>(
                     $id,
-                    InboundAccess::LegacyFull,
-                    move |peer, msg| {
-                        let service = service.clone();
-                        async move { service.$handle(&peer, msg).await }
-                    },
-                );
-                let service = self.clone();
-                router.register_v1_ask::<$actor, $message, _, _, _, _>(
-                    $id,
+                    InboundDelivery::Ask,
                     InboundAccess::Providers,
                     move |peer, msg| {
                         let service = service.clone();
@@ -103,16 +95,18 @@ impl GuardedProvider {
         register!(ProviderCatalogActor, GetProviderCatalog, catalog, catalog);
         register!(ProviderHostActor, GetProviderContractInfo, host, contract);
         let service = self.clone();
-        router.register_ask::<ProviderHostActor, ProviderChatRequest, _, _, _, _>(
+        router.register::<ProviderHostActor, ProviderChatRequest, _, _, _, _>(
             host,
-            InboundAccess::LegacyFull,
+            InboundDelivery::LegacyAsk,
+            InboundAccess::Full,
             move |peer, msg| {
                 let service = service.clone();
                 async move { service.chat(&peer, msg, Uuid::now_v7()).await }
             },
         );
-        router.register_v1_ask::<ProviderHostActor, MeteredChat, _, _, _, _>(
+        router.register::<ProviderHostActor, MeteredChat, _, _, _, _>(
             host,
+            InboundDelivery::V1Ask,
             InboundAccess::Providers,
             move |peer, msg| {
                 let service = self.clone();

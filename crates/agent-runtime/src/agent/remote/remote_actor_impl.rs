@@ -27,7 +27,7 @@ use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::message::Message;
 use kameo::remote::{_internal, RemoteActor, RemoteMessage};
 use kameo::reply::Reply;
-use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
+use querymt_remote::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use querymt_remote::peer_access::GrantStore;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,8 +75,7 @@ pub(super) fn register_session_request<A, M>(
                 })
         }
     };
-    router.register_ask::<A, M, _, _, _, _>(actor.id(), InboundAccess::LegacyFull, read.clone());
-    router.register_v1_ask::<A, M, _, _, _, _>(actor.id(), v1_access, read);
+    router.register::<A, M, _, _, _, _>(actor.id(), InboundDelivery::Ask, v1_access, read);
 }
 
 pub(crate) fn register_session_history(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
@@ -148,13 +147,9 @@ pub(super) fn register_session_turns(
             Duration::from_secs(10),
         )
     };
-    router.register_legacy_tell::<SessionActor, messages::Cancel, _, _, _>(
+    router.register::<SessionActor, messages::Cancel, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        cancel.clone(),
-    );
-    router.register_v1_ask::<SessionActor, messages::Cancel, _, _, _, _>(
-        actor.id(),
+        InboundDelivery::LegacyTellV1Ask,
         InboundAccess::Sessions,
         cancel,
     );
@@ -177,12 +172,12 @@ fn register_peer_session_ask<M, R>(
     let handle = move |origin, message| {
         send_peer_turn(weak.clone(), store.clone(), origin, message, timeout)
     };
-    router.register_ask::<SessionActor, M, _, _, _, _>(
+    router.register::<SessionActor, M, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        handle.clone(),
+        InboundDelivery::Ask,
+        v1_access,
+        handle,
     );
-    router.register_v1_ask::<SessionActor, M, _, _, _, _>(actor.id(), v1_access, handle);
 }
 
 async fn send_peer_turn<M, R>(
@@ -252,23 +247,15 @@ pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<Sessi
                 .map_err(file_proxy_send_error)
         }
     };
-    router.register_ask::<SessionActor, messages::GetFileIndex, _, _, _, _>(
+    router.register::<SessionActor, messages::GetFileIndex, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        index.clone(),
-    );
-    router.register_v1_ask::<SessionActor, messages::GetFileIndex, _, _, _, _>(
-        actor.id(),
+        InboundDelivery::Ask,
         InboundAccess::Filesystem,
         index,
     );
-    router.register_ask::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
+    router.register::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        read.clone(),
-    );
-    router.register_v1_ask::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
-        actor.id(),
+        InboundDelivery::Ask,
         InboundAccess::Filesystem,
         read,
     );
@@ -315,13 +302,9 @@ pub(super) fn register_session_subscriptions(
                 .map_err(local_session_error)
         }
     };
-    router.register_ask::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
+    router.register::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        subscribe.clone(),
-    );
-    router.register_v1_ask::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
-        actor.id(),
+        InboundDelivery::Ask,
         InboundAccess::Sessions,
         subscribe,
     );
@@ -345,13 +328,9 @@ pub(super) fn register_session_subscriptions(
                 .map_err(local_session_error)
         }
     };
-    router.register_ask::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
+    router.register::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
-        unsubscribe.clone(),
-    );
-    router.register_v1_ask::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
-        actor.id(),
+        InboundDelivery::Ask,
         InboundAccess::Sessions,
         unsubscribe,
     );
@@ -643,13 +622,9 @@ pub(crate) fn register_session_relay(
                         .map_err(|error| AgentError::RemoteActor(error.to_string()))
                 }
             };
-            router.register_legacy_tell::<EventRelayActor, $message, _, _, _>(
+            router.register::<EventRelayActor, $message, _, _, _, _>(
                 relay.id(),
-                InboundAccess::Identity,
-                deliver.clone(),
-            );
-            router.register_v1_ask::<EventRelayActor, $message, _, _, _, _>(
-                relay.id(),
+                InboundDelivery::LegacyTellV1Ask,
                 InboundAccess::Identity,
                 deliver,
             );

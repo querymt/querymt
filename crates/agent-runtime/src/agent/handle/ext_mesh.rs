@@ -474,7 +474,7 @@ mod access {
     ) {
         use crate::agent::remote::node_manager::{GetPeerSharing, PeerAccessInvalidated};
         use crate::error::AgentError;
-        use querymt_remote::mesh_ingress::{InboundAccess, PeerRequest};
+        use querymt_remote::mesh_ingress::{InboundAccess, InboundDelivery, PeerRequest};
 
         let notifications = handle.ext_notifications.clone();
         let inventory = handle.model_inventory.clone();
@@ -558,70 +558,74 @@ mod access {
                 }
             });
         }
-        router.register_v1_ask::<crate::agent::remote::RemoteNodeManager, PeerAccessInvalidated, _, _, _, _>(
-            actor.id(), InboundAccess::PeerAccess, move |peer: PeerRequest, reason: PeerAccessInvalidated| {
-                let notifications = notifications.clone();
-                async move {
-                    notify(&notifications, &peer.key().peer, "incoming", reason);
-                    Ok::<_, AgentError>(())
-                }
-            },
-        );
-
-        let inventory = handle.model_inventory.clone();
         router
-            .register_v1_ask::<crate::agent::remote::RemoteNodeManager, GetPeerSharing, _, _, _, _>(
+            .register::<crate::agent::remote::RemoteNodeManager, PeerAccessInvalidated, _, _, _, _>(
                 actor.id(),
+                InboundDelivery::V1Ask,
                 InboundAccess::PeerAccess,
-                move |peer: PeerRequest, _| {
-                    let store = store.clone();
-                    let inventory = inventory.clone();
+                move |peer: PeerRequest, reason: PeerAccessInvalidated| {
+                    let notifications = notifications.clone();
                     async move {
-                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                        let (state, quotas) = store
-                            .access_snapshot(peer.key(), now)
-                            .await
-                            .map_err(|_| AgentError::MeshNotBootstrapped)?;
-                        if peer.revision() != Some(state.revision) {
-                            return Err(AgentError::MeshAccessDenied);
-                        }
-                        let cargo_catalog = local_catalog(&inventory);
-                        let effective = match &state.grant {
-                            PeerGrant::None => return Ok(MeshPeerIncomingAccess::Denied),
-                            PeerGrant::Full => MeshPeerEffectiveAccess {
-                                mode: MeshPeerAccessMode::Full,
-                                sessions: true,
-                                filesystem: true,
-                                shell: true,
-                                providers: cargo_catalog
-                                    .into_keys()
-                                    .map(|provider_id| ProviderGrant {
-                                        provider_id,
-                                        models: ModelSelection::All,
-                                    })
-                                    .collect(),
-                            },
-                            PeerGrant::Custom {
-                                sessions,
-                                filesystem,
-                                providers,
-                            } => MeshPeerEffectiveAccess {
-                                mode: MeshPeerAccessMode::Custom,
-                                sessions: *sessions,
-                                filesystem: *filesystem,
-                                shell: false,
-                                providers: providers.clone(),
-                            },
-                        };
-                        let quotas = quotas
-                            .into_iter()
-                            .map(|quota| quota_wire(&state.grant, quota))
-                            .filter(|quota| quota.active)
-                            .collect();
-                        Ok(MeshPeerIncomingAccess::Granted { effective, quotas })
+                        notify(&notifications, &peer.key().peer, "incoming", reason);
+                        Ok::<_, AgentError>(())
                     }
                 },
             );
+
+        let inventory = handle.model_inventory.clone();
+        router.register::<crate::agent::remote::RemoteNodeManager, GetPeerSharing, _, _, _, _>(
+            actor.id(),
+            InboundDelivery::V1Ask,
+            InboundAccess::PeerAccess,
+            move |peer: PeerRequest, _| {
+                let store = store.clone();
+                let inventory = inventory.clone();
+                async move {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let (state, quotas) = store
+                        .access_snapshot(peer.key(), now)
+                        .await
+                        .map_err(|_| AgentError::MeshNotBootstrapped)?;
+                    if peer.revision() != Some(state.revision) {
+                        return Err(AgentError::MeshAccessDenied);
+                    }
+                    let cargo_catalog = local_catalog(&inventory);
+                    let effective = match &state.grant {
+                        PeerGrant::None => return Ok(MeshPeerIncomingAccess::Denied),
+                        PeerGrant::Full => MeshPeerEffectiveAccess {
+                            mode: MeshPeerAccessMode::Full,
+                            sessions: true,
+                            filesystem: true,
+                            shell: true,
+                            providers: cargo_catalog
+                                .into_keys()
+                                .map(|provider_id| ProviderGrant {
+                                    provider_id,
+                                    models: ModelSelection::All,
+                                })
+                                .collect(),
+                        },
+                        PeerGrant::Custom {
+                            sessions,
+                            filesystem,
+                            providers,
+                        } => MeshPeerEffectiveAccess {
+                            mode: MeshPeerAccessMode::Custom,
+                            sessions: *sessions,
+                            filesystem: *filesystem,
+                            shell: false,
+                            providers: providers.clone(),
+                        },
+                    };
+                    let quotas = quotas
+                        .into_iter()
+                        .map(|quota| quota_wire(&state.grant, quota))
+                        .filter(|quota| quota.active)
+                        .collect();
+                    Ok(MeshPeerIncomingAccess::Granted { effective, quotas })
+                }
+            },
+        );
     }
 
     fn notify(

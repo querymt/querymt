@@ -4,6 +4,7 @@
 //! original inbound messaging substreams. The legacy listener and the separate
 //! grant-aware protocol deliver authenticated caller identity to the same gate.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use libp2p::swarm::{
     THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::task::JoinSet;
 
 use crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM;
@@ -34,7 +36,7 @@ const MAX_IN_FLIGHT: usize = 100;
 
 mod router;
 mod wire;
-pub use router::{InboundAccess, InboundRouter, PeerRequest};
+pub use router::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 pub(crate) use wire::{ResponseSender, SharingRequest, SharingResponse, SharingWire};
 pub use wire::{SharingCallError, SharingRejection};
 
@@ -60,33 +62,69 @@ pub trait MeshIngress: Send + Sync + 'static {
     }
 }
 
-type Wire = cbor::Behaviour<SwarmRequest, SwarmResponse>;
-
-pub(crate) struct Inbound {
-    wire: Wire,
-    gate: Arc<dyn MeshIngress>,
-    tasks: JoinSet<(rpc::ResponseChannel<SwarmResponse>, SwarmResponse)>,
+pub(crate) enum InboundRequest<Q, R> {
+    Dispatch(Q),
+    Reply(R),
 }
 
-impl Inbound {
+pub(crate) trait InboundProtocol: Default + 'static {
+    type Request: Serialize + DeserializeOwned + Send + 'static;
+    type ActorRequest: Send + 'static;
+    type Response: Serialize + DeserializeOwned + Send + 'static;
+
+    const PROTOCOL: StreamProtocol;
+    const SUPPORT: ProtocolSupport;
+    const TASK_FAILURE: &'static str;
+
+    fn receive(request: Self::Request) -> InboundRequest<Self::ActorRequest, Self::Response>;
+    fn dispatch(
+        gate: &dyn MeshIngress,
+        peer: PeerId,
+        request: Self::ActorRequest,
+    ) -> impl Future<Output = Self::Response> + Send;
+    fn overloaded(request: Self::ActorRequest) -> Self::Response;
+
+    fn outbound_result(
+        &mut self,
+        _peer: PeerId,
+        _id: rpc::OutboundRequestId,
+        _result: Result<Self::Response, rpc::OutboundFailure>,
+    ) {
+    }
+}
+
+type Wire<P> = cbor::Behaviour<<P as InboundProtocol>::Request, <P as InboundProtocol>::Response>;
+type ReplyTask<R> = (rpc::ResponseChannel<R>, R);
+
+/// Each instance negotiates exactly one protocol. In particular, a sharing
+/// request never offers the legacy protocol as an outbound fallback.
+pub(crate) struct Inbound<P: InboundProtocol> {
+    wire: Wire<P>,
+    protocol: P,
+    gate: Arc<dyn MeshIngress>,
+    tasks: JoinSet<ReplyTask<P::Response>>,
+}
+
+impl<P: InboundProtocol> Inbound<P> {
     pub(crate) fn new(gate: Arc<dyn MeshIngress>, timeout: Duration) -> Self {
-        let wire = Wire::with_codec(
+        let wire = Wire::<P>::with_codec(
             cbor::codec::Codec::default()
                 .set_request_size_maximum(MESH_MESSAGE_SIZE_MAXIMUM)
                 .set_response_size_maximum(MESH_MESSAGE_SIZE_MAXIMUM),
-            [(LEGACY_PROTOCOL, ProtocolSupport::Inbound)],
+            [(P::PROTOCOL, P::SUPPORT)],
             rpc::Config::default().with_request_timeout(timeout),
         );
         Self {
             wire,
+            protocol: P::default(),
             gate,
             tasks: JoinSet::new(),
         }
     }
 }
 
-impl NetworkBehaviour for Inbound {
-    type ConnectionHandler = THandler<Wire>;
+impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
+    type ConnectionHandler = THandler<Wire<P>>;
     type ToSwarm = ();
 
     fn handle_established_inbound_connection(
@@ -98,6 +136,21 @@ impl NetworkBehaviour for Inbound {
     ) -> Result<THandler<Self>, ConnectionDenied> {
         self.wire
             .handle_established_inbound_connection(id, peer, local, remote)
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        id: ConnectionId,
+        peer: Option<PeerId>,
+        addresses: &[Multiaddr],
+        role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if matches!(P::SUPPORT, ProtocolSupport::Inbound) {
+            // The legacy listener does not contribute addresses for outbound dials.
+            return Ok(Vec::new());
+        }
+        self.wire
+            .handle_pending_outbound_connection(id, peer, addresses, role)
     }
 
     fn handle_established_outbound_connection(
@@ -131,7 +184,7 @@ impl NetworkBehaviour for Inbound {
                 Ok((channel, reply)) => {
                     let _ = self.wire.send_response(channel, reply);
                 }
-                Err(error) => tracing::error!(%error, "mesh ingress task failed"),
+                Err(error) => tracing::error!(%error, "{}", P::TASK_FAILURE),
             }
         }
         while let Poll::Ready(event) = self.wire.poll(cx) {
@@ -143,19 +196,40 @@ impl NetworkBehaviour for Inbound {
                             request, channel, ..
                         },
                     ..
-                }) => {
-                    if self.tasks.len() >= MAX_IN_FLIGHT {
-                        let _ = self.wire.send_response(channel, overloaded(request));
-                    } else {
+                }) => match P::receive(request) {
+                    InboundRequest::Reply(reply) => {
+                        let _ = self.wire.send_response(channel, reply);
+                    }
+                    InboundRequest::Dispatch(request) if self.tasks.len() >= MAX_IN_FLIGHT => {
+                        let _ = self.wire.send_response(channel, P::overloaded(request));
+                    }
+                    InboundRequest::Dispatch(request) => {
                         let gate = Arc::clone(&self.gate);
                         self.tasks.spawn(async move {
-                            (channel, gate.handle_legacy(peer, request).await)
+                            (channel, P::dispatch(&*gate, peer, request).await)
                         });
                         // Register the waker even when the first task was spawned
                         // after polling an empty JoinSet.
                         cx.waker().wake_by_ref();
                     }
-                }
+                },
+                ToSwarm::GenerateEvent(rpc::Event::Message {
+                    peer,
+                    message:
+                        rpc::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                }) => self
+                    .protocol
+                    .outbound_result(peer, request_id, Ok(response)),
+                ToSwarm::GenerateEvent(rpc::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                }) => self.protocol.outbound_result(peer, request_id, Err(error)),
                 ToSwarm::GenerateEvent(_) => {}
                 event => return Poll::Ready(event.map_out(|_| ())),
             }
@@ -164,14 +238,41 @@ impl NetworkBehaviour for Inbound {
     }
 }
 
-fn overloaded(request: SwarmRequest) -> SwarmResponse {
-    match request {
-        SwarmRequest::Ask { .. } => SwarmResponse::Ask(Err(RemoteSendError::MailboxFull)),
-        SwarmRequest::Tell { .. } => SwarmResponse::Tell(Err(RemoteSendError::MailboxFull)),
-        SwarmRequest::Link { .. } => SwarmResponse::Link(Err(RemoteSendError::MailboxFull)),
-        SwarmRequest::Unlink { .. } => SwarmResponse::Unlink(Err(RemoteSendError::MailboxFull)),
-        SwarmRequest::SignalLinkDied { .. } => {
-            SwarmResponse::SignalLinkDied(Err(RemoteSendError::MailboxFull))
+pub(crate) type LegacyWire = Inbound<Legacy>;
+
+#[derive(Default)]
+pub(crate) struct Legacy;
+
+impl InboundProtocol for Legacy {
+    type Request = SwarmRequest;
+    type ActorRequest = SwarmRequest;
+    type Response = SwarmResponse;
+
+    const PROTOCOL: StreamProtocol = LEGACY_PROTOCOL;
+    const SUPPORT: ProtocolSupport = ProtocolSupport::Inbound;
+    const TASK_FAILURE: &'static str = "mesh ingress task failed";
+
+    fn receive(request: SwarmRequest) -> InboundRequest<SwarmRequest, SwarmResponse> {
+        InboundRequest::Dispatch(request)
+    }
+
+    async fn dispatch(
+        gate: &dyn MeshIngress,
+        peer: PeerId,
+        request: SwarmRequest,
+    ) -> SwarmResponse {
+        gate.handle_legacy(peer, request).await
+    }
+
+    fn overloaded(request: SwarmRequest) -> SwarmResponse {
+        match request {
+            SwarmRequest::Ask { .. } => SwarmResponse::Ask(Err(RemoteSendError::MailboxFull)),
+            SwarmRequest::Tell { .. } => SwarmResponse::Tell(Err(RemoteSendError::MailboxFull)),
+            SwarmRequest::Link { .. } => SwarmResponse::Link(Err(RemoteSendError::MailboxFull)),
+            SwarmRequest::Unlink { .. } => SwarmResponse::Unlink(Err(RemoteSendError::MailboxFull)),
+            SwarmRequest::SignalLinkDied { .. } => {
+                SwarmResponse::SignalLinkDied(Err(RemoteSendError::MailboxFull))
+            }
         }
     }
 }

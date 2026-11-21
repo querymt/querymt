@@ -4,7 +4,7 @@
 use super::{
     GuardedProvider, enforce_settlement, failure, quota_error, validate_item_aware_request,
 };
-use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
+use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use crate::peer_access::quota::{QuotaError, ReservedAttempt, StreamMeter};
 use crate::peer_access::{PeerGrantKey, SharingProtocol};
 use crate::request_timeout::ask_sharing_v1;
@@ -108,21 +108,15 @@ pub(in crate::provider_share) fn install(
         },
         active: Mutex::new(HashMap::new()),
     });
-    let start = |service: Arc<StreamService>| {
-        move |peer, msg| {
-            let service = service.clone();
-            async move { service.start(peer, msg).await }
-        }
-    };
-    router.register_legacy_tell::<ProviderHostActor, StreamRequest, _, _, _>(
+    let stream = service.clone();
+    router.register::<ProviderHostActor, StreamRequest, _, _, _, _>(
         host,
-        InboundAccess::LegacyFull,
-        start(service.clone()),
-    );
-    router.register_v1_ask::<ProviderHostActor, StreamRequest, _, _, _, _>(
-        host,
+        InboundDelivery::LegacyTellV1Ask,
         InboundAccess::Providers,
-        start(service.clone()),
+        move |peer, msg| {
+            let service = stream.clone();
+            async move { service.start(peer, msg).await }
+        },
     );
     macro_rules! control {
         ($message:ty, $method:ident) => {{
@@ -131,13 +125,9 @@ pub(in crate::provider_share) fn install(
                 let service = service.clone();
                 async move { service.$method(&peer, msg).await }
             };
-            router.register_ask::<ProviderHostActor, $message, _, _, _, _>(
+            router.register::<ProviderHostActor, $message, _, _, _, _>(
                 host,
-                InboundAccess::LegacyFull,
-                handler.clone(),
-            );
-            router.register_v1_ask::<ProviderHostActor, $message, _, _, _, _>(
-                host,
+                InboundDelivery::Ask,
                 InboundAccess::Providers,
                 handler,
             );

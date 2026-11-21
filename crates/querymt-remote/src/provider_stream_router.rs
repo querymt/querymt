@@ -66,7 +66,7 @@ pub(crate) fn register_peer_relay(
     actor: &kameo::actor::ActorRef<ProviderStreamRouterActor>,
     host: libp2p::PeerId,
 ) {
-    use crate::mesh_ingress::{InboundAccess, PeerRequest};
+    use crate::mesh_ingress::{InboundAccess, InboundDelivery, PeerRequest};
 
     let weak = actor.downgrade();
     let relay = move |peer: PeerRequest, msg| {
@@ -82,13 +82,9 @@ pub(crate) fn register_peer_relay(
                 .map_err(|error| error.to_string())
         }
     };
-    ingress.register_legacy_tell::<ProviderStreamRouterActor, RoutedStreamRelayMessage, _, _, _>(
+    ingress.register::<ProviderStreamRouterActor, RoutedStreamRelayMessage, _, _, _, _>(
         actor_id,
-        InboundAccess::Identity,
-        relay.clone(),
-    );
-    ingress.register_v1_ask::<ProviderStreamRouterActor, RoutedStreamRelayMessage, _, _, _, _>(
-        actor_id,
+        InboundDelivery::LegacyTellV1Ask,
         InboundAccess::Identity,
         relay,
     );

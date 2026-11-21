@@ -27,13 +27,40 @@ mod tests;
 type AskResult = Result<Vec<u8>, RemoteSendError<Vec<u8>>>;
 type Handler =
     dyn Fn(PeerRequest, Vec<u8>) -> Pin<Box<dyn Future<Output = AskResult> + Send>> + Send + Sync;
-type RouteKey = (SharingProtocol, Delivery, &'static str, &'static str);
+type RouteKey = (&'static str, &'static str);
 type Routes = HashMap<ActorId, HashMap<RouteKey, Arc<Route>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Delivery {
     Ask,
     Tell,
+}
+
+/// The wire envelopes accepted by a route. The payload decoder is shared.
+#[derive(Debug, Clone, Copy)]
+pub enum InboundDelivery {
+    /// Ask on either protocol.
+    Ask,
+    /// Ask only on the legacy protocol.
+    LegacyAsk,
+    /// Ask only on the grant-aware protocol.
+    V1Ask,
+    /// Legacy Tell acknowledgment or grant-aware Ask reply for the same message.
+    LegacyTellV1Ask,
+}
+
+impl InboundDelivery {
+    fn accepts(self, protocol: SharingProtocol, delivery: Delivery) -> bool {
+        use Delivery::{Ask, Tell};
+        use SharingProtocol::{Legacy, V1};
+        matches!(
+            (self, protocol, delivery),
+            (Self::Ask, _, Ask)
+                | (Self::LegacyAsk, Legacy, Ask)
+                | (Self::V1Ask | Self::LegacyTellV1Ask, V1, Ask)
+                | (Self::LegacyTellV1Ask, Legacy, Tell)
+        )
+    }
 }
 
 /// Trusted local metadata captured at the network boundary. It is not wire data.
@@ -69,8 +96,8 @@ pub enum InboundAccess {
     Identity,
     /// The caller can read only the effective grant addressed to itself.
     PeerAccess,
-    /// Full access on the legacy contract, regardless of advertised peer version.
-    LegacyFull,
+    /// Full access, including on the grant-aware contract.
+    Full,
     /// Grant-aware session operations (not sufficient for tool execution).
     Sessions,
     /// Grant-aware workspace operations.
@@ -89,7 +116,7 @@ impl InboundAccess {
         }
         match self {
             Self::Identity | Self::PeerAccess => true,
-            Self::LegacyFull => grant == &PeerGrant::Full,
+            Self::Full => grant == &PeerGrant::Full,
             Self::Sessions => grant.allows_sessions(protocol),
             Self::Filesystem => grant.allows_filesystem(protocol),
             Self::Providers => match grant {
@@ -102,6 +129,7 @@ impl InboundAccess {
 }
 
 struct Route {
+    delivery: InboundDelivery,
     access: InboundAccess,
     handler: Box<Handler>,
 }
@@ -127,79 +155,11 @@ impl InboundRouter {
     /// Install an explicit wire message handler. Decode and reply encoding match
     /// Kameo 0.22, but the handler receives local peer metadata as a separate value.
     /// The handler must not copy remote authority from any field in `M`.
-    pub fn register_ask<A, M, R, E, F, Fut>(
+    /// Callback handlers must validate the authenticated sender and active context.
+    pub fn register<A, M, R, E, F, Fut>(
         &self,
         actor_id: ActorId,
-        access: InboundAccess,
-        handler: F,
-    ) where
-        A: RemoteActor + RemoteMessage<M>,
-        M: DeserializeOwned + Send + 'static,
-        R: Serialize + Send,
-        E: Serialize + Send,
-        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-    {
-        self.register::<A, M, R, E, F, Fut>(
-            actor_id,
-            SharingProtocol::Legacy,
-            Delivery::Ask,
-            access,
-            handler,
-        );
-    }
-
-    /// Install a handler only for the grant-aware protocol.
-    pub fn register_v1_ask<A, M, R, E, F, Fut>(
-        &self,
-        actor_id: ActorId,
-        access: InboundAccess,
-        handler: F,
-    ) where
-        A: RemoteActor + RemoteMessage<M>,
-        M: DeserializeOwned + Send + 'static,
-        R: Serialize + Send,
-        E: Serialize + Send,
-        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-    {
-        self.register::<A, M, R, E, F, Fut>(
-            actor_id,
-            SharingProtocol::V1,
-            Delivery::Ask,
-            access,
-            handler,
-        );
-    }
-
-    /// Install an explicitly guarded legacy notification route. The handler must
-    /// validate the authenticated sender and active context before accepting a callback.
-    pub fn register_legacy_tell<A, M, E, F, Fut>(
-        &self,
-        actor_id: ActorId,
-        access: InboundAccess,
-        handler: F,
-    ) where
-        A: RemoteActor + RemoteMessage<M>,
-        M: DeserializeOwned + Send + 'static,
-        E: Serialize + Send,
-        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
-    {
-        self.register::<A, M, (), E, F, Fut>(
-            actor_id,
-            SharingProtocol::Legacy,
-            Delivery::Tell,
-            access,
-            handler,
-        );
-    }
-
-    fn register<A, M, R, E, F, Fut>(
-        &self,
-        actor_id: ActorId,
-        protocol: SharingProtocol,
-        delivery: Delivery,
+        delivery: InboundDelivery,
         access: InboundAccess,
         handler: F,
     ) where
@@ -230,12 +190,14 @@ impl InboundRouter {
         });
         self.routes.write().entry(actor_id).or_default().insert(
             (
-                protocol,
-                delivery,
                 <A as RemoteActor>::REMOTE_ID,
                 <A as RemoteMessage<M>>::REMOTE_ID,
             ),
-            Arc::new(Route { access, handler }),
+            Arc::new(Route {
+                delivery,
+                access,
+                handler,
+            }),
         );
     }
 
@@ -300,17 +262,13 @@ impl InboundRouter {
         if actor_id.peer_id() != Some(&self.host) {
             return Ok(Err(RemoteSendError::BadActorType));
         }
-        let route_key = (
-            protocol,
-            delivery,
-            actor_remote_id.as_ref(),
-            message_remote_id.as_ref(),
-        );
+        let route_key = (actor_remote_id.as_ref(), message_remote_id.as_ref());
         let Some(route) = self
             .routes
             .read()
             .get(&actor_id)
             .and_then(|routes| routes.get(&route_key))
+            .filter(|route| route.delivery.accepts(protocol, delivery))
             .cloned()
         else {
             return Ok(Err(RemoteSendError::UnknownMessage {

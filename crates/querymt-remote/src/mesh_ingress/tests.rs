@@ -15,7 +15,7 @@ struct RecordingGate(mpsc::UnboundedSender<PeerId>);
 impl MeshIngress for RecordingGate {
     async fn handle_legacy(&self, peer: PeerId, request: SwarmRequest) -> SwarmResponse {
         self.0.send(peer).unwrap();
-        overloaded(request)
+        Legacy::overloaded(request)
     }
 
     async fn handle_v1(
@@ -125,6 +125,47 @@ async fn exchange<B: NetworkBehaviour>(
             _ = server.select_next_some() => {},
         }
     }
+}
+
+#[tokio::test]
+async fn sharing_probe_bypasses_the_actor_task_limit() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (tx, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new(RecordingGate(tx));
+        let mut server = lan(|_| SharingWire::new(gate.clone(), Duration::from_secs(3)));
+        let mut client = lan(|_| SharingWire::new(gate, Duration::from_secs(3)));
+        let addr = listening(&mut server, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        let host = *server.local_peer_id();
+        client.add_peer_address(host, addr);
+        for _ in 0..MAX_IN_FLIGHT {
+            server.behaviour_mut().tasks.spawn(std::future::pending());
+        }
+        let ask = SwarmRequest::Ask {
+            actor_id: ActorId::new_with_peer_id(17, host),
+            actor_remote_id: "test::Echo".into(),
+            message_remote_id: "test::EchoRequest".into(),
+            payload: vec![],
+            mailbox_timeout: None,
+            reply_timeout: None,
+            immediate: false,
+        };
+        assert!(matches!(
+            exchange(
+                &mut client,
+                &mut server,
+                SharingRequest::Actor(Box::new(ask))
+            )
+            .await,
+            Ok(SharingResponse::Actor(Err(SharingRejection::Busy)))
+        ));
+        assert!(matches!(
+            exchange(&mut client, &mut server, SharingRequest::Probe).await,
+            Ok(SharingResponse::Supported)
+        ));
+        assert!(calls.try_recv().is_err());
+    })
+    .await
+    .expect("sharing capacity test timed out");
 }
 
 #[tokio::test]
@@ -262,8 +303,9 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
         let mut host = lan(|peer| {
             let router = Arc::new(InboundRouter::new(peer, grants.clone()));
             let provider = ActorId::new_with_peer_id(1, peer);
-            router.register_v1_ask::<ProviderHostActor, MeteredChat, _, RemoteProviderHostError, _, _>(
+            router.register::<ProviderHostActor, MeteredChat, _, RemoteProviderHostError, _, _>(
                 provider,
+                InboundDelivery::V1Ask,
                 InboundAccess::Providers,
                 |_, msg| async move {
                     assert_eq!(msg.request.model, "echo-model");
@@ -271,16 +313,18 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
                     Ok(chat_reply(7))
                 },
             );
-            router.register_v1_ask::<ProviderHostActor, StreamStart, _, RemoteProviderHostError, _, _>(
+            router.register::<ProviderHostActor, StreamStart, _, RemoteProviderHostError, _, _>(
                 provider,
+                InboundDelivery::V1Ask,
                 InboundAccess::Providers,
                 move |peer, request| {
                     start_tx.send((peer.key().clone(), request)).unwrap();
                     async { Ok(()) }
                 },
             );
-            router.register_v1_ask::<ProviderHostActor, RenewProviderStreamLease, _, kameo::error::Infallible, _, _>(
+            router.register::<ProviderHostActor, RenewProviderStreamLease, _, kameo::error::Infallible, _, _>(
                 provider,
+                InboundDelivery::V1Ask,
                 InboundAccess::Providers,
                 move |_, request| {
                     let (finish, reply) = oneshot::channel();
@@ -292,12 +336,13 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
         });
         let mut legacy = lan(|peer| {
             let router = Arc::new(InboundRouter::new(peer, grants.clone()));
-            router.register_ask::<ProviderHostActor, ProviderChatRequest, _, RemoteProviderHostError, _, _>(
+            router.register::<ProviderHostActor, ProviderChatRequest, _, RemoteProviderHostError, _, _>(
                 ActorId::new_with_peer_id(1, peer),
-                InboundAccess::LegacyFull,
+                InboundDelivery::LegacyAsk,
+                InboundAccess::Full,
                 |_, _| async { Ok(chat_reply(3)) },
             );
-            Inbound::new(router, Duration::from_secs(3))
+            LegacyWire::new(router, Duration::from_secs(3))
         });
         let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         let host_addr = listening(&mut host, loopback.clone()).await;
