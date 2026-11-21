@@ -3078,6 +3078,7 @@ impl AgentsStore {
                             .cloned()
                             .unwrap_or_default();
                         view.prepend_events(&events, &prompts);
+                        view.apply_truncation(page.get("truncated"));
                         crate::telemetry::record_history_load("ok");
                         tracing::info!(events = events.len(), "older history page loaded");
                         let complete = page
@@ -3111,6 +3112,90 @@ impl AgentsStore {
     }
 
     /// Clear a failed older-history fetch and try again.
+    /// The open session's agent returns complete tool content a load shortened.
+    pub fn supports_tool_content(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|v| self.runtime(&v.agent_id))
+            .is_some_and(|rt| rt.supports_method("querymt/session/toolContent"))
+    }
+
+    /// Fetch the complete `part` (`result` or `arguments`) of tool call `id`
+    /// of the open session, which a windowed load shortened.
+    pub fn load_tool_content(&mut self, id: &str, part: &'static str, cx: &mut Context<Self>) {
+        if !self.supports_tool_content() {
+            return;
+        }
+        let Some(rpc) = self
+            .session
+            .as_ref()
+            .and_then(|v| self.runtime(&v.agent_id))
+            .and_then(|rt| rt.rpc.clone())
+        else {
+            return;
+        };
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
+        let Some(call) = view.truncated_tool(id) else {
+            return;
+        };
+        let shortened = match part {
+            "result" => call.truncated_result.is_some(),
+            _ => call.truncated_args.is_some(),
+        };
+        if !shortened || matches!(call.fetch, Some(crate::session::ContentFetch::Loading(_))) {
+            return;
+        }
+        let (agent, session, id) = (
+            view.agent_id.clone(),
+            view.session_id.clone(),
+            id.to_owned(),
+        );
+        view.set_tool_fetch(&id, Some(crate::session::ContentFetch::Loading(part)));
+        cx.notify();
+        let request = rpc.request(
+            "_querymt/session/toolContent",
+            json!({ "sessionId": session, "toolCallId": id, "part": part }),
+        );
+        cx.spawn(async move |this, cx| {
+            let result = request.await.and_then(|v| {
+                v.get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "The agent returned no content.".to_string())
+            });
+            let _ = this.update(cx, |s, cx| {
+                let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent && v.session_id == session)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(content) => view.set_full_tool_content(&id, part, content),
+                    Err(error) => {
+                        tracing::warn!(%error, tool = %id, part, "tool content fetch failed");
+                        view.set_tool_fetch(
+                            &id,
+                            Some(crate::session::ContentFetch::Failed(format!(
+                                "Could not load the full {}: {error}",
+                                if part == "result" {
+                                    "output"
+                                } else {
+                                    "parameters"
+                                }
+                            ))),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn retry_older_history(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = self.session.as_mut() {
             view.history_error = None;

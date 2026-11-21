@@ -294,6 +294,21 @@ impl AgentsStore {
     pub(crate) fn runtime_mut_for_test(&mut self, agent: &str) -> &mut super::AgentRuntime {
         self.runtime.entry(agent.to_owned()).or_default()
     }
+
+    /// Connect `agent` to a test channel: requests arrive on the receiver,
+    /// replies go through the returned client's `handle`.
+    pub(crate) fn rpc_for_test(
+        &mut self,
+        agent: &str,
+    ) -> (
+        std::rc::Rc<crate::rpc::RpcClient>,
+        async_channel::Receiver<String>,
+    ) {
+        let (sender, requests) = async_channel::unbounded();
+        let rpc = crate::rpc::RpcClient::new(sender);
+        self.runtime_mut_for_test(agent).rpc = Some(rpc.clone());
+        (rpc, requests)
+    }
 }
 
 /// A connected agent with one mesh peer (`thor`), worktrees and profiles.

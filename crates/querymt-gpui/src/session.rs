@@ -220,6 +220,13 @@ pub struct ToolCall {
     /// facts derived from it are computed once, never per frame.
     output: String,
     facts: OutputFacts,
+    /// A windowed load shortened the result: its full size in bytes.
+    /// `session/toolContent` returns the complete text.
+    pub truncated_result: Option<u64>,
+    /// A windowed load shortened string arguments: their full size in bytes.
+    pub truncated_args: Option<u64>,
+    /// Fetching the complete result or arguments (`session/toolContent`).
+    pub fetch: Option<ContentFetch>,
     pub diffs: Vec<Diff>,
     pub locations: Vec<String>,
     /// Lines (added, removed) across `diffs`; computed once when the diffs arrive.
@@ -243,6 +250,14 @@ pub fn diff_stats(d: &Diff) -> (usize, usize) {
         }
     }
     (adds, dels)
+}
+
+/// Progress of fetching a shortened tool call's complete content.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContentFetch {
+    /// The part being fetched: `result` or `arguments`.
+    Loading(&'static str),
+    Failed(String),
 }
 
 /// What rendering needs from a tool result, derived once per change: shell
@@ -309,6 +324,11 @@ impl ToolCall {
 
     pub fn running(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "in_progress" | "")
+    }
+
+    /// An edit tool, whose diff is built from its arguments.
+    pub fn is_edit(&self) -> bool {
+        EDIT_TOOLS.contains(&self.name().to_lowercase().as_str())
     }
 
     pub fn failed(&self) -> bool {
@@ -1307,6 +1327,7 @@ impl SessionView {
                 self.apply_child_links(links);
             }
         }
+        self.apply_truncation(snap.get("truncated"));
         let ts = |ev: &Value| {
             ev.get("timestamp")
                 .and_then(Value::as_f64)
@@ -1819,6 +1840,95 @@ impl SessionView {
     fn push(&mut self, key: String, kind: ItemKind) {
         let rev = self.next_rev();
         self.items.push(Item { key, rev, kind });
+    }
+
+    /// Mark tool calls whose result or string arguments a windowed load
+    /// shortened (`truncated` of a load snapshot or a history page).
+    pub fn apply_truncation(&mut self, entries: Option<&Value>) {
+        for entry in entries.and_then(Value::as_array).into_iter().flatten() {
+            let (Some(id), Some(part), Some(bytes)) = (
+                entry.get("tool_call_id").and_then(Value::as_str),
+                entry.get("part").and_then(Value::as_str),
+                entry.get("full_bytes").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            self.update_tool(id, |call| match part {
+                "result" => call.truncated_result = Some(bytes),
+                "arguments" => {
+                    call.truncated_args = Some(call.truncated_args.unwrap_or(0).max(bytes));
+                    // A diff built from shortened arguments would be silently
+                    // incomplete: drop it until the full arguments arrive.
+                    if call.synthesized {
+                        call.diffs.clear();
+                        call.stats = (0, 0);
+                        call.synthesized = false;
+                    }
+                }
+                _ => {}
+            });
+        }
+    }
+
+    /// Fetching the complete content of tool call `id` started or failed.
+    pub fn set_tool_fetch(&mut self, id: &str, fetch: Option<ContentFetch>) {
+        self.update_tool(id, |call| call.fetch = fetch);
+    }
+
+    /// A tool call whose result or arguments a load shortened.
+    pub fn truncated_tool(&self, id: &str) -> Option<&ToolCall> {
+        let ix = *self.tool_index.get(id)?;
+        let ItemKind::Work(entries) = &self.items[ix].kind else {
+            return None;
+        };
+        entries.iter().find_map(|e| match e {
+            WorkEntry::Tool(c) if c.id == id => Some(c.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// The complete result or arguments of a shortened tool call arrived.
+    pub fn set_full_tool_content(&mut self, id: &str, part: &str, content: String) {
+        self.update_tool(id, |call| {
+            call.fetch = None;
+            if part == "result" {
+                call.set_output(content);
+                call.truncated_result = None;
+            } else {
+                // Arguments come back as their JSON text.
+                if let Ok(input) = serde_json::from_str::<Value>(&content) {
+                    call.input = Some(input);
+                }
+                call.truncated_args = None;
+                if call.diffs.is_empty() || call.synthesized {
+                    let diffs = synthesized_diffs(call);
+                    call.synthesized = !diffs.is_empty();
+                    call.stats = diffs
+                        .iter()
+                        .map(diff_stats)
+                        .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                    call.diffs = diffs;
+                }
+            }
+        });
+    }
+
+    /// Change tool call `id` in place and mark its row changed.
+    fn update_tool(&mut self, id: &str, change: impl FnOnce(&mut ToolCall)) {
+        let Some(ix) = self.tool_index.get(id).copied() else {
+            return;
+        };
+        let ItemKind::Work(entries) = &mut self.items[ix].kind else {
+            return;
+        };
+        let Some(call) = entries.iter_mut().find_map(|e| match e {
+            WorkEntry::Tool(c) if c.id == id => Some(std::sync::Arc::make_mut(c)),
+            _ => None,
+        }) else {
+            return;
+        };
+        change(call);
+        self.touch(ix);
     }
 
     fn touch(&mut self, ix: usize) {

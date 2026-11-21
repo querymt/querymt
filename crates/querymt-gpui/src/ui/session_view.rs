@@ -330,6 +330,8 @@ struct RenderCtx {
     /// Appearance setting: fade streamed reply and reasoning text in.
     stream_fade: bool,
     md: md::Kept,
+    /// The agent returns complete tool content a load shortened.
+    tool_content: bool,
 }
 
 impl RenderCtx {
@@ -373,7 +375,15 @@ impl RenderCtx {
         for e in entries {
             self.expanded.contains(e.id()).hash(h);
             if let WorkEntry::Tool(call) = e {
-                self.expanded.contains(&tool_details_key(&call.id)).hash(h);
+                // Details, "Show N more lines" of the output and of each
+                // diff file: every key naming the call (the set is small).
+                let mut keys: Vec<&String> = self
+                    .expanded
+                    .iter()
+                    .filter(|k| k.contains(call.id.as_str()))
+                    .collect();
+                keys.sort();
+                keys.hash(h);
             }
         }
     }
@@ -392,9 +402,10 @@ impl RenderCtx {
         self.hash_globals(h);
     }
 
-    /// What every row depends on: the syntax theme.
+    /// What every row depends on: theme and agent abilities.
     fn hash_globals(&self, h: &mut DefaultHasher) {
         (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(h);
+        self.tool_content.hash(h);
     }
 
     /// Signature of one transcript row: it changes exactly when the row's
@@ -430,6 +441,8 @@ impl RenderCtx {
                             std::sync::Arc::as_ptr(call) as usize,
                             call.status.as_str(),
                             call.output().len(),
+                            call.truncated_result,
+                            call.truncated_args,
                         )
                             .hash(&mut h),
                         WorkEntry::Thought(t) => (t.id.as_str(), t.text.len()).hash(&mut h),
@@ -1107,15 +1120,83 @@ fn linked_text(id: impl Into<ElementId>, text: String, p: &Palette) -> Interacti
     })
 }
 
-fn clipped(text: &str, max: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max {
-        return text.trim_end().to_string();
+/// The first `cap` lines of `text` (see [`more_lines`]).
+fn clipped(text: &str, cap: usize) -> String {
+    match text.match_indices('\n').nth(cap.saturating_sub(1)) {
+        Some((end, _)) if cap > 0 => text[..end].trim_end().to_string(),
+        _ => text.trim_end().to_string(),
     }
-    format!(
-        "{}\n… {} more lines",
-        lines[..max].join("\n"),
-        lines.len() - max
+}
+
+/// Expanded-state key of a block's "Show N more lines".
+fn more_key(key: &str) -> String {
+    format!("{key}#more")
+}
+
+/// Lines block `key` shows: `max`, or all once its rest is shown.
+fn line_cap(key: &str, max: usize, rc: &RenderCtx) -> usize {
+    if rc.expanded.contains(&more_key(key)) {
+        usize::MAX
+    } else {
+        max
+    }
+}
+
+/// "Show N more lines" under a block cut at `max` of its `total` lines, or
+/// "Show fewer lines" once it shows them all (desktop shows results whole).
+fn more_lines(key: &str, total: usize, max: usize, rc: &RenderCtx) -> Option<AnyElement> {
+    if total <= max {
+        return None;
+    }
+    let p = &rc.p;
+    let more = more_key(key);
+    let open = rc.expanded.contains(&more);
+    let hover = p.card_hover.opacity(0.55);
+    let weak = rc.weak.clone();
+    Some(
+        h_flex()
+            .id(SharedString::from(format!("more-{key}")))
+            .gap_1p5()
+            .px_3()
+            .py_1()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .text_xs()
+            .text_color(p.dim)
+            .child(kit::icon(
+                if open {
+                    IconName::ChevronsUp
+                } else {
+                    IconName::ChevronsDown
+                },
+                12.,
+                p.dim,
+            ))
+            .child(if open {
+                "Show fewer lines".to_string()
+            } else {
+                let hidden = total - max;
+                format!(
+                    "Show {hidden} more {}",
+                    if hidden == 1 { "line" } else { "lines" }
+                )
+            })
+            .on_click(move |_, _, cx| toggle_expanded(&weak, more.clone(), cx))
+            .into_any_element(),
+    )
+}
+
+/// A text block cut at `max` lines, with its "Show N more lines".
+fn clipped_with_more(
+    key: &str,
+    text: &str,
+    max: usize,
+    rc: &RenderCtx,
+) -> (String, Option<AnyElement>) {
+    let total = text.trim_end().lines().count();
+    (
+        clipped(text, line_cap(key, max, rc)),
+        more_lines(key, total, max, rc),
     )
 }
 
@@ -1169,7 +1250,8 @@ fn detail_section(
 /// (old | new), a sign column and the line, tinted per change. Snippet diffs
 /// (edit arguments) show every line; whole-file diffs collapse unchanged runs.
 /// Diff rows of one hunk plus its (added, removed) counts.
-fn diff_rows(d: &Diff, p: &Palette) -> (Vec<AnyElement>, usize, usize) {
+/// Rows of a hunk, at most `cap`; also the lines it adds, removes and has.
+fn diff_rows(d: &Diff, cap: usize, p: &Palette) -> (Vec<AnyElement>, usize, usize, usize) {
     let old = d.old.clone().unwrap_or_default();
     let diff = similar::TextDiff::from_lines(&old, &d.new);
     let (mut adds, mut dels) = (0usize, 0usize);
@@ -1206,7 +1288,7 @@ fn diff_rows(d: &Diff, p: &Palette) -> (Vec<AnyElement>, usize, usize) {
         diff.grouped_ops(3)
     };
     for (gix, group) in groups.iter().enumerate() {
-        if gix > 0 && shown < DIFF_LINES {
+        if gix > 0 && shown < cap {
             rows.push(ellipsis(p));
         }
         for op in group {
@@ -1225,7 +1307,7 @@ fn diff_rows(d: &Diff, p: &Palette) -> (Vec<AnyElement>, usize, usize) {
                     }
                 };
                 shown += 1;
-                if shown > DIFF_LINES {
+                if shown > cap {
                     continue;
                 }
                 let old_no = change
@@ -1273,17 +1355,7 @@ fn diff_rows(d: &Diff, p: &Palette) -> (Vec<AnyElement>, usize, usize) {
             }
         }
     }
-    if shown > DIFF_LINES {
-        rows.push(
-            div()
-                .px_3()
-                .py_1()
-                .text_color(p.dim)
-                .child(format!("… {} more lines", shown - DIFF_LINES))
-                .into_any_element(),
-        );
-    }
-    (rows, adds, dels)
+    (rows, adds, dels, shown)
 }
 
 /// GitHub-style hunk marker (`@@ -10,2 +10,3 @@`); between hunks it doubles as
@@ -1333,8 +1405,12 @@ fn render_diff_file(
     let (mut adds, mut dels) = (0usize, 0usize);
     let mut body: Vec<AnyElement> = Vec::new();
     let multi = hunks.len() > 1;
+    // Each hunk is cut at `DIFF_LINES`; one toggle shows the rest of all.
+    let cap = line_cap(&key, DIFF_LINES, rc);
+    let mut hidden = 0;
     for (ix, d) in hunks.iter().enumerate() {
-        let (rows, a, r) = diff_rows(d, p);
+        let (rows, a, r, lines) = diff_rows(d, cap, p);
+        hidden += lines.saturating_sub(DIFF_LINES);
         adds += a;
         dels += r;
         if multi || d.old_start.is_some() {
@@ -1342,6 +1418,7 @@ fn render_diff_file(
         }
         body.extend(rows);
     }
+    let more = more_lines(&key, DIFF_LINES + hidden, DIFF_LINES, rc);
     // The tool card attached to the header draws the frame.
     v_flex()
         .w_full()
@@ -1395,6 +1472,7 @@ fn render_diff_file(
                 .children(body),
             rc,
         ))
+        .children(more)
 }
 
 /// Structured results open as a card attached to the tool row; unknown or
@@ -1804,12 +1882,14 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 .when(ix > 0, |el| el.border_t_1().border_color(p.border))
             }))
             .when(call.failed() && !output.trim().is_empty(), |el| {
+                let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
                 el.child(
-                    flat_block(clipped(output, OUTPUT_LINES), p)
+                    flat_block(text, p)
                         .border_t_1()
                         .border_color(p.border)
                         .text_color(p.danger),
                 )
+                .children(more)
             });
     }
     if is_shell(call) {
@@ -1828,16 +1908,19 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 )
                 .into_any_element()
             } else {
-                let block = flat_block(clipped(output, OUTPUT_LINES), p)
-                    .when(call.failed(), |el| el.text_color(p.danger));
-                scroll_area(
-                    format!("term-{}", call.id),
-                    TERMINAL_BLOCK_MAX_H,
-                    ScrollbarAxis::Vertical,
-                    block,
-                    rc,
-                )
-                .into_any_element()
+                let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
+                let block = flat_block(text, p).when(call.failed(), |el| el.text_color(p.danger));
+                v_flex()
+                    .w_full()
+                    .child(scroll_area(
+                        format!("term-{}", call.id),
+                        TERMINAL_BLOCK_MAX_H,
+                        ScrollbarAxis::Vertical,
+                        block,
+                        rc,
+                    ))
+                    .children(more)
+                    .into_any_element()
             });
     }
     if is_fetch(call) {
@@ -1855,7 +1938,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             )
             .into_any_element()
         } else {
-            let text = clipped(output, READ_LINES);
+            let (text, more) = clipped_with_more(id, output, READ_LINES, rc);
             let block = flat_frame(p)
                 .when(call.failed(), |el| el.text_color(p.danger))
                 .child(linked_text(
@@ -1863,14 +1946,17 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                     text,
                     p,
                 ));
-            scroll_area(
-                format!("fetch-scroll-{id}"),
-                READ_BLOCK_MAX_H,
-                ScrollbarAxis::Vertical,
-                block,
-                rc,
-            )
-            .into_any_element()
+            v_flex()
+                .w_full()
+                .child(scroll_area(
+                    format!("fetch-scroll-{id}"),
+                    READ_BLOCK_MAX_H,
+                    ScrollbarAxis::Vertical,
+                    block,
+                    rc,
+                ))
+                .children(more)
+                .into_any_element()
         });
     }
     if output.trim().is_empty() {
@@ -1884,14 +1970,17 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         ));
     }
     if call.failed() {
-        return body.child(flat_block(clipped(output, OUTPUT_LINES), p).text_color(p.danger));
+        let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
+        return body
+            .child(flat_block(text, p).text_color(p.danger))
+            .children(more);
     }
     let path = call.summary();
     let code = super::code::read_output(
         &format!("read-{}", call.id),
         output,
         Some(path.as_str()).filter(|s| !s.is_empty()),
-        READ_LINES,
+        line_cap(&call.id, READ_LINES, rc),
         true,
         &rc.syntax,
         p,
@@ -1901,6 +1990,12 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         READ_BLOCK_MAX_H,
         ScrollbarAxis::Vertical,
         code,
+        rc,
+    ))
+    .children(more_lines(
+        &call.id,
+        super::code::read_line_count(output),
+        READ_LINES,
         rc,
     ))
 }
@@ -2034,6 +2129,16 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
     let (adds, dels) = call.stats;
     let (id, weak) = (call.id.clone(), rc.weak.clone());
     let attached = open && expandable && attaches_to_header(call);
+    // Opening an edit whose arguments a load shortened fetches them, so its
+    // diff can be built (desktop `editNeedsFullArguments`).
+    let fetch_args = !open
+        && rc.tool_content
+        && call.is_edit()
+        && call.truncated_args.is_some()
+        && call.fetch.is_none();
+    let strip = (open && expandable)
+        .then(|| truncation_strip(call, rc))
+        .flatten();
     let row = h_flex()
         .id(SharedString::from(format!("tool-{}", call.id)))
         .gap_2()
@@ -2160,7 +2265,16 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
                                     )),
                             ),
                     )
-                    .on_click(move |_, _, cx| toggle_expanded(&weak, id.clone(), cx))
+                    .on_click(move |_, _, cx| {
+                        toggle_expanded(&weak, id.clone(), cx);
+                        if fetch_args {
+                            let id = id.clone();
+                            let _ = weak.update(cx, |this, cx| {
+                                this.store
+                                    .update(cx, |s, cx| s.load_tool_content(&id, "arguments", cx))
+                            });
+                        }
+                    })
             }
         });
     if attached {
@@ -2173,6 +2287,7 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
             .overflow_hidden()
             .bg(p.bg)
             .child(row)
+            .children(strip)
             .child(attached_content(call, rc))
             // GPUI clips children to rectangles, so tinted diff rows would show
             // square corners past the rounded border: paint the transcript
@@ -2184,9 +2299,96 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
     v_flex()
         .child(row)
         .when(open && expandable, |el| {
-            el.child(detail_well(p).child(tool_content(call, rc)))
+            el.child(detail_well(p).children(strip).child(tool_content(call, rc)))
         })
         .into_any_element()
+}
+
+/// "Output shortened" with "Show full output" (desktop
+/// `session-tool-truncated`): a windowed load cut this call's result or
+/// arguments, and the agent can return them whole.
+fn truncation_strip(call: &ToolCall, rc: &RenderCtx) -> Option<AnyElement> {
+    use crate::session::ContentFetch;
+
+    let (part, bytes, noun) = match (call.truncated_result, call.truncated_args) {
+        (Some(bytes), _) => ("result", bytes, "output"),
+        (None, Some(bytes)) => ("arguments", bytes, "parameters"),
+        (None, None) => return None,
+    };
+    let p = &rc.p;
+    let id = call.id.clone();
+    let weak = rc.weak.clone();
+    let load = move |id: String| {
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let id = id.clone();
+            let _ = weak.update(cx, |this, cx| {
+                this.store
+                    .update(cx, |s, cx| s.load_tool_content(&id, part, cx))
+            });
+        }
+    };
+    let action: AnyElement = match &call.fetch {
+        Some(ContentFetch::Loading(_)) => h_flex()
+            .gap_1p5()
+            .child(kit::spinner(
+                SharedString::from(format!("tc-spin-{}", call.id)),
+                12.,
+                p.muted,
+            ))
+            .child(format!("Loading full {noun}…"))
+            .into_any_element(),
+        _ if !rc.tool_content => div().into_any_element(),
+        Some(ContentFetch::Failed(_)) => kit::flat_btn(
+            SharedString::from(format!("tc-retry-{}", call.id)),
+            true,
+            true,
+            p,
+        )
+        .h(px(24.))
+        .child("Try again")
+        .on_click(load(id))
+        .into_any_element(),
+        None => kit::flat_btn(
+            SharedString::from(format!("tc-load-{}", call.id)),
+            true,
+            true,
+            p,
+        )
+        .h(px(24.))
+        .child(kit::icon(IconName::ChevronsDown, 13., p.text))
+        .child(format!("Show full {noun}"))
+        .on_click(load(id))
+        .into_any_element(),
+    };
+    let error = match &call.fetch {
+        Some(ContentFetch::Failed(error)) => Some(error.clone()),
+        _ => None,
+    };
+    Some(
+        v_flex()
+            .gap_1()
+            .px_2p5()
+            .py_1p5()
+            .text_xs()
+            .text_color(p.muted)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(kit::icon(IconName::Scissors, 12., p.dim))
+                    .child(div().flex_1().min_w_0().child(format!(
+                        "{} shortened · {} in full",
+                        if part == "result" {
+                            "Output"
+                        } else {
+                            "Parameters"
+                        },
+                        crate::util::human_size(bytes)
+                    )))
+                    .child(action),
+            )
+            .children(error.map(|e| div().text_color(p.danger).child(e)))
+            .into_any_element(),
+    )
 }
 
 /// Longest reasoning title, in chars (desktop `previewMaxLength`).
@@ -4587,6 +4789,7 @@ impl QmtApp {
             agent_id: view.agent_id.clone(),
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
             md: self.transcript.md.clone(),
+            tool_content: store.supports_tool_content(),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {
@@ -5660,6 +5863,8 @@ mod split_tests {
     struct Harness {
         handle: gpui_kit::AnyWindowHandle,
         app: gpui_kit::Entity<QmtApp>,
+        rpc: std::rc::Rc<crate::rpc::RpcClient>,
+        requests: async_channel::Receiver<String>,
     }
 
     fn app_with(
@@ -5673,6 +5878,7 @@ mod split_tests {
             crate::theme::apply(true, "orange", cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
+        let (rpc, requests) = store.rpc_for_test("test-agent");
         store.runtime_mut_for_test("test-agent").capabilities = Some(json!({ "methods": methods }));
         store.session = Some(view);
         let (handle, app) = cx.update(|cx| {
@@ -5682,7 +5888,12 @@ mod split_tests {
             })
             .unwrap()
         });
-        Harness { handle, app }
+        Harness {
+            handle,
+            app,
+            rpc,
+            requests,
+        }
     }
 
     #[gpui_kit::test]
@@ -5714,6 +5925,61 @@ mod split_tests {
             assert_eq!(rows(&app, cx), 2);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn shortened_output_is_fetched_whole(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let mut view = big_session(3);
+        view.apply_truncation(Some(&json!([
+            { "tool_call_id": "t1", "part": "result", "full_bytes": 50000 },
+            { "tool_call_id": "t2", "part": "arguments", "path": "/command", "full_bytes": 9000 }
+        ])));
+        let t1 = view.truncated_tool("t1").unwrap();
+        assert_eq!(t1.truncated_result, Some(50000));
+        assert_eq!(
+            view.truncated_tool("t2").unwrap().truncated_args,
+            Some(9000)
+        );
+        use gpui_kit::AppContext as _;
+        let Harness {
+            handle,
+            app,
+            rpc,
+            requests,
+        } = app_with(cx, view, json!(["querymt/session/toolContent"]));
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                app.expanded_items.insert("t1".into());
+            });
+            window.render_frame(cx);
+            let store = app.read(cx).store.clone();
+            store.update(cx, |s, cx| s.load_tool_content("t1", "result", cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let request: Value = serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(request["method"], "_querymt/session/toolContent");
+        assert_eq!(request["params"]["toolCallId"], "t1");
+        assert_eq!(request["params"]["part"], "result");
+        let full =
+            json!({ "stdout": "the whole output", "stderr": "", "exit_code": 0 }).to_string();
+        rpc.handle(&json!({ "id": request["id"], "result": { "content": full } }).to_string());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let store = app.read(cx).store.read(cx);
+            let call = store
+                .session
+                .as_ref()
+                .unwrap()
+                .truncated_tool("t1")
+                .unwrap();
+            assert_eq!(call.truncated_result, None);
+            assert_eq!(call.pretty_output(), "the whole output");
+            assert!(call.fetch.is_none());
+        });
     }
 }
 
@@ -5765,5 +6031,19 @@ mod perf_export {
         })
         .unwrap();
         crate::telemetry::shutdown();
+    }
+}
+
+#[cfg(test)]
+mod more_lines_tests {
+    use super::clipped;
+
+    #[test]
+    fn clipped_keeps_the_first_lines() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(clipped(text, 2), "a\nb");
+        assert_eq!(clipped(text, 4), "a\nb\nc\nd");
+        assert_eq!(clipped(text, usize::MAX), "a\nb\nc\nd");
+        assert_eq!(clipped("one", 1), "one");
     }
 }
