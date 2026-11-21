@@ -78,6 +78,7 @@ pub(crate) struct ExecutionContext {
     /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
     pub execution_origin: ExecutionOrigin,
     turn_authority: TurnAuthority,
+    restricted_mesh_turn: bool,
 
     /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
@@ -145,6 +146,7 @@ impl ExecutionContext {
             tool_config,
             execution_origin: ExecutionOrigin::Interactive,
             turn_authority: TurnAuthority::Local,
+            restricted_mesh_turn: false,
             knowledge_store: None,
             repository_knowledge: None,
             delivery_budget: std::sync::Mutex::new(None),
@@ -208,7 +210,19 @@ impl ExecutionContext {
         &self.turn_authority
     }
 
+    pub(crate) fn with_restricted_mesh_turn(mut self, restricted: bool) -> Self {
+        self.restricted_mesh_turn = restricted;
+        self
+    }
+
+    pub(crate) fn restricted_mesh_turn(&self) -> bool {
+        self.restricted_mesh_turn
+    }
+
     pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
+        if self.restricted_mesh_turn() {
+            return false;
+        }
         // The delegation orchestrator and routing tools can outlive this turn.
         // Until they preserve its origin, do not let them borrow host authority.
         matches!(self.turn_authority, TurnAuthority::Local)

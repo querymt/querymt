@@ -249,6 +249,10 @@ impl MiddlewareDriver for ContextMiddleware {
     fn name(&self) -> &'static str {
         "ContextMiddleware"
     }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
 }
 
 /// Factory for creating ContextMiddleware from config

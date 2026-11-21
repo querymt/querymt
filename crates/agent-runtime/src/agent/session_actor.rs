@@ -335,9 +335,9 @@ pub(crate) enum TurnAuthority {
 
 #[cfg(feature = "remote")]
 pub(crate) struct PeerTurn {
-    key: querymt_remote::peer_access::PeerGrantKey,
-    revision: Uuid,
-    protocol: querymt_remote::peer_access::SharingProtocol,
+    pub(crate) key: querymt_remote::peer_access::PeerGrantKey,
+    pub(crate) revision: Uuid,
+    pub(crate) protocol: querymt_remote::peer_access::SharingProtocol,
     store: Arc<dyn querymt_remote::peer_access::GrantStore>,
 }
 
@@ -355,6 +355,27 @@ impl PeerTurn {
         })
     }
 
+    pub(crate) async fn grant(&self) -> Result<querymt_remote::peer_access::PeerGrant, AgentError> {
+        let state = self
+            .store
+            .grant(&self.key)
+            .await
+            .map_err(|_| AgentError::MeshAccessDenied)?;
+        if state.revision != self.revision || !state.grant.allows_sessions(self.protocol) {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        Ok(state.grant)
+    }
+
+    pub(crate) async fn revoked(&self) {
+        querymt_remote::peer_access::wait_for_revision_loss(
+            self.store.as_ref(),
+            &self.key,
+            self.revision,
+        )
+        .await;
+    }
+
     pub(crate) fn schedule_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
         use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
         use querymt_remote::peer_access::SharingProtocol;
@@ -367,6 +388,20 @@ impl PeerTurn {
                 SharingProtocol::V1 => SchedulePeerProtocol::V1,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_peer(
+        key: querymt_remote::peer_access::PeerGrantKey,
+        revision: Uuid,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            revision,
+            protocol: querymt_remote::peer_access::SharingProtocol::V1,
+            store,
+        })
     }
 
     #[cfg(test)]
@@ -405,18 +440,8 @@ impl TurnAuthority {
     pub(crate) async fn check(&self) -> Result<(), AgentError> {
         match self {
             Self::Local => Ok(()),
-            // Until restricted tools and hosted inference share the quota and
-            // policy boundary, only a current Full grant may execute a turn.
             #[cfg(feature = "remote")]
-            Self::Peer(peer) => match peer.store.grant(&peer.key).await {
-                Ok(state)
-                    if state.revision == peer.revision
-                        && state.grant == querymt_remote::peer_access::PeerGrant::Full =>
-                {
-                    Ok(())
-                }
-                _ => Err(AgentError::MeshAccessDenied),
-            },
+            Self::Peer(peer) => peer.grant().await.map(|_| ()),
         }
     }
 
@@ -3286,28 +3311,20 @@ async fn execute_authorized_prompt(
 ) -> Result<PromptRun, AgentError> {
     authority.check().await?;
     #[cfg(feature = "remote")]
-    if let TurnAuthority::Peer(_) = authority {
+    if let TurnAuthority::Peer(peer) = authority {
         let cancel = exec.cancel_token.clone();
         let run = execute_prompt_with_span(exec, authority);
-        let revoked = async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                if let Err(error) = authority.check().await {
-                    return error;
-                }
-            }
-        };
         tokio::pin!(run);
         return tokio::select! {
             result = &mut run => {
                 authority.check().await?;
                 result
             }
-            error = revoked => {
+            _ = peer.revoked() => {
                 // Let the normal cancellation path finish accounting and cleanup.
                 cancel.cancel();
                 let _ = run.await;
-                Err(error)
+                Err(AgentError::MeshAccessDenied)
             }
         };
     }
@@ -3457,17 +3474,41 @@ async fn execute_prompt_inner(
     let history_store = config.provider.history_store();
     let scheduled_task =
         validate_execution_task(&*history_store, &execution_origin, &session_id).await?;
+    #[cfg(feature = "remote")]
+    let peer_grant = match authority {
+        TurnAuthority::Local => None,
+        TurnAuthority::Peer(peer) => Some((peer, peer.grant().await?)),
+    };
+    #[cfg(feature = "remote")]
+    let restricted = peer_grant
+        .as_ref()
+        .is_some_and(|(_, grant)| *grant != querymt_remote::peer_access::PeerGrant::Full);
+    #[cfg(not(feature = "remote"))]
+    let restricted = false;
+    // Unclassified owner hooks can implement mandatory admission rules, so do
+    // not silently bypass them for a restricted turn.
+    if restricted
+        && (builtin.is_some()
+            || config.hooks.is_enabled()
+            || config
+                .middleware_drivers
+                .iter()
+                .any(|driver| !driver.supports_restricted_mesh()))
+    {
+        return Err(AgentError::MeshAccessDenied);
+    }
 
     // Clean up revert state if a new prompt is sent while in reverted state.
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
     // `get_history` / `load_working_context` only sees the surviving messages.
-    if let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
-        &config.provider,
-        &**config.event_sink.journal(),
-        &session_id,
-    )
-    .await
+    if !restricted
+        && let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
+            &config.provider,
+            &**config.event_sink.journal(),
+            &session_id,
+        )
+        .await
     {
         warn!("Failed to clean up revert state: {}", e);
     }
@@ -3478,6 +3519,13 @@ async fn execute_prompt_inner(
         .with_session(&session_id)
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+    #[cfg(feature = "remote")]
+    let session_handle = if let Some((peer, grant)) = peer_grant {
+        session_handle.for_mesh_turn(peer, &grant)?
+    } else {
+        session_handle
+    };
 
     // Slash-command expansion can alter text, but never attachment capability.
     validate_model_image_support(&req.prompt, session_handle.llm_config())?;
@@ -3517,6 +3565,7 @@ async fn execute_prompt_inner(
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
     .with_turn_authority(authority.clone())
+    .with_restricted_mesh_turn(restricted)
     .with_knowledge_store(config.knowledge_store())
     .with_repository_knowledge(config.repository_knowledge())
     .with_event_sink(config.event_sink.clone())
@@ -3608,7 +3657,8 @@ async fn execute_prompt_inner(
     // bound checkout, matching the advertised catalog; legacy local
     // sessions keep the agent-level registry built at startup.
     let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
-    if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
+    if !restricted
+        && let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
             crate::slash_commands::try_expand(&text_content.text, slash_registry)
     {
@@ -3633,21 +3683,25 @@ async fn execute_prompt_inner(
     let message_id = Uuid::new_v4().to_string();
 
     authority.check().await?;
-    let hook_result = config
-        .hooks
-        .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
-            session_id: session_id.clone(),
-            turn_id: run_id.to_string(),
-            cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
-            model: exec_ctx
-                .llm_config()
-                .map(|cfg| cfg.model.clone())
-                .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
-            prompt: user_text.clone(),
-        })
-        .await
-        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    let hook_result = if restricted {
+        crate::hooks::UserPromptSubmitResult::default()
+    } else {
+        config
+            .hooks
+            .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
+                session_id: session_id.clone(),
+                turn_id: run_id.to_string(),
+                cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
+                model: exec_ctx
+                    .llm_config()
+                    .map(|cfg| cfg.model.clone())
+                    .unwrap_or_default(),
+                permission_mode: exec_ctx.permission_mode().to_string(),
+                prompt: user_text.clone(),
+            })
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?
+    };
     emit_hook_notices(&config, &session_id, hook_result.notices.clone());
     if hook_result.should_block {
         let reason = hook_result
@@ -3666,14 +3720,17 @@ async fn execute_prompt_inner(
     // message is stored, so the first model request already carries the cards.
     // It is additive and fail-open; it never blocks or alters the prompt.
     let mut context_contributions = hook_result.context_contributions;
-    let orientation = crate::agent::repository_delivery::orientation_contexts(
-        &config,
-        &exec_ctx,
-        &user_text,
-        &context_contributions,
-    )
-    .await;
-    context_contributions.extend(orientation);
+    if !restricted {
+        let orientation = crate::agent::repository_delivery::orientation_contexts(
+            &config,
+            &exec_ctx,
+            &user_text,
+            &context_contributions,
+        )
+        .await;
+        context_contributions.extend(orientation);
+    }
+    authority.check().await?;
 
     let mut parts = vec![MessagePart::Prompt {
         blocks: req.prompt.clone(),
@@ -3737,9 +3794,15 @@ async fn execute_prompt_inner(
     );
 
     let intent_started = std::time::Instant::now();
-    if let Err(error) =
-        maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
-            .await
+    if !restricted
+        && let Err(error) = maybe_update_session_intent(
+            &config,
+            &session_id,
+            &mut exec_ctx,
+            &user_text,
+            &message_id,
+        )
+        .await
     {
         warn!(
             "Failed to update intent projection after storing prompt {}: {}",
@@ -3792,7 +3855,8 @@ async fn execute_prompt_inner(
     );
 
     // Pre-turn snapshot for undo/redo (off critical path)
-    if let Some(ref backend) = config.snapshot_backend
+    if !restricted
+        && let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
         // The start and change records of a run share the run's turn id.
@@ -3862,7 +3926,8 @@ async fn execute_prompt_inner(
     debug!("Session {}: post-turn snapshot start", session_id);
 
     // Post-turn snapshot
-    if let Some(ref backend) = config.snapshot_backend
+    if !restricted
+        && let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
         if let Err(e) = ensure_pre_turn_snapshot_ready(&mut exec_ctx, "post_turn_snapshot").await {

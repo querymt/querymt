@@ -352,6 +352,40 @@ mod access {
             .unwrap_or_else(|| json!({"status": "unavailable"}))
     }
 
+    async fn finite_quota_supported(
+        provider: &crate::session::provider::SessionProvider,
+        id: &str,
+        model: &str,
+    ) -> bool {
+        use crate::agent::remote::provider_host_backend::qualified_text_stream_limit;
+        use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
+        let discovery = async {
+            let binding = provider.provider_resolver().resolve(id).await.ok()?;
+            let defaults = querymt_remote::params_for_remote_provider(provider.initial_params());
+            let resolved = resolve_provider_config(
+                &binding,
+                provider.initial_params(),
+                ProviderConfigMode::Runtime {
+                    model,
+                    params: defaults.as_ref(),
+                    api_key_override: None,
+                    session_id: "standalone",
+                },
+            )
+            .await
+            .ok()?;
+            qualified_text_stream_limit(
+                &binding.factory.config_schema(),
+                &resolved.pruned_config_str,
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), discovery)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     pub(super) async fn dispatch(
         agent: &LocalAgentHandle,
         req: ExtRequest,
@@ -477,10 +511,20 @@ mod access {
         let mut response = json!({ "version": 1, "peer_id": peer_id,
             "outgoing": {"revision": state.revision, "grant": state.grant, "quotas": quotas} });
         if req.method.as_ref() == "querymt/mesh/getPeerAccess" {
-            let catalog: Vec<_> = local_catalog(&agent.model_inventory).into_iter().map(|(provider_id, models)| {
-                let models: Vec<_> = models.into_iter().map(|model_id| json!({"model_id": model_id, "finite_quota_supported": false})).collect();
-                json!({"provider_id": provider_id, "models": models})
-            }).collect();
+            let mut catalog = Vec::new();
+            for (provider_id, models) in local_catalog(&agent.model_inventory) {
+                let mut rows = Vec::with_capacity(models.len());
+                for model_id in models {
+                    let supported = if provider_id == "llama-cpp" {
+                        finite_quota_supported(&agent.config.provider, &provider_id, &model_id)
+                            .await
+                    } else {
+                        false
+                    };
+                    rows.push(json!({"model_id": model_id, "finite_quota_supported": supported}));
+                }
+                catalog.push(json!({"provider_id": provider_id, "models": rows}));
+            }
             response["shareable_catalog"] = json!(catalog);
             response["incoming"] = incoming(agent, &mesh, &key.peer).await;
         }

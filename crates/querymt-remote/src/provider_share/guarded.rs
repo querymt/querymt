@@ -227,16 +227,19 @@ impl GuardedProvider {
             .maybe_tools(msg.tools.as_deref())
             .options(msg.options.unwrap_or_default());
         let (provider, id) = self
-            .prepare_attempt(peer, request, &call, request_id)
+            .prepare_attempt(peer, request, &call, request_id, false)
             .await?;
         let attempt = id.begin().await.map_err(quota_error)?;
         let watch = async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Err(error) = self.binding(peer, &msg.provider, &msg.model).await {
-                    return error;
-                }
+            if let Some(revision) = peer.revision() {
+                crate::peer_access::wait_for_revision_loss(
+                    self.store.as_ref(),
+                    peer.key(),
+                    revision,
+                )
+                .await;
             }
+            quota_error(QuotaError::Denied)
         };
         let response = tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(600), provider.chat(&call)) => result
@@ -260,11 +263,25 @@ impl GuardedProvider {
         request: ProviderBuildRequest,
         call: &ChatCall<'_>,
         request_id: Uuid,
+        streaming: bool,
     ) -> Result<(Arc<dyn querymt::LLMProvider>, ReservedAttempt), RemoteProviderHostError> {
         let grant = self
             .binding(peer, &request.provider_name, &request.model)
             .await?;
-        let bound_tokens = self.backend.quota_bound(&request, call);
+        // Building the local binding is not an upstream inference attempt. Its
+        // model tokenizer and effective generation settings may be needed for the bound.
+        let (provider, bound_tokens) = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.backend.prepare_chat(request.clone(), call, streaming),
+        )
+        .await
+        .map_err(|_| {
+            failure(
+                ProviderErrorKind::UnknownPermanent,
+                "mesh_provider_timeout",
+                "mesh provider preparation timed out",
+            )
+        })??;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -285,25 +302,6 @@ impl GuardedProvider {
         )
         .await
         .map_err(quota_error)?;
-        let prepared = tokio::time::timeout(
-            Duration::from_secs(30),
-            self.backend.build_provider(request.clone()),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(failure(
-                ProviderErrorKind::UnknownPermanent,
-                "mesh_provider_timeout",
-                "mesh provider preparation timed out",
-            ))
-        });
-        let provider = match prepared {
-            Ok(provider) => provider,
-            Err(error) => {
-                attempt.release().await.map_err(quota_error)?;
-                return Err(error);
-            }
-        };
         // Release without charging if preparation lost its authorization.
         if let Err(error) = self
             .binding(peer, &request.provider_name, &request.model)

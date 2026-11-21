@@ -142,13 +142,28 @@ impl EventForwarder {
         let mut rx = fanout.subscribe();
         let relay_actor_id = relay_ref.id();
         let task = tokio::spawn(async move {
-            let mut recheck = tokio::time::interval(std::time::Duration::from_secs(1));
+            let revoked = async {
+                if let Some(subscriber) = &subscriber {
+                    if !subscriber.is_current().await {
+                        return;
+                    }
+                    if let Some(revision) = subscriber.origin.revision() {
+                        querymt_remote::peer_access::wait_for_revision_loss(
+                            subscriber.store.as_ref(),
+                            subscriber.origin.key(),
+                            revision,
+                        )
+                        .await;
+                    }
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(revoked);
             loop {
                 let next = tokio::select! {
-                    _ = recheck.tick(), if subscriber.is_some() => {
-                        if let Some(subscriber) = &subscriber && !subscriber.is_current().await { break; }
-                        continue;
-                    }
+                    biased;
+                    _ = &mut revoked => break,
                     next = rx.recv() => next,
                 };
                 if next

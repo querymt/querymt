@@ -5,7 +5,7 @@ use super::{
     GuardedProvider, enforce_settlement, failure, quota_error, validate_item_aware_request,
 };
 use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
-use crate::peer_access::quota::{AttemptUsage, QuotaError, ReservedAttempt};
+use crate::peer_access::quota::{QuotaError, ReservedAttempt, StreamMeter};
 use crate::peer_access::{PeerGrantKey, SharingProtocol};
 use crate::request_timeout::ask_sharing_v1;
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 use futures_util::StreamExt;
 use kameo::actor::{ActorId, RemoteActorRef};
 use parking_lot::Mutex;
-use querymt::chat::{ChatCall, ChatStream, StreamChunk, StructuredStreamEvent, chunk_is_terminal};
+use querymt::chat::{ChatCall, ChatStream, StreamChunk, chunk_is_terminal};
 use querymt::error::{LLMError, ProviderErrorKind, TransportErrorKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,7 +173,7 @@ impl StreamService {
             .options(msg.options.unwrap_or_default());
         let (provider, reservation) = self
             .provider
-            .prepare_attempt(&peer, request, &call, id)
+            .prepare_attempt(&peer, request, &call, id, true)
             .await?;
         let started = Instant::now();
         let active = Arc::new(ActiveStream {
@@ -569,39 +569,5 @@ fn transport(kind: TransportErrorKind, message: &str) -> LLMError {
     LLMError::Transport {
         kind,
         message: message.to_owned(),
-    }
-}
-
-#[derive(Default)]
-struct StreamMeter {
-    usage: Option<querymt::Usage>,
-    terminal: bool,
-}
-
-impl StreamMeter {
-    fn observe(&mut self, chunk: &StreamChunk) {
-        self.terminal |= chunk_is_terminal(chunk);
-        let usage = match chunk {
-            StreamChunk::Usage(usage) => Some(usage),
-            StreamChunk::Structured(
-                StructuredStreamEvent::ResponseMetadata { usage, .. }
-                | StructuredStreamEvent::ResponseTerminal { usage, .. },
-            ) => usage.as_ref(),
-            _ => None,
-        };
-        if let Some(usage) = usage {
-            self.usage = Some(
-                self.usage
-                    .take()
-                    .map_or_else(|| usage.clone(), |current| current.merge_max(usage.clone())),
-            );
-        }
-    }
-
-    fn complete_usage(&self) -> AttemptUsage {
-        match (self.terminal, &self.usage) {
-            (true, Some(usage)) => AttemptUsage::from_usage(usage),
-            _ => AttemptUsage::Unknown,
-        }
     }
 }

@@ -155,6 +155,9 @@ async fn run_stop_hook(
     exec_ctx: &ExecutionContext,
     stop_reason: &str,
 ) -> Result<crate::hooks::StopResult, crate::hooks::HookError> {
+    if exec_ctx.restricted_mesh_turn() {
+        return Ok(crate::hooks::StopResult::default());
+    }
     let stop_hook = config
         .hooks
         .run_stop(StopRequest {
@@ -508,13 +511,12 @@ pub(crate) async fn execute_cycle_state_machine(
                 // Everything from here to request dispatch is agent overhead, not model time.
                 let step_started = std::time::Instant::now();
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Model);
-                let context = wait::reconcile_suspended_delegations(
-                    config,
-                    &context,
-                    exec_ctx,
-                    &mut event_rx,
-                )
-                .await?;
+                let context = if exec_ctx.restricted_mesh_turn() {
+                    context
+                } else {
+                    wait::reconcile_suspended_delegations(config, &context, exec_ctx, &mut event_rx)
+                        .await?
+                };
                 let context = apply_pending_steering(
                     config,
                     exec_ctx,
@@ -654,6 +656,9 @@ pub(crate) async fn execute_cycle_state_machine(
                 results,
                 context,
             } => {
+                if exec_ctx.restricted_mesh_turn() {
+                    return Err(crate::error::AgentError::MeshAccessDenied.into());
+                }
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Tools);
                 if results.is_empty()
                     && let Some(steered_context) = apply_pending_steering(
@@ -750,6 +755,9 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref context,
                 ref wait,
             } => {
+                if exec_ctx.restricted_mesh_turn() {
+                    return Err(crate::error::AgentError::MeshAccessDenied.into());
+                }
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Waiting);
                 wait::transition_waiting_for_event(config, wait, context, exec_ctx, &mut event_rx)
                     .await?
@@ -870,7 +878,8 @@ pub(crate) async fn execute_cycle_state_machine(
                             );
                         }
 
-                        if config.execution_policy.pruning.enabled
+                        if !exec_ctx.restricted_mesh_turn()
+                            && config.execution_policy.pruning.enabled
                             && let Err(e) = maintenance::run_pruning(config, exec_ctx).await
                         {
                             warn!("Pruning failed: {}", e);
@@ -898,6 +907,7 @@ pub(crate) async fn execute_cycle_state_machine(
                 info!("State machine stopped: {} ({:?})", message, stop_type);
 
                 if stop_type == StopType::ContextThreshold
+                    && !exec_ctx.restricted_mesh_turn()
                     && config.execution_policy.compaction.auto
                 {
                     mark_automatic_compaction(

@@ -1375,7 +1375,7 @@ mod node_manager_tests {
         };
         assert!(matches!(
             ingress.handle_v1(peer, resume()).await,
-            Err(SharingRejection::Denied)
+            Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
         ));
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
@@ -1613,7 +1613,7 @@ mod node_manager_tests {
         };
 
         set_grant(PeerGrant::Custom {
-            sessions: true,
+            sessions: false,
             filesystem: false,
             providers: vec![],
         });

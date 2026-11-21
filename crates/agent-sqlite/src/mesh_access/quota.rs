@@ -345,6 +345,7 @@ impl QuotaStore for SqliteMeshAccess {
             limit.validate()?;
         }
         let (key, scope) = (key.clone(), scope.clone());
+        let changes = self.changes.clone();
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let grant = load_grant(&tx, &key)?;
@@ -415,6 +416,7 @@ impl QuotaStore for SqliteMeshAccess {
             }
             let revision = save_grant(&tx, &key, &grant.grant)?;
             tx.commit().map_err(backend)?;
+            let _ = changes.send(key);
             Ok(revision)
         })
         .await

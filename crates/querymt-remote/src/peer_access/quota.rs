@@ -9,6 +9,46 @@ use super::{GrantStoreError, PeerGrantKey, SharingProtocol, valid_id};
 mod store;
 pub use store::{DispatchedAttempt, QuotaStore, ReservedAttempt};
 
+/// Accumulates usage only when an upstream stream has reached a semantic terminal.
+#[derive(Default)]
+pub struct StreamMeter {
+    usage: Option<querymt::Usage>,
+    terminal: bool,
+}
+
+impl StreamMeter {
+    pub fn observe(&mut self, chunk: &querymt::chat::StreamChunk) {
+        use querymt::chat::{StreamChunk, StructuredStreamEvent, chunk_is_terminal};
+        self.terminal |= chunk_is_terminal(chunk);
+        let usage = match chunk {
+            StreamChunk::Usage(usage) => Some(usage),
+            StreamChunk::Structured(
+                StructuredStreamEvent::ResponseMetadata { usage, .. }
+                | StructuredStreamEvent::ResponseTerminal { usage, .. },
+            ) => usage.as_ref(),
+            _ => None,
+        };
+        if let Some(usage) = usage {
+            self.usage = Some(
+                self.usage
+                    .take()
+                    .map_or_else(|| usage.clone(), |current| current.merge_max(usage.clone())),
+            );
+        }
+    }
+
+    pub fn has_complete_usage(&self) -> bool {
+        matches!(self.complete_usage(), AttemptUsage::Observed(_))
+    }
+
+    pub fn complete_usage(&self) -> AttemptUsage {
+        match (self.terminal, &self.usage) {
+            (true, Some(usage)) => AttemptUsage::from_usage(usage),
+            _ => AttemptUsage::Unknown,
+        }
+    }
+}
+
 /// A provider-wide or model-specific quota on a particular host and peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

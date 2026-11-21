@@ -176,21 +176,29 @@ pub(super) async fn transition_before_llm_call(
         message_count = messages.len() as u64
     );
     exec_ctx.require_turn_authority().await?;
-    let hook_result = config
-        .hooks
-        .run_context(crate::hooks::ContextHookRequest {
-            session_id: exec_ctx.session_id.clone(),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: context.model.to_string(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
-            trigger: trigger.to_string(),
-            context_window,
-            messages,
-        })
-        .instrument(hook_span)
-        .await?;
+    let hook_result = if exec_ctx.restricted_mesh_turn() {
+        crate::hooks::ContextHookResult {
+            estimated_tokens: crate::session::pruning::estimate_chat_tokens(&messages),
+            messages: Some(messages),
+            notices: Vec::new(),
+        }
+    } else {
+        config
+            .hooks
+            .run_context(crate::hooks::ContextHookRequest {
+                session_id: exec_ctx.session_id.clone(),
+                mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+                turn_id: exec_ctx.turn_id().to_string(),
+                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+                model: context.model.to_string(),
+                permission_mode: exec_ctx.permission_mode().to_string(),
+                trigger: trigger.to_string(),
+                context_window,
+                messages,
+            })
+            .instrument(hook_span)
+            .await?
+    };
     for notice in hook_result.notices {
         config.emit_event(
             &exec_ctx.session_id,
@@ -813,7 +821,7 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    let output: ChatOutput = if tools.is_empty() {
+    let output: ChatOutput = if tools.is_empty() && !exec_ctx.restricted_mesh_turn() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
         match super::llm_retry::call_with_retry(
@@ -1554,6 +1562,9 @@ pub(super) async fn transition_call_llm(
     let response_thinking = output.thinking();
     let response_thinking_signature = output.signature();
     let llm_tool_calls = middleware_calls_from_output(&output);
+    if exec_ctx.restricted_mesh_turn() && !llm_tool_calls.is_empty() {
+        return Err(crate::error::AgentError::MeshAccessDenied.into());
+    }
     let tool_calls = &llm_tool_calls;
     let usage = output.usage.clone();
     let finish_reason = output.finish_reason;

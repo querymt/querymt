@@ -27,6 +27,7 @@ mod quota;
 pub struct SqliteMeshAccess {
     conn: Arc<Mutex<Connection>>,
     lease: Option<Arc<std::fs::File>>,
+    changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
 }
 
 impl SqliteMeshAccess {
@@ -39,6 +40,7 @@ impl SqliteMeshAccess {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             lease: None,
+            changes: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -57,6 +59,7 @@ impl SqliteMeshAccess {
             Ok(Self {
                 conn: Arc::new(Mutex::new(open_store(path)?)),
                 lease: Some(Arc::new(lease)),
+                changes: tokio::sync::broadcast::channel(64).0,
             })
         })
         .await
@@ -169,6 +172,10 @@ fn save_grant(
 
 #[async_trait]
 impl GrantStore for SqliteMeshAccess {
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+        self.lease.as_ref().map(|_| self.changes.subscribe())
+    }
+
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
         let key = key.clone();
         self.with_conn(move |conn| load_grant(conn, &key)).await
@@ -182,6 +189,7 @@ impl GrantStore for SqliteMeshAccess {
     ) -> Result<PeerGrantState, GrantStoreError> {
         grant.validate()?;
         let key = key.clone();
+        let changes = self.changes.clone();
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -198,6 +206,7 @@ impl GrantStore for SqliteMeshAccess {
             }
             let revision = save_grant(&tx, &key, &grant)?;
             tx.commit().map_err(backend)?;
+            let _ = changes.send(key);
             Ok(PeerGrantState { revision, grant })
         })
         .await

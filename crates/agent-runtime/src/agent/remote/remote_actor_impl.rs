@@ -114,21 +114,21 @@ pub(super) fn register_session_turns(
         &store,
         actor,
         Duration::from_secs(600),
-        InboundAccess::LegacyFull,
+        InboundAccess::Sessions,
     );
     register_peer_session_ask::<messages::SubmitSessionInput, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
-        InboundAccess::LegacyFull,
+        InboundAccess::Sessions,
     );
     register_peer_session_ask::<messages::DiscardQueuedInput, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
-        InboundAccess::LegacyFull,
+        InboundAccess::Sessions,
     );
 
     register_peer_session_ask::<messages::GetRuntimeStatus, _>(
@@ -155,7 +155,7 @@ pub(super) fn register_session_turns(
     );
     router.register_v1_ask::<SessionActor, messages::Cancel, _, _, _, _>(
         actor.id(),
-        InboundAccess::LegacyFull,
+        InboundAccess::Sessions,
         cancel,
     );
 }

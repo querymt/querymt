@@ -52,6 +52,19 @@ pub trait RemoteProviderBackend: Send + Sync {
         None
     }
 
+    /// Prepare the exact binding and resolve the bound for one dispatch mode.
+    /// Implementations may use qualified host-side facts from the resolved config.
+    async fn prepare_chat(
+        &self,
+        request: ProviderBuildRequest,
+        call: &querymt::chat::ChatCall<'_>,
+        _streaming: bool,
+    ) -> Result<(Arc<dyn LLMProvider>, Option<i64>), Self::Error> {
+        let bound = self.quota_bound(&request, call);
+        let provider = self.build_provider(request).await?;
+        Ok((provider, bound))
+    }
+
     /// Resolve facts before the first chat request. Backends with generation
     /// defaults override this to report the settings of the provider they build.
     async fn contract_info(

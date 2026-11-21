@@ -41,6 +41,37 @@ pub trait GrantStore: Send + Sync {
         grant: PeerGrant,
     ) -> Result<PeerGrantState, GrantStoreError>;
 
+    /// Subscribe to committed revision changes. Stores with out-of-process
+    /// writers should return `None` unless they also observe those writers.
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+        None
+    }
+
     /// List persisted peers, including those not currently connected.
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError>;
+}
+
+/// Wait until the pinned revision is invalid or can no longer be verified.
+/// Subscribe before checking to avoid missing a concurrent committed edit.
+pub async fn wait_for_revision_loss(store: &dyn GrantStore, key: &PeerGrantKey, revision: Uuid) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut changes = store.subscribe_changes();
+    while store
+        .grant(key)
+        .await
+        .is_ok_and(|state| state.revision == revision)
+    {
+        if let Some(rx) = &mut changes {
+            loop {
+                match rx.recv().await {
+                    Ok(changed) if &changed != key => continue,
+                    Ok(_) | Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
 }

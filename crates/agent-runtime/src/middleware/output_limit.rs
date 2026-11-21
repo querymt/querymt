@@ -418,6 +418,10 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
     fn name(&self) -> &'static str {
         "OutputLimitRecoveryMiddleware"
     }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
 }
 
 /// Factory for `type = "output_limit_recovery"`.

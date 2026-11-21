@@ -625,6 +625,15 @@ impl SessionProvider {
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
         let pruned_config_str = resolved_cfg.pruned_config_str;
+        #[cfg(feature = "remote")]
+        let mesh_text_stream_limit = (provider_name == "llama-cpp")
+            .then(|| {
+                crate::agent::remote::provider_host_backend::qualified_text_stream_limit(
+                    &factory.config_schema(),
+                    &pruned_config_str,
+                )
+            })
+            .flatten();
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -682,6 +691,8 @@ impl SessionProvider {
                     settings,
                     output_caps,
                     reasoning_effort,
+                    #[cfg(feature = "remote")]
+                    mesh_text_stream_limit,
                 });
             }
 
@@ -703,6 +714,8 @@ impl SessionProvider {
                     settings,
                     output_caps,
                     reasoning_effort,
+                    #[cfg(feature = "remote")]
+                    mesh_text_stream_limit,
                 });
             }
 
@@ -717,6 +730,8 @@ impl SessionProvider {
                 settings,
                 output_caps,
                 reasoning_effort,
+                #[cfg(feature = "remote")]
+                mesh_text_stream_limit,
             });
         }
 
@@ -726,6 +741,8 @@ impl SessionProvider {
             settings,
             output_caps,
             reasoning_effort,
+            #[cfg(feature = "remote")]
+            mesh_text_stream_limit,
         })
     }
 }
@@ -749,7 +766,9 @@ impl Clone for SessionProvider {
 }
 
 pub(crate) struct ProviderSnapshot {
-    provider: Arc<dyn LLMProvider>,
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    #[cfg(feature = "remote")]
+    pub(crate) mesh_text_stream_limit: Option<i64>,
     settings: crate::agent::utils::genai::GenerationSettings,
     /// Output caps resolved with the provider; `None` when unknown.
     output_caps: Option<OutputCaps>,
@@ -778,6 +797,7 @@ impl ProviderSnapshot {
                 .zip(info.generation.output_ceiling)
                 .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
             reasoning_effort: info.generation.reasoning_effort,
+            mesh_text_stream_limit: None,
         }
     }
 
@@ -824,6 +844,8 @@ pub struct SessionHandle {
     /// turn instead of once per clone (the state machine clones the handle on
     /// every step). A failed init is not cached, so retries still rebuild.
     cached_llm_provider: Arc<tokio::sync::OnceCell<ProviderSnapshot>>,
+    #[cfg(feature = "remote")]
+    mesh_turn: Option<Arc<crate::agent::session_actor::PeerTurn>>,
 }
 
 impl Clone for SessionHandle {
@@ -835,6 +857,8 @@ impl Clone for SessionHandle {
             provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
             cached_llm_provider: Arc::clone(&self.cached_llm_provider),
+            #[cfg(feature = "remote")]
+            mesh_turn: self.mesh_turn.clone(),
         }
     }
 }
@@ -876,7 +900,35 @@ impl SessionHandle {
             provider_node_id,
             execution_config,
             cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(feature = "remote")]
+            mesh_turn: None,
         })
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn for_mesh_turn(
+        mut self,
+        peer: &Arc<crate::agent::session_actor::PeerTurn>,
+        grant: &querymt_remote::peer_access::PeerGrant,
+    ) -> Result<Self, crate::error::AgentError> {
+        use crate::error::AgentError;
+        let config = self
+            .llm_config
+            .as_ref()
+            .ok_or(AgentError::MeshAccessDenied)?;
+        if !grant.allows_model(peer.protocol, &config.provider, &config.model)
+            || self
+                .provider_node_id
+                .as_deref()
+                .is_some_and(|node| node != "local" && node != peer.key.host.to_string())
+        {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        // Never reuse an unguarded provider or route a peer's spend onward.
+        self.cached_llm_provider = Arc::new(tokio::sync::OnceCell::new());
+        self.mesh_turn = Some(peer.clone());
+        self.provider_node_id = Some("local".into());
+        Ok(self)
     }
 
     /// Get the session information
@@ -914,11 +966,37 @@ impl SessionHandle {
                     // Filled in by `record_auth_source` during credential resolution.
                     auth.source = tracing::field::Empty,
                 );
-                tracing::Instrument::instrument(
+                let built = tracing::Instrument::instrument(
                     self.provider.build_provider_snapshot(request),
                     span,
                 )
-                .await
+                .await?;
+                #[cfg(feature = "remote")]
+                if let Some(peer) = &self.mesh_turn {
+                    let mesh = self.provider.mesh.load_full().ok_or_else(|| {
+                        SessionError::InvalidOperation("mesh access store unavailable".into())
+                    })?;
+                    let store = mesh
+                        .quota_store()
+                        .filter(|_| mesh.peer_id() == peer.key.host.as_peer_id())
+                        .cloned()
+                        .ok_or_else(|| {
+                            SessionError::InvalidOperation("mesh access store unavailable".into())
+                        })?;
+                    let mut built = built;
+                    built.provider = Arc::new(
+                        crate::agent::remote::provider_host_backend::HostedProvider::new(
+                            built.provider,
+                            peer.clone(),
+                            store,
+                            config.provider.clone(),
+                            config.model.clone(),
+                            built.mesh_text_stream_limit,
+                        ),
+                    );
+                    return Ok(built);
+                }
+                Ok(built)
             })
             .await
             .map(|built| Arc::clone(&built.provider))
@@ -1594,6 +1672,7 @@ pub mod tests {
                 settings: Default::default(),
                 output_caps: Some(caps),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+                mesh_text_stream_limit: None,
             };
             let contract = host.contract_info();
             let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
@@ -1806,6 +1885,8 @@ pub mod tests {
             provider_node_id: None,
             execution_config: None,
             cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(feature = "remote")]
+            mesh_turn: None,
         };
 
         let ledger = crate::test_utils::test_ledger().await;

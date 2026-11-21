@@ -295,7 +295,7 @@ mod remote_impl {
         pub schedule_public_id: String,
     }
 
-    struct PeerScheduleRequest<M> {
+    struct PeerNodeRequest<M> {
         request: M,
         authority: Arc<PeerTurn>,
     }
@@ -566,21 +566,50 @@ mod remote_impl {
             use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
 
             Self::register_admission(router, actor);
-            Self::register_peer_schedule_ask::<CreateRemoteSchedule, _>(router, &store, actor);
-            Self::register_peer_schedule_ask::<ListRemoteSchedules, _>(router, &store, actor);
-            Self::register_peer_schedule_ask::<PauseRemoteSchedule, _>(router, &store, actor);
-            Self::register_peer_schedule_ask::<ResumeRemoteSchedule, _>(router, &store, actor);
-            Self::register_peer_schedule_ask::<TriggerRemoteSchedule, _>(router, &store, actor);
-            Self::register_peer_schedule_ask::<DeleteRemoteSchedule, _>(router, &store, actor);
+            Self::register_peer_ask::<CreateRemoteSchedule, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            Self::register_peer_ask::<ListRemoteSchedules, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            Self::register_peer_ask::<PauseRemoteSchedule, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            Self::register_peer_ask::<ResumeRemoteSchedule, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            Self::register_peer_ask::<TriggerRemoteSchedule, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            Self::register_peer_ask::<DeleteRemoteSchedule, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::LegacyFull,
+            );
             use crate::agent::remote::remote_actor_impl::{
                 register_session_read, register_session_request,
             };
-            // Cold resume initializes workspace and MCP state. Until that path
-            // is constrained, only Full can materialize the hosted runtime.
-            register_session_request::<_, ResumeRemoteSession>(
+            Self::register_peer_ask::<ResumeRemoteSession, _>(
                 router,
+                &store,
                 actor,
-                InboundAccess::LegacyFull,
+                InboundAccess::Sessions,
             );
             register_session_request::<_, CreateRemoteSession>(
                 router,
@@ -635,15 +664,16 @@ mod remote_impl {
             );
         }
 
-        fn register_peer_schedule_ask<M, R>(
+        fn register_peer_ask<M, R>(
             router: &InboundRouter,
             store: &Arc<dyn querymt_remote::peer_access::GrantStore>,
             actor: &kameo::actor::ActorRef<Self>,
+            v1_access: InboundAccess,
         ) where
-            Self: kameo::remote::RemoteMessage<M> + Message<PeerScheduleRequest<M>>,
+            Self: kameo::remote::RemoteMessage<M> + Message<PeerNodeRequest<M>>,
             M: serde::de::DeserializeOwned + Send + 'static,
             R: serde::Serialize + Send + 'static,
-            <Self as Message<PeerScheduleRequest<M>>>::Reply:
+            <Self as Message<PeerNodeRequest<M>>>::Reply:
                 kameo::reply::Reply<Ok = R, Error = AgentError>,
         {
             let weak = actor.downgrade();
@@ -655,7 +685,7 @@ mod remote_impl {
                     let actor = weak.upgrade().ok_or(AgentError::MeshNotBootstrapped)?;
                     let authority = Arc::new(PeerTurn::from_request(&origin, store)?);
                     actor
-                        .ask(PeerScheduleRequest { request, authority })
+                        .ask(PeerNodeRequest { request, authority })
                         .await
                         .map_err(|error| match error {
                             kameo::error::SendError::HandlerError(error) => error,
@@ -668,11 +698,7 @@ mod remote_impl {
                 InboundAccess::LegacyFull,
                 handle.clone(),
             );
-            router.register_v1_ask::<Self, M, _, _, _, _>(
-                actor.id(),
-                InboundAccess::LegacyFull,
-                handle,
-            );
+            router.register_v1_ask::<Self, M, _, _, _, _>(actor.id(), v1_access, handle);
         }
 
         fn register_admission(router: &InboundRouter, actor: &kameo::actor::ActorRef<Self>) {
@@ -1994,12 +2020,12 @@ mod remote_impl {
         }
     }
 
-    impl Message<PeerScheduleRequest<CreateRemoteSchedule>> for RemoteNodeManager {
+    impl Message<PeerNodeRequest<CreateRemoteSchedule>> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteScheduleResponse, AgentError>>;
 
         async fn handle(
             &mut self,
-            msg: PeerScheduleRequest<CreateRemoteSchedule>,
+            msg: PeerNodeRequest<CreateRemoteSchedule>,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
@@ -2011,12 +2037,12 @@ mod remote_impl {
         }
     }
 
-    impl Message<PeerScheduleRequest<ListRemoteSchedules>> for RemoteNodeManager {
+    impl Message<PeerNodeRequest<ListRemoteSchedules>> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSchedulesResponse, AgentError>>;
 
         async fn handle(
             &mut self,
-            msg: PeerScheduleRequest<ListRemoteSchedules>,
+            msg: PeerNodeRequest<ListRemoteSchedules>,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
@@ -2032,12 +2058,12 @@ mod remote_impl {
         }
     }
 
-    impl<M: PeerScheduleAction> Message<PeerScheduleRequest<M>> for RemoteNodeManager {
+    impl<M: PeerScheduleAction> Message<PeerNodeRequest<M>> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
 
         async fn handle(
             &mut self,
-            msg: PeerScheduleRequest<M>,
+            msg: PeerNodeRequest<M>,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
@@ -2285,52 +2311,88 @@ mod remote_impl {
             msg: ResumeRemoteSession,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            // Capture shared state for the spawned task
-            let shared_state = self.shared_state.clone();
+            let state = self.shared_state.clone();
+            ctx.spawn(async move { state.resume_session(msg.session_id, None).await })
+        }
+    }
 
-            // Spawn the heavy work as a background task
+    impl Message<PeerNodeRequest<ResumeRemoteSession>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<ResumeRemoteSession>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
             ctx.spawn(async move {
-                let session = shared_state
-                    .config
-                    .provider
-                    .history_store()
-                    .get_session(&msg.session_id)
+                state
+                    .resume_session(msg.request.session_id, Some(msg.authority.as_ref()))
                     .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?
-                    .ok_or_else(|| AgentError::SessionNotFound {
-                        session_id: msg.session_id.clone(),
-                    })?;
+            })
+        }
+    }
 
-                let cwd_path = session.cwd.clone();
-                let cwd = cwd_path.as_ref().map(|p| p.display().to_string());
-                let title = session.name.clone();
-                let created_at = session
-                    .created_at
-                    .map(|ts| ts.unix_timestamp())
-                    .unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0)
-                    });
-
-                let handoff = shared_state
-                    .materialize_remote_session(
-                        msg.session_id.clone(),
-                        cwd_path,
-                        cwd.clone(),
-                        title.clone(),
-                        created_at,
-                    )
-                    .await?;
-
-                Ok(CreateRemoteSessionResponse {
-                    session_id: msg.session_id,
-                    handoff,
-                    cwd,
-                    title,
+    impl RemoteNodeManagerState {
+        async fn resume_session(
+            &self,
+            session_id: String,
+            peer: Option<&PeerTurn>,
+        ) -> Result<CreateRemoteSessionResponse, AgentError> {
+            let restricted = if let Some(peer) = peer {
+                peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full
+            } else {
+                false
+            };
+            let session = self
+                .config
+                .provider
+                .history_store()
+                .get_session(&session_id)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?
+                .ok_or_else(|| AgentError::SessionNotFound {
+                    session_id: session_id.clone(),
+                })?;
+            let cwd_path = session.cwd;
+            let cwd = cwd_path.as_ref().map(|p| p.display().to_string());
+            let title = session.name;
+            let created_at = session
+                .created_at
+                .unwrap_or_else(time::OffsetDateTime::now_utc)
+                .unix_timestamp();
+            let handoff = if restricted {
+                // A Custom resume may export an existing runtime without
+                // triggering workspace materialization, MCP startup, or owner hooks.
+                let registry = self
+                    .bound_session_runtime(&session_id)
+                    .await?
+                    .map_or_else(|| self.registry.clone(), |(registry, _)| registry);
+                let Some(crate::agent::remote::SessionActorRef::Local(actor)) =
+                    crate::agent::session_registry::live_session(&registry, &session_id).await
+                else {
+                    return Err(AgentError::MeshAccessDenied);
+                };
+                self.handoff_for_local_actor(&session_id, actor).await
+            } else {
+                if let Some(peer) = peer {
+                    peer.grant().await?;
+                }
+                self.materialize_remote_session(
+                    session_id.clone(),
+                    cwd_path,
+                    cwd.clone(),
+                    title.clone(),
                     created_at,
-                })
+                )
+                .await?
+            };
+            Ok(CreateRemoteSessionResponse {
+                session_id,
+                handoff,
+                cwd,
+                title,
+                created_at,
             })
         }
     }
