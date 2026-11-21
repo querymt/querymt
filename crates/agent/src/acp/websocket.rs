@@ -2110,3 +2110,143 @@ pub(super) async fn forward_session_event(
     }
     true
 }
+
+#[cfg(test)]
+mod mesh_owner_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_token_file_requires_private_permissions_and_valid_contents() {
+        use std::io::{ErrorKind, Write};
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let token = "private-test-token-0123456789abcdef";
+        writeln!(file, "{token}").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let digest = load_mesh_owner_token(file.path()).unwrap();
+        assert!(mesh_owner_authorized(&headers, Some(&digest)));
+        assert!(!mesh_owner_authorized(&headers, None));
+
+        headers.insert(header::ORIGIN, HeaderValue::from_static("http://localhost"));
+        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+        headers.remove(header::ORIGIN);
+        headers.append(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer too-short"),
+        );
+        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {token}").parse().unwrap(),
+        );
+        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}-different").parse().unwrap(),
+        );
+        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert_eq!(
+            load_mesh_owner_token(file.path()).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        for invalid in [
+            "three words are never an owner token".to_owned(),
+            "x".repeat(1025),
+        ] {
+            std::fs::write(file.path(), invalid).unwrap();
+            assert_eq!(
+                load_mesh_owner_token(file.path()).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_policy_hints_reach_owner_connections_only() {
+        use crate::acp::shared::{
+            QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED, QMT_NOTIFICATION_SCHEDULES_CHANGED,
+        };
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let state = WsServerState::new(fixture.handle.clone());
+        let connect = |conn_id: &str, owner| {
+            let (tx, rx) = mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            spawn_global_notification_forwarders(
+                state.clone(),
+                ConnectionEventState {
+                    conn_id: conn_id.to_string(),
+                    tx,
+                    pending_requests: Arc::new(Mutex::new(HashMap::new())),
+                    forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+                    request_counter: Arc::new(AtomicU64::new(1)),
+                    connection_cancel: cancel.clone(),
+                    delivery: crate::acp::delivery::ConnectionDelivery::new(None, cancel.clone()),
+                },
+                owner,
+            );
+            (rx, cancel.drop_guard())
+        };
+        let (mut owner, _owner_guard) = connect("owner-fixture", true);
+        let (mut observer, _observer_guard) = connect("observer-fixture", false);
+        let hint =
+            json!({"version":1,"peer_id":"fixture-peer","direction":"outgoing","reason":"policy"});
+        for (method, params) in [
+            (QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED, hint.clone()),
+            (
+                QMT_NOTIFICATION_SCHEDULES_CHANGED,
+                json!({"change":"created"}),
+            ),
+        ] {
+            fixture
+                .handle
+                .broadcast_ext_notification(ExtNotification::new(
+                    method,
+                    Arc::from(serde_json::value::to_raw_value(&params).unwrap()),
+                ));
+        }
+        let recv = |mut rx: mpsc::Receiver<String>| async move {
+            let wire = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            (
+                serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+                rx,
+            )
+        };
+        let (received, owner_after_hint) = recv(owner).await;
+        owner = owner_after_hint;
+        assert_eq!(
+            received["method"],
+            QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED
+        );
+        assert_eq!(received["params"], hint);
+        let (received, _) = recv(owner).await;
+        assert_eq!(received["method"], QMT_NOTIFICATION_SCHEDULES_CHANGED);
+        let (received, observer_after_hint) = recv(observer).await;
+        observer = observer_after_hint;
+        assert_eq!(received["method"], QMT_NOTIFICATION_SCHEDULES_CHANGED);
+        assert!(observer.try_recv().is_err());
+    }
+}

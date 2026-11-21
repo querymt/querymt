@@ -129,6 +129,129 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     assert_eq!(stale.data.unwrap()["code"], "mesh_access_conflict");
     assert!(updates.try_recv().is_err());
 
+    // Use the same durable store as inference, so the ACP reset is tested against
+    // an actual outstanding reservation, not a simulated ACP error response.
+    use querymt_remote::peer_access::quota::{AttemptUsage, QuotaAttempt};
+    use querymt_remote::peer_access::{PeerGrantKey, SharingProtocol};
+    let grant = serde_json::json!({"mode":"custom", "sessions":true, "filesystem":false,
+        "providers":[{"provider_id":"fixture", "models":{"mode":"selected", "model_ids":["offline"]}}]});
+    let set_grant = |revision, grant| {
+        request(
+            "querymt/mesh/setPeerAccess",
+            serde_json::json!({
+                "version":1, "peer_id":peer, "expected_revision":revision, "grant":grant
+            }),
+        )
+    };
+    let revision = written["outgoing"]["revision"].clone();
+    let reply = handle
+        .owner_ext_method(set_grant(revision, grant.clone()))
+        .await
+        .unwrap();
+    let enabled: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    assert_eq!(enabled["outgoing"]["quotas"][0]["active"], true);
+    let change = updates.try_recv().unwrap();
+    let change: serde_json::Value = serde_json::from_str(change.params.get()).unwrap();
+    assert_eq!(
+        change,
+        serde_json::json!({"version":1,"peer_id":peer,"direction":"outgoing","reason":"policy"})
+    );
+
+    let revision = enabled["outgoing"]["revision"].clone();
+    let reply = handle
+        .owner_ext_method(set_grant(revision.clone(), grant))
+        .await
+        .unwrap();
+    let unchanged: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    assert_eq!(unchanged["outgoing"]["revision"], revision);
+    assert!(updates.try_recv().is_err());
+    let reply = handle
+        .owner_ext_method(request("querymt/mesh/nodes", serde_json::json!({})))
+        .await
+        .unwrap();
+    let nodes: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    assert_eq!(nodes["managed_peer_ids"], serde_json::json!([peer]));
+
+    let store = mesh.quota_store().unwrap();
+    let reserved = store
+        .reserve(QuotaAttempt {
+            peer: PeerGrantKey {
+                host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+                peer: querymt_remote::NodeId::parse(&peer).unwrap(),
+            },
+            grant_revision: serde_json::from_value(revision.clone()).unwrap(),
+            protocol: SharingProtocol::V1,
+            provider_id: "fixture".into(),
+            model_id: "offline".into(),
+            request_id: uuid::Uuid::now_v7(),
+            bound_tokens: Some(20),
+            now: time::OffsetDateTime::now_utc().unix_timestamp(),
+        })
+        .await
+        .unwrap();
+    store.mark_dispatched(reserved).await.unwrap();
+    let scope = serde_json::json!({"provider_id":"fixture", "model_id":"offline"});
+    let reset = |revision, scope| {
+        request(
+            "querymt/mesh/resetPeerQuota",
+            serde_json::json!({
+                "version":1, "peer_id":peer, "expected_revision":revision, "scope":scope
+            }),
+        )
+    };
+    let non_owner = handle
+        .ext_method(reset(revision.clone(), scope.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        non_owner.data.unwrap()["code"],
+        "mesh_access_owner_required"
+    );
+    let in_flight = handle
+        .owner_ext_method(reset(revision.clone(), scope.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        in_flight.data.unwrap(),
+        serde_json::json!({"code":"mesh_quota_in_flight", "scope":scope})
+    );
+    assert!(updates.try_recv().is_err());
+
+    store
+        .settle(reserved, AttemptUsage::Observed(12))
+        .await
+        .unwrap();
+    let reply = handle
+        .owner_ext_method(reset(revision, scope))
+        .await
+        .unwrap();
+    let reset: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    let quota = reset["outgoing"]["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["scope"]["model_id"] == "offline")
+        .unwrap();
+    assert_eq!(quota["usage"]["known_tokens"], "0");
+    assert_eq!(quota["usage"]["reserved_tokens"], "0");
+    assert_eq!(quota["usage"]["available_tokens"], "9007199254740993");
+    let reply = handle
+        .owner_ext_method(set_grant(
+            reset["outgoing"]["revision"].clone(),
+            serde_json::json!({"mode":"none"}),
+        ))
+        .await
+        .unwrap();
+    let revoked: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
+    assert_eq!(revoked["outgoing"]["grant"]["mode"], "none");
+    assert!(
+        revoked["outgoing"]["quotas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|q| q["active"] == false)
+    );
+
     let response = handle
         .ext_method(ExtRequest::new(
             "querymt/mesh/status",

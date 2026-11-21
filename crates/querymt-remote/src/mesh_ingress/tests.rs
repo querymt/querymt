@@ -1,5 +1,9 @@
 use super::*;
 use crate::mesh_runtime::{guarded_test_behaviour, messaging_config};
+use crate::peer_access::{
+    GrantStore, GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, PeerGrantState,
+    ProviderGrant,
+};
 use futures_util::StreamExt;
 use kameo::actor::ActorId;
 use libp2p::swarm::SwarmEvent;
@@ -169,6 +173,231 @@ async fn sharing_wire_distinguishes_legacy_negotiation_from_denial() {
     })
     .await
     .expect("sharing negotiation test timed out");
+}
+
+#[derive(Default)]
+struct FixtureGrants(parking_lot::RwLock<std::collections::HashMap<PeerGrantKey, PeerGrantState>>);
+
+#[async_trait]
+impl GrantStore for FixtureGrants {
+    async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+        Ok(self.0.read().get(key).cloned().unwrap_or_default())
+    }
+
+    async fn replace_grant(
+        &self,
+        key: &PeerGrantKey,
+        expected: uuid::Uuid,
+        grant: PeerGrant,
+    ) -> Result<PeerGrantState, GrantStoreError> {
+        let mut grants = self.0.write();
+        let actual = grants.get(key).cloned().unwrap_or_default().revision;
+        if expected != actual {
+            return Err(GrantStoreError::Conflict { expected, actual });
+        }
+        let state = PeerGrantState {
+            grant,
+            revision: uuid::Uuid::now_v7(),
+        };
+        grants.insert(key.clone(), state.clone());
+        Ok(state)
+    }
+
+    async fn managed_peers(
+        &self,
+        host: &crate::NodeId,
+    ) -> Result<Vec<crate::NodeId>, GrantStoreError> {
+        Ok(self
+            .0
+            .read()
+            .keys()
+            .filter(|key| &key.host == host)
+            .map(|key| key.peer.clone())
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
+    use crate::mesh_runtime::bootstrap_mesh_handle_with_ingress;
+    use crate::mesh_runtime_config::{
+        DirectoryMode, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
+    };
+    use crate::provider_share::guarded::MeteredChat;
+    use crate::{
+        KameoMeshClientTransport, NodeId, ProviderChatRequest, ProviderChatResponse,
+        ProviderHostActor, ProviderStreamRequest, ProviderStreamRouterActor,
+        RemoteProviderClientTransport, RemoteProviderHostError, RenewProviderStreamLease,
+    };
+    use kameo::actor::RemoteActorRef;
+    use querymt::error::{LLMError, ProviderErrorKind};
+    use tokio::sync::oneshot;
+
+    type StreamStart = ProviderStreamRequest<RemoteActorRef<ProviderStreamRouterActor>>;
+
+    fn chat_reply(output_tokens: u32) -> ProviderChatResponse {
+        ProviderChatResponse {
+            output: querymt::chat::ChatOutput {
+                usage: Some(querymt::Usage {
+                    output_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn assert_denied(error: LLMError) {
+        let LLMError::ProviderResponseError(failure) = error else {
+            panic!("expected a typed access denial, got {error:?}");
+        };
+        assert_eq!(failure.kind(), ProviderErrorKind::Authentication);
+        assert_eq!(failure.code(), Some("mesh_access_denied"));
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let grants = Arc::new(FixtureGrants::default());
+        let (start_tx, mut starts) = mpsc::unbounded_channel();
+        let (renew_tx, mut renewals) = mpsc::unbounded_channel();
+        let mut host = lan(|peer| {
+            let router = Arc::new(InboundRouter::new(peer, grants.clone()));
+            let provider = ActorId::new_with_peer_id(1, peer);
+            router.register_v1_ask::<ProviderHostActor, MeteredChat, _, RemoteProviderHostError, _, _>(
+                provider,
+                InboundAccess::Providers,
+                |_, msg| async move {
+                    assert_eq!(msg.request.model, "echo-model");
+                    assert!(!msg.request_id.is_nil());
+                    Ok(chat_reply(7))
+                },
+            );
+            router.register_v1_ask::<ProviderHostActor, StreamStart, _, RemoteProviderHostError, _, _>(
+                provider,
+                InboundAccess::Providers,
+                move |peer, request| {
+                    start_tx.send((peer.key().clone(), request)).unwrap();
+                    async { Ok(()) }
+                },
+            );
+            router.register_v1_ask::<ProviderHostActor, RenewProviderStreamLease, _, kameo::error::Infallible, _, _>(
+                provider,
+                InboundAccess::Providers,
+                move |_, request| {
+                    let (finish, reply) = oneshot::channel();
+                    renew_tx.send((request, finish)).unwrap();
+                    async move { Ok(reply.await.unwrap()) }
+                },
+            );
+            guarded_test_behaviour(peer, router)
+        });
+        let mut legacy = lan(|peer| {
+            let router = Arc::new(InboundRouter::new(peer, grants.clone()));
+            router.register_ask::<ProviderHostActor, ProviderChatRequest, _, RemoteProviderHostError, _, _>(
+                ActorId::new_with_peer_id(1, peer),
+                InboundAccess::LegacyFull,
+                |_, _| async { Ok(chat_reply(3)) },
+            );
+            Inbound::new(router, Duration::from_secs(3))
+        });
+        let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let host_addr = listening(&mut host, loopback.clone()).await;
+        let legacy_addr = listening(&mut legacy, loopback).await;
+        let (host_peer, legacy_peer) = (*host.local_peer_id(), *legacy.local_peer_id());
+        let (unused, _calls) = mpsc::unbounded_channel();
+        let identity = tempfile::tempdir().unwrap();
+        let mesh = bootstrap_mesh_handle_with_ingress(&MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(LanMeshConfig {
+                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                discovery: LanDiscovery::None,
+                directory: DirectoryMode::Kademlia,
+            }),
+            iroh_enabled: false,
+            iroh_gso: false,
+            iroh_dns: None,
+            iroh_scopes: vec![],
+            identity_file: Some(identity.path().join("identity")),
+            request_timeout: Duration::from_secs(3),
+            stream_reconnect_grace: Duration::from_secs(3),
+            node_name: None,
+            peers: vec![host_addr.with(libp2p::multiaddr::Protocol::P2p(host_peer)).to_string(), legacy_addr.with(libp2p::multiaddr::Protocol::P2p(legacy_peer)).to_string()],
+            auto_fallback: false,
+        }, Arc::new(RecordingGate(unused))).await.unwrap();
+        let run = async {
+            for peer in [host_peer, legacy_peer] {
+                let mut events = mesh.subscribe_peer_events();
+                while !mesh.is_peer_alive(&peer) {
+                    events.recv().await.unwrap();
+                }
+            }
+            let transport = KameoMeshClientTransport::new(mesh.clone());
+            // Address the fixtures directly; DHT lookup is not the boundary under test.
+            let host_ref = |peer| -> RemoteActorRef<ProviderHostActor> {
+                rmp_serde::from_slice(
+                    &rmp_serde::to_vec(&(ActorId::new_with_peer_id(1, peer),)).unwrap(),
+                ).unwrap()
+            };
+            let host = host_ref(host_peer);
+            let key_for = |peer| PeerGrantKey { host: NodeId::from_peer_id(peer), peer: NodeId::from_peer_id(*mesh.peer_id()) };
+            let request = ProviderChatRequest {
+                provider: "fixture".into(), model: "echo-model".into(), messages: vec![],
+                tools: None, params: None, item_aware_contract_version: None, options: None,
+            };
+            grants.replace_grant(&key_for(legacy_peer), uuid::Uuid::nil(), PeerGrant::Full).await.unwrap();
+            let legacy_reply = transport.send_chat_request(&host_ref(legacy_peer), &request).await.unwrap();
+            assert_eq!(legacy_reply.output.usage.unwrap().output_tokens, 3);
+            assert_denied(transport.send_chat_request(&host, &request).await.unwrap_err());
+            let key = key_for(host_peer);
+            let grant = grants.replace_grant(&key, uuid::Uuid::nil(), PeerGrant::Custom {
+                sessions: false, filesystem: false,
+                providers: vec![ProviderGrant { provider_id: request.provider.clone(), models: ModelSelection::All }],
+            }).await.unwrap();
+            let reply = transport.send_chat_request(&host, &request).await.unwrap();
+            assert_eq!(reply.output.usage.unwrap().output_tokens, 7);
+
+            let (session, id) = ("mesh-stream-session", "mesh-stream-request");
+            let (chunks, _consumer) = mpsc::unbounded_channel();
+            let (router, callback) = transport.prepare_stream_router(&host, session, id, chunks).await.unwrap();
+            transport.send_stream_request(&host, ProviderStreamRequest {
+                provider: request.provider, model: request.model, messages: vec![], tools: None,
+                session_id: session.into(), request_id: id.into(), stream_router_ref: callback,
+                reconnect_grace_secs: 3, heartbeat_interval_secs: 5, lease_ttl_secs: 30,
+                params: None, item_aware_contract_version: None, options: None,
+            }).await.unwrap();
+            let (caller, started) = starts.try_recv().unwrap();
+            assert_eq!(caller, key);
+            assert_eq!(started.request_id, id);
+            assert_eq!(started.stream_router_ref.id(), router.id());
+            let (renewed, ()) = tokio::join!(transport.renew_stream_lease(&host, session, id, 30), async {
+                let (renewed, reply) = renewals.recv().await.unwrap();
+                assert_eq!((renewed.session_id.as_str(), renewed.request_id.as_str()), (session, id));
+                reply.send(true).unwrap();
+            });
+            assert!(renewed.unwrap());
+
+            // Revoke after admission, before the handler can return success.
+            let (renewed, ()) = tokio::join!(transport.renew_stream_lease(&host, session, id, 30), async {
+                let (_, reply) = renewals.recv().await.unwrap();
+                grants.replace_grant(&key, grant.revision, PeerGrant::None).await.unwrap();
+                reply.send(true).unwrap();
+            });
+            assert_denied(renewed.unwrap_err());
+            assert_denied(transport.renew_stream_lease(&host, session, id, 30).await.unwrap_err());
+            assert!(matches!(renewals.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            router.kill();
+            mesh.shutdown().await;
+        };
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                _ = &mut run => break,
+                _ = host.select_next_some() => {},
+                _ = legacy.select_next_some() => {},
+            }
+        }
+    })
+    .await
+    .expect("mesh provider loopback test timed out");
 }
 
 #[tokio::test]

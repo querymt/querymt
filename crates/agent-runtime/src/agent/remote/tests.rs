@@ -2143,6 +2143,331 @@ mod node_manager_tests {
         }
     }
 
+    async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {
+        use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
+
+        crate::agent::remote::mesh::bootstrap_mesh_runtime(&MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(LanMeshConfig {
+                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                discovery: LanDiscovery::None,
+                directory: Default::default(),
+            }),
+            iroh_enabled: false,
+            iroh_gso: true,
+            iroh_dns: None,
+            iroh_scopes: Vec::new(),
+            identity_file: Some(dir.path().join("guarded-host.key")),
+            request_timeout: Duration::from_secs(3),
+            stream_reconnect_grace: Duration::from_secs(3),
+            node_name: None,
+            peers: Vec::new(),
+            auto_fallback: false,
+        })
+        .await
+        .unwrap()
+        .as_mesh_handle()
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn persisted_schedule_authority_is_bound_to_host_protocol_and_revision() {
+        use crate::agent::messages::{GetRuntimeStatus, ScheduledPrompt};
+        use crate::error::AgentError;
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        use querymt_remote::NodeId;
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let store = mesh.quota_store().unwrap();
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(*mesh.peer_id()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let custom = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            providers: Vec::new(),
+        };
+        let initial = store.grant(&key).await.unwrap();
+        let granted = store
+            .replace_grant(&key, initial.revision, custom.clone())
+            .await
+            .unwrap();
+        let history = config.provider.history_store();
+        let sid = history
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let permit = runtime
+            .execution_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let actor = SessionActor::spawn(
+            SessionActor::new(config.clone(), sid.clone(), runtime).with_mesh(Some(mesh.clone())),
+        );
+        let origin = |host, peer, revision, protocol| ScheduleOrigin::Peer {
+            host,
+            peer,
+            revision,
+            protocol,
+        };
+        let message = |origin| ScheduledPrompt {
+            schedule_public_id: "fixture-schedule".into(),
+            task_public_id: "fixture-task".into(),
+            prompt_text: "inert scheduled prompt".into(),
+            execution_limits: None,
+            origin,
+        };
+        let denied = |reply| {
+            assert!(matches!(
+                reply,
+                Err(SendError::HandlerError(AgentError::MeshAccessDenied))
+            ))
+        };
+        for rejected in [
+            origin(
+                libp2p::PeerId::random().to_string(),
+                key.peer.to_string(),
+                granted.revision,
+                SchedulePeerProtocol::V1,
+            ),
+            origin(
+                key.host.to_string(),
+                "invalid peer ID".into(),
+                granted.revision,
+                SchedulePeerProtocol::V1,
+            ),
+            origin(
+                key.host.to_string(),
+                key.peer.to_string(),
+                granted.revision,
+                SchedulePeerProtocol::Legacy,
+            ),
+        ] {
+            denied(actor.ask(message(rejected)).await);
+        }
+        assert!(
+            actor
+                .ask(GetRuntimeStatus)
+                .await
+                .unwrap()
+                .active_run_id
+                .is_none()
+        );
+        let saved = origin(
+            key.host.to_string(),
+            key.peer.to_string(),
+            granted.revision,
+            SchedulePeerProtocol::V1,
+        );
+        let start = actor.clone();
+        let running = tokio::spawn(async move { start.ask(message(saved)).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while actor
+                .ask(GetRuntimeStatus)
+                .await
+                .unwrap()
+                .active_run_id
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current V1 schedule must begin under its peer authority");
+        let revoked = store
+            .replace_grant(&key, granted.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        let regranted = store
+            .replace_grant(&key, revoked.revision, custom)
+            .await
+            .unwrap();
+        assert_ne!(regranted.revision, granted.revision);
+        // Even immediate regrant does not resurrect an admitted or persisted old turn.
+        denied(
+            tokio::time::timeout(Duration::from_secs(3), running)
+                .await
+                .expect("revoked scheduled run must stop while waiting")
+                .unwrap(),
+        );
+        denied(
+            actor
+                .ask(message(origin(
+                    key.host.to_string(),
+                    key.peer.to_string(),
+                    granted.revision,
+                    SchedulePeerProtocol::V1,
+                )))
+                .await,
+        );
+        assert!(history.get_history(&sid).await.unwrap().is_empty());
+        drop(permit);
+        mesh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn peer_access_read_and_usage_hints_are_scoped_to_the_authenticated_peer() {
+        use crate::agent::LocalAgentHandle;
+        use crate::agent::remote::node_manager::{GetPeerSharing, PeerAccessInvalidated};
+        use crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::NodeId;
+        use querymt_remote::mesh_ingress::MeshIngress;
+        use querymt_remote::peer_access::quota::{
+            AttemptUsage, QuotaAttempt, QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow,
+        };
+        use querymt_remote::peer_access::{
+            ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant, SharingProtocol,
+        };
+        use serde_json::{Value, json};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = LocalAgentHandle::from_config(config);
+        handle.set_mesh(mesh.clone());
+        let refs = spawn_and_register_local_mesh_actors(&handle, &mesh).await;
+        let node = refs.node_manager.id();
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let host = NodeId::from_peer_id(*mesh.peer_id());
+        let recipient = libp2p::PeerId::random();
+        let other = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host,
+            peer: NodeId::from_peer_id(recipient),
+        };
+        let get = |peer| async move {
+            let SwarmResponse::Ask(Ok(bytes)) = router
+                .handle_v1(
+                    peer,
+                    node_ask::<RemoteNodeManager, _>(node, &GetPeerSharing),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected peer-specific access snapshot");
+            };
+            rmp_serde::from_slice::<Value>(&bytes).unwrap()
+        };
+        assert_eq!(get(recipient).await, json!({"status":"denied"}));
+        let initial = store.grant(&key).await.unwrap();
+        let custom = store
+            .replace_grant(
+                &key,
+                initial.revision,
+                PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: false,
+                    providers: vec![ProviderGrant {
+                        provider_id: "mock".into(),
+                        models: ModelSelection::All,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let scope = QuotaScope {
+            provider_id: "mock".into(),
+            model_id: None,
+        };
+        let revision = store
+            .edit_quota(
+                &key,
+                custom.revision,
+                &scope,
+                QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                    tokens: 30,
+                    window: QuotaWindow::Manual,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        let visible = get(recipient).await;
+        assert_eq!(visible["status"], "granted");
+        assert_eq!(visible["effective"]["mode"], "custom");
+        assert_eq!(visible["effective"]["shell"], false);
+        assert_eq!(visible["quotas"][0]["limit"]["limit_tokens"], "30");
+        assert_eq!(get(other).await, json!({"status":"denied"}));
+
+        let mut updates = handle.subscribe_ext_notifications();
+        let attempt = store
+            .reserve(QuotaAttempt {
+                peer: key.clone(),
+                grant_revision: revision,
+                protocol: SharingProtocol::V1,
+                provider_id: "mock".into(),
+                model_id: "fixture".into(),
+                request_id: Uuid::now_v7(),
+                bound_tokens: Some(20),
+                now,
+            })
+            .await
+            .unwrap();
+        store.mark_dispatched(attempt).await.unwrap();
+        store
+            .settle(attempt, AttemptUsage::Observed(12))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(event.params.get()).unwrap(),
+            json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
+        );
+        assert_eq!(
+            get(recipient).await["quotas"][0]["usage"]["available_tokens"],
+            "18"
+        );
+        assert_eq!(store.grant(&key).await.unwrap().revision, revision);
+
+        let full = store
+            .replace_grant(&key, revision, PeerGrant::Full)
+            .await
+            .unwrap();
+        let visible = get(recipient).await;
+        assert_eq!(visible["effective"]["mode"], "full");
+        assert_eq!(visible["effective"]["shell"], true);
+        assert_eq!(visible["quotas"], json!([]));
+        store
+            .replace_grant(&key, full.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert_eq!(get(recipient).await, json!({"status":"denied"}));
+        let hint = router
+            .handle_v1(
+                other,
+                node_ask::<RemoteNodeManager, _>(node, &PeerAccessInvalidated::Policy),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(hint, SwarmResponse::Ask(Ok(_))));
+        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(event.params.get()).unwrap(),
+            json!({"version":1,"peer_id":other.to_string(),"direction":"incoming","reason":"policy"})
+        );
+        refs.node_manager.stop_gracefully().await.unwrap();
+        mesh.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_remote_schedule_lifecycle() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;

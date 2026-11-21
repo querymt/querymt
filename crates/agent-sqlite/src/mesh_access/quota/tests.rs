@@ -517,3 +517,106 @@ async fn revocation_invalidates_reserved_but_undispatched_attempt() {
         Some(100)
     );
 }
+
+#[tokio::test]
+async fn settled_requests_cannot_replay_across_restart_and_quota_reset() {
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    f.limit(&provider, 100, QuotaWindow::Weekly).await;
+    let mut request = f.request("a", Some(40), TUESDAY).await;
+    let attempt = f.store.reserve(request.clone()).await.unwrap();
+    assert!(matches!(
+        f.store.settle(attempt, AttemptUsage::Observed(20)).await,
+        Err(QuotaError::InvalidAttempt)
+    ));
+    f.store.mark_dispatched(attempt).await.unwrap();
+    assert!(matches!(
+        f.store.settle(attempt, AttemptUsage::Observed(-1)).await,
+        Err(QuotaError::InvalidTokens)
+    ));
+    assert_eq!(f.status(&provider, TUESDAY).await.reserved_tokens, 40);
+    assert_eq!(
+        f.store
+            .settle(attempt, AttemptUsage::Observed(20))
+            .await
+            .unwrap(),
+        QuotaSettlement::Recorded
+    );
+    assert_eq!(
+        f.store
+            .settle(attempt, AttemptUsage::Unknown)
+            .await
+            .unwrap(),
+        QuotaSettlement::AlreadyFinal
+    );
+    let status = f.status(&provider, TUESDAY).await;
+    assert_eq!(status.known_tokens, 20);
+    assert_eq!(status.estimated_tokens, 0);
+    request.grant_revision = f.edit(&provider, QuotaEdit::Reset, TUESDAY).await.unwrap();
+    let reopened = SqliteMeshAccess::open(&f.path).await.unwrap();
+    assert!(matches!(
+        reopened.reserve(request.clone()).await,
+        Err(QuotaError::DuplicateAttempt)
+    ));
+    request.request_id = Uuid::now_v7();
+    request.bound_tokens = None;
+    assert!(
+        matches!(reopened.reserve(request.clone()).await, Err(QuotaError::Unsupported(scope)) if scope == provider)
+    );
+    request.bound_tokens = Some(40);
+    let fresh = reopened
+        .reserve(request)
+        .await
+        .expect("denial did not reserve or consume the request ID");
+    reopened.release_unused(fresh).await.unwrap();
+    let status = reopened.quota(&f.key, &provider, TUESDAY).await.unwrap();
+    assert_eq!(status.available_tokens, Some(100));
+    assert_eq!(status.known_tokens, 0);
+}
+
+#[tokio::test]
+async fn unlimited_unknown_usage_survives_reconfigure_only_in_its_original_period() {
+    let f = Fixture::new().await;
+    let provider = scope(None);
+    let attempt = f
+        .store
+        .reserve(f.request("a", None, TUESDAY).await)
+        .await
+        .unwrap();
+    f.store.mark_dispatched(attempt).await.unwrap();
+    f.store
+        .settle(attempt, AttemptUsage::Unknown)
+        .await
+        .unwrap();
+    let unlimited = f.status(&provider, TUESDAY).await;
+    assert_eq!(unlimited.limit, QuotaLimit::Unlimited);
+    assert!(unlimited.has_unknown_usage);
+    assert!(unlimited.available_tokens.is_none());
+    assert!(matches!(
+        f.edit(&provider, QuotaEdit::Reset, TUESDAY).await,
+        Err(QuotaError::NotFinite)
+    ));
+    let finite = QuotaLimit::Finite {
+        tokens: 25,
+        window: QuotaWindow::Manual,
+    };
+    assert!(matches!(
+        f.edit(&provider, QuotaEdit::Update(finite), TUESDAY).await,
+        Err(QuotaError::ReconfigureRequired)
+    ));
+    assert_eq!(f.status(&provider, TUESDAY).await, unlimited);
+    let revision = f
+        .edit(&provider, QuotaEdit::Reconfigure(finite), TUESDAY)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.edit(&provider, QuotaEdit::Update(finite), TUESDAY)
+            .await
+            .unwrap(),
+        revision
+    );
+    let fresh = f.status(&provider, TUESDAY).await;
+    assert_eq!(fresh.available_tokens, Some(25));
+    assert!(!fresh.has_unknown_usage);
+    assert!(fresh.next_reset_at.is_none());
+}
