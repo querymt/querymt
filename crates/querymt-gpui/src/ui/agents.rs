@@ -994,7 +994,7 @@ impl QmtApp {
             .items_center()
             .justify_center()
             .on_click(cx.listener(|this, _, _, cx| {
-                if !this.close_topmost() {
+                if !this.close_delegate_dialog(cx) && !this.close_topmost() {
                     this.close_automation_overlay(cx);
                 }
                 cx.notify();

@@ -696,7 +696,10 @@ impl QmtApp {
         let mut sections: Vec<(String, Vec<Model>)> = Vec::new();
         let mut taken = std::collections::HashSet::new();
         if query.is_empty() {
-            let recent: Vec<Model> = store.recent_models(&agent).into_iter().cloned().collect();
+            // A delegate's own recent routes while its route is being chosen.
+            let recent: Vec<Model> = self
+                .delegate_recent_models(cx)
+                .unwrap_or_else(|| store.recent_models(&agent).into_iter().cloned().collect());
             if !recent.is_empty() {
                 taken.extend(recent.iter().map(Model::key));
                 sections.push(("Recent".into(), recent));
@@ -1424,7 +1427,9 @@ impl QmtApp {
             .runtime(&agent)
             .is_some_and(|rt| rt.pending.contains("models"));
         // Selection keys: the same model on two machines is two rows.
-        let selected = if self.page == Page::Session {
+        let selected = if let Some(route) = self.delegate_selected_key(cx) {
+            route
+        } else if self.page == Page::Session {
             store.session_model_key()
         } else {
             store.launch_model(&agent).map(Model::key)
@@ -1584,9 +1589,12 @@ impl QmtApp {
                                     },
                                 ))),
                         )
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)),
-                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // While a delegate is open the row routes that delegate.
+                            if !this.route_delegate_model(&id, cx) {
+                                this.select_model(id.clone(), cx)
+                            }
+                        }))
                         .into_any_element(),
                 );
             }
