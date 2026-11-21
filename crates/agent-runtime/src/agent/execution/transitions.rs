@@ -9,7 +9,7 @@
 use super::tool_calls::{Disposition, PreparedCall};
 use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::{genai, u32_from_usize};
 use crate::middleware::{
@@ -68,9 +68,9 @@ pub(super) fn context_hook_trigger(messages: &[ChatMessage]) -> &'static str {
 /// [`context_hook_trigger`] over the history before notices were stored.
 #[instrument(
     name = "agent.transition.before_llm_call",
-    skip(config, context, exec_ctx, trigger),
+    skip(config, context, env, trigger),
     fields(
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         provider = %context.provider,
         model = %context.model,
         steps = context.stats.steps
@@ -79,26 +79,26 @@ pub(super) fn context_hook_trigger(messages: &[ChatMessage]) -> &'static str {
 pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     trigger: &'static str,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "BeforeLlmCall: session={}, steps={}",
-        exec_ctx.session_id, context.stats.steps
+        env.session_id, context.stats.steps
     );
 
-    if exec_ctx.cancellation_token.is_cancelled() {
+    if env.cancellation_token.is_cancelled() {
         return Ok(ExecutionState::Cancelled);
     }
 
     let provider = match super::llm_retry::call_with_retry(
         config,
-        &exec_ctx.session_id,
+        &env.session_id,
         "provider_init",
-        &exec_ctx.cancellation_token,
+        &env.cancellation_token,
         || {
-            let session_handle = exec_ctx.session_handle.clone();
-            let cancel = exec_ctx.cancellation_token.clone();
+            let session_handle = env.session_handle.clone();
+            let cancel = env.cancellation_token.clone();
             async move {
                 tokio::select! {
                     result = session_handle.provider() => result.map_err(LLMError::from),
@@ -126,7 +126,7 @@ pub(super) async fn transition_before_llm_call(
         Arc::new(
             (**context)
                 .clone()
-                .with_profile(exec_ctx.session_handle.profile().await),
+                .with_profile(env.session_handle.profile().await),
         )
     } else {
         context.clone()
@@ -150,9 +150,9 @@ pub(super) async fn transition_before_llm_call(
         let _guard = collect_span.enter();
         let tools = config.collect_tools(
             provider,
-            Some(exec_ctx.runtime.as_ref()),
-            Some(&exec_ctx.tool_config),
-            exec_ctx.tool_set(config),
+            Some(env.runtime.as_ref()),
+            Some(&env.tool_config),
+            env.tool_set(),
         );
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
@@ -162,10 +162,10 @@ pub(super) async fn transition_before_llm_call(
         (tools, tools_json, new_hash)
     };
 
-    let current_hash = exec_ctx.runtime.mcp_tool_state.load().tools_hash;
+    let current_hash = env.runtime.mcp_tool_state.load().tools_hash;
     let changed = current_hash.is_none_or(|h| h != new_hash);
     if changed {
-        exec_ctx.runtime.mcp_tool_state.rcu(|snap| {
+        env.runtime.mcp_tool_state.rcu(|snap| {
             let mut s = snap.clone();
             s.tools_hash = Some(new_hash);
             s
@@ -174,7 +174,7 @@ pub(super) async fn transition_before_llm_call(
 
     if changed {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             querymt_agent_core::events::AgentEventKind::ToolsAvailable {
                 tools: tools.clone(),
                 tools_hash: new_hash,
@@ -186,7 +186,7 @@ pub(super) async fn transition_before_llm_call(
     // `tool_updates` this stores a baseline or a tool change when due, and the
     // list is the most recent baseline's; otherwise it is the tools offered now
     // and the stored tool records are left out.
-    let tool_state = super::tool_history::resolve(exec_ctx, &context, tool_updates, &tools).await?;
+    let tool_state = super::tool_history::resolve(env, &context, tool_updates, &tools).await?;
     let context = tool_state.context;
     let leading = tool_state.leading;
     let offered_tools = tool_state.offered;
@@ -212,12 +212,12 @@ pub(super) async fn transition_before_llm_call(
     let hook_result = config
         .hooks
         .run_context(crate::hooks::ContextHookRequest {
-            session_id: exec_ctx.session_id.clone(),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            session_id: env.session_id.clone(),
+            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
+            turn_id: env.turn_id().to_string(),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
             model: context.model.to_string(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             trigger: trigger.to_string(),
             context_window,
             messages,
@@ -226,7 +226,7 @@ pub(super) async fn transition_before_llm_call(
         .await?;
     for notice in hook_result.notices {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::HookNotice {
                 event_name: notice.event_name,
                 message: notice.message,
@@ -245,7 +245,7 @@ pub(super) async fn transition_before_llm_call(
     if !unanswered.is_empty() {
         log::error!(
             "Session {}: request had unanswered tool call(s) {:?}; answered them as cancelled",
-            exec_ctx.session_id,
+            env.session_id,
             unanswered
         );
         debug_assert!(
@@ -259,11 +259,10 @@ pub(super) async fn transition_before_llm_call(
         &context.provider,
         &context.model,
         leading_hash,
-        system_prompt_hash(config, exec_ctx),
+        system_prompt_hash(config, env),
         &messages,
     );
-    exec_ctx
-        .runtime
+    env.runtime
         .cache_prefix
         .lock()
         .begin(prefix_fingerprint, std::time::Instant::now());
@@ -321,11 +320,8 @@ pub(super) async fn transition_before_llm_call(
 /// Hash of the system prompt the session's provider is configured with: the
 /// turn-pinned session config when it carries one, else the agent's initial
 /// config.
-fn system_prompt_hash(
-    config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-) -> querymt_agent_core::hash::RapidHash {
-    let pinned = exec_ctx
+fn system_prompt_hash(config: &AgentConfig, env: &TurnEnv) -> querymt_agent_core::hash::RapidHash {
+    let pinned = env
         .llm_config()
         .and_then(|llm| llm.params.as_ref())
         .and_then(|params| params.get("system"));
@@ -426,25 +422,22 @@ fn accounting_failure(error: querymt_agent_services::accounting::AccountingError
 /// The logical accounting operation for one main model request. Its retries
 /// are separate attempts. Failing to open accounting is an execution error:
 /// no paid request may be sent without a ledger.
-async fn main_attempt_operation(
+fn main_attempt_operation(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-) -> Result<querymt_agent_services::accounting::AttemptOperation, anyhow::Error> {
-    let cycle = exec_ctx
-        .cycle_accounting(&config.event_sink)
-        .await
-        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
+    env: &TurnEnv,
+) -> querymt_agent_services::accounting::AttemptOperation {
+    let cycle = &env.cycle_accounting;
     let recorder = Arc::new(
         querymt_agent_services::accounting::AttemptRecorder::with_projection(
-            config.event_sink.session_stream(&exec_ctx.session_id),
+            config.event_sink.session_stream(&env.session_id),
             cycle.session_accounting().clone(),
         ),
     );
-    let (provider, model) = exec_ctx
+    let (provider, model) = env
         .llm_config()
         .map(|c| (c.provider.clone(), c.model.clone()))
         .unwrap_or_default();
-    Ok(querymt_agent_services::accounting::AttemptOperation::new(
+    querymt_agent_services::accounting::AttemptOperation::new(
         recorder,
         cycle,
         querymt_agent_services::accounting::AttemptPurpose::MainResponse,
@@ -452,7 +445,7 @@ async fn main_attempt_operation(
         model,
     )
     .with_budget_pricing(config.budget_pricing())
-    .with_budget_cap(config.budget_cap_usd()))
+    .with_budget_cap(config.budget_cap_usd())
 }
 
 /// A paid dispatch the cycle budget gate refused ends the cycle as a
@@ -526,10 +519,11 @@ async fn store_results_then_stop_on_length(
     config: &AgentConfig,
     results: Arc<[ToolResult]>,
     context: Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
 ) -> Result<ExecutionState, anyhow::Error> {
     let next =
-        super::tool_calls::store_all_tool_results(config, &results, &context, exec_ctx).await?;
+        super::tool_calls::store_all_tool_results(config, &results, &context, env, turn).await?;
     Ok(match next {
         ExecutionState::BeforeLlmCall { context } => ExecutionState::Stopped {
             message: "Model hit token limit".into(),
@@ -843,19 +837,19 @@ fn gate_function_calls_for_execution(
 /// tracks usage/costs, and emits LlmRequestStart/End events.
 #[instrument(
     name = "agent.transition.call_llm",
-    skip(config, context, request, exec_ctx),
+    skip(config, context, request, env, turn),
     fields(
         otel.name = %format!("chat {}", context.model),
         otel.kind = "client",
         gen_ai.operation.name = "chat",
         gen_ai.provider.name = %genai::provider_name(&context.provider),
         gen_ai.request.model = %context.model,
-        gen_ai.conversation.id = %exec_ctx.session_id,
-        session.id = %exec_ctx.session_id,
+        gen_ai.conversation.id = %env.session_id,
+        session.id = %env.session_id,
         gen_ai.request.stream = tracing::field::Empty,
         qmt.cache.prefix_change = tracing::field::Empty,
         qmt.cache.idle_secs = tracing::field::Empty,
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         provider = %context.provider,
         model = %context.model,
         message_count = context.messages.len(),
@@ -866,7 +860,8 @@ pub(super) async fn transition_call_llm(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
     request: &Arc<PreparedModelRequest>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
 ) -> Result<ExecutionState, anyhow::Error> {
     // A single expected generation; early cancellation/drop retains an abnormal finish
     // without marking the span as an error. Successful canonical output replaces it.
@@ -875,11 +870,11 @@ pub(super) async fn transition_call_llm(
     // Attempts of this request, streaming or not, are reported on the span.
     let request_attempts = genai::RequestAttempts::new(&chat_span);
     genai::agent_id(&chat_span, config.provider.agent_id.as_deref());
-    let session_id = &exec_ctx.session_id;
+    let session_id = &env.session_id;
     let request_messages = request.messages.as_ref();
-    genai::conversation_compacted(&chat_span, &exec_ctx.compaction_summaries, request_messages);
+    genai::conversation_compacted(&chat_span, &turn.compaction_summaries, request_messages);
     let tools = &request.tools;
-    let prefix = exec_ctx.runtime.cache_prefix.lock().pending_attribution();
+    let prefix = env.runtime.cache_prefix.lock().pending_attribution();
     if let Some(prefix) = prefix {
         chat_span.record("qmt.cache.prefix_change", prefix.change.as_str());
         if let Some(idle) = prefix.idle_secs {
@@ -892,7 +887,7 @@ pub(super) async fn transition_call_llm(
         request_messages.len()
     );
 
-    if exec_ctx.cancellation_token.is_cancelled() {
+    if env.cancellation_token.is_cancelled() {
         return Ok(ExecutionState::Cancelled);
     }
 
@@ -920,17 +915,16 @@ pub(super) async fn transition_call_llm(
         },
     );
 
-    let session_handle = &exec_ctx.session_handle;
+    let session_handle = &env.session_handle;
     let messages_with_cache = request_messages;
     // Recorded on every exit path (success, error, cancel) when dropped.
     let chat_timer = crate::agent::utils::llm_metrics::ChatTimer::start(
         genai::provider_name(&context.provider),
         &context.model,
-        &exec_ctx.cancellation_token,
+        &env.cancellation_token,
     );
-    let operation = main_attempt_operation(config, exec_ctx)
-        .instrument(info_span!("agent.accounting.open"))
-        .await?;
+    let operation =
+        info_span!("agent.accounting.open").in_scope(|| main_attempt_operation(config, env));
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -944,12 +938,12 @@ pub(super) async fn transition_call_llm(
     // change while that list is empty, so both are read.
     let output: ChatOutput = if tools.is_empty() && request.offered_tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
-        let cancel = exec_ctx.cancellation_token.clone();
+        let cancel = env.cancellation_token.clone();
         match super::llm_retry::call_chat_with_retry(
             config,
             session_id,
             &request_attempts,
-            &exec_ctx.cancellation_token,
+            &env.cancellation_token,
             || {
                 let messages_with_cache = &messages_with_cache;
                 let cancel = cancel.clone();
@@ -994,9 +988,9 @@ pub(super) async fn transition_call_llm(
             config,
             session_id,
             "provider_init",
-            &exec_ctx.cancellation_token,
+            &env.cancellation_token,
             || {
-                let cancel = exec_ctx.cancellation_token.clone();
+                let cancel = env.cancellation_token.clone();
                 async move {
                     tokio::select! {
                         result = session_handle.provider() => result.map_err(LLMError::from),
@@ -1140,7 +1134,7 @@ pub(super) async fn transition_call_llm(
                     attempt,
                     config.execution_policy.rate_limit.max_attempts(),
                 );
-                if exec_ctx.cancellation_token.is_cancelled() {
+                if env.cancellation_token.is_cancelled() {
                     return Ok(ExecutionState::Cancelled);
                 }
 
@@ -1189,7 +1183,7 @@ pub(super) async fn transition_call_llm(
                         &mut retry_budget,
                         false,
                         Some(message_id.clone()),
-                        &exec_ctx.cancellation_token,
+                        &env.cancellation_token,
                     )
                     .await
                     {
@@ -1206,11 +1200,9 @@ pub(super) async fn transition_call_llm(
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
                     timing.wait_begin();
-                    let item = super::llm_retry::next_stream_chunk(
-                        &mut stream,
-                        &exec_ctx.cancellation_token,
-                    )
-                    .await;
+                    let item =
+                        super::llm_retry::next_stream_chunk(&mut stream, &env.cancellation_token)
+                            .await;
                     timing.wait_end();
 
                     let chunk = match item {
@@ -1253,7 +1245,7 @@ pub(super) async fn transition_call_llm(
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
-                            &exec_ctx.cancellation_token,
+                            &env.cancellation_token,
                         )
                         .await
                         {
@@ -1292,7 +1284,7 @@ pub(super) async fn transition_call_llm(
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
-                            &exec_ctx.cancellation_token,
+                            &env.cancellation_token,
                         )
                         .await
                         {
@@ -1346,9 +1338,9 @@ pub(super) async fn transition_call_llm(
                             }
                             if matches!(event, StructuredStreamEvent::ResponseTerminal { .. }) {
                                 drained_usage =
-                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                    drain_trailing_usage(&mut stream, &env.cancellation_token)
                                         .await;
-                                if exec_ctx.cancellation_token.is_cancelled() {
+                                if env.cancellation_token.is_cancelled() {
                                     let partial = querymt_agent_services::accounting::merge_usage(
                                         accumulator.output().usage,
                                         drained_usage.take(),
@@ -1443,9 +1435,9 @@ pub(super) async fn transition_call_llm(
                                 // the accumulator (post-terminal events are invalid)
                                 // and merge into the output after validation.
                                 drained_usage =
-                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                    drain_trailing_usage(&mut stream, &env.cancellation_token)
                                         .await;
-                                if exec_ctx.cancellation_token.is_cancelled() {
+                                if env.cancellation_token.is_cancelled() {
                                     let partial = querymt_agent_services::accounting::merge_usage(
                                         accumulator.output().usage,
                                         drained_usage.take(),
@@ -1479,7 +1471,7 @@ pub(super) async fn transition_call_llm(
                                         &mut retry_budget,
                                         semantic_output_seen,
                                         Some(message_id.clone()),
-                                        &exec_ctx.cancellation_token,
+                                        &env.cancellation_token,
                                     )
                                     .await
                                     {
@@ -1561,7 +1553,7 @@ pub(super) async fn transition_call_llm(
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
-                            &exec_ctx.cancellation_token,
+                            &env.cancellation_token,
                         )
                         .await
                         {
@@ -1610,19 +1602,19 @@ pub(super) async fn transition_call_llm(
             // per-chunk cancellation check at the top of the loop. Re-check here
             // so a cancel signal that arrived concurrently with the terminal chunk
             // is not missed — without this the state machine would advance to AfterLlm.
-            if exec_ctx.cancellation_token.is_cancelled() {
+            if env.cancellation_token.is_cancelled() {
                 return Ok(ExecutionState::Cancelled);
             }
 
             streamed_output
         } else {
             // === NON-STREAMING FALLBACK ===
-            let cancel = exec_ctx.cancellation_token.clone();
+            let cancel = env.cancellation_token.clone();
             match super::llm_retry::call_chat_with_retry(
                 config,
                 session_id,
                 &request_attempts,
-                &exec_ctx.cancellation_token,
+                &env.cancellation_token,
                 || {
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
@@ -1674,12 +1666,7 @@ pub(super) async fn transition_call_llm(
     // included) and the cumulative figure is the session's recorded total.
     // Each is `None` unless it is a complete supported estimate.
     let request_cost = operation.totals().complete_total_usd();
-    let cumulative_cost = exec_ctx
-        .cycle_accounting(&config.event_sink)
-        .await
-        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?
-        .session_totals()
-        .complete_total_usd();
+    let cumulative_cost = env.cycle_accounting.session_totals().complete_total_usd();
 
     debug!(
         "Session {} received provider response ({} chars, {} tool call(s), finish: {:?}, cost: ${:.4?})",
@@ -1715,8 +1702,7 @@ pub(super) async fn transition_call_llm(
         },
     );
     // The request completed, so its prefix is now what the provider cached.
-    exec_ctx
-        .runtime
+    env.runtime
         .cache_prefix
         .lock()
         .commit(std::time::Instant::now());
@@ -1754,22 +1740,23 @@ pub(super) async fn transition_call_llm(
 /// and determines next state based on finish reason and tool calls.
 #[instrument(
     name = "agent.transition.after_llm",
-    skip(config, response, context, exec_ctx),
-    fields(session_id = %exec_ctx.session_id, has_tool_calls = response.has_tool_calls())
+    skip(config, response, context, env, turn),
+    fields(session_id = %env.session_id, has_tool_calls = response.has_tool_calls())
 )]
 pub(super) async fn transition_after_llm(
     config: &AgentConfig,
     response: &Arc<LlmResponse>,
     context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "AfterLlm: session={}, has_tool_calls={}",
-        exec_ctx.session_id,
+        env.session_id,
         response.has_tool_calls()
     );
 
-    if exec_ctx.cancellation_token.is_cancelled() {
+    if env.cancellation_token.is_cancelled() {
         return Ok(ExecutionState::Cancelled);
     }
 
@@ -1787,7 +1774,7 @@ pub(super) async fn transition_after_llm(
         "Received response from LLM".to_string()
     };
 
-    let progress_entry = exec_ctx
+    let progress_entry = turn
         .state
         .record_progress(
             crate::session::domain::ProgressKind::Note,
@@ -1798,7 +1785,7 @@ pub(super) async fn transition_after_llm(
         .map_err(|e| anyhow::anyhow!("Failed to record progress: {}", e))?;
 
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::ProgressRecorded { progress_entry },
     );
 
@@ -1860,7 +1847,7 @@ pub(super) async fn transition_after_llm(
 
     let assistant_msg = AgentMessage {
         id: msg_id,
-        session_id: exec_ctx.session_id.clone(),
+        session_id: env.session_id.clone(),
         role: ChatRole::Assistant,
         parts,
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -1873,8 +1860,7 @@ pub(super) async fn transition_after_llm(
     // neither persisted nor announced, but its usage below is still counted.
     let store_reply = !response.is_thinking_only_length_cutoff();
     if store_reply {
-        exec_ctx
-            .add_message(assistant_msg.clone())
+        env.add_message(assistant_msg.clone())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
 
@@ -1884,7 +1870,7 @@ pub(super) async fn transition_after_llm(
             .map(reasoning_parts_from_output)
             .unwrap_or_default();
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::AssistantMessageStored {
                 content: response.content.clone(),
                 thinking: response.thinking.clone(),
@@ -1895,7 +1881,7 @@ pub(super) async fn transition_after_llm(
     } else {
         debug!(
             "Not storing thinking-only reply cut off by the output limit: session={}",
-            exec_ctx.session_id
+            env.session_id
         );
     }
 
@@ -1920,9 +1906,7 @@ pub(super) async fn transition_after_llm(
     // Monetary fields are a view of this cycle's recorded components, never a
     // revaluation of token counters at current rates. Applied even when this
     // response reported no usage, so recorded charges stay visible.
-    if let Some(cycle) = exec_ctx.cycle_accounting.get() {
-        updated_stats.apply_recorded_costs(&cycle.cycle_totals());
-    }
+    updated_stats.apply_recorded_costs(&env.cycle_accounting.cycle_totals());
 
     let new_context = Arc::new(
         context
@@ -2007,7 +1991,8 @@ pub(super) async fn transition_after_llm(
         let results: Arc<[ToolResult]> = Arc::from(gated_results.into_boxed_slice());
 
         if response.finish_reason == Some(FinishReason::Length) {
-            return store_results_then_stop_on_length(config, results, new_context, exec_ctx).await;
+            return store_results_then_stop_on_length(config, results, new_context, env, turn)
+                .await;
         }
 
         // Store the synthesized results (no execution) by routing through the
@@ -2099,9 +2084,9 @@ pub(super) async fn transition_after_llm(
 /// history invariant is always maintained.
 #[instrument(
     name = "agent.transition.processing_tool_calls",
-    skip(config, driver, remaining_calls, results, context, exec_ctx),
+    skip(config, driver, remaining_calls, results, context, env, turn),
     fields(
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         remaining_calls = remaining_calls.len(),
         completed_results = results.len(),
         wave_count = tracing::field::Empty,
@@ -2115,23 +2100,24 @@ pub(super) async fn transition_processing_tool_calls(
     remaining_calls: &Arc<[MiddlewareToolCall]>,
     results: &Arc<[ToolResult]>,
     context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "ProcessingToolCalls: session={}, remaining={}, completed={}",
-        exec_ctx.session_id,
+        env.session_id,
         remaining_calls.len(),
         results.len()
     );
 
     // If already cancelled before we even start, we still need to store synthetic
     // results for every pending call to keep history consistent.
-    let already_cancelled = exec_ctx.cancellation_token.is_cancelled();
+    let already_cancelled = env.cancellation_token.is_cancelled();
 
     if remaining_calls.is_empty() {
-        let session_id = exec_ctx.session_id.clone();
+        let session_id = env.session_id.clone();
         let next_state =
-            super::tool_calls::store_all_tool_results(config, results, context, exec_ctx)
+            super::tool_calls::store_all_tool_results(config, results, context, env, turn)
                 .instrument(info_span!(
                     "agent.tools.store_results",
                     session_id = %session_id,
@@ -2152,18 +2138,14 @@ pub(super) async fn transition_processing_tool_calls(
     // completed, so later hooks observe its effects.
     let classes: Vec<crate::tools::ToolExecutionClass> = remaining_calls
         .iter()
-        .map(|call| {
-            exec_ctx
-                .tool_set(config)
-                .execution_class(&call.function.name)
-        })
+        .map(|call| env.tool_set().execution_class(&call.function.name))
         .collect();
     let segments = split_segments(&classes);
     debug!(
         "Executing {} tool calls in {} segment(s) for session {}",
         remaining_calls.len(),
         segments.len(),
-        exec_ctx.session_id
+        env.session_id
     );
 
     // One slot per call so results can be stored in the model's original order
@@ -2179,7 +2161,7 @@ pub(super) async fn transition_processing_tool_calls(
         if cancelled || clarification_applied {
             break;
         }
-        if exec_ctx.cancellation_token.is_cancelled() {
+        if env.cancellation_token.is_cancelled() {
             cancelled = true;
             break;
         }
@@ -2195,21 +2177,16 @@ pub(super) async fn transition_processing_tool_calls(
         // whatever the tool declares, and `prepare_segment` runs them.
         if (config.hooks.is_enabled()
             || indices.iter().any(|&index| {
-                !super::tool_calls::call_is_read_only(
-                    config,
-                    exec_ctx,
-                    &remaining_calls[index].function.name,
-                )
+                !super::tool_calls::call_is_read_only(env, &remaining_calls[index].function.name)
             }))
-            && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
+            && let Err(e) = ensure_pre_turn_snapshot_ready(env, turn, "before_mutating_tool").await
         {
             warn!(
                 "Failed to resolve pre-turn snapshot before tool execution: {}",
                 e
             );
         }
-        let segment_plan =
-            prepare_segment(config, driver, remaining_calls, &indices, exec_ctx).await?;
+        let segment_plan = prepare_segment(config, driver, remaining_calls, &indices, env).await?;
         // Preparation may resolve a call to a different target than the
         // pre-check saw (e.g. the MCP tool list reloaded); re-check the
         // prepared targets. A no-op when the snapshot is already resolved.
@@ -2217,7 +2194,7 @@ pub(super) async fn transition_processing_tool_calls(
             .ready
             .iter()
             .any(|(_, call, _)| !call.target.is_read_only())
-            && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
+            && let Err(e) = ensure_pre_turn_snapshot_ready(env, turn, "before_mutating_tool").await
         {
             warn!(
                 "Failed to resolve pre-turn snapshot before tool execution: {}",
@@ -2248,13 +2225,13 @@ pub(super) async fn transition_processing_tool_calls(
                 wave_count += waves.len() as u64;
                 serialized_calls += serialized_call_count(&call_infos, &waves) as u64;
                 for wave in &waves {
-                    if exec_ctx.cancellation_token.is_cancelled() {
+                    if env.cancellation_token.is_cancelled() {
                         cancelled = true;
                         break;
                     }
-                    // Reborrow immutably so the context can be shared across the
-                    // wave; execution only needs `&ExecutionContext`.
-                    let exec_ctx_ref: &ExecutionContext = exec_ctx;
+                    // Reborrow immutably so the run can be shared across the
+                    // wave; a tool call only reads it.
+                    let turn_ref: &Turn = turn;
                     let futures = wave.iter().map(|&position| {
                         let index = ready_indices[position];
                         let call = &remaining_calls[index];
@@ -2263,7 +2240,7 @@ pub(super) async fn transition_processing_tool_calls(
                         async move {
                             (
                                 index,
-                                run_prepared_tool_call(config, call, prepared_call, exec_ctx_ref)
+                                run_prepared_tool_call(config, call, prepared_call, env, turn_ref)
                                     .await,
                             )
                         }
@@ -2280,23 +2257,23 @@ pub(super) async fn transition_processing_tool_calls(
                     let class = classes[index];
                     let call = &remaining_calls[index];
                     let result =
-                        run_prepared_tool_call(config, call, prepared_call, exec_ctx).await;
+                        run_prepared_tool_call(config, call, prepared_call, env, turn).await;
                     if class == crate::tools::ToolExecutionClass::ClarificationBoundary
                         && !result.is_error
                     {
                         clarification_applied =
-                            apply_clarification_answer(exec_ctx, call, &result).await;
+                            apply_clarification_answer(turn, call, &result).await;
                     }
                     slots[index] = Some(result);
                     if class == crate::tools::ToolExecutionClass::SerialStateful {
                         // Following calls are prepared against the updated state.
-                        state_reload_ms += reload_working_context(exec_ctx).await;
+                        state_reload_ms += reload_working_context(turn).await;
                     }
                 }
             }
         }
 
-        if exec_ctx.cancellation_token.is_cancelled() {
+        if env.cancellation_token.is_cancelled() {
             cancelled = true;
         }
     }
@@ -2306,7 +2283,7 @@ pub(super) async fn transition_processing_tool_calls(
     span.record("serialized_calls", serialized_calls);
     span.record("state_reload_ms", state_reload_ms);
 
-    let was_cancelled = cancelled || exec_ctx.cancellation_token.is_cancelled();
+    let was_cancelled = cancelled || env.cancellation_token.is_cancelled();
 
     // Exactly one result per call: calls that never started (cancellation, or
     // a clarification that changed the run objective) get a synthetic result.
@@ -2326,18 +2303,19 @@ pub(super) async fn transition_processing_tool_calls(
     debug!(
         "Completed {} tool calls for session {} (cancelled={})",
         all_results.len() - results.len(),
-        exec_ctx.session_id,
+        env.session_id,
         was_cancelled,
     );
 
     // Always store results — even on cancellation — to maintain the
     // tool_use → tool_result history invariant required by LLM APIs.
-    let session_id = exec_ctx.session_id.clone();
+    let session_id = env.session_id.clone();
     let next_state = super::tool_calls::store_all_tool_results(
         config,
         &Arc::from(all_results.into_boxed_slice()),
         context,
-        exec_ctx,
+        env,
+        turn,
     )
     .instrument(info_span!(
         "agent.tools.store_results",
@@ -2399,20 +2377,20 @@ async fn prepare_segment(
     driver: &CompositeDriver,
     calls: &[MiddlewareToolCall],
     indices: &[usize],
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
 ) -> Result<SegmentPlan, anyhow::Error> {
     let mut immediate: Vec<(usize, ToolResult)> = Vec::new();
     let mut prepared: Vec<(usize, PreparedCall)> = Vec::new();
 
     for &index in indices {
-        if exec_ctx.cancellation_token.is_cancelled() {
+        if env.cancellation_token.is_cancelled() {
             break;
         }
         let call = &calls[index];
         let outcome = tokio::select! {
             biased;
-            _ = exec_ctx.cancellation_token.cancelled() => break,
-            outcome = super::tool_calls::prepare_tool_call(config, call, exec_ctx) => outcome,
+            _ = env.cancellation_token.cancelled() => break,
+            outcome = super::tool_calls::prepare_tool_call(config, call, env) => outcome,
         };
         match outcome {
             Ok(prepared_call) => match prepared_call.disposition {
@@ -2443,9 +2421,9 @@ async fn prepare_segment(
     }
 
     // File access is declared once, for the final effective arguments.
-    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
-    let accesses = exec_ctx
-        .tool_set(config)
+    let cwd = env.cwd().map(|path| path.to_path_buf());
+    let accesses = env
+        .tool_set()
         .file_access_batch(
             prepared
                 .iter()
@@ -2467,7 +2445,7 @@ async fn prepare_segment(
             .collect();
         driver
             .run_prepared_tool_calls(&PreparedBatch {
-                session_id: &exec_ctx.session_id,
+                session_id: &env.session_id,
                 cwd: cwd.as_deref(),
                 calls: &views,
             })
@@ -2490,13 +2468,13 @@ async fn prepare_segment(
 
 /// Reload the working context after a stateful tool ran so later calls are
 /// prepared against the updated state. Returns the elapsed milliseconds.
-async fn reload_working_context(exec_ctx: &mut ExecutionContext) -> u64 {
+async fn reload_working_context(turn: &mut Turn) -> u64 {
     let started = Instant::now();
-    match exec_ctx.state.load_working_context().await {
+    match turn.state.load_working_context().await {
         Ok(()) => {
-            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+            if let Some(objective) = turn.run_objective.as_mut() {
                 objective.set_task(
-                    exec_ctx.state.active_task.as_ref(),
+                    turn.state.active_task.as_ref(),
                     crate::agent::objective::ObjectiveSource::TaskUpdated,
                 );
             }
@@ -2532,11 +2510,12 @@ async fn run_prepared_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     prepared: PreparedCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
 ) -> ToolResult {
-    let cancel = exec_ctx.cancellation_token.clone();
+    let cancel = env.cancellation_token.clone();
     tokio::select! {
-        result = super::tool_calls::execute_prepared_tool_call(config, call, prepared, exec_ctx) => {
+        result = super::tool_calls::execute_prepared_tool_call(config, call, prepared, env, turn) => {
             match result {
                 Ok(tool_result) => tool_result,
                 Err(error) => {
@@ -2561,7 +2540,7 @@ async fn run_prepared_tool_call(
 /// Returns `true` when the answer was persisted and applied, which means the
 /// rest of the batch must be skipped so the model can reconsider.
 async fn apply_clarification_answer(
-    exec_ctx: &mut ExecutionContext,
+    turn: &mut Turn,
     call: &MiddlewareToolCall,
     tool_result: &ToolResult,
 ) -> bool {
@@ -2575,13 +2554,13 @@ async fn apply_clarification_answer(
         return false;
     }
 
-    let summary = exec_ctx
+    let summary = turn
         .state
         .current_intent
         .as_ref()
         .map(|intent| intent.summary.clone())
         .unwrap_or_else(|| clarification.clone());
-    match exec_ctx
+    match turn
         .state
         .update_intent_projection(
             summary,
@@ -2593,7 +2572,7 @@ async fn apply_clarification_answer(
         .await
     {
         Ok(_) => {
-            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+            if let Some(objective) = turn.run_objective.as_mut() {
                 objective.amend(crate::agent::objective::ObjectiveDirective {
                     text: clarification,
                     source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
@@ -2624,10 +2603,10 @@ async fn apply_clarification_answer(
 pub(super) async fn transition_before_llm_call_in_test(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
 ) -> Result<ExecutionState, anyhow::Error> {
     let trigger = context_hook_trigger(&context.messages);
-    transition_before_llm_call(config, context, exec_ctx, trigger).await
+    transition_before_llm_call(config, context, env, trigger).await
 }
 
 #[cfg(test)]
@@ -2638,18 +2617,20 @@ mod tests {
     /// workspace; read-only calls and text replies never wait for it.
     mod snapshot_wait_tests {
         use super::super::*;
+        use crate::agent::execution::turn::PreTurnSnapshot;
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
         use std::time::Duration;
 
-        fn turn() -> querymt_agent_core::model::TurnId {
+        fn turn_id() -> querymt_agent_core::model::TurnId {
             querymt_agent_core::model::TurnId::from(uuid::Uuid::from_u128(0x1111))
         }
 
-        async fn pending_snapshot_exec(agent: &TestAgent) -> ExecutionContext {
-            let exec = agent.execution_context().await;
-            *exec.runtime.pre_turn_snapshot_task.lock() =
-                Some(tokio::spawn(async { (turn(), Ok("snapshot-1".into())) }));
-            exec
+        async fn pending_snapshot_exec(agent: &TestAgent) -> (TurnEnv, Turn) {
+            let (exec, mut turn) = agent.turn().await;
+            turn.snapshot = PreTurnSnapshot::Pending(tokio::spawn(async {
+                (turn_id(), Ok("snapshot-1".into()))
+            }));
+            (exec, turn)
         }
 
         async fn agent() -> TestAgent {
@@ -2660,7 +2641,7 @@ mod tests {
         #[tokio::test]
         async fn read_only_tool_call_leaves_the_snapshot_pending() {
             let agent = agent().await;
-            let mut exec = pending_snapshot_exec(&agent).await;
+            let (exec, mut turn) = pending_snapshot_exec(&agent).await;
             let calls: Arc<[MiddlewareToolCall]> = Arc::from(vec![mock_tool_call(
                 "c1",
                 "read_tool",
@@ -2678,7 +2659,8 @@ mod tests {
                     &calls,
                     &results,
                     &context,
-                    &mut exec,
+                    &exec,
+                    &mut turn,
                 ),
             )
             .await
@@ -2686,16 +2668,15 @@ mod tests {
             .expect("transition succeeds");
 
             assert!(
-                exec.runtime.pre_turn_snapshot_task.lock().is_some(),
+                matches!(turn.snapshot, PreTurnSnapshot::Pending(_)),
                 "a read-only call must not wait for the pre-turn snapshot"
             );
-            assert!(exec.runtime.turn_snapshot.lock().is_none());
         }
 
         #[tokio::test]
         async fn mutating_tool_call_resolves_the_snapshot_first() {
             let agent = agent().await;
-            let mut exec = pending_snapshot_exec(&agent).await;
+            let (exec, mut turn) = pending_snapshot_exec(&agent).await;
             let calls: Arc<[MiddlewareToolCall]> = Arc::from(vec![mock_tool_call(
                 "c1",
                 "write_file",
@@ -2715,29 +2696,32 @@ mod tests {
                     &calls,
                     &results,
                     &context,
-                    &mut exec,
+                    &exec,
+                    &mut turn,
                 ),
             )
             .await;
 
-            assert!(exec.runtime.pre_turn_snapshot_task.lock().is_none());
+            let PreTurnSnapshot::Ready(snapshot) = &turn.snapshot else {
+                panic!("the snapshot must be resolved before the call");
+            };
             assert_eq!(
-                exec.runtime.turn_snapshot.lock().clone(),
-                Some(crate::agent::core::TurnSnapshot {
-                    turn_id: turn(),
+                *snapshot,
+                crate::agent::core::TurnSnapshot {
+                    turn_id: turn_id(),
                     snapshot_id: "snapshot-1".into(),
-                })
+                }
             );
         }
 
         #[tokio::test]
         async fn text_only_reply_does_not_wait_for_the_snapshot() {
             let agent = agent().await;
-            let mut exec = pending_snapshot_exec(&agent).await;
+            let (exec, mut turn) = pending_snapshot_exec(&agent).await;
             // A task that never finishes would hang the turn if it were awaited.
-            *exec.runtime.pre_turn_snapshot_task.lock() = Some(tokio::spawn(async {
+            turn.snapshot = PreTurnSnapshot::Pending(tokio::spawn(async {
                 std::future::pending::<()>().await;
-                (turn(), Ok("".into()))
+                (turn_id(), Ok("".into()))
             }));
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let response = Arc::new(LlmResponse::new(
@@ -2749,25 +2733,26 @@ mod tests {
 
             let state = tokio::time::timeout(
                 Duration::from_secs(10),
-                transition_after_llm(&agent.config, &response, &context, &mut exec),
+                transition_after_llm(&agent.config, &response, &context, &exec, &mut turn),
             )
             .await
             .expect("after_llm must not block on the pending snapshot")
             .expect("after llm");
 
             assert!(!matches!(state, ExecutionState::ProcessingToolCalls { .. }));
-            let pending = exec.runtime.pre_turn_snapshot_task.lock().take();
-            assert!(pending.is_some(), "snapshot task still pending");
-            pending.unwrap().abort();
+            let PreTurnSnapshot::Pending(pending) = std::mem::take(&mut turn.snapshot) else {
+                panic!("snapshot task still pending");
+            };
+            pending.abort();
         }
 
         #[tokio::test]
         async fn read_only_check_matches_snapshot_preparation() {
             let agent = agent().await;
-            let exec = agent.execution_context().await;
+            let (exec, _turn) = agent.turn().await;
             use super::super::super::tool_calls::call_is_read_only;
-            assert!(call_is_read_only(&agent.config, &exec, "read_tool"));
-            assert!(!call_is_read_only(&agent.config, &exec, "write_file"));
+            assert!(call_is_read_only(&exec, "read_tool"));
+            assert!(!call_is_read_only(&exec, "write_file"));
         }
     }
 
@@ -2793,10 +2778,8 @@ mod tests {
             ))
             .await;
             let token = CancellationToken::new();
-            let exec = agent
-                .execution_context_with_mcp(harness.tool_state.clone())
-                .await
-                .with_cancellation_token(token.clone());
+            let (mut exec, turn) = agent.turn_with_mcp(harness.tool_state.clone()).await;
+            exec.cancellation_token = token.clone();
             let mut events = agent.config.event_sink.fanout().subscribe();
 
             let call = mock_tool_call("c1", tool, &args.to_string());
@@ -2820,7 +2803,7 @@ mod tests {
                 token.cancel();
             };
             let (result, ()) = tokio::join!(
-                run_prepared_tool_call(&agent.config, &call, prepared, &exec),
+                run_prepared_tool_call(&agent.config, &call, prepared, &exec, &turn),
                 canceller
             );
 
@@ -2919,10 +2902,8 @@ mod tests {
             .await;
             let dir = tempfile::TempDir::new().unwrap();
             let token = CancellationToken::new();
-            let mut exec = agent
-                .execution_context_in(dir.path().to_path_buf())
-                .await
-                .with_cancellation_token(token.clone());
+            let (mut exec, mut turn) = agent.turn_in(dir.path().to_path_buf()).await;
+            exec.cancellation_token = token.clone();
             let mut events = agent.config.event_sink.fanout().subscribe();
             let pid_file = dir.path().join("running");
             let calls: Arc<[MiddlewareToolCall]> = batch
@@ -2958,7 +2939,8 @@ mod tests {
                         &calls,
                         &results,
                         &context,
-                        &mut exec,
+                        &exec,
+                        &mut turn,
                     ),
                 ),
                 canceller
@@ -3101,7 +3083,7 @@ mod tests {
                 });
                 let fixture =
                     TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-                let mut exec = fixture.execution_context().await;
+                let (exec, mut turn) = fixture.turn().await;
                 let (boundary, mut summary) = SessionCompaction::create_compaction_messages(
                     &exec.session_id,
                     if mode == "blank" {
@@ -3143,9 +3125,9 @@ mod tests {
                 }
                 let view = exec.session_handle.history_view().await.unwrap();
                 let mut messages = view.messages;
-                exec.compaction_summaries = view.summaries;
+                turn.compaction_summaries = view.summaries;
                 if mode == "reload_removed" {
-                    assert_eq!(exec.compaction_summaries.len(), 1);
+                    assert_eq!(turn.compaction_summaries.len(), 1);
                     fixture
                         .config
                         .provider
@@ -3153,7 +3135,7 @@ mod tests {
                         .delete_messages_after(&exec.session_id, &boundary_id)
                         .await
                         .unwrap();
-                    exec.compaction_summaries =
+                    turn.compaction_summaries =
                         exec.session_handle.history_view().await.unwrap().summaries;
                 }
                 let context = Arc::new(crate::middleware::ConversationContext::new(
@@ -3184,6 +3166,7 @@ mod tests {
                     })).unwrap()).unwrap());
                 }
                 let config = builder.build();
+                let exec = exec.tools_from(&config);
                 match mode {
                     "cached" => messages = apply_cache_breakpoints(&messages, None),
                     "removed" => {
@@ -3217,7 +3200,7 @@ mod tests {
                             options: Default::default(),
                         })
                     };
-                    transition_call_llm(&config, &context, &request, &exec).await
+                    transition_call_llm(&config, &context, &request, &exec, &turn).await
                 })
                 .await;
                 assert!(
@@ -3450,7 +3433,7 @@ mod tests {
             let attempts = vec![Ok(chunks.into_iter().map(|chunk| (0, Ok(chunk))).collect())];
             let (fixture, factory) = timed_fixture(true, attempts, "openai", None).await;
             let mut events = fixture.config.subscribe_events();
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
 
             // Tools must be present: a tool-less request takes the non-streaming path.
@@ -3461,15 +3444,17 @@ mod tests {
             }))
             .unwrap()]
             .into();
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
-                .await
-                .expect("call llm");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec, &turn)
+                    .await
+                    .expect("call llm");
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .expect("after llm");
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .expect("after llm");
 
             let mut seen = Vec::new();
             while let Ok(Ok(envelope)) =
@@ -3857,7 +3842,7 @@ mod tests {
         #[tokio::test]
         async fn before_llm_call_copies_context_overrides_into_the_request() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let context = Arc::new(
                 (*crate::test_utils::test_context(&exec.session_id, 0))
@@ -3898,7 +3883,7 @@ mod tests {
             Arc<PreparedModelRequest>,
             Arc<PreparedModelRequest>,
             TestAgent,
-            ExecutionContext,
+            TurnEnv,
             &'static str,
         ) {
             let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
@@ -3910,7 +3895,7 @@ mod tests {
                 Default::default(),
                 vec![mcp_tool("alpha", "A")],
             );
-            let exec = fixture.execution_context_with_mcp(state).await;
+            let (exec, _turn) = fixture.turn_with_mcp(state).await;
             let context = Arc::new(
                 (*crate::test_utils::test_context(&exec.session_id, 0))
                     .clone()
@@ -4043,7 +4028,7 @@ mod tests {
         /// every model request. `objective` is `Some` when `run_objective = true`.
         async fn prepared(
             fixture: &TestAgent,
-            exec: &ExecutionContext,
+            exec: &TurnEnv,
             messages: Vec<ChatMessage>,
             objective: Option<&str>,
         ) -> Vec<ChatMessage> {
@@ -4052,7 +4037,7 @@ mod tests {
 
         async fn prepared_in(
             config: &AgentConfig,
-            exec: &ExecutionContext,
+            exec: &TurnEnv,
             messages: Vec<ChatMessage>,
             objective: Option<&str>,
         ) -> Vec<ChatMessage> {
@@ -4137,7 +4122,7 @@ mod tests {
         /// First request of a turn, then one tool step.
         async fn prompt_to_first_tool_step(objective: Option<&str>) {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let prompt = ChatMessage::user().text("fix the build").build();
 
             let first = prepared(&fixture, &exec, vec![prompt.clone()], objective).await;
@@ -4151,7 +4136,7 @@ mod tests {
         /// Two consecutive tool steps of one turn.
         async fn across_a_tool_step(objective: Option<&str>) {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
 
@@ -4182,7 +4167,7 @@ mod tests {
         #[tokio::test]
         async fn durable_prefix_is_stable_across_turns() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
 
@@ -4198,7 +4183,7 @@ mod tests {
         async fn durable_prefix_is_stable_across_a_mode_switch() {
             use querymt_agent_core::model::NoticeSource;
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
 
@@ -4224,7 +4209,7 @@ mod tests {
         async fn notice_after_a_tool_batch_keeps_the_after_tool_batch_trigger() {
             use querymt_agent_core::model::NoticeSource;
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
             let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
@@ -4252,7 +4237,7 @@ mod tests {
         async fn durable_prefix_is_stable_for_a_provider_without_breakpoints() {
             // A local provider: hints are compared away, content must still match.
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "llama_cpp", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
 
@@ -4266,7 +4251,7 @@ mod tests {
         #[tokio::test]
         async fn request_without_request_scoped_context_ends_with_a_durable_message() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let prompt = ChatMessage::user().text("fix the build").build();
 
             let request = prepared(&fixture, &exec, vec![prompt], None).await;
@@ -4278,7 +4263,7 @@ mod tests {
         #[tokio::test]
         async fn context_after_the_user_prompt_follows_it() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let prompt = ChatMessage::user().text("fix the build").build();
 
             let request = prepared(&fixture, &exec, vec![prompt], Some(OBJECTIVE)).await;
@@ -4291,7 +4276,7 @@ mod tests {
         #[tokio::test]
         async fn context_after_a_tool_batch_leaves_the_tool_result_message_unchanged() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let config = config_with_context_hook(&fixture.config);
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
@@ -4310,7 +4295,7 @@ mod tests {
         #[tokio::test]
         async fn context_hook_sees_durable_history_only() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let config = config_with_context_hook(&fixture.config);
             let prompt = ChatMessage::user().text("fix the build").build();
 
@@ -4324,7 +4309,7 @@ mod tests {
         #[tokio::test]
         async fn objective_and_hook_text_share_one_message_objective_first() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let config = config_with_context_hook(&fixture.config);
             let prompt = ChatMessage::user().text("fix the build").build();
 
@@ -4338,7 +4323,7 @@ mod tests {
         #[tokio::test]
         async fn context_hook_contribution_is_request_scoped() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let with_hook = config_with_context_hook(&fixture.config);
             let prompt = ChatMessage::user().text("fix the build").build();
 
@@ -4353,7 +4338,7 @@ mod tests {
         #[tokio::test]
         async fn last_two_durable_messages_are_hinted_and_the_tail_is_not() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut history = vec![ChatMessage::user().text("fix the build").build()];
             history.extend(tool_step("call-1"));
             history.extend(tool_step("call-2"));
@@ -4369,7 +4354,7 @@ mod tests {
         #[tokio::test]
         async fn existing_history_hints_are_kept_and_hinting_is_idempotent() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut first = ChatMessage::user().text("fix the build").build();
             first.cache = Some(querymt::chat::CacheHint::Ephemeral {
                 ttl_seconds: Some(300),
@@ -4401,7 +4386,8 @@ mod tests {
                 config: &AgentConfig,
                 fixture: &TestAgent,
             ) -> Vec<querymt::chat::Tool> {
-                let exec = fixture.execution_context().await;
+                let (exec, _turn) = fixture.turn().await;
+                let exec = exec.tools_from(config);
                 let mut events = config.subscribe_events();
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
                 transition_before_llm_call_in_test(config, &context, &exec)
@@ -4442,7 +4428,7 @@ mod tests {
         #[tokio::test]
         async fn recovery_cap_is_clamped_after_preparing_the_request() {
             let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
             context.messages = Arc::from([ChatMessage::user().text("continue the report").build()]);
             context.request_overrides = querymt::chat::GenerationOptions::NONE
@@ -4483,7 +4469,7 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let context = Arc::new(
                 (*profiled_context(
@@ -4502,6 +4488,7 @@ mod tests {
                 &context,
                 &Arc::new(prepared.clone()),
                 &exec,
+                &turn,
             )
             .await
             .expect("first request");
@@ -4521,9 +4508,10 @@ mod tests {
 
             // The follow-up request is prepared from the cleared context.
             prepared.options = next.request_overrides;
-            let state = transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec)
-                .await
-                .expect("second request");
+            let state =
+                transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec, &turn)
+                    .await
+                    .expect("second request");
             let ExecutionState::AfterLlm { response, .. } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
@@ -4540,16 +4528,17 @@ mod tests {
             let (fixture, factory) =
                 timed_fixture(true, vec![Ok(stop_chunks())], "openai", None).await;
             // `support` defaults to none.
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
             prepared.options = overrides;
 
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
-                .await
-                .expect("request");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec, &turn)
+                    .await
+                    .expect("request");
             let ExecutionState::AfterLlm { response, .. } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
@@ -4571,7 +4560,7 @@ mod tests {
             let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
 
             let profile = exec.session_handle.profile().await;
 
@@ -4598,7 +4587,7 @@ mod tests {
         async fn model_switch_replaces_the_profile() {
             let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let before = fixture.execution_context().await;
+            let (before, _turn) = fixture.turn().await;
             let old = before.session_handle.profile().await;
             assert!(old.capabilities.options.max_tokens);
 
@@ -4608,7 +4597,7 @@ mod tests {
                 querymt::chat::GenerationOptionSupport::NONE;
             factory.binding.lock().unwrap()["max_tokens"] = serde_json::json!(999);
             fixture.config.provider.clear_provider_cache().await;
-            let after = fixture.execution_context().await;
+            let (after, _turn) = fixture.turn().await;
             let new = after.session_handle.profile().await;
 
             assert!(!Arc::ptr_eq(&old, &new));
@@ -4632,7 +4621,7 @@ mod tests {
             .await;
             let support = querymt::chat::GenerationOptionSupport::ALL;
             *factory.provider.support.lock().unwrap() = support;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let profile = profile_with(support, None);
             let plain = profiled_context(&exec.session_id, profile.clone());
@@ -4644,10 +4633,16 @@ mod tests {
             let escalated_request = Arc::new(prepared);
 
             let (_, spans) = capture(async {
-                transition_call_llm(&fixture.config, &escalated, &escalated_request, &exec)
-                    .await
-                    .expect("escalated request");
-                transition_call_llm(&fixture.config, &plain, &plain_request, &exec)
+                transition_call_llm(
+                    &fixture.config,
+                    &escalated,
+                    &escalated_request,
+                    &exec,
+                    &turn,
+                )
+                .await
+                .expect("escalated request");
+                transition_call_llm(&fixture.config, &plain, &plain_request, &exec, &turn)
                     .await
                     .expect("plain request");
             })
@@ -4706,7 +4701,7 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
@@ -4727,6 +4722,7 @@ mod tests {
                 &context,
                 &Arc::new(prepared.clone()),
                 &exec,
+                &turn,
             )
             .await
             .expect("first request");
@@ -4751,9 +4747,10 @@ mod tests {
             // retry takes the same streaming path.
             let mut retry = (*request).clone();
             retry.tools = prepared.tools.clone();
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
-                .await
-                .expect("second request");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec, &turn)
+                    .await
+                    .expect("second request");
             let state = middleware
                 .on_after_llm(state, Some(&exec.runtime))
                 .await
@@ -4761,9 +4758,10 @@ mod tests {
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .expect("after llm");
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .expect("after llm");
 
             assert_eq!(
                 *factory.provider.options_seen.lock().unwrap(),
@@ -4813,7 +4811,7 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let instruction_marker = "cut off by the output-token limit";
@@ -4831,9 +4829,10 @@ mod tests {
             );
             let mut prepared = (*request()).clone();
             prepared.tools = tools.clone();
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
-                .await
-                .expect("request 1");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec, &turn)
+                    .await
+                    .expect("request 1");
             let state = middleware
                 .on_after_llm(state, Some(&exec.runtime))
                 .await
@@ -4852,9 +4851,10 @@ mod tests {
             };
             let mut retry = (*request).clone();
             retry.tools = tools.clone();
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
-                .await
-                .expect("request 2");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec, &turn)
+                    .await
+                    .expect("request 2");
             let state = middleware
                 .on_after_llm(state, Some(&exec.runtime))
                 .await
@@ -4862,9 +4862,10 @@ mod tests {
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .expect("after 2");
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .expect("after 2");
             assert!(
                 matches!(
                     state,
@@ -4912,9 +4913,10 @@ mod tests {
             );
             let mut last = (*request).clone();
             last.tools = tools;
-            let state = transition_call_llm(&fixture.config, &context, &Arc::new(last), &exec)
-                .await
-                .expect("request 3");
+            let state =
+                transition_call_llm(&fixture.config, &context, &Arc::new(last), &exec, &turn)
+                    .await
+                    .expect("request 3");
             let state = middleware
                 .on_after_llm(state, Some(&exec.runtime))
                 .await
@@ -4931,9 +4933,10 @@ mod tests {
                 1,
                 "instruction stays in history after the normal reply, once"
             );
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .expect("after 3");
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .expect("after 3");
 
             assert_eq!(state.name(), "Complete");
             assert_eq!(
@@ -4965,7 +4968,8 @@ mod tests {
         /// prepared request answers every tool call.
         async fn model_step(
             config: &Arc<AgentConfig>,
-            exec: &ExecutionContext,
+            exec: &TurnEnv,
+            turn: &Turn,
             middleware: &crate::middleware::OutputLimitRecoveryMiddleware,
             tools: &Arc<[querymt::chat::Tool]>,
             context: Arc<crate::middleware::ConversationContext>,
@@ -4992,7 +4996,7 @@ mod tests {
             let mut request = (*request).clone();
             request.tools = tools.clone();
             request.offered_tools = tools.clone();
-            let state = transition_call_llm(config, &context, &Arc::new(request), exec)
+            let state = transition_call_llm(config, &context, &Arc::new(request), exec, turn)
                 .await
                 .expect("call llm");
             middleware.on_after_llm(state, None).await.unwrap()
@@ -5044,7 +5048,7 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let context = profiled_context(
@@ -5063,31 +5067,33 @@ mod tests {
 
             // 1: cut off at 32k -> escalate.
             let ExecutionState::BeforeLlmCall { context } =
-                model_step(&config, &exec, mw, &tools, context).await
+                model_step(&config, &exec, &turn, mw, &tools, context).await
             else {
                 panic!("expected escalation");
             };
             // 2: escalated retry succeeds.
             let ExecutionState::AfterLlm { response, context } =
-                model_step(&config, &exec, mw, &tools, context).await
+                model_step(&config, &exec, &turn, mw, &tools, context).await
             else {
                 panic!("expected AfterLlm");
             };
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .unwrap();
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .unwrap();
             let context = state.context().expect("context").clone();
             // 3: a later step of the same turn starts without overrides, is sent at
             // 128k, and is cut off inside a flushed invalid call.
             assert!(context.request_overrides.is_empty());
             let ExecutionState::AfterLlm { response, context } =
-                model_step(&config, &exec, mw, &tools, context).await
+                model_step(&config, &exec, &turn, mw, &tools, context).await
             else {
                 panic!("a second cut-off must not escalate again");
             };
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .unwrap();
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .unwrap();
             assert!(matches!(
                 state,
                 ExecutionState::Stopped {
@@ -5102,7 +5108,7 @@ mod tests {
                 panic!("expected continuation");
             };
             let ExecutionState::AfterLlm { .. } =
-                model_step(&config, &exec, mw, &tools, context).await
+                model_step(&config, &exec, &turn, mw, &tools, context).await
             else {
                 panic!("expected AfterLlm");
             };
@@ -5146,7 +5152,7 @@ mod tests {
             ))
             .await;
             let mut events = fixture.config.subscribe_events();
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let usage = Usage {
                 input_tokens: 10,
@@ -5170,9 +5176,10 @@ mod tests {
                 .with_output(Some(output)),
             );
 
-            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
-                .await
-                .expect("after llm");
+            let state =
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn)
+                    .await
+                    .expect("after llm");
 
             let mut stored = false;
             while let Ok(Ok(envelope)) =
@@ -5372,7 +5379,7 @@ mod tests {
                     Some("oci://ghcr.io/querymt/openai:latest"),
                 )
                 .await;
-                let exec = fixture.execution_context().await;
+                let (exec, turn) = fixture.turn().await;
                 let context = crate::test_utils::test_context(&exec.session_id, 0);
                 let mut request = (*request()).clone();
                 request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
@@ -5386,6 +5393,7 @@ mod tests {
                             &context,
                             &request,
                             &exec,
+                            &turn,
                         ));
                         if mode.starts_with("cancel") || mode.starts_with("drop") {
                             assert!(
@@ -5510,7 +5518,7 @@ mod tests {
                     let (fixture, factory) =
                         timed_fixture(streaming, attempts, provider, identity).await;
                     factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
-                    let exec = fixture.execution_context().await;
+                    let (exec, turn) = fixture.turn().await;
                     let context = crate::test_utils::test_context(&exec.session_id, 0);
                     let mut prepared = request();
                     if with_tools {
@@ -5526,7 +5534,7 @@ mod tests {
                         async {
                             for call in 0..2 {
                                 let ExecutionState::AfterLlm { response, .. } =
-                                    transition_call_llm(&fixture.config, &context, &prepared, &exec)
+                                    transition_call_llm(&fixture.config, &context, &prepared, &exec, &turn)
                                         .await
                                         .unwrap()
                                 else {
@@ -5641,7 +5649,7 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
 
             // The state machine clones the handle on every step; each clone must
@@ -5662,7 +5670,7 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let early_clone = exec.session_handle.clone();
             let from_clone = early_clone.provider().await.unwrap();
             let from_original = exec.session_handle.provider().await.unwrap();
@@ -5679,7 +5687,7 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let exec = fixture.execution_context().await;
+            let (exec, _turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (_, spans) = capture(async {
                 let _ = transition_before_llm_call_in_test(&fixture.config, &context, &exec).await;
@@ -5745,10 +5753,10 @@ mod tests {
                 Ok(output)
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(async {
-                transition_call_llm(&fixture.config, &context, &request(), &exec)
+                transition_call_llm(&fixture.config, &context, &request(), &exec, &turn)
                     .instrument(info_span!("test-parent"))
                     .await
             })
@@ -5827,7 +5835,7 @@ mod tests {
                     .returning(|_| Err(LLMError::AuthError("SECRET_ERROR".into())));
                 let fixture =
                     TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-                let exec = fixture.execution_context().await;
+                let (exec, turn) = fixture.turn().await;
                 if cancelled {
                     exec.cancellation_token.cancel();
                 }
@@ -5837,6 +5845,7 @@ mod tests {
                     &context,
                     &request(),
                     &exec,
+                    &turn,
                 ))
                 .await;
                 let chat = spans.iter().find(|s| s.name == "chat mock-model").unwrap();
@@ -5927,13 +5936,14 @@ mod tests {
                 ))
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(result.is_ok());
@@ -5972,9 +5982,9 @@ mod tests {
                 reply()
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
-            transition_call_llm(&fixture.config, &context, &prepared, &exec)
+            transition_call_llm(&fixture.config, &context, &prepared, &exec, &turn)
                 .await
                 .expect("call llm");
             sent.lock().unwrap().take().expect("one request was sent")
@@ -6024,13 +6034,14 @@ mod tests {
                 ))
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(result.is_ok());
@@ -6058,13 +6069,14 @@ mod tests {
                 Err(rate_limited_now())
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(result.is_err());
@@ -6107,13 +6119,14 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &streaming_request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(result.is_ok());
@@ -6140,13 +6153,14 @@ mod tests {
                 Some("oci://ghcr.io/querymt/openai:latest"),
             )
             .await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &streaming_request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(result.is_err());
@@ -6163,13 +6177,14 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat().returning(|_| Err(LLMError::Cancelled));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let (result, spans) = capture(transition_call_llm(
                 &fixture.config,
                 &context,
                 &request(),
                 &exec,
+                &turn,
             ))
             .await;
             assert!(matches!(result.unwrap(), ExecutionState::Cancelled));
@@ -6207,7 +6222,7 @@ mod tests {
             let shared = SharedLlmProvider::new(mock, vec![]);
             let lock = shared.inner.clone();
             let fixture = TestAgent::with_mock_provider(shared).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             // Initialize the provider before blocking the mock's call.
             exec.session_handle.provider().await.unwrap();
             let _locked = lock.lock().await;
@@ -6219,6 +6234,7 @@ mod tests {
                     &context,
                     &request,
                     &exec,
+                    &turn,
                 ));
                 assert!(futures_util::poll!(&mut future).is_pending());
                 drop(future);
@@ -7154,7 +7170,7 @@ mod tests {
                 ))
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let mut events = fixture.config.subscribe_events();
             let request = Arc::new(PreparedModelRequest {
                 messages: vec![ChatMessage::user().text("hi").build()].into(),
@@ -7179,6 +7195,7 @@ mod tests {
                 &context_with(AgentStats::default()),
                 &request,
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7207,9 +7224,15 @@ mod tests {
                 cache_write_tokens: 500,
                 ..Default::default()
             };
-            transition_call_llm(&fixture.config, &context_with(after_first), &request, &exec)
-                .await
-                .unwrap();
+            transition_call_llm(
+                &fixture.config,
+                &context_with(after_first),
+                &request,
+                &exec,
+                &turn,
+            )
+            .await
+            .unwrap();
             let second = request_end_costs(&mut events).await;
             let second_cost = (600.0 + 1_500.0 + 900.0) / 1e6;
             expect_usd(
@@ -7252,7 +7275,8 @@ mod tests {
         /// recorded.
         async fn send(
             fixture: &TestAgent,
-            exec: &ExecutionContext,
+            exec: &TurnEnv,
+            turn: &Turn,
             events: &mut tokio::sync::broadcast::Receiver<
                 querymt_agent_core::events::EventEnvelope,
             >,
@@ -7269,7 +7293,7 @@ mod tests {
             let ExecutionState::CallLlm { context, request } = state else {
                 panic!("expected CallLlm, got {}", state.name());
             };
-            transition_call_llm(&fixture.config, &context, &request, exec)
+            transition_call_llm(&fixture.config, &context, &request, exec, turn)
                 .await
                 .expect("call llm");
             loop {
@@ -7302,29 +7326,58 @@ mod tests {
         #[tokio::test]
         async fn request_end_attributes_each_prefix_change() {
             let fixture = fixture().await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let mut events = fixture.config.subscribe_events();
             let base = vec![user("a"), user("b")];
 
-            let (change, idle) =
-                send(&fixture, &exec, &mut events, "mock-model", base.clone()).await;
+            let (change, idle) = send(
+                &fixture,
+                &exec,
+                &turn,
+                &mut events,
+                "mock-model",
+                base.clone(),
+            )
+            .await;
             assert_eq!(change, Some(CachePrefixChange::FirstRequest));
             assert_eq!(idle, None, "no idle for the first request");
 
             let mut grown = base.clone();
             grown.push(user("c"));
-            let (change, idle) =
-                send(&fixture, &exec, &mut events, "mock-model", grown.clone()).await;
+            let (change, idle) = send(
+                &fixture,
+                &exec,
+                &turn,
+                &mut events,
+                "mock-model",
+                grown.clone(),
+            )
+            .await;
             assert_eq!(change, Some(CachePrefixChange::Unchanged));
             assert!(idle.is_some_and(|secs| secs < 5), "idle: {idle:?}");
 
-            let (change, _) =
-                send(&fixture, &exec, &mut events, "other-model", grown.clone()).await;
+            let (change, _) = send(
+                &fixture,
+                &exec,
+                &turn,
+                &mut events,
+                "other-model",
+                grown.clone(),
+            )
+            .await;
             assert_eq!(change, Some(CachePrefixChange::Model));
 
             // Compaction replaced the older messages.
             let compacted = vec![user("summary"), user("c"), user("d")];
-            let (change, _) = send(&fixture, &exec, &mut events, "other-model", compacted).await;
+            let (change, _) = send(
+                &fixture,
+                &exec,
+                &turn,
+                &mut events,
+                "other-model",
+                compacted,
+            )
+            .await;
             assert_eq!(change, Some(CachePrefixChange::History));
         }
 
@@ -7334,13 +7387,28 @@ mod tests {
             let mut events = fixture.config.subscribe_events();
             let messages = vec![user("a")];
 
-            let exec = fixture.execution_context().await;
-            send(&fixture, &exec, &mut events, "mock-model", messages.clone()).await;
+            let (exec, turn) = fixture.turn().await;
+            send(
+                &fixture,
+                &exec,
+                &turn,
+                &mut events,
+                "mock-model",
+                messages.clone(),
+            )
+            .await;
 
             // A loaded session gets a fresh runtime, and with it no fingerprint.
-            let reloaded = fixture.execution_context().await;
-            let (change, idle) =
-                send(&fixture, &reloaded, &mut events, "mock-model", messages).await;
+            let (reloaded, reloaded_turn) = fixture.turn().await;
+            let (change, idle) = send(
+                &fixture,
+                &reloaded,
+                &reloaded_turn,
+                &mut events,
+                "mock-model",
+                messages,
+            )
+            .await;
             assert_eq!(change, Some(CachePrefixChange::FirstRequest));
             assert_eq!(idle, None);
         }
@@ -7381,12 +7449,21 @@ mod tests {
             let _guard = tracing::subscriber::set_default(subscriber);
 
             let fixture = fixture().await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let mut events = fixture.config.subscribe_events();
-            send(&fixture, &exec, &mut events, "mock-model", vec![user("a")]).await;
             send(
                 &fixture,
                 &exec,
+                &turn,
+                &mut events,
+                "mock-model",
+                vec![user("a")],
+            )
+            .await;
+            send(
+                &fixture,
+                &exec,
+                &turn,
                 &mut events,
                 "mock-model",
                 vec![user("a"), user("b")],
@@ -7483,7 +7560,7 @@ mod tests {
             })
         }
 
-        fn context(exec: &ExecutionContext, provider: &str) -> Arc<ConversationContext> {
+        fn context(exec: &TurnEnv, provider: &str) -> Arc<ConversationContext> {
             Arc::new(ConversationContext::new(
                 exec.session_id.as_str().into(),
                 Arc::from([]),
@@ -7532,13 +7609,8 @@ mod tests {
                 .count()
         }
 
-        async fn session_totals(
-            exec: &ExecutionContext,
-        ) -> querymt_agent_services::accounting::ScopeTotals {
-            exec.cycle_accounting
-                .get()
-                .expect("cycle accounting is created on first dispatch")
-                .session_totals()
+        async fn session_totals(exec: &TurnEnv) -> querymt_agent_services::accounting::ScopeTotals {
+            exec.cycle_accounting.session_totals()
         }
 
         fn rate_limited() -> LLMError {
@@ -7563,12 +7635,13 @@ mod tests {
                 }
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             transition_call_llm(
                 &fixture.config,
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7601,12 +7674,13 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat_with_tools().returning(|_, _| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             transition_call_llm(
                 &fixture.config,
                 &context(&exec, "mock"),
                 &prepared(true),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7633,12 +7707,13 @@ mod tests {
                 });
                 let fixture =
                     TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-                let exec = fixture.execution_context().await;
+                let (exec, turn) = fixture.turn().await;
                 let result = transition_call_llm(
                     &fixture.config,
                     &context(&exec, "mock"),
                     &prepared(false),
                     &exec,
+                    &turn,
                 )
                 .await;
                 assert!(result.is_err());
@@ -7664,13 +7739,14 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat().times(0);
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             exec.cancellation_token.cancel();
             let state = transition_call_llm(
                 &fixture.config,
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7693,12 +7769,13 @@ mod tests {
                     .push(Arc::new(crate::middleware::LimitsMiddleware::new(
                         crate::middleware::LimitsConfig::default().max_price_usd(0.0),
                     )));
-                let exec = fixture.execution_context().await;
+                let (exec, turn) = fixture.turn().await;
                 let state = transition_call_llm(
                     &config,
                     &context(&exec, "mock"),
                     &prepared(with_tools),
                     &exec,
+                    &turn,
                 )
                 .await
                 .expect("a refused dispatch is a stop, not an error");
@@ -7723,7 +7800,7 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat().returning(|_| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
 
             let first_pricing = InjectedPricing::install(pricing());
             transition_call_llm(
@@ -7731,6 +7808,7 @@ mod tests {
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7751,6 +7829,7 @@ mod tests {
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7790,12 +7869,13 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat().returning(|_| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             transition_call_llm(
                 &fixture.config,
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7814,13 +7894,14 @@ mod tests {
             let mut mock = MockLlmProvider::new();
             mock.expect_chat().returning(|_| Ok(output()));
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let mut exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
 
             let state = transition_call_llm(
                 &fixture.config,
                 &context(&exec, "mock"),
                 &prepared(false),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7838,7 +7919,7 @@ mod tests {
                 .await
                 .unwrap();
             let result =
-                transition_after_llm(&fixture.config, &response, &context, &mut exec).await;
+                transition_after_llm(&fixture.config, &response, &context, &exec, &mut turn).await;
             assert!(result.is_err(), "history save must fail");
 
             // The charge is unaffected, live and from the journal alone.
@@ -7864,19 +7945,23 @@ mod tests {
                 .push(Arc::new(crate::middleware::LimitsMiddleware::new(
                     crate::middleware::LimitsConfig::default().max_price_usd(100.0),
                 )));
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             // Open accounting first, then make the journal unwritable so the
             // durable attempt start cannot be recorded.
-            exec.cycle_accounting(&config.event_sink).await.unwrap();
             fixture
                 .storage
                 .conn_for_test()
                 .lock()
                 .execute_batch("DROP TABLE event_journal")
                 .unwrap();
-            let result =
-                transition_call_llm(&config, &context(&exec, "mock"), &prepared(false), &exec)
-                    .await;
+            let result = transition_call_llm(
+                &config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+                &turn,
+            )
+            .await;
             let error = result.expect_err("storage failure must be an execution error");
             assert!(error.to_string().contains("accounting"), "{error:#}");
         }
@@ -7914,7 +7999,7 @@ mod tests {
         async fn request_end_cost_spans_retries_and_includes_cache_charges() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![
                 Err(rate_limited()),
                 Ok(vec![
                     (0, Ok(StreamChunk::Text("hello".into()))),
@@ -7934,6 +8019,7 @@ mod tests {
                 &context(&exec, "alias"),
                 &prepared(true),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -7967,7 +8053,7 @@ mod tests {
         async fn usage_bearing_retry_counts_once_and_marks_operation_partial() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![
                 // First attempt reports usage, then the connection drops.
                 Ok(vec![
                     (0, Ok(chunk_usage())),
@@ -7991,6 +8077,7 @@ mod tests {
                 &context(&exec, "alias"),
                 &prepared(true),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -8015,7 +8102,7 @@ mod tests {
         async fn cancelled_execution_is_accounted_without_a_request_end_event() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![Ok(vec![
                 (0, Ok(chunk_usage())),
                 (0, Ok(StreamChunk::Text("part".into()))),
             ])])
@@ -8028,6 +8115,7 @@ mod tests {
                 &context,
                 &request,
                 &exec,
+                &turn,
             ));
             assert!(
                 tokio::time::timeout(Duration::from_millis(400), &mut future)
@@ -8053,17 +8141,17 @@ mod tests {
             StreamChunk::Usage(usage())
         }
 
-        async fn stream_fixture(attempts: Vec<TimedChunks>) -> (TestAgent, ExecutionContext) {
+        async fn stream_fixture(attempts: Vec<TimedChunks>) -> (TestAgent, TurnEnv, Turn) {
             let (fixture, _factory) = timed_fixture(true, attempts, "openai", None).await;
-            let exec = fixture.execution_context().await;
-            (fixture, exec)
+            let (exec, turn) = fixture.turn().await;
+            (fixture, exec, turn)
         }
 
         #[tokio::test]
         async fn streaming_retry_after_setup_rejection_keeps_separate_accumulators() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![
                 Err(rate_limited()),
                 Ok(vec![
                     (0, Ok(StreamChunk::Text("hello".into()))),
@@ -8082,6 +8170,7 @@ mod tests {
                 &context(&exec, "alias"),
                 &prepared(true),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -8101,7 +8190,7 @@ mod tests {
         async fn streaming_failure_after_usage_is_partial_and_priced() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![Ok(vec![
                 (0, Ok(chunk_usage())),
                 (0, Ok(StreamChunk::Text("part".into()))),
                 (0, Err(LLMError::ProviderError("stream broke".into()))),
@@ -8112,6 +8201,7 @@ mod tests {
                 &context(&exec, "alias"),
                 &prepared(true),
                 &exec,
+                &turn,
             )
             .await;
             assert!(result.is_err());
@@ -8132,7 +8222,7 @@ mod tests {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
             // No terminal chunk: the provider stream stays pending.
-            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+            let (fixture, exec, turn) = stream_fixture(vec![Ok(vec![
                 (0, Ok(chunk_usage())),
                 (0, Ok(StreamChunk::Text("part".into()))),
             ])])
@@ -8144,6 +8234,7 @@ mod tests {
                 &context,
                 &request,
                 &exec,
+                &turn,
             ));
             assert!(
                 tokio::time::timeout(Duration::from_millis(400), &mut future)
@@ -8166,7 +8257,8 @@ mod tests {
         async fn dropped_streaming_request_settles_instead_of_staying_unresolved() {
             let _guard = CACHE_ENV_LOCK.lock().await;
             let _pricing = InjectedPricing::install_for("alias", pricing());
-            let (fixture, exec) = stream_fixture(vec![Ok(vec![(0, Ok(chunk_usage()))])]).await;
+            let (fixture, exec, turn) =
+                stream_fixture(vec![Ok(vec![(0, Ok(chunk_usage()))])]).await;
             {
                 let context = context(&exec, "alias");
                 let request = prepared(true);
@@ -8175,6 +8267,7 @@ mod tests {
                     &context,
                     &request,
                     &exec,
+                    &turn,
                 ));
                 assert!(
                     tokio::time::timeout(Duration::from_millis(400), &mut future)

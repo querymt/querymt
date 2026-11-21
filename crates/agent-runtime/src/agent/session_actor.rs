@@ -8,7 +8,7 @@ use crate::acp::protocol::{ExtResponse, PromptResponse, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig, TurnSnapshot};
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{PreTurnSnapshot, Turn, TurnEnv};
 use crate::agent::messages::*;
 use crate::agent::session_control::{
     SessionControlState, SessionControlTransition, SessionModelBinding,
@@ -113,39 +113,32 @@ fn summarize_intent_candidate(input: &str) -> Option<String> {
 async fn maybe_update_session_intent(
     _config: &AgentConfig,
     _session_id: &str,
-    exec_ctx: &mut ExecutionContext,
+    turn: &mut Turn,
     user_text: &str,
     source_ref: &str,
 ) -> Result<(), AgentError> {
     let Some(candidate) = summarize_intent_candidate(user_text) else {
         return Ok(());
     };
-    if exec_ctx
-        .state
-        .current_intent
-        .as_ref()
-        .is_some_and(|intent| {
-            intent.summary == candidate
-                || intent.next_step_hint.as_deref() == Some(candidate.as_str())
-        })
-    {
+    if turn.state.current_intent.as_ref().is_some_and(|intent| {
+        intent.summary == candidate || intent.next_step_hint.as_deref() == Some(candidate.as_str())
+    }) {
         return Ok(());
     }
 
-    let summary = exec_ctx
+    let summary = turn
         .state
         .current_intent
         .as_ref()
         .map(|intent| intent.summary.clone())
         .unwrap_or_else(|| candidate.clone());
-    let constraints = exec_ctx
+    let constraints = turn
         .state
         .current_intent
         .as_ref()
         .and_then(|intent| intent.constraints.clone());
-    let next_step_hint = exec_ctx.state.current_intent.as_ref().map(|_| candidate);
-    exec_ctx
-        .state
+    let next_step_hint = turn.state.current_intent.as_ref().map(|_| candidate);
+    turn.state
         .update_intent_projection(
             summary,
             constraints,
@@ -532,7 +525,7 @@ impl SessionActor {
             cancel_token: self.turn_state.token.clone(),
             mode: self.mode,
             tool_config: self.tool_config.clone(),
-            execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
+            execution_origin: crate::agent::execution::ExecutionOrigin::Interactive,
             turn_id,
             steering,
             phase_reporter,
@@ -2569,7 +2562,7 @@ impl Message<ScheduledPrompt> for SessionActor {
                     cancel_token,
                     mode,
                     tool_config,
-                    execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                    execution_origin: crate::agent::execution::ExecutionOrigin::Scheduled {
                         schedule_public_id: schedule_public_id.clone(),
                         task_public_id: task_public_id.clone(),
                     },
@@ -2647,7 +2640,7 @@ struct DetachedPromptExecution {
     mode: AgentMode,
     tool_config: ToolConfig,
     /// Origin of this execution — interactive or scheduled.
-    execution_origin: crate::agent::execution_context::ExecutionOrigin,
+    execution_origin: crate::agent::execution::ExecutionOrigin,
     /// The run's single turn id; the `String` run id used by events, hooks and
     /// steering is derived from it.
     turn_id: querymt_agent_core::model::TurnId,
@@ -2742,10 +2735,10 @@ fn model_supports_images(model_info: Option<&querymt::providers::ModelInfo>) -> 
 
 async fn validate_execution_task(
     store: &dyn crate::session::store::SessionStore,
-    execution_origin: &crate::agent::execution_context::ExecutionOrigin,
+    execution_origin: &crate::agent::execution::ExecutionOrigin,
     session_id: &str,
 ) -> Result<Option<crate::session::domain::Task>, AgentError> {
-    let crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } =
+    let crate::agent::execution::ExecutionOrigin::Scheduled { task_public_id, .. } =
         execution_origin
     else {
         return Ok(None);
@@ -2987,33 +2980,36 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let cycle_accounting =
         querymt_agent_services::accounting::CycleAccounting::begin(session_accounting);
 
-    // Create execution context — attach the cancellation token so it propagates
-    // into individual tool calls for cooperative cancellation.
-    // The knowledge store is propagated so knowledge tools can access it.
-    let mut exec_ctx = ExecutionContext::new(
-        session_id.clone(),
+    // The run's read-only inputs, built with a struct literal so that a missing
+    // field is a compile error. The cancellation token propagates into
+    // individual tool calls for cooperative cancellation; the knowledge store
+    // lets knowledge tools reach it.
+    let tool_set = TurnEnv::build_tool_set(&config, &runtime, &tool_config);
+    let env = TurnEnv {
+        session_id: session_id.clone(),
         turn_id,
-        runtime.clone(),
-        runtime_context,
+        runtime: runtime.clone(),
         session_handle,
+        cancellation_token: cancel_token.clone(),
         tool_config,
-    )
-    .with_cancellation_token(cancel_token.clone())
-    .with_execution_origin(execution_origin)
-    .with_knowledge_store(config.knowledge_store())
-    .with_repository_knowledge(config.repository_knowledge())
-    .with_event_sink(config.event_sink.clone())
-    .with_workspace_query_bridge(editor_bridge_for_workspace(
-        runtime.managed_checkout.get().copied().unwrap_or(false),
-        config.workspace_query_bridge_for_session(&session_id),
-    ))
-    .with_turn_mode(mode)
-    .with_steering(steering)
-    .with_phase_reporter(phase_reporter)
-    .with_cycle_accounting(cycle_accounting);
+        execution_origin,
+        knowledge_store: config.knowledge_store(),
+        repository_knowledge: config.repository_knowledge(),
+        event_sink: Some(config.event_sink.clone()),
+        workspace_query_bridge: editor_bridge_for_workspace(
+            runtime.managed_checkout.get().copied().unwrap_or(false),
+            config.workspace_query_bridge_for_session(&session_id),
+        ),
+        turn_mode: mode,
+        steering: Some(steering),
+        phase_reporter: Some(phase_reporter),
+        cycle_accounting,
+        tool_set,
+    };
+    let mut turn = Turn::new(runtime_context);
 
     if let Some(task) = &scheduled_task {
-        exec_ctx.state.active_task = Some(task.clone());
+        turn.state.active_task = Some(task.clone());
     }
 
     // 3b. Native `/compact [instructions]`: compact now, no model turn.
@@ -3027,7 +3023,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
         let outcome = crate::agent::execution::compact_history(
             &config,
-            &mut exec_ctx,
+            &env,
+            &mut turn,
             crate::agent::execution::TRIGGER_MANUAL,
             instructions,
         )
@@ -3078,7 +3075,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                         message: message.clone(),
                     },
                 );
-                Err(provider_failure_from_execution_error(&error, &exec_ctx)
+                Err(provider_failure_from_execution_error(&error, &env)
                     .unwrap_or(AgentError::Internal(message)))
             }
         };
@@ -3119,12 +3116,12 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
             session_id: session_id.clone(),
             turn_id: run_id.to_string(),
-            cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
-            model: exec_ctx
+            cwd: env.cwd().map(|p| p.to_path_buf()),
+            model: env
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             prompt: user_text.clone(),
         })
         .await
@@ -3149,7 +3146,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let mut context_contributions = hook_result.context_contributions;
     let orientation = crate::agent::repository_delivery::orientation_contexts(
         &config,
-        &exec_ctx,
+        &env,
+        &mut turn,
         &user_text,
         &context_contributions,
     )
@@ -3180,7 +3178,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         source_model: None,
     };
 
-    if let Err(e) = exec_ctx.add_message(agent_msg).await {
+    if let Err(e) = env.add_message(agent_msg).await {
         config.emit_event(
             &session_id,
             AgentEventKind::Error {
@@ -3219,8 +3217,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
     let intent_started = std::time::Instant::now();
     if let Err(error) =
-        maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
-            .await
+        maybe_update_session_intent(&config, &session_id, &mut turn, &user_text, &message_id).await
     {
         warn!(
             "Failed to update intent projection after storing prompt {}: {}",
@@ -3232,27 +3229,23 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         intent_started.elapsed().as_millis() as u64,
     );
 
-    let origin_label = match &exec_ctx.execution_origin {
-        crate::agent::execution_context::ExecutionOrigin::Interactive => "interactive".to_string(),
-        crate::agent::execution_context::ExecutionOrigin::Scheduled {
+    let origin_label = match &env.execution_origin {
+        crate::agent::execution::ExecutionOrigin::Interactive => "interactive".to_string(),
+        crate::agent::execution::ExecutionOrigin::Scheduled {
             schedule_public_id,
             task_public_id,
         } => format!("scheduled:{schedule_public_id}:{task_public_id}"),
     };
-    let objective_task = match &exec_ctx.execution_origin {
-        crate::agent::execution_context::ExecutionOrigin::Scheduled { .. } => {
-            scheduled_task.as_ref()
-        }
-        crate::agent::execution_context::ExecutionOrigin::Interactive => {
-            exec_ctx.state.active_task.as_ref()
-        }
+    let objective_task = match &env.execution_origin {
+        crate::agent::execution::ExecutionOrigin::Scheduled { .. } => scheduled_task.as_ref(),
+        crate::agent::execution::ExecutionOrigin::Interactive => turn.state.active_task.as_ref(),
     };
     let objective = crate::agent::objective::RunObjective::new(
         run_id,
         normalized_run_instruction(&req.prompt),
         origin_label,
         objective_task,
-        exec_ctx.state.current_intent.clone(),
+        turn.state.current_intent.clone(),
     );
     config.emit_event(
         &session_id,
@@ -3263,7 +3256,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
             source_ref: Some(message_id.clone()),
         },
     );
-    exec_ctx = exec_ctx.with_run_objective(objective);
+    turn.run_objective = Some(objective);
 
     config.emit_event(&session_id, AgentEventKind::TurnStarted);
 
@@ -3308,13 +3301,13 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
             )),
         );
 
-        *runtime.pre_turn_snapshot_task.lock() = Some(task);
+        turn.snapshot = PreTurnSnapshot::Pending(task);
     } else {
         debug!(
             "Session {}: no snapshot backend, skipping pre-turn snapshot",
             session_id
         );
-        *runtime.pre_turn_snapshot_task.lock() = None;
+        turn.snapshot = PreTurnSnapshot::None;
     }
 
     tracing::Span::current().record(
@@ -3324,7 +3317,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     debug!(
         "Session {}: entering execute_cycle_state_machine, cancelled={}",
         session_id,
-        exec_ctx.cancellation_token.is_cancelled()
+        env.cancellation_token.is_cancelled()
     );
 
     // Changed files belong to one run: start from none, and drop what the run
@@ -3333,7 +3326,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
     // Execute Agent Loop using State Machine
     let result =
-        crate::agent::execution::execute_cycle_state_machine(&config, &mut exec_ctx, mode).await;
+        crate::agent::execution::execute_cycle_state_machine(&config, &env, &mut turn, mode).await;
     *runtime.turn_diffs.lock() = Default::default();
 
     debug!(
@@ -3351,14 +3344,18 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     if let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
-        if let Err(e) = ensure_pre_turn_snapshot_ready(&mut exec_ctx, "post_turn_snapshot").await {
+        if let Err(e) = ensure_pre_turn_snapshot_ready(&env, &mut turn, "post_turn_snapshot").await
+        {
             warn!(
                 "Failed to resolve pre-turn snapshot before post-turn processing: {}",
                 e
             );
         }
 
-        let turn_snapshot_data = runtime.turn_snapshot.lock().take();
+        let turn_snapshot_data = match std::mem::take(&mut turn.snapshot) {
+            PreTurnSnapshot::Ready(snapshot) => Some(snapshot),
+            PreTurnSnapshot::None | PreTurnSnapshot::Pending(_) => None,
+        };
         if let Some(TurnSnapshot {
             turn_id,
             snapshot_id: pre_snapshot_id,
@@ -3401,7 +3398,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                                     source_provider: None,
                                     source_model: None,
                                 };
-                                if let Err(e) = exec_ctx.add_message(snapshot_msg).await {
+                                if let Err(e) = env.add_message(snapshot_msg).await {
                                     warn!("Failed to store turn snapshot patch: {}", e);
                                 }
                             }
@@ -3460,7 +3457,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                     message: message.clone(),
                 },
             );
-            Err(provider_failure_from_execution_error(&e, &exec_ctx)
+            Err(provider_failure_from_execution_error(&e, &env)
                 .unwrap_or(AgentError::Internal(message)))
         }
     }
@@ -3468,12 +3465,12 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
 fn provider_failure_from_execution_error(
     error: &anyhow::Error,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
 ) -> Option<AgentError> {
     let llm_error = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<LLMError>())?;
-    let llm_config = exec_ctx.llm_config();
+    let llm_config = env.llm_config();
 
     Some(AgentError::ProviderFailure {
         message: error.to_string(),
@@ -3486,21 +3483,26 @@ fn provider_failure_from_execution_error(
 
 #[instrument(
     name = "agent.snapshot.pre_turn.ensure",
-    skip(exec_ctx),
-    fields(session_id = %exec_ctx.session_id, reason = reason)
+    skip(env, turn),
+    fields(session_id = %env.session_id, reason = reason)
 )]
 pub(crate) async fn ensure_pre_turn_snapshot_ready(
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     reason: &'static str,
 ) -> Result<(), AgentError> {
-    let pending_task = exec_ctx.runtime.pre_turn_snapshot_task.lock().take();
-    let Some(task) = pending_task else {
-        return Ok(());
+    let task = match std::mem::take(&mut turn.snapshot) {
+        PreTurnSnapshot::Pending(task) => task,
+        // Nothing pending: keep a snapshot that is already ready.
+        settled @ (PreTurnSnapshot::None | PreTurnSnapshot::Ready(_)) => {
+            turn.snapshot = settled;
+            return Ok(());
+        }
     };
 
     let span = info_span!(
         "agent.snapshot.pre_turn.resolve",
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         reason = reason
     );
 
@@ -3508,7 +3510,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
         Ok((turn_id, Ok(snapshot_id))) => {
             // The runtime and the stored start record both own the id; a
             // `SnapshotId` clone is a reference-count increment.
-            *exec_ctx.runtime.turn_snapshot.lock() = Some(TurnSnapshot {
+            turn.snapshot = PreTurnSnapshot::Ready(TurnSnapshot {
                 turn_id,
                 snapshot_id: snapshot_id.clone(),
             });
@@ -3516,12 +3518,12 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
             let start_part = MessagePart::TurnSnapshotStart {
                 turn_id,
                 snapshot_id,
-                workspace_root: exec_ctx.runtime.cwd.clone(),
+                workspace_root: env.runtime.cwd.clone(),
                 inherited: false,
             };
             let snapshot_msg = AgentMessage {
                 id: Uuid::new_v4().to_string(),
-                session_id: exec_ctx.session_id.clone(),
+                session_id: env.session_id.clone(),
                 role: ChatRole::Assistant,
                 parts: vec![start_part],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -3529,7 +3531,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
                 source_provider: None,
                 source_model: None,
             };
-            exec_ctx.add_message(snapshot_msg).await.map_err(|e| {
+            env.add_message(snapshot_msg).await.map_err(|e| {
                 AgentError::Internal(format!("Failed to store turn snapshot start: {}", e))
             })?;
         }
@@ -3913,7 +3915,7 @@ mod tests {
             Self::with_session_id("test-session").await
         }
 
-        async fn execution_context(&self, session_id: &str) -> ExecutionContext {
+        async fn turn(&self, session_id: &str) -> (TurnEnv, Turn) {
             let session_handle = self
                 .config
                 .provider
@@ -3929,15 +3931,8 @@ mod tests {
                 HashMap::new(),
                 crate::agent::core::McpToolState::empty(),
             );
-
-            ExecutionContext::new(
-                session_id.to_string(),
-                querymt_agent_core::model::TurnId::new(),
-                runtime,
-                runtime_context,
-                session_handle,
-                ToolConfig::default(),
-            )
+            crate::test_utils::turn_parts(&self.config, session_handle, runtime, runtime_context)
+                .await
         }
 
         async fn with_session_id(session_id: &str) -> Self {
@@ -5607,45 +5602,38 @@ mod tests {
     #[tokio::test]
     async fn invalid_scheduled_task_does_not_write_history_or_intent() {
         let fixture = ActorFixture::new().await;
-        let exec_ctx = fixture
-            .execution_context("test-session")
-            .await
-            .with_execution_origin(
-                crate::agent::execution_context::ExecutionOrigin::Scheduled {
-                    schedule_public_id: "schedule-1".to_string(),
-                    task_public_id: "missing-task".to_string(),
-                },
-            );
+        let (mut env, turn) = fixture.turn("test-session").await;
+        env.execution_origin = crate::agent::execution::ExecutionOrigin::Scheduled {
+            schedule_public_id: "schedule-1".to_string(),
+            task_public_id: "missing-task".to_string(),
+        };
 
-        let result = validate_execution_task(
-            &*exec_ctx.state.store,
-            &exec_ctx.execution_origin,
-            "test-session",
-        )
-        .await;
+        let result =
+            validate_execution_task(&*turn.state.store, &env.execution_origin, "test-session")
+                .await;
 
         assert!(result.is_err());
         assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
-        assert!(exec_ctx.state.current_intent.is_none());
+        assert!(turn.state.current_intent.is_none());
     }
 
     #[tokio::test]
     async fn intent_projection_initializes_summary_without_next_step() {
         let fixture = ActorFixture::new().await;
-        let mut exec_ctx = fixture.execution_context("test-session").await;
+        let (_env, mut turn) = fixture.turn("test-session").await;
 
         maybe_update_session_intent(
             &fixture.config,
             "test-session",
-            &mut exec_ctx,
+            &mut turn,
             "Implement the fix",
             "message-1",
         )
         .await
         .expect("update intent projection");
 
-        let intent = exec_ctx.state.current_intent.expect("current intent");
+        let intent = turn.state.current_intent.expect("current intent");
         assert_eq!(intent.summary, "Implement the fix");
         assert_eq!(intent.next_step_hint, None);
         assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
@@ -5695,8 +5683,8 @@ mod tests {
     #[tokio::test]
     async fn intent_projection_preserves_summary_constraints_and_updates_next_step() {
         let fixture = ActorFixture::new().await;
-        let mut exec_ctx = fixture.execution_context("test-session").await;
-        exec_ctx.state.current_intent = Some(IntentSnapshot {
+        let (_env, mut turn) = fixture.turn("test-session").await;
+        turn.state.current_intent = Some(IntentSnapshot {
             id: 1,
             session_id: 1,
             task_id: None,
@@ -5712,14 +5700,14 @@ mod tests {
         maybe_update_session_intent(
             &fixture.config,
             "test-session",
-            &mut exec_ctx,
+            &mut turn,
             "Also add integration tests",
             "message-2",
         )
         .await
         .expect("update intent projection");
 
-        let intent = exec_ctx.state.current_intent.expect("current intent");
+        let intent = turn.state.current_intent.expect("current intent");
         assert_eq!(intent.summary, "Implement the fix");
         assert_eq!(
             intent.constraints.as_deref(),
@@ -5735,8 +5723,8 @@ mod tests {
     #[tokio::test]
     async fn intent_projection_skips_duplicate_summary_and_next_step() {
         let fixture = ActorFixture::new().await;
-        let mut exec_ctx = fixture.execution_context("test-session").await;
-        exec_ctx.state.current_intent = Some(IntentSnapshot {
+        let (_env, mut turn) = fixture.turn("test-session").await;
+        turn.state.current_intent = Some(IntentSnapshot {
             id: 1,
             session_id: 1,
             task_id: None,
@@ -5753,7 +5741,7 @@ mod tests {
             maybe_update_session_intent(
                 &fixture.config,
                 "test-session",
-                &mut exec_ctx,
+                &mut turn,
                 duplicate,
                 "duplicate-message",
             )
@@ -5763,8 +5751,7 @@ mod tests {
 
         assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
         assert_eq!(
-            exec_ctx
-                .state
+            turn.state
                 .current_intent
                 .as_ref()
                 .and_then(|intent| intent.next_step_hint.as_deref()),
@@ -5775,7 +5762,7 @@ mod tests {
     #[tokio::test]
     async fn provider_failure_recovers_contextualized_llm_error() {
         let fixture = ActorFixture::new().await;
-        let exec_ctx = fixture.execution_context("test-session").await;
+        let (env, _turn) = fixture.turn("test-session").await;
         let llm_error = LLMError::from(
             ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "provider is busy")
                 .with_code(Some("server_overloaded".to_string()))
@@ -5785,8 +5772,8 @@ mod tests {
         );
         let error = anyhow::Error::new(llm_error).context("execute cycle failed");
 
-        let provider_failure = provider_failure_from_execution_error(&error, &exec_ctx)
-            .expect("recover provider failure");
+        let provider_failure =
+            provider_failure_from_execution_error(&error, &env).expect("recover provider failure");
 
         match provider_failure {
             AgentError::ProviderFailure {
@@ -5819,10 +5806,10 @@ mod tests {
     #[tokio::test]
     async fn provider_failure_ignores_non_llm_error_chain() {
         let fixture = ActorFixture::new().await;
-        let exec_ctx = fixture.execution_context("test-session").await;
+        let (env, _turn) = fixture.turn("test-session").await;
         let error = anyhow::anyhow!("storage unavailable").context("execute cycle failed");
 
-        assert!(provider_failure_from_execution_error(&error, &exec_ctx).is_none());
+        assert!(provider_failure_from_execution_error(&error, &env).is_none());
     }
 
     // ── Actor message handler tests ──────────────────────────────────────────
@@ -5874,7 +5861,7 @@ mod tests {
     #[tokio::test]
     async fn status_consistency_steering_drain_publishes_new_revision_without_phase_change() {
         let fixture = crate::test_utils::TestAgent::new().await;
-        let mut exec = fixture.execution_context().await;
+        let (mut exec, mut turn) = fixture.turn().await;
         let mut actor = SessionActor::new(
             fixture.config.clone(),
             exec.session_id.clone(),
@@ -5884,11 +5871,11 @@ mod tests {
         let held_run_id = querymt_agent_core::model::TurnId::new();
         let mut run = ActiveRun::new(held_run_id, 1, actor.turn_state.token.clone());
         run.phase = RunPhase::Model;
-        exec = exec.with_steering(run.steering.clone());
+        exec.steering = Some(run.steering.clone());
         actor.active_run = Some(run);
         let actor_ref = SessionActor::spawn(actor);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        exec = exec.with_phase_reporter(tx);
+        exec.phase_reporter = Some(tx);
         let forward_actor = actor_ref.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(phase) = rx.recv().await {
@@ -5926,7 +5913,8 @@ mod tests {
         ));
         crate::agent::execution::apply_pending_steering(
             &fixture.config,
-            &mut exec,
+            &exec,
+            &mut turn,
             &context,
             "test",
             false,

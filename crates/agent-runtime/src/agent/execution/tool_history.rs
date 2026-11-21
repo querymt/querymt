@@ -19,7 +19,7 @@
 //! ([`ConversationContext::tool_baseline`]), and the messages it holds contain
 //! only the tool changes stored after that baseline.
 
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::TurnEnv;
 use crate::middleware::ConversationContext;
 use querymt::chat::{ChatInputPart, ChatMessage, ChatRole, Tool, ToolChange};
 use querymt_agent_core::model::{AgentMessage, MessagePart, ToolBaseline};
@@ -125,16 +125,16 @@ pub(crate) struct ToolRequestState {
 /// so they leave the conversation; a later load of the history drops them the
 /// same way.
 async fn store_baseline(
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     context: &Arc<ConversationContext>,
     baseline: Arc<ToolBaseline>,
 ) -> Result<Arc<ConversationContext>, anyhow::Error> {
-    let mut message = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+    let mut message = AgentMessage::new(env.session_id.clone(), ChatRole::User);
     message.parts.push(MessagePart::ToolBaseline {
         tools: baseline.tools.clone(),
         origin: baseline.origin.clone(),
     });
-    exec_ctx.add_message(message).await?;
+    env.add_message(message).await?;
 
     let mut next = (**context).clone();
     if context.messages.iter().any(is_tool_change) {
@@ -147,11 +147,11 @@ async fn store_baseline(
 /// Stores `change` as one user message after the conversation so far and
 /// returns the context that includes it.
 async fn store_change(
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     context: &Arc<ConversationContext>,
     change: ToolChange,
 ) -> Result<Arc<ConversationContext>, anyhow::Error> {
-    let mut message = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+    let mut message = AgentMessage::new(env.session_id.clone(), ChatRole::User);
     message.parts.push(MessagePart::ToolChange {
         added: change.added,
         removed: change.removed,
@@ -159,7 +159,7 @@ async fn store_change(
     let chat_message = message
         .to_chat_message()
         .map_err(|error| anyhow::anyhow!("Invalid tool change: {error}"))?;
-    exec_ctx.add_message(message).await?;
+    env.add_message(message).await?;
 
     let mut messages = context.messages.to_vec();
     messages.push(chat_message);
@@ -178,7 +178,7 @@ async fn store_change(
 /// a change only after a user message. Without `tool_updates`, nothing is
 /// stored.
 pub(crate) async fn resolve(
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     context: &Arc<ConversationContext>,
     tool_updates: bool,
     tools: &[Tool],
@@ -225,7 +225,7 @@ pub(crate) async fn resolve(
                 tools: tools.to_vec(),
                 origin: wanted,
             });
-            context = store_baseline(exec_ctx, &context, baseline.clone()).await?;
+            context = store_baseline(env, &context, baseline.clone()).await?;
             baseline
         }
     };
@@ -233,7 +233,7 @@ pub(crate) async fn resolve(
     if change_allowed
         && let Some(change) = diff(&offered(&baseline.tools, &context.messages), tools)
     {
-        context = store_change(exec_ctx, &context, change).await?;
+        context = store_change(env, &context, change).await?;
     }
 
     Ok(ToolRequestState {
@@ -349,16 +349,16 @@ mod tests {
 
     use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
 
-    async fn agent() -> (TestAgent, ExecutionContext) {
+    async fn agent() -> (TestAgent, TurnEnv) {
         let agent =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let exec = agent.execution_context().await;
+        let (exec, _turn) = agent.turn().await;
         (agent, exec)
     }
 
     fn context_for(
-        exec: &ExecutionContext,
+        exec: &TurnEnv,
         provider: &str,
         model: &str,
         messages: Vec<ChatMessage>,
@@ -382,7 +382,7 @@ mod tests {
     }
 
     /// Kinds of the stored tool records, in order: `baseline` or `change`.
-    async fn stored_records(agent: &TestAgent, exec: &ExecutionContext) -> Vec<&'static str> {
+    async fn stored_records(agent: &TestAgent, exec: &TurnEnv) -> Vec<&'static str> {
         agent
             .config
             .provider

@@ -12,26 +12,24 @@
 //! errors raised by the recorder.
 
 use super::{AccountingReason, ScopeTotals};
-use parking_lot::Mutex;
 use querymt::providers::IncompleteReason;
 use std::collections::HashSet;
 
 /// Remembers which budget-uncertainty reasons a cycle has already reported.
 #[derive(Default)]
 pub struct BudgetWarnings {
-    seen: Mutex<HashSet<AccountingReason>>,
+    seen: HashSet<AccountingReason>,
 }
 
 impl BudgetWarnings {
     /// Reasons in `totals` not yet reported for this cycle, recorded as
     /// reported. Repeated snapshots of the same state return nothing; a new
     /// missing category returns just the new reason.
-    pub fn take_new(&self, totals: &ScopeTotals) -> Vec<AccountingReason> {
-        let mut seen = self.seen.lock();
+    pub fn take_new(&mut self, totals: &ScopeTotals) -> Vec<AccountingReason> {
         totals
             .budget_reasons()
             .into_iter()
-            .filter(|reason| seen.insert(reason.clone()))
+            .filter(|reason| self.seen.insert(reason.clone()))
             .collect()
     }
 }
@@ -112,13 +110,13 @@ mod tests {
 
     #[test]
     fn complete_budget_never_warns() {
-        let warnings = BudgetWarnings::default();
+        let mut warnings = BudgetWarnings::default();
         assert!(warnings.take_new(&ScopeTotals::default()).is_empty());
     }
 
     #[test]
     fn repeated_snapshots_warn_once_per_reason() {
-        let warnings = BudgetWarnings::default();
+        let mut warnings = BudgetWarnings::default();
         let totals = totals_with(IncompleteReason::MissingRate {
             category: PricingCategory::CacheRead,
         });
@@ -131,7 +129,7 @@ mod tests {
 
     #[test]
     fn a_new_missing_category_warns_again() {
-        let warnings = BudgetWarnings::default();
+        let mut warnings = BudgetWarnings::default();
         let read = totals_with(IncompleteReason::MissingRate {
             category: PricingCategory::CacheRead,
         });

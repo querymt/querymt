@@ -23,6 +23,36 @@ The transition functions live in `crates/agent-runtime/src/agent/execution/trans
 
 Source: `crates/agent-runtime/src/agent/execution/mod.rs`, `crates/agent-runtime/src/agent/execution/transitions.rs`.
 
+## Run state: one owner per lifetime
+
+The state of a run is split by mutability in `crates/agent-runtime/src/agent/execution/turn.rs`:
+
+- `TurnEnv` is everything fixed when the run starts: session id, run id, the turn-pinned
+  `SessionHandle`, tool configuration, cancellation token, steering inbox, cycle
+  accounting and the run's `ToolSet`. It is built with a struct literal in
+  `execute_prompt_inner` (`session_actor.rs`), so a missing field is a compile error,
+  and step functions take it as `&TurnEnv`, including the concurrent tool wave.
+- `Turn` is everything that changes while the run executes: the `RuntimeContext`
+  (active task, intent), the run objective, compaction summaries, delegations suspended by
+  steering, the repository-knowledge delivery budget, budget warnings, the pre-turn
+  snapshot (`PreTurnSnapshot`: `None`, `Pending(task)`, `Ready(snapshot)`) and
+  `TurnBudgets`, the counters that bound the run (Stop-hook continuations per reason,
+  completion-guard and stop-recovery counts, model requests, the last compaction and
+  progress-review positions). It has one owner, the loop, and is borrowed `&mut` by the
+  steps that change it. It holds no lock, atomic or cell, so a new run starts from
+  `Turn::new` and nothing run-scoped is reachable from another session or a later run.
+- `SessionRuntime` keeps only session-scoped caches and grants (session grants, MCP tool
+  state, accounting, cache prefix) behind short synchronous locks.
+
+A tool wave shares `&TurnEnv` and `&Turn`: `execute_prepared_tool_call` only reads the
+run's `RuntimeContext` store and active task, and writes (progress entries, artifacts,
+delegations) go to the session store, not to `Turn`. Anything a wave produces for the run
+(`snapshot_part`, `hook_contexts`) comes back in its `ToolResult` and is folded in after
+the wave. `Turn` must stay `Sync` for that; `DelegationRecovery` wraps its future in a
+`SyncWrapper` for this reason.
+
+Source: `crates/agent-runtime/src/agent/execution/turn.rs`, `crates/agent-runtime/src/agent/session_actor.rs`.
+
 ## Tool-call lifecycle
 
 Each call is prepared, then executed (`crates/agent-runtime/src/agent/execution/tool_calls.rs`).

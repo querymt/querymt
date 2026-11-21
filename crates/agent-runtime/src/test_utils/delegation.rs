@@ -5,7 +5,7 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::delegation::roster::{Member, MemberAgent, MemberOrigin};
 use crate::delegation::{AgentInfo, DelegationOrchestrator};
 use crate::middleware::{ExecutionState, MiddlewareDriver};
@@ -156,7 +156,8 @@ pub struct TestHarness {
     pub config: Arc<AgentConfig>,
     /// The root handle the orchestrator is weakly bound to.
     pub delegator: Arc<crate::agent::LocalAgentHandle>,
-    pub(crate) exec_ctx: ExecutionContext,
+    pub(crate) env: TurnEnv,
+    pub(crate) turn: Turn,
     pub provider: Arc<Mutex<MockLlmProvider>>,
     pub orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
     pub _temp_dir: TempDir,
@@ -265,19 +266,14 @@ impl TestHarness {
             crate::agent::core::McpToolState::empty(),
         );
 
-        let exec_ctx = ExecutionContext::new(
-            session_id,
-            querymt_agent_core::model::TurnId::new(),
-            session_runtime,
-            runtime_context,
-            context,
-            crate::agent::core::ToolConfig::default(),
-        );
+        let (env, turn) =
+            crate::test_utils::turn_parts(&config, context, session_runtime, runtime_context).await;
 
         Self {
             config,
             delegator,
-            exec_ctx,
+            env,
+            turn,
             provider,
             orchestrator_handle,
             _temp_dir: temp_dir,
@@ -293,7 +289,8 @@ impl TestHarness {
     pub async fn run(&mut self) -> CycleOutcome {
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
-            &mut self.exec_ctx,
+            &self.env,
+            &mut self.turn,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -303,7 +300,7 @@ impl TestHarness {
     pub async fn set_parent_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
         let store = self.config.provider.history_store();
         let current = store
-            .get_session_llm_config(&self.exec_ctx.session_id)
+            .get_session_llm_config(&self.env.session_id)
             .await
             .expect("parent config lookup")
             .expect("parent config");
@@ -321,7 +318,7 @@ impl TestHarness {
             .await
             .expect("create parent config");
         store
-            .set_session_llm_config(&self.exec_ctx.session_id, updated.id)
+            .set_session_llm_config(&self.env.session_id, updated.id)
             .await
             .expect("set parent config");
     }
@@ -417,7 +414,7 @@ impl TestHarness {
         self.config
             .provider
             .history_store()
-            .list_child_sessions(&self.exec_ctx.session_id)
+            .list_child_sessions(&self.env.session_id)
             .await
             .expect("child sessions")
     }
@@ -437,7 +434,7 @@ impl TestHarness {
     pub async fn child_llm_params(&self) -> (String, LLMParams) {
         let store = self.config.provider.history_store();
         let child_sessions = store
-            .list_child_sessions(&self.exec_ctx.session_id)
+            .list_child_sessions(&self.env.session_id)
             .await
             .expect("child sessions");
         let child_session_id = child_sessions.first().expect("child session id");

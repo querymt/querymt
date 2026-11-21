@@ -4,7 +4,7 @@
 //! context window size.
 
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::utils::u32_from_usize;
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
@@ -47,26 +47,23 @@ async fn emit_compaction_event(config: &AgentConfig, session_id: &str, kind: Age
 /// Uses the cycle the compaction was initiated from. The billing basis is the
 /// session provider's (that provider handles the request), priced for the
 /// compaction model actually used.
-async fn compaction_ledger(
+fn compaction_ledger(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     model: &str,
-) -> Result<querymt_agent_services::accounting::DispatchLedger, anyhow::Error> {
-    let cycle = exec_ctx
-        .cycle_accounting(&config.event_sink)
-        .await
-        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
+) -> querymt_agent_services::accounting::DispatchLedger {
+    let cycle = &env.cycle_accounting;
     let recorder = Arc::new(
         querymt_agent_services::accounting::AttemptRecorder::with_projection(
-            config.event_sink.session_stream(&exec_ctx.session_id),
+            config.event_sink.session_stream(&env.session_id),
             cycle.session_accounting().clone(),
         ),
     );
-    let provider = exec_ctx
+    let provider = env
         .llm_config()
         .map(|c| c.provider.clone())
         .unwrap_or_default();
-    Ok(querymt_agent_services::accounting::DispatchLedger {
+    querymt_agent_services::accounting::DispatchLedger {
         operation: Arc::new(
             querymt_agent_services::accounting::AttemptOperation::new(
                 recorder,
@@ -78,20 +75,17 @@ async fn compaction_ledger(
             .with_budget_pricing(config.budget_pricing())
             .with_budget_cap(config.budget_cap_usd()),
         ),
-        basis: exec_ctx.session_handle.billing_basis_for_model(model),
-    })
+        basis: env.session_handle.billing_basis_for_model(model),
+    }
 }
 
 /// Run pruning on tool results to reduce context size.
 ///
 /// This marks low-value tool results as compacted based on the pruning configuration.
 /// Pruning is a lightweight operation that can run after every turn.
-pub(super) async fn run_pruning(
-    config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-) -> Result<(), anyhow::Error> {
-    let session_id = &exec_ctx.session_id;
-    let messages = exec_ctx
+pub(super) async fn run_pruning(config: &AgentConfig, env: &TurnEnv) -> Result<(), anyhow::Error> {
+    let session_id = &env.session_id;
+    let messages = env
         .session_handle
         .get_agent_history()
         .await
@@ -104,7 +98,7 @@ pub(super) async fn run_pruning(
     };
 
     let estimator =
-        crate::session::pruning::content_cost_estimator_for_llm_config(exec_ctx.llm_config());
+        crate::session::pruning::content_cost_estimator_for_llm_config(env.llm_config());
     let analysis = crate::session::pruning::compute_prune_candidates(
         &messages,
         &prune_config,
@@ -168,10 +162,11 @@ pub(crate) enum CompactionOutcome {
 /// operation typically triggered when context thresholds are hit.
 pub(super) async fn run_ai_compaction(
     config: &AgentConfig,
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
-    let outcome = compact_history(config, exec_ctx, TRIGGER_CONTEXT_THRESHOLD, None).await?;
+    let outcome = compact_history(config, env, turn, TRIGGER_CONTEXT_THRESHOLD, None).await?;
     let (filtered_messages, new_context_tokens) = match outcome {
         CompactionOutcome::Completed {
             messages,
@@ -207,7 +202,7 @@ pub(super) async fn run_ai_compaction(
 
     // The same read of the stored history as a turn start, so the rest of the
     // run continues from what a reload would give it.
-    let view = exec_ctx
+    let view = env
         .session_handle
         .view_of(filtered_messages)
         .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
@@ -230,7 +225,7 @@ pub(super) async fn run_ai_compaction(
         return Err(anyhow::anyhow!("No context available for compaction"));
     };
 
-    exec_ctx.compaction_summaries = view.summaries;
+    turn.compaction_summaries = view.summaries;
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
@@ -245,12 +240,13 @@ pub(super) async fn run_ai_compaction(
 /// instructions added to the summary prompt.
 pub(crate) async fn compact_history(
     config: &AgentConfig,
-    exec_ctx: &mut ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     trigger: &str,
     instructions: Option<&str>,
 ) -> Result<CompactionOutcome, anyhow::Error> {
-    let session_id = &exec_ctx.session_id;
-    let messages = exec_ctx
+    let session_id = &env.session_id;
+    let messages = env
         .session_handle
         .get_effective_agent_history()
         .await
@@ -259,9 +255,7 @@ pub(crate) async fn compact_history(
         return Ok(CompactionOutcome::NothingToCompact);
     }
 
-    let prompt_limit = exec_ctx
-        .execution_config()
-        .and_then(|cfg| cfg.max_prompt_bytes);
+    let prompt_limit = env.execution_config().and_then(|cfg| cfg.max_prompt_bytes);
     let token_estimate: usize = messages
         .iter()
         .map(|m| {
@@ -289,8 +283,8 @@ pub(crate) async fn compact_history(
         })
         .sum();
 
-    let turn_id = exec_ctx.turn_id().to_string();
-    let model_name = exec_ctx
+    let turn_id = env.turn_id().to_string();
+    let model_name = env
         .llm_config()
         .map(|cfg| cfg.model.clone())
         .unwrap_or_default();
@@ -302,9 +296,9 @@ pub(crate) async fn compact_history(
         .run_pre_compaction(PreCompactionRequest {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
             model: model_name.clone(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             trigger: trigger.to_string(),
             token_estimate: token_estimate_u32,
             message_count,
@@ -352,7 +346,7 @@ pub(crate) async fn compact_history(
     )
     .await;
 
-    let llm_config = exec_ctx
+    let llm_config = env
         .llm_config()
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
@@ -370,7 +364,7 @@ pub(crate) async fn compact_history(
             original_token_count: token_estimate,
         }
     } else {
-        let llm_provider = match exec_ctx
+        let llm_provider = match env
             .session_handle
             .provider()
             .await
@@ -384,13 +378,7 @@ pub(crate) async fn compact_history(
         };
         // Compaction is a paid request: its attempts are recorded against the
         // initiating cycle and session, never inferred from message history.
-        let ledger = match compaction_ledger(config, exec_ctx, model).await {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                emit_compaction_failure(config, session_id, &compaction_id, &error).await;
-                return Err(error);
-            }
-        };
+        let ledger = compaction_ledger(config, env, model);
         let retry_config = crate::session::compaction::RetryConfig {
             max_retries: config.execution_policy.compaction.retry.max_retries,
             initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
@@ -403,9 +391,7 @@ pub(crate) async fn compact_history(
                 llm_provider,
                 model,
                 &retry_config,
-                exec_ctx
-                    .execution_config()
-                    .and_then(|cfg| cfg.max_prompt_bytes),
+                env.execution_config().and_then(|cfg| cfg.max_prompt_bytes),
                 &ledger,
                 instructions,
             )
@@ -443,7 +429,7 @@ pub(crate) async fn compact_history(
     // Appended after validation, like the verbatim prompts, so it can never
     // rescue an empty summary.
     if let Some(section) =
-        crate::session::compaction::active_task_section(exec_ctx.state.active_task.as_ref())
+        crate::session::compaction::active_task_section(turn.state.active_task.as_ref())
     {
         use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
         result.summary_token_count = result
@@ -458,9 +444,9 @@ pub(crate) async fn compact_history(
         .run_post_compaction(PostCompactionRequest {
             session_id: session_id.clone(),
             turn_id,
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
             model: model_name,
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             trigger: trigger.to_string(),
             summary: result.summary.clone(),
             original_token_count: u32_from_usize(
@@ -519,12 +505,12 @@ pub(crate) async fn compact_history(
         result.original_token_count,
     );
 
-    if let Err(error) = exec_ctx.add_message(request_msg).await {
+    if let Err(error) = env.add_message(request_msg).await {
         let error = anyhow::anyhow!("Failed to store compaction request: {}", error);
         emit_compaction_failure(config, session_id, &compaction_id, &error).await;
         return Err(error);
     }
-    if let Err(error) = exec_ctx.add_message(summary_msg).await {
+    if let Err(error) = env.add_message(summary_msg).await {
         let error = anyhow::anyhow!("Failed to store compaction summary: {}", error);
         emit_compaction_failure(config, session_id, &compaction_id, &error).await;
         return Err(error);
@@ -533,7 +519,7 @@ pub(crate) async fn compact_history(
     // Re-establish a bounded set of recently relevant repository cards under
     // the new compaction epoch. Additive and fail-open.
     let restored =
-        crate::agent::repository_delivery::post_compaction_contexts(config, exec_ctx, &messages)
+        crate::agent::repository_delivery::post_compaction_contexts(config, env, turn, &messages)
             .await;
     if !restored.is_empty() {
         let mut message = querymt_agent_core::model::AgentMessage::new(
@@ -549,12 +535,12 @@ pub(crate) async fn compact_history(
                 content: context.content,
             })
             .collect();
-        if let Err(error) = exec_ctx.add_message(message).await {
+        if let Err(error) = env.add_message(message).await {
             warn!("failed to store post-compaction repository context: {error}");
         }
     }
 
-    let filtered_messages = match exec_ctx.session_handle.get_effective_agent_history().await {
+    let filtered_messages = match env.session_handle.get_effective_agent_history().await {
         Ok(messages) => messages,
         Err(error) => {
             let error = anyhow::anyhow!("Failed to get new history: {}", error);
@@ -606,7 +592,7 @@ pub(crate) async fn compact_history(
 mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
-    use crate::agent::core::{McpToolState, SessionRuntime, ToolConfig};
+    use crate::agent::core::{McpToolState, SessionRuntime};
     use crate::hooks::{
         HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig,
     };
@@ -650,7 +636,8 @@ mod tests {
         output: Option<ChatOutput>,
     ) -> (
         AgentConfig,
-        ExecutionContext,
+        TurnEnv,
+        Turn,
         ExecutionState,
         tempfile::TempDir,
     ) {
@@ -694,14 +681,8 @@ mod tests {
                 .await
                 .unwrap();
         let runtime = SessionRuntime::new(None, Default::default(), McpToolState::empty());
-        let exec_ctx = ExecutionContext::new(
-            session_id.clone(),
-            querymt_agent_core::model::TurnId::new(),
-            runtime,
-            runtime_context,
-            session_handle,
-            ToolConfig::default(),
-        );
+        let (env, turn) =
+            crate::test_utils::turn_parts(&config, session_handle, runtime, runtime_context).await;
         let state = ExecutionState::Stopped {
             message: "context threshold".into(),
             stop_type: StopType::ContextThreshold,
@@ -716,7 +697,7 @@ mod tests {
                 "mock".into(),
             ))),
         };
-        (config, exec_ctx, state, tempdir)
+        (config, env, turn, state, tempdir)
     }
 
     fn is_compaction_event(kind: &AgentEventKind) -> bool {
@@ -773,15 +754,15 @@ mod tests {
         output: Option<ChatOutput>,
         expected_error: &str,
     ) {
-        let (config, mut exec_ctx, state, _tempdir) = fixture(hooks, output).await;
+        let (config, env, mut turn, state, _tempdir) = fixture(hooks, output).await;
         let before = config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
         let mut events = config.subscribe_events();
-        let error = run_ai_compaction(&config, &mut exec_ctx, &state)
+        let error = run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .expect_err("compaction must fail");
         // Do not yield: all lifecycle events must be published before compaction returns.
@@ -790,14 +771,14 @@ mod tests {
         let after = config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
         assert_eq!(
             serde_json::to_value(&before).unwrap(),
             serde_json::to_value(&after).unwrap()
         );
-        let effective = exec_ctx
+        let effective = env
             .session_handle
             .get_effective_agent_history()
             .await
@@ -829,7 +810,7 @@ mod tests {
         assert_eq!(compaction_id, start_id);
         assert!(reason.contains(expected_error));
         assert!(!cancelled);
-        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
+        assert_compaction_journal_matches(&config, &env.session_id, &compaction_events).await;
         assert!(!crate::session::compaction::has_compaction(&after));
     }
 
@@ -893,7 +874,7 @@ mod tests {
             None,
             Some(FinishReason::Stop),
         );
-        let (mut config, mut exec_ctx, _state, _tempdir) =
+        let (mut config, env, mut turn, _state, _tempdir) =
             fixture(Hooks::disabled(), Some(output)).await;
         config.execution_policy.compaction.auto = true;
         config.middleware_drivers = vec![Arc::new(crate::middleware::ContextMiddleware::new(
@@ -906,14 +887,15 @@ mod tests {
         let before = config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             super::super::execute_cycle_state_machine(
                 &config,
-                &mut exec_ctx,
+                &env,
+                &mut turn,
                 crate::agent::core::AgentMode::Build,
             ),
         )
@@ -927,7 +909,7 @@ mod tests {
         let after = config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
         assert_eq!(
@@ -938,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_drops_a_tool_baseline_the_history_no_longer_holds() {
-        let (config, mut exec_ctx, state, _tempdir) =
+        let (config, env, mut turn, state, _tempdir) =
             fixture(custom_summary_hooks("Summary", None), None).await;
         // The run holds a baseline that was stored before the compaction, and
         // a tool change stored after it.
@@ -966,7 +948,7 @@ mod tests {
             context: Some(Arc::new(held)),
         };
 
-        let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+        let next = run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
 
@@ -976,25 +958,25 @@ mod tests {
         let context = next.context().unwrap();
         assert!(context.tool_baseline.is_none());
         assert!(!context.messages.iter().any(ChatMessage::has_tool_change));
-        let view = exec_ctx.session_handle.history_view().await.unwrap();
+        let view = env.session_handle.history_view().await.unwrap();
         assert_eq!(context.messages.as_ref(), view.messages);
         assert!(view.tool_baseline.is_none());
     }
 
     #[tokio::test]
     async fn valid_custom_summary_is_stored_and_emitted_as_success() {
-        let (config, mut exec_ctx, state, _tempdir) = fixture(
+        let (config, env, mut turn, state, _tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", Some("Keep the tests passing")),
             None,
         )
         .await;
         let mut events = config.subscribe_events();
-        let result = run_ai_compaction(&config, &mut exec_ctx, &state)
+        let result = run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
         let compaction_events = take_compaction_events(&mut events);
         let expected = "Valid continuation summary\n\nKeep the tests passing";
-        let effective = exec_ctx
+        let effective = env
             .session_handle
             .get_effective_agent_history()
             .await
@@ -1004,9 +986,9 @@ mod tests {
             matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
         );
         assert!(result.context().unwrap().stats.context_tokens > 0);
-        assert_eq!(exec_ctx.compaction_summaries.len(), 1);
+        assert_eq!(turn.compaction_summaries.len(), 1);
         assert_eq!(
-            exec_ctx.compaction_summaries[0].payload(),
+            turn.compaction_summaries[0].payload(),
             result.context().unwrap().messages[1].payload()
         );
         let [start, chunk, end] = compaction_events.as_slice() else {
@@ -1040,23 +1022,23 @@ mod tests {
         assert_eq!(compaction_id.as_ref(), Some(start_id));
         assert_eq!(summary, expected);
         assert!(context_tokens.unwrap() > 0);
-        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
+        assert_compaction_journal_matches(&config, &env.session_id, &compaction_events).await;
     }
 
     #[tokio::test]
     async fn compaction_start_counts_stored_notices() {
-        let (config, mut exec_ctx, state, _tempdir) =
+        let (config, env, mut turn, state, _tempdir) =
             fixture(custom_summary_hooks("Summary", None), None).await;
         let notice_text = "The instructions from the earlier mode no longer apply. ".repeat(10);
-        let mut notice = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        let mut notice = AgentMessage::new(env.session_id.clone(), ChatRole::User);
         notice.parts.push(MessagePart::Notice {
             source: querymt_agent_core::model::NoticeSource::AgentMode,
             content: notice_text.clone(),
         });
-        exec_ctx.session_handle.add_message(notice).await.unwrap();
+        env.session_handle.add_message(notice).await.unwrap();
 
         let mut events = config.subscribe_events();
-        run_ai_compaction(&config, &mut exec_ctx, &state)
+        run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
         let compaction_events = take_compaction_events(&mut events);
@@ -1100,24 +1082,19 @@ mod tests {
             out
         }
 
-        async fn totals(
-            exec: &ExecutionContext,
-        ) -> querymt_agent_services::accounting::ScopeTotals {
-            exec.cycle_accounting
-                .get()
-                .expect("compaction opens the cycle's accounting")
-                .session_totals()
+        async fn totals(env: &TurnEnv) -> querymt_agent_services::accounting::ScopeTotals {
+            env.cycle_accounting.session_totals()
         }
 
         #[tokio::test]
         async fn successful_compaction_charges_the_initiating_cycle_as_compaction_purpose() {
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
-            run_ai_compaction(&config, &mut exec_ctx, &state)
+            run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .unwrap();
 
-            let cycle = exec_ctx.cycle_accounting.get().unwrap();
+            let cycle = &env.cycle_accounting;
             let by_cycle = cycle.cycle_totals();
             assert_eq!(by_cycle.priced_attempts, 1);
             assert_eq!(by_cycle.unresolved_attempts, 0);
@@ -1131,22 +1108,22 @@ mod tests {
             );
             // Usage was reported, so the attempt is a settled metered attempt
             // even though the mock catalog has no price for it.
-            assert_eq!(totals(&exec_ctx).await.priced_attempts, 1);
+            assert_eq!(totals(&env).await.priced_attempts, 1);
         }
 
         #[tokio::test]
         async fn rejected_summary_and_retry_both_settle_before_failure() {
             // Both mock calls return an empty summary: validation rejects each.
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("  "))).await;
             let mut events = config.subscribe_events();
-            let error = run_ai_compaction(&config, &mut exec_ctx, &state)
+            let error = run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .expect_err("empty summary must fail");
             assert!(error.to_string().contains("empty summary"), "{error:#}");
             let _ = take_compaction_events(&mut events);
 
-            let t = totals(&exec_ctx).await;
+            let t = totals(&env).await;
             assert_eq!(t.unresolved_attempts, 0, "every attempt is settled");
             assert_eq!(
                 t.priced_attempts, 2,
@@ -1163,12 +1140,12 @@ mod tests {
 
         #[tokio::test]
         async fn compaction_reduces_effective_context_while_increasing_spend() {
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
             let before = state.context().unwrap().stats.clone();
             assert_eq!(before.context_tokens, 100_000);
 
-            let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+            let next = run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .unwrap();
             let after = next.context().unwrap().stats.clone();
@@ -1177,7 +1154,7 @@ mod tests {
             assert!(after.context_tokens < before.context_tokens);
             assert!(after.context_tokens > 0);
             // ... while spend (the ledger) grows.
-            let t = totals(&exec_ctx).await;
+            let t = totals(&env).await;
             assert_eq!(t.priced_attempts, 1);
             assert!(t.tokens.input > 0);
 
@@ -1197,16 +1174,12 @@ mod tests {
 
         #[tokio::test]
         async fn auxiliary_tokens_are_a_separate_purpose_total() {
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
-            run_ai_compaction(&config, &mut exec_ctx, &state)
+            run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .unwrap();
-            let accounting = exec_ctx
-                .cycle_accounting
-                .get()
-                .unwrap()
-                .session_accounting();
+            let accounting = env.cycle_accounting.session_accounting();
             let compaction = accounting.read(|r| r.purpose(AttemptPurpose::Compaction));
             let main = accounting.read(|r| r.purpose(AttemptPurpose::MainResponse));
             assert_eq!(compaction.tokens.input, 100);
@@ -1219,33 +1192,34 @@ mod tests {
 
         #[tokio::test]
         async fn hook_provided_summary_dispatches_nothing_and_charges_nothing() {
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, env, mut turn, state, _tempdir) =
                 fixture(custom_summary_hooks("Hook summary", None), None).await;
-            run_ai_compaction(&config, &mut exec_ctx, &state)
+            run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .unwrap();
-            assert!(
-                exec_ctx.cycle_accounting.get().is_none(),
-                "no provider request, so no accounting was opened"
+            assert_eq!(
+                env.cycle_accounting.cycle_totals(),
+                Default::default(),
+                "no provider request, so nothing was charged"
             );
         }
 
         #[tokio::test]
         async fn maintenance_cycle_has_its_own_identity_and_session_totals() {
-            let (config, mut exec_ctx, state, _tempdir) =
+            let (config, mut env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("Summary"))).await;
             // Compaction outside a prompt runs under a dedicated maintenance cycle.
-            let accounting = exec_ctx
+            let accounting = env
                 .runtime
-                .accounting(&exec_ctx.session_id, &config.event_sink)
+                .accounting(&env.session_id, &config.event_sink)
                 .await
                 .unwrap();
             let maintenance = CycleAccounting::begin_maintenance(accounting.clone());
             assert!(maintenance.is_maintenance());
             let id = maintenance.cycle_id().to_string();
-            exec_ctx = exec_ctx.with_cycle_accounting(maintenance);
+            env.cycle_accounting = maintenance;
 
-            run_ai_compaction(&config, &mut exec_ctx, &state)
+            run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .unwrap();
             assert_eq!(accounting.read(|r| r.cycle(&id).priced_attempts), 1);
@@ -1260,7 +1234,7 @@ mod tests {
         #[tokio::test]
         async fn budget_refusal_ends_compaction_as_a_price_limit_stop() {
             // No provider call is expected: the fixture's mock fails on any.
-            let (mut config, mut exec_ctx, state, _tempdir) =
+            let (mut config, env, mut turn, state, _tempdir) =
                 fixture(Hooks::disabled(), None).await;
             // A zero cap is already reached by a cycle with no spend.
             config
@@ -1270,7 +1244,7 @@ mod tests {
                 )));
             let mut events = config.subscribe_events();
 
-            let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+            let next = run_ai_compaction(&config, &env, &mut turn, &state)
                 .await
                 .expect("a refused dispatch is a stop, not an error");
             let ExecutionState::Stopped {
@@ -1292,7 +1266,7 @@ mod tests {
                 "{compaction_events:?}"
             );
             // Nothing was dispatched, so nothing was recorded or charged.
-            let t = totals(&exec_ctx).await;
+            let t = totals(&env).await;
             assert_eq!(t.priced_attempts, 0);
             assert_eq!(t.unresolved_attempts, 0);
         }
@@ -1338,11 +1312,12 @@ mod tests {
         repo: &Repo,
     ) -> (
         AgentConfig,
-        ExecutionContext,
+        TurnEnv,
+        Turn,
         ExecutionState,
         tempfile::TempDir,
     ) {
-        let (mut config, mut exec_ctx, state, tempdir) = fixture(
+        let (mut config, mut env, turn, state, tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", None),
             None,
         )
@@ -1360,13 +1335,13 @@ mod tests {
                 &settings,
                 repo.cache.path().join("config"),
             );
-        exec_ctx.runtime = SessionRuntime::new(
+        env.runtime = SessionRuntime::new(
             Some(repo.dir.path().to_path_buf()),
             Default::default(),
             McpToolState::empty(),
         );
         // The task in progress and a successful index call before compaction.
-        let mut task = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        let mut task = AgentMessage::new(env.session_id.clone(), ChatRole::User);
         task.parts.push(MessagePart::Prompt {
             blocks: vec![crate::acp::protocol::ContentBlock::Text(
                 crate::acp::protocol::TextContent::new(
@@ -1374,8 +1349,8 @@ mod tests {
                 ),
             )],
         });
-        exec_ctx.session_handle.add_message(task).await.unwrap();
-        let mut indexed = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        env.session_handle.add_message(task).await.unwrap();
+        let mut indexed = AgentMessage::new(env.session_id.clone(), ChatRole::User);
         indexed.parts.push(MessagePart::ToolResult {
             call_id: "c1".into(),
             content: vec![querymt::chat::ToolResultPart::text("outline")],
@@ -1395,13 +1370,12 @@ mod tests {
                 "[repository-knowledge version=old epoch=0 card=src/queue.rs#old]\nSTALE-INDEX"
                     .into(),
         });
-        exec_ctx.session_handle.add_message(indexed).await.unwrap();
-        (config, exec_ctx, state, tempdir)
+        env.session_handle.add_message(indexed).await.unwrap();
+        (config, env, turn, state, tempdir)
     }
 
-    async fn stored_cards(exec_ctx: &ExecutionContext) -> Vec<String> {
-        exec_ctx
-            .session_handle
+    async fn stored_cards(env: &TurnEnv) -> Vec<String> {
+        env.session_handle
             .get_effective_agent_history()
             .await
             .unwrap()
@@ -1417,12 +1391,12 @@ mod tests {
     #[tokio::test]
     async fn compaction_redelivers_recent_cards_under_the_new_epoch_from_current_sources() {
         let repo = repo();
-        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
-        run_ai_compaction(&config, &mut exec_ctx, &state)
+        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
+        run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
 
-        let cards = stored_cards(&exec_ctx).await;
+        let cards = stored_cards(&env).await;
         // Bounded by the shared per-turn budget (two cards by default).
         assert!(!cards.is_empty() && cards.len() <= 2, "{cards:?}");
         assert!(cards.iter().all(|c| c.contains("epoch=1")), "{cards:?}");
@@ -1436,10 +1410,10 @@ mod tests {
     #[tokio::test]
     async fn changed_and_removed_documents_are_not_resurrected_from_old_payloads() {
         let repo = repo();
-        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
         // An old card for the note sits in pre-compaction history.
         let old = {
-            let mut m = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+            let mut m = AgentMessage::new(env.session_id.clone(), ChatRole::User);
             m.parts.push(MessagePart::HookContext {
                 event_name: "user_prompt_submit".into(),
                 handler_id: "qmt.repository_knowledge.orientation".into(),
@@ -1450,7 +1424,7 @@ mod tests {
             });
             m
         };
-        exec_ctx.session_handle.add_message(old).await.unwrap();
+        env.session_handle.add_message(old).await.unwrap();
         std::fs::write(
             repo.dir.path().join("docs/arch.md"),
             "# Architecture\n## Scheduling\nThe scheduler now uses a fair queue for dispatching tasks to workers.\n",
@@ -1458,10 +1432,10 @@ mod tests {
         .unwrap();
         std::fs::remove_file(repo.dir.path().join("src/AGENTS.md")).unwrap();
 
-        run_ai_compaction(&config, &mut exec_ctx, &state)
+        run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
-        let cards = stored_cards(&exec_ctx).await;
+        let cards = stored_cards(&env).await;
         assert!(cards.iter().all(|c| !c.contains("STALE-TEXT")), "{cards:?}");
         assert!(cards.iter().any(|c| c.contains("fair queue")), "{cards:?}");
         assert!(
@@ -1473,16 +1447,16 @@ mod tests {
     #[tokio::test]
     async fn retained_cards_are_not_duplicated_by_a_second_evaluation() {
         let repo = repo();
-        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
-        run_ai_compaction(&config, &mut exec_ctx, &state)
+        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
+        run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
-        let first = stored_cards(&exec_ctx).await;
+        let first = stored_cards(&env).await;
         assert!(!first.is_empty());
 
-        let before = exec_ctx.session_handle.get_agent_history().await.unwrap();
+        let before = env.session_handle.get_agent_history().await.unwrap();
         let again = crate::agent::repository_delivery::post_compaction_contexts(
-            &config, &exec_ctx, &before,
+            &config, &env, &mut turn, &before,
         )
         .await;
         assert!(
@@ -1507,14 +1481,15 @@ mod tests {
     #[tokio::test]
     async fn only_index_calls_that_received_a_native_card_are_re_evaluated() {
         let repo = repo();
-        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, _state, _td) = knowledge_fixture(&repo).await;
 
         // No persisted index-context card names this call (a foreign `index`
         // tool, or a result a hook suppressed): nothing is recovered for it.
         let unenriched = vec![index_call_result("foreign")];
         let none = crate::agent::repository_delivery::post_compaction_contexts(
             &config,
-            &exec_ctx,
+            &env,
+            &mut turn,
             &unenriched,
         )
         .await;
@@ -1530,7 +1505,8 @@ mod tests {
         });
         let some = crate::agent::repository_delivery::post_compaction_contexts(
             &config,
-            &exec_ctx,
+            &env,
+            &mut turn,
             &[enriched],
         )
         .await;
@@ -1541,7 +1517,7 @@ mod tests {
     async fn restore_counts_only_native_cards_and_reads_history_once() {
         use crate::knowledge::repository::budget::Refusal;
         let repo = repo();
-        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, _state, _td) = knowledge_fixture(&repo).await;
         let card = |handler: &str, id: &str| crate::hooks::HookContextContribution {
             event_name: "post_tool_use".into(),
             handler_id: handler.into(),
@@ -1550,7 +1526,7 @@ mod tests {
         };
         let stored = |handler: &str, id: &str| {
             let c = card(handler, id);
-            let mut m = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+            let mut m = AgentMessage::new(env.session_id.clone(), ChatRole::User);
             m.parts.push(MessagePart::HookContext {
                 event_name: c.event_name,
                 handler_id: c.handler_id,
@@ -1564,20 +1540,18 @@ mod tests {
             stored("user-hook", "imitated"),
             stored("qmt.repository_knowledge.orientation", "native"),
         ] {
-            exec_ctx.session_handle.add_message(m).await.unwrap();
+            env.session_handle.add_message(m).await.unwrap();
         }
 
-        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+        crate::agent::repository_delivery::restore_state(&config, &env, &mut turn).await;
         // History added after the first restore is not re-read.
-        exec_ctx
-            .session_handle
+        env.session_handle
             .add_message(stored("qmt.repository_knowledge.orientation", "late"))
             .await
             .unwrap();
-        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+        crate::agent::repository_delivery::restore_state(&config, &env, &mut turn).await;
 
-        let mut guard = exec_ctx.delivery_budget.lock().unwrap();
-        let budget = guard.as_mut().expect("restored");
+        let budget = turn.delivery_budget.as_mut().expect("restored");
         let native = "qmt.repository_knowledge.orientation";
         assert!(
             budget.admit(&card(native, "imitated")).is_ok(),
@@ -1595,14 +1569,14 @@ mod tests {
 
     #[tokio::test]
     async fn without_repository_knowledge_compaction_adds_no_context() {
-        let (config, mut exec_ctx, state, _td) = fixture(
+        let (config, env, mut turn, state, _td) = fixture(
             custom_summary_hooks("Valid continuation summary", None),
             None,
         )
         .await;
-        run_ai_compaction(&config, &mut exec_ctx, &state)
+        run_ai_compaction(&config, &env, &mut turn, &state)
             .await
             .unwrap();
-        assert!(stored_cards(&exec_ctx).await.is_empty());
+        assert!(stored_cards(&env).await.is_empty());
     }
 }

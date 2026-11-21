@@ -22,7 +22,6 @@ pub mod core;
 mod dispatch_coverage_tests;
 pub(crate) mod event_chunk;
 pub mod execution;
-pub mod execution_context;
 pub mod file_proxy;
 pub mod handle;
 pub(crate) mod load_telemetry;

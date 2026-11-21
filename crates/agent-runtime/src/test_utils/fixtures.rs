@@ -6,6 +6,7 @@
 
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::test_utils::helpers::empty_plugin_registry;
@@ -51,35 +52,32 @@ impl TestAgent {
         }
     }
 
-    pub(crate) async fn execution_context(
-        &self,
-    ) -> crate::agent::execution_context::ExecutionContext {
-        self.execution_context_with_mcp(crate::agent::core::McpToolState::empty())
+    /// A run over a new session: the read-only [`TurnEnv`] and the mutable
+    /// [`Turn`], built as `execute_prompt_inner` builds them.
+    pub(crate) async fn turn(&self) -> (TurnEnv, Turn) {
+        self.turn_with_mcp(crate::agent::core::McpToolState::empty())
             .await
     }
 
-    /// Like [`Self::execution_context`], with the given live MCP tool state.
-    pub(crate) async fn execution_context_with_mcp(
+    /// Like [`Self::turn`], with the given live MCP tool state.
+    pub(crate) async fn turn_with_mcp(
         &self,
         mcp_tool_state: Arc<crate::agent::core::McpToolState>,
-    ) -> crate::agent::execution_context::ExecutionContext {
-        self.execution_context_with(None, mcp_tool_state).await
+    ) -> (TurnEnv, Turn) {
+        self.turn_with(None, mcp_tool_state).await
     }
 
-    /// Like [`Self::execution_context`], rooted at `cwd`.
-    pub(crate) async fn execution_context_in(
-        &self,
-        cwd: std::path::PathBuf,
-    ) -> crate::agent::execution_context::ExecutionContext {
-        self.execution_context_with(Some(cwd), crate::agent::core::McpToolState::empty())
+    /// Like [`Self::turn`], rooted at `cwd`.
+    pub(crate) async fn turn_in(&self, cwd: std::path::PathBuf) -> (TurnEnv, Turn) {
+        self.turn_with(Some(cwd), crate::agent::core::McpToolState::empty())
             .await
     }
 
-    async fn execution_context_with(
+    async fn turn_with(
         &self,
         cwd: Option<std::path::PathBuf>,
         mcp_tool_state: Arc<crate::agent::core::McpToolState>,
-    ) -> crate::agent::execution_context::ExecutionContext {
+    ) -> (TurnEnv, Turn) {
         let session_handle = self
             .config
             .provider
@@ -95,14 +93,7 @@ impl TestAgent {
         .unwrap();
         let runtime =
             crate::agent::core::SessionRuntime::new(cwd, Default::default(), mcp_tool_state);
-        crate::agent::execution_context::ExecutionContext::new(
-            session_id,
-            querymt_agent_core::model::TurnId::new(),
-            runtime,
-            state,
-            session_handle,
-            Default::default(),
-        )
+        turn_parts(&self.config, session_handle, runtime, state).await
     }
 
     /// Minimal agent with in-memory SQLite, no event observer.
@@ -186,5 +177,53 @@ impl TestAgent {
             .await
             .expect("create session")
             .public_id
+    }
+}
+
+/// The read-only [`TurnEnv`] and mutable [`Turn`] of a run over `session_handle`,
+/// with the defaults of an interactive build-mode run: no steering, no phase
+/// reporter, no knowledge store, a fresh cancellation token and cycle accounting.
+pub(crate) async fn turn_parts(
+    config: &crate::agent::agent_config::AgentConfig,
+    session_handle: crate::session::provider::SessionHandle,
+    runtime: Arc<crate::agent::core::SessionRuntime>,
+    state: crate::session::runtime::RuntimeContext,
+) -> (TurnEnv, Turn) {
+    let session_id = session_handle.session().public_id.clone();
+    let cycle_accounting = querymt_agent_services::accounting::CycleAccounting::begin(
+        runtime
+            .accounting(&session_id, &config.event_sink)
+            .await
+            .unwrap(),
+    );
+    let tool_config = crate::agent::core::ToolConfig::default();
+    let tool_set = TurnEnv::build_tool_set(config, &runtime, &tool_config);
+    let env = TurnEnv {
+        session_id,
+        turn_id: querymt_agent_core::model::TurnId::new(),
+        runtime,
+        session_handle,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tool_config,
+        execution_origin: crate::agent::execution::ExecutionOrigin::Interactive,
+        knowledge_store: None,
+        repository_knowledge: None,
+        event_sink: None,
+        workspace_query_bridge: None,
+        turn_mode: crate::agent::core::AgentMode::Build,
+        steering: None,
+        phase_reporter: None,
+        cycle_accounting,
+        tool_set,
+    };
+    (env, Turn::new(state))
+}
+
+impl TurnEnv {
+    /// This env with its tool set built from `config`, for tests that run a
+    /// step under a config other than the one the fixture was created with.
+    pub(crate) fn tools_from(mut self, config: &crate::agent::agent_config::AgentConfig) -> Self {
+        self.tool_set = Self::build_tool_set(config, &self.runtime, &self.tool_config);
+        self
     }
 }

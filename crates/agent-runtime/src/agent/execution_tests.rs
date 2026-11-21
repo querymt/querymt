@@ -20,7 +20,7 @@ use crate::acp::protocol::{ContentBlock, ImageContent, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::provider::SessionHandle;
@@ -39,7 +39,10 @@ use querymt_agent_core::events::AgentEventKind;
 struct TestHarness {
     config: Arc<AgentConfig>,
     session_id: String,
-    exec_ctx: ExecutionContext,
+    env: TurnEnv,
+    turn: Turn,
+    /// The config `env`'s tool set and accounting were built from.
+    env_config: Arc<AgentConfig>,
     provider: Arc<Mutex<MockLlmProvider>>,
     stored_messages: Arc<StdMutex<Vec<querymt_agent_core::model::AgentMessage>>>,
     history_writes: Arc<AtomicUsize>,
@@ -207,19 +210,15 @@ impl TestHarness {
             crate::agent::core::McpToolState::empty(),
         );
 
-        let exec_ctx = ExecutionContext::new(
-            session_id.clone(),
-            querymt_agent_core::model::TurnId::new(),
-            session_runtime,
-            runtime_context,
-            context,
-            crate::agent::core::ToolConfig::default(),
-        );
+        let (env, turn) =
+            crate::test_utils::turn_parts(&config, context, session_runtime, runtime_context).await;
 
         Self {
+            env_config: config.clone(),
             config,
             session_id,
-            exec_ctx,
+            env,
+            turn,
             provider,
             stored_messages,
             history_writes,
@@ -227,10 +226,30 @@ impl TestHarness {
         }
     }
 
+    /// Rebuild what `env` derives from the config (tool set, accounting) when
+    /// a test replaced the config after the harness was built.
+    async fn refresh_env(&mut self) {
+        if Arc::ptr_eq(&self.env_config, &self.config) {
+            return;
+        }
+        self.env.tool_set =
+            TurnEnv::build_tool_set(&self.config, &self.env.runtime, &self.env.tool_config);
+        self.env.cycle_accounting = querymt_agent_services::accounting::CycleAccounting::begin(
+            self.config
+                .event_sink
+                .session_accounting(&self.env.session_id)
+                .await
+                .expect("session accounting"),
+        );
+        self.env_config = self.config.clone();
+    }
+
     async fn run(&mut self) -> CycleOutcome {
+        self.refresh_env().await;
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
-            &mut self.exec_ctx,
+            &self.env,
+            &mut self.turn,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -263,7 +282,7 @@ impl TestHarness {
             builder = builder.with_hooks(hooks);
         }
         self.config = Arc::new(builder.build());
-        self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
+        self.env.tool_config.policy = ToolPolicy::BuiltInOnly;
     }
 
     fn enable_task_completion_guard(&mut self, enabled: bool) {
@@ -304,7 +323,7 @@ impl TestHarness {
 
     fn set_task(&mut self, status: TaskStatus, kind: TaskKind) {
         let now = OffsetDateTime::now_utc();
-        self.exec_ctx.state.active_task = Some(Task {
+        self.turn.state.active_task = Some(Task {
             id: 1,
             public_id: "task-1".to_string(),
             session_id: 1,
@@ -1064,7 +1083,7 @@ async fn invalid_steering_conversion_does_not_persist_history() {
         )
         .await
         .expect("direct inbox insertion bypasses admission validation");
-    harness.exec_ctx = harness.exec_ctx.with_steering(inbox);
+    harness.env.steering = Some(inbox);
     let context = Arc::new(crate::middleware::ConversationContext::new(
         Arc::from(harness.session_id.as_str()),
         Arc::from([]),
@@ -1075,7 +1094,8 @@ async fn invalid_steering_conversion_does_not_persist_history() {
 
     let result = crate::agent::execution::apply_pending_steering(
         &harness.config,
-        &mut harness.exec_ctx,
+        &harness.env,
+        &mut harness.turn,
         &context,
         "test",
         false,
@@ -1951,7 +1971,7 @@ async fn test_cancel_before_llm_call() {
         .return_const(None)
         .times(0..);
 
-    harness.exec_ctx.cancellation_token.cancel();
+    harness.env.cancellation_token.cancel();
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Cancelled);
@@ -1975,7 +1995,8 @@ async fn test_llm_error_returns_err() {
 
     let result = crate::agent::execution::execute_cycle_state_machine(
         &harness.config,
-        &mut harness.exec_ctx,
+        &harness.env,
+        &mut harness.turn,
         crate::agent::core::AgentMode::Build,
     )
     .await;
@@ -2721,8 +2742,8 @@ mod repository_delivery {
                 builder = builder.with_hooks(hooks);
             }
             self.config = Arc::new(builder.build());
-            self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
-            self.exec_ctx.runtime = crate::agent::core::SessionRuntime::new(
+            self.env.tool_config.policy = ToolPolicy::BuiltInOnly;
+            self.env.runtime = crate::agent::core::SessionRuntime::new(
                 Some(kb.repo.path().to_path_buf()),
                 HashMap::new(),
                 crate::agent::core::McpToolState::empty(),
@@ -2968,7 +2989,8 @@ mod repository_delivery {
         );
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             "the scheduler dispatches queued tasks to workers",
             &[],
         )
@@ -3010,7 +3032,8 @@ mod repository_delivery {
         );
         let oriented = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -3071,7 +3094,8 @@ mod repository_delivery {
         harness.with_repository_delivery(kb, &settings(false, true), Vec::new());
         crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -3133,16 +3157,18 @@ mod repository_delivery {
         // persisted history is unchanged, so the next turn delivers it again.
         let a = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
         .await;
         assert_eq!(a.len(), 1);
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None;
+        harness.turn.delivery_budget = None;
         let b = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -3354,7 +3380,7 @@ mod repository_delivery {
             &settings(true, true),
             vec![Arc::new(crate::tools::builtins::IndexTool::new())],
         );
-        let tools_before = harness.exec_ctx.tool_config.clone();
+        let tools_before = harness.env.tool_config.clone();
         let calls = vec![mock_querymt_tool_call(
             "call-1",
             "index",
@@ -3372,7 +3398,7 @@ mod repository_delivery {
         assert_eq!(out.contexts[0].0, INDEX_CONTEXT_HANDLER_ID);
 
         // Permissions, allow/deny lists and the system prompt are unchanged.
-        let after = &harness.exec_ctx.tool_config;
+        let after = &harness.env.tool_config;
         assert_eq!(after.allow, tools_before.allow);
         assert_eq!(after.deny, tools_before.deny);
         assert!(!crate::knowledge::repository::policy::RETRIEVAL_POLICY.contains(hostile));
@@ -3424,7 +3450,7 @@ mod repository_delivery {
             vec![Arc::new(crate::tools::builtins::IndexTool::new())],
         );
         harness
-            .exec_ctx
+            .env
             .tool_config
             .deny
             .insert(crate::config::ToolRef::builtin("index"));
@@ -3480,7 +3506,8 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3493,17 +3520,18 @@ mod repository_delivery {
         // The feature registers the retrieval tool, so the card may name it.
         assert!(cards[0].content.contains("repo_knowledge_get id="));
 
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None; // new turn
+        harness.turn.delivery_budget = None; // new turn
         // When session policy denies the tool, citations stay but no
         // unavailable call is suggested.
         harness
-            .exec_ctx
+            .env
             .tool_config
             .deny
             .insert(crate::config::ToolRef::builtin("repo_knowledge_get"));
         let denied = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3511,14 +3539,15 @@ mod repository_delivery {
         assert_eq!(denied.len(), 1);
         assert!(!denied[0].content.contains("repo_knowledge_get"));
         assert!(denied[0].content.contains("docs/arch.md"));
-        harness.exec_ctx.tool_config.deny = crate::config::ToolSet::new();
+        harness.env.tool_config.deny = crate::config::ToolSet::new();
 
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None; // new turn
+        harness.turn.delivery_budget = None; // new turn
         // A card already present (e.g. from a command-hook wrapper) is not
         // delivered again.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             prompt,
             &cards,
         )
@@ -3530,7 +3559,8 @@ mod repository_delivery {
         assert!(
             crate::agent::repository_delivery::orientation_contexts(
                 &harness.config,
-                &harness.exec_ctx,
+                &harness.env,
+                &mut harness.turn,
                 prompt,
                 &[],
             )
@@ -3551,7 +3581,8 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3577,7 +3608,8 @@ mod repository_delivery {
         // Same turn, same card again: matched and suppressed, not delivered.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env,
+            &mut harness.turn,
             prompt,
             &[],
         )
