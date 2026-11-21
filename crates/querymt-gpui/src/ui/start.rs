@@ -13,6 +13,7 @@ use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
 use super::{Page, QmtApp, kit};
+use crate::store::launch::WorktreeMode;
 use crate::store::{
     Attachment, ConnState, DEFAULT_PROFILE, LAUNCH_MODES, LAUNCH_REASONING, Model, SessionSummary,
 };
@@ -755,14 +756,45 @@ impl QmtApp {
             .filter_map(|id| store.config(id).map(|c| (id.clone(), c.name.clone())))
             .collect();
         // Like the desktop Options button: name a non-default profile next to it.
-        let profile_summary = agent.as_deref().and_then(|a| {
-            let id = store.launch_profile(a);
+        // Like the desktop Options button: name what is not the default
+        // (peer, worktree, profile) next to it.
+        let target_label = agent.as_deref().and_then(|a| {
+            let node = store.launch.target.as_ref()?;
             store
-                .profiles(a)
-                .iter()
-                .find(|p| p.id == id && id != DEFAULT_PROFILE)
-                .map(|p| p.name.clone())
+                .launch_targets(a)
+                .into_iter()
+                .find(|t| t.node_id.as_ref() == Some(node))
+                .map(|t| t.label)
         });
+        let profile_summary = {
+            let profile = agent.as_deref().and_then(|a| {
+                if let Some(node) = &store.launch.target {
+                    let id = store.launch.remote_profile.as_ref()?;
+                    return Some(
+                        store
+                            .peer_profiles(a, node)
+                            .and_then(|p| p.profiles.iter().find(|p| &p.id == id))
+                            .map_or_else(|| id.clone(), |p| p.name.clone()),
+                    );
+                }
+                let id = store.launch_profile(a);
+                store
+                    .profiles(a)
+                    .iter()
+                    .find(|p| p.id == id && id != DEFAULT_PROFILE)
+                    .map(|p| p.name.clone())
+            });
+            let worktree = agent
+                .as_deref()
+                .map(|a| store.launch_worktree(a))
+                .filter(|m| *m != WorktreeMode::Local)
+                .map(|m| m.label().to_string());
+            let parts: Vec<String> = [target_label.clone(), worktree, profile]
+                .into_iter()
+                .flatten()
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        };
 
         let sessions = store.all_sessions();
         let running = sessions.iter().filter(|s| s.root && s.running()).count();
@@ -891,7 +923,7 @@ impl QmtApp {
             .child("Options")
             .children(profile_summary.map(|name| {
                 div()
-                    .max_w(px(140.))
+                    .max_w(px(220.))
                     .truncate()
                     .text_xs()
                     .text_color(p.dim)
@@ -902,8 +934,18 @@ impl QmtApp {
                 if this.dismissed.closed_by(START_OPTIONS, ev) {
                     return;
                 }
-                this.close_profile_menu(window, cx);
+                this.close_option_menu(window, cx);
                 this.options_open = !this.options_open;
+                // A peer chosen before a reconnect: list its profiles again.
+                let store = this.store.read(cx);
+                if this.options_open
+                    && let Some(agent) = store.primary_agent()
+                    && let Some(node) = store.launch.target.clone()
+                    && store.peer_profiles(&agent, &node).is_none()
+                {
+                    this.store
+                        .update(cx, |s, cx| s.load_peer_profiles(&agent, &node, cx));
+                }
                 cx.notify();
             }));
         let options = div()
@@ -929,80 +971,90 @@ impl QmtApp {
 
         let attachments = self.attachment_strip(false, &p, cx).map(|s| s.pt_1p5());
 
-        let composer = v_flex()
-            .w_full()
-            .p_3()
-            .gap_2()
-            .rounded(px(14.))
-            .bg(p.surface)
-            .border_1()
-            .border_color(p.border)
-            .shadow_sm()
-            .child(self.workspace.clone())
-            .child(div().px_1().text_xs().text_color(p.dim).child(match &host {
-                Some(host) => format!("Use an absolute path on {host}, where the agent runs."),
-                None => "Use an absolute path on the machine where the agent runs.".to_string(),
-            }))
-            // Tab / Shift+Tab cycle the launch mode instead of indenting.
-            .child(
-                div()
-                    .min_h(px(96.))
-                    .px_1()
-                    .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                        let send = this.store.read(cx).prefs.send_shortcut;
-                        if send.submits(a.shift, a.secondary) {
-                            cx.stop_propagation();
-                            this.start_session(window, cx);
+        let composer =
+            v_flex()
+                .w_full()
+                .p_3()
+                .gap_2()
+                .rounded(px(14.))
+                .bg(p.surface)
+                .border_1()
+                .border_color(p.border)
+                .shadow_sm()
+                .child(self.workspace.clone())
+                .child(div().px_1().text_xs().text_color(p.dim).child(
+                    match (&target_label, &host) {
+                        (Some(peer), _) => {
+                            format!("Use an absolute path on {peer}, where the session will run.")
                         }
-                    }))
-                    .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
-                        cx.stop_propagation();
-                        this.cycle_launch_mode(false, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
-                        cx.stop_propagation();
-                        this.cycle_launch_mode(true, cx);
-                    }))
-                    .child(
-                        Textarea::new(&self.prompt)
-                            .appearance(false)
-                            .on_paste(self.paste_handler(false, cx)),
-                    ),
-            )
-            .children(attachments)
-            .when_some(self.attach_error.clone(), |el, err| {
-                el.child(
-                    h_flex()
-                        .gap_1p5()
-                        .text_xs()
-                        .text_color(p.danger)
-                        .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-                        .child(err),
+                        (None, Some(host)) => {
+                            format!("Use an absolute path on {host}, where the agent runs.")
+                        }
+                        (None, None) => {
+                            "Use an absolute path on the machine where the agent runs.".to_string()
+                        }
+                    },
+                ))
+                // Tab / Shift+Tab cycle the launch mode instead of indenting.
+                .child(
+                    div()
+                        .min_h(px(96.))
+                        .px_1()
+                        .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                            let send = this.store.read(cx).prefs.send_shortcut;
+                            if send.submits(a.shift, a.secondary) {
+                                cx.stop_propagation();
+                                this.start_session(window, cx);
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
+                            cx.stop_propagation();
+                            this.cycle_launch_mode(false, cx);
+                        }))
+                        .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
+                            cx.stop_propagation();
+                            this.cycle_launch_mode(true, cx);
+                        }))
+                        .child(
+                            Textarea::new(&self.prompt)
+                                .appearance(false)
+                                .on_paste(self.paste_handler(false, cx)),
+                        ),
                 )
-            })
-            .child(kit::divider(&p))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(plus)
-                    .child(model_button)
-                    .child(options)
-                    .child(div().flex_1())
-                    .child(
-                        kit::button("start")
-                            .primary()
-                            .w(px(120.))
-                            .when(!launch_busy, |button| button.icon(IconName::SendHorizontal))
-                            .label(if launch_busy { "Starting…" } else { "Start" })
-                            .map(|button| {
-                                kit::loading_button(button, "start-spinner", launch_busy, 16.)
-                            })
-                            .inactive(!can_start)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.start_session(window, cx)),
-                            ),
-                    ),
-            );
+                .children(attachments)
+                .when_some(self.attach_error.clone(), |el, err| {
+                    el.child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(p.danger)
+                            .child(kit::icon(IconName::CircleAlert, 13., p.danger))
+                            .child(err),
+                    )
+                })
+                .child(kit::divider(&p))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(plus)
+                        .child(model_button)
+                        .child(options)
+                        .child(div().flex_1())
+                        .child(
+                            kit::button("start")
+                                .primary()
+                                .w(px(120.))
+                                .when(!launch_busy, |button| button.icon(IconName::SendHorizontal))
+                                .label(if launch_busy { "Starting…" } else { "Start" })
+                                .map(|button| {
+                                    kit::loading_button(button, "start-spinner", launch_busy, 16.)
+                                })
+                                .inactive(!can_start)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_session(window, cx)
+                                })),
+                        ),
+                );
 
         let banner = launch_error.map(|err| {
             h_flex()
@@ -1244,6 +1296,9 @@ impl QmtApp {
             .collect();
 
         let profile_picker = self.profile_picker(p, cx);
+        let peer_note = self.peer_profiles_note(p, cx);
+        let target = self.target_picker(p, cx);
+        let worktree = self.worktree_section(agent, p, cx);
 
         v_flex()
             .id("options-panel")
@@ -1260,12 +1315,14 @@ impl QmtApp {
             .shadow_lg()
             .occlude()
             .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                // The profile menu overhangs the panel: a click in it is not outside.
-                if this.profile_menu_open && this.profile_menu_bounds.get().contains(&ev.position) {
+                // A select menu overhangs the panel: a click in it is not outside.
+                if this.option_menu.is_some()
+                    && this.profile_menu_bounds.get().contains(&ev.position)
+                {
                     return;
                 }
                 this.dismissed.record(START_OPTIONS, ev);
-                this.close_profile_menu(window, cx);
+                this.close_option_menu(window, cx);
                 this.options_open = false;
                 cx.notify();
             }))
@@ -1281,6 +1338,17 @@ impl QmtApp {
                 el.child(div().pt_1().child(kit::divider(p)))
                     .child(section("Profile"))
                     .child(picker)
+                    .children(peer_note)
+            })
+            .when_some(target, |el, target| {
+                el.child(div().pt_1().child(kit::divider(p)))
+                    .child(section("Target"))
+                    .child(target)
+            })
+            .when_some(worktree, |el, worktree| {
+                el.child(div().pt_1().child(kit::divider(p)))
+                    .child(section("Workspace"))
+                    .child(worktree)
             })
             .when(agents.len() > 1, |el| {
                 el.child(div().pt_1().child(kit::divider(p)))
@@ -1300,6 +1368,45 @@ impl QmtApp {
                             }))
                     })))
             })
+    }
+
+    /// Checkout or a new git worktree (desktop Workspace), for a local
+    /// target on an agent with managed worktrees.
+    fn worktree_section(
+        &self,
+        agent: Option<&str>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let store = self.store.read(cx);
+        let agent = agent?;
+        if !store.can_use_worktree(agent) {
+            return None;
+        }
+        let current = store.launch_worktree(agent);
+        let segments = WorktreeMode::ALL
+            .iter()
+            .enumerate()
+            .map(|(ix, (mode, label, _))| {
+                let mode = *mode;
+                kit::segment(("opt-worktree", ix), current == mode, p)
+                    .flex_1()
+                    .label(*label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .update(cx, |s, cx| s.set_launch_worktree(mode, cx))
+                    }))
+            });
+        let description = WorktreeMode::ALL
+            .iter()
+            .find(|(m, ..)| *m == current)
+            .map_or("", |(.., d)| d);
+        Some(
+            v_flex()
+                .gap_2()
+                .child(kit::segment_bar(p).children(segments))
+                .child(div().text_xs().text_color(p.muted).child(description)),
+        )
     }
 
     /// The picker's rows: "Recent", then models grouped by provider (and
@@ -1799,5 +1906,71 @@ mod tests {
         );
         assert!(errors[0].contains("10 MiB"));
         assert!(errors[1].contains("20 MiB total"));
+    }
+}
+
+#[cfg(test)]
+mod launch_option_tests {
+    use super::{Page, QmtApp};
+    use crate::store::launch::WorktreeMode;
+
+    #[gpui_kit::test]
+    fn options_offer_target_worktree_and_peer_profiles(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| crate::store::launch::peer_fixture());
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Start, cx);
+                app.options_open = true;
+            });
+            window.render_frame(cx);
+            app.update(cx, |app, cx| {
+                let p = *crate::theme::palette(cx);
+                assert!(app.worktree_section(Some("test-agent"), &p, cx).is_some());
+                app.store.update(cx, |s, cx| {
+                    s.set_launch_worktree(WorktreeMode::Worktree, cx)
+                });
+            });
+            // Target is a searchable select: open it, search, Enter picks.
+            // (Its trigger is an app button, which the test observer does not
+            // register; open it as the click does.)
+            app.update(cx, |app, cx| {
+                app.open_option_menu(super::super::profile_select::OptionMenu::Target, window, cx)
+            });
+            window.render_frame(cx);
+            app.update(cx, |app, cx| {
+                assert!(app.option_menu.is_some());
+                app.profile_query
+                    .update(cx, |s, cx| s.set_value("tho", window, cx));
+            });
+            window.render_frame(cx);
+            app.update(cx, |app, cx| app.pick_option_at_cursor(window, cx));
+            window.render_frame(cx);
+            app.update(cx, |app, cx| {
+                assert!(app.option_menu.is_none());
+                assert_eq!(app.store.read(cx).launch.target.as_deref(), Some("thor-id"));
+            });
+            app.update(cx, |app, cx| {
+                let p = *crate::theme::palette(cx);
+                // A peer: no worktrees, and its own profiles.
+                assert!(app.worktree_section(Some("test-agent"), &p, cx).is_none());
+                let store = app.store.read(cx);
+                assert_eq!(store.launch_worktree("test-agent"), WorktreeMode::Local);
+                assert!(store.peer_profiles("test-agent", "thor-id").is_some());
+            });
+        })
+        .unwrap();
     }
 }

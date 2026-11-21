@@ -5,6 +5,7 @@
 //! those two pages. Views observe the entity and re-render on `cx.notify()`.
 
 pub(crate) mod automations;
+pub(crate) mod launch;
 pub(crate) mod setup;
 
 use std::{collections::HashMap, rc::Rc, time::Duration};
@@ -497,12 +498,22 @@ pub struct ProviderAuth {
 pub const DEFAULT_PROFILE: &str = "default";
 
 /// `session/new` params; a non-default profile goes in `_meta.querymt.profile_id`.
-fn new_session_params(cwd: &str, profile: &str) -> Value {
-    let mut params = json!({ "cwd": cwd, "mcpServers": [] });
-    if profile != DEFAULT_PROFILE {
-        params["_meta"] = json!({ "querymt": { "profile_id": profile } });
-    }
-    params
+/// Profiles of a `_querymt/profiles` response.
+fn parse_profiles(v: &Value) -> Vec<Profile> {
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    v.get("profiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let id = text(p, "id")?;
+            Some(Profile {
+                name: text(p, "name").unwrap_or_else(|| id.clone()),
+                id,
+                description: text(p, "description").unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1109,6 +1120,10 @@ pub struct AgentRuntime {
     pub agent_title: Option<String>,
     pub agent_version: Option<String>,
     pub capabilities: Option<Value>,
+    /// Managed git worktrees, when `initialize` advertises them.
+    pub worktrees: Option<launch::WorktreeSupport>,
+    /// Profiles of mesh peers, loaded when one is chosen as launch target.
+    pub peer_profiles: launch::PeerProfileMap,
     pub models: Vec<Model>,
     pub sessions: Vec<SessionSummary>,
     pub sessions_loaded: bool,
@@ -1565,6 +1580,12 @@ pub struct LaunchState {
     pub busy: bool,
     pub error: Option<String>,
     pub last_started: Option<String>,
+    /// Mesh peer the next session runs on; `None`: the agent's machine.
+    pub target: Option<String>,
+    /// Worktree placement of the next local session.
+    pub worktree: launch::WorktreeMode,
+    /// Profile on the target peer; `None`: the peer's active profile.
+    pub remote_profile: Option<String>,
 }
 
 pub struct AgentsStore {
@@ -2611,6 +2632,8 @@ impl AgentsStore {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 rt.agent_version = info.and_then(|i| i.get("version")).and_then(Value::as_str).map(str::to_owned);
+                rt.worktrees = launch::worktree_support(&init);
+                rt.peer_profiles.clear();
                 rt.can_delete_sessions = init
                     .pointer("/agentCapabilities/sessionCapabilities/delete")
                     .is_some_and(|d| !d.is_null() && d.as_bool() != Some(false));
@@ -2696,15 +2719,38 @@ impl AgentsStore {
             return;
         };
         let model = self.launch_model(agent_id).cloned();
-        let params = new_session_params(&cwd, self.launch_profile(agent_id));
+        // A mesh peer creates the session through the agent and owns it; this
+        // machine creates it with `session/new`, in a worktree when chosen.
+        let target = self.launch.target.clone();
+        let (method, params) = match &target {
+            Some(node) => (
+                "_querymt/remote/createSession",
+                launch::remote_session_params(node, &cwd, self.launch.remote_profile.as_deref()),
+            ),
+            None => (
+                "session/new",
+                launch::new_session_params(
+                    &cwd,
+                    self.launch_profile(agent_id),
+                    self.launch_worktree(agent_id),
+                ),
+            ),
+        };
+        let remote = target.as_ref().map(|node| RemoteOwner {
+            node_id: node.clone(),
+            label: self
+                .launch_targets(agent_id)
+                .into_iter()
+                .find(|t| t.node_id.as_ref() == Some(node))
+                .map(|t| t.label),
+            connected: true,
+        });
         let image_mode = self.prefs.image_send_mode;
         let mode = self.prefs.mode().to_string();
         let reasoning = self.prefs.reasoning().to_string();
-        self.launch = LaunchState {
-            busy: true,
-            error: None,
-            last_started: None,
-        };
+        self.launch.busy = true;
+        self.launch.error = None;
+        self.launch.last_started = None;
         self.session = None;
         self.set_cwd(cwd.clone());
         cx.notify();
@@ -2712,12 +2758,15 @@ impl AgentsStore {
         let agent_id = agent_id.to_string();
         self._launch_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<String, String> = async {
-                let created = rpc.request("session/new", params).await?;
+                let created = rpc.request(method, params).await?;
                 let session_id = created
                     .get("sessionId")
+                    .or_else(|| created.get("session_id"))
                     .and_then(Value::as_str)
                     .ok_or("Agent did not return a session id.")?
                     .to_string();
+                // A worktree session runs in its checkout, not the folder.
+                let cwd = launch::session_cwd(&created).unwrap_or(cwd);
                 let log = |msg: String, cx: &mut AsyncApp| {
                     let agent_id = agent_id.clone();
                     let _ = this.update(cx, |s, _| {
@@ -2728,6 +2777,9 @@ impl AgentsStore {
                 };
                 // Order matters: mode → model → reasoning (the model can change reasoning choices).
                 let mut options = config_options(&created);
+                if let Some(list) = created.get("config_options").and_then(Value::as_array) {
+                    options = list.clone();
+                }
                 match find_option(&options, &["mode"]) {
                     Some((id, values)) if values.iter().any(|v| v == &mode) => {
                         let params = json!({ "sessionId": session_id, "configId": id, "value": mode });
@@ -2816,6 +2868,7 @@ impl AgentsStore {
                                 open: true,
                                 lifecycle_known: true,
                                 messages: 1,
+                                remote: remote.clone(),
                                 ..Default::default()
                             },
                         );
@@ -5078,20 +5131,7 @@ async fn load_extras(
                     .collect();
             }
             if let Ok(v) = profiles {
-                rt.profiles = v
-                    .get("profiles")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| {
-                        let id = text(p, "id")?;
-                        Some(Profile {
-                            name: text(p, "name").unwrap_or_else(|| id.clone()),
-                            id,
-                            description: text(p, "description").unwrap_or_default(),
-                        })
-                    })
-                    .collect();
+                rt.profiles = parse_profiles(&v);
             }
         }),
         cx,
@@ -5162,9 +5202,10 @@ mod tests {
 
     #[test]
     fn new_session_params_send_only_non_default_profiles() {
-        let plain = new_session_params("/w", DEFAULT_PROFILE);
+        use launch::{WorktreeMode, new_session_params};
+        let plain = new_session_params("/w", DEFAULT_PROFILE, WorktreeMode::Local);
         assert_eq!(plain, json!({ "cwd": "/w", "mcpServers": [] }));
-        let bound = new_session_params("/w", "review");
+        let bound = new_session_params("/w", "review", WorktreeMode::Local);
         assert_eq!(
             bound.pointer("/_meta/querymt/profile_id"),
             Some(&json!("review"))

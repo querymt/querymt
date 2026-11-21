@@ -371,7 +371,14 @@ async fn create(
         ScheduleTarget::Session { id, .. } => (id.clone(), false),
         ScheduleTarget::Workspace(path) => {
             let result = rpc
-                .request("session/new", super::new_session_params(path, profile))
+                .request(
+                    "session/new",
+                    super::launch::new_session_params(
+                        path,
+                        profile,
+                        super::launch::WorktreeMode::Local,
+                    ),
+                )
                 .await
                 .map_err(|err| format!("Could not create the background session: {err}"))?;
             let id = result

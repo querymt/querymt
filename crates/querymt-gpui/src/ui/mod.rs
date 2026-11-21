@@ -308,15 +308,16 @@ pub struct QmtApp {
     /// Command palette (Ctrl/Cmd+P).
     palette: Entity<CommandState>,
     palette_open: bool,
-    /// Profile select of the Start Options: menu, search, highlighted row.
-    profile_menu_open: bool,
+    /// Selects of the Start Options (Profile, Target): the open one, its
+    /// search and highlighted row (one menu is open at a time).
+    option_menu: Option<profile_select::OptionMenu>,
     profile_query: Entity<InputState>,
     profile_cursor: usize,
     profile_scroll: ScrollHandle,
-    /// Last painted trigger bounds and window height, to place the menu.
-    profile_trigger: Bounds<Pixels>,
+    /// Last painted trigger bounds per select and window height, to place the menu.
+    option_triggers: [Bounds<Pixels>; 2],
     profile_viewport_h: Pixels,
-    /// Where the open profile menu was placed (it overhangs the Options panel).
+    /// Where the open select menu was placed (it overhangs the Options panel).
     profile_menu_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Popovers just closed by an outside mouse down, so their triggers toggle.
     dismissed: kit::Dismissed,
@@ -432,7 +433,7 @@ impl QmtApp {
             &profile_query,
             window,
             |this, _, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => this.pick_profile_at_cursor(window, cx),
+                InputEvent::PressEnter { .. } => this.pick_option_at_cursor(window, cx),
                 InputEvent::Change => {
                     this.profile_cursor = 0;
                     this.profile_scroll.scroll_to_item(0);
@@ -525,11 +526,11 @@ impl QmtApp {
             app_focus,
             palette,
             palette_open: false,
-            profile_menu_open: false,
+            option_menu: None,
             profile_query,
             profile_cursor: 0,
             profile_scroll: ScrollHandle::new(),
-            profile_trigger: Bounds::default(),
+            option_triggers: Default::default(),
             profile_viewport_h: px(0.),
             profile_menu_bounds: Default::default(),
             dismissed: kit::Dismissed::default(),

@@ -269,23 +269,40 @@ impl WorkspaceField {
     /// The agent's machine is this one, so its paths can be completed from
     /// the local filesystem.
     fn local_fs(&self, cx: &App) -> bool {
-        local_fs(self.store.read(cx), self.agent.as_deref())
+        self.peer(cx).is_none() && local_fs(self.store.read(cx), self.agent.as_deref())
+    }
+
+    /// The mesh peer the Start composer launches on: its paths come from its
+    /// sessions, not this machine. Dialog fields always mean the agent.
+    fn peer<'a>(&self, cx: &'a App) -> Option<&'a str> {
+        (!self.dialog)
+            .then(|| self.store.read(cx).launch.target.as_deref())
+            .flatten()
     }
 
     /// The last workspace used, saved workspaces, then those of the session
-    /// list (local sessions, most recent first).
+    /// list (local sessions, most recent first). For a mesh peer: the
+    /// workspaces of its sessions only.
     fn known_workspaces(&self, cx: &App) -> Vec<String> {
         let store = self.store.read(cx);
+        let peer = self.peer(cx);
         let mut sessions: Vec<_> = store
             .all_sessions()
             .into_iter()
-            .filter(|s| s.remote.is_none())
+            .filter(|s| s.remote.as_ref().map(|r| r.node_id.as_str()) == peer)
             .filter(|s| self.agent.as_ref().is_none_or(|a| &s.agent_id == a))
             .collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let mut out: Vec<String> = Vec::new();
-        for w in std::iter::once(store.prefs.cwd.as_str())
-            .chain(store.prefs.workspaces.iter().map(String::as_str))
+        let own: Vec<&str> = if peer.is_some() {
+            Vec::new()
+        } else {
+            std::iter::once(store.prefs.cwd.as_str())
+                .chain(store.prefs.workspaces.iter().map(String::as_str))
+                .collect()
+        };
+        for w in own
+            .into_iter()
             .chain(sessions.iter().map(|s| s.group_cwd()))
         {
             if !w.trim().is_empty() && !out.iter().any(|o| o == w) {
