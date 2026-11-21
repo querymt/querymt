@@ -2,8 +2,10 @@ use crate::agent::agent_config::AgentConfig;
 use crate::session::provider::ProviderRequest;
 use async_trait::async_trait;
 use querymt::LLMProvider;
+use querymt::chat::ChatCall;
 #[cfg(any(test, feature = "test-support"))]
 use querymt_remote::ProviderHostActor;
+use querymt_remote::peer_access::quota::QuotaStore;
 use querymt_remote::{
     ProviderBuildRequest, RemoteProviderBackend, RemoteProviderHostError,
     params_for_remote_provider,
@@ -147,183 +149,24 @@ fn text_stream_bound(limit: Option<i64>, call: &ChatCall<'_>, streaming: bool) -
 }
 
 /// Wraps a single pinned host binding, never the shared provider cache.
-pub(crate) struct HostedProvider {
+pub(crate) fn hosted_provider(
     inner: Arc<dyn LLMProvider>,
-    peer: Arc<crate::agent::session_actor::PeerTurn>,
-    store: Arc<dyn querymt_remote::peer_access::quota::QuotaStore>,
+    peer: &crate::agent::session_actor::PeerTurn,
+    store: Arc<dyn QuotaStore>,
     provider: String,
     model: String,
     text_stream_limit: Option<i64>,
+) -> querymt_remote::MeteredProvider {
+    querymt_remote::MeteredProvider::hosted(
+        inner,
+        store,
+        peer.key.clone(),
+        peer.revision,
+        peer.protocol,
+        (provider, model),
+        move |call, streaming| text_stream_bound(text_stream_limit, call, streaming),
+    )
 }
-
-use futures_util::StreamExt;
-use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream};
-use querymt::error::{LLMError, ProviderErrorKind, ProviderFailure};
-use querymt_remote::peer_access::quota::{
-    AttemptUsage, DispatchedAttempt, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore,
-    ReservedAttempt, StreamMeter,
-};
-
-impl HostedProvider {
-    pub(crate) fn new(
-        inner: Arc<dyn LLMProvider>,
-        peer: Arc<crate::agent::session_actor::PeerTurn>,
-        store: Arc<dyn QuotaStore>,
-        provider: String,
-        model: String,
-        text_stream_limit: Option<i64>,
-    ) -> Self {
-        Self {
-            inner,
-            peer,
-            store,
-            provider,
-            model,
-            text_stream_limit,
-        }
-    }
-
-    async fn check(&self) -> Result<(), LLMError> {
-        let grant = self
-            .peer
-            .grant()
-            .await
-            .map_err(|_| quota_failure(QuotaError::Denied))?;
-        if !grant.allows_model(self.peer.protocol, &self.provider, &self.model) {
-            return Err(quota_failure(QuotaError::Denied));
-        }
-        Ok(())
-    }
-
-    async fn begin(
-        &self,
-        call: &ChatCall<'_>,
-        streaming: bool,
-    ) -> Result<DispatchedAttempt, LLMError> {
-        self.check().await?;
-        let attempt = ReservedAttempt::reserve(
-            self.store.clone(),
-            QuotaAttempt {
-                peer: self.peer.key.clone(),
-                grant_revision: self.peer.revision,
-                protocol: self.peer.protocol,
-                provider_id: self.provider.clone(),
-                model_id: self.model.clone(),
-                request_id: uuid::Uuid::new_v4(),
-                bound_tokens: text_stream_bound(self.text_stream_limit, call, streaming),
-                now: time::OffsetDateTime::now_utc().unix_timestamp(),
-            },
-        )
-        .await
-        .map_err(quota_failure)?;
-        attempt.begin().await.map_err(quota_failure)
-    }
-}
-
-fn quota_failure(error: QuotaError) -> LLMError {
-    error.into_provider_error()
-}
-
-async fn settle_hosted(attempt: DispatchedAttempt, usage: AttemptUsage) -> Result<(), LLMError> {
-    if attempt.settle(usage).await.map_err(quota_failure)? == QuotaSettlement::BoundExceeded {
-        return Err(ProviderFailure::new(
-            ProviderErrorKind::UnknownPermanent,
-            "provider exceeded its enforced token bound",
-        )
-        .with_code(Some("mesh_quota_bound_exceeded".into()))
-        .into());
-    }
-    Ok(())
-}
-
-#[async_trait]
-impl ChatProvider for HostedProvider {
-    fn capabilities(&self) -> ChatCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
-        let attempt = self.begin(call, false).await?;
-        let output = self.inner.chat(call).await;
-        let usage = output
-            .as_ref()
-            .ok()
-            .and_then(|output| output.usage.as_ref())
-            .map_or(AttemptUsage::Unknown, AttemptUsage::from_usage);
-        settle_hosted(attempt, usage).await?;
-        self.check().await?;
-        output
-    }
-
-    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
-        let attempt = self.begin(call, true).await?;
-        let stream = match self.inner.chat_stream(call).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                settle_hosted(attempt, AttemptUsage::Unknown).await?;
-                return Err(error);
-            }
-        };
-        let peer = self.peer.clone();
-        let revoked = Box::pin(async move { peer.revoked().await });
-        Ok(Box::pin(futures_util::stream::try_unfold(
-            (stream, Some(attempt), StreamMeter::default(), revoked),
-            |(mut stream, mut attempt, mut meter, mut revoked)| async move {
-                let item = tokio::select! {
-                    biased;
-                    _ = &mut revoked => return Err(quota_failure(QuotaError::Denied)),
-                    item = stream.next() => item,
-                };
-                match item {
-                    Some(Ok(chunk)) => {
-                        meter.observe(&chunk);
-                        if meter.has_complete_usage()
-                            && let Some(attempt) = attempt.take()
-                        {
-                            settle_hosted(attempt, meter.complete_usage()).await?;
-                        }
-                        Ok(Some((chunk, (stream, attempt, meter, revoked))))
-                    }
-                    Some(Err(error)) => {
-                        if let Some(attempt) = attempt.take() {
-                            settle_hosted(attempt, meter.complete_usage()).await?;
-                        }
-                        Err(error)
-                    }
-                    None => {
-                        if let Some(attempt) = attempt.take() {
-                            settle_hosted(attempt, meter.complete_usage()).await?;
-                        }
-                        Ok(None)
-                    }
-                }
-            },
-        )))
-    }
-}
-
-#[async_trait]
-impl querymt::completion::CompletionProvider for HostedProvider {
-    async fn complete(
-        &self,
-        _: &querymt::completion::CompletionRequest,
-    ) -> Result<querymt::completion::CompletionResponse, LLMError> {
-        Err(LLMError::NotImplemented(
-            "hosted completion is not metered".into(),
-        ))
-    }
-}
-
-#[async_trait]
-impl querymt::embedding::EmbeddingProvider for HostedProvider {
-    async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "hosted embeddings are not metered".into(),
-        ))
-    }
-}
-
-impl LLMProvider for HostedProvider {}
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn provider_host_from_config(config: Arc<AgentConfig>) -> ProviderHostActor {
@@ -334,6 +177,10 @@ pub fn provider_host_from_config(config: Arc<AgentConfig>) -> ProviderHostActor 
 mod tests {
     use super::*;
     use crate::{agent::session_actor::PeerTurn, test_utils::MockLlmProvider};
+    use futures_util::StreamExt;
+    use querymt::chat::{ChatOutput, ChatProvider, ChatStream};
+    use querymt::error::LLMError;
+    use querymt_remote::peer_access::quota::{AttemptUsage, QuotaAttempt, ReservedAttempt};
     use querymt_remote::{
         NodeId,
         peer_access::{
@@ -462,9 +309,9 @@ mod tests {
 
         let peer = PeerTurn::test_peer(key.clone(), revision, store.clone());
         // No mock methods are configured: touching the provider would fail the test.
-        let provider = HostedProvider::new(
+        let provider = hosted_provider(
             Arc::new(MockLlmProvider::new()),
-            peer,
+            &peer,
             store.clone(),
             "fixture".into(),
             "model".into(),
@@ -520,10 +367,10 @@ mod tests {
         key: &PeerGrantKey,
         revision: Uuid,
         store: Arc<dyn QuotaStore>,
-    ) -> HostedProvider {
-        HostedProvider::new(
+    ) -> querymt_remote::MeteredProvider {
+        hosted_provider(
             Arc::new(ScriptedStream(std::sync::Mutex::new(Some(stream)))),
-            PeerTurn::test_peer(key.clone(), revision, store.clone()),
+            &PeerTurn::test_peer(key.clone(), revision, store.clone()),
             store,
             "fixture".into(),
             "model".into(),
@@ -691,6 +538,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_stream_drop_cancels_upstream_and_charges_bound() {
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let (upstream, dropped) = tokio::sync::oneshot::channel::<()>();
+        let stream = futures_util::stream::once(async move {
+            let _upstream = upstream;
+            std::future::pending().await
+        });
+        let provider = hosted_stream(Ok(Box::pin(stream)), &key, revision, store.clone());
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        assert!(futures_util::poll!(stream.next()).is_pending());
+        assert_eq!(
+            store
+                .quota(&key, &scope, now)
+                .await
+                .unwrap()
+                .reserved_tokens,
+            10
+        );
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .unwrap()
+            .unwrap_err();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = store.quota(&key, &scope, now).await.unwrap();
+                if status.reserved_tokens == 0 {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((status.known_tokens, status.estimated_tokens), (0, 10));
+    }
+
+    #[tokio::test]
     async fn hosted_stream_revocation_wakes_a_pending_read_and_charges_bound() {
         use querymt::chat::StreamChunk;
         use std::time::Duration;
@@ -728,7 +613,6 @@ mod tests {
             matches!(provider.chat_stream(&ChatCall::new(&[])).await, Err(LLMError::ProviderResponseError(failure)) if failure.code() == Some("mesh_access_denied"))
         );
 
-        // Dropping a dispatched attempt settles on a background task.
         let settled = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let status = store.quota(&key, &scope, now).await.unwrap();

@@ -23,6 +23,8 @@ pub mod mesh_runtime_config;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_runtime_support;
 pub mod mesh_state;
+mod metered_provider;
+pub use metered_provider::MeteredProvider;
 pub mod names;
 pub mod node_id;
 pub mod peer_access;

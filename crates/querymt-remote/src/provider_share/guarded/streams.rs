@@ -1,11 +1,10 @@
 //! Peer-owned provider streams. The legacy actor remains separate: its local
 //! controls and unauthenticated wire handlers cannot address these streams.
 
-use super::{
-    GuardedProvider, enforce_settlement, failure, quota_error, validate_item_aware_request,
-};
+use super::{GuardedProvider, failure, policy_error, quota_error, validate_item_aware_request};
 use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
-use crate::peer_access::quota::{QuotaError, ReservedAttempt, StreamMeter};
+use crate::metered_provider::MeteredProvider;
+use crate::peer_access::quota::{QuotaError, ReservedAttempt};
 use crate::peer_access::{PeerGrantKey, SharingProtocol};
 use crate::request_timeout::ask_sharing_v1;
 use crate::{
@@ -26,10 +25,8 @@ use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const AUTH_INTERVAL: Duration = Duration::from_secs(1);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LEASE_SECS: u64 = 300;
-const MAX_STREAM_DURATION: Duration = Duration::from_secs(600);
 
 type StreamRequest = ProviderStreamRequest<RemoteActorRef<ProviderStreamRouterActor>>;
 
@@ -48,6 +45,7 @@ struct ActiveStream {
     started: Instant,
     state: Mutex<Progress>,
     cancel: CancellationToken,
+    lease_changed: tokio::sync::Notify,
 }
 
 struct Progress {
@@ -161,10 +159,11 @@ impl StreamService {
         let call = ChatCall::new(&msg.messages)
             .maybe_tools(msg.tools.as_deref())
             .options(msg.options.unwrap_or_default());
-        let (provider, reservation) = self
+        let provider = self
             .provider
-            .prepare_attempt(&peer, request, &call, id, true)
+            .prepare(&peer, request, &call, id, true)
             .await?;
+        let reservation = provider.reserve(&call, true).await.map_err(policy_error)?;
         let started = Instant::now();
         let active = Arc::new(ActiveStream {
             provider: msg.provider,
@@ -180,6 +179,7 @@ impl StreamService {
                 connected: true,
             }),
             cancel: CancellationToken::new(),
+            lease_changed: tokio::sync::Notify::new(),
         });
         let key = StreamKey {
             peer: peer.key().clone(),
@@ -278,6 +278,7 @@ impl StreamService {
             return Ok(false);
         }
         state.lease_expires = now + lease(msg.lease_ttl_secs);
+        stream.lease_changed.notify_one();
         Ok(true)
     }
 }
@@ -306,87 +307,86 @@ impl StreamRelay {
     }
 
     async fn watch(&self) -> RemoteProviderHostError {
-        loop {
-            let now = Instant::now();
-            if now >= self.active.state.lock().lease_expires
-                || now.duration_since(self.active.started) >= MAX_STREAM_DURATION
-            {
-                return RemoteProviderHostError::provider_chat(
-                    "chat_stream",
-                    &transport(
-                        TransportErrorKind::Timeout,
-                        "provider stream lease or deadline expired",
-                    ),
-                );
+        let access = match self.service.provider.access(
+            &self.peer,
+            &self.active.provider,
+            &self.active.model,
+        ) {
+            Ok(access) => access,
+            Err(error) => return error,
+        };
+        let lease = async {
+            loop {
+                let deadline = self.active.state.lock().lease_expires;
+                if Instant::now() >= deadline {
+                    return RemoteProviderHostError::provider_chat(
+                        "chat_stream",
+                        &transport(
+                            TransportErrorKind::Timeout,
+                            "provider stream lease or deadline expired",
+                        ),
+                    );
+                }
+                tokio::select! {
+                    _ = time::sleep_until(deadline) => {},
+                    _ = self.active.lease_changed.notified() => {},
+                }
             }
-            if let Err(error) = self.authorized().await {
-                return error;
-            }
-            time::sleep(AUTH_INTERVAL).await;
+        };
+        tokio::select! {
+            _ = self.active.cancel.cancelled() => cancelled(),
+            error = access.revocation() => policy_error(error),
+            error = lease => error,
         }
     }
 
     async fn run(
         self,
-        provider: Arc<dyn querymt::LLMProvider>,
+        provider: MeteredProvider,
         call: ChatCall<'_>,
-        reservation: ReservedAttempt,
+        mut reservation: ReservedAttempt,
     ) {
-        let mut meter = StreamMeter::default();
+        let settled = reservation.completion();
         let mut seq = 0;
-        let ready = if self.active.cancel.is_cancelled() {
-            Err(cancelled())
-        } else {
-            self.authorized().await
+        let outcome = tokio::select! {
+            biased;
+            error = self.watch() => Err(error),
+            result = async {
+                let stream = provider.stream_reserved(&call, reservation).await
+                    .map_err(|error| RemoteProviderHostError::provider_chat("chat_stream", &error))?;
+                self.forward(stream, &mut seq).await
+            } => result,
         };
-        let (outcome, settled) = match ready {
-            Err(error) => (Err(error), reservation.release().await.map_err(quota_error)),
-            Ok(()) => match reservation.begin().await {
-                Err(error) => (Err(quota_error(error)), Ok(())),
-                Ok(attempt) => {
-                    let outcome = tokio::select! {
-                        biased;
-                        _ = self.active.cancel.cancelled() => Err(cancelled()),
-                        error = self.watch() => Err(error),
-                        result = async {
-                            self.authorized().await?;
-                            let stream = provider.chat_stream(&call).await
-                                .map_err(|error| RemoteProviderHostError::provider_chat("chat_stream", &error))?;
-                            self.forward(stream, &mut meter, &mut seq).await
-                        } => result,
-                    };
-                    let settled = attempt
-                        .settle(meter.complete_usage())
-                        .await
-                        .map_err(quota_error)
-                        .and_then(enforce_settlement);
-                    (outcome, settled)
-                }
-            },
+        // An interrupted relay drops the metered stream (or its unopened
+        // reservation). Wait for that accounting before reporting the terminal.
+        let outcome = match (outcome, settled.await) {
+            (Ok(_), Err(error)) => Err(quota_error(QuotaError::Store(
+                crate::peer_access::GrantStoreError::Backend(Box::new(error)),
+            ))),
+            (outcome, _) => outcome,
         };
         self.service.active.lock().remove(&self.key);
-        let (terminal, seq) = match (outcome, settled) {
-            (_, Err(error)) | (Err(error), _) => (
+        let (terminal, seq) = match outcome {
+            Err(error) => (
                 StreamRelayMessage::ProviderError {
                     error: error.to_payload(),
                 },
                 None,
             ),
-            (Ok(message), Ok(())) => (message, Some(seq)),
+            Ok(message) => (message, Some(seq)),
         };
         // Settlement is complete before terminal delivery. Retry delivery only,
         // never inference, and recheck the grant before every retransmission.
         if !matches!(
             time::timeout(
                 RELAY_TIMEOUT + self.reconnect_grace,
-                self.deliver(terminal, seq),
+                self.deliver(terminal, seq)
             )
             .await,
             Ok(Ok(()))
         ) && let Err(error) = self.authorized().await
         {
-            // Only an unsequenced denial can pass a held gap. No provider data
-            // or error details are sent after access changes.
+            // Only an unsequenced denial can pass a held gap.
             let _ = self
                 .send(
                     StreamRelayMessage::ProviderError {
@@ -401,7 +401,6 @@ impl StreamRelay {
     async fn forward(
         &self,
         mut stream: ChatStream,
-        meter: &mut StreamMeter,
         seq: &mut u64,
     ) -> Result<StreamRelayMessage, RemoteProviderHostError> {
         self.active.state.lock().phase = ProviderStreamPhase::WaitingFirstChunk;
@@ -423,7 +422,6 @@ impl StreamRelay {
             };
             match item {
                 Some(Ok(chunk)) => {
-                    meter.observe(&chunk);
                     let terminal = chunk_is_terminal(&chunk);
                     batch.push(chunk);
                     if terminal {

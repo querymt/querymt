@@ -4,7 +4,9 @@ use crate::mesh_ingress::{
     SharingResponse,
 };
 use crate::mesh_runtime_support::SwarmCommand;
-use crate::peer_access::quota::{QuotaEdit, QuotaScope, QuotaStatus, ReservationId};
+use crate::peer_access::quota::{
+    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaScope, QuotaSettlement, QuotaStatus, ReservationId,
+};
 use crate::peer_access::{
     GrantStore, GrantStoreError, ModelSelection, PeerGrantKey, ProviderGrant,
 };
@@ -28,14 +30,26 @@ use querymt::error::TransportErrorKind;
 use querymt::{LLMProvider, Usage};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 
-#[derive(Default)]
 struct Store {
     grants: Mutex<HashMap<PeerGrantKey, PeerGrantState>>,
     attempts: Mutex<HashMap<(PeerGrantKey, Uuid), ReservationId>>,
     settled: Mutex<Vec<(ReservationId, AttemptUsage)>>,
+    changes: broadcast::Sender<PeerGrantKey>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            grants: Default::default(),
+            attempts: Default::default(),
+            settled: Default::default(),
+            changes: broadcast::channel(16).0,
+        }
+    }
 }
 
 #[async_trait]
@@ -61,7 +75,13 @@ impl GrantStore for Store {
             grant,
             revision: Uuid::now_v7(),
         };
-        Ok(state.clone())
+        let state = state.clone();
+        drop(grants);
+        let _ = self.changes.send(key.clone());
+        Ok(state)
+    }
+    fn subscribe_changes(&self) -> Option<broadcast::Receiver<PeerGrantKey>> {
+        Some(self.changes.subscribe())
     }
     async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
         unreachable!("not needed for provider requests")

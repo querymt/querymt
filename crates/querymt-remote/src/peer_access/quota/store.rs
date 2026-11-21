@@ -82,6 +82,7 @@ struct AttemptLease {
     store: std::sync::Arc<dyn QuotaStore>,
     id: ReservationId,
     state: Option<AttemptPhase>,
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -94,12 +95,18 @@ impl AttemptLease {
     async fn release(&mut self) -> Result<(), QuotaError> {
         self.store.release_unused(self.id).await?;
         self.state = None;
+        if let Some(done) = self.completion.take() {
+            let _ = done.send(());
+        }
         Ok(())
     }
 
     async fn settle(&mut self, usage: AttemptUsage) -> Result<QuotaSettlement, QuotaError> {
         let result = self.store.settle(self.id, usage).await?;
         self.state = None;
+        if let Some(done) = self.completion.take() {
+            let _ = done.send(());
+        }
         Ok(result)
     }
 }
@@ -117,6 +124,7 @@ impl Drop for AttemptLease {
             store: self.store.clone(),
             id: self.id,
             state: None,
+            completion: self.completion.take(),
         };
         runtime.spawn(async move {
             let result = match phase {
@@ -135,6 +143,15 @@ fn task_failed(error: tokio::task::JoinError) -> QuotaError {
 }
 
 impl ReservedAttempt {
+    // A relay can drop a blocked upstream read and still wait for accounting
+    // before reporting the terminal failure.
+    #[cfg(feature = "kameo-mesh")]
+    pub(crate) fn completion(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.0.completion = Some(sender);
+        receiver
+    }
+
     /// Reserve under the initiating grant. Cancellation cannot orphan the committed reservation.
     pub async fn reserve(
         store: std::sync::Arc<dyn QuotaStore>,
@@ -148,6 +165,7 @@ impl ReservedAttempt {
                 store,
                 id,
                 state: Some(AttemptPhase::Reserved),
+                completion: None,
             }))
         })
         .await

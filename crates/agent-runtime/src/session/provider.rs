@@ -1006,9 +1006,9 @@ impl SessionHandle {
                         })?;
                     let mut built = built;
                     built.provider = Arc::new(
-                        crate::agent::remote::provider_host_backend::HostedProvider::new(
+                        crate::agent::remote::provider_host_backend::hosted_provider(
                             built.provider,
-                            peer.clone(),
+                            peer,
                             store,
                             config.provider.clone(),
                             config.model.clone(),
