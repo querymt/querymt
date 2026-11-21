@@ -534,15 +534,38 @@ impl QuotaStore for SqliteMeshAccess {
         }).await
     }
 
+    fn subscribe_usage_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+        self.lease.as_ref().map(|_| self.usage_changes.subscribe())
+    }
+
     async fn settle(
         &self,
         attempt: ReservationId,
         usage: AttemptUsage,
     ) -> Result<QuotaSettlement, QuotaError> {
+        let changes = self.usage_changes.clone();
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
-            let result = settle_attempt(&tx, &attempt.0.to_string(), usage)?;
+            let id = attempt.0.to_string();
+            let result = settle_attempt(&tx, &id, usage)?;
+            let peer = if result != QuotaSettlement::AlreadyFinal && changes.receiver_count() != 0 {
+                tx.query_row(
+                    "SELECT a.host_id, a.peer_id FROM quota_attempts a WHERE a.id=?1
+                     AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id)",
+                    [&id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(backend)?
+            } else {
+                None
+            };
             tx.commit().map_err(backend)?;
+            if let Some((host, peer)) = peer
+                && let (Ok(host), Ok(peer)) = (NodeId::parse(&host), NodeId::parse(&peer))
+            {
+                let _ = changes.send(PeerGrantKey { host, peer });
+            }
             Ok(result)
         })
         .await

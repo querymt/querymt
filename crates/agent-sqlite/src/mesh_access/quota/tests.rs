@@ -247,6 +247,36 @@ async fn a_stream_spanning_renewal_settles_against_its_original_windows() {
 }
 
 #[tokio::test]
+async fn committed_settlement_notifies_only_its_peer_without_changing_revision() {
+    let f = Fixture::new().await;
+    f.limit(&scope(None), 20, QuotaWindow::Weekly).await;
+    let request = f.request("a", Some(10), TUESDAY).await;
+    let revision = request.grant_revision;
+    let mut hints = f.store.usage_changes.subscribe();
+    let attempt = f.store.reserve(request).await.unwrap();
+    f.store.mark_dispatched(attempt).await.unwrap();
+    assert!(hints.try_recv().is_err());
+
+    assert_eq!(
+        f.store
+            .settle(attempt, AttemptUsage::Observed(7))
+            .await
+            .unwrap(),
+        QuotaSettlement::Recorded
+    );
+    assert_eq!(hints.try_recv().unwrap(), f.key);
+    assert_eq!(f.store.grant(&f.key).await.unwrap().revision, revision);
+    assert_eq!(
+        f.store
+            .settle(attempt, AttemptUsage::Observed(7))
+            .await
+            .unwrap(),
+        QuotaSettlement::AlreadyFinal
+    );
+    assert!(hints.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn dropped_attempts_release_only_work_that_could_not_dispatch() {
     use querymt_remote::peer_access::quota::ReservedAttempt;
 

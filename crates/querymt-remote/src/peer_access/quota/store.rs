@@ -15,6 +15,11 @@ use crate::{
 /// Durable quota operations. All implementations must serialize admission and edits.
 #[async_trait]
 pub trait QuotaStore: GrantStore {
+    /// Receive a refresh hint when committed usage changes, without advancing the grant revision.
+    fn subscribe_usage_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
+        None
+    }
+
     /// Read current accounting information for a scope.
     async fn quota(
         &self,

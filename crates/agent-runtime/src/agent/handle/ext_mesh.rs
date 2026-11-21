@@ -274,12 +274,48 @@ mod access {
         store: Arc<dyn querymt_remote::peer_access::quota::QuotaStore>,
         actor: &kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
         handle: &LocalAgentHandle,
+        mesh: &querymt_remote::MeshHandle,
     ) {
         use crate::agent::remote::node_manager::{GetPeerSharing, PeerAccessInvalidated};
         use crate::error::AgentError;
         use querymt_remote::mesh_ingress::{InboundAccess, PeerRequest};
 
         let notifications = handle.ext_notifications.clone();
+        if let Some(mut usage) = store.subscribe_usage_changes() {
+            let mesh = mesh.clone();
+            let store = store.clone();
+            let notifications = notifications.clone();
+            let actor = actor.downgrade();
+            tokio::spawn(async move {
+                let stopped = actor.wait_for_shutdown();
+                tokio::pin!(stopped);
+                loop {
+                    let key = tokio::select! {
+                        () = &mut stopped => break,
+                        key = usage.recv() => match key {
+                            Ok(key) => key,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                    };
+                    if key.host.as_peer_id() == mesh.peer_id() {
+                        notify(
+                            &notifications,
+                            &key.peer,
+                            "outgoing",
+                            PeerAccessInvalidated::Quota,
+                        );
+                        if store
+                            .grant(&key)
+                            .await
+                            .is_ok_and(|state| matches!(state.grant, PeerGrant::Custom { .. }))
+                        {
+                            notify_peer(mesh.clone(), key.peer, PeerAccessInvalidated::Quota);
+                        }
+                    }
+                }
+            });
+        }
         router.register_v1_ask::<crate::agent::remote::RemoteNodeManager, PeerAccessInvalidated, _, _, _, _>(
             actor.id(), InboundAccess::PeerAccess, move |peer: PeerRequest, reason: PeerAccessInvalidated| {
                 let notifications = notifications.clone();

@@ -28,6 +28,7 @@ pub struct SqliteMeshAccess {
     conn: Arc<Mutex<Connection>>,
     lease: Option<Arc<std::fs::File>>,
     changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
+    usage_changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
 }
 
 impl SqliteMeshAccess {
@@ -41,6 +42,7 @@ impl SqliteMeshAccess {
             conn: Arc::new(Mutex::new(conn)),
             lease: None,
             changes: tokio::sync::broadcast::channel(64).0,
+            usage_changes: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -60,6 +62,7 @@ impl SqliteMeshAccess {
                 conn: Arc::new(Mutex::new(open_store(path)?)),
                 lease: Some(Arc::new(lease)),
                 changes: tokio::sync::broadcast::channel(64).0,
+                usage_changes: tokio::sync::broadcast::channel(64).0,
             })
         })
         .await
