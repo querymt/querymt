@@ -1452,7 +1452,6 @@ mod node_manager_tests {
             ScheduleOrigin::Peer {
                 host: host.to_string(),
                 peer: peer.to_string(),
-                revision,
                 protocol: SchedulePeerProtocol::V1,
             }
         );
@@ -1667,7 +1666,7 @@ mod node_manager_tests {
         let mut prompt = Prompt::new(crate::acp::protocol::PromptRequest::new(id.clone(), vec![]));
         let legacy_payload = rmp_serde::to_vec_named(&prompt).unwrap();
         prompt.authority = crate::agent::session_actor::PeerTurn::test_authority(
-            store.1.lock().revision,
+            store.1.lock().grant.clone(),
             store.clone(),
         );
         assert_eq!(rmp_serde::to_vec_named(&prompt).unwrap(), legacy_payload);
@@ -1828,19 +1827,39 @@ mod node_manager_tests {
             GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
         };
 
-        struct Store(parking_lot::Mutex<PeerGrantState>);
+        use querymt_remote::peer_access::{PolicyChange, PolicyEffect};
+        use tokio::sync::broadcast;
+
+        struct Store(
+            parking_lot::Mutex<PeerGrantState>,
+            broadcast::Sender<PolicyChange>,
+        );
         #[async_trait::async_trait]
         impl GrantStore for Store {
             async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
                 Ok(self.0.lock().clone())
             }
+            fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+                Some(self.1.subscribe())
+            }
             async fn replace_grant(
                 &self,
-                _: &PeerGrantKey,
+                key: &PeerGrantKey,
                 _: Uuid,
-                _: PeerGrant,
+                grant: PeerGrant,
             ) -> Result<PeerGrantState, GrantStoreError> {
-                unreachable!("fixture changes grant directly")
+                let state = PeerGrantState {
+                    grant: grant.clone(),
+                    revision: Uuid::now_v7(),
+                };
+                *self.0.lock() = state.clone();
+                self.1
+                    .send(PolicyChange {
+                        key: key.clone(),
+                        effect: PolicyEffect::Grant(grant),
+                    })
+                    .unwrap();
+                Ok(state)
             }
             async fn managed_peers(
                 &self,
@@ -1866,10 +1885,13 @@ mod node_manager_tests {
         ));
         let mut observed = viewer.event_sink.fanout().subscribe();
         let mut local = config.event_sink.fanout().subscribe();
-        let store = Arc::new(Store(parking_lot::Mutex::new(PeerGrantState {
-            grant: PeerGrant::Full,
-            revision: Uuid::now_v7(),
-        })));
+        let store = Arc::new(Store(
+            parking_lot::Mutex::new(PeerGrantState {
+                grant: PeerGrant::Full,
+                revision: Uuid::now_v7(),
+            }),
+            broadcast::channel(8).0,
+        ));
         let host = *mesh.peer_id();
         let ingress = InboundRouter::new(host, store.clone());
         register_session_subscriptions(&ingress, mesh, store.clone(), &session);
@@ -1914,10 +1936,18 @@ mod node_manager_tests {
             .unwrap()
             .unwrap();
         local.recv().await.unwrap();
-        *store.0.lock() = PeerGrantState {
-            grant: PeerGrant::None,
-            revision: Uuid::now_v7(),
-        };
+        let node = querymt_remote::NodeId::from_peer_id(host);
+        store
+            .replace_grant(
+                &PeerGrantKey {
+                    host: node.clone(),
+                    peer: node,
+                },
+                Uuid::nil(),
+                PeerGrant::None,
+            )
+            .await
+            .unwrap();
         publish("after", 2);
         tokio::time::timeout(Duration::from_secs(3), local.recv())
             .await
@@ -2516,7 +2546,6 @@ mod node_manager_tests {
             schedule.config.origin = ScheduleOrigin::Peer {
                 host: key.host.to_string(),
                 peer: key.peer.to_string(),
-                revision: grant.revision,
                 protocol: SchedulePeerProtocol::V1,
             };
             repo.update_schedule(schedule).await.unwrap();
@@ -2635,10 +2664,9 @@ mod node_manager_tests {
         let actor = SessionActor::spawn(
             SessionActor::new(config.clone(), sid.clone(), runtime).with_mesh(Some(mesh.clone())),
         );
-        let origin = |host, peer, revision, protocol| ScheduleOrigin::Peer {
+        let origin = |host, peer, protocol| ScheduleOrigin::Peer {
             host,
             peer,
-            revision,
             protocol,
         };
         let message = |origin| ScheduledPrompt {
@@ -2658,19 +2686,16 @@ mod node_manager_tests {
             origin(
                 libp2p::PeerId::random().to_string(),
                 key.peer.to_string(),
-                granted.revision,
                 SchedulePeerProtocol::V1,
             ),
             origin(
                 key.host.to_string(),
                 "invalid peer ID".into(),
-                granted.revision,
                 SchedulePeerProtocol::V1,
             ),
             origin(
                 key.host.to_string(),
                 key.peer.to_string(),
-                granted.revision,
                 SchedulePeerProtocol::Legacy,
             ),
         ] {
@@ -2687,7 +2712,6 @@ mod node_manager_tests {
         let saved = origin(
             key.host.to_string(),
             key.peer.to_string(),
-            granted.revision,
             SchedulePeerProtocol::V1,
         );
         let start = actor.clone();
@@ -2753,7 +2777,6 @@ mod node_manager_tests {
                 .ask(message(origin(
                     key.host.to_string(),
                     key.peer.to_string(),
-                    granted.revision,
                     SchedulePeerProtocol::V1,
                 )))
                 .await,
@@ -2853,7 +2876,6 @@ mod node_manager_tests {
         let attempt = store
             .reserve(QuotaAttempt {
                 peer: key.clone(),
-                grant_revision: revision,
                 protocol: SharingProtocol::V1,
                 provider_id: "mock".into(),
                 model_id: "fixture".into(),

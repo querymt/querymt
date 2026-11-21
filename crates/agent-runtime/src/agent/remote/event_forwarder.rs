@@ -177,11 +177,6 @@ impl EventForwarder {
                 {
                     continue;
                 }
-                if let Some(subscriber) = &subscriber
-                    && !subscriber.is_current().await
-                {
-                    break;
-                }
                 match next {
                     Ok(envelope) => {
                         let event: AgentEvent = match &envelope {

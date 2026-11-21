@@ -148,7 +148,7 @@ mod tests {
             .unwrap();
         let authority = TurnAuthority::Peer(PeerTurn::test_peer(
             key.clone(),
-            initial.revision,
+            initial.grant,
             store.clone(),
         ));
         let parent = fixture.execution_context().await.session_id;

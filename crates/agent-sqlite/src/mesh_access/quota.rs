@@ -328,6 +328,7 @@ fn settle_attempt(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl SqliteMeshAccess {
     pub(super) async fn quota(
         &self,
@@ -520,9 +521,7 @@ impl QuotaStore for SqliteMeshAccess {
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let grant = load_grant(&tx, &attempt.peer)?;
-            if grant.revision != attempt.grant_revision
-                || !grant.grant.allows_model(attempt.protocol, &attempt.provider_id, &attempt.model_id)
-            {
+            if !grant.grant.allows_model(attempt.protocol, &attempt.provider_id, &attempt.model_id) {
                 return Err(QuotaError::Denied);
             }
             let host = attempt.peer.host.to_string();
@@ -580,9 +579,9 @@ impl QuotaStore for SqliteMeshAccess {
             }
             let id_text = id.0.to_string();
             tx.execute(
-                "INSERT INTO quota_attempts (id,host_id,peer_id,provider_id,model_id,request_id,grant_revision,state)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'reserved')",
-                params![id_text, host, peer, attempt.provider_id, attempt.model_id, replay_id, grant.revision.to_string()],
+                "INSERT INTO quota_attempts (id,host_id,peer_id,provider_id,model_id,request_id,state)
+                 VALUES (?1,?2,?3,?4,?5,?6,'reserved')",
+                params![id_text, host, peer, attempt.provider_id, attempt.model_id, replay_id],
             ).map_err(backend)?;
             for (period, bound) in periods {
                 tx.execute("INSERT INTO quota_reservations (attempt_id,period_id,reserved) VALUES (?1,?2,?3)", params![id_text, period, bound]).map_err(backend)?;

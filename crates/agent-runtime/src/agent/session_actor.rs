@@ -336,9 +336,8 @@ pub(crate) enum TurnAuthority {
 #[cfg(feature = "remote")]
 pub(crate) struct PeerTurn {
     pub(crate) key: querymt_remote::peer_access::PeerGrantKey,
-    revision: Uuid,
     pub(crate) protocol: querymt_remote::peer_access::SharingProtocol,
-    pinned: Option<querymt_remote::peer_access::PeerGrant>,
+    pinned: querymt_remote::peer_access::PeerGrant,
     changes: parking_lot::Mutex<
         Option<tokio::sync::broadcast::Receiver<querymt_remote::peer_access::PolicyChange>>,
     >,
@@ -353,9 +352,11 @@ impl PeerTurn {
     ) -> Result<Self, AgentError> {
         Ok(Self {
             key: origin.key().clone(),
-            revision: origin.revision().ok_or(AgentError::MeshAccessDenied)?,
             protocol: origin.protocol(),
-            pinned: origin.grant().cloned(),
+            pinned: origin
+                .grant()
+                .cloned()
+                .ok_or(AgentError::MeshAccessDenied)?,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
         })
@@ -375,7 +376,7 @@ impl PeerTurn {
             .await
             .map_err(|_| AgentError::MeshAccessDenied)?;
         self.check_grant(&state.grant, binding)?;
-        Ok(self.pinned.clone().unwrap_or(state.grant))
+        Ok(self.pinned.clone())
     }
 
     fn check_grant(
@@ -384,16 +385,12 @@ impl PeerTurn {
         binding: Option<(&str, &str)>,
     ) -> Result<(), AgentError> {
         if !grant.allows_sessions(self.protocol)
-            || self.pinned.as_ref().is_some_and(|pinned| {
-                pinned.allows_shell() && !grant.allows_shell()
-                    || pinned.allows_filesystem(self.protocol)
-                        && !grant.allows_filesystem(self.protocol)
-                    || binding.is_some_and(|(provider, model)| {
-                        !pinned.allows_model(self.protocol, provider, model)
-                    })
-            })
+            || self.pinned.allows_shell() && !grant.allows_shell()
+            || self.pinned.allows_filesystem(self.protocol)
+                && !grant.allows_filesystem(self.protocol)
             || binding.is_some_and(|(provider, model)| {
-                !grant.allows_model(self.protocol, provider, model)
+                !self.pinned.allows_model(self.protocol, provider, model)
+                    || !grant.allows_model(self.protocol, provider, model)
             })
         {
             return Err(AgentError::MeshAccessDenied);
@@ -437,7 +434,6 @@ impl PeerTurn {
         ScheduleOrigin::Peer {
             host: self.key.host.to_string(),
             peer: self.key.peer.to_string(),
-            revision: self.revision,
             protocol: match self.protocol {
                 SharingProtocol::Legacy => SchedulePeerProtocol::Legacy,
                 SharingProtocol::V1 => SchedulePeerProtocol::V1,
@@ -448,14 +444,13 @@ impl PeerTurn {
     #[cfg(test)]
     pub(crate) fn test_peer(
         key: querymt_remote::peer_access::PeerGrantKey,
-        revision: Uuid,
+        pinned: querymt_remote::peer_access::PeerGrant,
         store: Arc<dyn querymt_remote::peer_access::GrantStore>,
     ) -> Arc<Self> {
         Arc::new(Self {
             key,
-            revision,
             protocol: querymt_remote::peer_access::SharingProtocol::V1,
-            pinned: None,
+            pinned,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
         })
@@ -463,7 +458,7 @@ impl PeerTurn {
 
     #[cfg(test)]
     pub(crate) fn test_authority(
-        revision: Uuid,
+        pinned: querymt_remote::peer_access::PeerGrant,
         store: Arc<dyn querymt_remote::peer_access::GrantStore>,
     ) -> TurnAuthority {
         use querymt_remote::{
@@ -475,9 +470,8 @@ impl PeerTurn {
                 host: NodeId::from_peer_id(libp2p::PeerId::random()),
                 peer: NodeId::from_peer_id(libp2p::PeerId::random()),
             },
-            revision,
             protocol: SharingProtocol::V1,
-            pinned: None,
+            pinned,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
         }))
@@ -489,7 +483,6 @@ impl std::fmt::Debug for PeerTurn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerTurn")
             .field("key", &self.key)
-            .field("revision", &self.revision)
             .field("protocol", &self.protocol)
             .finish_non_exhaustive()
     }
@@ -509,24 +502,10 @@ impl TurnAuthority {
         &self,
         origin: &crate::session::domain_schedule::ScheduleOrigin,
     ) -> bool {
-        use crate::session::domain_schedule::ScheduleOrigin;
-        match (self.stored_origin(), origin) {
-            (
-                ScheduleOrigin::Peer {
-                    host,
-                    peer,
-                    protocol,
-                    ..
-                },
-                ScheduleOrigin::Peer {
-                    host: stored_host,
-                    peer: stored_peer,
-                    protocol: stored_protocol,
-                    ..
-                },
-            ) => host == *stored_host && peer == *stored_peer && protocol == *stored_protocol,
-            _ => false,
-        }
+        matches!(
+            origin,
+            crate::session::domain_schedule::ScheduleOrigin::Peer { .. }
+        ) && self.stored_origin() == *origin
     }
 
     pub(crate) async fn check(&self) -> Result<(), AgentError> {
@@ -555,10 +534,8 @@ impl TurnAuthority {
             return false;
         }
         #[cfg(feature = "remote")]
-        if let (Self::Peer(caller), Self::Peer(turn)) = (self, target)
-            && let Some(grant) = &caller.pinned
-        {
-            return turn.check_grant(grant, None).is_ok();
+        if let (Self::Peer(caller), Self::Peer(turn)) = (self, target) {
+            return turn.check_grant(&caller.pinned, None).is_ok();
         }
         true
     }
@@ -2895,7 +2872,6 @@ impl TurnAuthority {
             ScheduleOrigin::Peer {
                 host,
                 peer,
-                revision: _,
                 protocol,
             } => {
                 use crate::session::domain_schedule::SchedulePeerProtocol;
@@ -2922,8 +2898,7 @@ impl TurnAuthority {
                     .map_err(|_| AgentError::MeshAccessDenied)?;
                 Ok(TurnAuthority::Peer(Arc::new(PeerTurn {
                     key,
-                    revision: state.revision,
-                    pinned: Some(state.grant),
+                    pinned: state.grant,
                     changes,
                     protocol: match protocol {
                         SchedulePeerProtocol::Legacy => SharingProtocol::Legacy,
@@ -5982,7 +5957,6 @@ mod tests {
         for origin in [ScheduleOrigin::Peer {
             host: "persisted-host".into(),
             peer: "persisted-peer".into(),
-            revision: Uuid::now_v7(),
             protocol: SchedulePeerProtocol::V1,
         }] {
             let result = fixture

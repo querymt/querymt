@@ -99,7 +99,6 @@ pub enum ScheduleOrigin {
     Peer {
         host: String,
         peer: String,
-        revision: uuid::Uuid,
         protocol: SchedulePeerProtocol,
     },
 }
@@ -429,7 +428,6 @@ mod tests {
             origin: ScheduleOrigin::Peer {
                 host: "host-node".into(),
                 peer: "peer-node".into(),
-                revision: uuid::Uuid::now_v7(),
                 protocol: SchedulePeerProtocol::V1,
             },
         };

@@ -136,7 +136,6 @@ pub struct QuotaStatus {
 pub struct QuotaAttempt {
     pub peer: PeerGrantKey,
     /// Revision captured when the host authorized the initiating peer.
-    pub grant_revision: Uuid,
     pub protocol: SharingProtocol,
     pub provider_id: String,
     pub model_id: String,

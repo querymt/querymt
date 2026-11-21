@@ -141,7 +141,6 @@ mod tests {
         let attempt = store
             .reserve(QuotaAttempt {
                 peer: key.clone(),
-                grant_revision: revision,
                 protocol: SharingProtocol::V1,
                 provider_id: "fixture".into(),
                 model_id: "model".into(),

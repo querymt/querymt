@@ -81,7 +81,7 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
         )
         .await
         .unwrap();
-    let authority = TurnAuthority::Peer(PeerTurn::test_peer(key, granted.revision, store.clone()));
+    let authority = TurnAuthority::Peer(PeerTurn::test_peer(key, granted.grant, store.clone()));
     let parent = &harness.exec_ctx.session_id;
     let delegation = harness
         .exec_ctx

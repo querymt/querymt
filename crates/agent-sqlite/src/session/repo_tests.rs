@@ -908,7 +908,6 @@ mod tests {
             let origin = ScheduleOrigin::Peer {
                 host: "host".into(),
                 peer: "peer".into(),
-                revision: uuid::Uuid::now_v7(),
                 protocol: SchedulePeerProtocol::V1,
             };
             let delegated = repo

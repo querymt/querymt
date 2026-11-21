@@ -67,7 +67,6 @@ impl Fixture {
     async fn request(&self, model: &str, tokens: Option<i64>, now: i64) -> QuotaAttempt {
         QuotaAttempt {
             peer: self.key.clone(),
-            grant_revision: self.store.grant(&self.key).await.unwrap().revision,
             protocol: SharingProtocol::V1,
             provider_id: "provider".into(),
             model_id: model.into(),
@@ -352,7 +351,7 @@ async fn committed_settlement_notifies_only_its_peer_without_changing_revision()
     let f = Fixture::new().await;
     f.limit(&scope(None), 20, QuotaWindow::Weekly).await;
     let request = f.request("a", Some(10), TUESDAY).await;
-    let revision = request.grant_revision;
+    let revision = f.store.grant(&f.key).await.unwrap().revision;
     let mut hints = f.store.usage_changes.subscribe();
     let attempt = f.store.reserve(request).await.unwrap();
     f.store.mark_dispatched(attempt).await.unwrap();
@@ -422,36 +421,29 @@ async fn dropped_attempts_release_only_work_that_could_not_dispatch() {
 }
 
 #[tokio::test]
-async fn a_stale_authorization_cannot_reserve_under_a_regrant() {
+async fn reservation_checks_current_permission_without_consuming_replay_on_denial() {
     let f = Fixture::new().await;
     let provider = scope(None);
     f.limit(&provider, 20, QuotaWindow::Weekly).await;
-    let stale = f.request("a", Some(15), TUESDAY).await;
+    let request = f.request("a", Some(15), TUESDAY).await;
+    let revision = f.store.grant(&f.key).await.unwrap().revision;
     let revoked = f
         .store
-        .replace_grant(&f.key, stale.grant_revision, PeerGrant::None)
+        .replace_grant(&f.key, revision, PeerGrant::None)
         .await
         .unwrap();
-    let regranted = f
-        .store
-        .replace_grant(&f.key, revoked.revision, f.grant.clone())
-        .await
-        .unwrap();
-
     assert!(matches!(
-        f.store.reserve(stale.clone()).await,
+        f.store.reserve(request.clone()).await,
         Err(QuotaError::Denied)
     ));
     let status = f.store.quota(&f.key, &provider, TUESDAY).await.unwrap();
     assert_eq!(status.reserved_tokens, 0);
     // No attempt or replay tombstone was created for the rejected reservation.
     f.store
-        .reserve(QuotaAttempt {
-            grant_revision: regranted.revision,
-            ..stale
-        })
+        .replace_grant(&f.key, revoked.revision, f.grant.clone())
         .await
         .unwrap();
+    f.store.reserve(request).await.unwrap();
 }
 
 #[tokio::test]
@@ -694,7 +686,7 @@ async fn settled_requests_cannot_replay_across_restart_and_quota_reset() {
     let status = f.status(&provider, TUESDAY).await;
     assert_eq!(status.known_tokens, 20);
     assert_eq!(status.estimated_tokens, 0);
-    request.grant_revision = f.edit(&provider, QuotaEdit::Reset, TUESDAY).await.unwrap();
+    f.edit(&provider, QuotaEdit::Reset, TUESDAY).await.unwrap();
     let reopened = SqliteMeshAccess::open(&f.path).await.unwrap();
     assert!(matches!(
         reopened.reserve(request.clone()).await,

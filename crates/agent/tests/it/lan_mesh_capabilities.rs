@@ -175,7 +175,6 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
                 host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
                 peer: querymt_remote::NodeId::parse(&peer).unwrap(),
             },
-            grant_revision: serde_json::from_value(revision.clone()).unwrap(),
             protocol: SharingProtocol::V1,
             provider_id: "fixture".into(),
             model_id: "offline".into(),

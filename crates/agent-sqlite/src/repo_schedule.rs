@@ -661,7 +661,6 @@ mod tests {
         let origin = ScheduleOrigin::Peer {
             host: "origin-host".into(),
             peer: "origin-peer".into(),
-            revision: uuid::Uuid::now_v7(),
             protocol: SchedulePeerProtocol::V1,
         };
         schedule.config.origin = origin.clone();

@@ -51,14 +51,6 @@ impl Owner {
     fn guarded(&self) -> bool {
         !matches!(self, Self::Local)
     }
-
-    fn duration(&self, secs: u64) -> Duration {
-        Duration::from_secs(if self.guarded() {
-            secs.clamp(1, 300)
-        } else {
-            secs.max(1)
-        })
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -146,7 +138,10 @@ impl ActiveStream {
         {
             return false;
         }
-        progress.lease_expires = now + self.key.owner.duration(seconds);
+        let Some(deadline) = now.checked_add(Duration::from_secs(seconds.max(1))) else {
+            return false;
+        };
+        progress.lease_expires = deadline;
         self.lease_changed.notify_one();
         true
     }
@@ -229,9 +224,15 @@ impl Relay {
         #[cfg(feature = "kameo-mesh")] guarded: Option<(MeshHandle, MeteredAccess)>,
     ) -> Result<Self, RemoteProviderHostError> {
         let now = Instant::now();
-        let lease = owner.duration(req.lease_ttl_secs);
-        let grace = owner.duration(req.reconnect_grace_secs);
-        let heartbeat = owner.duration(req.heartbeat_interval_secs);
+        let lease = Duration::from_secs(req.lease_ttl_secs.max(1));
+        let grace = Duration::from_secs(req.reconnect_grace_secs.max(1));
+        let heartbeat = Duration::from_secs(req.heartbeat_interval_secs.max(1));
+        let lease_expires = now.checked_add(lease).ok_or_else(|| {
+            RemoteProviderHostError::provider_chat_message(
+                "chat_stream",
+                "unrepresentable stream lease",
+            )
+        })?;
         #[cfg(feature = "kameo-mesh")]
         let (mesh, access) = guarded.unzip();
         let key = StreamKey {
@@ -247,7 +248,7 @@ impl Relay {
             cancel,
             lease_changed: Notify::new(),
             progress: Mutex::new(Progress {
-                lease_expires: now + lease,
+                lease_expires,
                 last_progress: now,
                 chunks: 0,
                 phase: ProviderStreamPhase::OpeningUpstream,
@@ -385,7 +386,7 @@ impl Relay {
         let delivered = if self.guarded() {
             matches!(
                 time::timeout(
-                    RELAY_TIMEOUT + self.grace,
+                    RELAY_TIMEOUT.saturating_add(self.grace),
                     self.deliver(&mut delivery, terminal, sequenced)
                 )
                 .await,
@@ -420,7 +421,13 @@ impl Relay {
         delivery: &mut Delivery,
     ) -> Result<Option<StreamRelayMessage>, RemoteProviderHostError> {
         self.active.progress.lock().phase = ProviderStreamPhase::WaitingFirstChunk;
-        let mut heartbeat = time::interval_at(Instant::now() + self.heartbeat, self.heartbeat);
+        let first_heartbeat = Instant::now().checked_add(self.heartbeat).ok_or_else(|| {
+            RemoteProviderHostError::provider_chat_message(
+                "chat_stream",
+                "unrepresentable heartbeat interval",
+            )
+        })?;
+        let mut heartbeat = time::interval_at(first_heartbeat, self.heartbeat);
         heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut flush_at = Instant::now();
         loop {
@@ -510,7 +517,6 @@ impl Relay {
     ) -> Result<(), RemoteProviderHostError> {
         let started = Instant::now();
         loop {
-            self.active.authorize().await?;
             let connected = self.active.progress.lock().connected;
             let mut ready = connected;
             if !connected {
@@ -522,20 +528,22 @@ impl Relay {
                     },
                 };
                 if self.send(self.frame(notice, None), true).await.is_ok() {
-                    self.active.authorize().await?;
                     delivery.acknowledged();
                     ready = true;
                 }
             }
             if ready {
-                let ack = self.guarded()
-                    || should_ack_relay_message(
-                        message,
-                        delivery.unacked,
-                        delivery.last_ack.elapsed(),
-                        8,
-                        Duration::from_millis(40),
-                    );
+                // The final batch is sent after the forwarder's revocation select ends.
+                if self.guarded() && crate::relay_message_is_terminal(message) && seq.is_some() {
+                    self.active.authorize().await?;
+                }
+                let ack = should_ack_relay_message(
+                    message,
+                    delivery.unacked,
+                    delivery.last_ack.elapsed(),
+                    8,
+                    Duration::from_millis(40),
+                );
                 match self.send(self.frame(message.clone(), seq), ack).await {
                     Ok(()) => {
                         if ack
@@ -615,15 +623,15 @@ impl Relay {
                 .map_err(|error| error.to_string());
         }
         let tell = self.receiver.tell(&frame);
-        if self.guarded() {
+        if !ack {
+            tell.send().map_err(|error| error.to_string())
+        } else if self.guarded() {
             time::timeout(RELAY_TIMEOUT, tell.send_ack())
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())
-        } else if ack {
-            tell.send_ack().await.map_err(|error| error.to_string())
         } else {
-            tell.send().map_err(|error| error.to_string())
+            tell.send_ack().await.map_err(|error| error.to_string())
         }
     }
 }

@@ -119,10 +119,13 @@ impl QuotaStore for Store {
         unreachable!("fixture has immutable caps")
     }
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
-        assert_eq!(
-            self.grants.lock()[&attempt.peer].revision,
-            attempt.grant_revision
-        );
+        if !self.grants.lock()[&attempt.peer].grant.allows_model(
+            attempt.protocol,
+            &attempt.provider_id,
+            &attempt.model_id,
+        ) {
+            return Err(QuotaError::Denied);
+        }
         assert_eq!(attempt.provider_id, "fixture");
         assert_eq!(attempt.model_id, "allowed");
         assert_eq!(attempt.bound_tokens, Some(25));
@@ -1039,6 +1042,17 @@ async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_con
     assert!(live.receiver_connected);
     assert!(live.lease_expires_in_ms > 1_000);
     assert!(fixture.store.settled.lock().is_empty());
+    let long_renew = RenewProviderStreamLease {
+        lease_ttl_secs: 600,
+        ..renew.clone()
+    };
+    assert!(fixture.call::<_, bool>(&long_renew).await.unwrap());
+    let extended = fixture
+        .call::<_, Option<ProviderStreamStatus>>(&status)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(extended.lease_expires_in_ms > 300_000);
 
     assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 1);
     assert!(!fixture.call::<_, bool>(&renew).await.unwrap());
@@ -1442,7 +1456,7 @@ async fn guarded_stream_releases_a_reservation_if_policy_becomes_unreadable() {
 async fn dropping_reservation_future_releases_a_late_commit_without_charging() {
     let store = Arc::new(Store::default());
     let peer = key(PeerId::random(), PeerId::random());
-    let grant = store
+    store
         .replace_grant(&peer, Uuid::nil(), PeerGrant::Full)
         .await
         .unwrap();
@@ -1451,7 +1465,6 @@ async fn dropping_reservation_future_releases_a_late_commit_without_charging() {
         store.clone(),
         QuotaAttempt {
             peer,
-            grant_revision: grant.revision,
             protocol: SharingProtocol::V1,
             provider_id: "fixture".into(),
             model_id: "allowed".into(),

@@ -348,6 +348,10 @@ impl Message<GuardedStreamStart> for ProviderHostActor {
                 reservation.release().await.map_err(quota_error)?;
                 return Err(RemoteProviderHostError::Internal("stream admission cancelled".into()));
             }
+            if let Err(error) = access.check().await {
+                reservation.release().await.map_err(quota_error)?;
+                return Err(policy_error(error));
+            }
             let relay = Relay::new(streams, &msg, owner, cancel, Some((mesh, access)))?;
             let settled = reservation.completion();
             tokio::spawn(relay.run(async move {

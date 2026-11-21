@@ -3691,7 +3691,7 @@ mod prepared_call_tests {
             .agent
             .execution_context()
             .await
-            .with_turn_authority(PeerTurn::test_authority(revision, store.clone()));
+            .with_turn_authority(PeerTurn::test_authority(PeerGrant::Full, store.clone()));
         for name in ["route_delegation_to_peer", "use_remote_provider"] {
             let workflow = mock_tool_call("workflow", name, "{}");
             let prepared = prepare_tool_call(&config, &workflow, &exec).await.unwrap();

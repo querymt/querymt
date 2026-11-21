@@ -304,12 +304,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_inference_and_direct_inference_share_an_allowance() {
-        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let (_dir, store, key, scope, _, now) = finite_quota_fixture(16).await;
         let direct = ReservedAttempt::reserve(
             store.clone(),
             QuotaAttempt {
                 peer: key.clone(),
-                grant_revision: revision,
                 protocol: SharingProtocol::V1,
                 provider_id: "fixture".into(),
                 model_id: "model".into(),
@@ -325,7 +324,11 @@ mod tests {
         .unwrap();
         direct.settle(AttemptUsage::Observed(7)).await.unwrap();
 
-        let peer = PeerTurn::test_peer(key.clone(), revision, store.clone());
+        let peer = PeerTurn::test_peer(
+            key.clone(),
+            store.grant(&key).await.unwrap().grant,
+            store.clone(),
+        );
         // No mock methods are configured: touching the provider would fail the test.
         let provider = hosted_provider(
             Arc::new(MockLlmProvider::new()),
@@ -383,12 +386,12 @@ mod tests {
     fn hosted_stream(
         stream: Result<ChatStream, LLMError>,
         key: &PeerGrantKey,
-        revision: Uuid,
+        _revision: Uuid,
         store: Arc<dyn QuotaStore>,
     ) -> querymt_remote::MeteredProvider {
         hosted_provider(
             Arc::new(ScriptedStream(std::sync::Mutex::new(Some(stream)))),
-            &PeerTurn::test_peer(key.clone(), revision, store.clone()),
+            &PeerTurn::test_peer(key.clone(), PeerGrant::Full, store.clone()),
             store,
             "fixture".into(),
             "model".into(),

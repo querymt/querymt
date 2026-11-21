@@ -15,13 +15,10 @@ use kameo::remote::{
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
-use uuid::Uuid;
 
 use super::{MeshIngress, SharingRejection};
 use crate::NodeId;
-use crate::peer_access::{
-    GrantStore, PeerGrant, PeerGrantKey, PeerGrantState, PolicyEffect, SharingProtocol,
-};
+use crate::peer_access::{GrantStore, PeerGrant, PeerGrantKey, PolicyEffect, SharingProtocol};
 
 #[cfg(test)]
 mod tests;
@@ -70,18 +67,13 @@ impl InboundDelivery {
 pub struct PeerRequest {
     key: PeerGrantKey,
     protocol: SharingProtocol,
-    state: Option<PeerGrantState>,
+    grant: Option<PeerGrant>,
 }
 
 impl PeerRequest {
     /// Grant authorized at ingress, absent for identity-only routes.
     pub fn grant(&self) -> Option<&PeerGrant> {
-        self.state.as_ref().map(|state| &state.grant)
-    }
-
-    /// Revision recorded in the existing durable origin format, not a permission.
-    pub fn revision(&self) -> Option<Uuid> {
-        self.state.as_ref().map(|state| state.revision)
+        self.grant.as_ref()
     }
 
     /// Host and authenticated caller in the direction of resource access.
@@ -217,12 +209,12 @@ impl InboundRouter {
         &self,
         peer: &PeerRequest,
         access: InboundAccess,
-    ) -> Result<Option<PeerGrantState>, SharingRejection> {
+    ) -> Result<Option<PeerGrant>, SharingRejection> {
         if access == InboundAccess::Identity {
             return Ok(None);
         }
         match self.store.grant(peer.key()).await {
-            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state)),
+            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state.grant)),
             Ok(_) => Err(SharingRejection::Denied),
             Err(error) => {
                 tracing::warn!(%error, "cannot authorize mesh request");
@@ -289,44 +281,41 @@ impl InboundRouter {
                 peer: NodeId::from_peer_id(peer),
             },
             protocol,
-            state: None,
+            grant: None,
         };
-        let mut changes = (route.access != InboundAccess::Identity)
+        let changes = (route.access != InboundAccess::Identity)
             .then(|| self.store.subscribe_changes())
             .flatten();
-        origin.state = self.authorize(&origin, route.access).await?;
-        let is_current = || {
+        origin.grant = self.authorize(&origin, route.access).await?;
+        let is_current = {
             self.routes
                 .read()
                 .get(&actor_id)
                 .and_then(|routes| routes.get(&route_key))
                 .is_some_and(|current| Arc::ptr_eq(current, &route))
         };
-        if !is_current() {
+        if !is_current {
             return Ok(Err(RemoteSendError::ActorNotRunning));
         }
         let result = (route.handler)(origin.clone(), payload).await;
-        if origin.state.is_some() && self.authorize(&origin, route.access).await.is_err() {
+        if origin.grant.is_some() && self.authorize(&origin, route.access).await.is_err() {
             return Err(SharingRejection::Changed);
         }
-        if let Some(changes) = &mut changes {
+        // Restoring a grant must not resume delivery of a revoked request.
+        if let Some(mut changes) = changes {
             use tokio::sync::broadcast::error::TryRecvError;
             loop {
                 match changes.try_recv() {
-                    Ok(change) if &change.key == origin.key() => {
-                        if let PolicyEffect::Grant(grant) = change.effect
-                            && !route.access.permits(&grant, protocol)
-                        {
-                            return Err(SharingRejection::Changed);
-                        }
+                    Ok(change)
+                        if change.key == origin.key
+                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol)) =>
+                    {
+                        return Err(SharingRejection::Changed);
                     }
                     Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                     Err(_) => break,
                 }
             }
-        }
-        if !is_current() {
-            return Err(SharingRejection::Changed);
         }
         Ok(result)
     }

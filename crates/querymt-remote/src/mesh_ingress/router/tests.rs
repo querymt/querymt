@@ -1,9 +1,10 @@
 use super::*;
-use crate::peer_access::{GrantStoreError, PeerGrantState, PolicyChange};
+use crate::peer_access::{GrantStoreError, PeerGrantState, PolicyChange, PolicyEffect};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 struct TestStore {
     entries: RwLock<HashMap<PeerGrantKey, PeerGrantState>>,

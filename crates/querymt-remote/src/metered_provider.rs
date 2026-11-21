@@ -20,9 +20,7 @@ use crate::peer_access::quota::{
     AttemptUsage, DispatchedAttempt, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore,
     ReservedAttempt, StreamMeter,
 };
-use crate::peer_access::{
-    PeerGrant, PeerGrantKey, PeerGrantState, SharingProtocol, wait_for_policy_loss,
-};
+use crate::peer_access::{PeerGrant, PeerGrantKey, SharingProtocol, wait_for_policy_loss};
 
 type Bound = dyn Fn(&ChatCall<'_>, bool) -> Option<i64> + Send + Sync;
 type Revocation = Pin<Box<dyn Future<Output = LLMError> + Send>>;
@@ -61,10 +59,6 @@ impl MeteredAccess {
     }
 
     pub(crate) async fn check(&self) -> Result<(), LLMError> {
-        self.current().await.map(|_| ())
-    }
-
-    async fn current(&self) -> Result<PeerGrantState, LLMError> {
         let state = self.store.grant(&self.peer).await.map_err(|error| {
             if self.catalog.is_none() {
                 return denied();
@@ -76,8 +70,7 @@ impl MeteredAccess {
                 "mesh policy unavailable",
             )
         })?;
-        self.check_grant(&state.grant)?;
-        Ok(state)
+        self.check_grant(&state.grant)
     }
 
     fn check_grant(&self, grant: &PeerGrant) -> Result<(), LLMError> {
@@ -183,7 +176,7 @@ impl MeteredProvider {
     ) -> Result<ReservedAttempt, LLMError> {
         let request_id = self.request_id.unwrap_or_else(Uuid::new_v4);
         let bound_tokens = (self.bound)(call, streaming);
-        let mut state = self.access.current().await?;
+        self.access.check().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -193,61 +186,16 @@ impl MeteredProvider {
         tokio::select! {
             biased;
             error = revoked => Err(error),
-            result = async {
-                loop {
-                    let result = ReservedAttempt::reserve(
-                        self.access.store.clone(),
-                        QuotaAttempt {
-                            peer: self.access.peer.clone(),
-                            grant_revision: state.revision,
-                            protocol: self.access.protocol,
-                            provider_id: self.access.provider.clone(),
-                            model_id: self.access.model.clone(),
-                            request_id,
-                            bound_tokens,
-                            now,
-                        },
-                    ).await;
-                    match result {
-                        Ok(reserved) => return self.check_reserved(reserved).await,
-                        Err(QuotaError::Denied) => {
-                            // Re-read permission and retry only a lost admission race.
-                            let current = self.access.current().await?;
-                            if current.revision == state.revision {
-                                return Err(denied());
-                            }
-                            state = current;
-                        }
-                        Err(error) => return Err(error.into_provider_error()),
-                    }
-                }
-            } => result,
+            result = ReservedAttempt::reserve(self.access.store.clone(), QuotaAttempt {
+                peer: self.access.peer.clone(),
+                protocol: self.access.protocol,
+                provider_id: self.access.provider.clone(),
+                model_id: self.access.model.clone(),
+                request_id,
+                bound_tokens,
+                now,
+            }) => result.map_err(QuotaError::into_provider_error),
         }
-    }
-
-    async fn check_reserved(&self, reserved: ReservedAttempt) -> Result<ReservedAttempt, LLMError> {
-        if let Err(error) = self.access.check().await {
-            reserved
-                .release()
-                .await
-                .map_err(QuotaError::into_provider_error)?;
-            return Err(error);
-        }
-        Ok(reserved)
-    }
-
-    async fn begin(&self, reserved: ReservedAttempt) -> Result<DispatchedAttempt, LLMError> {
-        let attempt = self
-            .check_reserved(reserved)
-            .await?
-            .begin()
-            .await
-            .map_err(QuotaError::into_provider_error)?;
-        if let Err(error) = self.access.check().await {
-            self.finish(attempt, AttemptUsage::Unknown).await?;
-            return Err(error);
-        }
-        Ok(attempt)
     }
 
     pub(crate) async fn stream_reserved(
@@ -259,7 +207,7 @@ impl MeteredProvider {
         let attempt = tokio::select! {
             biased;
             error = &mut revoked => return Err(error),
-            result = self.begin(reserved) => result?,
+            result = reserved.begin() => result.map_err(QuotaError::into_provider_error)?,
         };
         let opened = tokio::select! {
             biased;
@@ -359,7 +307,9 @@ impl ChatProvider for MeteredProvider {
         let attempt = tokio::select! {
             biased;
             error = &mut revoked => return Err(error),
-            result = async { self.begin(self.reserve(call, false).await?).await } => result?,
+            result = async {
+                self.reserve(call, false).await?.begin().await.map_err(QuotaError::into_provider_error)
+            } => result?,
         };
         let output = tokio::select! {
             biased;

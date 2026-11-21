@@ -25,7 +25,6 @@ CREATE TABLE quota_attempts (
     provider_id TEXT NOT NULL,
     model_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
-    grant_revision TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'released', 'settled')),
     UNIQUE (host_id, peer_id, request_id)
 ) STRICT;
