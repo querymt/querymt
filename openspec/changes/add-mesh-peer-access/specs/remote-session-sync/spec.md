@@ -14,7 +14,7 @@ Within an established sharing protocol, the attaching agent SHALL use paged tran
 
 ### Requirement: Incomplete transfer is reported, not hidden
 
-If the attaching agent cannot transfer the events required for an authorized load within the transfer budget, it SHALL fail with a typed retryable remote-transfer error, not silently return a response missing part of the requested window. If the owner is unreachable and the requested window already exists locally, the agent MAY serve it as a cached, possibly stale copy unless the current known policy denies it. A confirmed denial SHALL be surfaced as an access error, not retried as a different transfer or presented as an offline load. This does not recall copies already delivered to the peer.
+If an authorized load exceeds its transfer budget, the agent SHALL return a typed, retryable remote-transfer error, never partial history. If the owner is unreachable, the agent MAY serve a complete local copy marked stale unless a known denial applies. A confirmed denial SHALL return an access error, with neither transfer fallback nor cache fallback. This does not recall copies already delivered to the peer.
 
 #### Scenario: Owner becomes unreachable mid-transfer
 - **WHEN** the owner stops responding before the recent window has been transferred
