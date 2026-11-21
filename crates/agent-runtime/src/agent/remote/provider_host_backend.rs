@@ -655,6 +655,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_stream_rejects_completion_and_suspends_a_faulty_binding() {
+        use querymt::chat::{FinishReason, StreamChunk};
+
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(40).await;
+        let upstream = futures_util::stream::iter([
+            Ok(StreamChunk::Usage(querymt::Usage {
+                input_tokens: 12,
+                output_tokens: 3,
+                ..Default::default()
+            })),
+            Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            }),
+        ]);
+        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Usage(_)))
+        ));
+        assert!(
+            matches!(stream.next().await, Some(Err(LLMError::ProviderResponseError(error)))
+            if error.code() == Some("mesh_quota_bound_exceeded"))
+        );
+        let charged = store.quota(&key, &scope, now).await.unwrap();
+        assert_eq!(charged.known_tokens, 15);
+        assert_eq!(charged.reserved_tokens, 0);
+        assert_eq!(charged.available_tokens, Some(25));
+        // The remaining balance can fit the advertised bound, but it is no
+        // longer trustworthy. A second upstream invocation would panic.
+        assert!(matches!(provider.chat_stream(&ChatCall::new(&[])).await,
+            Err(LLMError::ProviderResponseError(error)) if error.code() == Some("mesh_quota_unsupported")));
+        assert_eq!(store.quota(&key, &scope, now).await.unwrap(), charged);
+    }
+
+    #[tokio::test]
     async fn hosted_stream_revocation_wakes_a_pending_read_and_charges_bound() {
         use querymt::chat::StreamChunk;
         use std::time::Duration;

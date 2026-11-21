@@ -289,3 +289,70 @@ impl QuotaError {
             .into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::error::{LLMError, ProviderErrorKind};
+
+    #[test]
+    fn quota_denial_details_survive_the_provider_wire_and_stay_bound_to_the_error_code() {
+        let scope = QuotaScope {
+            provider_id: "fixture".into(),
+            model_id: Some("small".into()),
+        };
+        let limits = vec![LimitingQuota {
+            scope: scope.clone(),
+            available_tokens: 9_007_199_254_740_993,
+            next_reset_at: Some(1_800_000_000),
+        }];
+        for (denial, expected_kind, code, expected_details) in [
+            (
+                QuotaError::Exhausted(limits.clone()),
+                ProviderErrorKind::QuotaExceeded,
+                "mesh_quota_exhausted",
+                QuotaDenialDetails::Limits { limits },
+            ),
+            (
+                QuotaError::Unsupported(scope.clone()),
+                ProviderErrorKind::UnsupportedOperation,
+                "mesh_quota_unsupported",
+                QuotaDenialDetails::Scope { scope },
+            ),
+        ] {
+            let payload = denial.into_provider_error().to_payload();
+            let LLMError::ProviderResponseError(failure) = LLMError::from_payload(payload) else {
+                panic!("quota denial lost its provider failure type");
+            };
+            assert_eq!(failure.kind(), expected_kind);
+            assert_eq!(failure.code(), Some(code));
+            let details =
+                QuotaDenialDetails::from_provider_metadata(code, failure.error_type()).unwrap();
+            assert_eq!(
+                serde_json::to_value(details).unwrap(),
+                serde_json::to_value(expected_details).unwrap()
+            );
+            assert!(
+                QuotaDenialDetails::from_provider_metadata(
+                    "mesh_access_denied",
+                    failure.error_type()
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            QuotaDenialDetails::from_provider_metadata(
+                "mesh_quota_exhausted",
+                Some("rate_limited")
+            )
+            .is_none()
+        );
+        assert!(
+            QuotaDenialDetails::from_provider_metadata(
+                "mesh_quota_exhausted",
+                Some("querymt.mesh.quota.v1:bad-json")
+            )
+            .is_none()
+        );
+    }
+}

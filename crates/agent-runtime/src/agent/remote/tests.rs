@@ -1377,6 +1377,27 @@ mod node_manager_tests {
             ingress.handle_v1(peer, resume()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
+        let discover_owner = || async {
+            let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress
+                .handle_v1(
+                    peer,
+                    node_ask::<RemoteNodeManager, _>(manager.id(), &GetNodeInfo),
+                )
+                .await
+            else {
+                panic!("node discovery must be available independently of session sharing");
+            };
+            rmp_serde::from_slice::<crate::agent::remote::NodeInfo>(&bytes).unwrap()
+        };
+        let shared = discover_owner().await;
+        assert_eq!(shared.node_id.as_peer_id(), &host);
+        assert_eq!(shared.active_sessions, Some(1));
+        assert!(
+            !shared
+                .capabilities
+                .iter()
+                .any(|capability| capability == "shell")
+        );
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
                 manager.id(),
@@ -1484,6 +1505,10 @@ mod node_manager_tests {
             ingress.handle_v1(peer, resume()).await,
             Err(SharingRejection::Denied)
         ));
+        let denied = discover_owner().await;
+        assert_eq!(denied.node_id, shared.node_id);
+        assert_eq!(denied.active_sessions, None);
+        assert!(denied.capabilities.is_empty());
         assert!(
             session
                 .ask(crate::agent::messages::GetHistory)
@@ -1873,6 +1898,196 @@ mod node_manager_tests {
                 .is_err()
         );
         assert!(session.is_alive());
+    }
+
+    #[tokio::test]
+    async fn v1_unsubscribe_and_grant_revision_retire_the_forwarder() {
+        use crate::agent::messages::{
+            EventStreamPage, GetEventStreamSince, SubscribeEvents, UnsubscribeEvents,
+        };
+        use crate::agent::remote::EventRelayActor;
+        use crate::agent::remote::event_relay::RelayLagged;
+        use crate::agent::remote::remote_actor_impl::{
+            register_session_relay, register_session_routes,
+        };
+        use crate::error::AgentError;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::NodeId;
+        use querymt_remote::mesh_ingress::{MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let owner_mesh = bootstrap_guarded_lan(&dir).await;
+        let ingress = owner_mesh.inbound_router().unwrap();
+        let store = owner_mesh.quota_store().unwrap();
+        // Kameo exports fixture actors with the single process-local peer ID.
+        let peer = *owner_mesh.peer_id();
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(*owner_mesh.peer_id()),
+            peer: NodeId::from_peer_id(peer),
+        };
+        let grant = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            providers: vec![],
+        };
+        let initial = store.grant(&key).await.unwrap();
+        let allowed = store
+            .replace_grant(&key, initial.revision, grant.clone())
+            .await
+            .unwrap();
+        let (SessionActorRef::Local(session), id) =
+            spawn_test_session_with_id(config.clone(), "revision-bound-relay").await
+        else {
+            panic!("expected local fixture");
+        };
+        register_session_routes(&owner_mesh, &session);
+        let (viewer, _viewer_dir) = test_agent_config().await;
+        let relay = EventRelayActor::spawn(
+            EventRelayActor::new(
+                viewer.event_sink.clone(),
+                id.clone(),
+                "test relay".into(),
+                Some(peer.to_string()),
+                None,
+            )
+            .with_gap_source(SessionActorRef::Local(session.clone())),
+        );
+        register_session_relay(ingress, &relay, peer, &id);
+        let relay_ref = relay.into_remote_ref().await;
+        let relay_actor_id = relay_ref.id().sequence_id();
+        let relay_name = "revision-bound-relay";
+        let subscribe = || {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &SubscribeEvents {
+                    relay_actor_id,
+                    relay_ref: Some(relay_ref.clone()),
+                    relay_dht_name: Some(relay_name.into()),
+                    after_source_seq: None,
+                },
+            )
+        };
+        let unsubscribe = |name: &str| {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &UnsubscribeEvents {
+                    relay_actor_id,
+                    relay_dht_name: name.into(),
+                },
+            )
+        };
+        let replay = || {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &GetEventStreamSince {
+                    after_source_seq: None,
+                    limit: 10,
+                },
+            )
+        };
+        let fanout = config.event_sink.fanout();
+        let baseline = fanout.subscriber_count();
+        let wait_for_retirement = || async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while fanout.subscriber_count() != baseline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("forwarder did not release its subscription");
+        };
+
+        assert!(matches!(
+            ingress.handle_v1(peer, subscribe()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        assert!(matches!(
+            ingress.handle_v1(peer, unsubscribe("other-name")).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        assert_eq!(fanout.subscriber_count(), baseline + 1);
+        assert!(matches!(
+            ingress.handle_v1(peer, unsubscribe(relay_name)).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        wait_for_retirement().await;
+
+        assert!(matches!(
+            ingress.handle_v1(peer, subscribe()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        let revoked = store
+            .replace_grant(&key, allowed.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ingress.handle_v1(peer, replay()).await,
+            Err(SharingRejection::Denied)
+        ));
+        store
+            .replace_grant(&key, revoked.revision, grant)
+            .await
+            .unwrap();
+        wait_for_retirement().await;
+
+        config
+            .emit_event_persisted(&id, AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, replay()).await else {
+            panic!("a fresh history request must use the current grant");
+        };
+        let page: EventStreamPage = rmp_serde::from_slice(&bytes).unwrap();
+        let [event] = page.events.as_slice() else {
+            panic!("expected the durable event written after regrant");
+        };
+        assert_eq!(event.session_id, id);
+        assert!(matches!(event.kind, AgentEventKind::SessionCreated));
+
+        // A lag notice is an owner-to-viewer callback, not a session-grant RPC.
+        // The relay still requires both the attached owner and the attached session.
+        let lag = |session_id: &str| {
+            node_ask::<EventRelayActor, _>(
+                relay.id(),
+                &RelayLagged {
+                    session_id: session_id.into(),
+                    skipped: 1,
+                },
+            )
+        };
+        for (sender, session_id) in [(libp2p::PeerId::random(), id.as_str()), (peer, "other")] {
+            let Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(error)))) =
+                ingress.handle_v1(sender, lag(session_id)).await
+            else {
+                panic!("lag notice did not match the attachment");
+            };
+            assert!(matches!(
+                rmp_serde::from_slice::<AgentError>(&error).unwrap(),
+                AgentError::MeshAccessDenied
+            ));
+        }
+        let mut events = viewer.event_sink.fanout().subscribe();
+        assert!(matches!(
+            ingress.handle_v1(peer, lag(&id)).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        let recovered = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .expect("lag notice should recover a durable tail without another live event")
+            .unwrap();
+        assert_eq!(recovered.session_id(), id);
+        assert!(matches!(recovered.kind(), AgentEventKind::SessionCreated));
+        assert_eq!(
+            viewer
+                .event_sink
+                .journal()
+                .latest_source_seq(&id, &peer.to_string())
+                .await
+                .unwrap(),
+            Some(event.seq)
+        );
+        owner_mesh.shutdown().await;
     }
 
     #[tokio::test]

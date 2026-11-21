@@ -2193,6 +2193,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_discovers_owner_and_replaces_only_the_failed_generation() {
+        use crate::agent::remote::scope::{
+            MeshScopeId, scoped_node_manager_for_peer, scoped_session,
+        };
+        use crate::agent::remote::test_helpers::fixtures::{NodeManagerFixture, get_test_mesh};
+
+        let mesh = get_test_mesh().await;
+        let owner = NodeManagerFixture::new_with_mesh().await;
+        let (viewer, storage, _dir) = handle_with_real_storage().await;
+        viewer.set_mesh(mesh.clone());
+        let node_id = mesh.peer_id().to_string();
+        let scope = MeshScopeId::lan_default();
+        let manager_name = scoped_node_manager_for_peer(&scope, &node_id);
+        mesh.register_actor(owner.actor_ref.clone(), manager_name.clone())
+            .await;
+        let session_id = owner
+            .config
+            .provider
+            .history_store()
+            .create_session(Some("owner session".into()), None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        storage
+            .session_store()
+            .save_remote_session_bookmark(&test_bookmark(&session_id, &node_id))
+            .await
+            .unwrap();
+        let first_event = owner
+            .config
+            .emit_event_persisted(
+                &session_id,
+                AgentEventKind::PromptReceived {
+                    content: "before attach".into(),
+                    message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A persisted owner session with no live publication must be resumed
+        // through the manager registered under that owner's peer ID.
+        let first = viewer
+            .ensure_remote_session_connected(&session_id, None, RemoteConnectReason::Open)
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, RemoteConnectOutcome::Resumed);
+        let current = viewer
+            .ensure_remote_session_connected(
+                &session_id,
+                None,
+                RemoteConnectReason::ExplicitReconnect,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.outcome, RemoteConnectOutcome::Reattached);
+        assert_ne!(current.attachment_id, first.attachment_id);
+        let stale_recovery = viewer
+            .connect_remote_session(
+                &session_id,
+                RemoteConnectOptions {
+                    node_hint: None,
+                    peer_label: None,
+                    preferred_scope: None,
+                    reason: RemoteConnectReason::OperationRecovery,
+                    replace: RemoteReplacePolicy::ReplaceIfMatches(first.attachment_id),
+                    handoff: None,
+                    windowed: false,
+                    fork_origin: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_recovery.outcome, RemoteConnectOutcome::Reused);
+        assert_eq!(stale_recovery.attachment_id, current.attachment_id);
+
+        viewer
+            .sync_remote_for_load(&session_id, &current, false)
+            .await
+            .unwrap();
+
+        // Overflow the forwarder's live queue after persisting a session event.
+        // Only unrelated events remain in the queue, so no later matching event
+        // can reveal the missing tail. The forwarder's lag notice must recover it.
+        use querymt_agent_core::events::{EphemeralEvent, EventEnvelope, EventOrigin};
+        let mut live = viewer.config.event_sink.fanout().subscribe();
+        let missed = owner
+            .config
+            .emit_event_persisted(
+                &session_id,
+                AgentEventKind::PromptReceived {
+                    content: "missed live event".into(),
+                    message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let unrelated = EventEnvelope::Ephemeral(EphemeralEvent {
+            session_id: "unrelated-session".into(),
+            session_seq: 0,
+            timestamp: missed.timestamp,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::Cancelled,
+        });
+        for _ in 0..4096 {
+            owner.config.event_sink.fanout().publish(unrelated.clone());
+        }
+        let recovered = tokio::time::timeout(Duration::from_secs(3), live.recv())
+            .await
+            .expect("the relay should recover the dropped durable tail")
+            .unwrap();
+        assert!(matches!(
+            recovered.kind(),
+            AgentEventKind::PromptReceived { content, .. } if content == "missed live event"
+        ));
+        let replay = viewer
+            .remote_session_events_from_journal(&session_id, &current.session_ref)
+            .await
+            .unwrap()
+            .unwrap();
+        let prompts = replay
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                AgentEventKind::PromptReceived { content, .. } => {
+                    Some((entry.seq, content.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prompts,
+            vec![
+                (first_event.stream_seq, "before attach"),
+                (missed.stream_seq, "missed live event")
+            ]
+        );
+
+        let attachment = viewer
+            .registry
+            .lock()
+            .await
+            .take_remote_attachment(&session_id)
+            .unwrap();
+        assert_eq!(attachment.attachment_id, current.attachment_id);
+        crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
+        mesh.deregister_actor(&scoped_session(&scope, &session_id));
+        mesh.deregister_actor(&manager_name);
+    }
+
+    #[tokio::test]
     async fn conflicting_node_hint_cannot_change_bookmark() {
         let (handle, storage, _tmp) = handle_with_real_storage().await;
         let bookmark = test_bookmark("owner-check", "owner");
