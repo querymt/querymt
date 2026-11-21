@@ -25,8 +25,6 @@ const SITES: &[(&str, usize, Class)] = &[
     ("delegation/summarizer.rs", 2, Class::Recorded),
     // `SessionHandle::submit_request`, which requires a `DispatchLedger`.
     ("session/provider.rs", 1, Class::Recorded),
-    // Turn-pinned provider wrapper adds the peer quota ledger to these dispatches.
-    ("agent/remote/provider_host_backend.rs", 2, Class::Recorded),
     // `Agent::chat` / `AgentRunner::chat` run a normal prompt cycle.
     ("runner.rs", 1, Class::AgentApi),
 ];
