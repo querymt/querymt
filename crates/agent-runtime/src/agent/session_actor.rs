@@ -564,13 +564,6 @@ impl TurnAuthority {
     }
 }
 
-/// Mailbox-only request; peer authority is supplied by authenticated mesh ingress.
-#[cfg(feature = "remote")]
-pub(crate) struct PeerTurnMessage<M> {
-    pub(crate) message: M,
-    pub(crate) authority: TurnAuthority,
-}
-
 struct QueuedPrompt {
     input_id: String,
     authority: TurnAuthority,
@@ -978,35 +971,18 @@ impl SessionActor {
 // 4. Matching PromptFinished resets token and clears prompt_running.
 
 impl Message<Cancel> for SessionActor {
-    type Reply = ();
-
-    async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        self.cancel_turn().await;
-    }
-}
-
-#[cfg(feature = "remote")]
-impl Message<PeerTurnMessage<Cancel>> for SessionActor {
     type Reply = Result<(), AgentError>;
 
-    async fn handle(
-        &mut self,
-        msg: PeerTurnMessage<Cancel>,
-        _: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    async fn handle(&mut self, msg: Cancel, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
         msg.authority.check().await?;
         if self.active_run.is_some() {
             if !msg.authority.can_control(&self.active_authority) {
                 return Err(AgentError::MeshAccessDenied);
             }
-            self.cancel_turn().await;
+        } else if !matches!(msg.authority, TurnAuthority::Local) {
+            return Ok(());
         }
-        Ok(())
-    }
-}
 
-impl SessionActor {
-    async fn cancel_turn(&mut self) {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
         let cancelled_elicitations = crate::elicitation::cancel_pending_elicitations_for_session(
@@ -1045,6 +1021,7 @@ impl SessionActor {
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
         self.publish_runtime().await;
+        Ok(())
     }
 }
 
@@ -1787,30 +1764,9 @@ impl Message<GetRuntimeStatus> for SessionActor {
 
     async fn handle(
         &mut self,
-        _msg: GetRuntimeStatus,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        Ok(self.observe_runtime().await)
-    }
-}
-
-#[cfg(feature = "remote")]
-impl Message<PeerTurnMessage<GetRuntimeStatus>> for SessionActor {
-    type Reply = Result<SessionRuntimeStatus, AgentError>;
-
-    async fn handle(
-        &mut self,
-        msg: PeerTurnMessage<GetRuntimeStatus>,
+        msg: GetRuntimeStatus,
         _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let mut status = self.observe_runtime().await;
-        status.steerable &= msg.authority.can_control(&self.active_authority);
-        Ok(status)
-    }
-}
-
-impl SessionActor {
-    async fn observe_runtime(&mut self) -> SessionRuntimeStatus {
         let pending_steering_count = match &self.active_run {
             Some(run) => run.steering.pending_count().await,
             None => 0,
@@ -1818,7 +1774,9 @@ impl SessionActor {
         if pending_steering_count != self.published_pending_steering {
             self.emit_runtime_changed(pending_steering_count);
         }
-        self.runtime_status(pending_steering_count)
+        let mut status = self.runtime_status(pending_steering_count);
+        status.steerable &= msg.authority.can_control(&self.active_authority);
+        Ok(status)
     }
 }
 
@@ -2618,34 +2576,10 @@ impl Message<SubmitSessionInput> for SessionActor {
         msg: SubmitSessionInput,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.submit_input(msg, &TurnAuthority::Local, ctx.actor_ref())
-            .await
-    }
-}
-
-#[cfg(feature = "remote")]
-impl Message<PeerTurnMessage<SubmitSessionInput>> for SessionActor {
-    type Reply = Result<SubmitInputResult, AgentError>;
-
-    async fn handle(
-        &mut self,
-        msg: PeerTurnMessage<SubmitSessionInput>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.submit_input(msg.message, &msg.authority, ctx.actor_ref())
-            .await
-    }
-}
-
-impl SessionActor {
-    async fn submit_input(
-        &mut self,
-        msg: SubmitSessionInput,
-        authority: &TurnAuthority,
-        actor_ref: &kameo::actor::ActorRef<Self>,
-    ) -> Result<SubmitInputResult, AgentError> {
+        let SubmitSessionInput { input, authority } = msg;
+        let authority = &authority;
+        let actor_ref = ctx.actor_ref();
         authority.check().await?;
-        let input = msg.input;
         if input.session_id != self.session_id {
             return Err(AgentError::from(TurnControlError::SessionMismatch {
                 expected: self.session_id.clone(),
@@ -2833,33 +2767,13 @@ impl Message<DiscardQueuedInput> for SessionActor {
     async fn handle(
         &mut self,
         msg: DiscardQueuedInput,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.discard_queued_input(msg, &TurnAuthority::Local).await
-    }
-}
-
-#[cfg(feature = "remote")]
-impl Message<PeerTurnMessage<DiscardQueuedInput>> for SessionActor {
-    type Reply = Result<DiscardQueuedInputResult, AgentError>;
-
-    async fn handle(
-        &mut self,
-        msg: PeerTurnMessage<DiscardQueuedInput>,
         _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.discard_queued_input(msg.message, &msg.authority).await
-    }
-}
-
-impl SessionActor {
-    async fn discard_queued_input(
-        &mut self,
-        msg: DiscardQueuedInput,
-        authority: &TurnAuthority,
-    ) -> Result<DiscardQueuedInputResult, AgentError> {
+        let DiscardQueuedInput {
+            input_id,
+            authority,
+        } = msg;
         authority.check().await?;
-        let input_id = msg.input_id;
         let Some(position) = self.queued_prompts.iter().position(|queued| {
             queued.input_id == input_id && authority.can_control(&queued.authority)
         }) else {
@@ -2892,25 +2806,7 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let queued = self
-            .enqueue_prompt(msg, TurnAuthority::Local, ctx.actor_ref())
-            .await;
-        ctx.spawn(wait_for_prompt_reply(queued))
-    }
-}
-
-#[cfg(feature = "remote")]
-impl Message<PeerTurnMessage<Prompt>> for SessionActor {
-    type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
-
-    async fn handle(
-        &mut self,
-        msg: PeerTurnMessage<Prompt>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let queued = self
-            .enqueue_prompt(msg.message, msg.authority, ctx.actor_ref())
-            .await;
+        let queued = self.enqueue_prompt(msg, ctx.actor_ref()).await;
         ctx.spawn(wait_for_prompt_reply(queued))
     }
 }
@@ -2929,9 +2825,9 @@ impl SessionActor {
     async fn enqueue_prompt(
         &mut self,
         msg: Prompt,
-        authority: TurnAuthority,
         actor_ref: &kameo::actor::ActorRef<Self>,
     ) -> Result<PromptReceiver, AgentError> {
+        let authority = msg.authority;
         authority.check().await?;
         if msg.req.session_id.0.as_ref() != self.session_id {
             return Err(TurnControlError::SessionMismatch {
@@ -4850,17 +4746,15 @@ mod tests {
     }
 
     fn text_submit(session_id: &str, text: &str) -> SubmitSessionInput {
-        SubmitSessionInput {
-            input: SubmitInput {
-                session_id: session_id.to_string(),
-                client_input_id: None,
-                expected_run_id: None,
-                delivery: InputDelivery::Queue,
-                prompt: vec![crate::acp::protocol::ContentBlock::Text(
-                    crate::acp::protocol::TextContent::new(text),
-                )],
-            },
-        }
+        SubmitSessionInput::new(SubmitInput {
+            session_id: session_id.to_string(),
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        })
     }
 
     async fn seed_orphan(f: &ActorFixture, run_id: &str) {
@@ -6419,15 +6313,13 @@ mod tests {
         });
         let mut events = fixture.config.subscribe_events();
         actor_ref
-            .ask(SubmitSessionInput {
-                input: SubmitInput {
-                    session_id: exec.session_id.clone(),
-                    client_input_id: Some("steer-once".into()),
-                    expected_run_id: Some(held_run_id.to_string()),
-                    delivery: InputDelivery::Steer,
-                    prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
-                },
-            })
+            .ask(SubmitSessionInput::new(SubmitInput {
+                session_id: exec.session_id.clone(),
+                client_input_id: Some("steer-once".into()),
+                expected_run_id: Some(held_run_id.to_string()),
+                delivery: InputDelivery::Steer,
+                prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
+            }))
             .await
             .unwrap();
         let before = actor_ref.ask(GetRuntimeStatus).await.unwrap();
@@ -7192,23 +7084,19 @@ mod tests {
         let mut events = fixture.config.subscribe_events();
         for input_id in ["queued-1", "queued-2"] {
             actor_ref
-                .ask(SubmitSessionInput {
-                    input: SubmitInput {
-                        session_id: session_id.clone(),
-                        client_input_id: Some(input_id.to_string()),
-                        expected_run_id: None,
-                        delivery: InputDelivery::Queue,
-                        prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
-                    },
-                })
+                .ask(SubmitSessionInput::new(SubmitInput {
+                    session_id: session_id.clone(),
+                    client_input_id: Some(input_id.to_string()),
+                    expected_run_id: None,
+                    delivery: InputDelivery::Queue,
+                    prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
+                }))
                 .await
                 .expect("queue input");
         }
 
         let discarded = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-1".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-1".to_string()))
             .await
             .expect("discard queued input");
         assert_eq!(
@@ -7227,9 +7115,7 @@ mod tests {
         );
 
         let repeated = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-1".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-1".to_string()))
             .await
             .expect("repeat discard queued input");
         assert_eq!(
@@ -7321,14 +7207,14 @@ mod tests {
             CancellationToken::new(),
         ));
         let actor_ref = SessionActor::spawn(actor);
-        let submit = || SubmitSessionInput {
-            input: SubmitInput {
+        let submit = || {
+            SubmitSessionInput::new(SubmitInput {
                 session_id: session_id.clone(),
                 client_input_id: Some("queued-failure".to_string()),
                 expected_run_id: None,
                 delivery: InputDelivery::Queue,
                 prompt: vec![crate::acp::protocol::ContentBlock::from("queued")],
-            },
+            })
         };
 
         fixture.event_journal.fail_next_append();
@@ -7359,9 +7245,7 @@ mod tests {
 
         fixture.event_journal.fail_next_append();
         let failed_discard = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-failure".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-failure".to_string()))
             .await;
         assert!(matches!(
             failed_discard,
@@ -7378,9 +7262,7 @@ mod tests {
         );
 
         let discarded = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-failure".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-failure".to_string()))
             .await
             .expect("discard retry should succeed");
         assert_eq!(
@@ -7481,14 +7363,12 @@ mod tests {
 
         let first = f
             .actor_ref
-            .ask(SubmitSessionInput {
-                input: input.clone(),
-            })
+            .ask(SubmitSessionInput::new(input.clone()))
             .await
             .expect("first keyed submission should be acknowledged");
         let second = f
             .actor_ref
-            .ask(SubmitSessionInput { input })
+            .ask(SubmitSessionInput::new(input))
             .await
             .expect("duplicate keyed submission should return the cached receipt");
 

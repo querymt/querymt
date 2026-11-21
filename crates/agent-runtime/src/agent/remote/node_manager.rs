@@ -361,14 +361,29 @@ mod remote_impl {
         Delete,
     }
 
-    trait PeerScheduleAction: Send + 'static {
+    impl ScheduleAction {
+        async fn apply(
+            self,
+            scheduler: &crate::scheduler::SchedulerHandle,
+            id: &str,
+        ) -> Result<(), crate::session::error::SessionError> {
+            match self {
+                Self::Pause => scheduler.pause_schedule(id).await,
+                Self::Resume => scheduler.resume_schedule(id).await,
+                Self::Trigger => scheduler.trigger_now(id).await,
+                Self::Delete => scheduler.remove_schedule(id).await,
+            }
+        }
+    }
+
+    trait RemoteScheduleAction: Send + 'static {
         const ACTION: ScheduleAction;
         fn schedule_id(&self) -> &str;
     }
 
-    macro_rules! peer_schedule_action {
+    macro_rules! remote_schedule_action {
         ($message:ty, $action:ident) => {
-            impl PeerScheduleAction for $message {
+            impl RemoteScheduleAction for $message {
                 const ACTION: ScheduleAction = ScheduleAction::$action;
                 fn schedule_id(&self) -> &str {
                     &self.schedule_public_id
@@ -377,10 +392,10 @@ mod remote_impl {
         };
     }
 
-    peer_schedule_action!(PauseRemoteSchedule, Pause);
-    peer_schedule_action!(ResumeRemoteSchedule, Resume);
-    peer_schedule_action!(TriggerRemoteSchedule, Trigger);
-    peer_schedule_action!(DeleteRemoteSchedule, Delete);
+    remote_schedule_action!(PauseRemoteSchedule, Pause);
+    remote_schedule_action!(ResumeRemoteSchedule, Resume);
+    remote_schedule_action!(TriggerRemoteSchedule, Trigger);
+    remote_schedule_action!(DeleteRemoteSchedule, Delete);
 
     /// Shut down the live runtime actor for a session on this node.
     ///
@@ -2074,7 +2089,7 @@ mod remote_impl {
         }
     }
 
-    impl<M: PeerScheduleAction> Message<PeerNodeRequest<M>> for RemoteNodeManager {
+    impl<M: RemoteScheduleAction> Message<PeerNodeRequest<M>> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
 
         async fn handle(
@@ -2100,13 +2115,10 @@ mod remote_impl {
                     return Err(AgentError::MeshAccessDenied);
                 }
                 authority.check().await?;
-                match M::ACTION {
-                    ScheduleAction::Pause => scheduler.pause_schedule(id).await,
-                    ScheduleAction::Resume => scheduler.resume_schedule(id).await,
-                    ScheduleAction::Trigger => scheduler.trigger_now(id).await,
-                    ScheduleAction::Delete => scheduler.remove_schedule(id).await,
-                }
-                .map_err(|error| AgentError::Internal(error.to_string()))
+                M::ACTION
+                    .apply(&scheduler, id)
+                    .await
+                    .map_err(|error| AgentError::Internal(error.to_string()))
             })
         }
     }
@@ -2129,84 +2141,17 @@ mod remote_impl {
         }
     }
 
-    impl Message<PauseRemoteSchedule> for RemoteNodeManager {
+    impl<M: RemoteScheduleAction> Message<M> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
 
-        async fn handle(
-            &mut self,
-            msg: PauseRemoteSchedule,
-            ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
+        async fn handle(&mut self, msg: M, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
             let shared_state = self.shared_state.clone();
-            let schedule_public_id = msg.schedule_public_id.clone();
+            let id = msg.schedule_id().to_owned();
             ctx.spawn(async move {
                 shared_state
                     .run_schedule_action(|scheduler| {
-                        let schedule_public_id = schedule_public_id.clone();
-                        async move { scheduler.pause_schedule(&schedule_public_id).await }
-                    })
-                    .await
-            })
-        }
-    }
-
-    impl Message<ResumeRemoteSchedule> for RemoteNodeManager {
-        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
-
-        async fn handle(
-            &mut self,
-            msg: ResumeRemoteSchedule,
-            ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
-            let shared_state = self.shared_state.clone();
-            let schedule_public_id = msg.schedule_public_id.clone();
-            ctx.spawn(async move {
-                shared_state
-                    .run_schedule_action(|scheduler| {
-                        let schedule_public_id = schedule_public_id.clone();
-                        async move { scheduler.resume_schedule(&schedule_public_id).await }
-                    })
-                    .await
-            })
-        }
-    }
-
-    impl Message<TriggerRemoteSchedule> for RemoteNodeManager {
-        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
-
-        async fn handle(
-            &mut self,
-            msg: TriggerRemoteSchedule,
-            ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
-            let shared_state = self.shared_state.clone();
-            let schedule_public_id = msg.schedule_public_id.clone();
-            ctx.spawn(async move {
-                shared_state
-                    .run_schedule_action(|scheduler| {
-                        let schedule_public_id = schedule_public_id.clone();
-                        async move { scheduler.trigger_now(&schedule_public_id).await }
-                    })
-                    .await
-            })
-        }
-    }
-
-    impl Message<DeleteRemoteSchedule> for RemoteNodeManager {
-        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
-
-        async fn handle(
-            &mut self,
-            msg: DeleteRemoteSchedule,
-            ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
-            let shared_state = self.shared_state.clone();
-            let schedule_public_id = msg.schedule_public_id.clone();
-            ctx.spawn(async move {
-                shared_state
-                    .run_schedule_action(|scheduler| {
-                        let schedule_public_id = schedule_public_id.clone();
-                        async move { scheduler.remove_schedule(&schedule_public_id).await }
+                        let id = id.clone();
+                        async move { M::ACTION.apply(&scheduler, &id).await }
                     })
                     .await
             })

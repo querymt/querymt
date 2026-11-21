@@ -369,7 +369,7 @@ impl SessionActorRef {
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::Prompt { req })
+                .ask(messages::Prompt::new(req))
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
@@ -377,7 +377,7 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                let message = messages::Prompt { req };
+                let message = messages::Prompt::new(req);
                 if let Some(mesh) = mesh
                     .as_deref()
                     .filter(|mesh| mesh.inbound_router().is_some())
@@ -429,11 +429,10 @@ impl SessionActorRef {
             let Self::Local(actor) = self else {
                 return Err(AcpError::from(AgentError::MeshAccessDenied));
             };
+            let mut message = messages::Prompt::new(req);
+            message.authority = authority.clone();
             return actor
-                .ask(crate::agent::session_actor::PeerTurnMessage {
-                    message: messages::Prompt { req },
-                    authority: authority.clone(),
-                })
+                .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error)
                 .map_err(AcpError::from);
@@ -450,7 +449,7 @@ impl SessionActorRef {
         &self,
         input: messages::SubmitInput,
     ) -> Result<messages::SubmitInputResult, AgentError> {
-        let message = messages::SubmitSessionInput { input };
+        let message = messages::SubmitSessionInput::new(input);
         match self {
             Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
                 kameo::error::SendError::HandlerError(error) => error,
@@ -584,7 +583,7 @@ impl SessionActorRef {
         &self,
         input_id: String,
     ) -> Result<messages::DiscardQueuedInputResult, AgentError> {
-        let message = messages::DiscardQueuedInput { input_id };
+        let message = messages::DiscardQueuedInput::new(input_id);
         match self {
             Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
                 kameo::error::SendError::HandlerError(error) => error,

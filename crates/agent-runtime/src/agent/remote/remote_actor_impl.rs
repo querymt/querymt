@@ -19,11 +19,10 @@ use crate::agent::messages;
 use crate::agent::remote::event_forwarder::PeerSubscription;
 use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 use crate::agent::session_actor::{
-    PeerTurn, PeerTurnMessage, SessionActor, SubscribePeerEvents, TurnAuthority,
-    UnsubscribePeerEvents,
+    PeerTurn, SessionActor, SubscribePeerEvents, TurnAuthority, UnsubscribePeerEvents,
 };
 use crate::error::AgentError;
-use kameo::actor::{ActorRef, WeakActorRef};
+use kameo::actor::ActorRef;
 use kameo::message::Message;
 use kameo::remote::{_internal, RemoteActor, RemoteMessage};
 use kameo::reply::Reply;
@@ -113,45 +112,40 @@ pub(super) fn register_session_turns(
         &store,
         actor,
         Duration::from_secs(600),
-        InboundAccess::Sessions,
+        InboundDelivery::Ask,
+        |msg| &mut msg.authority,
     );
     register_peer_session_ask::<messages::SubmitSessionInput, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
-        InboundAccess::Sessions,
+        InboundDelivery::Ask,
+        |msg| &mut msg.authority,
     );
     register_peer_session_ask::<messages::DiscardQueuedInput, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
-        InboundAccess::Sessions,
+        InboundDelivery::Ask,
+        |msg| &mut msg.authority,
     );
-
     register_peer_session_ask::<messages::GetRuntimeStatus, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
-        InboundAccess::Sessions,
+        InboundDelivery::Ask,
+        |msg| &mut msg.authority,
     );
-    let weak = actor.downgrade();
-    let cancel = move |origin, message| {
-        send_peer_turn(
-            weak.clone(),
-            store.clone(),
-            origin,
-            message,
-            Duration::from_secs(10),
-        )
-    };
-    router.register::<SessionActor, messages::Cancel, _, _, _, _>(
-        actor.id(),
+    register_peer_session_ask::<messages::Cancel, _>(
+        router,
+        &store,
+        actor,
+        Duration::from_secs(10),
         InboundDelivery::LegacyTellV1Ask,
-        InboundAccess::Sessions,
-        cancel,
+        |msg| &mut msg.authority,
     );
 }
 
@@ -160,50 +154,41 @@ fn register_peer_session_ask<M, R>(
     store: &Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
     timeout: Duration,
-    v1_access: InboundAccess,
+    delivery: InboundDelivery,
+    authority: fn(&mut M) -> &mut TurnAuthority,
 ) where
-    SessionActor: RemoteMessage<M> + Message<PeerTurnMessage<M>>,
+    SessionActor: RemoteMessage<M> + Message<M>,
     M: serde::de::DeserializeOwned + Send + 'static,
-    <SessionActor as Message<PeerTurnMessage<M>>>::Reply: Reply<Ok = R, Error = AgentError>,
+    <SessionActor as Message<M>>::Reply: Reply<Ok = R>,
+    <<SessionActor as Message<M>>::Reply as Reply>::Error: Into<AgentError>,
     R: serde::Serialize + Send + 'static,
 {
     let weak = actor.downgrade();
     let store = store.clone();
-    let handle = move |origin, message| {
-        send_peer_turn(weak.clone(), store.clone(), origin, message, timeout)
+    let handle = move |origin: PeerRequest, mut message: M| {
+        let weak = weak.clone();
+        let store = store.clone();
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+            *authority(&mut message) =
+                TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store)?));
+            actor
+                .ask(message)
+                .mailbox_timeout(Duration::from_secs(10))
+                .reply_timeout(timeout)
+                .send()
+                .await
+                .map_err(|error| local_session_error(error.map_err(Into::into)))
+        }
     };
     router.register::<SessionActor, M, _, _, _, _>(
         actor.id(),
-        InboundDelivery::Ask,
-        v1_access,
+        delivery,
+        InboundAccess::Sessions,
         handle,
     );
-}
-
-async fn send_peer_turn<M, R>(
-    weak: WeakActorRef<SessionActor>,
-    store: Arc<dyn GrantStore>,
-    origin: PeerRequest,
-    message: M,
-    timeout: Duration,
-) -> Result<R, AgentError>
-where
-    SessionActor: Message<PeerTurnMessage<M>>,
-    M: Send + 'static,
-    <SessionActor as Message<PeerTurnMessage<M>>>::Reply: Reply<Ok = R, Error = AgentError>,
-    R: Send + 'static,
-{
-    let actor = weak
-        .upgrade()
-        .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
-    let authority = TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store)?));
-    actor
-        .ask(PeerTurnMessage { authority, message })
-        .mailbox_timeout(Duration::from_secs(10))
-        .reply_timeout(timeout)
-        .send()
-        .await
-        .map_err(local_session_error)
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {

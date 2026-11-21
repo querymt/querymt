@@ -1521,7 +1521,7 @@ mod node_manager_tests {
     async fn guarded_turns_do_not_control_owner_work_and_recheck_on_revocation() {
         use crate::agent::messages::{
             Cancel, DiscardQueuedInput, DiscardQueuedInputResult, GetRuntimeStatus, InputDelivery,
-            SubmitInput, SubmitInputResult, SubmitSessionInput,
+            Prompt, SubmitInput, SubmitInputResult, SubmitSessionInput,
         };
         use crate::agent::remote::remote_actor_impl::register_session_turns;
         use crate::error::AgentError;
@@ -1596,14 +1596,14 @@ mod node_manager_tests {
         };
         let ingress = InboundRouter::new(host, store.clone());
         register_session_turns(&ingress, store.clone(), &session);
-        let input = |delivery, expected_run_id| SubmitSessionInput {
-            input: SubmitInput {
+        let input = |delivery, expected_run_id| {
+            SubmitSessionInput::new(SubmitInput {
                 session_id: id.clone(),
                 client_input_id: Some("same-key".into()),
                 expected_run_id,
                 delivery,
                 prompt: vec!["inert prompt".into()],
-            },
+            })
         };
         let queue =
             || node_ask::<SessionActor, _>(session.id(), &input(InputDelivery::Queue, None));
@@ -1651,6 +1651,41 @@ mod node_manager_tests {
             Err(SharingRejection::Denied)
         ));
         set_grant(PeerGrant::Full);
+        let legacy_cancel = kameo::remote::messaging::SwarmRequest::Tell {
+            actor_id: session.id(),
+            actor_remote_id: "querymt::SessionActor".into(),
+            message_remote_id: "querymt::Cancel".into(),
+            payload: vec![0x90], // Legacy MessagePack unit struct.
+            mailbox_timeout: None,
+            immediate: false,
+        };
+        assert!(matches!(
+            ingress.handle_legacy(peer, legacy_cancel).await,
+            SwarmResponse::Tell(Ok(()))
+        ));
+
+        let mut prompt = Prompt::new(crate::acp::protocol::PromptRequest::new(id.clone(), vec![]));
+        let legacy_payload = rmp_serde::to_vec_named(&prompt).unwrap();
+        prompt.authority = crate::agent::session_actor::PeerTurn::test_authority(
+            store.1.lock().revision,
+            store.clone(),
+        );
+        assert_eq!(rmp_serde::to_vec_named(&prompt).unwrap(), legacy_payload);
+        let decoded: Prompt = rmp_serde::from_slice(&legacy_payload).unwrap();
+        assert!(matches!(
+            decoded.authority,
+            crate::agent::session_actor::TurnAuthority::Local
+        ));
+        let response = ingress
+            .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &prompt))
+            .await;
+        let Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(bytes)))) = response else {
+            panic!("expected Prompt to return a typed handler error: {response:?}");
+        };
+        assert!(matches!(
+            rmp_serde::from_slice::<AgentError>(&bytes).unwrap(),
+            AgentError::InvalidPromptContent { .. }
+        ));
 
         let SubmitInputResult::Started {
             run_id: owner_run, ..
@@ -1700,18 +1735,14 @@ mod node_manager_tests {
             SubmitInputResult::Queued { input_id, .. } if input_id == peer_input)
         );
         let owner_queue = session
-            .ask(SubmitSessionInput {
-                input: SubmitInput {
-                    client_input_id: Some("owner-pending".into()),
-                    ..input(InputDelivery::Queue, None).input
-                },
-            })
+            .ask(SubmitSessionInput::new(SubmitInput {
+                client_input_id: Some("owner-pending".into()),
+                ..input(InputDelivery::Queue, None).input
+            }))
             .await
             .unwrap();
         assert!(matches!(owner_queue, SubmitInputResult::Queued { .. }));
-        let discard = DiscardQueuedInput {
-            input_id: "owner-pending".into(),
-        };
+        let discard = DiscardQueuedInput::new("owner-pending".into());
         let result = ingress
             .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &discard))
             .await
