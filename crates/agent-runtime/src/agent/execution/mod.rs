@@ -674,7 +674,11 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref request,
             } => {
                 llm_request_count = llm_request_count.saturating_add(1);
-                task_completion_tool_available = has_effective_task_completion_tool(&request.tools);
+                // `request.tools` is the baseline's list; tool changes in the
+                // messages add or remove tools after it, so read them too.
+                task_completion_tool_available = has_effective_task_completion_tool(
+                    &tool_history::effective_tools(&request.tools, &request.messages),
+                );
                 let span = tracing::Span::current();
                 span.record("llm_request_count", llm_request_count as u64);
                 span.record("completion_guard_available", task_completion_tool_available);

@@ -10,9 +10,7 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::{BillingClass, ModelPricing};
 use querymt::{
     LLMProvider,
-    chat::{
-        ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions, PromptCacheCapabilities,
-    },
+    chat::{ChatMessage, ChatRole, GenerationOptions, PromptCacheCapabilities},
     error::LLMError,
     plugin::LLMProviderFactory,
 };
@@ -806,8 +804,12 @@ impl SessionProvider {
             return unchanged(config, None);
         }
 
+        // The pruned configuration keeps only the keys the provider's schema
+        // lists, so two providers can end up with the same text. What a
+        // configuration declares depends on the provider that reads it.
         let key = {
             let mut hasher = DefaultHasher::new();
+            factory.name().hash(&mut hasher);
             config.hash(&mut hasher);
             hasher.finish()
         };
@@ -1164,61 +1166,6 @@ impl SessionHandle {
         provider.call_tool(name, args).await
     }
 
-    /// Submit a chat call to the LLM without auto-saving.
-    ///
-    /// Per-request options the provider does not honour are dropped (see
-    /// [`supported_overrides`]); the request then runs with the configured
-    /// values.
-    ///
-    /// This is a paid request, so the caller supplies the `ledger` that
-    /// records it: the start is durable before dispatch and the attempt is
-    /// settled with the reported usage (or its absence). There is no
-    /// unrecorded variant.
-    pub async fn submit_request(
-        &self,
-        call: &ChatCall<'_>,
-        ledger: &querymt_agent_services::accounting::DispatchLedger,
-    ) -> Result<ChatOutput, LLMError> {
-        let provider = self.provider().await?;
-        let options = supported_overrides(provider.as_ref(), call.options);
-        let call = call.options(options);
-        querymt_agent_services::accounting::run_attempt(
-            &ledger.operation,
-            ledger.basis.clone(),
-            &tokio_util::sync::CancellationToken::new(),
-            || provider.chat(&call),
-        )
-        .await
-    }
-
-    /// Higher-level chat interface (used by CLI) that handles conversion and storage
-    pub async fn chat(
-        &self,
-        messages: &[ChatMessage],
-        ledger: &querymt_agent_services::accounting::DispatchLedger,
-    ) -> SessionResult<ChatOutput> {
-        // 1. Store incoming messages (User or Tool Result)
-        for msg in messages {
-            let agent_msg = self.convert_chat_to_agent(msg);
-            self.add_message(agent_msg).await?;
-        }
-
-        // 2. Fetch full history for context
-        let llm_messages = self.history().await?;
-
-        // 3. Call LLM
-        let response = self
-            .submit_request(&ChatCall::new(&llm_messages), ledger)
-            .await?;
-
-        // 4. Store response
-        let response_msg: ChatMessage = response.clone().into();
-        let agent_response = self.convert_chat_to_agent(&response_msg);
-        self.add_message(agent_response).await?;
-
-        Ok(response)
-    }
-
     /// Get pricing information for this session's model.
     ///
     /// Returns `None` for non-billable OAuth providers or OAuth sessions
@@ -1264,119 +1211,6 @@ impl SessionHandle {
                 },
                 pricing: None,
             },
-        }
-    }
-
-    pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
-        let mut parts = Vec::new();
-
-        // A structured assistant turn stores its canonical output once; the
-        // projected content blocks are not duplicated as additional parts.
-        if msg.role == ChatRole::Assistant
-            && let Some(output) = msg.output()
-        {
-            parts.push(MessagePart::Output {
-                output: output.clone(),
-            });
-            let source_provider = self.llm_config.as_ref().map(|cfg| cfg.provider.clone());
-            let source_model = self.llm_config.as_ref().map(|cfg| cfg.model.clone());
-            return Self::finish_agent_message(
-                self.session.public_id.clone(),
-                source_provider,
-                source_model,
-                msg,
-                parts,
-            );
-        }
-
-        for part in msg.portable_input_parts() {
-            match part {
-                querymt::chat::ChatInputPart::Text { text } => {
-                    parts.push(MessagePart::Text { content: text });
-                }
-                querymt::chat::ChatInputPart::Attachment(media) => {
-                    // Attachments render as a display projection.
-                    let desc = match media.source() {
-                        querymt::chat::MediaSource::Inline { data } => format!(
-                            "[Attachment: {}, {} bytes]",
-                            media
-                                .media_type()
-                                .map(ToString::to_string)
-                                .unwrap_or_default(),
-                            data.len()
-                        ),
-                        querymt::chat::MediaSource::DataUrl { url }
-                        | querymt::chat::MediaSource::Url { url } => {
-                            format!("[Attached resource: {url}]")
-                        }
-                        querymt::chat::MediaSource::ProviderFile { file_id, .. } => {
-                            format!("[Provider file: {file_id}]")
-                        }
-                    };
-                    parts.push(MessagePart::Text { content: desc });
-                }
-                querymt::chat::ChatInputPart::ToolResult(result) => {
-                    parts.push(MessagePart::ToolResult {
-                        call_id: result.call_id,
-                        content: result.parts,
-                        is_error: result.is_error,
-                        tool_name: result.name,
-                        tool_arguments: None,
-                        compacted_at: None,
-                    });
-                }
-                querymt::chat::ChatInputPart::ToolChange(change) if change.baseline => {
-                    parts.push(MessagePart::ToolBaseline {
-                        tools: change.added,
-                        origin: change.origin.unwrap_or_default(),
-                    });
-                }
-                querymt::chat::ChatInputPart::ToolChange(change) => {
-                    parts.push(MessagePart::ToolChange {
-                        added: change.added,
-                        removed: change.removed,
-                    });
-                }
-            }
-        }
-
-        let source_provider = if msg.role == ChatRole::Assistant {
-            self.llm_config.as_ref().map(|cfg| cfg.provider.clone())
-        } else {
-            None
-        };
-        let source_model = if msg.role == ChatRole::Assistant {
-            self.llm_config.as_ref().map(|cfg| cfg.model.clone())
-        } else {
-            None
-        };
-
-        Self::finish_agent_message(
-            self.session.public_id.clone(),
-            source_provider,
-            source_model,
-            msg,
-            parts,
-        )
-    }
-
-    /// Assemble the AgentMessage envelope for converted chat content.
-    fn finish_agent_message(
-        session_id: String,
-        source_provider: Option<String>,
-        source_model: Option<String>,
-        msg: &ChatMessage,
-        parts: Vec<MessagePart>,
-    ) -> AgentMessage {
-        AgentMessage {
-            id: uuid::Uuid::now_v7().to_string(),
-            session_id,
-            role: msg.role,
-            parts,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-            source_provider,
-            source_model,
         }
     }
 }
@@ -1737,7 +1571,7 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatOutput, FinishReason};
+    use querymt::chat::{ChatCall, ChatOutput, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
@@ -1977,6 +1811,7 @@ pub mod tests {
 
     /// Factory for a provider with a fixed declaration; counts its builds.
     struct DeclaringFactory {
+        name: &'static str,
         declaration: PromptCacheCapabilities,
         builds: std::sync::atomic::AtomicUsize,
     }
@@ -1984,9 +1819,16 @@ pub mod tests {
     impl DeclaringFactory {
         fn new(declaration: PromptCacheCapabilities) -> Self {
             Self {
+                // A name no provider list has ever contained.
+                name: "acme",
                 declaration,
                 builds: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn named(mut self, name: &'static str) -> Self {
+            self.name = name;
+            self
         }
 
         fn builds(&self) -> usize {
@@ -1996,8 +1838,7 @@ pub mod tests {
 
     impl LLMProviderFactory for DeclaringFactory {
         fn name(&self) -> &str {
-            // A name no provider list has ever contained.
-            "acme"
+            self.name
         }
 
         fn config_schema(&self) -> String {
@@ -2132,7 +1973,33 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn chat_skips_provider_when_history_conversion_fails() {
+    async fn providers_with_the_same_pruned_configuration_keep_their_own_declaration() {
+        // Pruning leaves only the keys a schema lists, so two providers can
+        // read the same text. The declaration of the first must not decide
+        // what the second gets.
+        let declaring = DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS).named("alpha");
+        let silent = DeclaringFactory::new(PromptCacheCapabilities::NONE).named("beta");
+        let provider = session_provider().await;
+        let config = r#"{"model":"m","system":["one","two"]}"#.to_string();
+
+        let first = provider
+            .with_default_cache_hints(&declaring, config.clone(), 0)
+            .unwrap();
+        let second = provider
+            .with_default_cache_hints(&silent, config.clone(), 0)
+            .unwrap();
+
+        assert_eq!(hinted_sections(&first.config), [true, true]);
+        assert_eq!(
+            second.config, config,
+            "no hints for a provider declaring none"
+        );
+        // The second provider was probed itself, not answered from the cache.
+        assert_eq!(silent.builds(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_fails_when_a_stored_message_cannot_be_converted() {
         use crate::acp::protocol::{ContentBlock, ImageContent};
         use crate::test_utils::{MockSessionStore, mock_llm_config, mock_session};
         use querymt_agent_core::model::MessagePart;
@@ -2168,10 +2035,12 @@ pub mod tests {
             cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         };
 
-        let ledger = crate::test_utils::test_ledger().await;
-        let error = handle.chat(&[], &ledger).await.unwrap_err();
+        // The agent cycle loads history this way before it builds a request.
+        let error = handle.history_with_notice_state().await.unwrap_err();
 
         assert!(matches!(error, SessionError::InvalidOperation(_)));
+        // The failure comes before any provider is built.
+        assert!(handle.cached_llm_provider.get().is_none());
     }
 
     #[tokio::test]

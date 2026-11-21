@@ -403,13 +403,15 @@ fn several_tool_changes_keep_their_relative_order() {
         user("tail"),
     ];
     let body = body_of(&prepare(&supported(), &messages, None));
-    assert_eq!(roles(&body), ["user", "user", "system", "system"]);
+    // Both changes share one system entry: a second adjacent entry would not
+    // follow a user entry.
+    assert_eq!(roles(&body), ["user", "user", "system"]);
     assert_eq!(
         body["messages"][2]["content"][0]["tool"]["definition"]["name"],
         "one"
     );
     assert_eq!(
-        body["messages"][3]["content"][0]["tool"]["definition"]["name"],
+        body["messages"][2]["content"][1]["tool"]["definition"]["name"],
         "two"
     );
 }

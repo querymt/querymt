@@ -970,7 +970,8 @@ impl Hooks {
                         {
                             Ok(candidate)
                                 if validate_message_projection(&candidate).is_ok()
-                                    && preserves_tool_identities(&messages, &candidate) =>
+                                    && preserves_tool_identities(&messages, &candidate)
+                                    && preserves_tool_changes(&messages, &candidate) =>
                             {
                                 messages = candidate;
                             }
@@ -979,8 +980,12 @@ impl Hooks {
                                     .err()
                                     .map(|error| error.to_string())
                                     .unwrap_or_else(|| {
-                                        "projection changed or removed tool-call identities"
-                                            .to_string()
+                                        if preserves_tool_identities(&messages, &candidate) {
+                                            "projection changed, removed or reordered tool-change messages"
+                                        } else {
+                                            "projection changed or removed tool-call identities"
+                                        }
+                                        .to_string()
                                     });
                                 notices.push(control_notice(
                                     HookEventConfig::Context,
@@ -2027,6 +2032,24 @@ fn preserves_tool_identities(
         ids
     }
     identities(candidate).is_subset(&identities(current))
+}
+
+/// Whether `candidate` holds exactly the tool changes `current` holds, in the
+/// same order. A tool change is stored once, when the tools change, and is
+/// never generated again; a request that lacks one keeps the old tool list.
+fn preserves_tool_changes(
+    current: &[querymt::chat::ChatMessage],
+    candidate: &[querymt::chat::ChatMessage],
+) -> bool {
+    fn changes(messages: &[querymt::chat::ChatMessage]) -> Vec<&querymt::chat::ToolChange> {
+        messages
+            .iter()
+            .filter_map(querymt::chat::ChatMessage::input)
+            .flatten()
+            .filter_map(querymt::chat::ChatInputPart::as_tool_change)
+            .collect()
+    }
+    changes(current) == changes(candidate)
 }
 
 fn flatten_content(content: &[querymt::chat::ToolResultPart]) -> String {

@@ -115,6 +115,33 @@ pub(crate) fn without_tool_records(messages: &[ChatMessage]) -> Vec<ChatMessage>
         .collect()
 }
 
+/// The tools in effect once the request's messages are read: the request's
+/// tool list (the latest baseline's) with every tool change in `messages`
+/// applied in order. The messages are those that are sent, so a baseline or a
+/// change from before the latest baseline is not among them.
+///
+/// Anything that depends on which tools the model can call must use this and
+/// not the request's tool list alone, which leaves out later changes.
+pub(crate) fn effective_tools(leading: &[Tool], messages: &[ChatMessage]) -> Vec<Tool> {
+    let mut in_effect: BTreeMap<String, Tool> = leading
+        .iter()
+        .map(|tool| (tool.function.name.clone(), tool.clone()))
+        .collect();
+    for record in messages
+        .iter()
+        .filter_map(tool_record)
+        .filter(|record| !record.baseline)
+    {
+        for tool in &record.added {
+            in_effect.insert(tool.function.name.clone(), tool.clone());
+        }
+        for name in &record.removed {
+            in_effect.remove(name);
+        }
+    }
+    in_effect.into_values().collect()
+}
+
 /// What the tools offered now add, redefine and remove compared with
 /// `offered`; `None` when nothing differs. Both lists are in name order when
 /// `current` and `offered` are.
@@ -339,6 +366,30 @@ mod tests {
         assert_eq!(a.function.description, "A2");
         // The leading list is the baseline's, not the folded one.
         assert_eq!(names(&state.baseline.unwrap().tools), ["a", "b"]);
+    }
+
+    #[test]
+    fn effective_tools_apply_the_changes_to_the_baseline_list() {
+        let leading = vec![tool("a", "A"), tool("b", "B")];
+        let sent = vec![
+            user("go"),
+            change(vec![tool("complete_task", "C"), tool("a", "A2")], &["b"]),
+        ];
+        let effective = effective_tools(&leading, &sent);
+        assert_eq!(names(&effective), ["a", "complete_task"]);
+        assert_eq!(effective[0].function.description, "A2");
+
+        // A later change can take a tool away again.
+        let sent = vec![
+            user("go"),
+            change(vec![tool("complete_task", "C")], &[]),
+            user("more"),
+            change(vec![], &["complete_task"]),
+        ];
+        assert_eq!(names(&effective_tools(&leading, &sent)), ["a", "b"]);
+
+        // No changes: the request's list.
+        assert_eq!(names(&effective_tools(&leading, &[user("go")])), ["a", "b"]);
     }
 
     #[test]

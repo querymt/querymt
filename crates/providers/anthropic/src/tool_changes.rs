@@ -199,6 +199,14 @@ fn flush(
             "A tool change must directly follow a user message".into(),
         ));
     }
-    placed.append(pending);
+    // Several tool changes can wait for the same spot. Two adjacent `system`
+    // entries would leave the first without a `user` entry before it and
+    // not directly before an `assistant` entry, so they are sent as one
+    // entry whose blocks keep the order of the changes.
+    let content = pending.drain(..).flat_map(|entry| entry.content).collect();
+    placed.push(AnthropicMessage {
+        role: SYSTEM_ROLE,
+        content,
+    });
     Ok(())
 }

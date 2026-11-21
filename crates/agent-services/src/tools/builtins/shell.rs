@@ -82,6 +82,17 @@ impl PipeReader {
     }
 }
 
+impl Drop for PipeReader {
+    /// A reader dropped without [`PipeReader::take`] (the call was aborted while
+    /// waiting for the streams) is not stopped: dropping a `JoinHandle` detaches
+    /// its task, which stays alive while a background process holds the pipe.
+    /// Taking the buffer here makes that task discard what it reads from then on
+    /// instead of growing the buffer with no one left to read it.
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
 /// Wait up to [`OUTPUT_GRACE`] for both streams to end, then take what was read.
 async fn collect_output(mut stdout: PipeReader, mut stderr: PipeReader) -> (Vec<u8>, Vec<u8>) {
     let _ = tokio::time::timeout(OUTPUT_GRACE, async {
@@ -318,6 +329,40 @@ mod tests {
         );
         // Unknown access never counts as a declared write.
         assert!(!FileAccess::Unknown.has_writes());
+    }
+
+    #[tokio::test]
+    async fn dropped_reader_discards_later_output() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let reader = PipeReader::spawn(Some(reader));
+        let buffer = Arc::clone(&reader.buffer);
+
+        writer.write_all(b"before").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while buffer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|read| read.is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader did not read the data");
+
+        // The call is gone, but the writer (a background process) is not.
+        drop(reader);
+        assert!(buffer.lock().unwrap().is_none(), "buffer is released");
+
+        writer.write_all(b"after").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            buffer.lock().unwrap().is_none(),
+            "output after the drop is discarded, not buffered"
+        );
     }
 
     #[cfg(unix)]

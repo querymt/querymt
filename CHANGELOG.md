@@ -497,6 +497,13 @@
 
 ### Breaking
 
+- **`SessionHandle::chat`, `SessionHandle::submit_request` and
+  `SessionHandle::convert_chat_to_agent` removed** from
+  `querymt_agent_runtime::session`. `chat` sent the stored history as it was
+  and skipped the agent's per-request tool handling, so it failed on any session
+  with stored tool lists or tool changes; the other two had no other caller.
+  Send prompts with `AgentSession::chat`, `Agent::chat` or ACP
+  `session/prompt`.
 - **`qmt_llama_cpp::LlamaCppConfig` has a new public field
   `grammar_backend: Option<GrammarBackend>`**; struct literals must add it
   (`None` keeps the default). `qmt_llama_cpp::GrammarBackend` is a new exported
