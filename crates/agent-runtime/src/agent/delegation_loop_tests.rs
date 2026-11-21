@@ -33,7 +33,12 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
     use std::time::Duration;
 
     let harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
-    let mesh = crate::agent::remote::bootstrap_mesh_runtime(&MeshRuntimeConfig {
+    let store = Arc::new(
+        querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
+            .await
+            .unwrap(),
+    );
+    let config = MeshRuntimeConfig {
         enabled: true,
         lan: Some(LanMeshConfig {
             listen: Some("/ip4/127.0.0.1/tcp/0".into()),
@@ -50,9 +55,10 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
         node_name: None,
         peers: vec![],
         auto_fallback: false,
-    })
-    .await
-    .unwrap();
+    };
+    let mesh = crate::agent::remote::bootstrap_mesh_runtime(&config, store)
+        .await
+        .unwrap();
     let mesh = mesh.as_mesh_handle();
     harness.delegator.set_mesh(mesh.clone());
     let store = mesh.quota_store().unwrap();

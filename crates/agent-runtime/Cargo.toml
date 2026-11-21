@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [features]
 # Kameo remote actors, libp2p mesh and the QR/invite flows.
-remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr", "querymt-agent-sqlite/mesh-access"]
+remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
 # OAuth token support (keyring) and rmcp's OAuth client.
 oauth = ["querymt-utils/oauth", "rmcp/auth"]
 # Dynamic provider plugin loading.
@@ -105,7 +105,7 @@ rmcp = { version = "3.11", features = ["transport-streamable-http-client-unix-so
 [dev-dependencies]
 rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
-querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
+querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support", "mesh-access"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
 rmcp = { version = "3.11", features = ["server", "transport-streamable-http-server"] }
 mockall.workspace = true

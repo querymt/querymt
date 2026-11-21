@@ -10,4 +10,4 @@ pub mod types;
 
 #[cfg(feature = "remote")]
 pub(crate) use invite::admit_via_invite_on_runtime;
-pub use types::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
+pub use types::{AgentMesh, MeshJoinOutcome, MeshSpec};

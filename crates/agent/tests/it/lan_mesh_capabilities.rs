@@ -3,12 +3,12 @@ use querymt::plugin::host::PluginRegistry;
 use querymt_agent::LocalAgentHandle;
 use querymt_agent::acp::protocol::ExtRequest;
 use querymt_agent::agent::agent_config_builder::AgentConfigBuilder;
-use querymt_agent::agent::remote::bootstrap_mesh_runtime;
+use querymt_agent::api::{Mesh, MeshRuntime};
+use querymt_agent::config::{MeshDiscoveryConfig, MeshTomlConfig};
 use querymt_agent::send_agent::SendAgent;
 use querymt_agent::session::sqlite_storage::SqliteStorage;
-use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
+use querymt_agent_sqlite::mesh_access::SqliteMeshAccess;
 use std::sync::Arc;
-use std::time::Duration;
 
 // A separate test binary keeps LAN-only bootstrap independent of the unit tests'
 // shared LAN+Iroh fixture: Kameo permits only one global swarm per process.
@@ -32,27 +32,34 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         .build(),
     );
     let handle = LocalAgentHandle::from_config(config);
-    let mesh = bootstrap_mesh_runtime(&MeshRuntimeConfig {
+    let identity = dir.path().join("identity.key");
+    let store_path = dir.path().join("identity.key.access.sqlite3");
+    let spec = Mesh::from_toml(MeshTomlConfig {
         enabled: true,
-        lan: Some(LanMeshConfig {
-            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
-            discovery: LanDiscovery::None,
-            directory: Default::default(),
-        }),
-        iroh_enabled: false,
-        iroh_gso: true,
-        iroh_dns: None,
-        iroh_scopes: Vec::new(),
-        identity_file: Some(dir.path().join("identity.key")),
-        request_timeout: Duration::from_secs(30),
-        stream_reconnect_grace: Duration::from_secs(30),
-        node_name: None,
-        peers: Vec::new(),
-        auto_fallback: false,
-    })
-    .await
-    .expect("guarded LAN mesh");
-    let mesh = mesh.as_mesh_handle().clone();
+        listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+        discovery: MeshDiscoveryConfig::None,
+        identity_file: Some(identity.to_str().unwrap().into()),
+        ..MeshTomlConfig::default()
+    });
+    let lease = SqliteMeshAccess::open_exclusive(&store_path).await.unwrap();
+    let error = spec.start().await.unwrap_err();
+    assert!(error.to_string().contains("mesh access startup"));
+    drop(lease);
+
+    let runtime = spec
+        .start()
+        .await
+        .expect("guarded LAN mesh on retry")
+        .handle();
+    let reused = MeshRuntime::shared(spec.spec_for_internal_use().clone())
+        .await
+        .expect("reuse without reopening the exclusively held store")
+        .handle();
+    let mesh = runtime.as_mesh_handle().clone();
+    assert!(Arc::ptr_eq(
+        mesh.quota_store().unwrap(),
+        reused.as_mesh_handle().quota_store().unwrap(),
+    ));
     assert!(mesh.inbound_router().is_some());
     handle.set_mesh(mesh.clone());
 

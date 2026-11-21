@@ -8,6 +8,8 @@
 
 pub mod acp;
 pub mod api;
+#[cfg(feature = "remote")]
+mod mesh_access;
 pub mod prelude;
 pub mod profiles;
 pub mod runner;
@@ -22,10 +24,32 @@ pub use api as simple;
 #[cfg(feature = "plugin-loaders")]
 pub use querymt_agent_runtime::plugin_update;
 pub use querymt_agent_runtime::{
-    agent, auth, chat_session, config, control, delegation, dotagents, elicitation, error, hooks,
+    auth, chat_session, config, control, delegation, dotagents, elicitation, error, hooks,
     mcp_auth, middleware, model_inventory, model_registry, profile_host, scheduler, send_agent,
     skills, slash_commands, template,
 };
+
+/// Agent runtime types and agent-owned mesh startup.
+pub mod agent {
+    pub use querymt_agent_runtime::agent::*;
+
+    #[cfg(feature = "remote")]
+    pub mod remote {
+        pub use mesh::{bootstrap_mesh_runtime, join_mesh_via_invite};
+        pub use querymt_agent_runtime::agent::remote::*;
+
+        pub mod mesh {
+            pub use crate::mesh_access::{
+                bootstrap_mesh_runtime, join_mesh_via_invite, join_mesh_via_invite_with_dns,
+                join_mesh_via_invite_with_gso,
+            };
+            pub use querymt_agent_runtime::agent::remote::mesh::{
+                MeshError, MeshEvent, MeshHandle, MeshRoute, MeshRuntimeConfig, MeshRuntimeHandle,
+                MeshScopeId, PeerEvent, RouteTable,
+            };
+        }
+    }
+}
 
 // Services, index and core layers.
 pub use querymt_agent_core::events;

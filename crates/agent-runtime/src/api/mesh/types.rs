@@ -8,26 +8,10 @@ use std::sync::Arc;
 #[cfg(feature = "remote")]
 use crate::agent::LocalAgentHandle;
 #[cfg(feature = "remote")]
-use crate::config::RemoteAgentConfig;
-#[cfg(feature = "remote")]
 use crate::config::{LanMeshTomlConfig, MeshTomlConfig, MeshTransportConfig};
 
 #[cfg(feature = "remote")]
 use crate::agent::remote::MeshRuntimeHandle;
-
-#[cfg(feature = "remote")]
-use super::runtime::start_shared_runtime;
-
-#[cfg(feature = "remote")]
-#[derive(Clone, Debug)]
-pub struct Mesh {
-    spec: MeshSpec,
-    remote_agents: Vec<RemoteAgentConfig>,
-}
-
-#[cfg(not(feature = "remote"))]
-#[derive(Clone, Debug, Default)]
-pub struct Mesh;
 
 #[cfg(feature = "remote")]
 #[derive(Clone, Debug)]
@@ -44,16 +28,6 @@ pub enum MeshSpec {
 pub enum MeshSpec {
     Disabled,
 }
-
-#[cfg(feature = "remote")]
-#[derive(Clone, Debug)]
-pub struct MeshRuntime {
-    runtime: MeshRuntimeHandle,
-}
-
-#[cfg(not(feature = "remote"))]
-#[derive(Clone, Debug, Default)]
-pub struct MeshRuntime;
 
 #[cfg(feature = "remote")]
 #[derive(Clone)]
@@ -85,109 +59,7 @@ pub struct MeshJoinOutcome {
 }
 
 #[cfg(feature = "remote")]
-impl Mesh {
-    pub fn disabled() -> Self {
-        Self {
-            spec: MeshSpec::Disabled,
-            remote_agents: Vec::new(),
-        }
-    }
-
-    pub fn lan() -> Self {
-        Self {
-            spec: MeshSpec::Lan,
-            remote_agents: Vec::new(),
-        }
-    }
-
-    pub fn iroh() -> Self {
-        Self {
-            spec: MeshSpec::Iroh,
-            remote_agents: Vec::new(),
-        }
-    }
-
-    pub fn hybrid() -> Self {
-        Self {
-            spec: MeshSpec::Hybrid,
-            remote_agents: Vec::new(),
-        }
-    }
-
-    pub fn from_toml(config: MeshTomlConfig) -> Self {
-        Self {
-            spec: MeshSpec::Toml(Box::new(config)),
-            remote_agents: Vec::new(),
-        }
-    }
-
-    /// Builds the default shared mesh configuration used by the high-level API.
-    pub fn shared() -> Self {
-        Self::hybrid()
-    }
-
-    pub fn with_remote_agents(mut self, remote_agents: Vec<RemoteAgentConfig>) -> Self {
-        self.remote_agents = remote_agents;
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn remote_agents(&self) -> &[RemoteAgentConfig] {
-        &self.remote_agents
-    }
-
-    #[doc(hidden)]
-    pub fn spec_for_internal_use(&self) -> &MeshSpec {
-        &self.spec
-    }
-
-    #[doc(hidden)]
-    pub fn node_name(&self) -> Option<String> {
-        self.spec.node_name()
-    }
-
-    #[doc(hidden)]
-    pub fn is_disabled(&self) -> bool {
-        matches!(self.spec, MeshSpec::Disabled)
-    }
-
-    pub async fn start(&self) -> Result<MeshRuntime> {
-        start_shared_runtime(self.spec.clone()).await
-    }
-}
-
-#[cfg(not(feature = "remote"))]
-impl Mesh {
-    pub fn disabled() -> Self {
-        Self
-    }
-
-    pub fn lan() -> Self {
-        Self
-    }
-
-    pub fn iroh() -> Self {
-        Self
-    }
-
-    pub fn hybrid() -> Self {
-        Self
-    }
-
-    pub fn shared() -> Self {
-        Self
-    }
-}
-
-#[cfg(feature = "remote")]
 impl MeshSpec {
-    pub(crate) fn node_name(&self) -> Option<String> {
-        match self {
-            MeshSpec::Toml(cfg) => cfg.node_name.clone(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn into_toml(self) -> MeshTomlConfig {
         match self {
             MeshSpec::Disabled => MeshTomlConfig::default(),
@@ -224,22 +96,6 @@ impl MeshSpec {
             }
             MeshSpec::Toml(cfg) => *cfg,
         }
-    }
-}
-
-#[cfg(feature = "remote")]
-impl MeshRuntime {
-    /// Starts or reuses the process-wide shared mesh runtime.
-    pub async fn shared(spec: MeshSpec) -> Result<Self> {
-        start_shared_runtime(spec).await
-    }
-
-    pub(crate) fn from_handle(runtime: MeshRuntimeHandle) -> Self {
-        Self { runtime }
-    }
-
-    pub fn handle(&self) -> MeshRuntimeHandle {
-        self.runtime.clone()
     }
 }
 

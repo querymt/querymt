@@ -1057,7 +1057,7 @@ mod event_forwarder_stub {
 //  RemoteNodeManager — lifecycle tests (requires `remote` feature)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "remote")]
+#[cfg(all(test, feature = "remote"))]
 mod node_manager_tests {
     use super::*;
     use crate::agent::messages::{GetEventStream, GetMode};
@@ -2368,7 +2368,12 @@ mod node_manager_tests {
     async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {
         use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
 
-        crate::agent::remote::mesh::bootstrap_mesh_runtime(&MeshRuntimeConfig {
+        let store = Arc::new(
+            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
+                .await
+                .unwrap(),
+        );
+        let config = MeshRuntimeConfig {
             enabled: true,
             lan: Some(LanMeshConfig {
                 listen: Some("/ip4/127.0.0.1/tcp/0".into()),
@@ -2385,11 +2390,12 @@ mod node_manager_tests {
             node_name: None,
             peers: Vec::new(),
             auto_fallback: false,
-        })
-        .await
-        .unwrap()
-        .as_mesh_handle()
-        .clone()
+        };
+        crate::agent::remote::mesh::bootstrap_mesh_runtime(&config, store)
+            .await
+            .unwrap()
+            .as_mesh_handle()
+            .clone()
     }
 
     #[tokio::test]
