@@ -966,6 +966,20 @@ Useful when:
 - Multiple nodes on same machine
 - Want descriptive names for peers
 
+## Peer Sharing and Quotas
+
+Joining a mesh authenticates a peer; it does not grant access. Grants are directional and saved on the resource host by peer ID. In `qmacp mesh get PEER_ID`, `outgoing` is what this host shares, and `incoming` is what the peer shares back. An offline peer does not erase its saved outgoing policy.
+
+Manage grants and quotas through owner ACP. For WebSocket administration, point `QMT_ACP_MESH_OWNER_TOKEN_FILE` on the server and `QMACP_MESH_OWNER_TOKEN_FILE` on the client at the same private token file. Use a numeric loopback endpoint. An owner-started ACP stdio process does not need a token. Other ACP connections cannot read or change saved sharing policy.
+
+- **Custom:** Select session access and the providers and models the peer may use. Filesystem access requires session access and permits only confined file operations. Custom never enables the shell or unclassified hooks. Cold resumes and same-host child startup are refused when the host cannot initialize them without unclassified effects.
+- **Full:** Grants the supported shell, session, filesystem, and provider capabilities. The shell runs with the host user's OS permissions; grant Full only to peers you trust at that level. Existing host approvals still apply. Pre-upgrade clients need explicit Full for protected operations on an upgraded host.
+- **Revocation:** Changing a grant stops further authorized delivery and affected work at the next supported boundary. It does not recall previously delivered content or undo completed effects.
+
+Provider-wide and model-specific quotas both apply to a Custom inference request. Direct mesh calls and hosted turns share the same balance on the resource host. Finite quotas reserve capacity before dispatch; unsupported bindings are rejected rather than run without a bound. The rebuilt llama.cpp plugin qualifies non-speculative text streaming with a configured `n_ctx`, including rendered tool definitions. Media and one-shot inference are not qualified for that binding. Daily, weekly, and monthly windows reset on UTC boundaries without rollover. Resetting or reconfiguring a scope can be refused while it has an outstanding attempt.
+
+Use `qmacp mesh nodes`, `mesh get`, `mesh set`, `mesh set-quota`, `mesh reset-quota`, and `mesh watch`. Writes require the current `outgoing.revision`; after a conflict, read the policy again before choosing whether to retry. Notifications are refresh hints, not policy snapshots. For ACP client integration, `scripts/generate-types.sh` emits the versioned peer-access types in `target/generated/types.ts`.
+
 ## Session Management
 
 ### Creating Remote Sessions
