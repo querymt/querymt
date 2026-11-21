@@ -5,6 +5,7 @@ mod automations;
 mod chrome;
 mod code;
 mod delegates;
+mod fork;
 mod inbox;
 mod keys;
 mod kit;
@@ -265,6 +266,8 @@ pub struct QmtApp {
     templates_help_open: bool,
     /// Workspace undo awaiting confirmation: user turn to go back to.
     confirm_undo: Option<String>,
+    /// Fork from a reply awaiting confirmation, or being created.
+    fork: Option<fork::ForkDialog>,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
     appearance_scroll_open: bool,
     key_input: Entity<InputState>,
@@ -502,6 +505,7 @@ impl QmtApp {
             templates_help_open: false,
             confirm_reset: false,
             confirm_undo: None,
+            fork: None,
             appearance_scroll_open: false,
             key_input,
             oauth_code,
@@ -616,6 +620,7 @@ impl QmtApp {
         }
         if std::mem::take(&mut self.confirm_reset)
             || self.confirm_undo.take().is_some()
+            || self.close_fork_dialog()
             || self.confirm_delete.take().is_some()
             || self.confirm_session_delete.take().is_some()
             || self.dialog.take().is_some()
@@ -1323,6 +1328,11 @@ impl Render for QmtApp {
             .or_else(|| {
                 (self.page == Page::Session)
                     .then(|| self.render_delegate_dialog(radii, cx))
+                    .flatten()
+            })
+            .or_else(|| {
+                (self.page == Page::Session)
+                    .then(|| self.render_fork_dialog(radii, cx))
                     .flatten()
             })
             .or_else(|| self.render_model_modal(radii, cx))

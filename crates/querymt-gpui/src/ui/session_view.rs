@@ -323,6 +323,9 @@ struct RenderCtx {
     undoable: HashSet<String>,
     /// User turn that redo restores (top of the undo stack).
     redo_target: Option<String>,
+    /// Turn-closing items whose turn can be forked now (supported, idle,
+    /// not rolled back, with an agent-identified fork point).
+    fork_points: HashSet<usize>,
     /// Items from this index on were rolled back by an undo (shown dimmed).
     reverted_from: Option<usize>,
     /// Agent of the open session; delegated child sessions live on it too.
@@ -397,6 +400,7 @@ impl RenderCtx {
             self.undoable.contains(user).hash(h);
             (self.redo_target.as_ref() == Some(user)).hash(h);
         }
+        self.fork_points.contains(&ix).hash(h);
         self.reverted_from.is_some_and(|r| ix >= r).hash(h);
         (self.copied.as_deref() == Some(item.key.as_str())).hash(h);
         self.hash_globals(h);
@@ -2764,6 +2768,7 @@ fn turn_actions(
     let user = rc.turn_user.get(&ix).filter(|_| rc.undo_ready);
     let undo_to = user.filter(|u| rc.undoable.contains(*u)).cloned();
     let redo = user.is_some_and(|u| rc.redo_target.as_ref() == Some(u));
+    let fork = rc.fork_points.contains(&ix);
     h_flex()
         .gap_1()
         .pl_1()
@@ -2813,6 +2818,20 @@ fn turn_actions(
                     let _ = weak.update(cx, |this, cx| {
                         this.store.update(cx, |s, cx| s.redo_workspace(cx))
                     });
+                }),
+            )
+        })
+        .when(fork, |el| {
+            let weak = rc.weak.clone();
+            el.child(
+                kit::icon_button(
+                    SharedString::from(format!("fork-{}", item.key)),
+                    IconName::GitFork,
+                    "Fork into a new session from this response",
+                )
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| this.request_fork(ix, cx));
                 }),
             )
         })
@@ -4752,6 +4771,28 @@ impl QmtApp {
             _ => None,
         };
 
+        let turn_end = turn_ends(&view.items);
+        let reverted_from = view.reverted_from().and_then(|id| {
+            view.items
+                .iter()
+                .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
+        });
+        // Desktop: forks only from settled, live turns while nothing else runs.
+        let fork_ready = store.session_supports_fork()
+            && !store.fork_pending()
+            && !running
+            && !loading
+            && !view.undo_pending;
+        let fork_points: HashSet<usize> = if fork_ready {
+            turn_end
+                .keys()
+                .copied()
+                .filter(|ix| reverted_from.is_none_or(|r| *ix < r))
+                .filter(|ix| view.fork_point(*ix).is_some())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let rc = Rc::new(RenderCtx {
             p,
             syntax: gpui_kit::component::ActiveTheme::theme(&**cx)
@@ -4767,7 +4808,7 @@ impl QmtApp {
                 .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
                 .unwrap_or(0),
             last_ix: view.items.len().saturating_sub(1),
-            turn_end: turn_ends(&view.items),
+            turn_end,
             copied: self.copied.clone(),
             block_scrolls: self.transcript.block_scrolls.clone(),
             cwd: view.cwd.clone(),
@@ -4781,11 +4822,8 @@ impl QmtApp {
                 .map(|i| i.key.clone())
                 .collect(),
             redo_target: view.redo_target().map(str::to_owned),
-            reverted_from: view.reverted_from().and_then(|id| {
-                view.items
-                    .iter()
-                    .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
-            }),
+            fork_points,
+            reverted_from,
             agent_id: view.agent_id.clone(),
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
             md: self.transcript.md.clone(),

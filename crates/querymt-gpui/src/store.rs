@@ -6,6 +6,7 @@
 
 pub(crate) mod automations;
 pub(crate) mod delegates;
+pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod setup;
 
@@ -1140,6 +1141,8 @@ pub struct AgentRuntime {
     pub session_errors: HashMap<String, String>,
     /// `initialize` advertised `sessionCapabilities.delete`.
     pub can_delete_sessions: bool,
+    /// `initialize` advertised `sessionCapabilities.fork`.
+    pub can_fork_sessions: bool,
     /// Parent session id -> its loaded direct children.
     pub children: HashMap<String, ChildList>,
     pub(crate) schedules: automations::ScheduleCatalog,
@@ -2643,6 +2646,9 @@ impl AgentsStore {
                 rt.can_delete_sessions = init
                     .pointer("/agentCapabilities/sessionCapabilities/delete")
                     .is_some_and(|d| !d.is_null() && d.as_bool() != Some(false));
+                rt.can_fork_sessions = init
+                    .pointer("/agentCapabilities/sessionCapabilities/fork")
+                    .is_some_and(|d| !d.is_null() && d.as_bool() != Some(false));
                 rt.state = ConnState::Connected;
                 rt.connected_at = Some(now_ms());
                 let reconnected = std::mem::take(&mut rt.reconnect_attempt) > 0;
@@ -3269,10 +3275,11 @@ impl AgentsStore {
     fn start_undo_op(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         let undo = target.is_some();
         let supported = self.session_supports_undo();
+        let forking = self.fork_pending();
         let Some(view) = self.session.as_mut() else {
             return;
         };
-        if view.loading || view.running() || view.undo_pending {
+        if view.loading || view.running() || view.undo_pending || forking {
             return;
         }
         if !supported {
