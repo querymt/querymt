@@ -358,7 +358,7 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{AgentStats, ConversationContext, ToolFunction, TurnInfo};
+    use crate::middleware::{ToolFunction, TurnInfo};
     use crate::test_utils::HookRig;
     use crate::tools::builtins::{EditTool, MultiEditTool, ReadTool, ShellTool};
     use serde_json::json;
@@ -373,10 +373,9 @@ mod tests {
         registry
     }
 
-    /// One run of a guard: its per-run state and the context its notices go to.
+    /// One run of a guard: its per-run state and the rig its notices go to.
     struct Run {
         turn: Box<dyn TurnMiddleware>,
-        context: Arc<ConversationContext>,
         rig: HookRig,
     }
 
@@ -389,28 +388,17 @@ mod tests {
             Self {
                 turn: middleware
                     .begin_turn(&TurnInfo::new("s1", crate::agent::core::AgentMode::Build)),
-                context: context(),
-                rig: HookRig::new(),
+                rig: HookRig::at_step("s1", 0),
             }
         }
 
         async fn review(&mut self, batch: &PreparedBatch<'_>) -> Vec<PreparedCallVerdict> {
-            let mut cx = HookCx::new(&mut self.context, &self.rig.runtime, &self.rig.changed);
+            let mut cx = self.rig.cx();
             self.turn
                 .on_prepared_tool_calls(&mut cx, batch)
                 .await
                 .unwrap()
         }
-    }
-
-    fn context() -> Arc<ConversationContext> {
-        Arc::new(ConversationContext::new(
-            "s1".into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ))
     }
 
     fn call(id: &str, name: &str, args: Value) -> ToolCall {
@@ -604,12 +592,12 @@ mod tests {
         assert_eq!(proceed, ["1", "2"], "warn mode runs every call");
         assert!(rejected.is_empty());
         // The note is queued on the run; the loop stores it after the results.
-        assert_eq!(run.context.pending_notices.len(), 1);
+        assert_eq!(run.rig.pending.len(), 1);
         assert_eq!(
-            run.context.pending_notices[0].source,
+            run.rig.pending[0].source,
             querymt_agent_core::model::NoticeSource::ParallelEdit
         );
-        let text = run.context.pending_notices[0].content.clone();
+        let text = run.rig.pending[0].content.clone();
         assert!(text.contains("design.md"), "{text}");
         assert!(text.contains("multiedit"), "{text}");
     }
@@ -623,7 +611,7 @@ mod tests {
 
         review_run(&mut run, &calls).await;
 
-        assert!(run.context.pending_notices.is_empty());
+        assert!(run.rig.pending.is_empty());
     }
 
     /// Review a pair whose *raw* arguments and *effective* access disagree.

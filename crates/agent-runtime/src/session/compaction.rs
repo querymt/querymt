@@ -3,7 +3,7 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
-use crate::agent::utils::{genai, render_prompt_for_llm};
+use crate::agent::utils::genai;
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::{FutureExt, StreamExt};
@@ -239,7 +239,10 @@ impl SessionCompaction {
         instructions: Option<&str>,
     ) -> Result<CompactionResult> {
         // Estimate original token count
-        let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
+        // The compaction request carries no tool records, so none are counted.
+        let original_token_count =
+            crate::session::pruning::estimate_history_tokens(messages, max_prompt_bytes, false)
+                .map_err(|error| LLMError::GenericError(error.to_string()))?;
 
         // Build the compaction request
         let chat_messages = self.build_compaction_messages_with_instructions(
@@ -294,14 +297,19 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         instructions: Option<&str>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
-        // The summary needs the conversation, not the tool definitions: tool
-        // baselines and tool changes are left out. The request carries no tool
-        // list, and a provider rejects such a record as a message.
-        let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
-            .iter()
-            .filter(|message| !message.is_tool_record())
-            .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
-            .collect::<std::result::Result<_, _>>()?;
+        // The summary needs the conversation, not the tool definitions: the
+        // request carries no tool list, so tool baselines and tool changes are
+        // left out by the projection (`tool_changes: false`), which also keeps
+        // native provider output out (no output target).
+        let mut chat_messages = querymt_agent_core::projection::project_request(
+            messages,
+            &querymt_agent_core::projection::RequestTarget {
+                output: None,
+                max_prompt_bytes,
+                tool_changes: false,
+            },
+        )?
+        .messages;
 
         // Add the compaction prompt as a user message
         chat_messages.push(
@@ -607,46 +615,6 @@ impl SessionCompaction {
             ));
         }
         Ok(())
-    }
-
-    /// Estimate token count for a list of messages
-    pub(crate) fn estimate_messages_tokens(
-        &self,
-        messages: &[AgentMessage],
-        max_prompt_bytes: Option<usize>,
-    ) -> usize {
-        messages
-            .iter()
-            .map(|m| {
-                m.parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
-                            self.estimator.estimate(content)
-                        }
-                        MessagePart::Prompt { blocks } => self
-                            .estimator
-                            .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
-                        MessagePart::ToolResult { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .filter_map(|b| b.as_text())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.estimator.estimate(&text)
-                        }
-                        MessagePart::Reasoning { item, .. } => {
-                            self.estimator.estimate(&item.visible_text())
-                        }
-                        MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
-                        MessagePart::Output { output } => {
-                            self.estimator.estimate(&output.estimate_text())
-                        }
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum()
     }
 
     /// Create a compaction message pair to be stored in history.
@@ -1854,6 +1822,11 @@ mod tests {
         }
     }
 
+    /// The shared estimate of a stored history.
+    fn estimate_tokens(messages: &[AgentMessage], max_prompt_bytes: Option<usize>) -> usize {
+        crate::session::pruning::estimate_history_tokens(messages, max_prompt_bytes, false).unwrap()
+    }
+
     // ========================================================================
     // Helper Functions (backwards compatibility)
     // ========================================================================
@@ -1904,10 +1877,8 @@ mod tests {
             }],
             ..structured.clone()
         };
-
-        let compactor = SessionCompaction::new();
-        let structured_estimate = compactor.estimate_messages_tokens(&[structured], None);
-        let legacy_estimate = compactor.estimate_messages_tokens(&[legacy_equivalent], None);
+        let structured_estimate = estimate_tokens(&[structured], None);
+        let legacy_estimate = estimate_tokens(&[legacy_equivalent], None);
         assert_eq!(
             structured_estimate, legacy_estimate,
             "structured output must be sized like its legacy projection"
@@ -2012,25 +1983,22 @@ mod tests {
 
     #[test]
     fn test_estimate_messages_tokens_text_parts() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for text messages");
     }
 
     #[test]
     fn test_estimate_messages_tokens_tool_results() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::conversation_with_tools("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for tool results");
     }
 
     #[test]
     fn test_estimate_messages_tokens_mixed_parts() {
-        let fixture = CompactionFixture::new();
         let messages = vec![
             MessageFixture::user_message("1", "s1", "User request"),
             MessageFixture::reasoning_message("2", "s1", "Let me think about this"),
@@ -2038,13 +2006,12 @@ mod tests {
             MessageFixture::assistant_message("4", "s1", "Final response"),
         ];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for all part types");
     }
 
     #[test]
     fn notice_is_estimated_like_text_of_the_same_content() {
-        let fixture = CompactionFixture::new();
         let content = "The agent mode changed. ".repeat(20);
         let text = MessageFixture::user_message("1", "s1", &content);
         let mut notice = text.clone();
@@ -2053,29 +2020,24 @@ mod tests {
             content: content.clone(),
         }];
 
-        let notice_tokens = fixture.service.estimate_messages_tokens(&[notice], None);
+        let notice_tokens = estimate_tokens(&[notice], None);
         assert!(notice_tokens > 0);
-        assert_eq!(
-            notice_tokens,
-            fixture.service.estimate_messages_tokens(&[text], None)
-        );
+        assert_eq!(notice_tokens, estimate_tokens(&[text], None));
     }
 
     #[test]
     fn test_estimate_messages_tokens_empty() {
-        let fixture = CompactionFixture::new();
         let messages: Vec<AgentMessage> = vec![];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert_eq!(tokens, 0, "Empty messages should have 0 tokens");
     }
 
     #[test]
     fn test_estimate_messages_tokens_long_conversation() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(
             tokens > 500,
             "Long conversation should have significant token count"
@@ -2303,7 +2265,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let original_tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let original_tokens = estimate_tokens(&messages, None);
         let result = fixture
             .process_with_summary(&messages, "short")
             .await

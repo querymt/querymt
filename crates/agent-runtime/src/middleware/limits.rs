@@ -215,9 +215,8 @@ impl TurnMiddleware for LimitsTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
+    use crate::middleware::ExecutionState;
     use crate::test_utils::HookRig;
-    use std::sync::Arc;
 
     #[test]
     fn try_new_rejects_invalid_manual_rates() {
@@ -358,28 +357,10 @@ mod tests {
     async fn test_max_steps_stop() {
         let mut stack =
             HookRig::stack_of(LimitsMiddleware::new(LimitsConfig::default().max_steps(5)));
-        let stats = Arc::new(AgentStats {
-            steps: 5,
-            ..Default::default()
-        });
-        let context = Arc::new(ConversationContext {
-            session_id: "test".into(),
-            messages: Arc::from([]),
-            request_objective: None,
-            pending_notices: Arc::from([]),
-            stored_mode_notice: None,
-            tool_baseline: None,
-            stats,
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: Default::default(),
-            profile: Default::default(),
-            last_applied: Default::default(),
-        });
-
-        let state = ExecutionState::BeforeLlmCall { context };
-        let result = HookRig::new().step_start(&mut stack, state).await.unwrap();
+        let result = HookRig::at_step("test", 5)
+            .step_start(&mut stack)
+            .await
+            .unwrap();
 
         assert!(matches!(
             result,
@@ -394,30 +375,12 @@ mod tests {
     async fn test_max_steps_continue() {
         let mut stack =
             HookRig::stack_of(LimitsMiddleware::new(LimitsConfig::default().max_steps(5)));
-        let stats = Arc::new(AgentStats {
-            steps: 3,
-            ..Default::default()
-        });
-        let context = Arc::new(ConversationContext {
-            session_id: "test".into(),
-            messages: Arc::from([]),
-            request_objective: None,
-            pending_notices: Arc::from([]),
-            stored_mode_notice: None,
-            tool_baseline: None,
-            stats,
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: Default::default(),
-            profile: Default::default(),
-            last_applied: Default::default(),
-        });
+        let result = HookRig::at_step("test", 3)
+            .step_start(&mut stack)
+            .await
+            .unwrap();
 
-        let state = ExecutionState::BeforeLlmCall { context };
-        let result = HookRig::new().step_start(&mut stack, state).await.unwrap();
-
-        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+        assert!(matches!(result, ExecutionState::BeforeLlmCall));
     }
 }
 

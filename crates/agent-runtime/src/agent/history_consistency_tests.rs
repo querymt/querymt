@@ -8,9 +8,11 @@
 //! the run sent. Cache hints are left out of the comparison.
 
 use crate::agent::core::McpToolState;
-use crate::agent::execution::tool_history::without_tool_changes;
 use crate::hooks::{HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig};
-use crate::middleware::{ContextConfig, ContextMiddleware, Middleware, StepVerdict};
+use crate::middleware::{
+    AgentModeMiddleware, ContextConfig, ContextMiddleware, HookCx, Middleware, PreparedBatch,
+    PreparedCallVerdict, StepVerdict, TurnInfo, TurnMiddleware,
+};
 use crate::session::provider::SessionProvider;
 use crate::test_utils::{Act, ScriptedMiddleware, UndoTestFixture, mock_querymt_tool_call};
 use crate::tools::{Tool as _, builtins::WriteFileTool};
@@ -23,6 +25,7 @@ use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
 use querymt::{LLMProvider, Usage};
 use querymt_agent_core::model::MessagePart;
+use querymt_agent_core::projection::{RequestTarget, project_request};
 use querymt_agent_core::session::backend::StorageBackend;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -86,23 +89,24 @@ impl ScriptedProvider {
         let Some((provider, session)) = self.0.reload.get() else {
             return;
         };
-        let view = provider
-            .with_session(session)
-            .await
-            .expect("session loads")
-            .history_view()
+        let handle = provider.with_session(session).await.expect("session loads");
+        let stored = handle
+            .get_effective_agent_history()
             .await
             .expect("history loads");
-        let (expected_tools, expected) = if self.0.tool_updates {
-            (
-                view.tool_baseline
-                    .as_ref()
-                    .map(|baseline| baseline.tools.clone()),
-                view.messages.clone(),
-            )
-        } else {
-            (None, without_tool_changes(&view.messages))
-        };
+        let target = handle.output_target(&stored);
+        let projected = project_request(
+            &stored,
+            &RequestTarget {
+                output: target.as_ref(),
+                max_prompt_bytes: handle
+                    .execution_config()
+                    .and_then(|config| config.max_prompt_bytes),
+                tool_changes: self.0.tool_updates,
+            },
+        )
+        .expect("history projects");
+        let (expected_tools, expected) = (projected.baseline_tools, projected.messages);
 
         let sent = durable(call.messages);
         let reloaded = durable(&expected);
@@ -115,7 +119,7 @@ impl ScriptedProvider {
         }
         if self.0.tool_updates {
             let sent_tools = serde_json::to_value(call.tools).unwrap();
-            let reloaded_tools = serde_json::to_value(expected_tools.as_deref()).unwrap();
+            let reloaded_tools = serde_json::to_value(expected_tools).unwrap();
             if sent_tools != reloaded_tools {
                 self.0.divergences.lock().unwrap().push(format!(
                     "request {index}: tools: sent {sent_tools}, reload {reloaded_tools}"
@@ -360,6 +364,17 @@ impl Run {
     /// Accept `text` as steering of the active run while request number `at`
     /// is being answered, so it is waiting when the reply's tool calls start.
     async fn steer_at_request(&self, at: usize, text: &'static str) {
+        let hook = self.steering_hook(text).await;
+        self.provider
+            .0
+            .before_reply
+            .set((at, hook))
+            .ok()
+            .expect("one steering hook");
+    }
+
+    /// A hook that accepts `text` as steering of the session's active run.
+    async fn steering_hook(&self, text: &'static str) -> Hook {
         use crate::acp::protocol::{ContentBlock, TextContent};
         use querymt_agent_core::events::AgentEventKind;
 
@@ -373,7 +388,7 @@ impl Run {
             self.fixture.handle.config.subscribe_events(),
         ));
         let session = self.session.clone();
-        let hook: Hook = Arc::new(move || {
+        Arc::new(move || {
             let (actor, events, session) = (actor.clone(), events.clone(), session.clone());
             Box::pin(async move {
                 let mut events = events.lock().await;
@@ -394,13 +409,7 @@ impl Run {
                     .await
                     .expect("steering is accepted");
             })
-        });
-        self.provider
-            .0
-            .before_reply
-            .set((at, hook))
-            .ok()
-            .expect("one steering hook");
+        })
     }
 
     async fn stored(&self) -> Vec<querymt_agent_core::model::AgentMessage> {
@@ -486,6 +495,49 @@ fn two_write_calls(index: usize) -> ChatOutput {
     )
 }
 
+/// Accepts steering the first time a tool batch is prepared, which is after the
+/// run drained its inbox for that batch: the steering arrives while the tools run.
+struct SteerDuringBatch(Arc<OnceLock<Hook>>);
+
+impl Middleware for SteerDuringBatch {
+    fn name(&self) -> &'static str {
+        "SteerDuringBatch"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(SteerInBatch {
+            hook: self.0.clone(),
+            fired: false,
+        })
+    }
+}
+
+struct SteerInBatch {
+    hook: Arc<OnceLock<Hook>>,
+    fired: bool,
+}
+
+#[async_trait]
+impl TurnMiddleware for SteerInBatch {
+    async fn on_prepared_tool_calls(
+        &mut self,
+        _cx: &mut HookCx<'_>,
+        batch: &PreparedBatch<'_>,
+    ) -> crate::middleware::Result<Vec<PreparedCallVerdict>> {
+        if !self.fired
+            && let Some(hook) = self.hook.get()
+        {
+            self.fired = true;
+            hook().await;
+        }
+        Ok(batch
+            .calls
+            .iter()
+            .map(|_| PreparedCallVerdict::Proceed)
+            .collect())
+    }
+}
+
 // ---- scenarios ----
 
 #[tokio::test]
@@ -522,9 +574,10 @@ async fn reasoning_run(with_provenance: bool) {
 }
 
 /// Output that records its provenance, as every provider with native reasoning
-/// does. Fails on the current code (task 2.1 finding, 5.4): the session's stored
-/// LLM config has no protocol or endpoint, so a load never matches the
-/// provenance and sends the portable form.
+/// does. The session's stored LLM config has no protocol or endpoint, so the
+/// replay identity is completed from the latest reply of the same provider and
+/// model (`SessionHandle::output_target`); without that a load would never match
+/// the provenance and would send the portable form.
 #[tokio::test]
 async fn request_after_a_reply_with_provider_reasoning_matches_a_reload() {
     reasoning_run(true).await;
@@ -718,4 +771,227 @@ async fn first_request_of_the_next_run_continues_the_previous_one() {
         seen[2].messages.last().map(|m| (m.role, m.text())),
         Some((ChatRole::User, "run 1".to_string()))
     );
+}
+
+/// run-history-consistency / Steering arrives while tools run.
+#[tokio::test]
+async fn steering_arrives_while_tools_run() {
+    let slot = Arc::new(OnceLock::new());
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 10),
+        _ => done(10),
+    });
+    let run = Run::new(
+        provider,
+        Setup {
+            middleware: vec![Arc::new(SteerDuringBatch(slot.clone()))],
+            ..Setup::default()
+        },
+    )
+    .await;
+    slot.set(run.steering_hook("use another file name").await)
+        .ok()
+        .expect("one steering hook");
+
+    run.prompt("run 0").await;
+
+    // The batch finished: its result is stored directly after the call, and
+    // the steering after it, before the next model request.
+    let order = tool_batch_order(&run.stored().await);
+    assert_eq!(order, ["calls", "results:1", "steering"]);
+    assert!(run.fixture.worktree.path().join("step-0.txt").exists());
+    run.assert_matches_a_reload(2);
+    assert!(text_of(&run.provider.seen()[1].messages).contains("use another file name"));
+}
+
+/// The compaction in the middle of a run removes what the run had stored; the
+/// next request stores it again.
+fn compacting_run_setup(extra: Vec<Arc<dyn Middleware>>) -> Setup {
+    let mut middleware: Vec<Arc<dyn Middleware>> = extra;
+    middleware.push(Arc::new(ContextMiddleware::new(
+        ContextConfig::with_manual_limit(1000),
+    )));
+    Setup {
+        hooks: Some(custom_summary_hooks("what happened so far")),
+        middleware,
+        ..Setup::default()
+    }
+}
+
+fn count_parts(
+    stored: &[querymt_agent_core::model::AgentMessage],
+    matches: impl Fn(&MessagePart) -> bool,
+) -> usize {
+    stored
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter(|part| matches(part))
+        .count()
+}
+
+/// run-history-consistency / Mode reminder compacted away is stored again.
+#[tokio::test]
+async fn mode_reminder_compacted_away_is_stored_again() {
+    use crate::agent::core::AgentMode;
+    use querymt_agent_core::model::NoticeSource;
+
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 900),
+        _ => done(10),
+    });
+    let mut reminders = std::collections::HashMap::new();
+    reminders.insert(AgentMode::Plan, "plan reminder".to_string());
+    let run = Run::new(
+        provider,
+        compacting_run_setup(vec![Arc::new(AgentModeMiddleware::with_reminders(
+            reminders,
+        ))]),
+    )
+    .await;
+    run.fixture
+        .handle
+        .session_ref_for_agent_session(&run.session)
+        .await
+        .expect("session actor")
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("set mode");
+
+    run.prompt("run 0").await;
+
+    let stored = run.stored().await;
+    assert!(
+        count_parts(&stored, |part| matches!(
+            part,
+            MessagePart::Compaction { .. }
+        )) > 0
+    );
+    assert_eq!(
+        count_parts(&stored, |part| matches!(
+            part,
+            MessagePart::Notice {
+                source: NoticeSource::AgentMode,
+                ..
+            }
+        )),
+        2,
+        "stored before the compaction and again after it"
+    );
+    assert!(text_of(&run.provider.seen()[1].messages).contains("plan reminder"));
+    run.assert_matches_a_reload(2);
+}
+
+/// run-history-consistency / Baseline compacted away is stored again.
+#[tokio::test]
+async fn baseline_compacted_away_is_stored_again() {
+    let provider = ScriptedProvider::new(true, |index| match index {
+        0 => write_call(0, 900),
+        _ => done(10),
+    });
+    let run = Run::new(provider, compacting_run_setup(Vec::new())).await;
+
+    run.prompt("run 0").await;
+
+    let stored = run.stored().await;
+    assert!(
+        count_parts(&stored, |part| matches!(
+            part,
+            MessagePart::Compaction { .. }
+        )) > 0
+    );
+    assert_eq!(
+        count_parts(&stored, |part| matches!(
+            part,
+            MessagePart::ToolBaseline { .. }
+        )),
+        2,
+        "a baseline before the compaction and a new one after it"
+    );
+    run.assert_matches_a_reload(2);
+}
+
+/// A history stored with the steering message before the results (the order
+/// older builds wrote) still loads and prepares a valid request.
+#[tokio::test]
+async fn history_in_the_old_steering_order_still_loads() {
+    use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+    use querymt_agent_core::projection::{RequestTarget, project_request};
+
+    let fixture =
+        TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![])).await;
+    let (env, _turn) = fixture.turn().await;
+    let stored = |role: ChatRole, parts: Vec<MessagePart>| {
+        let mut message =
+            querymt_agent_core::model::AgentMessage::new(env.session_id.clone(), role);
+        message.parts = parts;
+        message
+    };
+    let call = querymt::ToolCall {
+        id: "call-1".into(),
+        call_type: "function".into(),
+        function: querymt::FunctionCall {
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        },
+    };
+    for message in [
+        stored(
+            ChatRole::User,
+            vec![MessagePart::Text {
+                content: "go".into(),
+            }],
+        ),
+        stored(ChatRole::Assistant, vec![MessagePart::ToolUse(call)]),
+        // The old order: steering first, then the skipped result.
+        stored(
+            ChatRole::User,
+            vec![MessagePart::Steering {
+                run_id: "run".into(),
+                client_input_id: None,
+                blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                    crate::acp::protocol::TextContent::new("use another file name"),
+                )],
+            }],
+        ),
+        stored(
+            ChatRole::User,
+            vec![MessagePart::ToolResult {
+                call_id: "call-1".into(),
+                content: vec![querymt::chat::ToolResultPart::text("Skipped")],
+                is_error: true,
+                tool_name: Some("read_file".into()),
+                tool_arguments: None,
+                compacted_at: None,
+            }],
+        ),
+    ] {
+        env.session_handle.add_message(message).await.unwrap();
+    }
+
+    let loaded = env
+        .session_handle
+        .get_effective_agent_history()
+        .await
+        .unwrap();
+    let mut request = project_request(
+        &loaded,
+        &RequestTarget {
+            output: None,
+            max_prompt_bytes: None,
+            tool_changes: false,
+        },
+    )
+    .unwrap()
+    .messages;
+
+    assert!(
+        querymt_agent_core::model::answer_unanswered_tool_calls(&mut request).is_empty(),
+        "every call is answered: {}",
+        text_of(&request)
+    );
+    // The result follows the call in one message, with the steering text after it.
+    assert_eq!(request.len(), 3);
+    assert!(request[1].has_tool_use());
+    assert!(request[2].has_tool_result());
+    assert!(request[2].text().contains("use another file name"));
 }

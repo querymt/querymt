@@ -232,8 +232,24 @@ impl TurnStack {
     }
 
     /// When the run is about to end on `stop`. The first middleware that
-    /// recovers ends the stage.
+    /// recovers ends the stage. When none does, what they queued while they
+    /// were consulted is dropped: it was meant for a run that goes on, and the
+    /// stop goes on to publication unchanged.
     pub(crate) async fn stopped(
+        &mut self,
+        cx: &mut HookCx<'_>,
+        stop: &Stop,
+        cancel: &CancellationToken,
+    ) -> Result<Folded<StopVerdict>> {
+        let checkpoint = cx.checkpoint();
+        let folded = self.consult_stopped(cx, stop, cancel).await?;
+        if matches!(folded, Folded::Decided(StopVerdict::Pass)) {
+            cx.rollback(checkpoint);
+        }
+        Ok(folded)
+    }
+
+    async fn consult_stopped(
         &mut self,
         cx: &mut HookCx<'_>,
         stop: &Stop,

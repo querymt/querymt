@@ -20,12 +20,15 @@ use crate::agent::turn_control::{RunPhase, SteeringInbox};
 use crate::knowledge::KnowledgeStore;
 use crate::knowledge::repository::RepositoryKnowledgeRegistry;
 use crate::knowledge::repository::budget::DeliveryBudget;
+use crate::middleware::{AgentStats, HookCx, HookInputs, ModelProfile, PendingNotice};
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::{AgentToolContext, ToolRegistry, ToolSet};
-use querymt_agent_core::model::{AgentMessage, TurnId};
+use querymt::chat::{ChatRole, GenerationOptions};
+use querymt_agent_core::model::{AgentMessage, MessagePart, NoticeSource, TurnId};
+use querymt_agent_core::projection::ToolBaselineRef;
 use querymt_agent_services::accounting::{BudgetWarnings, CycleAccounting};
 use querymt_agent_services::event_sink::EventSink;
 use querymt_agent_services::snapshot::{SnapshotId, SnapshotResult};
@@ -145,8 +148,17 @@ impl TurnEnv {
         self.runtime.cwd.as_deref()
     }
 
-    /// Persist an `AgentMessage` via the turn-pinned session handle.
-    pub(crate) async fn add_message(&self, message: AgentMessage) -> SessionResult<()> {
+    /// Stores an undo/redo snapshot record. Unlike conversation messages,
+    /// which go through [`History::commit`], these are not part of the run's
+    /// history: a load of the effective history drops them.
+    pub(crate) async fn store_snapshot_record(&self, message: AgentMessage) -> SessionResult<()> {
+        debug_assert!(
+            message.parts.iter().all(|part| matches!(
+                part,
+                MessagePart::TurnSnapshotStart { .. } | MessagePart::TurnSnapshotPatch { .. }
+            )),
+            "only snapshot records bypass the run's history"
+        );
         self.session_handle.add_message(message).await
     }
 
@@ -158,6 +170,17 @@ impl TurnEnv {
     /// The turn-pinned execution config snapshot.
     pub(crate) fn execution_config(&self) -> Option<&SessionExecutionConfig> {
         self.session_handle.execution_config()
+    }
+
+    /// The provider of the session's pinned model (empty when none is pinned).
+    pub(crate) fn provider_name(&self) -> &str {
+        self.llm_config()
+            .map_or("", |config| config.provider.as_str())
+    }
+
+    /// The session's pinned model (empty when none is pinned).
+    pub(crate) fn model_name(&self) -> &str {
+        self.llm_config().map_or("", |config| config.model.as_str())
     }
 
     /// The id of the run this execution belongs to. Work that happens inside
@@ -219,8 +242,20 @@ pub(crate) struct Turn {
     pub state: RuntimeContext,
     /// The single source of instruction authority for this run.
     pub run_objective: Option<RunObjective>,
-    /// Typed-summary provenance, refreshed whenever effective history is rebuilt.
-    pub compaction_summaries: Vec<querymt::chat::ChatMessage>,
+    /// The run's conversation: the stored messages and nothing else. The only
+    /// way to grow it is [`History::commit`].
+    pub history: History,
+    /// Usage and cost counters of the run.
+    pub stats: AgentStats,
+    /// Notices raised since the last model request. The loop stores them at
+    /// the request boundary, after any tool results.
+    pub pending_notices: Vec<PendingNotice>,
+    /// Generation overrides for the next model request only.
+    pub request_overrides: GenerationOptions,
+    /// Options the most recent model request was sent with.
+    pub last_applied: GenerationOptions,
+    /// Facts about the session's model.
+    pub profile: Arc<ModelProfile>,
     /// Delegations left running when steering interrupts a wait.
     pub suspended_delegations: HashSet<String>,
     /// Retains a supplementary terminal read across bounded BeforeModel
@@ -242,13 +277,41 @@ pub(crate) struct Turn {
 }
 
 impl Turn {
+    /// What a middleware hook may read and write of this run.
+    pub(crate) fn hook_cx<'a>(&'a mut self, env: &'a TurnEnv) -> HookCx<'a> {
+        HookCx::new(HookInputs {
+            session_id: &env.session_id,
+            provider: env.provider_name(),
+            model: env.model_name(),
+            mode: env.turn_mode,
+            runtime: &env.runtime,
+            history: &self.history,
+            stats: &self.stats,
+            profile: &self.profile,
+            last_applied: self.last_applied,
+            request_overrides: &mut self.request_overrides,
+            pending_notices: &mut self.pending_notices,
+            changed: &self.changed_paths,
+        })
+    }
+
+    /// Queue a notice to be stored before the next model request.
+    pub(crate) fn queue_notice(&mut self, source: NoticeSource, content: String) {
+        self.pending_notices.push(PendingNotice { source, content });
+    }
+
     /// A run that starts from `state` with nothing suspended, reported or
     /// counted.
     pub(crate) fn new(state: RuntimeContext) -> Self {
         Self {
             state,
             run_objective: None,
-            compaction_summaries: Vec::new(),
+            history: History::default(),
+            stats: AgentStats::default(),
+            pending_notices: Vec::new(),
+            request_overrides: GenerationOptions::NONE,
+            last_applied: GenerationOptions::NONE,
+            profile: Arc::new(ModelProfile::default()),
             suspended_delegations: HashSet::new(),
             suspended_recovery: None,
             delivery_budget: None,
@@ -257,6 +320,128 @@ impl Turn {
             changed_paths: Default::default(),
             budgets: TurnBudgets::default(),
         }
+    }
+}
+
+/// The run's history: the session's stored messages, in order.
+///
+/// The run holds the type the store holds, so what it reads from the history
+/// (the tool baseline in effect, the latest mode reminder, the number of user
+/// turns) is looked up in the messages when asked and is never kept in a field
+/// beside them. Messages are appended only by [`History::commit`], which
+/// writes to the store first.
+#[derive(Debug, Default)]
+pub(crate) struct History {
+    messages: Vec<AgentMessage>,
+}
+
+impl History {
+    /// The stored messages.
+    pub(crate) fn as_slice(&self) -> &[AgentMessage] {
+        &self.messages
+    }
+
+    /// Stores `messages` in order, then appends them. The only way to grow a
+    /// history: a message is appended only after its write succeeded, so a
+    /// request never carries a message the store does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the store's error at the first message that cannot be
+    /// written. Earlier messages of the call stay stored and appended.
+    pub(crate) async fn commit(
+        &mut self,
+        session: &SessionHandle,
+        messages: Vec<AgentMessage>,
+    ) -> anyhow::Result<()> {
+        self.messages.reserve(messages.len());
+        for message in messages {
+            session.add_message(message.clone()).await?;
+            self.messages.push(message);
+        }
+        Ok(())
+    }
+
+    /// Loads the session's effective history from the store: the one place a
+    /// run reads its history, when it starts. From then on the run holds what
+    /// the store holds, because it is the only writer.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store cannot return the history.
+    pub(crate) async fn load(session: &SessionHandle) -> anyhow::Result<Self> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "agent.execution.history_load",
+            history_ms = tracing::field::Empty,
+            message_count = tracing::field::Empty
+        );
+        async {
+            let started = std::time::Instant::now();
+            let messages = session
+                .get_effective_agent_history()
+                .await
+                .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
+            let span = tracing::Span::current();
+            span.record("history_ms", started.elapsed().as_millis() as u64);
+            span.record("message_count", messages.len() as u64);
+            Ok(Self { messages })
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// After a compaction boundary was committed: drops what the boundary
+    /// closed, as a load of the store would.
+    pub(crate) fn keep_effective(&mut self) {
+        let all = std::mem::take(&mut self.messages);
+        self.messages = querymt_agent_core::history::filter_to_effective_history(all);
+    }
+
+    /// Sets the messages without storing them, for tests that arrange a run.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn replace(&mut self, messages: Vec<AgentMessage>) {
+        self.messages = messages;
+    }
+
+    /// The most recent stored tool baseline.
+    pub(crate) fn tool_baseline(&self) -> Option<ToolBaselineRef<'_>> {
+        querymt_agent_core::projection::tool_baseline(&self.messages)
+    }
+
+    /// Content of the most recent stored mode reminder.
+    pub(crate) fn last_mode_notice(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter().rev())
+            .find_map(|part| match part {
+                MessagePart::Notice {
+                    source: NoticeSource::AgentMode,
+                    content,
+                } => Some(content.as_str()),
+                _ => None,
+            })
+    }
+
+    /// User turns: user messages that carry no tool result and are not made
+    /// only of harness notices or tool records.
+    pub(crate) fn user_turns(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| {
+                let harness_only = !message.parts.is_empty()
+                    && message.parts.iter().all(|part| {
+                        matches!(part, MessagePart::Notice { .. }) || part.is_tool_record()
+                    });
+                message.role == ChatRole::User
+                    && !harness_only
+                    && !message
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, MessagePart::ToolResult { .. }))
+            })
+            .count()
     }
 }
 

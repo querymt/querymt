@@ -15,7 +15,8 @@ cancel and mode changes while a turn runs.
 
 ## States and transitions
 
-The loop moves an `ExecutionState` (`crates/agent-runtime/src/middleware/state.rs`) through
+The loop moves an `ExecutionState` (`crates/agent-runtime/src/middleware/state.rs`; a position
+that carries only what its step consumes, never run state) through
 `BeforeLlmCall`, `CallLlm`, `AfterLlm` and `ProcessingToolCalls`. After tool results are
 stored it returns to `BeforeLlmCall`, or enters `WaitingForEvent` when a delegation must
 finish first. A turn ends in `Complete`, `Stopped` (a middleware stop) or `Cancelled`.
@@ -33,7 +34,8 @@ The state of a run is split by mutability in `crates/agent-runtime/src/agent/exe
   `execute_prompt_inner` (`session_actor.rs`), so a missing field is a compile error,
   and step functions take it as `&TurnEnv`, including the concurrent tool wave.
 - `Turn` is everything that changes while the run executes: the `RuntimeContext`
-  (active task, intent), the run objective, compaction summaries, delegations suspended by
+  (active task, intent), the run objective, the `History`, the statistics, the queued
+  notices, the request overrides, the model profile, delegations suspended by
   steering, the repository-knowledge delivery budget, budget warnings, the pre-turn
   snapshot (`PreTurnSnapshot`: `None`, `Pending(task)`, `Ready(snapshot)`) and
   `TurnBudgets`, the counters that bound the run (Stop-hook continuations per reason,
@@ -52,6 +54,47 @@ the wave. `Turn` must stay `Sync` for that; `DelegationRecovery` wraps its futur
 `SyncWrapper` for this reason.
 
 Source: `crates/agent-runtime/src/agent/execution/turn.rs`, `crates/agent-runtime/src/agent/session_actor.rs`.
+
+## History: one writer, one projection
+
+The run holds the messages the session store holds (`History` over `Vec<AgentMessage>`,
+`turn.rs`). `History::load` reads them once, where the run is set up
+(`execute_prompt_inner`); the loop, the native `/compact` and compaction read the run's
+history and never the store. `History::commit` is the only way to grow it, the prompt of
+the run included: it writes each message to the store and appends it only after the write
+succeeded, so a request never carries a message the store does not hold and a failed write
+fails the run. Undo/redo snapshot records are the one other write (`store_snapshot_record`):
+they are not conversation and a load drops them. Everything the run reads from the history
+(the tool baseline in effect, the latest mode reminder, the number of user turns) is looked
+up in the messages when asked; nothing is cached in a field beside them. After a compaction
+boundary was committed, `History::keep_effective` drops what it closed, as a load would.
+
+`querymt_agent_core::projection::project_request` is the one place a stored history becomes
+the messages of a request: a notice is user text, a tool baseline is the request's tool list
+and never a message, a tool change after the baseline in effect is a message only for a
+provider that takes them, native provider output is replayed only to the target it came
+from, and prompt content is cut at the size limit. `projection::tool_baseline` is the one
+lookup of the baseline in effect (the projection, `tool_history::offered` and the origin
+check all use it). A model request, a compaction request and every token estimate
+(`pruning::estimate_history_tokens`, with the provider's `tool_updates`) read the history
+through the projection, so what a reload would send is what the run sends. Cache hints are
+put on the messages as they are sent (`cache_hints.rs`), after any context hook.
+
+The identity native replay is checked against is `SessionHandle::output_target`: the session
+store records no endpoint, so it is completed from the latest stored output of the same
+provider and model. It is a gate, not proof of the endpoint configured now: the provider is
+the authority and re-checks every output's provenance against its own configuration (OpenAI,
+xAI and Codex), degrading what does not match to the portable form. Taking the identity from
+the provider itself needs the run's resolved model (`unify-model-call-path`).
+
+Skipped results of a batch that steering interrupted are committed before the steering that
+skipped them (`commit_steering` with the results as `preceding`), so the stored order is the
+sent order. The run does not reload its history when it completes: it already holds what a
+load would give it. `TurnStack::stopped` drops what the middleware queued while consulted
+when none of them recovers, so the loop and the test rigs share that rule.
+
+Source: `crates/agent-runtime/src/agent/execution/turn.rs`, `crates/agent-core/src/projection.rs`,
+`crates/agent-runtime/src/agent/execution/cache_hints.rs`.
 
 ## Tool-call lifecycle
 

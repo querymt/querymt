@@ -159,37 +159,31 @@ pub(crate) mod genai {
         });
     }
 
-    /// Keep only typed successful summaries, projected alongside the effective history.
-    /// Canonical assistant output supersedes legacy parts, including compaction parts.
-    pub(crate) fn compaction_summaries(
-        history: &[AgentMessage],
-        projected: &[ChatMessage],
-    ) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .zip(projected)
-            .filter(|(message, _)| {
-                message.parts.iter().any(|part| {
-                    matches!(part, MessagePart::Compaction { summary, .. } if !summary.trim().is_empty())
-                }) && !(message.role == ChatRole::Assistant
-                    && message.parts.iter().any(|part| matches!(part, MessagePart::Output { .. })))
-            })
-            .map(|(_, projected)| projected.clone())
-            .collect()
-    }
-
+    /// Mark the span when the request carries a typed successful compaction
+    /// summary of the stored history. Canonical assistant output supersedes
+    /// legacy parts, including compaction parts.
     pub(crate) fn conversation_compacted(
         span: &Span,
-        summaries: &[ChatMessage],
+        history: &[AgentMessage],
         messages: &[ChatMessage],
     ) {
         // Hooks/middleware can replace the final request; cache hints are not content.
-        if summaries.iter().any(|summary| {
-            messages.iter().any(|message| {
+        let summaries = history.iter().filter(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, MessagePart::Compaction { summary, .. } if !summary.trim().is_empty())
+            }) && !(message.role == ChatRole::Assistant
+                && message.parts.iter().any(|part| matches!(part, MessagePart::Output { .. })))
+        });
+        for summary in summaries {
+            let Ok(summary) = summary.to_chat_message() else {
+                continue;
+            };
+            if messages.iter().any(|message| {
                 message.role == summary.role && message.payload() == summary.payload()
-            })
-        }) {
-            span.set_attribute("gen_ai.conversation.compacted", true);
+            }) {
+                span.set_attribute("gen_ai.conversation.compacted", true);
+                return;
+            }
         }
     }
 

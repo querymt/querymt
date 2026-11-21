@@ -29,6 +29,21 @@
 
 ### Behavior changes
 
+- **Skipped tool results are stored before the steering that skipped them.**
+  When steering is applied before a tool batch starts, the stored order is now
+  the assistant message with the calls, one message with the skipped results,
+  then the steering message (before, the steering message was stored first and a
+  load moved the results behind it, so the request a run sent differed from the
+  one a reload sends). Sessions stored with the old order still load: the
+  results are moved to directly after their calls, as before.
+- **Token figures of a compaction use the request's estimate.** `compaction_start`
+  and `compaction_end` events, the `context_tokens` that follow a compaction and
+  the delegation summary budget are now the estimate of the request the history
+  projects to (steering, reasoning and compaction summaries included, and the
+  tool list and tool-change definitions when the session's provider takes tool
+  changes as messages), where three different partial estimates were used. The
+  numbers change for histories that hold any of those parts; for one with a
+  4,000-byte tool-change definition the figure grows by about 1,000 tokens.
 - **Duplicate-code review runs in every run that changed files (middleware
   `dedup_check`).** Before, its "already reviewed" flag was cleared only by
   `MiddlewareDriver::reset`, which no run called, so after the first review of
@@ -487,6 +502,19 @@
   `NoticeSource::DuplicateToolCall` and `Delegation::retry_count` stay.
 - **`SessionRuntime::turn_diffs` is removed.** The files a run changed are held
   by the run itself and reach middleware through `HookCx::changed_paths`.
+- **BREAKING (Rust API): the run no longer holds its history as provider
+  messages.** `HookCx::history()` returns `&[AgentMessage]`, the messages as the
+  session stores them (a notice with its source, a tool baseline, a steering
+  message), not the `&[ChatMessage]` a provider is sent. `ConversationContext`
+  is removed, and the `ExecutionState` variants no longer carry a `context`: the
+  history, statistics, queued notices and request overrides of a run belong to
+  the run and reach a hook through `HookCx` (`history`, `stats`,
+  `pending_notices`, `last_applied`, `request_overrides`).
+  `SessionHandle::add_message` is `pub(crate)`, and `SessionHandle::history`
+  and `SessionHandle::project_history` are removed: the run is the only writer
+  of its history, and a model or compaction request is projected from the stored
+  messages in one place. Public `SessionRuntime` fields `turn_snapshot` and
+  `pre_turn_snapshot_task` are removed with `turn_diffs`.
 
 ### Fixed
 

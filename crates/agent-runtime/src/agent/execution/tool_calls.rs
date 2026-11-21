@@ -1970,20 +1970,21 @@ pub(super) async fn record_tool_side_effects(
 /// assistant tool-call message) keep their relative order and go at the end.
 fn order_results_by_call_position(
     results: &[ToolResult],
-    messages: &[querymt::chat::ChatMessage],
+    history: &[AgentMessage],
 ) -> Vec<ToolResult> {
     let mut ordered = results.to_vec();
-    let Some(assistant) = messages
+    let Some(assistant) = history
         .iter()
         .rfind(|message| message.role == ChatRole::Assistant)
     else {
         return ordered;
     };
 
+    let calls = assistant.function_calls();
     let mut positions: HashMap<&str, usize> = HashMap::new();
-    for (position, call) in assistant.function_calls().enumerate() {
+    for (position, call) in calls.iter().enumerate() {
         // First occurrence wins if an id is (unexpectedly) repeated.
-        positions.entry(call.call_id.as_str()).or_insert(position);
+        positions.entry(call.id.as_str()).or_insert(position);
     }
     // `sort_by_key` is stable, so unknown ids (usize::MAX) keep their order.
     ordered.sort_by_key(|result| {
@@ -2013,15 +2014,15 @@ fn resolved_isolation_label(resolved: crate::worktree::ResolvedIsolation) -> &'s
 /// 5. Returns either WaitingForEvent (if delegation) or BeforeLlmCall
 #[instrument(
     name = "agent.tools.store_all_results",
-    skip(config, results, context, env, turn),
+    skip(config, results, env, turn, steering),
     fields(session_id = %env.session_id, result_count = results.len())
 )]
 pub(super) async fn store_all_tool_results(
     config: &AgentConfig,
     results: &Arc<[ToolResult]>,
-    context: &Arc<crate::middleware::ConversationContext>,
     env: &TurnEnv,
     turn: &mut Turn,
+    steering: super::DrainedSteering,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "Storing all tool results: session={}, count={}",
@@ -2029,13 +2030,12 @@ pub(super) async fn store_all_tool_results(
         results.len()
     );
 
-    let mut messages = (*context.messages).to_vec();
     let mut wait_conditions = Vec::new();
 
     // Middleware may pre-fill `results` (e.g. rejected calls), so the incoming
     // order is not necessarily the order of the assistant's tool calls. Store
     // results in call order.
-    let ordered_results = order_results_by_call_position(results, &context.messages);
+    let ordered_results = order_results_by_call_position(results, turn.history.as_slice());
 
     // Record per-result side effects (delegations, artifacts, etc.) before
     // persisting the combined tool_result message so hook-driven rewrites are
@@ -2101,28 +2101,12 @@ pub(super) async fn store_all_tool_results(
         source_model: None,
     };
 
-    env.add_message(result_msg.clone())
+    // The results are stored directly after the assistant message that made
+    // the calls. Steering accepted before the batch started is stored after
+    // them, so the stored order is the order the model is sent.
+    super::commit_steering(config, env, turn, steering, vec![result_msg])
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
-
-    // Steering may have been accepted after the assistant requested these tools.
-    // Persist its original order, but keep the request's result batch adjacent
-    // to the assistant instead of inserting a user message between them.
-    let result_index = messages
-        .iter()
-        .rposition(|message| message.role == ChatRole::Assistant)
-        .map_or(messages.len(), |index| index + 1);
-    messages.insert(
-        result_index,
-        result_msg
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid stored tool result content: {error}"))?,
-    );
-
-    let new_context = Arc::new(context.with_history(
-        Arc::from(messages.into_boxed_slice()),
-        context.stats.clone(),
-    ));
 
     // Aggregate changed file paths from tool results for dedup check
     let mut combined = querymt_agent_index::DiffPaths::default();
@@ -2140,20 +2124,16 @@ pub(super) async fn store_all_tool_results(
 
     if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {
         return Ok(ExecutionState::WaitingForEvent {
-            context: new_context,
             wait: wait_condition,
         });
     }
 
-    Ok(ExecutionState::BeforeLlmCall {
-        context: new_context,
-    })
+    Ok(ExecutionState::BeforeLlmCall)
 }
 
 #[cfg(test)]
 mod result_order_tests {
     use super::*;
-    use querymt::chat::ChatMessage;
 
     fn result(call_id: &str) -> ToolResult {
         ToolResult::new(
@@ -2169,12 +2149,22 @@ mod result_order_tests {
         results.iter().map(|r| r.call_id.as_str()).collect()
     }
 
-    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
-        let mut builder = ChatMessage::assistant();
-        for id in ids {
-            builder = builder.tool_use(*id, "edit", serde_json::json!({}));
-        }
-        builder.build()
+    fn assistant_with_calls(ids: &[&str]) -> AgentMessage {
+        let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+        message.parts = ids
+            .iter()
+            .map(|id| {
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: id.to_string(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "edit".into(),
+                        arguments: "{}".into(),
+                    },
+                })
+            })
+            .collect();
+        message
     }
 
     #[test]

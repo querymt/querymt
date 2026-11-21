@@ -1,15 +1,14 @@
 use crate::middleware::{
-    AgentStats, ConversationContext, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult,
-    WaitCondition, WaitReason,
+    AgentStats, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult, WaitCondition,
+    WaitReason,
 };
-use crate::test_utils::{mock_tool_call, test_context};
-use querymt::chat::{ChatMessage, FinishReason, ToolResultPart};
+use crate::test_utils::mock_tool_call;
+use querymt::chat::{FinishReason, ToolResultPart};
 use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
 #[test]
 fn test_execution_state_name_all_variants() {
-    let context = test_context("sess-1", 0);
     let response = Arc::new(LlmResponse::new(
         "".to_string(),
         vec![],
@@ -17,15 +16,9 @@ fn test_execution_state_name_all_variants() {
         Some(FinishReason::Stop),
     ));
     let states = vec![
-        (
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            "BeforeLlmCall",
-        ),
+        (ExecutionState::BeforeLlmCall, "BeforeLlmCall"),
         (
             ExecutionState::CallLlm {
-                context: context.clone(),
                 request: Arc::new(PreparedModelRequest {
                     messages: Arc::from([]),
                     tools: Arc::from([]),
@@ -36,39 +29,25 @@ fn test_execution_state_name_all_variants() {
             },
             "CallLlm",
         ),
-        (
-            ExecutionState::AfterLlm {
-                response: response.clone(),
-                context: context.clone(),
-            },
-            "AfterLlm",
-        ),
+        (ExecutionState::AfterLlm { response }, "AfterLlm"),
         (
             ExecutionState::ProcessingToolCalls {
                 remaining_calls: Arc::from([]),
                 results: Arc::from([]),
-                context: context.clone(),
             },
             "ProcessingToolCalls",
         ),
         (
             ExecutionState::WaitingForEvent {
-                context: context.clone(),
                 wait: WaitCondition::delegation("del-1".to_string()),
             },
             "WaitingForEvent",
         ),
-        (
-            ExecutionState::Complete {
-                context: context.clone(),
-            },
-            "Complete",
-        ),
+        (ExecutionState::Complete, "Complete"),
         (
             ExecutionState::Stopped {
                 message: "done".into(),
                 stop_type: StopType::Other,
-                context: None,
             },
             "Stopped",
         ),
@@ -78,111 +57,6 @@ fn test_execution_state_name_all_variants() {
     for (state, expected) in states {
         assert_eq!(state.name(), expected);
     }
-}
-
-#[test]
-fn test_execution_state_context_accessors() {
-    let context = test_context("sess-1", 0);
-    let response = Arc::new(LlmResponse::new(
-        "".to_string(),
-        vec![],
-        None,
-        Some(FinishReason::Stop),
-    ));
-
-    let stateful_states = vec![
-        ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        },
-        ExecutionState::CallLlm {
-            context: context.clone(),
-            request: Arc::new(PreparedModelRequest {
-                messages: Arc::from([]),
-                tools: Arc::from([]),
-                offered_tools: Arc::from([]),
-                estimated_tokens: 0,
-                options: Default::default(),
-            }),
-        },
-        ExecutionState::AfterLlm {
-            response: response.clone(),
-            context: context.clone(),
-        },
-        ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from([]),
-            results: Arc::from([]),
-            context: context.clone(),
-        },
-        ExecutionState::WaitingForEvent {
-            context: context.clone(),
-            wait: WaitCondition::delegation("del-1".to_string()),
-        },
-        ExecutionState::Complete {
-            context: context.clone(),
-        },
-    ];
-
-    for state in stateful_states {
-        assert!(state.context().is_some());
-    }
-
-    let terminal_states = vec![
-        ExecutionState::Stopped {
-            message: "done".into(),
-            stop_type: StopType::Other,
-            context: None,
-        },
-        ExecutionState::Cancelled,
-    ];
-
-    for state in terminal_states {
-        assert!(state.context().is_none());
-    }
-}
-
-#[test]
-fn test_conversation_context_counts_user_messages() {
-    let messages = vec![
-        ChatMessage::user().text("one").build(),
-        ChatMessage::assistant().text("two").build(),
-        ChatMessage::user().text("three").build(),
-    ];
-    let stats = AgentStats {
-        turns: 2,
-        ..Default::default()
-    };
-    let context = ConversationContext::new(
-        "sess-1".into(),
-        Arc::from(messages.into_boxed_slice()),
-        Arc::new(stats),
-        "mock".into(),
-        "mock-model".into(),
-    );
-
-    assert_eq!(context.user_message_count(), 2);
-    assert!(!context.is_first_turn());
-}
-
-#[test]
-fn test_conversation_context_queue_notice_does_not_touch_messages() {
-    let context = ConversationContext::new(
-        "sess-1".into(),
-        Arc::from([]),
-        Arc::new(AgentStats::default()),
-        "mock".into(),
-        "mock-model".into(),
-    );
-
-    let queued = context.queue_notice(
-        querymt_agent_core::model::NoticeSource::DuplicateCode,
-        "hello".to_string(),
-    );
-
-    assert!(context.pending_notices.is_empty());
-    assert!(queued.messages.is_empty());
-    assert_eq!(queued.pending_notices.len(), 1);
-    assert_eq!(queued.pending_notices[0].content, "hello");
-    assert!(queued.is_first_turn());
 }
 
 #[test]

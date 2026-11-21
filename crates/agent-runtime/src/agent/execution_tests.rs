@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -46,6 +46,8 @@ struct TestHarness {
     provider: Arc<Mutex<MockLlmProvider>>,
     stored_messages: Arc<StdMutex<Vec<querymt_agent_core::model::AgentMessage>>>,
     history_writes: Arc<AtomicUsize>,
+    /// While set, the store rejects the write of an assistant message.
+    fail_assistant_writes: Arc<AtomicBool>,
     _temp_dir: TempDir,
 }
 
@@ -120,9 +122,18 @@ impl TestHarness {
         let history_writes = Arc::new(AtomicUsize::new(0));
         let stored_messages_for_mock = stored_messages.clone();
         let history_writes_for_mock = history_writes.clone();
+        let fail_assistant_writes = Arc::new(AtomicBool::new(false));
+        let fail_for_mock = fail_assistant_writes.clone();
         store
             .expect_add_message()
             .returning(move |_, message| {
+                if fail_for_mock.load(Ordering::SeqCst)
+                    && message.role == querymt::chat::ChatRole::Assistant
+                {
+                    return Err(crate::session::error::SessionError::Other(
+                        "disk full".into(),
+                    ));
+                }
                 stored_messages_for_mock.lock().unwrap().push(message);
                 history_writes_for_mock.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -222,6 +233,7 @@ impl TestHarness {
             provider,
             stored_messages,
             history_writes,
+            fail_assistant_writes,
             _temp_dir: temp_dir,
         }
     }
@@ -246,6 +258,9 @@ impl TestHarness {
 
     async fn run(&mut self) -> CycleOutcome {
         self.refresh_env().await;
+        self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
+            .await
+            .expect("history loads");
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &self.env,
@@ -1023,19 +1038,10 @@ async fn invalid_steering_conversion_does_not_persist_history() {
         .await
         .expect("direct inbox insertion bypasses admission validation");
     harness.env.steering = Some(inbox);
-    let context = Arc::new(crate::middleware::ConversationContext::new(
-        Arc::from(harness.session_id.as_str()),
-        Arc::from([]),
-        Arc::new(crate::middleware::AgentStats::default()),
-        Arc::from("mock"),
-        Arc::from("mock-model"),
-    ));
-
     let result = crate::agent::execution::apply_pending_steering(
         &harness.config,
         &harness.env,
         &mut harness.turn,
-        &context,
         "test",
         false,
     )
@@ -1043,6 +1049,63 @@ async fn invalid_steering_conversion_does_not_persist_history() {
 
     assert!(result.is_err());
     assert_eq!(harness.history_writes.load(Ordering::SeqCst), 0);
+}
+
+/// run-history-consistency / Storing an assistant reply fails.
+#[tokio::test]
+async fn storing_an_assistant_reply_fails() {
+    let mut user = querymt_agent_core::model::AgentMessage::new(
+        "sess-test".into(),
+        querymt::chat::ChatRole::User,
+    );
+    user.parts
+        .push(querymt_agent_core::model::MessagePart::Text {
+            content: "go".into(),
+        });
+    let mut harness = TestHarness::new(vec![user], None).await;
+    harness.fail_assistant_writes.store(true, Ordering::SeqCst);
+    // The reply calls a tool: were it kept, a second request would follow.
+    let calls = vec![mock_querymt_tool_call("call-a", "unknown_tool", "{}")];
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .returning(move |_| Ok(MockChatResponse::with_tools("", calls.clone()).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    harness.turn.history =
+        crate::agent::execution::turn::History::load(&harness.env.session_handle)
+            .await
+            .unwrap();
+    let result = crate::agent::execution::execute_cycle_state_machine(
+        &harness.config,
+        &harness.env,
+        &mut harness.turn,
+        crate::agent::core::AgentMode::Build,
+    )
+    .await;
+
+    let error = result.expect_err("the run fails with the store's error");
+    assert!(
+        format!("{error:#}").contains("Failed to store assistant message")
+            && format!("{error:#}").contains("disk full"),
+        "{error:#}"
+    );
+    // One request was sent; the unstored reply is not in what a next one would carry.
+    assert!(
+        harness
+            .turn
+            .history
+            .as_slice()
+            .iter()
+            .all(|message| { message.role != querymt::chat::ChatRole::Assistant })
+    );
 }
 
 #[tokio::test]
@@ -1919,6 +1982,10 @@ async fn test_llm_error_returns_err() {
         .return_const(None)
         .times(0..);
 
+    harness.turn.history =
+        crate::agent::execution::turn::History::load(&harness.env.session_handle)
+            .await
+            .unwrap();
     let result = crate::agent::execution::execute_cycle_state_machine(
         &harness.config,
         &harness.env,

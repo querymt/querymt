@@ -10,11 +10,11 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::{BillingClass, ModelPricing};
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatRole, GenerationOptions, PromptCacheCapabilities},
+    chat::{GenerationOptions, PromptCacheCapabilities},
     error::LLMError,
     plugin::LLMProviderFactory,
 };
-use querymt_agent_core::model::{AgentMessage, MessagePart, OutputTarget};
+use querymt_agent_core::model::AgentMessage;
 use querymt_agent_services::accounting::{
     BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
 };
@@ -1002,8 +1002,42 @@ impl SessionHandle {
     }
 
     /// Get the LLM config captured at handle creation time (turn-pinned).
+    /// A handle for the same session pinned to `model`, for tests that
+    /// change the model between two requests of one run.
+    #[cfg(test)]
+    pub(crate) fn with_model_for_test(&self, model: &str) -> Self {
+        let mut next = self.clone();
+        if let Some(config) = next.llm_config.as_mut() {
+            config.model = model.to_string();
+        }
+        next
+    }
+
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.llm_config.as_ref()
+    }
+
+    /// The identity native replay is checked against for this session's model
+    /// (`None` when no model is pinned: nothing native replays).
+    ///
+    /// The session store records no protocol or endpoint for a model, while a
+    /// provider stamps its output with both. So that a reply replays to the
+    /// provider that produced it, the identity is completed from the latest
+    /// stored output of the same provider and model in `history`.
+    ///
+    /// This gate does not prove the endpoint is the one configured now: the
+    /// provider that is sent the messages is the authority on that and checks
+    /// every output's provenance against its own configuration (OpenAI, xAI and
+    /// Codex do), degrading what does not match to the portable form. Taking
+    /// the identity from the provider itself is planned with the run's resolved
+    /// model (`unify-model-call-path`).
+    pub(crate) fn output_target(
+        &self,
+        history: &[AgentMessage],
+    ) -> Option<querymt_agent_core::model::OutputTarget> {
+        self.llm_config
+            .as_ref()
+            .map(|llm| complete_output_target(llm, history))
     }
 
     /// Get the session execution config captured at handle creation time (turn-pinned).
@@ -1098,63 +1132,8 @@ impl SessionHandle {
         Ok(messages)
     }
 
-    /// Get the session history converted to standard ChatMessages for the LLM.
-    pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
-        Ok(self.history_view().await?.messages)
-    }
-
-    /// The effective history as a run reads it (see [`HistoryView`]).
-    pub(crate) async fn history_view(&self) -> SessionResult<HistoryView> {
-        let agent_msgs = self.get_effective_agent_history().await?;
-        self.view_of(agent_msgs)
-    }
-
-    /// The view of an effective history that is already loaded. Every place
-    /// that turns stored messages into a run's history goes through here, so
-    /// they agree on what is sent and on what is read next to it.
-    pub(crate) fn view_of(&self, mut agent_msgs: Vec<AgentMessage>) -> SessionResult<HistoryView> {
-        // A baseline has no chat form: it is taken out before the projection.
-        let tool_baseline =
-            querymt_agent_core::history::take_tool_baseline(&mut agent_msgs).map(Arc::new);
-        let messages = self.project_history(&agent_msgs)?;
-        let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
-        let turns = user_turns(&agent_msgs, &messages);
-        Ok(HistoryView {
-            messages,
-            summaries,
-            mode_notice: last_mode_notice(&agent_msgs),
-            tool_baseline,
-            turns,
-        })
-    }
-
-    fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
-        // Build the full target identity so native provider state (encrypted
-        // reasoning, opaque items) may only replay to the exact same
-        // provider/protocol/model/endpoint; any other target gets the portable
-        // projection.
-        let target = self.llm_config.as_ref().map(|cfg| {
-            let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone());
-            target.protocol = cfg.protocol.clone();
-            target.endpoint = cfg.endpoint.clone();
-            target
-        });
-        let max_prompt_bytes = self
-            .execution_config
-            .as_ref()
-            .and_then(|cfg| cfg.max_prompt_bytes);
-        agent_msgs
-            .iter()
-            .map(|message| {
-                message
-                    .to_chat_message_with_output_target(target.as_ref(), max_prompt_bytes)
-                    .map_err(|error| SessionError::InvalidOperation(error.to_string()))
-            })
-            .collect()
-    }
-
     /// Persist an AgentMessage to the store
-    pub async fn add_message(&self, message: AgentMessage) -> SessionResult<()> {
+    pub(crate) async fn add_message(&self, message: AgentMessage) -> SessionResult<()> {
         self.provider
             .history_store
             .add_message(&self.session.public_id, message)
@@ -1419,58 +1398,39 @@ pub(crate) fn record_auth_source(source: AuthSource) {
     tracing::Span::current().record("auth.source", source.as_str());
 }
 
+/// The replay identity of `llm`, with the protocol and endpoint the store does
+/// not record taken from the latest output of the same provider and model in
+/// `history` (see [`SessionHandle::output_target`]).
+fn complete_output_target(
+    llm: &LLMConfig,
+    history: &[AgentMessage],
+) -> querymt_agent_core::model::OutputTarget {
+    use querymt_agent_core::model::{MessagePart, OutputTarget};
+    let mut target = OutputTarget::new(llm.provider.clone(), llm.model.clone());
+    target.protocol = llm.protocol.clone();
+    target.endpoint = llm.endpoint.clone();
+    if target.endpoint.is_empty() {
+        let own = history
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter().rev())
+            .find_map(|part| match part {
+                MessagePart::Output { output } => output.provenance.as_ref().filter(|origin| {
+                    !origin.endpoint.is_empty()
+                        && origin.provider == llm.provider
+                        && origin.model == llm.model
+                }),
+                _ => None,
+            });
+        if let Some(origin) = own {
+            target.protocol = origin.protocol.clone();
+            target.endpoint = origin.endpoint.clone();
+        }
+    }
+    target
+}
+
 /// True when `error` means stored OAuth tokens could not be refreshed.
-/// Content of the most recent `agent_mode` notice in `messages`.
-fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
-    messages
-        .iter()
-        .rev()
-        .flat_map(|message| message.parts.iter().rev())
-        .find_map(|part| match part {
-            MessagePart::Notice {
-                source: querymt_agent_core::model::NoticeSource::AgentMode,
-                content,
-            } => Some(Arc::from(content.as_str())),
-            _ => None,
-        })
-}
-
-/// What a load of a session's stored history gives a run: the messages a
-/// request is built from and what is read from the stored parts next to them.
-/// A `ChatMessage` carries neither a notice's source nor a tool baseline, so
-/// those are read here.
-#[derive(Debug, Clone)]
-pub(crate) struct HistoryView {
-    /// The projected messages. They hold no tool baseline and no tool change
-    /// from before the baseline in effect.
-    pub messages: Vec<ChatMessage>,
-    /// The compaction summaries among `messages`.
-    pub summaries: Vec<ChatMessage>,
-    /// Content of the most recent stored `agent_mode` notice.
-    pub mode_notice: Option<Arc<str>>,
-    /// The tool baseline in effect (the most recent one stored).
-    pub tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
-    /// The number of user turns.
-    pub turns: usize,
-}
-
-/// User turns in a history: user messages that carry no tool result and are
-/// not made only of harness notices. `messages` is the one-to-one projection
-/// of `agent_msgs`.
-fn user_turns(agent_msgs: &[AgentMessage], messages: &[ChatMessage]) -> usize {
-    agent_msgs
-        .iter()
-        .zip(messages)
-        .filter(|(stored, message)| {
-            let notice_only = !stored.parts.is_empty()
-                && stored.parts.iter().all(|part| {
-                    matches!(part, MessagePart::Notice { .. }) || part.is_tool_record()
-                });
-            message.role == ChatRole::User && !message.has_tool_result() && !notice_only
-        })
-        .count()
-}
-
 fn is_oauth_refresh_failure(error: &SessionError) -> bool {
     matches!(error, SessionError::CredentialRefresh { .. })
 }
@@ -1590,7 +1550,7 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatCall, ChatOutput, FinishReason};
+    use querymt::chat::{ChatCall, ChatOutput, ChatRole, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
@@ -1602,6 +1562,59 @@ pub mod tests {
     use crate::agent::core::AgentMode;
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
+
+    #[test]
+    fn output_target_is_completed_from_the_latest_output_of_the_same_model() {
+        use querymt::chat::ChatOutputProvenance;
+        use querymt_agent_core::model::MessagePart;
+        let llm = LLMConfig {
+            id: 1,
+            name: None,
+            provider: "p".into(),
+            model: "m".into(),
+            protocol: String::new(),
+            endpoint: String::new(),
+            params: None,
+            created_at: None,
+            updated_at: None,
+            provider_node_id: None,
+        };
+        let reply = |provider: &str, model: &str, endpoint: &str| {
+            let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+            message.parts.push(MessagePart::Output {
+                output: ChatOutput {
+                    provenance: Some(ChatOutputProvenance {
+                        provider: provider.into(),
+                        protocol: "responses".into(),
+                        model: model.into(),
+                        endpoint: endpoint.into(),
+                    }),
+                    ..ChatOutput::default()
+                },
+            });
+            message
+        };
+
+        // The latest reply of another model, and of another provider, is not
+        // the identity of this one.
+        let history = vec![
+            reply("p", "m", "https://a"),
+            reply("p", "other", "https://b"),
+            reply("q", "m", "https://c"),
+        ];
+        let target = complete_output_target(&llm, &history);
+        assert_eq!(target.endpoint, "https://a");
+        assert_eq!(target.protocol, "responses");
+
+        // Without a reply of its own the identity stays incomplete, which
+        // never authorizes native replay.
+        assert_eq!(complete_output_target(&llm, &[]).endpoint, "");
+        assert_eq!(
+            complete_output_target(&llm, &history[1..]).endpoint,
+            "",
+            "replies of other models do not complete it"
+        );
+    }
 
     #[cfg(feature = "remote")]
     #[test]
@@ -2015,51 +2028,6 @@ pub mod tests {
         );
         // The second provider was probed itself, not answered from the cache.
         assert_eq!(silent.builds(), 1);
-    }
-
-    #[tokio::test]
-    async fn history_fails_when_a_stored_message_cannot_be_converted() {
-        use crate::acp::protocol::{ContentBlock, ImageContent};
-        use crate::test_utils::{MockSessionStore, mock_llm_config, mock_session};
-        use querymt_agent_core::model::MessagePart;
-
-        let invalid_message = AgentMessage {
-            id: "invalid".to_string(),
-            session_id: "session".to_string(),
-            role: ChatRole::User,
-            parts: vec![MessagePart::Prompt {
-                blocks: vec![ContentBlock::Image(ImageContent::new("%%%", "image/png"))],
-            }],
-            created_at: 0,
-            parent_message_id: None,
-            source_provider: None,
-            source_model: None,
-        };
-        let mut store = MockSessionStore::new();
-        store
-            .expect_get_effective_history()
-            .return_once(move |_| Ok(vec![invalid_message]));
-        let (registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
-        let provider = Arc::new(SessionProvider::new(
-            Arc::new(registry),
-            Arc::new(store),
-            LLMParams::new().provider("mock").model("model"),
-        ));
-        let handle = SessionHandle {
-            provider,
-            session: mock_session("session"),
-            llm_config: Some(mock_llm_config()),
-            provider_node_id: None,
-            execution_config: None,
-            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
-        };
-
-        // The agent cycle loads history this way before it builds a request.
-        let error = handle.history_view().await.unwrap_err();
-
-        assert!(matches!(error, SessionError::InvalidOperation(_)));
-        // The failure comes before any provider is built.
-        assert!(handle.cached_llm_provider.get().is_none());
     }
 
     #[tokio::test]

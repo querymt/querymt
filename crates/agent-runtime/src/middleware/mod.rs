@@ -4,6 +4,7 @@ pub mod driver;
 pub mod error;
 pub mod factory;
 mod middleware_driver;
+pub(crate) use middleware_driver::HookInputs;
 pub mod state;
 
 // Keep existing exports during transition
@@ -29,9 +30,9 @@ pub use middleware_driver::{
     TurnMiddleware,
 };
 pub use state::{
-    AgentStats, ConversationContext, ExecutionState, LlmResponse, ModelProfile, PendingNotice,
-    PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason,
-    apply_usage_to_stats, calculate_context_tokens,
+    AgentStats, ExecutionState, LlmResponse, ModelProfile, PendingNotice, PreparedModelRequest,
+    ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason, apply_usage_to_stats,
+    calculate_context_tokens,
 };
 
 // Re-export model info types for convenience

@@ -38,15 +38,15 @@ pub(crate) struct PrefixFingerprint {
 
 impl PrefixFingerprint {
     pub(crate) fn new(
-        provider: &Arc<str>,
-        model: &Arc<str>,
+        provider: &str,
+        model: &str,
         tools: RapidHash,
         system: RapidHash,
         durable_messages: &[ChatMessage],
     ) -> Self {
         Self {
-            provider: Arc::clone(provider),
-            model: Arc::clone(model),
+            provider: Arc::from(provider),
+            model: Arc::from(model),
             tools,
             system,
             history: durable_messages.iter().map(message_hash).collect(),

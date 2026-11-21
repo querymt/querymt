@@ -72,7 +72,7 @@ Every hook has a default that passes, so a middleware implements only the hooks 
 
 The first middleware that returns a decision other than the passing one (`Proceed`, `Finish`, `Pass`) ends the stage; later middleware are not consulted for it. Notices and overrides queued by earlier middleware in that stage are kept.
 
-`HookCx` is what a hook may read of the run (`session_id`, `history`, `stats`, `provider`, `model`, `profile`, `mode`, `last_applied`, `request_overrides`, `last_mode_notice`, `changed_paths`, `runtime`) and the two things it may write, at any stage: `queue_notice(source, text)` stores a notice before the next model request, and `set_request_overrides(options)` sets generation overrides for that request.
+`HookCx` is what a hook may read of the run (`session_id`, `history` (the stored messages, `&[AgentMessage]`), `stats`, `provider`, `model`, `profile`, `mode`, `last_applied`, `request_overrides`, `last_mode_notice`, `changed_paths`, `runtime`) and the two things it may write, at any stage: `queue_notice(source, text)` stores a notice before the next model request, and `set_request_overrides(options)` sets generation overrides for that request.
 
 When a run is cancelled while a hook is running, the hook's future is dropped and the run ends as cancelled without waiting for it. A hook must leave `self` usable at every `.await`, which is trivially true because the instance is dropped with the run.
 

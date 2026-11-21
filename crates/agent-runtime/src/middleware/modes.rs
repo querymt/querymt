@@ -267,9 +267,10 @@ impl MiddlewareFactory for PlanModeCompatFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::PendingNotice;
     use crate::middleware::factory::MIDDLEWARE_REGISTRY;
-    use crate::middleware::{ConversationContext, ExecutionState};
     use crate::test_utils::HookRig;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     fn middleware() -> AgentModeMiddleware {
         let mut reminders = HashMap::new();
@@ -278,38 +279,55 @@ mod tests {
         AgentModeMiddleware::with_reminders(reminders)
     }
 
-    fn context(mode: AgentMode, stored: Option<&str>) -> Arc<ConversationContext> {
-        Arc::new(
-            ConversationContext::new(
-                "s".into(),
-                Arc::from([]),
-                Arc::new(crate::middleware::AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )
-            .with_session_mode(mode)
-            .with_stored_mode_notice(stored.map(Arc::from)),
-        )
+    /// What a request starts from: the session's mode and the mode notice
+    /// the stored history holds.
+    #[derive(Clone)]
+    struct Context {
+        mode: AgentMode,
+        stored: Option<String>,
     }
 
-    /// Run the middleware for one request; returns the context it hands on.
-    async fn step(
-        middleware: &AgentModeMiddleware,
-        context: Arc<ConversationContext>,
-    ) -> Arc<ConversationContext> {
+    impl Context {
+        fn last_mode_notice(&self) -> Option<&str> {
+            self.stored.as_deref()
+        }
+    }
+
+    fn context(mode: AgentMode, stored: Option<&str>) -> Context {
+        Context {
+            mode,
+            stored: stored.map(str::to_string),
+        }
+    }
+
+    /// What the middleware handed on for one request.
+    struct Stepped {
+        pending_notices: Vec<PendingNotice>,
+        last_mode_notice: Option<String>,
+    }
+
+    /// Run the middleware for one request.
+    async fn step(middleware: &AgentModeMiddleware, context: Context) -> Stepped {
         let mut stack = HookRig::stack_of(middleware.clone());
-        let state = HookRig::new()
-            .step_start(&mut stack, ExecutionState::BeforeLlmCall { context })
-            .await
-            .unwrap();
-        let ExecutionState::BeforeLlmCall { context } = state else {
-            panic!("expected BeforeLlmCall");
-        };
-        context
+        let mut rig = HookRig::new();
+        rig.mode = context.mode;
+        if let Some(content) = &context.stored {
+            let mut message = AgentMessage::new("s".into(), querymt::chat::ChatRole::User);
+            message.parts.push(MessagePart::Notice {
+                source: NoticeSource::AgentMode,
+                content: content.clone(),
+            });
+            rig.set_history(vec![message]);
+        }
+        rig.step_start(&mut stack).await.unwrap();
+        Stepped {
+            last_mode_notice: rig.cx().last_mode_notice().map(str::to_string),
+            pending_notices: rig.pending,
+        }
     }
 
-    fn queued(context: &ConversationContext) -> Vec<(NoticeSource, &str)> {
-        context
+    fn queued(stepped: &Stepped) -> Vec<(NoticeSource, &str)> {
+        stepped
             .pending_notices
             .iter()
             .map(|notice| (notice.source, notice.content.as_str()))
@@ -317,8 +335,8 @@ mod tests {
     }
 
     /// Mimics the loop storing queued notices: the last one becomes the stored notice.
-    fn stored(context: &ConversationContext, mode: AgentMode) -> Arc<ConversationContext> {
-        self::context(mode, context.last_mode_notice())
+    fn stored(stepped: &Stepped, mode: AgentMode) -> Context {
+        self::context(mode, stepped.last_mode_notice.as_deref())
     }
 
     #[tokio::test]

@@ -3012,6 +3012,21 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         turn.state.active_task = Some(task.clone());
     }
 
+    // The run reads the stored history once, here. From now on it is the only
+    // writer of its session's conversation, so it holds what the store holds.
+    turn.history = match crate::agent::execution::turn::History::load(&env.session_handle).await {
+        Ok(history) => history,
+        Err(error) => {
+            config.emit_event(
+                &session_id,
+                AgentEventKind::Error {
+                    message: error.to_string(),
+                },
+            );
+            return Err(AgentError::Internal(error.to_string()));
+        }
+    };
+
     // 3b. Native `/compact [instructions]`: compact now, no model turn.
     // Built-ins are matched before registry expansion so they take priority
     // over user-defined commands of the same name.
@@ -3021,6 +3036,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     {
         log::info!("Session {}: manual compaction requested", session_id);
         let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
+        // The estimates of a compaction depend on what the model takes.
+        turn.profile = env.session_handle.profile().await;
         let outcome = crate::agent::execution::compact_history(
             &config,
             &env,
@@ -3178,7 +3195,11 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         source_model: None,
     };
 
-    if let Err(e) = env.add_message(agent_msg).await {
+    if let Err(e) = turn
+        .history
+        .commit(&env.session_handle, vec![agent_msg])
+        .await
+    {
         config.emit_event(
             &session_id,
             AgentEventKind::Error {
@@ -3393,7 +3414,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                                     source_provider: None,
                                     source_model: None,
                                 };
-                                if let Err(e) = env.add_message(snapshot_msg).await {
+                                if let Err(e) = env.store_snapshot_record(snapshot_msg).await {
                                     warn!("Failed to store turn snapshot patch: {}", e);
                                 }
                             }
@@ -3526,7 +3547,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
                 source_provider: None,
                 source_model: None,
             };
-            env.add_message(snapshot_msg).await.map_err(|e| {
+            env.store_snapshot_record(snapshot_msg).await.map_err(|e| {
                 AgentError::Internal(format!("Failed to store turn snapshot start: {}", e))
             })?;
         }
@@ -5899,18 +5920,10 @@ mod tests {
             .unwrap();
         let before = actor_ref.ask(GetRuntimeStatus).await.unwrap();
         assert_eq!(before.pending_steering_count, 1);
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            Arc::from(exec.session_id.as_str()),
-            Arc::from([]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            Arc::from("mock"),
-            Arc::from("mock-model"),
-        ));
         crate::agent::execution::apply_pending_steering(
             &fixture.config,
             &exec,
             &mut turn,
-            &context,
             "test",
             false,
         )

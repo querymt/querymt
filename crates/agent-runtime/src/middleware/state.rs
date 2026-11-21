@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationOptions};
+use querymt::chat::{ChatMessage, ChatOutput, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
 use querymt_agent_core::events::StopType;
@@ -127,15 +127,14 @@ pub struct PreparedModelRequest {
     /// changes in `messages` applied. Equal to `tools` when there are none.
     pub offered_tools: Arc<[querymt::chat::Tool]>,
     pub estimated_tokens: usize,
-    /// Per-request generation overrides copied from
-    /// [`ConversationContext::request_overrides`].
+    /// Per-request generation overrides, from the run's `request_overrides`.
     pub options: GenerationOptions,
 }
 
 /// Per-session facts about the model a session talks to.
 ///
 /// Resolved together with the provider, replaced when the model is switched and
-/// carried on [`ConversationContext`], so middleware never has to reconstruct
+/// carried on the run, so middleware never has to reconstruct
 /// them from "the last request".
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
@@ -145,195 +144,6 @@ pub struct ModelProfile {
     pub capabilities: querymt::chat::ChatCapabilities,
     /// Reasoning effort the provider is configured with, when known.
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
-}
-
-/// Context passed to middleware during state transitions
-#[derive(Debug, Clone)]
-pub struct ConversationContext {
-    pub session_id: Arc<str>,
-    pub messages: Arc<[ChatMessage]>,
-    /// Rendered run objective for this request, set only when
-    /// `[agent.execution] run_objective` is `true`. It is request-scoped: sent
-    /// in the request tail, never stored and never part of `messages`.
-    pub request_objective: Option<Arc<str>>,
-    /// Notices raised since the last model request. The loop stores them at the
-    /// request boundary, after any tool results; until then they are not part
-    /// of `messages`.
-    pub pending_notices: Arc<[PendingNotice]>,
-    /// Content of the most recent stored `agent_mode` notice in the effective
-    /// history, `None` when there is none. A `ChatMessage` does not carry its
-    /// notice source, so the mode comparison reads this instead.
-    pub stored_mode_notice: Option<Arc<str>>,
-    /// The tool baseline in effect in the stored history, `None` when there is
-    /// none. A baseline has no chat form, so it is not in `messages`; every
-    /// tool-change message in `messages` was stored after it.
-    pub(crate) tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
-    pub stats: Arc<AgentStats>,
-    /// Current provider for the session (for dynamic model info lookup)
-    pub provider: Arc<str>,
-    /// Current model for the session (for dynamic model info lookup)
-    pub model: Arc<str>,
-    /// Per-session agent mode (Build, Plan, Review).
-    /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
-    /// Defaults to `Build` for backward compatibility.
-    pub session_mode: crate::agent::core::AgentMode,
-    /// Generation overrides for the next model request only.
-    ///
-    /// Middleware sets these when it returns to `BeforeLlmCall` (e.g. to raise
-    /// `max_tokens`). They are consumed by exactly one request: the context built
-    /// after that request does not carry them forward.
-    pub request_overrides: GenerationOptions,
-    /// Facts about the session's model (caps, capabilities, effort, pricing).
-    pub profile: Arc<ModelProfile>,
-    /// Options the most recent model request was actually sent with.
-    ///
-    /// Carried to the `Stopped` state so `on_stopped` knows which cap was hit.
-    /// Cleared at turn start.
-    pub last_applied: GenerationOptions,
-}
-
-impl ConversationContext {
-    pub fn new(
-        session_id: Arc<str>,
-        messages: Arc<[ChatMessage]>,
-        stats: Arc<AgentStats>,
-        provider: Arc<str>,
-        model: Arc<str>,
-    ) -> Self {
-        Self {
-            session_id,
-            messages,
-            request_objective: None,
-            pending_notices: Arc::from([]),
-            stored_mode_notice: None,
-            tool_baseline: None,
-            stats,
-            provider,
-            model,
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: GenerationOptions::NONE,
-            profile: Arc::new(ModelProfile::default()),
-            last_applied: GenerationOptions::NONE,
-        }
-    }
-
-    /// Set the model profile (builder-style).
-    #[must_use]
-    pub fn with_profile(mut self, profile: Arc<ModelProfile>) -> Self {
-        self.profile = profile;
-        self
-    }
-
-    /// Set the options the last request was sent with (builder-style).
-    #[must_use]
-    pub fn with_last_applied(mut self, applied: GenerationOptions) -> Self {
-        self.last_applied = applied;
-        self
-    }
-
-    /// Returns the number of user messages in the conversation
-    pub fn user_message_count(&self) -> usize {
-        self.messages
-            .iter()
-            .filter(|msg| matches!(msg.role, ChatRole::User))
-            .count()
-    }
-
-    /// Queue a notice to be stored before the next model request.
-    #[must_use]
-    pub fn queue_notice(&self, source: NoticeSource, content: String) -> Self {
-        let mut pending = self.pending_notices.to_vec();
-        pending.push(PendingNotice { source, content });
-        let mut next = self.clone();
-        next.pending_notices = Arc::from(pending.into_boxed_slice());
-        next
-    }
-
-    /// A context over a new history with new stats.
-    ///
-    /// Everything else carries over, notice state included (queued notices,
-    /// stored mode notice) and the tool baseline, so a rebuild cannot silently
-    /// drop it. A history loaded from the store replaces those too: use
-    /// `with_stored_state` on the result. The two
-    /// request-scoped values are reset: the run objective is attached again
-    /// for every request, and request overrides are consumed by exactly one
-    /// request. Chain `with_request_overrides` / `with_last_applied` /
-    /// `with_stored_mode_notice` to set them on the result.
-    #[must_use]
-    pub fn with_history(&self, messages: Arc<[ChatMessage]>, stats: Arc<AgentStats>) -> Self {
-        Self {
-            messages,
-            stats,
-            request_objective: None,
-            request_overrides: GenerationOptions::NONE,
-            ..self.clone()
-        }
-    }
-
-    /// Set the stored mode notice (builder-style).
-    #[must_use]
-    pub fn with_stored_mode_notice(mut self, content: Option<Arc<str>>) -> Self {
-        self.stored_mode_notice = content;
-        self
-    }
-
-    /// Set what a load of the stored history found next to its messages: the
-    /// most recent mode notice and the tool baseline in effect. Every site
-    /// that replaces `messages` with a loaded history calls this, so neither
-    /// can be left describing the previous history.
-    #[must_use]
-    pub(crate) fn with_stored_state(
-        mut self,
-        mode_notice: Option<Arc<str>>,
-        tool_baseline: Option<Arc<querymt_agent_core::model::ToolBaseline>>,
-    ) -> Self {
-        self.stored_mode_notice = mode_notice;
-        self.tool_baseline = tool_baseline;
-        self
-    }
-
-    /// Content of the most recent `agent_mode` notice, counting notices that
-    /// are queued but not yet stored.
-    pub fn last_mode_notice(&self) -> Option<&str> {
-        self.pending_notices
-            .iter()
-            .rev()
-            .find(|notice| notice.source == NoticeSource::AgentMode)
-            .map(|notice| notice.content.as_str())
-            .or(self.stored_mode_notice.as_deref())
-    }
-
-    /// Set the request-scoped run objective (builder-style).
-    #[must_use]
-    pub fn with_request_objective(mut self, objective: Option<Arc<str>>) -> Self {
-        self.request_objective = objective;
-        self
-    }
-
-    /// Set the per-session mode on this context (builder-style).
-    pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
-        self.session_mode = mode;
-        self
-    }
-
-    /// Set the overrides applied to the next model request (builder-style).
-    #[must_use]
-    pub fn with_request_overrides(mut self, overrides: GenerationOptions) -> Self {
-        self.request_overrides = overrides;
-        self
-    }
-
-    /// Returns a copy of this context whose overrides are cleared, so a
-    /// consumed override never leaks into a later request.
-    #[must_use]
-    pub fn without_request_overrides(&self) -> Self {
-        self.clone().with_request_overrides(GenerationOptions::NONE)
-    }
-
-    /// Returns true if this is the first user turn
-    pub fn is_first_turn(&self) -> bool {
-        self.stats.turns <= 1
-    }
 }
 
 /// Response from the LLM provider
@@ -549,23 +359,19 @@ impl WaitCondition {
     }
 }
 
-/// Represents the complete state of agent execution
+/// Where the loop is. The state of the run (history, statistics, queued
+/// notices) lives in the run's `Turn`; a position carries only what its step
+/// consumes.
 #[derive(Debug)]
 pub enum ExecutionState {
     /// Before calling the LLM - middleware can inject messages or stop
-    BeforeLlmCall { context: Arc<ConversationContext> },
+    BeforeLlmCall,
 
     /// Ready to call the LLM with tools
-    CallLlm {
-        context: Arc<ConversationContext>,
-        request: Arc<PreparedModelRequest>,
-    },
+    CallLlm { request: Arc<PreparedModelRequest> },
 
     /// After receiving LLM response
-    AfterLlm {
-        response: Arc<LlmResponse>,
-        context: Arc<ConversationContext>,
-    },
+    AfterLlm { response: Arc<LlmResponse> },
 
     /// Processing multiple tool calls from a single LLM response
     ProcessingToolCalls {
@@ -573,24 +379,18 @@ pub enum ExecutionState {
         remaining_calls: Arc<[ToolCall]>,
         /// Tool results collected so far
         results: Arc<[ToolResult]>,
-        /// Current conversation context
-        context: Arc<ConversationContext>,
     },
 
     /// Waiting for an external event before continuing
-    WaitingForEvent {
-        context: Arc<ConversationContext>,
-        wait: WaitCondition,
-    },
+    WaitingForEvent { wait: WaitCondition },
 
     /// Execution completed successfully
-    Complete { context: Arc<ConversationContext> },
+    Complete,
 
     /// Execution stopped by middleware
     Stopped {
         message: Arc<str>,
         stop_type: StopType,
-        context: Option<Arc<ConversationContext>>,
     },
 
     /// Execution cancelled by user
@@ -601,28 +401,14 @@ impl ExecutionState {
     /// Returns a human-readable name for the state
     pub fn name(&self) -> &'static str {
         match self {
-            ExecutionState::BeforeLlmCall { .. } => "BeforeLlmCall",
+            ExecutionState::BeforeLlmCall => "BeforeLlmCall",
             ExecutionState::CallLlm { .. } => "CallLlm",
             ExecutionState::AfterLlm { .. } => "AfterLlm",
             ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
             ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
-            ExecutionState::Complete { .. } => "Complete",
+            ExecutionState::Complete => "Complete",
             ExecutionState::Stopped { .. } => "Stopped",
             ExecutionState::Cancelled => "Cancelled",
-        }
-    }
-
-    /// Returns the context if this state has one
-    pub fn context(&self) -> Option<&Arc<ConversationContext>> {
-        match self {
-            ExecutionState::BeforeLlmCall { context } => Some(context),
-            ExecutionState::CallLlm { context, .. } => Some(context),
-            ExecutionState::AfterLlm { context, .. } => Some(context),
-            ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
-            ExecutionState::WaitingForEvent { context, .. } => Some(context),
-            ExecutionState::Complete { context } => Some(context),
-            ExecutionState::Stopped { context, .. } => context.as_ref(),
-            _ => None,
         }
     }
 }
@@ -631,32 +417,6 @@ impl ExecutionState {
 mod tests {
     use super::*;
     use querymt::chat::ToolResultPart;
-
-    fn context_with(messages: Vec<ChatMessage>) -> ConversationContext {
-        ConversationContext::new(
-            Arc::from("session"),
-            Arc::from(messages),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        )
-    }
-
-    #[test]
-    fn request_objective_is_not_part_of_the_durable_messages() {
-        let latest = ChatMessage::user().text("Delegation completed").build();
-        let context =
-            context_with(vec![latest]).with_request_objective(Some(Arc::from("objective")));
-
-        assert_eq!(context.messages.len(), 1);
-        assert_eq!(context.messages[0].text(), "Delegation completed");
-        assert_eq!(context.request_objective.as_deref(), Some("objective"));
-    }
-
-    #[test]
-    fn contexts_carry_no_request_objective_by_default() {
-        assert!(context_with(Vec::new()).request_objective.is_none());
-    }
 
     #[test]
     fn test_tool_result_with_snapshot() {

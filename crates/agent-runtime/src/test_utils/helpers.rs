@@ -153,7 +153,7 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::delegation::AgentInfo;
-use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
+use crate::middleware::{ToolCall, ToolFunction};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -161,7 +161,7 @@ use crate::session::store::{LLMConfig, Session};
 use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
 use anyhow::Result;
 use querymt::LLMParams;
-use querymt::chat::{ChatMessage, ChatRole};
+use querymt::chat::ChatRole;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 use querymt_agent_services::snapshot::backend::SnapshotBackend;
@@ -171,46 +171,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-/// Creates a test conversation context with the given session ID and step count
-pub fn test_context(session_id: &str, steps: usize) -> Arc<ConversationContext> {
-    Arc::new(ConversationContext::new(
-        session_id.into(),
-        Arc::from([]),
-        Arc::new(AgentStats {
-            steps,
-            ..Default::default()
-        }),
-        "mock".into(),
-        "mock-model".into(),
-    ))
-}
-
-/// Creates a test conversation context with the given number of user messages
-/// for testing turn-based middleware
-pub fn test_context_with_user_messages(
-    session_id: &str,
-    user_message_count: usize,
-) -> Arc<ConversationContext> {
-    let messages: Vec<ChatMessage> = (0..user_message_count)
-        .map(|i| {
-            ChatMessage::user()
-                .text(format!("User message {}", i))
-                .build()
-        })
-        .collect();
-
-    Arc::new(ConversationContext::new(
-        session_id.into(),
-        Arc::from(messages.into_boxed_slice()),
-        Arc::new(AgentStats {
-            turns: user_message_count,
-            ..Default::default()
-        }),
-        "mock".into(),
-        "mock-model".into(),
-    ))
-}
 
 /// Creates a mock tool call for middleware/state tests
 pub fn mock_tool_call(id: &str, name: &str, args: &str) -> ToolCall {

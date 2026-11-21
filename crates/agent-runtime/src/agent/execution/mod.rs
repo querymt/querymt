@@ -39,6 +39,7 @@ fn format_stop_hook_continuation_message(
     message
 }
 
+pub(crate) mod cache_hints;
 mod llm_retry;
 mod maintenance;
 pub(crate) mod prefix;
@@ -60,8 +61,7 @@ use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::utils::u32_from_usize;
 use crate::hooks::StopRequest;
 use crate::middleware::{
-    EndVerdict, ExecutionState, Folded, HookCx, ReplyVerdict, StepVerdict, Stop, StopVerdict,
-    TurnInfo,
+    EndVerdict, ExecutionState, Folded, ReplyVerdict, StepVerdict, Stop, StopVerdict, TurnInfo,
 };
 use log::{debug, info, trace, warn};
 use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
@@ -188,70 +188,92 @@ fn has_effective_task_completion_tool(tools: &[querymt::chat::Tool]) -> bool {
         .any(|tool| tool.function.name == "complete_task")
 }
 
-/// Attach the rendered run objective to the context as request-scoped text,
-/// only when `[agent.execution] run_objective` is `true`. The objective is
-/// still built and amended, and its events are emitted, in both cases.
-fn refresh_objective(
-    config: &AgentConfig,
-    context: &Arc<crate::middleware::ConversationContext>,
-    turn: &Turn,
-) -> Arc<crate::middleware::ConversationContext> {
-    let objective = config
-        .execution_policy
-        .run_objective
-        .then(|| Arc::from(render_run_objective(turn)));
-    Arc::new((**context).clone().with_request_objective(objective))
+/// Inputs taken out of the steering inbox and not yet stored, with the
+/// boundary at which they are applied.
+///
+/// Draining and committing are separate so that the tool-call stage can store
+/// the skipped results of a batch before the steering that skipped them.
+pub(crate) struct DrainedSteering {
+    inputs: Vec<crate::agent::turn_control::SteeringInput>,
+    boundary: &'static str,
 }
 
-pub(crate) async fn apply_pending_steering(
-    config: &AgentConfig,
+impl DrainedSteering {
+    pub(crate) fn none() -> Self {
+        Self {
+            inputs: Vec::new(),
+            boundary: "",
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+    }
+}
+
+/// Take what is waiting in the run's steering inbox. `closing` also closes the
+/// inbox, so nothing accepted after this is applied to this run.
+pub(crate) async fn drain_steering(
     env: &TurnEnv,
-    turn: &mut Turn,
-    context: &Arc<crate::middleware::ConversationContext>,
     boundary: &'static str,
     closing: bool,
-) -> Result<Option<Arc<crate::middleware::ConversationContext>>, anyhow::Error> {
+) -> DrainedSteering {
     let Some(inbox) = env.steering.clone() else {
-        return Ok(None);
+        return DrainedSteering::none();
     };
-    let pending = if closing {
+    let inputs = if closing {
         inbox.begin_closing_and_drain().await
     } else {
         inbox.drain().await
     };
-    if pending.is_empty() {
-        return Ok(None);
+    if !inputs.is_empty() {
+        // Consumption happens off the actor mailbox; publish its new count even
+        // if the next model/tool interval is silent and no phase transition
+        // follows.
+        env.report_runtime_change();
     }
-    // Consumption happens off the actor mailbox; publish its new count even if
-    // the next model/tool interval is silent and no phase transition follows.
-    env.report_runtime_change();
+    DrainedSteering { inputs, boundary }
+}
 
-    let mut messages = context.messages.to_vec();
-    for input in pending {
-        let blocks = input.blocks;
-        let display = crate::agent::utils::render_prompt_for_display(&blocks);
+/// Store `preceding` and then one user message per drained input, in that
+/// order, and apply what the inputs say to the run (events, intent, objective).
+pub(crate) async fn commit_steering(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+    drained: DrainedSteering,
+    mut preceding: Vec<querymt_agent_core::model::AgentMessage>,
+) -> Result<(), anyhow::Error> {
+    let DrainedSteering { inputs, boundary } = drained;
+    let mut applied = Vec::with_capacity(inputs.len());
+    for input in inputs {
         let message_id = uuid::Uuid::new_v4().to_string();
-        let client_prompt_id = input.client_input_id.clone();
         let message = querymt_agent_core::model::AgentMessage {
             id: message_id.clone(),
             session_id: env.session_id.clone(),
             role: querymt::chat::ChatRole::User,
             parts: vec![querymt_agent_core::model::MessagePart::Steering {
                 run_id: env.turn_id().to_string(),
-                client_input_id: client_prompt_id.clone(),
-                blocks: blocks.clone(),
+                client_input_id: input.client_input_id.clone(),
+                blocks: input.blocks.clone(),
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
             source_provider: None,
             source_model: None,
         };
-        let chat_message = message
+        message
             .to_chat_message()
             .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
-        env.add_message(message).await?;
-        messages.push(chat_message);
+        preceding.push(message);
+        applied.push((message_id, input));
+    }
+    turn.history.commit(&env.session_handle, preceding).await?;
 
+    for (message_id, input) in applied {
+        let blocks = input.blocks;
+        let display = crate::agent::utils::render_prompt_for_display(&blocks);
+        let client_prompt_id = input.client_input_id.clone();
         for block in blocks {
             config.emit_event(
                 &env.session_id,
@@ -327,71 +349,72 @@ pub(crate) async fn apply_pending_steering(
             },
         );
     }
+    Ok(())
+}
 
-    let next = context
-        .with_history(
-            Arc::from(messages.into_boxed_slice()),
-            context.stats.clone(),
-        )
-        .with_request_overrides(context.request_overrides);
-    Ok(Some(Arc::new(next)))
+/// Drain the steering inbox and store what was drained after the history so
+/// far. Returns whether anything was applied.
+pub(crate) async fn apply_pending_steering(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+    boundary: &'static str,
+    closing: bool,
+) -> Result<bool, anyhow::Error> {
+    let drained = drain_steering(env, boundary, closing).await;
+    if drained.is_empty() {
+        return Ok(false);
+    }
+    commit_steering(config, env, turn, drained, Vec::new()).await?;
+    Ok(true)
 }
 
 /// Queue the periodic progress review as a `progress_review` notice.
-fn queue_progress_review(
-    context: &crate::middleware::ConversationContext,
-) -> crate::middleware::ConversationContext {
-    context.queue_notice(
+fn queue_progress_review(turn: &mut Turn) {
+    turn.queue_notice(
         querymt_agent_core::model::NoticeSource::ProgressReview,
         crate::agent::objective::PROGRESS_REVIEW_NOTICE.to_string(),
-    )
+    );
 }
 
 /// Store all queued notices as one user message (one `Notice` part each)
 /// before the model request.
 ///
 /// Runs at the point where steering is applied, after any tool results in the
-/// context, so a notice never sits between a tool call and its result. One
+/// history, so a notice never sits between a tool call and its result. One
 /// message (instead of one per notice) avoids a run of consecutive user
 /// messages and makes the write all-or-nothing. After a tool batch it still
 /// follows the tool-result user message; providers whose chat template
 /// requires strictly alternating roles must merge adjacent user messages.
 ///
 /// Nothing is stored for a request that is never sent: the queue lives on the
-/// context and is dropped with it.
+/// run and is dropped with it.
 pub(crate) async fn store_pending_notices(
     env: &TurnEnv,
-    context: &Arc<crate::middleware::ConversationContext>,
-) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+    turn: &mut Turn,
+) -> Result<(), anyhow::Error> {
     use querymt_agent_core::model::{AgentMessage, MessagePart};
 
-    if context.pending_notices.is_empty() {
-        return Ok(context.clone());
+    if turn.pending_notices.is_empty() {
+        return Ok(());
     }
     let mut message = AgentMessage::new(env.session_id.clone(), querymt::chat::ChatRole::User);
     message.parts.extend(
-        context
-            .pending_notices
+        turn.pending_notices
             .iter()
             .map(|notice| MessagePart::Notice {
                 source: notice.source,
                 content: notice.content.clone(),
             }),
     );
-    let chat_message = message
+    message
         .to_chat_message()
         .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
-    env.add_message(message).await?;
-
-    let mut messages = context.messages.to_vec();
-    messages.push(chat_message);
-    let mut next = (**context).clone();
-    next.messages = Arc::from(messages.into_boxed_slice());
-    if let Some(mode) = context.last_mode_notice() {
-        next.stored_mode_notice = Some(Arc::from(mode));
-    }
-    next.pending_notices = Arc::from([]);
-    Ok(Arc::new(next))
+    turn.history
+        .commit(&env.session_handle, vec![message])
+        .await?;
+    turn.pending_notices.clear();
+    Ok(())
 }
 
 /// Store the queued notices and prepare the model request.
@@ -401,39 +424,39 @@ pub(crate) async fn store_pending_notices(
 pub(crate) async fn prepare_model_request(
     config: &AgentConfig,
     env: &TurnEnv,
-    context: &Arc<crate::middleware::ConversationContext>,
+    turn: &mut Turn,
 ) -> Result<ExecutionState, anyhow::Error> {
-    let trigger = transitions::context_hook_trigger(&context.messages);
-    let stored = store_pending_notices(env, context).await?;
-    transitions::transition_before_llm_call(config, &stored, env, trigger).await
+    // The run objective is request-scoped: sent in the request tail, never
+    // stored. It is still built and amended, and its events are emitted,
+    // whether or not it is sent.
+    let objective = config
+        .execution_policy
+        .run_objective
+        .then(|| render_run_objective(turn));
+    let trigger = transitions::context_hook_trigger(turn.history.as_slice());
+    store_pending_notices(env, turn).await?;
+    transitions::transition_before_llm_call(config, env, turn, trigger, objective.as_deref()).await
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
 
-/// The state a stop of middleware leads to. `context` carries what middleware
-/// queued before the stop, so a recovery still stores it.
-pub(crate) fn stopped_state(
-    stop: Stop,
-    context: Arc<crate::middleware::ConversationContext>,
-) -> ExecutionState {
+/// The state a stop of middleware leads to. What middleware queued before the
+/// stop is on the run, so a recovery still stores it.
+pub(crate) fn stopped_state(stop: Stop) -> ExecutionState {
     ExecutionState::Stopped {
         message: stop.message,
         stop_type: stop.stop_type,
-        context: Some(context),
     }
 }
 
 /// The state after the middleware of a stage that precedes a model request.
-pub(crate) fn step_state(
-    folded: Folded<StepVerdict>,
-    context: Arc<crate::middleware::ConversationContext>,
-) -> ExecutionState {
+pub(crate) fn step_state(folded: Folded<StepVerdict>) -> ExecutionState {
     match folded {
         Folded::Cancelled => ExecutionState::Cancelled,
-        Folded::Decided(StepVerdict::Proceed) => ExecutionState::BeforeLlmCall { context },
-        Folded::Decided(StepVerdict::Stop(stop)) => stopped_state(stop, context),
+        Folded::Decided(StepVerdict::Proceed) => ExecutionState::BeforeLlmCall,
+        Folded::Decided(StepVerdict::Stop(stop)) => stopped_state(stop),
     }
 }
 
@@ -445,7 +468,7 @@ use crate::agent::agent_config::AgentConfig;
 /// It reads configuration from `AgentConfig` rather than requiring a full agent instance.
 ///
 /// `session_mode` is the per-session `AgentMode` captured at turn start.
-/// It is injected into every `ConversationContext` so middleware can read it.
+/// Middleware reads it through its hook context.
 #[instrument(
     name = "agent.execution.turn",
     skip(config, env, turn),
@@ -474,51 +497,18 @@ pub(crate) async fn execute_cycle_state_machine(
             .begin_turn(&TurnInfo::new(&env.session_id, session_mode))
     });
 
+    // The run's history was loaded when the run was set up (`History::load`)
+    // and holds the prompt of this run.
     debug!(
-        "Session {}: state machine loading history, cancelled={}",
+        "Session {}: state machine starts with {} messages, cancelled={}",
         env.session_id,
+        turn.history.as_slice().len(),
         env.cancellation_token.is_cancelled()
     );
-
-    let (messages, stored_mode_notice, tool_baseline, turns): (
-        Arc<[querymt::chat::ChatMessage]>,
-        _,
-        _,
-        _,
-    ) = async {
-        let started = std::time::Instant::now();
-        let view = env
-            .session_handle
-            .history_view()
-            .await
-            .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
-        turn.compaction_summaries = view.summaries;
-        let messages: Arc<[querymt::chat::ChatMessage]> =
-            Arc::from(view.messages.into_boxed_slice());
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let span = tracing::Span::current();
-        span.record("history_ms", elapsed_ms);
-        span.record("message_count", messages.len() as u64);
-        Ok::<_, anyhow::Error>((messages, view.mode_notice, view.tool_baseline, view.turns))
-    }
-    .instrument(info_span!(
-        "agent.execution.history_load",
-        session_id = %env.session_id,
-        history_ms = tracing::field::Empty,
-        message_count = tracing::field::Empty
-    ))
-    .await?;
-
-    debug!(
-        "Session {}: history loaded, {} messages",
-        env.session_id,
-        messages.len()
-    );
-    let stats = crate::middleware::AgentStats {
-        turns,
+    turn.stats = crate::middleware::AgentStats {
+        turns: turn.history.user_turns(),
         ..Default::default()
     };
-    let stats = Arc::new(stats);
 
     let llm_config = env
         .llm_config()
@@ -530,31 +520,16 @@ pub(crate) async fn execute_cycle_state_machine(
     );
 
     // Builds the provider for the turn on first use, so this is where cold-start cost lands.
-    let profile = env
+    turn.profile = env
         .session_handle
         .profile()
         .instrument(info_span!("agent.execution.profile"))
         .await;
-    let initial_context = info_span!("agent.execution.context_init").in_scope(|| {
-        Arc::new(
-            crate::middleware::ConversationContext::new(
-                env.session_id.as_str().into(),
-                messages,
-                stats,
-                llm_config.provider.as_str().into(),
-                llm_config.model.as_str().into(),
-            )
-            .with_session_mode(session_mode)
-            .with_stored_state(stored_mode_notice, tool_baseline)
-            .with_profile(profile),
-        )
-    });
 
     let mut event_rx = config.event_sink.fanout().subscribe();
 
-    let mut start_context = initial_context;
     let started = {
-        let mut cx = HookCx::new(&mut start_context, &env.runtime, &turn.changed_paths);
+        let mut cx = turn.hook_cx(env);
         stack
             .turn_start(&mut cx, &env.cancellation_token)
             .instrument(debug_span!(
@@ -564,7 +539,7 @@ pub(crate) async fn execute_cycle_state_machine(
             .await
             .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
     };
-    let mut state = step_state(started, start_context);
+    let mut state = step_state(started);
 
     debug!(
         "Session {}: run_turn_start done, state={}, cancelled={}",
@@ -588,38 +563,21 @@ pub(crate) async fn execute_cycle_state_machine(
         );
 
         state = match state {
-            ExecutionState::BeforeLlmCall { context } => {
+            ExecutionState::BeforeLlmCall => {
                 // Everything from here to request dispatch is agent overhead, not model time.
                 let step_started = std::time::Instant::now();
                 env.report_phase(crate::agent::turn_control::RunPhase::Model);
-                let context = wait::reconcile_suspended_delegations(
-                    config,
-                    &context,
-                    env,
-                    turn,
-                    &mut event_rx,
-                )
-                .await?;
-                let context = apply_pending_steering(
-                    config,
-                    env,
-                    turn,
-                    &context,
-                    "before_model_request",
-                    false,
-                )
-                .await?
-                .unwrap_or(context);
-                let steps = context.stats.steps;
+                wait::reconcile_suspended_delegations(config, env, turn, &mut event_rx).await?;
+                apply_pending_steering(config, env, turn, "before_model_request", false).await?;
+                let steps = turn.stats.steps;
                 let checkpoint_due = crate::agent::objective::progress_review_due(
                     steps,
                     turn.budgets.last_objective_checkpoint_step(),
                 );
-                let mut context = context;
                 if checkpoint_due {
                     turn.budgets.set_last_objective_checkpoint_step(steps);
                     // Stored as a notice whether or not the objective is sent.
-                    context = Arc::new(queue_progress_review(&context));
+                    queue_progress_review(turn);
                     config.emit_event(
                         &env.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
@@ -640,20 +598,14 @@ pub(crate) async fn execute_cycle_state_machine(
                         },
                     );
                 }
-                let context = refresh_objective(config, &context, turn);
                 // Price limits read this cycle's committed accounting, which
                 // includes cache and auxiliary (compaction/summary) attempts
                 // that settled since the last main response.
                 let totals = env.cycle_accounting.cycle_totals();
                 warn_incomplete_budget(config, env, turn, &totals);
-                let mut stats = (*context.stats).clone();
-                stats.apply_recorded_costs(&totals);
-                let mut refreshed = (*context).clone();
-                refreshed.stats = Arc::new(stats);
-                let context = Arc::new(refreshed);
-                let mut context = context;
+                turn.stats.apply_recorded_costs(&totals);
                 let stepped = {
-                    let mut cx = HookCx::new(&mut context, &env.runtime, &turn.changed_paths);
+                    let mut cx = turn.hook_cx(env);
                     stack
                         .step_start(&mut cx, &env.cancellation_token)
                         .instrument(debug_span!(
@@ -663,20 +615,16 @@ pub(crate) async fn execute_cycle_state_machine(
                         .await
                         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
                 };
-                let state = step_state(stepped, context);
-
-                match state {
-                    ExecutionState::BeforeLlmCall {
-                        context: ref conv_context,
-                    } => {
+                match step_state(stepped) {
+                    ExecutionState::BeforeLlmCall => {
                         // Middleware queued its notices during step start; store
                         // them now, after any tool results and before the request.
-                        let next = prepare_model_request(config, env, conv_context).await?;
+                        let next = prepare_model_request(config, env, turn).await?;
                         crate::agent::utils::llm_metrics::step_overhead(
                             "pre_request",
                             step_started.elapsed().as_secs_f64(),
-                            crate::agent::utils::genai::provider_name(&conv_context.provider),
-                            &conv_context.model,
+                            crate::agent::utils::genai::provider_name(env.provider_name()),
+                            env.model_name(),
                         );
                         next
                     }
@@ -684,10 +632,7 @@ pub(crate) async fn execute_cycle_state_machine(
                 }
             }
 
-            ExecutionState::CallLlm {
-                ref context,
-                ref request,
-            } => {
+            ExecutionState::CallLlm { ref request } => {
                 // The tools the model can call, not the request's tool list:
                 // a tool change in the messages adds to or removes from that.
                 turn.budgets
@@ -698,13 +643,12 @@ pub(crate) async fn execute_cycle_state_machine(
                     "completion_guard_available",
                     turn.budgets.task_completion_tool_available(),
                 );
-                transitions::transition_call_llm(config, context, request, env, turn).await?
+                transitions::transition_call_llm(config, request, env, turn).await?
             }
 
-            ExecutionState::AfterLlm { response, context } => {
-                let mut context = context;
+            ExecutionState::AfterLlm { response } => {
                 let reviewed = {
-                    let mut cx = HookCx::new(&mut context, &env.runtime, &turn.changed_paths);
+                    let mut cx = turn.hook_cx(env);
                     stack
                         .after_llm(&mut cx, &response, &env.cancellation_token)
                         .instrument(debug_span!(
@@ -717,18 +661,16 @@ pub(crate) async fn execute_cycle_state_machine(
                 match reviewed {
                     Folded::Cancelled => ExecutionState::Cancelled,
                     Folded::Decided(ReplyVerdict::Proceed) => {
-                        transitions::transition_after_llm(config, &response, &context, env, turn)
-                            .await?
+                        transitions::transition_after_llm(config, &response, env, turn).await?
                     }
-                    Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop, context),
+                    Folded::Decided(ReplyVerdict::Stop(stop)) => stopped_state(stop),
                     Folded::Decided(ReplyVerdict::Retry) => {
                         // The discarded reply was billed: its usage counts.
-                        let stats = &mut Arc::make_mut(&mut context).stats;
                         crate::middleware::apply_usage_to_stats(
-                            Arc::make_mut(stats),
+                            &mut turn.stats,
                             response.usage.as_ref(),
                         );
-                        ExecutionState::BeforeLlmCall { context }
+                        ExecutionState::BeforeLlmCall
                     }
                 }
             }
@@ -736,20 +678,17 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::ProcessingToolCalls {
                 remaining_calls,
                 results,
-                context,
             } => {
                 env.report_phase(crate::agent::turn_control::RunPhase::Tools);
-                if results.is_empty()
-                    && let Some(steered_context) = apply_pending_steering(
-                        config,
-                        env,
-                        turn,
-                        &context,
-                        "before_tool_batch",
-                        false,
-                    )
-                    .await?
-                {
+                let steering = if results.is_empty() {
+                    drain_steering(env, "before_tool_batch", false).await
+                } else {
+                    DrainedSteering::none()
+                };
+                if !steering.is_empty() {
+                    // Steering arrived before the batch started: every call is
+                    // skipped, and the skipped results are stored directly
+                    // after the assistant message, before the steering.
                     let skipped = remaining_calls
                         .iter()
                         .map(|call| {
@@ -770,9 +709,9 @@ pub(crate) async fn execute_cycle_state_machine(
                         &mut stack,
                         &Arc::from(Vec::new().into_boxed_slice()),
                         &Arc::from(skipped.into_boxed_slice()),
-                        &steered_context,
                         env,
                         turn,
+                        steering,
                     )
                     .await?;
                     state = next;
@@ -783,53 +722,27 @@ pub(crate) async fn execute_cycle_state_machine(
                     &mut stack,
                     &remaining_calls,
                     &results,
-                    &context,
                     env,
                     turn,
+                    DrainedSteering::none(),
                 )
                 .await?
             }
 
-            ExecutionState::WaitingForEvent {
-                ref context,
-                ref wait,
-            } => {
+            ExecutionState::WaitingForEvent { ref wait } => {
                 env.report_phase(crate::agent::turn_control::RunPhase::Waiting);
-                wait::transition_waiting_for_event(config, wait, context, env, turn, &mut event_rx)
-                    .await?
+                wait::transition_waiting_for_event(config, wait, env, turn, &mut event_rx).await?
             }
 
-            ExecutionState::Complete { context } => {
+            ExecutionState::Complete => {
                 env.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let view =
-                    env.session_handle.history_view().await.map_err(|error| {
-                        anyhow::anyhow!("Failed to load session history: {error}")
-                    })?;
-                turn.compaction_summaries = view.summaries;
-                let history = Arc::from(view.messages.into_boxed_slice());
-                let fallback_context = Arc::new(
-                    context
-                        .with_history(history, context.stats.clone())
-                        .with_last_applied(querymt::chat::GenerationOptions::NONE)
-                        .with_stored_state(view.mode_notice, view.tool_baseline),
-                );
-                if let Some(context) = apply_pending_steering(
-                    config,
-                    env,
-                    turn,
-                    &fallback_context,
-                    "before_completion",
-                    true,
-                )
-                .await?
-                {
-                    state = ExecutionState::BeforeLlmCall { context };
+                turn.last_applied = querymt::chat::GenerationOptions::NONE;
+                if apply_pending_steering(config, env, turn, "before_completion", true).await? {
+                    state = ExecutionState::BeforeLlmCall;
                     continue;
                 }
-                let mut completed_context = fallback_context;
                 let ended = {
-                    let mut cx =
-                        HookCx::new(&mut completed_context, &env.runtime, &turn.changed_paths);
+                    let mut cx = turn.hook_cx(env);
                     stack
                         .turn_end(&mut cx, &env.cancellation_token)
                         .instrument(debug_span!(
@@ -842,15 +755,13 @@ pub(crate) async fn execute_cycle_state_machine(
 
                 match ended {
                     Folded::Cancelled => ExecutionState::Cancelled,
-                    Folded::Decided(EndVerdict::Continue) => ExecutionState::BeforeLlmCall {
-                        context: completed_context,
-                    },
+                    Folded::Decided(EndVerdict::Continue) => ExecutionState::BeforeLlmCall,
                     Folded::Decided(EndVerdict::Stop(stop)) => {
                         info!(
                             "Turn-end middleware stopped: {} ({:?})",
                             stop.message, stop.stop_type
                         );
-                        stopped_state(stop, completed_context)
+                        stopped_state(stop)
                     }
                     Folded::Decided(EndVerdict::Finish) => {
                         debug!("State machine reached Complete state");
@@ -873,17 +784,15 @@ pub(crate) async fn execute_cycle_state_machine(
                             } else {
                                 turn.budgets
                                     .note_stop_hook_continuation(turn::StopHookKind::EndTurn);
-                                let current_context = completed_context.clone();
                                 let message = format_stop_hook_continuation_message(
                                     stop_hook.stop_reason.or(stop_hook.block_reason),
                                     &stop_hook.additional_contexts,
                                 );
-                                state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(current_context.queue_notice(
-                                        querymt_agent_core::model::NoticeSource::StopHook,
-                                        message,
-                                    )),
-                                };
+                                turn.queue_notice(
+                                    querymt_agent_core::model::NoticeSource::StopHook,
+                                    message,
+                                );
+                                state = ExecutionState::BeforeLlmCall;
                                 continue;
                             }
                         }
@@ -907,12 +816,11 @@ pub(crate) async fn execute_cycle_state_machine(
                                         task_id: task.public_id.clone(),
                                     },
                                 );
-                                state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(completed_context.queue_notice(
-                                        querymt_agent_core::model::NoticeSource::TaskCompletion,
-                                        "<system-reminder>\nThe current finite task remains active. Continue the work and call complete_task with concrete evidence when it is done, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
-                                    )),
-                                };
+                                turn.queue_notice(
+                                    querymt_agent_core::model::NoticeSource::TaskCompletion,
+                                    "<system-reminder>\nThe current finite task remains active. Continue the work and call complete_task with concrete evidence when it is done, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
+                                );
+                                state = ExecutionState::BeforeLlmCall;
                                 continue;
                             }
                             config.emit_event(
@@ -938,7 +846,6 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::Stopped {
                 ref message,
                 stop_type,
-                ..
             } => {
                 info!("State machine stopped: {} ({:?})", message, stop_type);
 
@@ -948,7 +855,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     turn.budgets.mark_automatic_compaction()?;
                     info!("Context threshold reached, triggering AI compaction");
 
-                    match maintenance::run_ai_compaction(config, env, turn, &state).await {
+                    match maintenance::run_ai_compaction(config, env, turn).await {
                         Ok(new_state) => {
                             state = new_state;
                             continue;
@@ -961,63 +868,46 @@ pub(crate) async fn execute_cycle_state_machine(
 
                 // Give middleware the chance to replace the stop with a
                 // continuation. The per-turn guard bounds any recovery loop.
-                if state.context().is_some() {
-                    let max_recoveries = config.execution_policy.max_stop_recoveries;
-                    if turn.budgets.stop_recoveries() >= max_recoveries {
-                        warn!(
-                            "Session {}: stop recovery limit ({}) reached; publishing stop",
-                            env.session_id, max_recoveries
-                        );
-                    } else {
-                        let stop = Stop::new(stop_type, message.clone());
-                        let mut recovery_context = state
-                            .context()
-                            .cloned()
-                            .expect("a stop with a context was checked above");
-                        let recovered = {
-                            let mut cx = HookCx::new(
-                                &mut recovery_context,
-                                &env.runtime,
-                                &turn.changed_paths,
+                let max_recoveries = config.execution_policy.max_stop_recoveries;
+                if turn.budgets.stop_recoveries() >= max_recoveries {
+                    warn!(
+                        "Session {}: stop recovery limit ({}) reached; publishing stop",
+                        env.session_id, max_recoveries
+                    );
+                } else {
+                    let stop = Stop::new(stop_type, message.clone());
+                    let recovered = {
+                        let mut cx = turn.hook_cx(env);
+                        stack
+                            .stopped(&mut cx, &stop, &env.cancellation_token)
+                            .instrument(info_span!(
+                                "agent.execution.middleware.stopped",
+                                session_id = %env.session_id
+                            ))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
+                    };
+                    match recovered {
+                        Folded::Cancelled => return Ok(CycleOutcome::Cancelled),
+                        Folded::Decided(StopVerdict::Recover) => {
+                            turn.budgets.note_stop_recovery();
+                            debug!(
+                                "Session {}: stop recovered by middleware ({}/{})",
+                                env.session_id,
+                                turn.budgets.stop_recoveries(),
+                                max_recoveries
                             );
-                            stack
-                                .stopped(&mut cx, &stop, &env.cancellation_token)
-                                .instrument(info_span!(
-                                    "agent.execution.middleware.stopped",
-                                    session_id = %env.session_id
-                                ))
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?
-                        };
-                        match recovered {
-                            Folded::Cancelled => return Ok(CycleOutcome::Cancelled),
-                            Folded::Decided(StopVerdict::Recover) => {
-                                turn.budgets.note_stop_recovery();
-                                debug!(
-                                    "Session {}: stop recovered by middleware ({}/{})",
-                                    env.session_id,
-                                    turn.budgets.stop_recoveries(),
-                                    max_recoveries
-                                );
-                                state = ExecutionState::BeforeLlmCall {
-                                    context: recovery_context,
-                                };
-                                continue;
-                            }
-                            // Nobody recovered: what was queued while consulting is
-                            // dropped, and the stop goes on to publication unchanged.
-                            Folded::Decided(StopVerdict::Pass) => {}
+                            state = ExecutionState::BeforeLlmCall;
+                            continue;
                         }
+                        // Nobody recovered: the stop goes on to publication
+                        // unchanged (the stack dropped what was queued).
+                        Folded::Decided(StopVerdict::Pass) => {}
                     }
                 }
                 // A token-limit stop that middleware could not recover still
                 // gives Stop hooks a say, so unattended loops can carry on.
-                if let ExecutionState::Stopped {
-                    stop_type: StopType::ModelTokenLimit,
-                    context: Some(ref stopped_context),
-                    ..
-                } = state
-                {
+                if stop_type == StopType::ModelTokenLimit {
                     let stop_hook = run_stop_hook(config, env, "ModelTokenLimit").await?;
                     if stop_hook.should_continue {
                         let max = config.execution_policy.max_stop_hook_continuations;
@@ -1034,40 +924,20 @@ pub(crate) async fn execute_cycle_state_machine(
                                 stop_hook.stop_reason.or(stop_hook.block_reason),
                                 &stop_hook.additional_contexts,
                             );
-                            let next = Arc::new(stopped_context.queue_notice(
+                            turn.queue_notice(
                                 querymt_agent_core::model::NoticeSource::StopHook,
                                 message,
-                            ));
-                            state = ExecutionState::BeforeLlmCall { context: next };
+                            );
+                            state = ExecutionState::BeforeLlmCall;
                             continue;
                         }
                     }
                 }
 
-                let ExecutionState::Stopped {
-                    ref message,
-                    stop_type,
-                    ..
-                } = state
-                else {
-                    unreachable!("stop recovery only returns Stopped or diverts above");
+                let metrics = ExecutionMetrics {
+                    steps: u32_from_usize(turn.stats.steps, "stats.steps", Some(&env.session_id)),
+                    turns: u32_from_usize(turn.stats.turns, "stats.turns", Some(&env.session_id)),
                 };
-
-                let metrics = state
-                    .context()
-                    .map(|ctx| ExecutionMetrics {
-                        steps: u32_from_usize(
-                            ctx.stats.steps,
-                            "ctx.stats.steps",
-                            Some(&env.session_id),
-                        ),
-                        turns: u32_from_usize(
-                            ctx.stats.turns,
-                            "ctx.stats.turns",
-                            Some(&env.session_id),
-                        ),
-                    })
-                    .unwrap_or_default();
 
                 config.emit_event(
                     &env.session_id,
@@ -1095,12 +965,15 @@ pub(crate) async fn execute_cycle_state_machine(
 
 #[cfg(test)]
 mod tests {
+    use super::turn::Turn;
     use super::{
-        apply_pending_steering, format_stop_hook_continuation_message,
+        apply_pending_steering, drain_steering, format_stop_hook_continuation_message,
         has_effective_task_completion_tool,
     };
     use crate::session::backend::StorageBackend;
+    use querymt::chat::ChatRole;
     use querymt::chat::{FunctionTool, Tool};
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1304,34 +1177,24 @@ mod tests {
         let overrides = querymt::chat::GenerationOptions::NONE
             .with_max_tokens(128_000)
             .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
-        let context = Arc::new(
-            crate::middleware::ConversationContext::new(
-                session_id.clone().into(),
-                Arc::from([]),
-                Arc::new(crate::middleware::AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )
-            .with_request_overrides(overrides),
-        );
+        turn.request_overrides = overrides;
         let expected_run_id = env.turn_id().to_string();
         assert!(!expected_run_id.is_empty());
         let mut live_events = fixture.config.subscribe_events();
 
-        let next = apply_pending_steering(
+        let applied = apply_pending_steering(
             &fixture.config,
             &env,
             &mut turn,
-            &context,
             "before_model_request",
             false,
         )
         .await
-        .expect("apply steering")
-        .expect("steering changes context");
+        .expect("apply steering");
 
-        assert_eq!(next.messages.len(), 1);
-        assert_eq!(next.request_overrides, overrides);
+        assert!(applied, "steering changes the history");
+        assert_eq!(turn.history.as_slice().len(), 1);
+        assert_eq!(turn.request_overrides, overrides);
         let history = fixture
             .config
             .provider
@@ -1423,11 +1286,44 @@ mod tests {
         )));
     }
 
+    /// A stored assistant message that calls `ids`.
+    fn assistant_calling(session_id: &str, ids: &[(&str, &str)]) -> AgentMessage {
+        let mut message = AgentMessage::new(session_id.to_string(), ChatRole::Assistant);
+        message.parts = ids
+            .iter()
+            .map(|(id, path)| {
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: id.to_string(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: json!({ "path": path }).to_string(),
+                    },
+                })
+            })
+            .collect();
+        message
+    }
+
+    /// A stored user message that answers `results`.
+    fn results_for(session_id: &str, results: &[(&str, &str)]) -> AgentMessage {
+        let mut message = AgentMessage::new(session_id.to_string(), ChatRole::User);
+        message.parts = results
+            .iter()
+            .map(|(id, text)| MessagePart::ToolResult {
+                call_id: id.to_string(),
+                content: vec![querymt::chat::ToolResultPart::text(*text)],
+                is_error: false,
+                tool_name: Some("read_file".into()),
+                tool_arguments: None,
+                compacted_at: None,
+            })
+            .collect();
+        message
+    }
+
     #[tokio::test]
     async fn tool_results_stay_ahead_of_steering_in_live_and_reloaded_history() {
-        use querymt::chat::{ChatMessage, ChatRole, ToolResultPart};
-        use querymt_agent_core::model::{AgentMessage, MessagePart};
-
         let fixture = crate::test_utils::TestAgent::new().await;
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
             querymt_agent_core::model::TurnId::new(),
@@ -1444,60 +1340,42 @@ mod tests {
             .unwrap();
         let (mut env, mut turn) = fixture.turn().await;
         env.steering = Some(steering);
-        let assistant = ChatMessage::assistant()
-            .tool_use("call-1", "read_file", json!({"path": "."}))
-            .build();
-        let mut stored = AgentMessage::new(env.session_id.clone(), ChatRole::Assistant);
-        stored.parts.push(MessagePart::Output {
-            output: assistant.output().unwrap().clone(),
-        });
-        env.add_message(stored).await.unwrap();
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            env.session_id.clone().into(),
-            Arc::from(vec![assistant]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
-        let steered = apply_pending_steering(
-            &fixture.config,
-            &env,
-            &mut turn,
-            &context,
-            "before_tool_batch",
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(steered.messages[1].text(), "change direction");
+        let calls = assistant_calling(&env.session_id, &[("call-1", ".")]);
+        turn.history
+            .commit(&env.session_handle, vec![calls])
+            .await
+            .unwrap();
+        let drained = drain_steering(&env, "before_tool_batch", false).await;
+        assert!(!drained.is_empty());
         let results = Arc::from(vec![crate::middleware::ToolResult::new(
             "call-1".into(),
-            vec![ToolResultPart::text(
+            vec![querymt::chat::ToolResultPart::text(
                 "Skipped because new user steering was received",
             )],
             true,
             Some("read_file".into()),
             Some("{\"path\":\".\"}".into()),
         )]);
+
         let next = super::tool_calls::store_all_tool_results(
             &fixture.config,
             &results,
-            &steered,
             &env,
             &mut turn,
+            drained,
         )
         .await
         .unwrap();
-        let crate::middleware::ExecutionState::BeforeLlmCall { context: live } = next else {
-            panic!("expected another model request");
-        };
-        assert_eq!(live.messages.len(), 3);
-        assert!(live.messages[0].has_tool_use());
-        assert!(live.messages[1].has_tool_result());
-        assert_eq!(live.messages[2].text(), "change direction");
 
-        // Storage retains the real chronology; replay normalizes only in memory.
+        assert!(
+            matches!(next, crate::middleware::ExecutionState::BeforeLlmCall),
+            "expected another model request"
+        );
+        // The run holds the stored order: the call, its results, then the steering.
+        let live = turn.history.as_slice();
+        assert_eq!(live.len(), 3);
+        assert!(matches!(&live[1].parts[0], MessagePart::ToolResult { .. }));
+        assert!(matches!(&live[2].parts[0], MessagePart::Steering { .. }));
         let stored = fixture
             .config
             .provider
@@ -1505,57 +1383,38 @@ mod tests {
             .get_history(&env.session_id)
             .await
             .unwrap();
-        assert!(matches!(&stored[1].parts[0], MessagePart::Steering { .. }));
         assert!(matches!(
-            &stored[2].parts[0],
+            &stored[1].parts[0],
             MessagePart::ToolResult { .. }
         ));
-        let replay = env.session_handle.history().await.unwrap();
-        assert_eq!(replay.len(), 2);
-        assert!(replay[0].has_tool_use());
-        let parts = replay[1].portable_input_parts();
-        assert!(
-            matches!(&parts[0], querymt::chat::ChatInputPart::ToolResult(result)
-            if result.call_id == "call-1" && result.parts[0].as_text().unwrap().starts_with("Skipped"))
+        assert!(matches!(&stored[2].parts[0], MessagePart::Steering { .. }));
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(live).unwrap(),
+            serde_json::to_value(&reloaded).unwrap(),
+            "a reload gives the history the run holds"
         );
-        assert_eq!(replay[1].text(), "change direction");
     }
 
+    /// A run over a history that holds a call to two tools and their results.
     async fn notice_fixture() -> (
         crate::test_utils::TestAgent,
         crate::agent::execution::turn::TurnEnv,
-        Arc<crate::middleware::ConversationContext>,
+        Turn,
     ) {
-        use querymt::chat::{ChatMessage, ToolResultPart};
-
         let fixture = crate::test_utils::TestAgent::new().await;
-        let (exec_ctx, _turn) = fixture.turn().await;
-        let assistant = ChatMessage::assistant()
-            .tool_use("call-1", "read_file", json!({"path": "."}))
-            .tool_use("call-2", "read_file", json!({"path": ".."}))
-            .build();
-        let results = ChatMessage::user()
-            .tool_result(
-                "call-1".into(),
-                Some("read_file".into()),
-                false,
-                vec![ToolResultPart::text("one")],
-            )
-            .tool_result(
-                "call-2".into(),
-                Some("read_file".into()),
-                false,
-                vec![ToolResultPart::text("two")],
-            )
-            .build();
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            exec_ctx.session_id.clone().into(),
-            Arc::from(vec![assistant, results]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
-        (fixture, exec_ctx, context)
+        let (env, mut turn) = fixture.turn().await;
+        let calls = assistant_calling(&env.session_id, &[("call-1", "."), ("call-2", "..")]);
+        let results = results_for(&env.session_id, &[("call-1", "one"), ("call-2", "two")]);
+        turn.history
+            .commit(&env.session_handle, vec![calls, results])
+            .await
+            .unwrap();
+        (fixture, env, turn)
     }
 
     async fn stored_notices(
@@ -1584,20 +1443,17 @@ mod tests {
     async fn progress_review_at_step_seven_is_stored_once_before_the_request() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let (fixture, env, mut turn) = notice_fixture().await;
         let mut last = 0usize;
-        let mut context = context;
         for steps in 1..=10usize {
             if crate::agent::objective::progress_review_due(steps, last) {
                 last = steps;
                 assert_eq!(steps, 7);
-                context = Arc::new(super::queue_progress_review(&context));
+                super::queue_progress_review(&mut turn);
             }
-            context = super::store_pending_notices(&exec_ctx, &context)
-                .await
-                .unwrap();
+            super::store_pending_notices(&env, &mut turn).await.unwrap();
         }
-        let stored = stored_notices(&fixture, &exec_ctx.session_id).await;
+        let stored = stored_notices(&fixture, &env.session_id).await;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].0, NoticeSource::ProgressReview);
     }
@@ -1621,15 +1477,16 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_is_stable_when_a_notice_is_stored() {
-        let (_fixture, exec_ctx, context) = notice_fixture().await;
-        let before = serde_json::to_value(&*context.messages).unwrap();
-        let queued = Arc::new(super::queue_progress_review(&context));
-        let stored = super::store_pending_notices(&exec_ctx, &queued)
-            .await
-            .unwrap();
-        let after = serde_json::to_value(&stored.messages[..context.messages.len()]).unwrap();
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        let before = serde_json::to_value(turn.history.as_slice()).unwrap();
+        let before_len = turn.history.as_slice().len();
+        super::queue_progress_review(&mut turn);
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        let after = serde_json::to_value(&turn.history.as_slice()[..before_len]).unwrap();
         assert_eq!(after, before);
-        assert_eq!(stored.messages.len(), context.messages.len() + 1);
+        assert_eq!(turn.history.as_slice().len(), before_len + 1);
     }
 
     /// Several queued notices become one stored user message, so roles keep
@@ -1638,27 +1495,25 @@ mod tests {
     async fn several_notices_are_stored_as_one_message() {
         use querymt_agent_core::model::{MessagePart, NoticeSource};
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
-        let queued = context
-            .queue_notice(NoticeSource::DuplicateToolCall, "same call".into())
-            .queue_notice(NoticeSource::AgentMode, "plan reminder".into());
+        let (fixture, env, mut turn) = notice_fixture().await;
+        let before_len = turn.history.as_slice().len();
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call".into());
+        turn.queue_notice(NoticeSource::AgentMode, "plan reminder".into());
 
-        let stored = super::store_pending_notices(&exec_ctx, &Arc::new(queued))
-            .await
-            .unwrap();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
-        assert_eq!(stored.messages.len(), context.messages.len() + 1);
-        assert_eq!(stored.stored_mode_notice.as_deref(), Some("plan reminder"));
-        assert!(stored.pending_notices.is_empty());
+        assert_eq!(turn.history.as_slice().len(), before_len + 1);
+        assert_eq!(turn.history.last_mode_notice(), Some("plan reminder"));
+        assert!(turn.pending_notices.is_empty());
         let history = fixture
             .config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
-        assert_eq!(history.len(), 1, "one stored message");
-        let sources: Vec<_> = history[0]
+        assert_eq!(history.len(), 3, "one stored message for both notices");
+        let sources: Vec<_> = history[2]
             .parts
             .iter()
             .filter_map(|part| match part {
@@ -1675,22 +1530,29 @@ mod tests {
     /// A stored notice is not a user turn, so it does not bring `max_turns` closer.
     #[tokio::test]
     async fn restored_turns_do_not_count_stored_notices() {
-        use querymt::chat::ChatRole;
-        use querymt_agent_core::model::{AgentMessage, MessagePart, NoticeSource};
+        use querymt_agent_core::model::NoticeSource;
 
-        let (_fixture, exec_ctx, context) = notice_fixture().await;
-        let mut prompt = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        let mut prompt = AgentMessage::new(env.session_id.clone(), ChatRole::User);
         prompt.parts.push(MessagePart::Text {
             content: "fix the build".into(),
         });
-        exec_ctx.session_handle.add_message(prompt).await.unwrap();
-        let queued = Arc::new(context.queue_notice(NoticeSource::ProgressReview, "review".into()));
-        super::store_pending_notices(&exec_ctx, &queued)
+        turn.history
+            .commit(&env.session_handle, vec![prompt])
             .await
             .unwrap();
+        turn.queue_notice(NoticeSource::ProgressReview, "review".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
-        let view = exec_ctx.session_handle.history_view().await.unwrap();
-        assert_eq!(view.turns, 1);
+        assert_eq!(turn.history.user_turns(), 1);
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        let mut loaded = super::turn::History::default();
+        loaded.replace(reloaded);
+        assert_eq!(loaded.user_turns(), 1);
     }
 
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
@@ -1705,25 +1567,48 @@ mod tests {
 
     #[tokio::test]
     async fn run_objective_is_off_by_default_and_sent_when_enabled() {
-        let (fixture, _env, context) = notice_fixture().await;
-        let (_env, mut turn) = fixture.turn().await;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let (env, mut turn) = fixture.turn().await;
         turn.run_objective = Some(objective_for("fix the build"));
+        let mut user = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        user.parts.push(MessagePart::Text {
+            content: "go".into(),
+        });
+        turn.history
+            .commit(&env.session_handle, vec![user])
+            .await
+            .unwrap();
+        let request_tail = |state: crate::middleware::ExecutionState| match state {
+            crate::middleware::ExecutionState::CallLlm { request } => request
+                .messages
+                .last()
+                .map(|message| (request.messages.len(), message.text())),
+            other => panic!("expected a prepared request, got {}", other.name()),
+        };
 
         // Default configuration: nothing is attached to the request.
         assert!(!fixture.config.execution_policy.run_objective);
-        let off = super::refresh_objective(&fixture.config, &context, &turn);
-        assert!(off.request_objective.is_none());
+        let off = super::prepare_model_request(&fixture.config, &env, &mut turn)
+            .await
+            .unwrap();
+        let (off_len, _) = request_tail(off).expect("a request");
+        assert_eq!(off_len, 1);
 
-        // Enabled: the rendered objective is attached, durable messages untouched.
+        // Enabled: the rendered objective is attached to the request tail and
+        // the durable messages are untouched.
         let mut config = (*fixture.config).clone();
         config.execution_policy.run_objective = true;
-        let on = super::refresh_objective(&config, &context, &turn);
-        assert!(
-            on.request_objective
-                .as_deref()
-                .is_some_and(|text| text.contains("fix the build"))
-        );
-        assert_eq!(on.messages.len(), context.messages.len());
+        let on = super::prepare_model_request(&config, &env, &mut turn)
+            .await
+            .unwrap();
+        let (on_len, tail) = request_tail(on).expect("a request");
+        assert_eq!(on_len, 2);
+        assert!(tail.contains("fix the build"));
+        assert_eq!(turn.history.as_slice().len(), 1);
     }
 
     #[tokio::test]
@@ -1747,31 +1632,26 @@ mod tests {
         let (mut env, mut turn) = fixture.turn().await;
         env.steering = Some(steering);
         turn.run_objective = Some(objective_for("fix the build"));
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            env.session_id.clone().into(),
-            Arc::from([]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
         let mut events = fixture.config.subscribe_events();
 
-        let steered = super::apply_pending_steering(
+        let applied = super::apply_pending_steering(
             &fixture.config,
             &env,
             &mut turn,
-            &context,
             "before_model_request",
             false,
         )
         .await
-        .unwrap()
         .unwrap();
-        let next = super::refresh_objective(&fixture.config, &steered, &turn);
 
         // The steering text is in the stored message, once; the objective is not sent.
-        assert!(next.request_objective.is_none());
-        let texts: Vec<String> = next.messages.iter().map(|m| m.text()).collect();
+        assert!(applied);
+        let texts: Vec<String> = turn
+            .history
+            .as_slice()
+            .iter()
+            .map(|message| message.to_chat_message().unwrap().text())
+            .collect();
         assert_eq!(texts, ["change direction"]);
         // The objective was still amended and its event emitted.
         assert_eq!(turn.run_objective.as_ref().unwrap().revision, 2);
@@ -1791,17 +1671,14 @@ mod tests {
     async fn each_warning_kind_has_its_own_source() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
-        let queued = context
-            .queue_notice(NoticeSource::DuplicateToolCall, "same call".into())
-            .queue_notice(NoticeSource::DuplicateCode, "similar code".into());
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call".into());
+        turn.queue_notice(NoticeSource::DuplicateCode, "similar code".into());
 
-        super::store_pending_notices(&exec_ctx, &Arc::new(queued))
-            .await
-            .unwrap();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
         assert_eq!(
-            stored_notices(&fixture, &exec_ctx.session_id).await,
+            stored_notices(&fixture, &env.session_id).await,
             vec![
                 (NoticeSource::DuplicateToolCall, "same call".to_string()),
                 (NoticeSource::DuplicateCode, "similar code".to_string()),
@@ -1813,19 +1690,21 @@ mod tests {
     async fn notice_survives_into_the_next_turn() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (_fixture, exec_ctx, context) = notice_fixture().await;
-        let queued = Arc::new(context.queue_notice(NoticeSource::StopHook, "keep going".into()));
-        let stored = super::store_pending_notices(&exec_ctx, &queued)
-            .await
-            .unwrap();
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::StopHook, "keep going".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
         // The next turn builds its first request from stored history.
-        let reloaded = exec_ctx.session_handle.history().await.unwrap();
-        assert_eq!(reloaded.len(), 1);
-        assert_eq!(reloaded[0].text(), "keep going");
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(reloaded.len(), 3);
+        assert_eq!(reloaded[2].to_chat_message().unwrap().text(), "keep going");
         assert_eq!(
-            reloaded[0].text(),
-            stored.messages.last().unwrap().text(),
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(turn.history.as_slice()).unwrap(),
             "same content as the message sent in the previous turn"
         );
     }
@@ -1834,20 +1713,24 @@ mod tests {
     async fn notice_follows_tool_results() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
-        let queued =
-            context.queue_notice(NoticeSource::DuplicateToolCall, "same call twice".into());
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call twice".into());
 
-        let stored = super::store_pending_notices(&exec_ctx, &Arc::new(queued))
-            .await
-            .unwrap();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
-        assert_eq!(stored.messages.len(), 3);
-        assert!(stored.messages[1].has_tool_result());
-        assert_eq!(stored.messages[2].text(), "same call twice");
-        assert!(stored.pending_notices.is_empty());
+        let stored = turn.history.as_slice();
+        assert_eq!(stored.len(), 3);
+        assert!(matches!(
+            &stored[1].parts[0],
+            MessagePart::ToolResult { .. }
+        ));
         assert_eq!(
-            stored_notices(&fixture, &exec_ctx.session_id).await,
+            stored[2].to_chat_message().unwrap().text(),
+            "same call twice"
+        );
+        assert!(turn.pending_notices.is_empty());
+        assert_eq!(
+            stored_notices(&fixture, &env.session_id).await,
             vec![(
                 NoticeSource::DuplicateToolCall,
                 "same call twice".to_string()
@@ -1859,65 +1742,45 @@ mod tests {
     async fn notice_is_stored_once() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
-        let queued = Arc::new(context.queue_notice(NoticeSource::TaskCompletion, "finish".into()));
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::TaskCompletion, "finish".into());
 
-        let first = super::store_pending_notices(&exec_ctx, &queued)
-            .await
-            .unwrap();
-        let second = super::store_pending_notices(&exec_ctx, &first)
-            .await
-            .unwrap();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+        let first = turn.history.as_slice().len();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
-        assert_eq!(second.messages.len(), first.messages.len());
-        assert_eq!(
-            second
-                .messages
-                .iter()
-                .filter(|message| message.text() == "finish")
-                .count(),
-            1
-        );
-        assert_eq!(
-            stored_notices(&fixture, &exec_ctx.session_id).await.len(),
-            1
-        );
+        assert_eq!(turn.history.as_slice().len(), first);
+        assert_eq!(stored_notices(&fixture, &env.session_id).await.len(), 1);
     }
 
     #[tokio::test]
     async fn notice_for_a_request_that_is_never_sent_is_not_stored() {
         use querymt_agent_core::model::NoticeSource;
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let (fixture, env, mut turn) = notice_fixture().await;
         // The run is cancelled before the next request: the queued notice is
-        // dropped with the context and nothing reaches storage.
-        let queued = context.queue_notice(NoticeSource::DuplicateCode, "review".into());
-        assert_eq!(queued.pending_notices.len(), 1);
-        assert_eq!(queued.messages.len(), 2);
-        drop(queued);
+        // dropped with the run and nothing reaches storage.
+        turn.queue_notice(NoticeSource::DuplicateCode, "review".into());
+        assert_eq!(turn.pending_notices.len(), 1);
+        assert_eq!(turn.history.as_slice().len(), 2);
+        drop(turn);
 
-        assert!(
-            stored_notices(&fixture, &exec_ctx.session_id)
-                .await
-                .is_empty()
-        );
+        assert!(stored_notices(&fixture, &env.session_id).await.is_empty());
     }
 
     #[tokio::test]
     async fn notice_is_reported_in_loaded_history() {
         use querymt_agent_core::model::{MessagePart, NoticeSource};
 
-        let (fixture, exec_ctx, context) = notice_fixture().await;
-        let queued = Arc::new(context.queue_notice(NoticeSource::ParallelEdit, "edit once".into()));
-        super::store_pending_notices(&exec_ctx, &queued)
-            .await
-            .unwrap();
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::ParallelEdit, "edit once".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
 
         let history = fixture
             .config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
         let part = history

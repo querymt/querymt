@@ -1051,9 +1051,8 @@ impl AgentMessage {
                     input_parts.push(ChatInputPart::text(content.clone()))
                 }
                 // A baseline is a request's tool list, never a message: it has
-                // no chat form. A history is read with
-                // `history::take_tool_baseline` before it is projected, which
-                // removes the baselines and returns the one in effect.
+                // no chat form. `projection::project_request` takes it out of a
+                // request's messages and returns its list.
                 MessagePart::ToolBaseline { .. } => {}
                 MessagePart::ToolChange { added, removed } => input_parts.push(
                     ChatInputPart::tool_change(ToolChange::new(added.clone(), removed.clone())),
@@ -1076,16 +1075,6 @@ impl AgentMessage {
         }
         Ok(ChatMessage::from_user_parts(input_parts))
     }
-}
-
-/// The tool list a request starts from and what it was built for: the content
-/// of a stored [`MessagePart::ToolBaseline`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolBaseline {
-    /// The offered tools, in the order the request lists them.
-    pub tools: Vec<querymt::chat::Tool>,
-    /// The provider and model the baseline was built for, `provider/model`.
-    pub origin: String,
 }
 
 /// Normalize tool-result batches across intervening user messages and synthesize

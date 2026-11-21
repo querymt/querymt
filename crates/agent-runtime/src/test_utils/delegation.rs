@@ -235,6 +235,9 @@ impl TestHarness {
     }
 
     pub async fn run(&mut self) -> CycleOutcome {
+        self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
+            .await
+            .expect("history loads");
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &self.env,

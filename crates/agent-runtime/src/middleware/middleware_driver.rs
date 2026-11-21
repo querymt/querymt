@@ -9,13 +9,12 @@
 
 use super::driver::{PreparedBatch, PreparedCallVerdict};
 use crate::agent::core::{AgentMode, SessionRuntime};
-use crate::middleware::{
-    AgentStats, ConversationContext, LlmResponse, ModelProfile, PendingNotice, Result,
-};
+use crate::agent::execution::turn::History;
+use crate::middleware::{AgentStats, LlmResponse, ModelProfile, PendingNotice, Result};
 use async_trait::async_trait;
-use querymt::chat::{ChatMessage, GenerationOptions};
+use querymt::chat::GenerationOptions;
 use querymt_agent_core::events::{SessionLimits, StopType};
-use querymt_agent_core::model::NoticeSource;
+use querymt_agent_core::model::{AgentMessage, NoticeSource};
 use querymt_agent_index::DiffPaths;
 use std::sync::Arc;
 
@@ -111,100 +110,137 @@ impl<'a> TurnInfo<'a> {
 ///
 /// Writes land in the run in the order middleware are consulted.
 pub struct HookCx<'a> {
-    context: &'a mut Arc<ConversationContext>,
-    runtime: &'a Arc<SessionRuntime>,
-    changed: &'a DiffPaths,
+    inputs: HookInputs<'a>,
+}
+
+/// What a hook is handed: borrows of the run's state, read-only except for
+/// the two things a hook may write.
+pub(crate) struct HookInputs<'a> {
+    pub session_id: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub mode: AgentMode,
+    pub runtime: &'a Arc<SessionRuntime>,
+    pub history: &'a History,
+    pub stats: &'a AgentStats,
+    pub profile: &'a ModelProfile,
+    pub last_applied: GenerationOptions,
+    pub request_overrides: &'a mut GenerationOptions,
+    pub pending_notices: &'a mut Vec<PendingNotice>,
+    pub changed: &'a DiffPaths,
+}
+
+/// The state of a hook's two writes at one point of a stage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HookCheckpoint {
+    queued: usize,
+    overrides: GenerationOptions,
 }
 
 impl<'a> HookCx<'a> {
-    pub(crate) fn new(
-        context: &'a mut Arc<ConversationContext>,
-        runtime: &'a Arc<SessionRuntime>,
-        changed: &'a DiffPaths,
-    ) -> Self {
-        Self {
-            context,
-            runtime,
-            changed,
-        }
+    pub(crate) fn new(inputs: HookInputs<'a>) -> Self {
+        Self { inputs }
     }
 
     /// The session the run belongs to.
     pub fn session_id(&self) -> &str {
-        &self.context.session_id
+        self.inputs.session_id
     }
 
-    /// The conversation as the next request will send it.
-    pub fn history(&self) -> &[ChatMessage] {
-        &self.context.messages
+    /// The conversation as the session stores it.
+    pub fn history(&self) -> &[AgentMessage] {
+        self.inputs.history.as_slice()
     }
 
     /// Usage and cost counters of the run so far.
     pub fn stats(&self) -> &AgentStats {
-        &self.context.stats
+        self.inputs.stats
     }
 
     /// The provider of the session's model.
     pub fn provider(&self) -> &str {
-        &self.context.provider
+        self.inputs.provider
     }
 
     /// The session's model.
     pub fn model(&self) -> &str {
-        &self.context.model
+        self.inputs.model
     }
 
     /// Facts about the session's model: output caps, capabilities, effort.
     pub fn profile(&self) -> &ModelProfile {
-        &self.context.profile
+        self.inputs.profile
     }
 
     /// The session's agent mode.
     pub fn mode(&self) -> AgentMode {
-        self.context.session_mode
+        self.inputs.mode
     }
 
     /// The options the most recent model request was sent with.
     pub fn last_applied(&self) -> GenerationOptions {
-        self.context.last_applied
+        self.inputs.last_applied
     }
 
     /// The overrides set for the next request so far.
     pub fn request_overrides(&self) -> GenerationOptions {
-        self.context.request_overrides
+        *self.inputs.request_overrides
     }
 
     /// Content of the most recent mode notice, counting notices queued but not
     /// yet stored.
     pub fn last_mode_notice(&self) -> Option<&str> {
-        self.context.last_mode_notice()
+        self.inputs
+            .pending_notices
+            .iter()
+            .rev()
+            .find(|notice| notice.source == NoticeSource::AgentMode)
+            .map(|notice| notice.content.as_str())
+            .or_else(|| self.inputs.history.last_mode_notice())
     }
 
     /// Notices queued for the next request and not yet stored.
     pub fn pending_notices(&self) -> &[PendingNotice] {
-        &self.context.pending_notices
+        self.inputs.pending_notices
     }
 
     /// The session's shared runtime state (working directory, indexes).
     pub fn runtime(&self) -> &Arc<SessionRuntime> {
-        self.runtime
+        self.inputs.runtime
     }
 
     /// The files the run's tool calls changed so far.
     pub fn changed_paths(&self) -> &DiffPaths {
-        self.changed
+        self.inputs.changed
+    }
+
+    /// What a rollback restores: the writes a hook may make.
+    pub(crate) fn checkpoint(&self) -> HookCheckpoint {
+        HookCheckpoint {
+            queued: self.inputs.pending_notices.len(),
+            overrides: *self.inputs.request_overrides,
+        }
+    }
+
+    /// Drops the notices queued and the overrides set since `checkpoint`.
+    pub(crate) fn rollback(&mut self, checkpoint: HookCheckpoint) {
+        self.inputs.pending_notices.truncate(checkpoint.queued);
+        *self.inputs.request_overrides = checkpoint.overrides;
     }
 
     /// Queue a notice. It is stored before the next model request and is sent
     /// to the model as user text.
     pub fn queue_notice(&mut self, source: NoticeSource, content: impl Into<String>) {
-        *self.context = Arc::new(self.context.queue_notice(source, content.into()));
+        self.inputs.pending_notices.push(PendingNotice {
+            source,
+            content: content.into(),
+        });
     }
 
     /// Set the generation overrides of the next model request, replacing any
     /// set earlier. They apply to that one request.
     pub fn set_request_overrides(&mut self, overrides: GenerationOptions) {
-        Arc::make_mut(self.context).request_overrides = overrides;
+        *self.inputs.request_overrides = overrides;
     }
 }
 

@@ -141,12 +141,9 @@ pub(crate) const TRIGGER_MANUAL: &str = "manual";
 
 /// How a compaction attempt ended without an error.
 pub(crate) enum CompactionOutcome {
-    /// A summary boundary was stored. Carries the new effective history and
-    /// its estimated token count.
-    Completed {
-        messages: Vec<querymt_agent_core::model::AgentMessage>,
-        context_tokens: usize,
-    },
+    /// A summary boundary was stored and the run's history is the new
+    /// effective history. Carries its estimated token count.
+    Completed { context_tokens: usize },
     /// A pre-compaction hook blocked the compaction.
     Blocked { message: String },
     /// The cycle budget refused the paid compaction request.
@@ -164,26 +161,20 @@ pub(super) async fn run_ai_compaction(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
     let outcome = compact_history(config, env, turn, TRIGGER_CONTEXT_THRESHOLD, None).await?;
-    let (filtered_messages, new_context_tokens) = match outcome {
-        CompactionOutcome::Completed {
-            messages,
-            context_tokens,
-        } => (messages, context_tokens),
+    let new_context_tokens = match outcome {
+        CompactionOutcome::Completed { context_tokens } => context_tokens,
         CompactionOutcome::Blocked { message } => {
             return Ok(ExecutionState::Stopped {
                 message: message.into(),
                 stop_type: StopType::ContextThreshold,
-                context: current_state.context().cloned(),
             });
         }
         CompactionOutcome::PriceLimit { message } => {
             return Ok(ExecutionState::Stopped {
                 message: message.into(),
                 stop_type: StopType::PriceLimit,
-                context: current_state.context().cloned(),
             });
         }
         CompactionOutcome::NothingToCompact => {
@@ -191,44 +182,16 @@ pub(super) async fn run_ai_compaction(
         }
     };
     debug!(
-        "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",
-        current_state
-            .context()
-            .map(|c| c.stats.context_tokens)
-            .unwrap_or(0),
+        "Post-compaction context tokens updated: {} -> {} ({} messages)",
+        turn.stats.context_tokens,
         new_context_tokens,
-        filtered_messages.len()
+        turn.history.as_slice().len()
     );
-
-    // The same read of the stored history as a turn start, so the rest of the
-    // run continues from what a reload would give it.
-    let view = env
-        .session_handle
-        .view_of(filtered_messages)
-        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
-
-    let new_context = if let Some(ctx) = current_state.context() {
-        let mut new_stats = crate::middleware::AgentStats::clone(&ctx.stats);
-        new_stats.context_tokens = new_context_tokens;
-
-        Arc::new(
-            ctx.with_history(
-                Arc::from(view.messages.into_boxed_slice()),
-                Arc::new(new_stats),
-            )
-            // Compaction may have removed the stored reminder and the tool
-            // baseline; read the surviving ones so the next request stores
-            // them again if needed.
-            .with_stored_state(view.mode_notice, view.tool_baseline),
-        )
-    } else {
-        return Err(anyhow::anyhow!("No context available for compaction"));
-    };
-
-    turn.compaction_summaries = view.summaries;
-    Ok(ExecutionState::BeforeLlmCall {
-        context: new_context,
-    })
+    // Compaction may have removed the stored reminder and the tool baseline;
+    // the history now holds what survived, so the next request stores them
+    // again if needed.
+    turn.stats.context_tokens = new_context_tokens;
+    Ok(ExecutionState::BeforeLlmCall)
 }
 
 /// Summarize the effective history and store the summary boundary.
@@ -246,42 +209,17 @@ pub(crate) async fn compact_history(
     instructions: Option<&str>,
 ) -> Result<CompactionOutcome, anyhow::Error> {
     let session_id = &env.session_id;
-    let messages = env
-        .session_handle
-        .get_effective_agent_history()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
+    // The run's history is the stored one: nothing else writes it.
+    let messages = turn.history.as_slice().to_vec();
     if messages.is_empty() {
         return Ok(CompactionOutcome::NothingToCompact);
     }
 
     let prompt_limit = env.execution_config().and_then(|cfg| cfg.max_prompt_bytes);
-    let token_estimate: usize = messages
-        .iter()
-        .map(|m| {
-            m.parts
-                .iter()
-                .map(|p| match p {
-                    MessagePart::Text { content } | MessagePart::Notice { content, .. } => {
-                        content.len() / 4
-                    }
-                    MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
-                        crate::agent::utils::render_prompt_for_llm(blocks, prompt_limit).len() / 4
-                    }
-                    MessagePart::ToolResult { content, .. } => {
-                        content
-                            .iter()
-                            .filter_map(|b| b.as_text())
-                            .map(|t| t.len())
-                            .sum::<usize>()
-                            / 4
-                    }
-                    MessagePart::Output { output } => output.estimate_text().len() / 4,
-                    _ => 0,
-                })
-                .sum::<usize>()
-        })
-        .sum();
+    let tool_changes = turn.profile.capabilities.tool_updates;
+    let token_estimate =
+        crate::session::pruning::estimate_history_tokens(&messages, prompt_limit, tool_changes)
+            .map_err(|e| anyhow::anyhow!("Invalid prompt content in history: {e}"))?;
 
     let turn_id = env.turn_id().to_string();
     let model_name = env
@@ -505,13 +443,12 @@ pub(crate) async fn compact_history(
         result.original_token_count,
     );
 
-    if let Err(error) = env.add_message(request_msg).await {
-        let error = anyhow::anyhow!("Failed to store compaction request: {}", error);
-        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
-        return Err(error);
-    }
-    if let Err(error) = env.add_message(summary_msg).await {
-        let error = anyhow::anyhow!("Failed to store compaction summary: {}", error);
+    if let Err(error) = turn
+        .history
+        .commit(&env.session_handle, vec![request_msg, summary_msg])
+        .await
+    {
+        let error = anyhow::anyhow!("Failed to store compaction boundary: {}", error);
         emit_compaction_failure(config, session_id, &compaction_id, &error).await;
         return Err(error);
     }
@@ -535,23 +472,29 @@ pub(crate) async fn compact_history(
                 content: context.content,
             })
             .collect();
-        if let Err(error) = env.add_message(message).await {
+        if let Err(error) = turn
+            .history
+            .commit(&env.session_handle, vec![message])
+            .await
+        {
             warn!("failed to store post-compaction repository context: {error}");
         }
     }
 
-    let filtered_messages = match env.session_handle.get_effective_agent_history().await {
-        Ok(messages) => messages,
+    // The boundary closes what came before it, as a load of the store would.
+    turn.history.keep_effective();
+    let new_context_tokens = match crate::session::pruning::estimate_history_tokens(
+        turn.history.as_slice(),
+        prompt_limit,
+        tool_changes,
+    ) {
+        Ok(tokens) => tokens,
         Err(error) => {
-            let error = anyhow::anyhow!("Failed to get new history: {}", error);
+            let error = anyhow::anyhow!("Invalid prompt content after compaction: {error}");
             emit_compaction_failure(config, session_id, &compaction_id, &error).await;
             return Err(error);
         }
     };
-
-    let new_context_tokens = config
-        .compaction
-        .estimate_messages_tokens(&filtered_messages, prompt_limit);
 
     // One validated text summary chunk after the start and before the terminal update.
     emit_compaction_event(
@@ -583,7 +526,6 @@ pub(crate) async fn compact_history(
     .await;
 
     Ok(CompactionOutcome::Completed {
-        messages: filtered_messages,
         context_tokens: new_context_tokens,
     })
 }
@@ -591,19 +533,29 @@ pub(crate) async fn compact_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compacts the history the store holds: the run's history is loaded
+    /// first, as a run does when it starts.
+    async fn compact_stored(
+        config: &AgentConfig,
+        env: &TurnEnv,
+        turn: &mut Turn,
+    ) -> Result<ExecutionState, anyhow::Error> {
+        turn.history = super::super::turn::History::load(&env.session_handle).await?;
+        run_ai_compaction(config, env, turn).await
+    }
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::{McpToolState, SessionRuntime};
     use crate::hooks::{
         HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig,
     };
-    use crate::middleware::{AgentStats, ConversationContext};
     use crate::session::RuntimeContext;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::session::store::SessionExecutionConfig;
     use crate::test_utils::helpers::mock_plugin_registry;
     use crate::test_utils::mocks::{MockLlmProvider, SharedLlmProvider, TestProviderFactory};
     use querymt::LLMParams;
-    use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
+    use querymt::chat::{ChatOutput, ChatRole, FinishReason};
     use querymt_agent_core::events::{DurableEvent, EventEnvelope};
     use querymt_agent_core::model::AgentMessage;
 
@@ -634,13 +586,7 @@ mod tests {
     async fn fixture(
         hooks: Hooks,
         output: Option<ChatOutput>,
-    ) -> (
-        AgentConfig,
-        TurnEnv,
-        Turn,
-        ExecutionState,
-        tempfile::TempDir,
-    ) {
+    ) -> (AgentConfig, TurnEnv, Turn, tempfile::TempDir) {
         let mut mock = MockLlmProvider::new();
         if let Some(output) = output {
             // The configured single retry may call the provider at most twice.
@@ -681,23 +627,10 @@ mod tests {
                 .await
                 .unwrap();
         let runtime = SessionRuntime::new(None, Default::default(), McpToolState::empty());
-        let (env, turn) =
+        let (env, mut turn) =
             crate::test_utils::turn_parts(&config, session_handle, runtime, runtime_context).await;
-        let state = ExecutionState::Stopped {
-            message: "context threshold".into(),
-            stop_type: StopType::ContextThreshold,
-            context: Some(Arc::new(ConversationContext::new(
-                session_id.into(),
-                Arc::from([ChatMessage::user().text("Continue the task").build()]),
-                Arc::new(AgentStats {
-                    context_tokens: 100_000,
-                    ..AgentStats::default()
-                }),
-                "mock".into(),
-                "mock".into(),
-            ))),
-        };
-        (config, env, turn, state, tempdir)
+        turn.stats.context_tokens = 100_000;
+        (config, env, turn, tempdir)
     }
 
     fn is_compaction_event(kind: &AgentEventKind) -> bool {
@@ -754,7 +687,7 @@ mod tests {
         output: Option<ChatOutput>,
         expected_error: &str,
     ) {
-        let (config, env, mut turn, state, _tempdir) = fixture(hooks, output).await;
+        let (config, env, mut turn, _tempdir) = fixture(hooks, output).await;
         let before = config
             .provider
             .history_store()
@@ -762,7 +695,7 @@ mod tests {
             .await
             .unwrap();
         let mut events = config.subscribe_events();
-        let error = run_ai_compaction(&config, &env, &mut turn, &state)
+        let error = compact_stored(&config, &env, &mut turn)
             .await
             .expect_err("compaction must fail");
         // Do not yield: all lifecycle events must be published before compaction returns.
@@ -787,7 +720,7 @@ mod tests {
             serde_json::to_value(&effective).unwrap(),
             serde_json::to_value(&before).unwrap()
         );
-        assert_eq!(state.context().unwrap().stats.context_tokens, 100_000);
+        assert_eq!(turn.stats.context_tokens, 100_000);
 
         let [start, failed] = compaction_events.as_slice() else {
             panic!("expected start and failure before return: {compaction_events:?}");
@@ -874,8 +807,7 @@ mod tests {
             None,
             Some(FinishReason::Stop),
         );
-        let (mut config, env, mut turn, _state, _tempdir) =
-            fixture(Hooks::disabled(), Some(output)).await;
+        let (mut config, env, mut turn, _tempdir) = fixture(Hooks::disabled(), Some(output)).await;
         config.execution_policy.compaction.auto = true;
         config.middleware_drivers = vec![Arc::new(crate::middleware::ContextMiddleware::new(
             // Force compaction before the first model request, even at initial zero usage.
@@ -888,6 +820,9 @@ mod tests {
             .provider
             .history_store()
             .get_history(&env.session_id)
+            .await
+            .unwrap();
+        turn.history = super::super::turn::History::load(&env.session_handle)
             .await
             .unwrap();
         let outcome = tokio::time::timeout(
@@ -920,60 +855,61 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_drops_a_tool_baseline_the_history_no_longer_holds() {
-        let (config, env, mut turn, state, _tempdir) =
+        let (config, env, mut turn, _tempdir) =
             fixture(custom_summary_hooks("Summary", None), None).await;
         // The run holds a baseline that was stored before the compaction, and
         // a tool change stored after it.
-        let ExecutionState::Stopped {
-            message,
-            stop_type,
-            context: Some(context),
-        } = state
-        else {
-            panic!("fixture state is a stop with a context");
-        };
-        let mut held = (*context).clone();
-        held.tool_baseline = Some(Arc::new(querymt_agent_core::model::ToolBaseline {
+        let mut baseline = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        baseline.parts.push(MessagePart::ToolBaseline {
             tools: Vec::new(),
             origin: "mock/mock".into(),
-        }));
-        let mut messages = held.messages.to_vec();
-        messages.push(ChatMessage::from_tool_change(
-            querymt::chat::ToolChange::new(Vec::new(), vec!["gone".into()]),
-        ));
-        held.messages = Arc::from(messages.into_boxed_slice());
-        let state = ExecutionState::Stopped {
-            message,
-            stop_type,
-            context: Some(Arc::new(held)),
-        };
-
-        let next = run_ai_compaction(&config, &env, &mut turn, &state)
+        });
+        let mut change = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        change.parts.push(MessagePart::ToolChange {
+            added: Vec::new(),
+            removed: vec!["gone".into()],
+        });
+        turn.history
+            .commit(&env.session_handle, vec![baseline, change])
             .await
             .unwrap();
+        assert!(turn.history.tool_baseline().is_some());
+
+        compact_stored(&config, &env, &mut turn).await.unwrap();
 
         // The effective history starts at the summary, so a load finds no
         // baseline: the run must not keep the old one, or the next request
         // would lead with a list no stored baseline records.
-        let context = next.context().unwrap();
-        assert!(context.tool_baseline.is_none());
-        assert!(!context.messages.iter().any(ChatMessage::has_tool_change));
-        let view = env.session_handle.history_view().await.unwrap();
-        assert_eq!(context.messages.as_ref(), view.messages);
-        assert!(view.tool_baseline.is_none());
+        assert!(turn.history.tool_baseline().is_none());
+        assert!(
+            !turn
+                .history
+                .as_slice()
+                .iter()
+                .flat_map(|message| &message.parts)
+                .any(MessagePart::is_tool_record)
+        );
+        let loaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(turn.history.as_slice()).unwrap(),
+            serde_json::to_value(&loaded).unwrap(),
+            "the run holds what a load gives it"
+        );
     }
 
     #[tokio::test]
     async fn valid_custom_summary_is_stored_and_emitted_as_success() {
-        let (config, env, mut turn, state, _tempdir) = fixture(
+        let (config, env, mut turn, _tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", Some("Keep the tests passing")),
             None,
         )
         .await;
         let mut events = config.subscribe_events();
-        let result = run_ai_compaction(&config, &env, &mut turn, &state)
-            .await
-            .unwrap();
+        let result = compact_stored(&config, &env, &mut turn).await.unwrap();
         let compaction_events = take_compaction_events(&mut events);
         let expected = "Valid continuation summary\n\nKeep the tests passing";
         let effective = env
@@ -985,11 +921,12 @@ mod tests {
         assert!(
             matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
         );
-        assert!(result.context().unwrap().stats.context_tokens > 0);
-        assert_eq!(turn.compaction_summaries.len(), 1);
+        assert!(matches!(result, ExecutionState::BeforeLlmCall));
+        assert!(turn.stats.context_tokens > 0);
         assert_eq!(
-            turn.compaction_summaries[0].payload(),
-            result.context().unwrap().messages[1].payload()
+            serde_json::to_value(turn.history.as_slice()).unwrap(),
+            serde_json::to_value(&effective).unwrap(),
+            "the run holds the effective history"
         );
         let [start, chunk, end] = compaction_events.as_slice() else {
             panic!("expected start, summary, and end before return: {compaction_events:?}");
@@ -1025,9 +962,53 @@ mod tests {
         assert_compaction_journal_matches(&config, &env.session_id, &compaction_events).await;
     }
 
+    /// The estimate of the request the stored history of `env`'s session
+    /// would be sent as, without its tail: what every history estimate must
+    /// equal.
+    async fn request_estimate(env: &TurnEnv) -> usize {
+        let history = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        let projected = querymt_agent_core::projection::project_request(
+            &history,
+            &querymt_agent_core::projection::RequestTarget {
+                output: None,
+                max_prompt_bytes: None,
+                tool_changes: true,
+            },
+        )
+        .unwrap();
+        crate::session::pruning::estimate_chat_tokens(&projected.messages)
+            + projected
+                .baseline_tools
+                .filter(|tools| !tools.is_empty())
+                .map_or(0, |tools| {
+                    crate::session::pruning::tool_json_tokens(
+                        serde_json::to_vec(tools).unwrap().len(),
+                    )
+                })
+    }
+
+    async fn compaction_start_figure(
+        config: &AgentConfig,
+        env: &TurnEnv,
+        turn: &mut Turn,
+    ) -> usize {
+        let mut events = config.subscribe_events();
+        compact_stored(config, env, turn).await.unwrap();
+        let compaction_events = take_compaction_events(&mut events);
+        let AgentEventKind::CompactionStart { token_estimate, .. } = &compaction_events[0].kind
+        else {
+            panic!("first compaction event must be a start: {compaction_events:?}");
+        };
+        *token_estimate as usize
+    }
+
     #[tokio::test]
     async fn compaction_start_counts_stored_notices() {
-        let (config, env, mut turn, state, _tempdir) =
+        let (config, env, mut turn, _tempdir) =
             fixture(custom_summary_hooks("Summary", None), None).await;
         let notice_text = "The instructions from the earlier mode no longer apply. ".repeat(10);
         let mut notice = AgentMessage::new(env.session_id.clone(), ChatRole::User);
@@ -1036,21 +1017,170 @@ mod tests {
             content: notice_text.clone(),
         });
         env.session_handle.add_message(notice).await.unwrap();
+        let before_notice = request_estimate(&env).await;
 
-        let mut events = config.subscribe_events();
-        run_ai_compaction(&config, &env, &mut turn, &state)
+        let figure = compaction_start_figure(&config, &env, &mut turn).await;
+
+        assert_eq!(figure, before_notice);
+        let original = "Keep the implemented shader and verified test results.";
+        assert!(
+            figure >= original.len() / 4 + notice_text.len() / 4,
+            "the notice is counted: {figure}"
+        );
+    }
+
+    /// run-history-consistency / Compaction figure equals the request estimate.
+    #[tokio::test]
+    async fn compaction_figure_equals_the_request_estimate() {
+        let (config, env, mut turn) = {
+            let (config, env, turn, _tempdir) =
+                fixture(custom_summary_hooks("Summary", None), None).await;
+            std::mem::forget(_tempdir);
+            (config, env, turn)
+        };
+        let session_id = env.session_id.clone();
+        let mut steering = AgentMessage::new(session_id.clone(), ChatRole::User);
+        steering.parts.push(MessagePart::Steering {
+            run_id: "run".into(),
+            client_input_id: None,
+            blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new("use another file name, please"),
+            )],
+        });
+        let mut reply = AgentMessage::new(session_id.clone(), ChatRole::Assistant);
+        reply.parts.push(MessagePart::Reasoning {
+            item: querymt::chat::ChatReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: vec![querymt::chat::ChatReasoningPart::text("r".repeat(256))],
+                encrypted_content: None,
+                signature: None,
+                status: None,
+                extensions: Default::default(),
+            },
+            time_ms: None,
+        });
+        reply.parts.push(MessagePart::Text {
+            content: "Done.".into(),
+        });
+        let mut baseline = AgentMessage::new(session_id.clone(), ChatRole::User);
+        baseline.parts.push(MessagePart::ToolBaseline {
+            tools: Vec::new(),
+            origin: "mock/mock".into(),
+        });
+        let mut change = AgentMessage::new(session_id, ChatRole::User);
+        change.parts.push(MessagePart::ToolChange {
+            added: vec![querymt::chat::Tool {
+                tool_type: "function".into(),
+                function: querymt::chat::FunctionTool {
+                    name: "big".into(),
+                    description: "d".repeat(4_000),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }],
+            removed: Vec::new(),
+        });
+        for message in [steering, reply, baseline, change] {
+            env.session_handle.add_message(message).await.unwrap();
+        }
+        let expected = request_estimate(&env).await;
+        // A provider that takes tool changes is sent the definitions.
+        Arc::make_mut(&mut turn.profile).capabilities.tool_updates = true;
+
+        let figure = compaction_start_figure(&config, &env, &mut turn).await;
+
+        assert_eq!(figure, expected);
+        assert!(
+            figure > 1_000,
+            "the 4,000-byte definition is counted: {figure}"
+        );
+    }
+
+    /// A provider without `tool_updates` is never sent tool records, so the
+    /// figure does not count them.
+    #[tokio::test]
+    async fn compaction_figure_leaves_out_tool_records_for_a_provider_without_tool_updates() {
+        let (config, env, mut turn) = {
+            let (config, env, turn, _tempdir) =
+                fixture(custom_summary_hooks("Summary", None), None).await;
+            std::mem::forget(_tempdir);
+            (config, env, turn)
+        };
+        let mut text = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        text.parts.push(MessagePart::Text {
+            content: "hello".into(),
+        });
+        let mut baseline = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        baseline.parts.push(MessagePart::ToolBaseline {
+            tools: vec![querymt::chat::Tool {
+                tool_type: "function".into(),
+                function: querymt::chat::FunctionTool {
+                    name: "big".into(),
+                    description: "d".repeat(4_000),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }],
+            origin: "mock/mock".into(),
+        });
+        for message in [text, baseline] {
+            env.session_handle.add_message(message).await.unwrap();
+        }
+        assert!(!turn.profile.capabilities.tool_updates);
+
+        let figure = compaction_start_figure(&config, &env, &mut turn).await;
+
+        assert!(
+            figure < 100,
+            "the baseline's tool list is not counted: {figure}"
+        );
+    }
+
+    /// run-history-consistency / Tool-change definitions are counted.
+    #[tokio::test]
+    async fn tool_change_definitions_are_counted() {
+        let (_config, env, _turn, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        let session_id = env.session_id.clone();
+        let mut baseline = AgentMessage::new(session_id.clone(), ChatRole::User);
+        baseline.parts.push(MessagePart::ToolBaseline {
+            tools: Vec::new(),
+            origin: "mock/mock".into(),
+        });
+        env.session_handle.add_message(baseline).await.unwrap();
+        let without = request_estimate(&env).await;
+        let definition = querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "big".into(),
+                description: "d".repeat(4_000),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        };
+        let mut change = AgentMessage::new(session_id, ChatRole::User);
+        change.parts.push(MessagePart::ToolChange {
+            added: vec![definition.clone()],
+            removed: Vec::new(),
+        });
+        env.session_handle.add_message(change).await.unwrap();
+
+        let with = request_estimate(&env).await;
+        let history = env
+            .session_handle
+            .get_effective_agent_history()
             .await
             .unwrap();
-        let compaction_events = take_compaction_events(&mut events);
-        let AgentEventKind::CompactionStart { token_estimate, .. } = &compaction_events[0].kind
-        else {
-            panic!("first compaction event must be a start: {compaction_events:?}");
-        };
-        let original = "Keep the implemented shader and verified test results.";
-        assert_eq!(
-            *token_estimate as usize,
-            original.len() / 4 + notice_text.len() / 4
-        );
+        let shared =
+            crate::session::pruning::estimate_history_tokens(&history, None, true).unwrap();
+
+        let definition_tokens = serde_json::to_string(&definition)
+            .unwrap()
+            .len()
+            .div_ceil(4);
+        assert!(with >= without + definition_tokens, "{without} -> {with}");
+        assert_eq!(shared, with, "the shared estimate counts it the same way");
     }
 
     mod accounting_tests {
@@ -1088,11 +1218,9 @@ mod tests {
 
         #[tokio::test]
         async fn successful_compaction_charges_the_initiating_cycle_as_compaction_purpose() {
-            let (config, env, mut turn, state, _tempdir) =
+            let (config, env, mut turn, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
-            run_ai_compaction(&config, &env, &mut turn, &state)
-                .await
-                .unwrap();
+            compact_stored(&config, &env, &mut turn).await.unwrap();
 
             let cycle = &env.cycle_accounting;
             let by_cycle = cycle.cycle_totals();
@@ -1114,10 +1242,10 @@ mod tests {
         #[tokio::test]
         async fn rejected_summary_and_retry_both_settle_before_failure() {
             // Both mock calls return an empty summary: validation rejects each.
-            let (config, env, mut turn, state, _tempdir) =
+            let (config, env, mut turn, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("  "))).await;
             let mut events = config.subscribe_events();
-            let error = run_ai_compaction(&config, &env, &mut turn, &state)
+            let error = compact_stored(&config, &env, &mut turn)
                 .await
                 .expect_err("empty summary must fail");
             assert!(error.to_string().contains("empty summary"), "{error:#}");
@@ -1140,15 +1268,14 @@ mod tests {
 
         #[tokio::test]
         async fn compaction_reduces_effective_context_while_increasing_spend() {
-            let (config, env, mut turn, state, _tempdir) =
+            let (config, env, mut turn, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
-            let before = state.context().unwrap().stats.clone();
+            let before = turn.stats.clone();
             assert_eq!(before.context_tokens, 100_000);
 
-            let next = run_ai_compaction(&config, &env, &mut turn, &state)
-                .await
-                .unwrap();
-            let after = next.context().unwrap().stats.clone();
+            let next = compact_stored(&config, &env, &mut turn).await.unwrap();
+            assert!(matches!(next, ExecutionState::BeforeLlmCall));
+            let after = turn.stats.clone();
 
             // Effective context shrinks to the post-compaction estimate ...
             assert!(after.context_tokens < before.context_tokens);
@@ -1174,11 +1301,9 @@ mod tests {
 
         #[tokio::test]
         async fn auxiliary_tokens_are_a_separate_purpose_total() {
-            let (config, env, mut turn, state, _tempdir) =
+            let (config, env, mut turn, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
-            run_ai_compaction(&config, &env, &mut turn, &state)
-                .await
-                .unwrap();
+            compact_stored(&config, &env, &mut turn).await.unwrap();
             let accounting = env.cycle_accounting.session_accounting();
             let compaction = accounting.read(|r| r.purpose(AttemptPurpose::Compaction));
             let main = accounting.read(|r| r.purpose(AttemptPurpose::MainResponse));
@@ -1192,11 +1317,9 @@ mod tests {
 
         #[tokio::test]
         async fn hook_provided_summary_dispatches_nothing_and_charges_nothing() {
-            let (config, env, mut turn, state, _tempdir) =
+            let (config, env, mut turn, _tempdir) =
                 fixture(custom_summary_hooks("Hook summary", None), None).await;
-            run_ai_compaction(&config, &env, &mut turn, &state)
-                .await
-                .unwrap();
+            compact_stored(&config, &env, &mut turn).await.unwrap();
             assert_eq!(
                 env.cycle_accounting.cycle_totals(),
                 Default::default(),
@@ -1206,7 +1329,7 @@ mod tests {
 
         #[tokio::test]
         async fn maintenance_cycle_has_its_own_identity_and_session_totals() {
-            let (config, mut env, mut turn, state, _tempdir) =
+            let (config, mut env, mut turn, _tempdir) =
                 fixture(Hooks::disabled(), Some(response("Summary"))).await;
             // Compaction outside a prompt runs under a dedicated maintenance cycle.
             let accounting = env
@@ -1219,9 +1342,7 @@ mod tests {
             let id = maintenance.cycle_id().to_string();
             env.cycle_accounting = maintenance;
 
-            run_ai_compaction(&config, &env, &mut turn, &state)
-                .await
-                .unwrap();
+            compact_stored(&config, &env, &mut turn).await.unwrap();
             assert_eq!(accounting.read(|r| r.cycle(&id).priced_attempts), 1);
 
             // A later prompt cycle starts at zero while session spend remains.
@@ -1234,8 +1355,7 @@ mod tests {
         #[tokio::test]
         async fn budget_refusal_ends_compaction_as_a_price_limit_stop() {
             // No provider call is expected: the fixture's mock fails on any.
-            let (mut config, env, mut turn, state, _tempdir) =
-                fixture(Hooks::disabled(), None).await;
+            let (mut config, env, mut turn, _tempdir) = fixture(Hooks::disabled(), None).await;
             // A zero cap is already reached by a cycle with no spend.
             config
                 .middleware_drivers
@@ -1244,7 +1364,7 @@ mod tests {
                 )));
             let mut events = config.subscribe_events();
 
-            let next = run_ai_compaction(&config, &env, &mut turn, &state)
+            let next = compact_stored(&config, &env, &mut turn)
                 .await
                 .expect("a refused dispatch is a stop, not an error");
             let ExecutionState::Stopped {
@@ -1308,16 +1428,8 @@ mod tests {
         }
     }
 
-    async fn knowledge_fixture(
-        repo: &Repo,
-    ) -> (
-        AgentConfig,
-        TurnEnv,
-        Turn,
-        ExecutionState,
-        tempfile::TempDir,
-    ) {
-        let (mut config, mut env, turn, state, tempdir) = fixture(
+    async fn knowledge_fixture(repo: &Repo) -> (AgentConfig, TurnEnv, Turn, tempfile::TempDir) {
+        let (mut config, mut env, turn, tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", None),
             None,
         )
@@ -1371,7 +1483,7 @@ mod tests {
                     .into(),
         });
         env.session_handle.add_message(indexed).await.unwrap();
-        (config, env, turn, state, tempdir)
+        (config, env, turn, tempdir)
     }
 
     async fn stored_cards(env: &TurnEnv) -> Vec<String> {
@@ -1391,10 +1503,8 @@ mod tests {
     #[tokio::test]
     async fn compaction_redelivers_recent_cards_under_the_new_epoch_from_current_sources() {
         let repo = repo();
-        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
-        run_ai_compaction(&config, &env, &mut turn, &state)
-            .await
-            .unwrap();
+        let (config, env, mut turn, _td) = knowledge_fixture(&repo).await;
+        compact_stored(&config, &env, &mut turn).await.unwrap();
 
         let cards = stored_cards(&env).await;
         // Bounded by the shared per-turn budget (two cards by default).
@@ -1410,7 +1520,7 @@ mod tests {
     #[tokio::test]
     async fn changed_and_removed_documents_are_not_resurrected_from_old_payloads() {
         let repo = repo();
-        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, _td) = knowledge_fixture(&repo).await;
         // An old card for the note sits in pre-compaction history.
         let old = {
             let mut m = AgentMessage::new(env.session_id.clone(), ChatRole::User);
@@ -1432,9 +1542,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(repo.dir.path().join("src/AGENTS.md")).unwrap();
 
-        run_ai_compaction(&config, &env, &mut turn, &state)
-            .await
-            .unwrap();
+        compact_stored(&config, &env, &mut turn).await.unwrap();
         let cards = stored_cards(&env).await;
         assert!(cards.iter().all(|c| !c.contains("STALE-TEXT")), "{cards:?}");
         assert!(cards.iter().any(|c| c.contains("fair queue")), "{cards:?}");
@@ -1447,10 +1555,8 @@ mod tests {
     #[tokio::test]
     async fn retained_cards_are_not_duplicated_by_a_second_evaluation() {
         let repo = repo();
-        let (config, env, mut turn, state, _td) = knowledge_fixture(&repo).await;
-        run_ai_compaction(&config, &env, &mut turn, &state)
-            .await
-            .unwrap();
+        let (config, env, mut turn, _td) = knowledge_fixture(&repo).await;
+        compact_stored(&config, &env, &mut turn).await.unwrap();
         let first = stored_cards(&env).await;
         assert!(!first.is_empty());
 
@@ -1481,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn only_index_calls_that_received_a_native_card_are_re_evaluated() {
         let repo = repo();
-        let (config, env, mut turn, _state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, _td) = knowledge_fixture(&repo).await;
 
         // No persisted index-context card names this call (a foreign `index`
         // tool, or a result a hook suppressed): nothing is recovered for it.
@@ -1517,7 +1623,7 @@ mod tests {
     async fn restore_counts_only_native_cards_and_reads_history_once() {
         use crate::knowledge::repository::budget::Refusal;
         let repo = repo();
-        let (config, env, mut turn, _state, _td) = knowledge_fixture(&repo).await;
+        let (config, env, mut turn, _td) = knowledge_fixture(&repo).await;
         let card = |handler: &str, id: &str| crate::hooks::HookContextContribution {
             event_name: "post_tool_use".into(),
             handler_id: handler.into(),
@@ -1569,14 +1675,12 @@ mod tests {
 
     #[tokio::test]
     async fn without_repository_knowledge_compaction_adds_no_context() {
-        let (config, env, mut turn, state, _td) = fixture(
+        let (config, env, mut turn, _td) = fixture(
             custom_summary_hooks("Valid continuation summary", None),
             None,
         )
         .await;
-        run_ai_compaction(&config, &env, &mut turn, &state)
-            .await
-            .unwrap();
+        compact_stored(&config, &env, &mut turn).await.unwrap();
         assert!(stored_cards(&env).await.is_empty());
     }
 }

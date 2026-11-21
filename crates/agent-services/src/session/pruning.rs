@@ -359,6 +359,48 @@ impl ContentCostEstimator for GenericContentCostEstimator {
     }
 }
 
+/// The estimate of a serialized tool list: four bytes to a token.
+pub fn tool_json_tokens(json_len: usize) -> usize {
+    json_len.div_ceil(4)
+}
+
+/// The size of a stored history, in tokens: the estimate of the request it
+/// projects to, without a tail, plus the tool list of the baseline in effect.
+/// Every estimate the agent makes of a stored history goes through here, so the
+/// figure that starts a compaction, the before and after figures of one, the
+/// delegation summary budget and a request's own budget agree: they count
+/// every part a request sends (steering, reasoning, compaction summaries and,
+/// when `tool_changes` is set, tool-change definitions).
+///
+/// `tool_changes` is whether the request takes tool changes as messages
+/// (`tool_updates`); without it the history's tool records are not sent and
+/// not counted.
+///
+/// # Errors
+///
+/// Fails when a stored message cannot be converted.
+pub fn estimate_history_tokens(
+    history: &[AgentMessage],
+    max_prompt_bytes: Option<usize>,
+    tool_changes: bool,
+) -> Result<usize, querymt_agent_core::model::PromptContentError> {
+    let projected = querymt_agent_core::projection::project_request(
+        history,
+        &querymt_agent_core::projection::RequestTarget {
+            output: None,
+            max_prompt_bytes,
+            tool_changes,
+        },
+    )?;
+    let tools = projected
+        .baseline_tools
+        .filter(|tools| !tools.is_empty())
+        .map_or(0, |tools| {
+            serde_json::to_vec(tools).map_or(0, |json| tool_json_tokens(json.len()))
+        });
+    Ok(estimate_chat_tokens(&projected.messages).saturating_add(tools))
+}
+
 /// Approximate prepared-message cost without counting binary transport or output metadata.
 // TODO: Prefer provider/model-specific estimation, including token-counting APIs when supported.
 // This local heuristic (especially image reserves) is neither an exact count nor an upper bound;
