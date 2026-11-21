@@ -821,8 +821,12 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    let output: ChatOutput = if tools.is_empty() && !exec_ctx.restricted_mesh_turn() {
-        // No tools — always use the non-streaming simple submit path.
+    let output: ChatOutput = if tools.is_empty()
+        && !exec_ctx.restricted_mesh_turn()
+        && !session_handle.uses_explicit_mesh_provider()
+    {
+        // Keep the simple local path. A remote binding may enforce finite
+        // capacity only for streaming, even when no tools were requested.
         let cancel = exec_ctx.cancellation_token.clone();
         match super::llm_retry::call_with_retry(
             config,

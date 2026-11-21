@@ -936,6 +936,25 @@ impl SessionHandle {
         &self.session
     }
 
+    pub(crate) fn uses_explicit_mesh_provider(&self) -> bool {
+        #[cfg(feature = "remote")]
+        {
+            self.provider_node_id.as_deref().is_some_and(|node| {
+                node != "local"
+                    && self
+                        .provider
+                        .mesh
+                        .load()
+                        .as_deref()
+                        .is_none_or(|mesh| mesh.peer_id().to_string() != node)
+            })
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            false
+        }
+    }
+
     /// Get the LLM config captured at handle creation time (turn-pinned).
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.llm_config.as_ref()
