@@ -2430,8 +2430,13 @@ the run with a "model hit token limit" stop. It is active for every agent by def
 type <code>model_token_limit</code>. A reply that is cut off in the middle of a tool call never
 runs that call; the model is told to split the write into smaller calls.</p>
 <p><strong>Initial cap and ceiling.</strong> With no <code>max_tokens</code> configured, Anthropic requests start at
-<code>min(32000, model output limit)</code> and the model's output limit is the ceiling. If the
-limit is unknown, 32,000 is used for both.</p>
+<code>min(32000, model output limit)</code> and the model's output limit is the ceiling. At
+reasoning effort <code>high</code> or <code>max</code> the requests start at <code>min(64000, model output limit)</code>
+instead, because reasoning tokens count against the cap and long replies were being cut
+off and discarded at 32,000. The effort is read when the provider is built for a request,
+so a change of effort applies from the next request. If the limit is unknown, 32,000 is
+used for both at every effort. An explicit <code>max_tokens</code> is used as it is and is also the
+ceiling.</p>
 <p><strong>Default instruction.</strong> <code>{cap}</code> expands to the cap that was hit:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
 <span class="normal"><a href="#__codelineno-9-2">2</a></span>

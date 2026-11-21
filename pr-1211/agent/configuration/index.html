@@ -1545,6 +1545,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#tools-that-change-during-a-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Tools that change during a session
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2742,7 +2753,12 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <span class="normal"><a href="#__codelineno-5-41">41</a></span>
 <span class="normal"><a href="#__codelineno-5-42">42</a></span>
 <span class="normal"><a href="#__codelineno-5-43">43</a></span>
-<span class="normal"><a href="#__codelineno-5-44">44</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
+<span class="normal"><a href="#__codelineno-5-44">44</a></span>
+<span class="normal"><a href="#__codelineno-5-45">45</a></span>
+<span class="normal"><a href="#__codelineno-5-46">46</a></span>
+<span class="normal"><a href="#__codelineno-5-47">47</a></span>
+<span class="normal"><a href="#__codelineno-5-48">48</a></span>
+<span class="normal"><a href="#__codelineno-5-49">49</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">max_stop_hook_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="w">   </span><span class="c1"># Stop-hook continuations allowed per turn (0 = advisory only)</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="n">run_objective</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">             </span><span class="c1"># Send the rendered run objective with each model request</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a>
@@ -2785,8 +2801,39 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="k">[agent.execution.rate_limit]</span>
 <a id="__codelineno-5-42" name="__codelineno-5-42"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
 <a id="__codelineno-5-43" name="__codelineno-5-43"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
-<a id="__codelineno-5-44" name="__codelineno-5-44"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-44" name="__codelineno-5-44"></a><span class="n">transport_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="w">  </span><span class="c1"># 0..=300; base wait after a failure the provider never answered</span>
+<a id="__codelineno-5-45" name="__codelineno-5-45"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-46" name="__codelineno-5-46"></a>
+<a id="__codelineno-5-47" name="__codelineno-5-47"></a><span class="c1"># Prompt cache</span>
+<a id="__codelineno-5-48" name="__codelineno-5-48"></a><span class="k">[agent.execution.prompt_cache]</span>
+<a id="__codelineno-5-49" name="__codelineno-5-49"></a><span class="n">ttl_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w">              </span><span class="c1"># 0..=86400; 0 keeps the provider's default cache lifetime</span>
 </code></pre></div></td></tr></table></div>
+<p><code>default_wait_secs</code> is the base wait before retrying a failure the provider
+answered (overloaded, rate limited, a 5xx status) when it supplied no delay of
+its own. A delay the provider does supply (<code>Retry-After</code>, <code>retry-after-ms</code>,
+<code>x-ratelimit-reset-requests</code>, or a delay named in the error message) is used
+instead, capped at <code>max_wait_secs</code>.</p>
+<p><code>transport_wait_secs</code> is the base wait for failures where no answer arrived:
+connection refused or reset, DNS failure, a timeout, or a response stream that
+broke or could not be decoded. These carry no delay hint and are usually brief,
+so they do not wait the 60 seconds. With the defaults the retries wait about 10
+seconds and then about 20 (<code>backoff_multiplier</code>), and the attempts are counted
+against <code>max_retries</code> together with the other failures. <code>0</code> retries at once. A
+value outside <code>0..=300</code>, or one that is not an integer, fails the load with an
+error naming <code>transport_wait_secs</code>.</p>
+<p><code>ttl_secs</code> is the cache lifetime that the agent's default cache hints (the
+first and last system section and the last two messages) request. It is capped
+at the longest lifetime the provider offers (3600 for Anthropic, 1800 for OpenAI
+Responses), and the provider rounds it up to one it supports (Anthropic: up to
+300 gives 5 minutes, more gives 1 hour; OpenAI Responses: 30 minutes). <code>0</code>, the
+default, requests no lifetime, so the provider's own default applies. A provider
+that offers no choice of lifetime ignores the setting. Hints you set yourself
+with <code>cache = { ephemeral = { ttl_seconds = ... } }</code> keep their own lifetime.
+Anthropic bills a 1-hour cache write at twice the input price against 1.25 times
+for 5 minutes, so a longer lifetime pays off only when you often pause for 5 to
+60 minutes. Use <code>qmt.cache.prefix_change</code> and <code>qmt.cache.idle_secs</code> to see how
+often that happens. A value outside <code>0..=86400</code>, one that is not an integer, or
+an unknown key in the table fails the load with an error naming the key.</p>
 <h4 id="snapshot-scope-and-retention">Snapshot scope and retention</h4>
 <p>Every file inside the snapshot scope is captured, whatever its size. The scope
 is decided by path:</p>
@@ -3176,6 +3223,39 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
 <a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="c1"># Mix with built-in tools</span>
 <a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem.*"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
+<h3 id="tools-that-change-during-a-session">Tools that change during a session</h3>
+<p>An MCP server can add, remove or redefine tools while a session runs (a
+<code>tools/list_changed</code> notification), and the offered tools can change in other
+ways, for example when a skill changes the <code>skill</code> tool's description. Editing
+the tool list at the head of a request invalidates the provider's prompt cache
+for the whole conversation, so the agent avoids that where the provider allows
+it:</p>
+<ul>
+<li>A provider that can change tools inside the conversation declares
+  <code>tool_updates</code> in its chat capabilities. Today that is Anthropic, for the
+  models that accept it: Opus 4.8, 5 and 5.5, Sonnet 5.5, Haiku 5.5 and the
+  Fable 5 and Mythos 5 families. Sonnet 5, Haiku 4.5 and older models do not.
+  A provider plugin built before the declaration existed is treated as not
+  declaring it.</li>
+<li>For such a provider the agent stores the offered tools in the session history
+  as a baseline before the first request, after a compaction and after a model
+  change. The baseline is the request's tool list and is never sent as a
+  message. When the tools offered now differ from the baseline plus the changes
+  stored after it, the agent stores one change (the definitions added or
+  redefined, and the names removed) after the tool results and sends it as a
+  message in the conversation. The tool list at the head of the request stays
+  the same, so the cached prefix is still read and the request records
+  <code>prefix_change = "none"</code>.</li>
+<li>Every other provider gets the tools offered now as the request's tool list, as
+  before, and nothing is stored. A change then costs one cache rewrite and the
+  request records <code>prefix_change = "tools"</code>. Baselines and changes stored under
+  an earlier model stay in the history and are left out of requests to such a
+  provider.</li>
+</ul>
+<p>Tools are always sent ordered by name, so a restart or an MCP refresh that
+reports the same tools does not change the request. Tool changes follow the
+tool results of the step they were found in and are never placed between a tool
+call and its result.</p>
 <h2 id="middleware-configuration">Middleware Configuration</h2>
 <p>Middleware extends agent behavior through a pluggable stack. Building an agent (root agent or delegate) fails when an entry has an unknown <code>type</code> or invalid configuration; an entry turned off by its own config (for example <code>enabled = false</code>) is skipped. The initial session mode is the <code>mode</code> key on <code>[agent]</code> and <code>[[delegates]]</code>, not a middleware setting:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1"> 1</a></span>

@@ -2072,8 +2072,13 @@ legacy strings and string arrays remain supported. For example, in an agent conf
 <a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>In the agent runtime, plain system strings and <code>{ file = "..." }</code> entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses, but only on
-the <strong>first and last</strong> section (a single section gets one hint). Sections in between
+default cache hints for every provider that declares explicit cache breakpoints in its
+chat capabilities (<code>prompt_cache.explicit_breakpoints</code>: Anthropic, and OpenAI Responses
+on a model and endpoint that support them), but only on
+the <strong>first and last</strong> section (a single section gets one hint). A provider or plugin
+that declares nothing gets no default system hints; the decision never depends on the
+provider's name. <code>[agent.execution.prompt_cache] ttl_secs</code> sets the lifetime these
+hints request (see the agent configuration reference). Sections in between
 are still cached, because the last section's prefix covers them; they just have no
 reuse boundary of their own. To keep a boundary on a middle section, give it an
 explicit <code>cache</code> hint. Explicit hints/TTLs (including <code>cache = null</code>) and native
@@ -2084,12 +2089,13 @@ defaults are agent policy.</p>
 the provider keeps the most useful ones and drops the rest with a warning; see
 <a href="../available-providers/#prompt-cache-breakpoints">Prompt cache breakpoints</a>.</p>
 <p>Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
-unsupported translation remains disabled, so annotations do not guarantee reuse.</p>
+unsupported translation remains disabled and Codex declares no breakpoints, so it
+gets no default hints.</p>
 <p>Programmatic callers can pass <code>querymt::params::SystemPrompt::with_cache(text, hint)</code>
 to <code>.system(...)</code>. File references are resolved by the agent, not provider plugins.
 Providers translate hints; unsupported endpoints may skip them. Responses supports
-only a 1,800-second (<code>30m</code>) request-wide minimum lifetime: applied hints must agree
-with the provider's configured TTL. Omit <code>ttl_seconds</code> for the provider default.
+only a 1,800-second (<code>30m</code>) request-wide lifetime: a hint asking for 1,800 seconds or
+less is sent as <code>30m</code>, and a hint asking for more fails the request. Omit <code>ttl_seconds</code> for the provider default.
 A lifetime is not a deletion deadline, and cache hits are not guaranteed.</p>
 <p>On supported OpenAI Responses models, hints become explicit prefix breakpoints;
 request-wide mode remains configurable with <code>extra_body.prompt_cache_options</code>.
