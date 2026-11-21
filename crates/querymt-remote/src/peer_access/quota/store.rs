@@ -20,14 +20,6 @@ pub trait QuotaStore: GrantStore {
         None
     }
 
-    /// Read current accounting information for a scope.
-    async fn quota(
-        &self,
-        key: &PeerGrantKey,
-        scope: &QuotaScope,
-        now: i64,
-    ) -> Result<QuotaStatus, QuotaError>;
-
     /// Read the grant and all stored quota scopes from one snapshot.
     async fn access_snapshot(
         &self,

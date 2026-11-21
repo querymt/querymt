@@ -226,6 +226,22 @@ mod tests {
         );
     }
 
+    async fn scope_status(
+        store: &dyn QuotaStore,
+        key: &PeerGrantKey,
+        scope: &QuotaScope,
+        now: i64,
+    ) -> querymt_remote::peer_access::quota::QuotaStatus {
+        store
+            .access_snapshot(key, now)
+            .await
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|status| &status.scope == scope)
+            .unwrap()
+    }
+
     async fn finite_quota_fixture(
         tokens: i64,
     ) -> (
@@ -327,7 +343,7 @@ mod tests {
         assert!(
             matches!(error, LLMError::ProviderResponseError(failure) if failure.code() == Some("mesh_quota_exhausted"))
         );
-        let after = store.quota(&key, &scope, now).await.unwrap();
+        let after = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(after.known_tokens, 7);
         assert_eq!(after.reserved_tokens, 0);
     }
@@ -402,7 +418,7 @@ mod tests {
         assert!(
             matches!(stream.next().await, Some(Ok(StreamChunk::Usage(actual))) if actual == usage)
         );
-        let ongoing = store.quota(&key, &scope, now).await.unwrap();
+        let ongoing = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!((ongoing.known_tokens, ongoing.reserved_tokens), (0, 10));
         assert!(matches!(
             stream.next().await,
@@ -410,7 +426,7 @@ mod tests {
                 finish_reason: FinishReason::Stop
             }))
         ));
-        let settled = store.quota(&key, &scope, now).await.unwrap();
+        let settled = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(
             (
                 settled.known_tokens,
@@ -421,7 +437,7 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(
-            store.quota(&key, &scope, now).await.unwrap(),
+            scope_status(store.as_ref(), &key, &scope, now).await,
             settled,
             "EOF must not settle a second time"
         );
@@ -451,7 +467,7 @@ mod tests {
             Some(Ok(StreamChunk::Usage(_)))
         ));
         assert!(stream.next().await.is_none());
-        let after_eof = store.quota(&key, &scope, now).await.unwrap();
+        let after_eof = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(
             (
                 after_eof.known_tokens,
@@ -478,7 +494,7 @@ mod tests {
         assert!(
             matches!(stream.next().await, Some(Err(LLMError::NotImplemented(message))) if message == "fixture upstream error")
         );
-        let after_error = store.quota(&key, &scope, now).await.unwrap();
+        let after_error = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(
             (
                 after_error.known_tokens,
@@ -492,7 +508,7 @@ mod tests {
         assert!(
             matches!(startup.chat_stream(&ChatCall::new(&[])).await, Err(LLMError::NotImplemented(message)) if message == "fixture upstream error")
         );
-        let after_startup = store.quota(&key, &scope, now).await.unwrap();
+        let after_startup = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(
             (
                 after_startup.known_tokens,
@@ -528,7 +544,7 @@ mod tests {
             matches!(stream.next().await, Some(Err(LLMError::ProviderResponseError(error)))
             if error.code() == Some("mesh_quota_bound_exceeded"))
         );
-        let charged = store.quota(&key, &scope, now).await.unwrap();
+        let charged = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!(charged.known_tokens, 15);
         assert_eq!(charged.reserved_tokens, 0);
         assert_eq!(charged.available_tokens, Some(25));
@@ -536,7 +552,10 @@ mod tests {
         // longer trustworthy. A second upstream invocation would panic.
         assert!(matches!(provider.chat_stream(&ChatCall::new(&[])).await,
             Err(LLMError::ProviderResponseError(error)) if error.code() == Some("mesh_quota_unsupported")));
-        assert_eq!(store.quota(&key, &scope, now).await.unwrap(), charged);
+        assert_eq!(
+            scope_status(store.as_ref(), &key, &scope, now).await,
+            charged
+        );
     }
 
     #[tokio::test]
@@ -551,10 +570,8 @@ mod tests {
         let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
         assert!(futures_util::poll!(stream.next()).is_pending());
         assert_eq!(
-            store
-                .quota(&key, &scope, now)
+            scope_status(store.as_ref(), &key, &scope, now)
                 .await
-                .unwrap()
                 .reserved_tokens,
             10
         );
@@ -565,7 +582,7 @@ mod tests {
             .unwrap_err();
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let status = store.quota(&key, &scope, now).await.unwrap();
+                let status = scope_status(store.as_ref(), &key, &scope, now).await;
                 if status.reserved_tokens == 0 {
                     break status;
                 }
@@ -617,7 +634,7 @@ mod tests {
             matches!(tokio::time::timeout(Duration::from_secs(3), pending).await.unwrap(),
             Some(Err(LLMError::ProviderResponseError(failure))) if failure.code() == Some("mesh_quota_exhausted"))
         );
-        let status = store.quota(&key, &scope, now).await.unwrap();
+        let status = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!((status.reserved_tokens, status.estimated_tokens), (0, 10));
     }
 
@@ -635,10 +652,8 @@ mod tests {
             matches!(stream.next().await, Some(Ok(StreamChunk::Text(text))) if text == "fixture")
         );
         assert_eq!(
-            store
-                .quota(&key, &scope, now)
+            scope_status(store.as_ref(), &key, &scope, now)
                 .await
-                .unwrap()
                 .reserved_tokens,
             10
         );
@@ -661,7 +676,7 @@ mod tests {
 
         let settled = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let status = store.quota(&key, &scope, now).await.unwrap();
+                let status = scope_status(store.as_ref(), &key, &scope, now).await;
                 if status.reserved_tokens == 0 {
                     break status;
                 }

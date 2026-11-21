@@ -327,9 +327,9 @@ fn settle_attempt(
     Ok(outcome)
 }
 
-#[async_trait]
-impl QuotaStore for SqliteMeshAccess {
-    async fn quota(
+#[cfg(test)]
+impl SqliteMeshAccess {
+    pub(super) async fn quota(
         &self,
         key: &PeerGrantKey,
         scope: &QuotaScope,
@@ -352,7 +352,10 @@ impl QuotaStore for SqliteMeshAccess {
         })
         .await
     }
+}
 
+#[async_trait]
+impl QuotaStore for SqliteMeshAccess {
     async fn access_snapshot(
         &self,
         key: &PeerGrantKey,

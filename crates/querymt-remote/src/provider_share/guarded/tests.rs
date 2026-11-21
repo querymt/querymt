@@ -5,7 +5,7 @@ use crate::mesh_ingress::{
 };
 use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaScope, QuotaSettlement, QuotaStatus, ReservationId,
+    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaScope, QuotaSettlement, ReservationId,
     ReservedAttempt,
 };
 use crate::peer_access::{
@@ -108,14 +108,6 @@ impl GrantStore for Store {
 
 #[async_trait]
 impl QuotaStore for Store {
-    async fn quota(
-        &self,
-        _: &PeerGrantKey,
-        _: &QuotaScope,
-        _: i64,
-    ) -> Result<QuotaStatus, QuotaError> {
-        unreachable!("dispatch uses atomic admission, not a status poll")
-    }
     async fn edit_quota(
         &self,
         _: &PeerGrantKey,

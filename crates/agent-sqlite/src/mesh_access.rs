@@ -297,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrades_v1_grants_without_changing_their_revision() {
-        use querymt_remote::peer_access::quota::{QuotaLimit, QuotaScope, QuotaStore};
+        use querymt_remote::peer_access::quota::{QuotaLimit, QuotaScope};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mesh.db");
