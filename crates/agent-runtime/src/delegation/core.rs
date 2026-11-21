@@ -1021,21 +1021,34 @@ async fn execute_delegation(
             #[cfg(feature = "remote")]
             mesh.as_ref(),
         )?;
+        #[cfg(not(feature = "remote"))]
+        let restricted = false;
         #[cfg(feature = "remote")]
-        if let TurnAuthority::Peer(peer) = &authority
-            && (target
+        let restricted = if let TurnAuthority::Peer(peer) = &authority {
+            let member = target
                 .as_local()
-                .is_none_or(|member| member.config.hooks.is_enabled())
-                || ctx.hooks.is_enabled()
-                || peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full)
-        {
-            return Err(crate::error::AgentError::MeshAccessDenied.into());
-        }
-        Ok::<_, anyhow::Error>(authority)
+                .ok_or(crate::error::AgentError::MeshAccessDenied)?;
+            let grant = peer.grant().await?;
+            if member.config.hooks.is_enabled() || ctx.hooks.is_enabled() {
+                return Err(crate::error::AgentError::MeshAccessDenied.into());
+            }
+            let restricted = grant != querymt_remote::peer_access::PeerGrant::Full;
+            if restricted
+                && (ctx.workspace_service.is_some()
+                    || delegation.isolation != crate::worktree::DelegationIsolation::Shared
+                    || !member.supports_confined_delegation())
+            {
+                return Err(crate::error::AgentError::MeshAccessDenied.into());
+            }
+            restricted
+        } else {
+            false
+        };
+        Ok::<_, anyhow::Error>((authority, restricted))
     }
     .await;
-    let authority = match admission {
-        Ok(authority) => authority,
+    let (authority, restricted) = match admission {
+        Ok(admitted) => admitted,
         Err(error) => {
             fail_delegation(
                 DelegationFailureContext {
@@ -1073,6 +1086,7 @@ async fn execute_delegation(
             delegation,
             cancel_token.clone(),
             &authority,
+            restricted,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -1092,6 +1106,7 @@ async fn execute_delegation(
         delegation,
         cancel_token,
         &authority,
+        restricted,
     )
     .await;
 }
@@ -1103,6 +1118,7 @@ async fn execute_delegation_inner(
     delegation: Delegation,
     cancel_token: CancellationToken,
     authority: &TurnAuthority,
+    _restricted: bool,
 ) {
     let delegation_id = delegation.public_id.clone();
     let mut planning_context_additions = String::new();
@@ -1426,6 +1442,15 @@ async fn execute_delegation_inner(
         Err(_) => warn!("Delegation start hook failed"),
     }
     let (child_session_id, session_ref) = match async {
+        #[cfg(feature = "remote")]
+        if _restricted {
+            let member = target.as_local().ok_or_else(|| {
+                crate::acp::protocol::Error::from(crate::error::AgentError::MeshAccessDenied)
+            })?;
+            return member
+                .create_confined_delegation_session(parent_session_id.clone(), authority)
+                .await;
+        }
         match child_workspace.as_ref() {
             Some(binding) => {
                 target

@@ -129,12 +129,15 @@ pub(super) async fn transition_before_llm_call(
         );
         tools.retain(|tool| exec_ctx.allows_workflow_tool(&tool.function.name));
         if exec_ctx.restricted_mesh_turn() {
-            let available =
-                !tools.is_empty() && exec_ctx.tool_set(config).find("read_tool").is_some();
-            tools.clear();
-            if available {
-                tools.push(super::tool_calls::confined_read_definition());
-            }
+            tools = tools
+                .into_iter()
+                .filter_map(|tool| {
+                    let name = tool.function.name;
+                    exec_ctx.tool_set(config).find(&name)?;
+                    super::tool_calls::confined_mesh_tool(config, &name)
+                        .map(|(_, definition)| definition)
+                })
+                .collect();
         }
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;

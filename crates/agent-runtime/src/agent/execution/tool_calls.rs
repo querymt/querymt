@@ -268,7 +268,8 @@ async fn prepare_tool_call_inner(
     }
     let tool = exec_ctx.tool_set(config).find(&call.function.name);
     let (tool, target, schema) = if exec_ctx.restricted_mesh_turn() {
-        if tool.is_none() || !exec_ctx.tool_config.allows(ToolRef::builtin("read_tool")) {
+        let name = &call.function.name;
+        if tool.is_none() || !exec_ctx.tool_config.allows(ToolRef::builtin(name)) {
             return Ok(reject(
                 args,
                 Vec::new(),
@@ -277,8 +278,16 @@ async fn prepare_tool_call_inner(
                 Vec::new(),
             ));
         }
-        let reader: Arc<dyn Tool> = Arc::new(crate::tools::builtins::ReadTool::new());
-        let schema = confined_read_definition().function.parameters;
+        let Some((reader, definition)) = confined_mesh_tool(config, name) else {
+            return Ok(reject(
+                args,
+                Vec::new(),
+                "Error: restricted tool is unavailable".into(),
+                "blocked",
+                Vec::new(),
+            ));
+        };
+        let schema = definition.function.parameters;
         (
             Some(reader.clone()),
             ToolTarget::Builtin(reader),
@@ -1048,7 +1057,7 @@ async fn dispatch(
     }
 
     exec_ctx.require_turn_authority().await?;
-    if exec_ctx.restricted_mesh_turn() {
+    if exec_ctx.restricted_mesh_turn() && call.function.name == "read_tool" {
         return Ok((
             dispatch_confined_read(exec_ctx, args).await,
             SnapshotState::None,
@@ -1111,7 +1120,45 @@ fn begin_snapshot(
 }
 
 /// Invoke the resolved target.
-pub(super) fn confined_read_definition() -> querymt::chat::Tool {
+pub(super) fn confined_mesh_tool(
+    config: &AgentConfig,
+    name: &str,
+) -> Option<(Arc<dyn Tool>, querymt::chat::Tool)> {
+    match name {
+        "read_tool" => Some((
+            Arc::new(crate::tools::builtins::ReadTool::new()),
+            confined_read_definition(),
+        )),
+        "delegate" if config.workspace_service().is_none() => {
+            let roster = config.roster()?.clone();
+            let snapshot = roster.snapshot();
+            let ids: Vec<_> = snapshot
+                .iter()
+                .filter(|member| {
+                    member.location() == crate::delegation::roster::MemberLocation::Local
+                        && member.info().isolation != crate::worktree::DelegationIsolation::Isolated
+                })
+                .map(|member| member.id().to_string())
+                .collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let tool = crate::agent::builtin_tools::DelegateTool::new(roster.clone());
+            let mut definition = tool.definition();
+            definition.function.description =
+                "Delegate a model task to another agent on this host without opening a workspace."
+                    .into();
+            definition.function.parameters["properties"]["target_agent_id"]["enum"] =
+                serde_json::json!(ids);
+            definition.function.parameters["properties"]["isolation"] =
+                serde_json::json!({"type": "string", "enum": ["shared"]});
+            Some((Arc::new(tool), definition))
+        }
+        _ => None,
+    }
+}
+
+fn confined_read_definition() -> querymt::chat::Tool {
     let mut definition = crate::tools::builtins::ReadTool::new().definition();
     definition.function.description = "Read a visible regular file under this session's workspace. Use a relative path and optional offset and limit.".into();
     if let Some(properties) = definition.function.parameters["properties"].as_object_mut() {
@@ -1911,7 +1958,11 @@ pub(super) async fn record_tool_side_effects(
         let mut context_val = updated_context.or(context_val);
         let constraints = updated_constraints.or(constraints);
         let expected_output = updated_expected_output.or(expected_output);
-        let requested_isolation = updated_isolation.unwrap_or(isolation);
+        let requested_isolation = if exec_ctx.restricted_mesh_turn() {
+            crate::worktree::DelegationIsolation::Shared
+        } else {
+            updated_isolation.unwrap_or(isolation)
+        };
 
         if !pre_hook.additional_contexts.is_empty() {
             let extra_context = pre_hook.additional_contexts.join("\n\n");

@@ -225,7 +225,7 @@ impl ExecutionContext {
 
     pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
         if self.restricted_mesh_turn() {
-            return self.confined_mesh_read && name == "read_tool";
+            return name == "delegate" || self.confined_mesh_read && name == "read_tool";
         }
         // The delegation orchestrator and routing tools can outlive this turn.
         // Until they preserve its origin, do not let them borrow host authority.

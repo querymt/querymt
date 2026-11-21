@@ -752,9 +752,6 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref context,
                 ref wait,
             } => {
-                if exec_ctx.restricted_mesh_turn() {
-                    return Err(crate::error::AgentError::MeshAccessDenied.into());
-                }
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Waiting);
                 wait::transition_waiting_for_event(config, wait, context, exec_ctx, &mut event_rx)
                     .await?
