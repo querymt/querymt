@@ -44,7 +44,7 @@
   written as `[agent]` with `[[delegates]]`, so its `config_kind` is now
   `single`, not `quorum`.
 - **Mesh sharing:** Agent mesh runtimes start with no sharing grants. Joining a
-  scope does not grant access in either direction. Use owner ACP to grant access
+  scope does not grant access in either direction. Use ACP to grant access
   explicitly; pre-upgrade clients require Full access on an upgraded host.
 - **Scheduled execution:** Schedules with no recorded origin no longer run as
   the owner. Recreate older jobs you trust from the host to record their local

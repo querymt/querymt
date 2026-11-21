@@ -138,7 +138,7 @@ fn mesh_capabilities() -> Value {
 }
 
 #[tokio::test]
-async fn mesh_commands_do_not_assume_owner_support() {
+async fn mesh_commands_require_advertised_support() {
     for operation in [
         vec!["nodes"],
         vec!["get", "peer"],

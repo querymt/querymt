@@ -1315,7 +1315,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                             let params: serde_json::Value =
                                 serde_json::from_str(req.params.get()).unwrap_or_default();
                             let ext_value: Result<serde_json::Value, acp::Error> =
-                                agent.owner_ext_method(req).await.and_then(|resp| {
+                                agent.ext_method(req).await.and_then(|resp| {
                                     serde_json::from_str(resp.0.get()).map_err(|e| {
                                         acp::Error::internal_error().data(e.to_string())
                                     })

@@ -318,17 +318,6 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
     request: RpcMessage,
     context: RpcDispatchContext,
 ) {
-    dispatch_rpc_message_with_owner(state, request, context, false).await;
-}
-
-/// Dispatch using owner authority derived by the transport, never by the request.
-#[doc(hidden)]
-pub async fn dispatch_rpc_message_with_owner<S: SendAgent>(
-    state: RpcDispatchState<S>,
-    request: RpcMessage,
-    context: RpcDispatchContext,
-    owner: bool,
-) {
     let RpcDispatchState {
         agent,
         session_owners,
@@ -336,14 +325,13 @@ pub async fn dispatch_rpc_message_with_owner<S: SendAgent>(
         conn_id,
         tx,
     } = state;
-    let output = handle_rpc_message_with_owner(
+    let output = handle_rpc_message_with_context(
         agent.as_ref(),
         &session_owners,
         &pending_elicitations,
         &conn_id,
         request,
         context,
-        owner,
     )
     .await;
 
@@ -2899,27 +2887,6 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     req: RpcMessage,
     context: RpcDispatchContext,
 ) -> RpcDispatchOutput {
-    handle_rpc_message_with_owner(
-        agent,
-        session_owners,
-        pending_elicitations,
-        conn_id,
-        req,
-        context,
-        false,
-    )
-    .await
-}
-
-async fn handle_rpc_message_with_owner<S: SendAgent>(
-    agent: &S,
-    session_owners: &SessionOwnerMap,
-    pending_elicitations: &PendingElicitationMap,
-    conn_id: &str,
-    req: RpcMessage,
-    context: RpcDispatchContext,
-    owner: bool,
-) -> RpcDispatchOutput {
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
     let mut notifications = Vec::new();
@@ -3484,8 +3451,9 @@ async fn handle_rpc_message_with_owner<S: SendAgent>(
                     } else {
                         false
                     };
-                    let response = if owner { agent.owner_ext_method(ext_req).await } else { agent.ext_method(ext_req).await }
-                        .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
+                    let response = agent.ext_method(ext_req).await.map(|r| {
+                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
+                    });
                     match response {
                         Ok(mut value) => {
                             let session_id = session_id_for_owner.clone().or_else(|| {

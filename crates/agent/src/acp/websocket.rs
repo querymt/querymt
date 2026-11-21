@@ -29,17 +29,18 @@ use crate::acp::shared::{
     AcpLiveEventTranslator, PendingElicitationMap, RpcDispatchContext, RpcDispatchState,
     RpcMessage, SessionOwnerMap, convert_elicitation_response_value,
     convert_permission_response_value, create_elicitation_request,
-    dispatch_rpc_message_with_context, dispatch_rpc_message_with_owner, is_event_owned,
+    dispatch_rpc_message_with_context, is_event_owned,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
+#[cfg(any(feature = "dashboard", test))]
+use axum::http::{HeaderMap, header};
 use axum::{
     Router,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -64,7 +65,6 @@ pub(crate) struct WsServerState {
     pub(crate) elicitation_recovery:
         crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
     session_reconciliation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
-    mesh_owner_digest: Option<[u8; 32]>,
 }
 
 impl WsServerState {
@@ -76,7 +76,6 @@ impl WsServerState {
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
             elicitation_recovery: Default::default(),
             session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
-            mesh_owner_digest: None,
             agent,
         }
     }
@@ -1213,13 +1212,7 @@ async fn enforce_same_origin(
     next.run(request).await
 }
 
-fn websocket_router(mut state: WsServerState) -> Router {
-    if let Some(path) = std::env::var_os("QMT_ACP_MESH_OWNER_TOKEN_FILE") {
-        match load_mesh_owner_token(std::path::Path::new(&path)) {
-            Ok(digest) => state.mesh_owner_digest = Some(digest),
-            Err(error) => log::warn!("ACP mesh owner credential disabled: {error}"),
-        }
-    }
+fn websocket_router(state: WsServerState) -> Router {
     Router::new()
         .route("/ws", get(websocket_handler))
         .with_state(state)
@@ -1229,13 +1222,10 @@ async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
 ) -> Response {
     let secure_recovery_transport = is_loopback_websocket_peer(Some(peer));
-    let mesh_owner = secure_recovery_transport
-        && mesh_owner_authorized(&headers, state.mesh_owner_digest.as_ref());
     ws.on_upgrade(move |socket| {
-        handle_websocket_connection(socket, state, secure_recovery_transport, mesh_owner)
+        handle_websocket_connection(socket, state, secure_recovery_transport)
     })
     .into_response()
 }
@@ -1267,69 +1257,11 @@ pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
             .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
 }
 
-fn load_mesh_owner_token(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
-    use sha2::Digest;
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "owner token file must not be accessible to group or other users",
-            ));
-        }
-    }
-    if !metadata.is_file() || metadata.len() > 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid owner token file",
-        ));
-    }
-    let mut token = String::new();
-    file.take(1025).read_to_string(&mut token)?;
-    let token = token.trim();
-    if !(32..=1024).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "owner token must contain at least 32 printable non-space characters",
-        ));
-    }
-    Ok(sha2::Sha256::digest(token.as_bytes()).into())
-}
-
-pub(super) fn mesh_owner_authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
-    use sha2::Digest;
-    use subtle::ConstantTimeEq;
-    let Some(expected) = expected else {
-        return false;
-    };
-    if headers.contains_key(header::ORIGIN) {
-        return false;
-    }
-    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(token) = auth
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    if auth.next().is_some() || !(32..=1024).contains(&token.len()) {
-        return false;
-    }
-    let actual: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
-    bool::from(expected.ct_eq(&actual))
-}
-
 /// Handle a WebSocket connection lifecycle
 async fn handle_websocket_connection(
     socket: WebSocket,
     state: WsServerState,
     secure_recovery_transport: bool,
-    mesh_owner: bool,
 ) {
     let conn_id = Uuid::new_v4().to_string();
     log::info!("New WebSocket connection: {}", conn_id);
@@ -1371,12 +1303,7 @@ async fn handle_websocket_connection(
     let session_load = Arc::new(StdMutex::new(
         crate::acp::shared::AcpSessionLoadPreferences::default(),
     ));
-    spawn_event_forwarders_with_owner(
-        state.clone(),
-        connection_state.clone(),
-        translator.clone(),
-        mesh_owner,
-    );
+    spawn_event_forwarders(state.clone(), connection_state.clone(), translator.clone());
 
     let bridge_task = tokio::spawn(run_websocket_bridge(
         bridge_rx,
@@ -1436,7 +1363,7 @@ async fn handle_websocket_connection(
                         let translator_dispatch = translator_receive.clone();
                         let session_load_dispatch = session_load_receive.clone();
                         tokio::spawn(async move {
-                            dispatch_rpc_message_with_owner(
+                            dispatch_rpc_message_with_context(
                                 RpcDispatchState {
                                     agent: state_dispatch.agent.clone(),
                                     session_owners: state_dispatch.session_owners.clone(),
@@ -1457,7 +1384,6 @@ async fn handle_websocket_connection(
                                     session_load: Some(session_load_dispatch.clone()),
                                     delivery: Some(connection_dispatch.delivery.clone()),
                                 },
-                                mesh_owner,
                             )
                             .await;
                             if let Some(session_id) = permission_attach_session
@@ -1643,11 +1569,7 @@ pub(crate) struct ConnectionEventState {
     pub(crate) delivery: Arc<crate::acp::delivery::ConnectionDelivery>,
 }
 
-fn spawn_global_notification_forwarders(
-    state: WsServerState,
-    connection: ConnectionEventState,
-    mesh_owner: bool,
-) {
+fn spawn_global_notification_forwarders(state: WsServerState, connection: ConnectionEventState) {
     let mut notifications = state.agent.subscribe_ext_notifications();
     let tx = connection.tx.clone();
     let cancel = connection.connection_cancel.clone();
@@ -1661,12 +1583,6 @@ fn spawn_global_notification_forwarders(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             };
-            if !mesh_owner
-                && notification.method.as_ref()
-                    == crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED
-            {
-                continue;
-            }
             if send_websocket_ext_notification(&tx, notification)
                 .await
                 .is_err()
@@ -1758,16 +1674,7 @@ pub(crate) fn spawn_event_forwarders(
     connection: ConnectionEventState,
     translator: Arc<StdMutex<AcpLiveEventTranslator>>,
 ) {
-    spawn_event_forwarders_with_owner(state, connection, translator, false);
-}
-
-fn spawn_event_forwarders_with_owner(
-    state: WsServerState,
-    connection: ConnectionEventState,
-    translator: Arc<StdMutex<AcpLiveEventTranslator>>,
-    mesh_owner: bool,
-) {
-    spawn_global_notification_forwarders(state.clone(), connection.clone(), mesh_owner);
+    spawn_global_notification_forwarders(state.clone(), connection.clone());
     // Every member is built on the root's event stream: one subscription.
     let mut events = state.event_source.subscribe();
     tokio::spawn(async move {
@@ -2109,144 +2016,4 @@ pub(super) async fn forward_session_event(
         }
     }
     true
-}
-
-#[cfg(test)]
-mod mesh_owner_tests {
-    use super::*;
-    use axum::http::HeaderValue;
-    use serde_json::json;
-
-    #[cfg(unix)]
-    #[test]
-    fn owner_token_file_requires_private_permissions_and_valid_contents() {
-        use std::io::{ErrorKind, Write};
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        let token = "private-test-token-0123456789abcdef";
-        writeln!(file, "{token}").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        let digest = load_mesh_owner_token(file.path()).unwrap();
-        assert!(mesh_owner_authorized(&headers, Some(&digest)));
-        assert!(!mesh_owner_authorized(&headers, None));
-
-        headers.insert(header::ORIGIN, HeaderValue::from_static("http://localhost"));
-        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
-        headers.remove(header::ORIGIN);
-        headers.append(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer too-short"),
-        );
-        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Basic {token}").parse().unwrap(),
-        );
-        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}-different").parse().unwrap(),
-        );
-        assert!(!mesh_owner_authorized(&headers, Some(&digest)));
-
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o644))
-            .unwrap();
-        assert_eq!(
-            load_mesh_owner_token(file.path()).unwrap_err().kind(),
-            ErrorKind::PermissionDenied
-        );
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .unwrap();
-        for invalid in [
-            "three words are never an owner token".to_owned(),
-            "x".repeat(1025),
-        ] {
-            std::fs::write(file.path(), invalid).unwrap();
-            assert_eq!(
-                load_mesh_owner_token(file.path()).unwrap_err().kind(),
-                ErrorKind::InvalidData
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn mesh_policy_hints_reach_owner_connections_only() {
-        use crate::acp::shared::{
-            QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED, QMT_NOTIFICATION_SCHEDULES_CHANGED,
-        };
-
-        let fixture = crate::test_utils::TestAgent::new().await;
-        let state = WsServerState::new(fixture.handle.clone());
-        let connect = |conn_id: &str, owner| {
-            let (tx, rx) = mpsc::channel(4);
-            let cancel = CancellationToken::new();
-            spawn_global_notification_forwarders(
-                state.clone(),
-                ConnectionEventState {
-                    conn_id: conn_id.to_string(),
-                    tx,
-                    pending_requests: Arc::new(Mutex::new(HashMap::new())),
-                    forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
-                    request_counter: Arc::new(AtomicU64::new(1)),
-                    connection_cancel: cancel.clone(),
-                    delivery: crate::acp::delivery::ConnectionDelivery::new(None, cancel.clone()),
-                },
-                owner,
-            );
-            (rx, cancel.drop_guard())
-        };
-        let (mut owner, _owner_guard) = connect("owner-fixture", true);
-        let (mut observer, _observer_guard) = connect("observer-fixture", false);
-        let hint =
-            json!({"version":1,"peer_id":"fixture-peer","direction":"outgoing","reason":"policy"});
-        for (method, params) in [
-            (QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED, hint.clone()),
-            (
-                QMT_NOTIFICATION_SCHEDULES_CHANGED,
-                json!({"change":"created"}),
-            ),
-        ] {
-            fixture
-                .handle
-                .broadcast_ext_notification(ExtNotification::new(
-                    method,
-                    Arc::from(serde_json::value::to_raw_value(&params).unwrap()),
-                ));
-        }
-        let recv = |mut rx: mpsc::Receiver<String>| async move {
-            let wire = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            (
-                serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
-                rx,
-            )
-        };
-        let (received, owner_after_hint) = recv(owner).await;
-        owner = owner_after_hint;
-        assert_eq!(
-            received["method"],
-            QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED
-        );
-        assert_eq!(received["params"], hint);
-        let (received, _) = recv(owner).await;
-        assert_eq!(received["method"], QMT_NOTIFICATION_SCHEDULES_CHANGED);
-        let (received, observer_after_hint) = recv(observer).await;
-        observer = observer_after_hint;
-        assert_eq!(received["method"], QMT_NOTIFICATION_SCHEDULES_CHANGED);
-        assert!(observer.try_recv().is_err());
-    }
 }

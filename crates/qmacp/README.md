@@ -60,17 +60,14 @@ Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `
 
 ### Mesh access
 
-`mesh nodes` lists discoverable nodes; the other `mesh` commands require an
-owner connection that advertises mesh access v1. Copy the peer ID from the node
-listing and the revision from `outgoing.revision`. Use the revision returned by
-each successful write for the next write.
+`mesh nodes` lists discoverable nodes; the other `mesh` commands require the
+server to advertise mesh access v1. Copy the peer ID from the node listing and
+the revision from `outgoing.revision`. Use the revision returned by each
+successful write for the next write.
 
-For WebSocket administration, set `QMT_ACP_MESH_OWNER_TOKEN_FILE` on qmtcode and
-`QMACP_MESH_OWNER_TOKEN_FILE` on qmacp to the same private credential file. Use a
-random token (for example, `openssl rand -hex 32`) in a file readable only by its
-owner (`0600` on Unix). qmacp sends it only to a numeric loopback address. qmtcode
-also requires a loopback connection and rejects owner credentials on browser
-requests. ACP stdio requires no token. Do not put the token in a URL or CLI argument.
+ACP is unauthenticated. When the mesh access store is configured, every ACP
+connection can read and change mesh sharing policy. Deployments may run ACP
+behind a proxy if needed. Built-in ACP authentication is planned separately.
 
 ```sh
 qmacp --quiet mesh nodes

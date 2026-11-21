@@ -22,11 +22,10 @@ impl LocalAgentHandle {
         ext_json_response(&response)
     }
 
-    pub(super) async fn handle_ext_mesh_nodes(&self, owner: bool) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_mesh_nodes(&self) -> Result<ExtResponse, Error> {
         let nodes = crate::control::mesh::list_nodes(self).await;
         #[cfg(feature = "remote")]
-        if owner
-            && let Some(mesh) = self.mesh()
+        if let Some(mesh) = self.mesh()
             && let Some(store) = mesh.quota_store()
         {
             let host = querymt_remote::NodeId::from_peer_id(*mesh.peer_id());
@@ -39,7 +38,6 @@ impl LocalAgentHandle {
                 &serde_json::json!({"nodes": nodes.nodes, "managed_peer_ids": ids}),
             );
         }
-        let _ = owner;
         ext_json_response(&nodes)
     }
 
@@ -57,12 +55,7 @@ impl LocalAgentHandle {
     pub(super) async fn handle_ext_mesh_access(
         &self,
         req: ExtRequest,
-        owner: bool,
     ) -> Result<ExtResponse, Error> {
-        if !owner {
-            return Err(Error::new(-32000, "local owner authority required")
-                .data(serde_json::json!({"code": "mesh_access_owner_required"})));
-        }
         #[cfg(feature = "remote")]
         {
             access::dispatch(self, req).await
@@ -933,13 +926,13 @@ mod access {
         };
         use std::time::Duration;
 
-        async fn owner_access(handle: &LocalAgentHandle, peer: &NodeId) -> serde_json::Value {
+        async fn acp_access(handle: &LocalAgentHandle, peer: &NodeId) -> serde_json::Value {
             let params = json!({"version": 1, "peer_id": peer.to_string()});
             let request = ExtRequest::new(
                 "querymt/mesh/getPeerAccess",
                 serde_json::value::to_raw_value(&params).unwrap().into(),
             );
-            let response = handle.handle_ext_mesh_access(request, true).await.unwrap();
+            let response = handle.handle_ext_method(request).await.unwrap();
             serde_json::from_str(response.0.get()).unwrap()
         }
 
@@ -969,7 +962,7 @@ mod access {
         }
 
         #[tokio::test]
-        async fn catalog_withdrawal_refreshes_owner_and_v1_peer_access() {
+        async fn catalog_withdrawal_refreshes_acp_and_v1_peer_access() {
             let (config, fixture, dir) = CatalogFixture::config().await;
             let handle = LocalAgentHandle::from_config(config);
             let deadline = Duration::from_secs(5);
@@ -1023,7 +1016,7 @@ mod access {
             register_peer_access_read(router, store, &actor, &handle, mesh);
             let mut updates = handle.subscribe_ext_notifications();
 
-            let before = owner_access(&handle, &peer).await;
+            let before = acp_access(&handle, &peer).await;
             assert_eq!(before["incoming"], json!({"status": "unavailable"}));
             assert_eq!(before["outgoing"]["grant"], json!({"mode": "full"}));
             assert_eq!(before["outgoing"]["revision"], json!(grant.revision));
@@ -1058,7 +1051,7 @@ mod access {
                 json!({"version": 1, "peer_id": peer.to_string(), "direction": "outgoing", "reason": "catalog"})
             );
 
-            let after = owner_access(&handle, &peer).await;
+            let after = acp_access(&handle, &peer).await;
             assert_eq!(
                 after["outgoing"], before["outgoing"],
                 "catalog withdrawal must not rewrite the grant"

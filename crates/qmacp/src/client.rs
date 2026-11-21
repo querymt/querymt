@@ -167,39 +167,7 @@ impl AcpClient {
         text_limit: Option<usize>,
     ) -> Result<Self> {
         let connect = async {
-            let mut request = url.into_client_request()?;
-            if let Some(path) = std::env::var_os("QMACP_MESH_OWNER_TOKEN_FILE") {
-                let uri = request.uri();
-                let is_loopback = uri
-                    .host()
-                    .and_then(|host| {
-                        host.trim_matches(['[', ']'])
-                            .parse::<std::net::IpAddr>()
-                            .ok()
-                    })
-                    .is_some_and(|ip| ip.is_loopback());
-                anyhow::ensure!(
-                    is_loopback,
-                    "mesh owner credentials require a numeric loopback endpoint"
-                );
-                let token = tokio::fs::read_to_string(path)
-                    .await
-                    .context("read mesh owner token")?;
-                let token = token.trim();
-                anyhow::ensure!(
-                    (32..=1024).contains(&token.len())
-                        && token.bytes().all(|b| b.is_ascii_graphic()),
-                    "invalid mesh owner token"
-                );
-                let mut authorization = format!("Bearer {token}")
-                    .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-                    .map_err(|_| anyhow::anyhow!("invalid mesh owner authorization header"))?;
-                authorization.set_sensitive(true);
-                request.headers_mut().insert(
-                    tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-                    authorization,
-                );
-            }
+            let request = url.into_client_request()?;
             let connector = match request.uri().scheme_str() {
                 Some("wss") => Some(native_tls_connector()?),
                 _ => None,

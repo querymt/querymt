@@ -970,7 +970,7 @@ Useful when:
 
 Joining a mesh authenticates a peer; it does not grant access. Grants are directional and saved on the resource host by peer ID. In `qmacp mesh get PEER_ID`, `outgoing` is what this host shares, and `incoming` is what the peer shares back. An offline peer does not erase its saved outgoing policy.
 
-Manage grants and quotas through owner ACP. For WebSocket administration, point `QMT_ACP_MESH_OWNER_TOKEN_FILE` on the server and `QMACP_MESH_OWNER_TOKEN_FILE` on the client at the same private token file. Use a numeric loopback endpoint. An owner-started ACP stdio process does not need a token. Other ACP connections cannot read or change saved sharing policy.
+Manage grants and quotas through ACP. When the mesh access store is configured, every ACP connection (stdio or WebSocket) can discover the controls, read and change grants and quotas, and receive change notifications. ACP is unauthenticated: qmtcode trusts any connected client. Deployments may run ACP behind a proxy if needed. Built-in ACP authentication is planned separately.
 
 - **Custom:** Select session access and the providers and models the peer may use. Filesystem access requires session access and permits only confined file operations. Custom never enables the shell or unclassified hooks. Cold resumes and same-host child startup are refused when the host cannot initialize them without unclassified effects.
 - **Full:** Grants the supported shell, session, filesystem, and provider capabilities. The shell runs with the host user's OS permissions; grant Full only to peers you trust at that level. Existing host approvals still apply. Pre-upgrade clients need explicit Full for protected operations on an upgraded host.

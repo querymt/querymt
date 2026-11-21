@@ -69,28 +69,17 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     assert_eq!(result["transport"]["mesh_transport"], "lan");
     assert_eq!(result["features"]["mesh"], true);
     assert_eq!(result["features"]["mesh_invites"], false);
-    assert!(result.get("mesh_access_version").is_none());
+    assert_eq!(result["mesh_access_version"], 1);
     let request = |method, params| {
         ExtRequest::new(
             method,
             serde_json::value::to_raw_value(&params).unwrap().into(),
         )
     };
-    let response = handle
-        .owner_ext_method(request("querymt/capabilities", serde_json::json!({})))
-        .await
-        .unwrap();
-    let owner_caps: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
-    assert_eq!(owner_caps["mesh_access_version"], 1);
     let peer = libp2p::PeerId::random().to_string();
     let read_params = serde_json::json!({"version": 1, "peer_id": peer});
-    let denied = handle
-        .ext_method(request("querymt/mesh/getPeerAccess", read_params.clone()))
-        .await
-        .unwrap_err();
-    assert_eq!(denied.data.unwrap()["code"], "mesh_access_owner_required");
     let response = handle
-        .owner_ext_method(request("querymt/mesh/getPeerAccess", read_params.clone()))
+        .ext_method(request("querymt/mesh/getPeerAccess", read_params))
         .await
         .unwrap();
     let initial: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
@@ -100,14 +89,14 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         "expected_revision": initial["outgoing"]["revision"], "scope": {"provider_id":"fixture","model_id":"offline"},
         "operation":"reconfigure", "limit": {"kind":"finite", "limit_tokens":"9007199254740993", "window":"weekly"}});
     let invalid = handle
-        .owner_ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
+        .ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
         .await
         .unwrap_err();
     assert_eq!(invalid.data.unwrap()["code"], "mesh_access_invalid_params");
     assert!(updates.try_recv().is_err());
     params["version"] = serde_json::json!(1);
     let response = handle
-        .owner_ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
+        .ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
         .await
         .unwrap();
     let written: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
@@ -123,7 +112,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         "querymt/mesh/peerAccessChanged"
     );
     let stale = handle
-        .owner_ext_method(request("querymt/mesh/setPeerQuota", params))
+        .ext_method(request("querymt/mesh/setPeerQuota", params))
         .await
         .unwrap_err();
     assert_eq!(stale.data.unwrap()["code"], "mesh_access_conflict");
@@ -145,7 +134,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     };
     let revision = written["outgoing"]["revision"].clone();
     let reply = handle
-        .owner_ext_method(set_grant(revision, grant.clone()))
+        .ext_method(set_grant(revision, grant.clone()))
         .await
         .unwrap();
     let enabled: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
@@ -159,14 +148,14 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
 
     let revision = enabled["outgoing"]["revision"].clone();
     let reply = handle
-        .owner_ext_method(set_grant(revision.clone(), grant))
+        .ext_method(set_grant(revision.clone(), grant))
         .await
         .unwrap();
     let unchanged: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
     assert_eq!(unchanged["outgoing"]["revision"], revision);
     assert!(updates.try_recv().is_err());
     let reply = handle
-        .owner_ext_method(request("querymt/mesh/nodes", serde_json::json!({})))
+        .ext_method(request("querymt/mesh/nodes", serde_json::json!({})))
         .await
         .unwrap();
     let nodes: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
@@ -199,16 +188,8 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
             }),
         )
     };
-    let non_owner = handle
-        .ext_method(reset(revision.clone(), scope.clone()))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        non_owner.data.unwrap()["code"],
-        "mesh_access_owner_required"
-    );
     let in_flight = handle
-        .owner_ext_method(reset(revision.clone(), scope.clone()))
+        .ext_method(reset(revision.clone(), scope.clone()))
         .await
         .unwrap_err();
     assert_eq!(
@@ -221,10 +202,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         .settle(reserved, AttemptUsage::Observed(12))
         .await
         .unwrap();
-    let reply = handle
-        .owner_ext_method(reset(revision, scope))
-        .await
-        .unwrap();
+    let reply = handle.ext_method(reset(revision, scope)).await.unwrap();
     let reset: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
     let reset_revision = &reset["outgoing"]["revision"];
     let quota_request = |operation, limit| {
@@ -250,7 +228,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         ("100", "monthly", "mesh_quota_reconfigure_required"),
     ] {
         let error = handle
-            .owner_ext_method(quota_request(
+            .ext_method(quota_request(
                 "update",
                 serde_json::json!({
                     "kind":"finite", "limit_tokens":amount, "window":window
@@ -262,7 +240,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     }
     assert!(updates.try_recv().is_err());
     let response = handle
-        .owner_ext_method(quota_request(
+        .ext_method(quota_request(
             "update",
             serde_json::json!({
                 "kind":"finite", "limit_tokens":"9007199254740993", "window":"weekly"
@@ -283,7 +261,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     assert_eq!(quota["usage"]["reserved_tokens"], "0");
     assert_eq!(quota["usage"]["available_tokens"], "9007199254740993");
     let reply = handle
-        .owner_ext_method(set_grant(
+        .ext_method(set_grant(
             reset["outgoing"]["revision"].clone(),
             serde_json::json!({"mode":"none"}),
         ))

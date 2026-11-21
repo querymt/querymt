@@ -143,11 +143,6 @@ pub trait SendAgent: Send + Sync + Any {
     /// Provides a mechanism for protocol extensions beyond the core ACP specification.
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error>;
 
-    /// Dispatch on a transport that has independently verified local owner authority.
-    async fn owner_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
-        self.ext_method(req).await
-    }
-
     /// Handle extension notifications.
     ///
     /// Receives extension notifications that don't require a response.

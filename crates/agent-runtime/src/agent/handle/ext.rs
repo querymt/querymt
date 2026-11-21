@@ -1,9 +1,9 @@
 use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn handle_ext_capabilities(&self, owner: bool) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
         let mut capabilities = crate::control::capabilities::get_capabilities(self);
-        if owner && self.has_mesh_access_store() {
+        if self.has_mesh_access_store() {
             capabilities.mesh_access_version = Some(1);
             capabilities
                 .methods
@@ -15,11 +15,7 @@ impl LocalAgentHandle {
         super::utils::ext_json_response(&capabilities)
     }
 
-    pub(super) async fn handle_ext_method(
-        &self,
-        req: ExtRequest,
-        owner: bool,
-    ) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
             "querymt/profiles" => self.handle_ext_profiles(req).await,
@@ -79,12 +75,12 @@ impl LocalAgentHandle {
             "querymt/worktree/remove" => self.handle_ext_worktree_remove(req).await,
             "querymt/worktree/recover" => self.handle_ext_worktree_recover(req).await,
             "querymt/worktree/archive" => self.handle_ext_worktree_archive(req).await,
-            "querymt/capabilities" => self.handle_ext_capabilities(owner).await,
+            "querymt/capabilities" => self.handle_ext_capabilities().await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,
-            "querymt/mesh/nodes" => self.handle_ext_mesh_nodes(owner).await,
+            "querymt/mesh/nodes" => self.handle_ext_mesh_nodes().await,
             m if super::ext_mesh::ACCESS_METHODS.contains(&m) => {
-                self.handle_ext_mesh_access(req, owner).await
+                self.handle_ext_mesh_access(req).await
             }
             "querymt/mesh/createInvite" => self.handle_ext_mesh_create_invite(req).await,
             "querymt/mesh/listInvites" => self.handle_ext_mesh_list_invites().await,

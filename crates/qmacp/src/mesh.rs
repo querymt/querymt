@@ -209,8 +209,7 @@ pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Valu
                         .is_some_and(|code| {
                             matches!(
                                 code,
-                                "mesh_access_owner_required"
-                                    | "mesh_access_conflict"
+                                "mesh_access_conflict"
                                     | "mesh_quota_reconfigure_required"
                                     | "mesh_quota_in_flight"
                                     | "mesh_access_denied"
