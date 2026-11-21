@@ -5,6 +5,7 @@
 //! those two pages. Views observe the entity and re-render on `cx.notify()`.
 
 pub(crate) mod automations;
+pub(crate) mod delegates;
 pub(crate) mod launch;
 pub(crate) mod setup;
 
@@ -1124,6 +1125,8 @@ pub struct AgentRuntime {
     pub worktrees: Option<launch::WorktreeSupport>,
     /// Profiles of mesh peers, loaded when one is chosen as launch target.
     pub peer_profiles: launch::PeerProfileMap,
+    /// Delegate routing per session id.
+    pub delegates: HashMap<String, delegates::DelegateState>,
     pub models: Vec<Model>,
     pub sessions: Vec<SessionSummary>,
     pub sessions_loaded: bool,
@@ -1365,6 +1368,9 @@ pub struct Prefs {
     /// on the machine where the agent runs.
     #[serde(default)]
     pub workspaces: Vec<String>,
+    /// Recent model keys per (agent, profile, delegate).
+    #[serde(default)]
+    pub recent_delegate_models: HashMap<String, Vec<String>>,
 }
 
 impl Prefs {
@@ -3013,6 +3019,7 @@ impl AgentsStore {
                     }
                 }
                 s.refresh_undo_stack(cx);
+                s.refresh_delegates(cx);
                 cx.notify();
             });
             load_span.record("session.apply_ms", now_ms() - apply_started);
@@ -4320,6 +4327,18 @@ impl AgentsStore {
                         .is_some_and(|rt| rt.schedules.loaded || rt.schedules.loading)
                     {
                         self.refresh_schedules(id, cx);
+                    }
+                } else if method.ends_with("session/delegateModelsChanged") {
+                    let sid = params
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|v| v.agent_id == id && v.session_id == sid)
+                    {
+                        self.refresh_delegates(cx);
                     }
                 } else if method.contains("models/changed") || method.contains("nodesChanged") {
                     self.refresh(id, cx);

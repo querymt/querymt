@@ -4,6 +4,7 @@ mod agents;
 mod automations;
 mod chrome;
 mod code;
+mod delegates;
 mod inbox;
 mod keys;
 mod kit;
@@ -216,6 +217,7 @@ pub struct QmtApp {
     session_query: Entity<InputState>,
     session_filters: SessionFilters,
     automations: automations::AutomationPage,
+    delegates: delegates::DelegateDialog,
     setup: setup::SetupState,
     workspaces: workspaces::WorkspacesPage,
     /// Which Sessions-page groups are open.
@@ -466,6 +468,7 @@ impl QmtApp {
             session_query,
             session_filters: SessionFilters::default(),
             automations: Default::default(),
+            delegates: Default::default(),
             setup: Default::default(),
             workspaces,
             session_groups: Default::default(),
@@ -1317,6 +1320,11 @@ impl Render for QmtApp {
         let overlay = self
             .render_preview(radii, window, cx)
             .or_else(|| self.render_palette(radii, cx))
+            .or_else(|| {
+                (self.page == Page::Session)
+                    .then(|| self.render_delegate_dialog(radii, cx))
+                    .flatten()
+            })
             .or_else(|| self.render_model_modal(radii, cx))
             .or_else(|| self.render_automation_overlay(radii, cx))
             .or_else(|| self.render_workspace_overlay(radii, cx))
@@ -1359,7 +1367,10 @@ impl Render for QmtApp {
                 if ev.keystroke.key != "escape" {
                     return;
                 }
-                if this.close_topmost() || this.close_automation_overlay(cx) {
+                if this.close_delegate_dialog(cx)
+                    || this.close_topmost()
+                    || this.close_automation_overlay(cx)
+                {
                     this.last_escape = None;
                     cx.stop_propagation();
                     cx.notify();

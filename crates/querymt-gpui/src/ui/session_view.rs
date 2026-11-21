@@ -3967,14 +3967,23 @@ impl QmtApp {
                             }),
                     )
             })
-            .when(mode.is_none() && !control, |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(p.muted)
-                        .child("This agent exposes no session options."),
-                )
-            })
+            .children(self.delegate_option_row(p, cx).map(|row| {
+                v_flex()
+                    .gap_2()
+                    .child(div().pt_1().child(kit::divider(p)))
+                    .child(row)
+            }))
+            .when(
+                mode.is_none() && !control && self.delegate_option_row(p, cx).is_none(),
+                |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child("This agent exposes no session options."),
+                    )
+                },
+            )
     }
 
     fn session_composer(
