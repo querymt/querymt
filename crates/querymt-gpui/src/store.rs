@@ -9,6 +9,7 @@ pub(crate) mod delegates;
 pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod setup;
+pub(crate) mod worktree;
 
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
@@ -247,6 +248,8 @@ pub struct Worktree {
     /// `ready` when usable; otherwise e.g. `failed`, `archived`.
     pub lifecycle: Option<String>,
     pub handed_off_to: Option<String>,
+    /// Session that owns the checkout now (the successor after a handoff).
+    pub owner_session_id: Option<String>,
 }
 
 impl Worktree {
@@ -343,6 +346,7 @@ impl SessionSummary {
                 baseline_mode: opt(w.get("baselineMode")),
                 lifecycle: opt(w.get("lifecycle")),
                 handed_off_to: opt(w.get("handedOffTo")),
+                owner_session_id: opt(w.get("ownerSessionId")),
             });
         let remote = (text(m("location")) == "remote")
             .then(|| opt(m("nodeId")))
@@ -2985,6 +2989,7 @@ impl AgentsStore {
                 view.loading = false;
                 match result {
                     Ok(v) => {
+                        view.access = crate::session::SessionAccess::parse(&v);
                         view.apply_config(v.get("configOptions"));
                         view.apply_modes(v.get("modes"));
                         let snap = v.pointer("/_meta/querymt~1sessionLoadSnapshot.v1");
@@ -3214,6 +3219,7 @@ impl AgentsStore {
     pub fn session_supports_undo(&self) -> bool {
         self.session
             .as_ref()
+            .filter(|v| v.access.is_none())
             .and_then(|v| self.runtime.get(&v.agent_id))
             .is_some_and(|rt| {
                 [

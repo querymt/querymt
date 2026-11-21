@@ -32,6 +32,7 @@ use crate::session::{
     SessionView, Thought, ToolCall, UserAttachment, WorkEntry, is_compact_command,
 };
 use crate::store::SessionSummary;
+use crate::store::worktree::WorktreeAction;
 use crate::theme::{Palette, palette};
 use crate::usage::{self, TokenKey};
 use crate::util::{human_size, workspace_name};
@@ -4129,6 +4130,14 @@ impl QmtApp {
             cx.notify();
         }));
         let menu_panel = self.session_menu_open.then(|| {
+            let (can_create_worktree, can_handoff_worktree) = {
+                let store = self.store.read(cx);
+                let busy = store.worktree_pending();
+                (
+                    !busy && store.can_create_worktree(),
+                    !busy && store.can_handoff_worktree(),
+                )
+            };
             let (pinned, resolved, archived) = summary
                 .map(|s| (s.pinned, s.resolved, s.archived))
                 .unwrap_or_default();
@@ -4195,6 +4204,33 @@ impl QmtApp {
                         });
                     })),
                 )
+                .when(can_create_worktree || can_handoff_worktree, |el| {
+                    el.child(div().my_1().child(kit::divider(p)))
+                })
+                .when(can_create_worktree, |el| {
+                    el.child(
+                        item(
+                            "m-worktree-new",
+                            IconName::GitBranchPlus,
+                            "New worktree session".into(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_worktree_dialog(WorktreeAction::Create, window, cx)
+                        })),
+                    )
+                })
+                .when(can_handoff_worktree, |el| {
+                    el.child(
+                        item(
+                            "m-worktree-handoff",
+                            IconName::GitBranch,
+                            "Hand off worktree".into(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_worktree_dialog(WorktreeAction::Handoff, window, cx)
+                        })),
+                    )
+                })
                 .child(div().my_1().child(kit::divider(p)))
                 // Like the desktop menu: copy items stay open and read "Copied" for a moment.
                 .when(!cwd.is_empty(), |el| {
@@ -5373,7 +5409,25 @@ impl QmtApp {
             .iter()
             .filter_map(|k| self.request_card(k, false, false, window, cx))
             .collect();
-        let composer = self.session_composer(&view_snapshot, control, &p, cx);
+        // A read-only session (worktree handed off or archived) shows why
+        // instead of a composer (desktop `describeSessionAccess`).
+        let read_only = view_snapshot.access.as_ref().map(|a| a.describe());
+        let composer = match read_only {
+            Some(text) => h_flex()
+                .w_full()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .rounded(px(14.))
+                .bg(p.surface)
+                .border_1()
+                .border_color(p.border)
+                .text_sm()
+                .text_color(p.muted)
+                .child(kit::icon(IconName::Lock, 14., p.muted))
+                .child(div().flex_1().min_w_0().child(text)),
+            None => self.session_composer(&view_snapshot, control, &p, cx),
+        };
         // A soft halo in the page background color around the composer: text
         // scrolling under it dissolves instead of meeting a hard edge.
         let halo = vec![
@@ -5386,9 +5440,12 @@ impl QmtApp {
             };
             COMPOSER_HALO_LAYERS
         ];
-        let composer = self
-            .drop_zone("session-drop", true, composer, &p, cx)
-            .shadow(halo);
+        let composer = if read_only.is_some() {
+            div().id("session-read-only").child(composer).shadow(halo)
+        } else {
+            self.drop_zone("session-drop", true, composer, &p, cx)
+                .shadow(halo)
+        };
         // Measure the floating area; re-render once when its height changes.
         let measure = {
             let (cell, weak) = (self.transcript.composer_h.clone(), cx.entity().downgrade());

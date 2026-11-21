@@ -28,6 +28,7 @@ impl AgentsStore {
     pub fn session_supports_fork(&self) -> bool {
         self.session
             .as_ref()
+            .filter(|v| v.access.is_none())
             .and_then(|v| self.runtime.get(&v.agent_id))
             .is_some_and(|rt| rt.is_connected() && rt.can_fork_sessions)
     }

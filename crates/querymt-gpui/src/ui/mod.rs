@@ -21,6 +21,7 @@ mod smooth_scroll;
 mod start;
 mod workspace_select;
 mod workspaces;
+mod worktree;
 
 use gpui_kit::assets::IconName;
 use std::collections::{HashMap, HashSet};
@@ -268,6 +269,8 @@ pub struct QmtApp {
     confirm_undo: Option<String>,
     /// Fork from a reply awaiting confirmation, or being created.
     fork: Option<fork::ForkDialog>,
+    /// New worktree session / worktree handoff dialog.
+    worktree: Option<worktree::WorktreeDialog>,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
     appearance_scroll_open: bool,
     key_input: Entity<InputState>,
@@ -506,6 +509,7 @@ impl QmtApp {
             confirm_reset: false,
             confirm_undo: None,
             fork: None,
+            worktree: None,
             appearance_scroll_open: false,
             key_input,
             oauth_code,
@@ -621,6 +625,7 @@ impl QmtApp {
         if std::mem::take(&mut self.confirm_reset)
             || self.confirm_undo.take().is_some()
             || self.close_fork_dialog()
+            || self.close_worktree_dialog()
             || self.confirm_delete.take().is_some()
             || self.confirm_session_delete.take().is_some()
             || self.dialog.take().is_some()
@@ -1333,6 +1338,11 @@ impl Render for QmtApp {
             .or_else(|| {
                 (self.page == Page::Session)
                     .then(|| self.render_fork_dialog(radii, cx))
+                    .flatten()
+            })
+            .or_else(|| {
+                (self.page == Page::Session)
+                    .then(|| self.render_worktree_dialog(radii, window, cx))
                     .flatten()
             })
             .or_else(|| self.render_model_modal(radii, cx))
