@@ -22,51 +22,14 @@ where
 #[cfg(feature = "remote")]
 #[tokio::test]
 async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error() {
-    use crate::agent::remote::RemoteNodeManager;
-    use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
-    use kameo::actor::Spawn;
-
-    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
-    let f = RealStorageHandleFixture::new().await;
-    f.handle.set_mesh(mesh.clone());
-
-    let remote = RealStorageHandleFixture::new().await;
-    let peer_id = *mesh.peer_id();
-    let node_id = peer_id.to_string();
-    let node_manager = RemoteNodeManager::new(
-        remote.handle.config.clone(),
-        remote.handle.registry.clone(),
-        Some(mesh.clone()),
-        remote.handle.scheduler_handle.clone(),
-    )
-    .with_node_name("peer-alpha".to_string());
-    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
-
-    let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
-    mesh.register_actor(node_manager_ref.clone(), per_peer_name)
-        .await;
-    mesh.inject_known_peer_for_test(peer_id);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let session = node_manager_ref
-        .ask(crate::agent::remote::CreateRemoteSession { cwd: None })
-        .await
-        .expect("create remote session");
-
-    remote
-        .storage
-        .session_store()
-        .delete_session(&session.session_id)
-        .await
-        .expect("delete persisted remote session row");
-
+    let f = RemoteScheduleFixture::new(true).await;
     let req = crate::acp::protocol::ExtRequest::new(
         "querymt/schedules/create",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(
                 serde_json::json!({
-                    "node_id": node_id,
-                    "session_id": session.session_id,
+                    "node_id": f.node_id,
+                    "session_id": f.session_id,
                     "prompt": "daily summary",
                     "trigger": { "type": "interval", "seconds": 300 },
                     "max_runs": 2,
@@ -78,6 +41,7 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
     );
 
     let err = f
+        .client
         .handle
         .ext_method(req)
         .await
@@ -93,10 +57,11 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
         err.message
     );
     assert!(
-        err.message.contains(&session.session_id),
+        err.message.contains(&f.session_id),
         "error should include session id: {}",
         err.message
     );
+    f.finish().await;
 }
 
 #[cfg(feature = "remote")]

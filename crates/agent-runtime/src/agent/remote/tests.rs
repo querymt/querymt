@@ -2369,9 +2369,11 @@ mod node_manager_tests {
         use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
 
         let store = Arc::new(
-            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
-                .await
-                .unwrap(),
+            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open_exclusive(
+                dir.path().join("guarded-host.access.sqlite3"),
+            )
+            .await
+            .unwrap(),
         );
         let config = MeshRuntimeConfig {
             enabled: true,
