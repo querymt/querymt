@@ -56,10 +56,9 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
         let snapshot = self
             .config
             .provider
-            .build_provider_snapshot(
+            .build_local_provider_snapshot(
                 ProviderRequest::new(&request.provider_name, &request.model)
-                    .with_params(request.params.as_ref())
-                    .with_provider_node_id(Some("local")),
+                    .with_params(request.params.as_ref()),
             )
             .await
             .map_err(|error| host_error("prepare_chat", None, error))?;
@@ -73,10 +72,9 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
     ) -> Result<querymt_remote::ProviderContractInfo, Self::Error> {
         self.config
             .provider
-            .build_provider_snapshot(
+            .build_local_provider_snapshot(
                 ProviderRequest::new(&request.provider_name, &request.model)
-                    .with_params(request.params.as_ref())
-                    .with_provider_node_id(Some("local")),
+                    .with_params(request.params.as_ref()),
             )
             .await
             .map(|snapshot| snapshot.contract_info())
@@ -89,12 +87,12 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
     ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
         self.config
             .provider
-            .build_provider(
+            .build_local_provider_snapshot(
                 ProviderRequest::new(&request.provider_name, &request.model)
-                    .with_params(request.params.as_ref())
-                    .with_provider_node_id(Some("local")),
+                    .with_params(request.params.as_ref()),
             )
             .await
+            .map(|built| built.provider)
             .map_err(|e| {
                 host_error(
                     "build_provider",
@@ -115,13 +113,18 @@ pub fn provider_backend_from_config(
 }
 
 pub(crate) fn qualified_text_stream_limit(schema: &str, resolved_config: &str) -> Option<i64> {
-    let schema: serde_json::Value = serde_json::from_str(schema).ok()?;
-    if schema["x-querymt-chat-token-bound"] != "llama-cpp-text-stream-n-ctx-v2" {
+    if !has_text_stream_bound(schema) {
         return None;
     }
     let config: serde_json::Value = serde_json::from_str(resolved_config).ok()?;
     let limit = i32::try_from(config["n_ctx"].as_u64()?).ok()?;
     (limit > 0 && config["speculative"].is_null()).then_some(i64::from(limit))
+}
+
+pub(crate) fn has_text_stream_bound(schema: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(schema).is_ok_and(|schema| {
+        schema["x-querymt-chat-token-bound"] == "llama-cpp-text-stream-n-ctx-v2"
+    })
 }
 
 fn text_stream_bound(limit: Option<i64>, call: &ChatCall<'_>, streaming: bool) -> Option<i64> {

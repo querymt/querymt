@@ -23,6 +23,10 @@ use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// Keep accepting the documented node selector on existing requests and rows.
+#[cfg(feature = "remote")]
+const LOCAL_PROVIDER_NODE: &str = "local";
+
 /// Cached provider entry: `(config_id, provider_node_id, allow_mesh_fallback, provider)`.
 ///
 /// `provider_node_id` is stored separately from `llm_configs` (in the `sessions`
@@ -478,6 +482,22 @@ impl SessionProvider {
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<ProviderSnapshot> {
+        self.build_provider_snapshot_with_route(req, false).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn build_local_provider_snapshot(
+        &self,
+        req: ProviderRequest<'_>,
+    ) -> SessionResult<ProviderSnapshot> {
+        self.build_provider_snapshot_with_route(req, true).await
+    }
+
+    async fn build_provider_snapshot_with_route(
+        &self,
+        req: ProviderRequest<'_>,
+        _local_only: bool,
+    ) -> SessionResult<ProviderSnapshot> {
         let provider_name = req.provider_name;
         let model = req.model;
         let params = req.params;
@@ -485,14 +505,15 @@ impl SessionProvider {
         let session_id = req.session_id;
 
         #[cfg(feature = "remote")]
-        let explicitly_local = req.provider_node_id.is_some_and(|node| {
-            node == "local"
-                || self
-                    .mesh
-                    .load()
-                    .as_deref()
-                    .is_some_and(|mesh| mesh.peer_id().to_string() == node)
-        });
+        let explicitly_local = _local_only
+            || req.provider_node_id.is_some_and(|node| {
+                node == LOCAL_PROVIDER_NODE
+                    || self
+                        .mesh
+                        .load()
+                        .as_deref()
+                        .is_some_and(|mesh| mesh.peer_id().to_string() == node)
+            });
         // An owner-local selection can arrive with an explicit node ID from a viewer.
         // Resolve it locally, without falling back to another node on failure.
         #[cfg(feature = "remote")]
@@ -628,14 +649,11 @@ impl SessionProvider {
         let builder_config = resolved_cfg.builder_config;
         let pruned_config_str = resolved_cfg.pruned_config_str;
         #[cfg(feature = "remote")]
-        let mesh_text_stream_limit = (provider_name == "llama-cpp")
-            .then(|| {
-                crate::agent::remote::provider_host_backend::qualified_text_stream_limit(
-                    &factory.config_schema(),
-                    &pruned_config_str,
-                )
-            })
-            .flatten();
+        let mesh_text_stream_limit =
+            crate::agent::remote::provider_host_backend::qualified_text_stream_limit(
+                &factory.config_schema(),
+                &pruned_config_str,
+            );
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -919,17 +937,15 @@ impl SessionHandle {
             .as_ref()
             .ok_or(AgentError::MeshAccessDenied)?;
         if !grant.allows_model(peer.protocol, &config.provider, &config.model)
-            || self
-                .provider_node_id
-                .as_deref()
-                .is_some_and(|node| node != "local" && node != peer.key.host.to_string())
+            || self.provider_node_id.as_deref().is_some_and(|node| {
+                node != LOCAL_PROVIDER_NODE && node != peer.key.host.to_string()
+            })
         {
             return Err(AgentError::MeshAccessDenied);
         }
         // Never reuse an unguarded provider or route a peer's spend onward.
         self.cached_llm_provider = Arc::new(tokio::sync::OnceCell::new());
         self.mesh_turn = Some(peer.clone());
-        self.provider_node_id = Some("local".into());
         Ok(self)
     }
 
@@ -941,15 +957,16 @@ impl SessionHandle {
     pub(crate) fn uses_explicit_mesh_provider(&self) -> bool {
         #[cfg(feature = "remote")]
         {
-            self.provider_node_id.as_deref().is_some_and(|node| {
-                node != "local"
-                    && self
-                        .provider
-                        .mesh
-                        .load()
-                        .as_deref()
-                        .is_none_or(|mesh| mesh.peer_id().to_string() != node)
-            })
+            self.mesh_turn.is_none()
+                && self.provider_node_id.as_deref().is_some_and(|node| {
+                    node != LOCAL_PROVIDER_NODE
+                        && self
+                            .provider
+                            .mesh
+                            .load()
+                            .as_deref()
+                            .is_none_or(|mesh| mesh.peer_id().to_string() != node)
+                })
         }
         #[cfg(not(feature = "remote"))]
         {
@@ -988,7 +1005,13 @@ impl SessionHandle {
                     auth.source = tracing::field::Empty,
                 );
                 let built = tracing::Instrument::instrument(
-                    self.provider.build_provider_snapshot(request),
+                    async {
+                        #[cfg(feature = "remote")]
+                        if self.mesh_turn.is_some() {
+                            return self.provider.build_local_provider_snapshot(request).await;
+                        }
+                        self.provider.build_provider_snapshot(request).await
+                    },
                     span,
                 )
                 .await?;

@@ -165,7 +165,7 @@ pub enum AttemptUsage {
 }
 
 impl AttemptUsage {
-    /// Convert a confirmed normalized provider usage total, excluding cache tiers.
+    /// Sum normalized usage, counting cache reads and aggregate writes once.
     pub fn from_usage(usage: &querymt::Usage) -> Self {
         Self::Observed(
             [
