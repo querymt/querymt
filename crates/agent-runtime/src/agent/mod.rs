@@ -67,6 +67,8 @@ mod delegation_loop_tests;
 #[cfg(test)]
 mod execution_tests;
 #[cfg(test)]
+mod history_consistency_tests;
+#[cfg(test)]
 mod local_session_concurrency_tests;
 #[cfg(test)]
 mod registry_lock_tests;

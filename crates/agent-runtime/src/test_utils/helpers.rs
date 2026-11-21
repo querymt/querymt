@@ -319,6 +319,15 @@ pub fn mock_plugin_registry_in(
     dir: &std::path::Path,
     factory: Arc<TestProviderFactory>,
 ) -> Result<PluginRegistry> {
+    mock_plugin_registry_for(dir, factory)
+}
+
+/// Like [`mock_plugin_registry_in`] for any provider factory that names itself
+/// `mock`.
+pub fn mock_plugin_registry_for(
+    dir: &std::path::Path,
+    factory: Arc<dyn querymt::plugin::LLMProviderFactory>,
+) -> Result<PluginRegistry> {
     let wasm_path = dir.join("mock.wasm");
     std::fs::write(&wasm_path, "")?;
     let config_path = dir.join("providers.toml");
@@ -423,6 +432,18 @@ impl UndoTestFixture {
             .register_session_actor_with_cwd(&session.public_id, cwd)
             .await;
         Ok((session.public_id, cell))
+    }
+
+    /// A fixture whose LLM is built by `factory` (a provider that is not a
+    /// [`SharedLlmProvider`]), with `hooks` and `middleware` installed.
+    pub(crate) async fn with_factory(
+        factory: Arc<dyn querymt::plugin::LLMProviderFactory>,
+        hooks: Option<crate::hooks::Hooks>,
+        middleware: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
+    ) -> Result<Self> {
+        let config_dir = TempDir::new()?;
+        let registry = mock_plugin_registry_for(config_dir.path(), factory)?;
+        Self::with_registry(registry, config_dir, hooks, middleware).await
     }
 
     /// Like [`Self::with_provider`], with `hooks` installed on the agent.
@@ -530,13 +551,29 @@ impl UndoTestFixture {
         session_id: &str,
         cwd: &std::path::Path,
     ) -> Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>> {
+        self.register_session_actor_with_mcp(
+            session_id,
+            cwd,
+            crate::agent::core::McpToolState::empty(),
+        )
+        .await
+    }
+
+    /// Like [`Self::register_session_actor_with_cwd`], with the session's MCP
+    /// tool state supplied by the caller, who can change it while a run is going.
+    pub(crate) async fn register_session_actor_with_mcp(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        mcp: Arc<crate::agent::core::McpToolState>,
+    ) -> Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>> {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
         let runtime = crate::agent::core::SessionRuntime::new(
             Some(cwd.to_path_buf()),
             std::collections::HashMap::new(),
-            crate::agent::core::McpToolState::empty(),
+            mcp,
         );
         if let Some(workspace) = &self.workspace {
             assert!(

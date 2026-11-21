@@ -1,0 +1,720 @@
+//! The history a run sends to the model against the history stored for the
+//! session (spec `run-history-consistency`, "History sent in a run matches the
+//! stored session").
+//!
+//! Every test runs the real loop with a scripted provider. At each model
+//! request the provider loads the session from the store, as a later run or a
+//! restarted process would, and compares what that load would send with what
+//! the run sent. Cache hints are left out of the comparison.
+
+use crate::agent::core::McpToolState;
+use crate::agent::execution::tool_history::without_tool_changes;
+use crate::hooks::{HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig};
+use crate::middleware::{ContextConfig, ContextMiddleware, MiddlewareDriver};
+use crate::session::provider::SessionProvider;
+use crate::test_utils::{MessageInjectingDriver, UndoTestFixture, mock_querymt_tool_call};
+use crate::tools::{Tool as _, builtins::WriteFileTool};
+use async_trait::async_trait;
+use querymt::chat::{
+    ChatCall, ChatCapabilities, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
+    ChatReasoningItem, ChatReasoningPart, ChatRole, FinishReason, Tool,
+};
+use querymt::error::LLMError;
+use querymt::plugin::{Fut, LLMProviderFactory};
+use querymt::{LLMProvider, Usage};
+use querymt_agent_core::model::MessagePart;
+use querymt_agent_core::session::backend::StorageBackend;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// What the scripted provider answers request number `index` with.
+type Script = dyn Fn(usize) -> ChatOutput + Send + Sync;
+
+/// Runs inside the provider while it answers a request, before the reply is
+/// returned.
+type Hook = Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// One request as the provider received it.
+#[derive(Clone)]
+struct Seen {
+    messages: Vec<ChatMessage>,
+}
+
+struct Inner {
+    script: Box<Script>,
+    tools: Vec<Tool>,
+    tool_updates: bool,
+    seen: Mutex<Vec<Seen>>,
+    /// Differences found between a request and a reload, one line each.
+    divergences: Mutex<Vec<String>>,
+    /// The store to reload from and the session to reload.
+    reload: OnceLock<(Arc<SessionProvider>, String)>,
+    /// A hook to run while answering request number `.0`.
+    before_reply: OnceLock<(usize, Hook)>,
+}
+
+/// A provider that answers from a script and checks every request against a
+/// reload of the session.
+#[derive(Clone)]
+struct ScriptedProvider(Arc<Inner>);
+
+impl ScriptedProvider {
+    fn new(
+        tool_updates: bool,
+        script: impl Fn(usize) -> ChatOutput + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(Inner {
+            script: Box::new(script),
+            tools: vec![WriteFileTool::new().definition()],
+            tool_updates,
+            seen: Mutex::default(),
+            divergences: Mutex::default(),
+            reload: OnceLock::new(),
+            before_reply: OnceLock::new(),
+        }))
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.0.seen.lock().unwrap().clone()
+    }
+
+    fn divergences(&self) -> Vec<String> {
+        self.0.divergences.lock().unwrap().clone()
+    }
+
+    /// Compare `call` with the request a fresh load of the session prepares.
+    async fn compare_with_reload(&self, index: usize, call: &ChatCall<'_>) {
+        let Some((provider, session)) = self.0.reload.get() else {
+            return;
+        };
+        let view = provider
+            .with_session(session)
+            .await
+            .expect("session loads")
+            .history_view()
+            .await
+            .expect("history loads");
+        let (expected_tools, expected) = if self.0.tool_updates {
+            (
+                view.tool_baseline
+                    .as_ref()
+                    .map(|baseline| baseline.tools.clone()),
+                view.messages.clone(),
+            )
+        } else {
+            (None, without_tool_changes(&view.messages))
+        };
+
+        let sent = durable(call.messages);
+        let reloaded = durable(&expected);
+        if let Some(difference) = first_difference(&sent, &reloaded) {
+            self.0
+                .divergences
+                .lock()
+                .unwrap()
+                .push(format!("request {index}: messages: {difference}"));
+        }
+        if self.0.tool_updates {
+            let sent_tools = serde_json::to_value(call.tools).unwrap();
+            let reloaded_tools = serde_json::to_value(expected_tools.as_deref()).unwrap();
+            if sent_tools != reloaded_tools {
+                self.0.divergences.lock().unwrap().push(format!(
+                    "request {index}: tools: sent {sent_tools}, reload {reloaded_tools}"
+                ));
+            }
+        }
+    }
+}
+
+/// The messages as JSON, without cache hints.
+fn durable(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            message.cache = None;
+            serde_json::to_value(message).unwrap()
+        })
+        .collect()
+}
+
+fn first_difference(sent: &[serde_json::Value], reloaded: &[serde_json::Value]) -> Option<String> {
+    let at = sent.iter().zip(reloaded).position(|(a, b)| a != b);
+    match at {
+        Some(i) => Some(format!(
+            "first difference at message {i}: sent {}, reload {}",
+            sent[i], reloaded[i]
+        )),
+        None if sent.len() != reloaded.len() => Some(format!(
+            "sent {} messages, reload {}; the first message only one side has is {}",
+            sent.len(),
+            reloaded.len(),
+            sent.get(reloaded.len())
+                .or_else(|| reloaded.get(sent.len()))
+                .map_or_else(String::new, ToString::to_string)
+        )),
+        None => None,
+    }
+}
+
+#[async_trait]
+impl querymt::chat::ChatProvider for ScriptedProvider {
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_tool_updates(self.0.tool_updates)
+    }
+
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        let index = {
+            let mut seen = self.0.seen.lock().unwrap();
+            seen.push(Seen {
+                messages: call.messages.to_vec(),
+            });
+            seen.len() - 1
+        };
+        self.compare_with_reload(index, call).await;
+        if let Some((at, hook)) = self.0.before_reply.get()
+            && *at == index
+        {
+            hook().await;
+        }
+        Ok((self.0.script)(index))
+    }
+}
+
+#[async_trait]
+impl querymt::completion::CompletionProvider for ScriptedProvider {
+    async fn complete(
+        &self,
+        _: &querymt::completion::CompletionRequest,
+    ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented("scripted".into()))
+    }
+}
+
+#[async_trait]
+impl querymt::embedding::EmbeddingProvider for ScriptedProvider {
+    async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented("scripted".into()))
+    }
+}
+
+impl LLMProvider for ScriptedProvider {
+    fn tools(&self) -> Option<&[Tool]> {
+        Some(&self.0.tools)
+    }
+}
+
+struct ScriptedFactory(ScriptedProvider);
+
+impl LLMProviderFactory for ScriptedFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn config_schema(&self) -> String {
+        "{}".to_string()
+    }
+
+    fn from_config(&self, _cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+        Ok(Box::new(self.0.clone()))
+    }
+
+    fn list_models<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
+        Box::pin(async { Ok(vec!["mock-model".to_string()]) })
+    }
+}
+
+// ---- scripted replies ----
+
+fn usage(input_tokens: u32) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens: 5,
+        ..Usage::default()
+    }
+}
+
+/// A reply that calls `write_file` once and reports `used` tokens of context.
+fn write_call(index: usize, used: u32) -> ChatOutput {
+    ChatOutput::from_projections(
+        None,
+        Some("writing".into()),
+        Some(vec![mock_querymt_tool_call(
+            &format!("write-{index}"),
+            "write_file",
+            &serde_json::json!({"path": format!("step-{index}.txt"), "content": "x"}).to_string(),
+        )]),
+        Some(usage(used)),
+        Some(FinishReason::ToolCalls),
+    )
+}
+
+fn done(used: u32) -> ChatOutput {
+    ChatOutput::from_projections(
+        None,
+        Some("done".into()),
+        None,
+        Some(usage(used)),
+        Some(FinishReason::Stop),
+    )
+}
+
+/// A reply with a signed, encrypted reasoning item, text and a `write_file`
+/// call. `with_provenance` records where it came from, as the providers that
+/// produce native reasoning do (protocol and endpoint included).
+fn write_call_with_reasoning(index: usize, with_provenance: bool) -> ChatOutput {
+    let mut output = write_call(index, 10);
+    output.items.insert(
+        0,
+        ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("reasoning-1".into()),
+            summary: Vec::new(),
+            content: vec![ChatReasoningPart::text("weighing the options")],
+            encrypted_content: Some("enc-1".into()),
+            signature: Some("sig-1".into()),
+            status: None,
+            extensions: Default::default(),
+        }),
+    );
+    output.status = Some(ChatOutputStatus::Completed);
+    if with_provenance {
+        output.provenance = Some(querymt::chat::ChatOutputProvenance {
+            provider: "mock".into(),
+            protocol: "responses".into(),
+            model: "mock-model".into(),
+            endpoint: "https://mock.invalid/v1/responses".into(),
+        });
+    }
+    output
+}
+
+// ---- the run ----
+
+struct Run {
+    fixture: UndoTestFixture,
+    provider: ScriptedProvider,
+    session: String,
+}
+
+#[derive(Default)]
+struct Setup {
+    hooks: Option<Hooks>,
+    middleware: Vec<Arc<dyn MiddlewareDriver>>,
+    mcp: Option<Arc<McpToolState>>,
+}
+
+impl Run {
+    async fn new(provider: ScriptedProvider, setup: Setup) -> Self {
+        let fixture = UndoTestFixture::with_factory(
+            Arc::new(ScriptedFactory(provider.clone())),
+            setup.hooks,
+            setup.middleware,
+        )
+        .await
+        .expect("fixture");
+        let store = fixture.storage.session_store();
+        let cwd = fixture.worktree.path().to_path_buf();
+        let session = store
+            .create_session(None, Some(cwd.clone()), None, None)
+            .await
+            .expect("session")
+            .public_id;
+        let llm_config = store
+            .create_or_get_llm_config(
+                &querymt::LLMParams::new()
+                    .provider("mock")
+                    .model("mock-model"),
+            )
+            .await
+            .expect("llm config");
+        store
+            .set_session_llm_config(&session, llm_config.id)
+            .await
+            .expect("bind llm config");
+        fixture
+            .register_session_actor_with_mcp(
+                &session,
+                &cwd,
+                setup.mcp.unwrap_or_else(McpToolState::empty),
+            )
+            .await;
+        provider
+            .0
+            .reload
+            .set((fixture.handle.config.provider.clone(), session.clone()))
+            .ok()
+            .expect("the reload target is set once");
+        Self {
+            fixture,
+            provider,
+            session,
+        }
+    }
+
+    async fn prompt(&self, text: &str) {
+        self.fixture
+            .prompt_to_completion(&self.session, text)
+            .await
+            .expect("run completes");
+    }
+
+    /// Accept `text` as steering of the active run while request number `at`
+    /// is being answered, so it is waiting when the reply's tool calls start.
+    async fn steer_at_request(&self, at: usize, text: &'static str) {
+        use crate::acp::protocol::{ContentBlock, TextContent};
+        use querymt_agent_core::events::AgentEventKind;
+
+        let actor = self
+            .fixture
+            .handle
+            .session_ref_for_agent_session(&self.session)
+            .await
+            .expect("session actor");
+        let events = Arc::new(tokio::sync::Mutex::new(
+            self.fixture.handle.config.subscribe_events(),
+        ));
+        let session = self.session.clone();
+        let hook: Hook = Arc::new(move || {
+            let (actor, events, session) = (actor.clone(), events.clone(), session.clone());
+            Box::pin(async move {
+                let mut events = events.lock().await;
+                let run_id = loop {
+                    let envelope = events.try_recv().expect("the run has started");
+                    if envelope.session_id() == session
+                        && let AgentEventKind::RunStarted { run_id, .. } = envelope.kind()
+                    {
+                        break run_id.clone();
+                    }
+                };
+                actor
+                    .steer(
+                        session,
+                        run_id,
+                        vec![ContentBlock::Text(TextContent::new(text))],
+                    )
+                    .await
+                    .expect("steering is accepted");
+            })
+        });
+        self.provider
+            .0
+            .before_reply
+            .set((at, hook))
+            .ok()
+            .expect("one steering hook");
+    }
+
+    async fn stored(&self) -> Vec<querymt_agent_core::model::AgentMessage> {
+        self.fixture
+            .storage
+            .session_store()
+            .get_history(&self.session)
+            .await
+            .expect("history")
+    }
+
+    /// The run made `requests` model requests and every one matched a reload.
+    fn assert_matches_a_reload(&self, requests: usize) {
+        assert_eq!(
+            self.provider.seen().len(),
+            requests,
+            "number of model requests"
+        );
+        let divergences = self.provider.divergences();
+        assert!(
+            divergences.is_empty(),
+            "a request differs from a reload of the session:\n{}",
+            divergences.join("\n")
+        );
+    }
+}
+
+fn text_of(messages: &[ChatMessage]) -> String {
+    serde_json::to_string(messages).unwrap()
+}
+
+/// What the stored messages of a run with tool calls and steering are, in
+/// order: `calls`, `results:N` and `steering`. Other messages are left out.
+fn tool_batch_order(stored: &[querymt_agent_core::model::AgentMessage]) -> Vec<String> {
+    stored
+        .iter()
+        .filter_map(|message| {
+            let results = message
+                .parts
+                .iter()
+                .filter(|part| matches!(part, MessagePart::ToolResult { .. }))
+                .count();
+            if message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Steering { .. }))
+            {
+                Some("steering".to_string())
+            } else if results > 0 {
+                Some(format!("results:{results}"))
+            } else if message.parts.iter().any(|part| match part {
+                MessagePart::ToolUse(_) => true,
+                MessagePart::Output { output } => output
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, ChatOutputItem::FunctionCall(_))),
+                _ => false,
+            }) {
+                Some("calls".to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// A reply that calls `write_file` twice.
+fn two_write_calls(index: usize) -> ChatOutput {
+    let call = |n: usize| {
+        mock_querymt_tool_call(
+            &format!("write-{index}-{n}"),
+            "write_file",
+            &serde_json::json!({"path": format!("step-{index}-{n}.txt"), "content": "x"})
+                .to_string(),
+        )
+    };
+    ChatOutput::from_projections(
+        None,
+        Some("writing".into()),
+        Some(vec![call(0), call(1)]),
+        Some(usage(10)),
+        Some(FinishReason::ToolCalls),
+    )
+}
+
+// ---- scenarios ----
+
+#[tokio::test]
+async fn request_after_a_tool_step_matches_a_reload() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 10),
+        _ => done(10),
+    });
+    let run = Run::new(provider, Setup::default()).await;
+
+    run.prompt("run 0").await;
+
+    run.assert_matches_a_reload(2);
+}
+
+async fn reasoning_run(with_provenance: bool) {
+    let provider = ScriptedProvider::new(false, move |index| match index {
+        0 => write_call_with_reasoning(0, with_provenance),
+        _ => done(10),
+    });
+    let run = Run::new(provider, Setup::default()).await;
+
+    run.prompt("run 0").await;
+
+    // The reasoning is replayed to the model that produced it: the request
+    // carries the native item, not its portable form.
+    let second = run.provider.seen().remove(1);
+    assert!(
+        text_of(&second.messages).contains("enc-1"),
+        "the second request carries the native reasoning: {}",
+        text_of(&second.messages)
+    );
+    run.assert_matches_a_reload(2);
+}
+
+/// Output that records its provenance, as every provider with native reasoning
+/// does. Fails on the current code (task 2.1 finding, 5.4): the session's stored
+/// LLM config has no protocol or endpoint, so a load never matches the
+/// provenance and sends the portable form.
+#[tokio::test]
+async fn request_after_a_reply_with_provider_reasoning_matches_a_reload() {
+    reasoning_run(true).await;
+}
+
+/// Output from before provenance was recorded replays by provider and model,
+/// which a load can match. Guards the part that works today.
+#[tokio::test]
+async fn request_after_a_reply_with_legacy_reasoning_matches_a_reload() {
+    reasoning_run(false).await;
+}
+
+#[tokio::test]
+async fn request_after_a_stored_tool_change_matches_a_reload() {
+    fn mcp_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: name.into(),
+                description: name.into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+    let mcp = McpToolState::new(Default::default(), vec![mcp_tool("alpha")]);
+    // An MCP server adds a tool while the first reply is being produced.
+    let appearing = mcp.clone();
+    let provider = ScriptedProvider::new(true, move |index| match index {
+        0 => {
+            appearing.rcu(|snapshot| {
+                let mut next = snapshot.clone();
+                next.tool_defs.push(mcp_tool("beta"));
+                next
+            });
+            write_call(0, 10)
+        }
+        _ => done(10),
+    });
+    let run = Run::new(
+        provider,
+        Setup {
+            mcp: Some(mcp),
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    run.prompt("run 0").await;
+
+    let second = run.provider.seen().remove(1);
+    assert!(
+        second.messages.iter().any(ChatMessage::has_tool_change),
+        "the second request carries the tool change: {}",
+        text_of(&second.messages)
+    );
+    run.assert_matches_a_reload(2);
+}
+
+#[tokio::test]
+async fn request_after_a_stored_notice_matches_a_reload() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 10),
+        _ => done(10),
+    });
+    let run = Run::new(
+        provider,
+        Setup {
+            middleware: vec![Arc::new(MessageInjectingDriver {
+                inject_content: "check the notice".into(),
+            })],
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    run.prompt("run 0").await;
+
+    assert!(
+        text_of(&run.provider.seen()[1].messages).contains("check the notice"),
+        "the second request carries the notice"
+    );
+    run.assert_matches_a_reload(2);
+}
+
+fn custom_summary_hooks(summary: &str) -> Hooks {
+    Hooks::new(HooksConfig {
+        enabled: true,
+        pre_compaction: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                command: format!(
+                    "printf '%s' '{}'",
+                    serde_json::json!({"hook_specific_output": {
+                        "hook_event_name": "pre_compaction",
+                        "compaction": {"summary": summary}
+                    }})
+                ),
+                timeout_sec: Some(5),
+                ..HookCommandConfig::default()
+            })],
+        }],
+        ..HooksConfig::default()
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn request_after_a_mid_run_compaction_matches_a_reload() {
+    // The first reply reports 90% of the context, so the loop compacts before
+    // its next request.
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 900),
+        _ => done(10),
+    });
+    let run = Run::new(
+        provider,
+        Setup {
+            hooks: Some(custom_summary_hooks("what happened so far")),
+            middleware: vec![Arc::new(ContextMiddleware::new(
+                ContextConfig::with_manual_limit(1000),
+            ))],
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    run.prompt("run 0").await;
+
+    assert!(
+        run.stored().await.iter().any(|message| message
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Compaction { .. }))),
+        "the run compacted its history"
+    );
+    assert!(
+        text_of(&run.provider.seen()[1].messages).contains("what happened so far"),
+        "the request after the compaction starts from the summary"
+    );
+    run.assert_matches_a_reload(2);
+}
+
+#[tokio::test]
+async fn steering_arrives_before_a_tool_batch() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => two_write_calls(0),
+        _ => done(10),
+    });
+    let run = Run::new(provider, Setup::default()).await;
+    // Accepted while the model answers, so it is applied before either call runs.
+    run.steer_at_request(0, "use another file name").await;
+
+    run.prompt("run 0").await;
+
+    let order = tool_batch_order(&run.stored().await);
+    let divergences = run.provider.divergences();
+    assert!(
+        order == ["calls", "results:2", "steering"] && divergences.is_empty(),
+        "stored order: {order:?}; a reload sends differently from the run: {divergences:?}"
+    );
+    assert_eq!(run.provider.seen().len(), 2);
+    // Neither call ran: both are skipped.
+    assert!(!run.fixture.worktree.path().join("step-0-0.txt").exists());
+    assert!(!run.fixture.worktree.path().join("step-0-1.txt").exists());
+}
+
+#[tokio::test]
+async fn first_request_of_the_next_run_continues_the_previous_one() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call(0, 10),
+        _ => done(10),
+    });
+    let run = Run::new(provider, Setup::default()).await;
+
+    run.prompt("run 0").await;
+    run.prompt("run 1").await;
+
+    run.assert_matches_a_reload(3);
+    let seen = run.provider.seen();
+    let last_of_first = durable(&seen[1].messages);
+    let first_of_second = durable(&seen[2].messages);
+    assert!(first_of_second.len() > last_of_first.len());
+    assert_eq!(
+        first_difference(&last_of_first, &first_of_second[..last_of_first.len()]),
+        None,
+        "the next run's first request begins with the previous run's last request"
+    );
+    assert_eq!(
+        seen[2].messages.last().map(|m| (m.role, m.text())),
+        Some((ChatRole::User, "run 1".to_string()))
+    );
+}
