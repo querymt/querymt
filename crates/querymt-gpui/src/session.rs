@@ -849,6 +849,8 @@ pub struct SessionView {
     pub undo_pending: bool,
     /// Notice to append once the transcript has (re)loaded, e.g. after an undo.
     pub after_load_notice: Option<String>,
+    /// The agent serves this session read-only (`_meta.querymt.sessionAccess`).
+    pub access: Option<SessionAccess>,
     tool_index: HashMap<String, usize>,
     /// Child sessions of tool calls not loaded yet (e.g. older history pages).
     child_links: HashMap<String, String>,
@@ -868,6 +870,52 @@ pub struct ParentSession {
     pub title: String,
     /// The parent's own parent, so Back walks up a delegation chain.
     pub parent: Option<Box<ParentSession>>,
+}
+
+/// Why a session can only be read (desktop `SessionAccessInfo`): its
+/// worktree was handed off or archived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAccess {
+    pub reason: Option<String>,
+    pub owner_session_id: Option<String>,
+}
+
+impl SessionAccess {
+    /// `_meta.querymt.sessionAccess` of a `session/load` response; only an
+    /// explicit read-only grant counts.
+    pub fn parse(response: &Value) -> Option<Self> {
+        let access = response.pointer("/_meta/querymt/sessionAccess")?;
+        (access.get("mode").and_then(Value::as_str) == Some("read_only")).then(|| {
+            let s = |k: &str| {
+                access
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(str::to_owned)
+            };
+            Self {
+                reason: s("reason"),
+                owner_session_id: s("ownerSessionId"),
+            }
+        })
+    }
+
+    /// Notice shown in place of the composer (desktop `describeSessionAccess`).
+    pub fn describe(&self) -> &'static str {
+        match self.reason.as_deref() {
+            Some("workspace_archived") => {
+                "This worktree was archived, so this conversation is read-only. To delete the \
+                 checkout, run /worktree remove from another session."
+            }
+            Some("owner_transferred") => {
+                "This worktree was handed off, so this conversation is read-only."
+            }
+            _ if self.owner_session_id.is_some() => {
+                "This worktree was handed off, so this conversation is read-only."
+            }
+            _ => "This conversation is read-only.",
+        }
+    }
 }
 
 /// Where a fork from one turn branches, and what it keeps (desktop
@@ -1577,6 +1625,7 @@ impl SessionView {
             undo_stack: self.undo_stack.clone(),
             undo_pending: self.undo_pending,
             after_load_notice: None,
+            access: self.access.clone(),
             tool_index: HashMap::new(),
             child_links: HashMap::new(),
             counter: 0,
@@ -3127,6 +3176,26 @@ mod undo_tests {
             );
         }
         view
+    }
+
+    #[test]
+    fn read_only_access_is_parsed_from_a_load() {
+        use super::SessionAccess;
+        let load = |access: serde_json::Value| {
+            SessionAccess::parse(&json!({ "_meta": { "querymt": { "sessionAccess": access } } }))
+        };
+        let handed = load(
+            json!({ "mode": "read_only", "reason": "owner_transferred", "ownerSessionId": "h1" }),
+        )
+        .unwrap();
+        assert_eq!(handed.owner_session_id.as_deref(), Some("h1"));
+        assert!(handed.describe().contains("handed off"));
+        let archived =
+            load(json!({ "mode": "read_only", "reason": "workspace_archived" })).unwrap();
+        assert!(archived.describe().contains("archived"));
+        // Only an explicit read-only grant counts.
+        assert_eq!(load(json!({ "mode": "read_write" })), None);
+        assert_eq!(SessionAccess::parse(&json!({})), None);
     }
 
     #[test]

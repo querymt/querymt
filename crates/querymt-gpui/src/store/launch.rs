@@ -64,13 +64,21 @@ impl WorktreeMode {
 /// (`agentCapabilities._meta.querymt.workspace`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorktreeSupport {
+    /// `querymt/worktree/handoff` exists.
     pub handoff: bool,
+    /// Handoff accepts `summary: true`.
+    pub handoff_summary: bool,
+    /// `querymt/worktree/create` accepts `source_session_id` (lineage).
+    pub source_session: bool,
 }
 
 pub fn worktree_support(init: &Value) -> Option<WorktreeSupport> {
     let workspace = init.pointer("/agentCapabilities/_meta/querymt/workspace")?;
-    (workspace.get("supported").and_then(Value::as_bool) == Some(true)).then(|| WorktreeSupport {
-        handoff: workspace.get("handoff").and_then(Value::as_bool) == Some(true),
+    let flag = |k: &str| workspace.get(k).and_then(Value::as_bool) == Some(true);
+    flag("supported").then(|| WorktreeSupport {
+        handoff: flag("handoff"),
+        handoff_summary: flag("handoff") && flag("handoffSummary"),
+        source_session: flag("sourceSession"),
     })
 }
 
@@ -465,7 +473,10 @@ mod tests {
         );
         assert_eq!(
             worktree_support(&init),
-            Some(WorktreeSupport { handoff: true })
+            Some(WorktreeSupport {
+                handoff: true,
+                ..Default::default()
+            })
         );
         assert_eq!(worktree_support(&json!({})), None);
         let created = parse(r#"{"_meta":{"querymt":{"sessionWorkspace":{"sessionCwd":"/wt/a"}}}}"#);
