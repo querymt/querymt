@@ -287,6 +287,17 @@ fn code_card(
 }
 
 /// Read-tool result: headers as dim labels, code as highlighted cards.
+/// Code lines of a read result.
+pub fn read_line_count(output: &str) -> usize {
+    segments(output)
+        .iter()
+        .map(|s| match s {
+            Segment::Code { numbers, .. } => numbers.len(),
+            Segment::Meta(_) => 0,
+        })
+        .sum()
+}
+
 /// `flat` renders only the code, borderless, to fill a card attached to the
 /// tool header (the tool's own notes like "(File has more lines…)" are dropped).
 pub fn read_output(
