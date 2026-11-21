@@ -209,14 +209,17 @@ fn synthesized_diffs(call: &ToolCall) -> Vec<Diff> {
     diffs
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ToolCall {
     pub id: String,
     pub title: String,
     pub kind: String,
     pub status: String,
     pub input: Option<Value>,
-    pub output: String,
+    /// The result text; written through [`ToolCall::set_output`] so the
+    /// facts derived from it are computed once, never per frame.
+    output: String,
+    facts: OutputFacts,
     pub diffs: Vec<Diff>,
     pub locations: Vec<String>,
     /// Lines (added, removed) across `diffs`; computed once when the diffs arrive.
@@ -242,7 +245,68 @@ pub fn diff_stats(d: &Diff) -> (usize, usize) {
     (adds, dels)
 }
 
+/// What rendering needs from a tool result, derived once per change: shell
+/// results are JSON (`stdout`, `stderr`, `exit_code`).
+#[derive(Clone, Debug, Default)]
+struct OutputFacts {
+    /// stdout + stderr (+ exit code) of a shell JSON result; `None`: the
+    /// output shows as it is.
+    pretty: Option<String>,
+    exit: Option<i64>,
+}
+
+impl OutputFacts {
+    fn of(output: &str) -> Self {
+        let trimmed = output.trim();
+        if !trimmed.starts_with('{') {
+            return Self::default();
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            return Self::default();
+        };
+        let exit = v.get("exit_code").and_then(Value::as_i64);
+        let out = v.get("stdout").and_then(Value::as_str);
+        let err = v.get("stderr").and_then(Value::as_str);
+        let pretty = (out.is_some() || err.is_some()).then(|| {
+            let mut text = out.unwrap_or_default().trim_end().to_string();
+            if let Some(err) = err.filter(|e| !e.trim().is_empty()) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(err.trim_end());
+            }
+            if let Some(code) = exit.filter(|c| *c != 0) {
+                text.push_str(&format!("\n[exit code {code}]"));
+            }
+            text
+        });
+        Self { pretty, exit }
+    }
+}
+
 impl ToolCall {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn set_output(&mut self, output: String) {
+        self.facts = OutputFacts::of(&output);
+        self.output = output;
+    }
+
+    #[cfg(test)]
+    pub fn with_output(mut self, output: impl Into<String>) -> Self {
+        self.set_output(output.into());
+        self
+    }
+
     pub fn running(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "in_progress" | "")
     }
@@ -263,14 +327,7 @@ impl ToolCall {
 
     /// Exit code of a shell result, when the output is the usual JSON envelope.
     pub fn exit_code(&self) -> Option<i64> {
-        let trimmed = self.output.trim();
-        if !trimmed.starts_with('{') {
-            return None;
-        }
-        serde_json::from_str::<Value>(trimmed)
-            .ok()?
-            .get("exit_code")?
-            .as_i64()
+        self.facts.exit
     }
 
     /// Full shell command (all lines), when there is one.
@@ -318,32 +375,8 @@ impl ToolCall {
     }
 
     /// Output prettified: shell JSON results become stdout + stderr.
-    pub fn pretty_output(&self) -> String {
-        let trimmed = self.output.trim();
-        if trimmed.starts_with('{')
-            && let Ok(v) = serde_json::from_str::<Value>(trimmed)
-        {
-            let out = v.get("stdout").and_then(Value::as_str);
-            let err = v.get("stderr").and_then(Value::as_str);
-            if out.is_some() || err.is_some() {
-                let mut text = out.unwrap_or_default().trim_end().to_string();
-                if let Some(err) = err.filter(|e| !e.trim().is_empty()) {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(err.trim_end());
-                }
-                if let Some(code) = v
-                    .get("exit_code")
-                    .and_then(Value::as_i64)
-                    .filter(|c| *c != 0)
-                {
-                    text.push_str(&format!("\n[exit code {code}]"));
-                }
-                return text;
-            }
-        }
-        self.output.clone()
+    pub fn pretty_output(&self) -> &str {
+        self.facts.pretty.as_deref().unwrap_or(&self.output)
     }
 }
 
@@ -351,7 +384,9 @@ impl ToolCall {
 #[derive(Clone, Debug)]
 pub enum WorkEntry {
     Thought(Thought),
-    Tool(Box<ToolCall>),
+    /// Shared, so copying a work group (every transcript snapshot does)
+    /// copies pointers; [`Arc::make_mut`] copies one call when it changes.
+    Tool(std::sync::Arc<ToolCall>),
 }
 
 impl WorkEntry {
@@ -1696,9 +1731,10 @@ impl SessionView {
                     if let WorkEntry::Tool(call) = e
                         && call.running()
                     {
+                        let call = std::sync::Arc::make_mut(call);
                         call.status = "failed".into();
                         if call.output.is_empty() {
-                            call.output = "Run ended before a tool result was recorded.".into();
+                            call.set_output("Run ended before a tool result was recorded.".into());
                         }
                         changed = true;
                     }
@@ -1724,7 +1760,7 @@ impl SessionView {
                     && call.id == tool_call_id
                     && call.child_session.as_deref() != Some(child)
                 {
-                    call.child_session = Some(child.to_string());
+                    std::sync::Arc::make_mut(call).child_session = Some(child.to_string());
                     changed = true;
                 }
             }
@@ -2359,30 +2395,21 @@ impl SessionView {
             Some(ix) => ix,
             None if created || !self.tool_index.contains_key(id) => {
                 let call = ToolCall {
-                    id: id.into(),
-                    title: String::new(),
-                    kind: String::new(),
-                    status: String::new(),
-                    input: None,
-                    output: String::new(),
-                    diffs: vec![],
-                    locations: vec![],
-                    stats: (0, 0),
-                    synthesized: false,
                     child_session: self.child_links.remove(id),
+                    ..ToolCall::new(id)
                 };
                 let ix = match self.items.last_mut() {
                     Some(Item {
                         kind: ItemKind::Work(entries),
                         ..
                     }) => {
-                        entries.push(WorkEntry::Tool(Box::new(call)));
+                        entries.push(WorkEntry::Tool(std::sync::Arc::new(call)));
                         self.items.len() - 1
                     }
                     _ => {
                         self.push(
                             format!("work-{id}"),
-                            ItemKind::Work(vec![WorkEntry::Tool(Box::new(call))]),
+                            ItemKind::Work(vec![WorkEntry::Tool(std::sync::Arc::new(call))]),
                         );
                         self.items.len() - 1
                     }
@@ -2396,7 +2423,7 @@ impl SessionView {
             return;
         };
         let Some(call) = entries.iter_mut().find_map(|e| match e {
-            WorkEntry::Tool(c) if c.id == id => Some(c),
+            WorkEntry::Tool(c) if c.id == id => Some(std::sync::Arc::make_mut(c)),
             _ => None,
         }) else {
             return;
@@ -2447,7 +2474,7 @@ impl SessionView {
                     _ => {}
                 }
             }
-            call.output = output;
+            call.set_output(output);
             if !diffs.is_empty() {
                 call.synthesized = false;
                 call.stats = diffs
@@ -2459,10 +2486,11 @@ impl SessionView {
         } else if call.output.is_empty()
             && let Some(raw) = update.get("rawOutput").filter(|v| !v.is_null())
         {
-            call.output = raw
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| raw.to_string());
+            call.set_output(
+                raw.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| raw.to_string()),
+            );
         }
         // Edit tools report a receipt, not a diff: rebuild one from the arguments.
         if call.diffs.is_empty() || call.synthesized {
@@ -2488,7 +2516,6 @@ mod diff_tests {
     #[test]
     fn multiedit_receipt_anchors_line_numbers() {
         let call = ToolCall {
-            id: "t".into(),
             title: "Run multiedit".into(),
             kind: "edit".into(),
             status: "completed".into(),
@@ -2499,13 +2526,9 @@ mod diff_tests {
                     { "old_string": "z", "new_string": "" }
                 ]
             })),
-            output: "OK paths=1 edits=2 added=2 deleted=1\nP /x/a.rs\nH replace old=10,2 new=10,3 +2 -1\nH replace old=40,1 new=41,0 +0 -1".into(),
-            diffs: vec![],
-            locations: vec![],
-            stats: (0, 0),
-            synthesized: false,
-            child_session: None,
-        };
+            ..ToolCall::new("t")
+        }
+        .with_output("OK paths=1 edits=2 added=2 deleted=1\nP /x/a.rs\nH replace old=10,2 new=10,3 +2 -1\nH replace old=40,1 new=41,0 +0 -1");
         let diffs = synthesized_diffs(&call);
         assert_eq!(diffs.len(), 2);
         assert_eq!(
@@ -2522,20 +2545,15 @@ mod diff_tests {
     #[test]
     fn failed_or_running_edits_have_no_diff() {
         let mut call = ToolCall {
-            id: "t".into(),
             title: "Run edit".into(),
             kind: "edit".into(),
             status: "completed".into(),
             input: Some(json!({ "file_path": "a", "old_string": "x", "new_string": "y" })),
-            output: "old_string not found in content".into(),
-            diffs: vec![],
-            locations: vec![],
-            stats: (0, 0),
-            synthesized: false,
-            child_session: None,
-        };
+            ..ToolCall::new("t")
+        }
+        .with_output("old_string not found in content");
         assert!(synthesized_diffs(&call).is_empty());
-        call.output = String::new();
+        call.set_output(String::new());
         call.status = "in_progress".into();
         assert!(synthesized_diffs(&call).is_empty());
         call.status = "completed".into();

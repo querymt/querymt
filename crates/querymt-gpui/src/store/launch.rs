@@ -289,6 +289,13 @@ impl AgentsStore {
 /// Peer profile lists, keyed by node id.
 pub type PeerProfileMap = HashMap<String, PeerProfiles>;
 
+#[cfg(test)]
+impl AgentsStore {
+    pub(crate) fn runtime_mut_for_test(&mut self, agent: &str) -> &mut super::AgentRuntime {
+        self.runtime.entry(agent.to_owned()).or_default()
+    }
+}
+
 /// A connected agent with one mesh peer (`thor`), worktrees and profiles.
 #[cfg(test)]
 pub(crate) fn peer_fixture() -> AgentsStore {

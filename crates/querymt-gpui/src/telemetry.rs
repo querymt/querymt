@@ -35,6 +35,8 @@ mod web {
     pub fn record_follow_engaged() {}
     pub fn record_remeasure() {}
     pub fn record_history_load(_: &'static str) {}
+    pub fn record_frame(_: f64, _: usize) {}
+    pub fn record_row(_: f64, _: &'static str, _: usize) {}
 }
 #[cfg(target_family = "wasm")]
 pub use web::*;
@@ -307,6 +309,12 @@ mod native {
             pub remeasure: Counter<u64>,
             /// Older-history page loads, by `outcome`.
             pub history_loads: Counter<u64>,
+            /// Transcript build, layout and prepaint per frame, ms.
+            pub frame_ms: Histogram<f64>,
+            /// Transcript rows built per frame.
+            pub frame_rows: Histogram<u64>,
+            /// Time to build one transcript row, ms, by `kind` and `entries`.
+            pub row_ms: Histogram<f64>,
         }
 
         pub fn instruments() -> &'static Instruments {
@@ -340,6 +348,25 @@ mod native {
                         .u64_counter("querymt_gpui.transcript.history_load")
                         .with_description("Older history pages requested")
                         .build(),
+                    frame_ms: meter
+                        .f64_histogram("querymt_gpui.transcript.frame_ms")
+                        .with_unit("ms")
+                        .with_description("Transcript build, layout and prepaint per frame")
+                        .with_boundaries(vec![
+                            2., 4., 8., 12., 16., 24., 33., 50., 100., 200., 500.,
+                        ])
+                        .build(),
+                    frame_rows: meter
+                        .u64_histogram("querymt_gpui.transcript.frame_rows")
+                        .with_description("Transcript rows built per frame")
+                        .with_boundaries(vec![5., 10., 20., 40., 80., 160., 320.])
+                        .build(),
+                    row_ms: meter
+                        .f64_histogram("querymt_gpui.transcript.row_ms")
+                        .with_unit("ms")
+                        .with_description("Time to build one transcript row")
+                        .with_boundaries(vec![0.1, 0.25, 0.5, 1., 2., 4., 8., 16., 33., 100.])
+                        .build(),
                 }
             })
         }
@@ -367,5 +394,27 @@ mod native {
     }
     pub fn record_history_load(outcome: &'static str) {
         record(|m| m.history_loads.add(1, &[KeyValue::new("outcome", outcome)]));
+    }
+    pub fn record_frame(ms: f64, rows: usize) {
+        record(|m| {
+            m.frame_ms.record(ms, &[]);
+            m.frame_rows.record(rows as u64, &[]);
+        });
+    }
+    /// `entries`: work entries the row holds (0 for other rows), bucketed so
+    /// a slow kind of row stands out without unbounded attribute values.
+    pub fn record_row(ms: f64, kind: &'static str, entries: usize) {
+        let size = match entries {
+            0 => "0",
+            1..50 => "<50",
+            50..500 => "<500",
+            _ => "500+",
+        };
+        record(|m| {
+            m.row_ms.record(
+                ms,
+                &[KeyValue::new("kind", kind), KeyValue::new("entries", size)],
+            )
+        });
     }
 }

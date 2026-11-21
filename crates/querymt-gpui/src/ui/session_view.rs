@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -118,7 +119,7 @@ const TOOL_ROW_GROUP: &str = "tool-row";
 /// only where an item's signature (revision, expansion, turn state) changed.
 pub struct Transcript {
     pub list: ListState,
-    items: Rc<RefCell<Vec<Rc<Item>>>>,
+    items: Rc<RefCell<Vec<Rc<Row>>>>,
     sigs: Vec<u64>,
     /// Item keys, to recognise older history prepended above the current first item.
     keys: Vec<String>,
@@ -145,6 +146,38 @@ struct ScrollProbe {
     following: bool,
     item_count: usize,
     layout_seq: u64,
+    /// Session shown, for slow-frame reports.
+    session: String,
+    /// This frame so far: when its first row started building, rows built,
+    /// and the slowest row (key, kind, work entries, ms).
+    frame_started: Option<f64>,
+    rows_built: usize,
+    slowest: Option<(String, &'static str, usize, f64)>,
+}
+
+/// A transcript frame slower than this is reported (two 60 Hz frames).
+const SLOW_FRAME_MS: f64 = 33.;
+
+impl ScrollProbe {
+    /// Row `row` was built, starting at `started` (ms).
+    fn row_built(&mut self, row: &Row, started: f64) {
+        let ms = crate::util::now_ms() - started;
+        let (kind, entries) = match (&row.part, &row.item.kind) {
+            (Part::Head, ItemKind::Work(e)) => ("work_head", e.len()),
+            (Part::Block { range, .. }, _) => ("work_block", range.len()),
+            (_, ItemKind::Work(e)) => ("work", e.len()),
+            (_, ItemKind::User { .. }) => ("user", 0),
+            (_, ItemKind::Agent { .. }) => ("reply", 0),
+            (_, ItemKind::Notice { .. }) => ("notice", 0),
+            (_, ItemKind::Compaction(_)) => ("compaction", 0),
+        };
+        crate::telemetry::record_row(ms, kind, entries);
+        self.frame_started.get_or_insert(started);
+        self.rows_built += 1;
+        if self.slowest.as_ref().is_none_or(|s| ms > s.3) {
+            self.slowest = Some((row.key.clone(), kind, entries, ms));
+        }
+    }
 }
 
 /// Frame movement beyond which content moving with the input is still a jump.
@@ -171,6 +204,29 @@ fn sample_transcript(
     let mut p = probe.borrow_mut();
     p.layout_seq += 1;
     let layout_seq = p.layout_seq;
+    // Rows built this frame: from the first one to after the list's layout
+    // and prepaint (this sampler prepaints after the list).
+    if let Some(started) = p.frame_started.take() {
+        let frame_ms = crate::util::now_ms() - started;
+        let rows = std::mem::take(&mut p.rows_built);
+        let slowest = p.slowest.take();
+        crate::telemetry::record_frame(frame_ms, rows);
+        if frame_ms > SLOW_FRAME_MS {
+            let (row_key, row_kind, row_entries, row_ms) = slowest.unwrap_or_default();
+            tracing::warn!(
+                session.id = p.session.as_str(),
+                frame.ms = frame_ms,
+                frame.rows = rows,
+                row.key = row_key.as_str(),
+                row.kind = row_kind,
+                row.entries = row_entries,
+                row.ms = row_ms,
+                list.scroll_top_ix = list.logical_scroll_top().item_ix,
+                list.item_count = list.item_count(),
+                "slow transcript frame"
+            );
+        }
+    }
     // Content movement of the row that was first on screen last frame, when
     // it is still laid out and no rows were inserted above it.
     let shift = p
@@ -291,13 +347,11 @@ impl RenderCtx {
         match &item.kind {
             ItemKind::Work(entries) => {
                 self.expanded.contains(&item.key).hash(&mut h);
-                for e in entries {
-                    self.expanded.contains(e.id()).hash(&mut h);
-                    if let WorkEntry::Tool(call) = e {
-                        self.expanded
-                            .contains(&tool_details_key(&call.id))
-                            .hash(&mut h);
-                    }
+                // Only the visible blocks' expansion shows (a running group
+                // can hold thousands of hidden entries).
+                let plan = WorkPlan::of(ix, item, entries, self);
+                for block in plan.visible() {
+                    self.hash_entries(&entries[block.clone()], &mut h);
                 }
                 (self.running && ix >= self.last_turn_start).hash(&mut h);
                 (self.running && ix == self.last_ix).hash(&mut h);
@@ -310,15 +364,86 @@ impl RenderCtx {
             }
             _ => self.expanded.contains(&item.key).hash(&mut h),
         }
-        self.turn_end.get(&ix).hash(&mut h);
-        if let Some(user) = self.turn_user.get(&ix) {
-            self.undo_ready.hash(&mut h);
-            self.undoable.contains(user).hash(&mut h);
-            (self.redo_target.as_ref() == Some(user)).hash(&mut h);
+        self.hash_turn(ix, item, &mut h);
+        h.finish()
+    }
+
+    /// Expansion state of work entries.
+    fn hash_entries(&self, entries: &[WorkEntry], h: &mut DefaultHasher) {
+        for e in entries {
+            self.expanded.contains(e.id()).hash(h);
+            if let WorkEntry::Tool(call) = e {
+                self.expanded.contains(&tool_details_key(&call.id)).hash(h);
+            }
         }
-        self.reverted_from.is_some_and(|r| ix >= r).hash(&mut h);
-        (self.copied.as_deref() == Some(item.key.as_str())).hash(&mut h);
-        (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(&mut h);
+    }
+
+    /// What the closing row of a turn shows besides its content: response
+    /// actions, undo/redo, dimming after an undo, the copied flash, theme.
+    fn hash_turn(&self, ix: usize, item: &Item, h: &mut DefaultHasher) {
+        self.turn_end.get(&ix).hash(h);
+        if let Some(user) = self.turn_user.get(&ix) {
+            self.undo_ready.hash(h);
+            self.undoable.contains(user).hash(h);
+            (self.redo_target.as_ref() == Some(user)).hash(h);
+        }
+        self.reverted_from.is_some_and(|r| ix >= r).hash(h);
+        (self.copied.as_deref() == Some(item.key.as_str())).hash(h);
+        self.hash_globals(h);
+    }
+
+    /// What every row depends on: the syntax theme.
+    fn hash_globals(&self, h: &mut DefaultHasher) {
+        (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(h);
+    }
+
+    /// Signature of one transcript row: it changes exactly when the row's
+    /// content or height may.
+    fn row_sig(&self, item: &Item, row: &RowSpec) -> u64 {
+        let ix = row.ix;
+        let ItemKind::Work(entries) = &item.kind else {
+            return self.sig(ix, item);
+        };
+        let mut h = DefaultHasher::new();
+        match &row.part {
+            Part::Whole => return self.sig(ix, item),
+            Part::Head => {
+                // Counts and the hidden total follow the item's revision.
+                ("head", item.rev).hash(&mut h);
+                self.expanded.contains(&item.key).hash(&mut h);
+                (self.running && ix >= self.last_turn_start).hash(&mut h);
+                self.reverted_from.is_some_and(|r| ix >= r).hash(&mut h);
+                self.hash_globals(&mut h);
+            }
+            Part::Block {
+                range,
+                live,
+                first,
+                last,
+            } => {
+                (range.start, range.len(), live, first, last).hash(&mut h);
+                for e in &entries[range.clone()] {
+                    match e {
+                        // A changed call is a new allocation (`Arc::make_mut`
+                        // while the transcript holds the old one).
+                        WorkEntry::Tool(call) => (
+                            std::sync::Arc::as_ptr(call) as usize,
+                            call.status.as_str(),
+                            call.output().len(),
+                        )
+                            .hash(&mut h),
+                        WorkEntry::Thought(t) => (t.id.as_str(), t.text.len()).hash(&mut h),
+                    }
+                }
+                self.hash_entries(&entries[range.clone()], &mut h);
+                if *last {
+                    self.hash_turn(ix, item, &mut h);
+                } else {
+                    self.reverted_from.is_some_and(|r| ix >= r).hash(&mut h);
+                    self.hash_globals(&mut h);
+                }
+            }
+        }
         h.finish()
     }
 }
@@ -327,7 +452,7 @@ impl Transcript {
     pub fn new() -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(1200.));
         list.set_follow_mode(FollowMode::Tail);
-        let items: Rc<RefCell<Vec<Rc<Item>>>> = Rc::default();
+        let items: Rc<RefCell<Vec<Rc<Row>>>> = Rc::default();
         let md = md::Kept::default();
         // A row whose Markdown is still parsing measures short: keep that
         // height provisional so the list neither anchors to it nor re-engages
@@ -354,65 +479,78 @@ impl Transcript {
     }
 
     fn sync(&mut self, session: &str, view: &[Item], rc: &RenderCtx) {
-        let sigs: Vec<u64> = view
-            .iter()
-            .enumerate()
-            .map(|(ix, i)| rc.sig(ix, i))
-            .collect();
-        let keys: Vec<String> = view.iter().map(|i| i.key.clone()).collect();
+        let specs = transcript_rows(view, rc);
+        let sigs: Vec<u64> = specs.iter().map(|r| rc.row_sig(&view[r.ix], r)).collect();
+        // One snapshot per item, shared by its rows; taken only for rows
+        // that changed.
+        let mut snapshots: HashMap<usize, Rc<Item>> = HashMap::new();
+        let mut row = |spec: &RowSpec| -> Rc<Row> {
+            let item = snapshots
+                .entry(spec.ix)
+                .or_insert_with(|| Rc::new(view[spec.ix].clone()))
+                .clone();
+            Rc::new(Row {
+                item,
+                ix: spec.ix,
+                part: spec.part.clone(),
+                key: spec.key.clone(),
+            })
+        };
+        let keys: Vec<String> = specs.iter().map(|r| r.key.clone()).collect();
         if session != self.session {
             self.session = session.to_string();
             if crate::telemetry::enabled() {
                 let mut probe = self.probe.borrow_mut();
                 *probe = ScrollProbe {
                     layout_seq: probe.layout_seq,
+                    session: session.to_string(),
                     ..Default::default()
                 };
             }
             self.block_scrolls.borrow_mut().clear();
             self.md.clear();
-            *self.items.borrow_mut() = view.iter().cloned().map(Rc::new).collect();
+            *self.items.borrow_mut() = specs.iter().map(&mut row).collect();
+            self.list.reset(specs.len());
             self.sigs = sigs;
             self.keys = keys;
-            self.list.reset(view.len());
             self.list.set_follow_mode(FollowMode::Tail);
             self.list.scroll_to_end();
             return;
         }
-        // Older history was prepended: insert those rows above, so the list's
-        // scroll anchor shifts with them and the reader stays where they were.
-        if let Some(first) = self.keys.first()
-            && let Some(added) = keys.iter().position(|k| k == first).filter(|&n| n > 0)
-        {
-            let mut items = self.items.borrow_mut();
-            let older: Vec<Rc<Item>> = view[..added].iter().cloned().map(Rc::new).collect();
-            items.splice(0..0, older);
-            self.sigs.splice(0..0, sigs[..added].iter().copied());
-            self.keys.splice(0..0, keys[..added].iter().cloned());
-            self.list.splice(0..0, added);
-            tracing::debug!(rows = added, "older history rows prepended");
-        }
-        let old_len = self.sigs.len();
+        // Rows kept at both ends (same key) update in place; the rows between
+        // them are replaced with one splice. Older history prepended above,
+        // or a large work group opening into one row per block, is a single
+        // splice, so the list's scroll anchor shifts with it.
+        let (old_len, new_len) = (self.keys.len(), keys.len());
+        let common = old_len.min(new_len);
+        let head = (0..common).take_while(|&i| self.keys[i] == keys[i]).count();
+        let tail = (0..common - head)
+            .take_while(|&i| self.keys[old_len - 1 - i] == keys[new_len - 1 - i])
+            .count();
         let mut items = self.items.borrow_mut();
-        for ix in 0..old_len.min(view.len()) {
-            if self.keys[ix] != keys[ix] || self.sigs[ix] != sigs[ix] {
-                items[ix] = Rc::new(view[ix].clone());
-                if self.keys[ix] == keys[ix] {
-                    // Height changed, not identity: keep the reader's offset
-                    // inside a potentially very tall work-group row.
-                    self.list.remeasure_items(ix..ix + 1);
-                    crate::telemetry::record_remeasure();
-                } else {
-                    self.list.splice(ix..ix + 1, 1);
-                }
+        let kept = (0..head).chain(new_len - tail..new_len);
+        for new_ix in kept {
+            let old_ix = if new_ix < head {
+                new_ix
+            } else {
+                new_ix + old_len - new_len
+            };
+            if self.sigs[old_ix] != sigs[new_ix] {
+                items[old_ix] = row(&specs[new_ix]);
+                // Height changed, not identity: keep the reader's offset
+                // inside a potentially tall row.
+                self.list.remeasure_items(old_ix..old_ix + 1);
+                crate::telemetry::record_remeasure();
             }
         }
-        if view.len() > old_len {
-            items.extend(view[old_len..].iter().cloned().map(Rc::new));
-            self.list.splice(old_len..old_len, view.len() - old_len);
-        } else if view.len() < old_len {
-            items.truncate(view.len());
-            self.list.splice(view.len()..old_len, 0);
+        let (old_mid, new_mid) = (head..old_len - tail, head..new_len - tail);
+        if !old_mid.is_empty() || !new_mid.is_empty() {
+            let fresh: Vec<Rc<Row>> = specs[new_mid.clone()].iter().map(&mut row).collect();
+            items.splice(old_mid.clone(), fresh);
+            self.list.splice(old_mid.clone(), new_mid.len());
+            if head == 0 && tail == old_len && old_len > 0 {
+                tracing::debug!(rows = new_mid.len(), "older history rows prepended");
+            }
         }
         self.sigs = sigs;
         self.keys = keys;
@@ -651,7 +789,7 @@ fn tool_preview(call: &ToolCall, cwd: &str) -> String {
 fn tool_preview_raw(call: &ToolCall) -> String {
     let name = concrete_tool_name(call);
     if is_skill(call)
-        && let Some(skill) = SkillContent::parse(&call.output)
+        && let Some(skill) = SkillContent::parse(call.output())
     {
         return skill.name.to_string();
     }
@@ -660,7 +798,7 @@ fn tool_preview_raw(call: &ToolCall) -> String {
             .locations
             .first()
             .cloned()
-            .unwrap_or_else(|| result_preview(&call.output));
+            .unwrap_or_else(|| result_preview(call.output()));
     };
     let s = |k: &str| {
         args.get(k)
@@ -750,7 +888,7 @@ fn tool_preview_raw(call: &ToolCall) -> String {
                     (None, None) => path,
                 }
             }
-            None => result_preview(&call.output),
+            None => result_preview(call.output()),
         },
         _ => file()
             .or_else(|| s("root"))
@@ -767,7 +905,7 @@ fn tool_preview_raw(call: &ToolCall) -> String {
                     .collect();
                 (!paths.is_empty()).then(|| paths.join(", "))
             })
-            .unwrap_or_else(|| result_preview(&call.output)),
+            .unwrap_or_else(|| result_preview(call.output())),
     }
 }
 
@@ -1266,7 +1404,7 @@ fn attaches_to_header(call: &ToolCall) -> bool {
         || is_shell(call)
         || is_read(call)
         || is_fetch(call)
-        || (is_skill(call) && !call.failed() && SkillContent::parse(&call.output).is_some())
+        || (is_skill(call) && !call.failed() && SkillContent::parse(call.output()).is_some())
         || (!call.failed() && DelegateBrief::parse(call).is_some())
 }
 
@@ -1632,7 +1770,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     let p = &rc.p;
     if is_skill(call)
         && !call.failed()
-        && let Some(skill) = SkillContent::parse(&call.output)
+        && let Some(skill) = SkillContent::parse(call.output())
     {
         return render_skill_content(call, &skill, rc);
     }
@@ -1667,7 +1805,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             }))
             .when(call.failed() && !output.trim().is_empty(), |el| {
                 el.child(
-                    flat_block(clipped(&output, OUTPUT_LINES), p)
+                    flat_block(clipped(output, OUTPUT_LINES), p)
                         .border_t_1()
                         .border_color(p.border)
                         .text_color(p.danger),
@@ -1690,7 +1828,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 )
                 .into_any_element()
             } else {
-                let block = flat_block(clipped(&output, OUTPUT_LINES), p)
+                let block = flat_block(clipped(output, OUTPUT_LINES), p)
                     .when(call.failed(), |el| el.text_color(p.danger));
                 scroll_area(
                     format!("term-{}", call.id),
@@ -1717,7 +1855,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             )
             .into_any_element()
         } else {
-            let text = clipped(&output, READ_LINES);
+            let text = clipped(output, READ_LINES);
             let block = flat_frame(p)
                 .when(call.failed(), |el| el.text_color(p.danger))
                 .child(linked_text(
@@ -1746,12 +1884,12 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         ));
     }
     if call.failed() {
-        return body.child(flat_block(clipped(&output, OUTPUT_LINES), p).text_color(p.danger));
+        return body.child(flat_block(clipped(output, OUTPUT_LINES), p).text_color(p.danger));
     }
     let path = call.summary();
     let code = super::code::read_output(
         &format!("read-{}", call.id),
-        &output,
+        output,
         Some(path.as_str()).filter(|s| !s.is_empty()),
         READ_LINES,
         true,
@@ -1792,7 +1930,7 @@ fn tool_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         el.child(detail_section(
             SharedString::from(format!("cp-out-{}", call.id)),
             if call.failed() { "Error" } else { "Result" },
-            output,
+            output.to_string(),
             call.failed(),
             p,
         ))
@@ -2071,30 +2209,83 @@ fn reasoning_title(text: &str) -> String {
     }
 }
 
-/// Splits work entries into tools and reasoning blocks: consecutive summary
-/// thoughts form one block, any other thought is a block of its own
-/// (desktop `groupConsecutiveReasoning`).
-fn group_work(entries: &[WorkEntry]) -> Vec<WorkBlock<'_>> {
-    let mut out: Vec<WorkBlock> = Vec::new();
-    for e in entries {
-        match e {
-            WorkEntry::Tool(call) => out.push(WorkBlock::Tool(call)),
-            WorkEntry::Thought(t) => match out.last_mut() {
-                Some(WorkBlock::Reasoning(run))
-                    if t.is_summary() && run.iter().all(|r| r.is_summary()) =>
-                {
-                    run.push(t)
-                }
-                _ => out.push(WorkBlock::Reasoning(vec![t])),
-            },
+/// Splits work entries into tools and reasoning blocks, as `start..end`
+/// ranges: consecutive summary thoughts form one block, any other thought is
+/// a block of its own (desktop `groupConsecutiveReasoning`).
+fn work_blocks(entries: &[WorkEntry]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let joins = match e {
+            WorkEntry::Thought(t) if t.is_summary() => out.last().is_some_and(|b| {
+                entries[b.clone()]
+                    .iter()
+                    .all(|x| matches!(x, WorkEntry::Thought(r) if r.is_summary()))
+            }),
+            _ => false,
+        };
+        match out.last_mut() {
+            Some(last) if joins => last.end = i + 1,
+            _ => out.push(i..i + 1),
         }
     }
     out
 }
 
-enum WorkBlock<'a> {
-    Tool(&'a ToolCall),
-    Reasoning(Vec<&'a Thought>),
+/// Expanded work groups with more visible blocks than this become one
+/// transcript row per block, so the list builds and lays out only the
+/// blocks on screen.
+const SPLIT_BLOCKS: usize = 12;
+
+/// How a work group shows: its blocks, the visible ones, and its header.
+struct WorkPlan {
+    /// A settled turn's group: a summary row, open or closed.
+    settled: bool,
+    open: bool,
+    blocks: Vec<Range<usize>>,
+    /// Blocks shown: `blocks[visible_from..]` (none for a closed summary).
+    visible_from: usize,
+    /// The last visible block is the live end of a running turn.
+    live_tail: bool,
+}
+
+impl WorkPlan {
+    fn of(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) -> Self {
+        let settled = !(rc.running && ix >= rc.last_turn_start);
+        let open = rc.expanded.contains(&item.key);
+        let blocks = work_blocks(entries);
+        // Summary runs show as one block, so collapsing counts blocks, not entries.
+        let visible_from = if settled && !open {
+            blocks.len()
+        } else if settled || open || blocks.len() <= 3 {
+            0
+        } else {
+            blocks.len() - 2
+        };
+        Self {
+            settled,
+            open,
+            visible_from,
+            live_tail: rc.running && ix == rc.last_ix,
+            blocks,
+        }
+    }
+
+    fn visible(&self) -> &[Range<usize>] {
+        &self.blocks[self.visible_from..]
+    }
+
+    fn hidden(&self) -> usize {
+        if self.settled { 0 } else { self.visible_from }
+    }
+
+    /// A header row: the settled summary, or the running group's toggle.
+    fn has_header(&self) -> bool {
+        self.settled || self.hidden() > 0 || self.open && self.blocks.len() > 3
+    }
+
+    fn split(&self) -> bool {
+        self.visible().len() > SPLIT_BLOCKS
+    }
 }
 
 /// A reasoning block (desktop `SessionReasoningBlock`). A run of provider
@@ -2201,10 +2392,87 @@ fn render_reasoning(thoughts: &[&Thought], live: bool, rc: &RenderCtx) -> AnyEle
         .into_any_element()
 }
 
+/// A whole work group in one row: its header and visible blocks.
 fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) -> AnyElement {
+    let plan = WorkPlan::of(ix, item, entries, rc);
+    let visible = plan.visible();
+    let n = visible.len();
+    v_flex()
+        .w_full()
+        .children(work_header(item, entries, &plan, rc))
+        .children(visible.iter().enumerate().map(|(i, block)| {
+            render_block(&entries[block.clone()], plan.live_tail && i + 1 == n, rc)
+        }))
+        .into_any_element()
+}
+
+/// One block of a work group: a tool call or a run of reasoning. `live`:
+/// the last block of a running turn (only it can still stream).
+fn render_block(entries: &[WorkEntry], live: bool, rc: &RenderCtx) -> AnyElement {
+    match entries {
+        [WorkEntry::Tool(call)] => render_tool(call, rc),
+        _ => {
+            let thoughts: Vec<&Thought> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    WorkEntry::Thought(t) => Some(t),
+                    WorkEntry::Tool(_) => None,
+                })
+                .collect();
+            render_reasoning(&thoughts, live, rc)
+        }
+    }
+}
+
+/// Header of a work group: the settled turn's summary (closed or open), or
+/// the running group's "+N previous work entries" / "Show fewer" toggle.
+fn work_header(
+    item: &Item,
+    entries: &[WorkEntry],
+    plan: &WorkPlan,
+    rc: &RenderCtx,
+) -> Option<AnyElement> {
+    if !plan.has_header() {
+        return None;
+    }
     let p = &rc.p;
-    let settled = !(rc.running && ix >= rc.last_turn_start);
-    let open = rc.expanded.contains(&item.key);
+    let (key, weak) = (item.key.clone(), rc.weak.clone());
+    let hover = p.card_hover.opacity(0.55);
+    let id = SharedString::from(format!("work-{}", item.key));
+    if !plan.settled {
+        let hidden = plan.hidden();
+        return Some(
+            h_flex()
+                .id(id)
+                .gap_1p5()
+                .px_1p5()
+                .py_1()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .text_xs()
+                .text_color(p.dim)
+                .child(kit::icon(
+                    if plan.open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    },
+                    12.,
+                    p.dim,
+                ))
+                .child(if plan.open {
+                    "Show fewer work entries".to_string()
+                } else {
+                    format!(
+                        "+{hidden} previous work {}",
+                        if hidden == 1 { "entry" } else { "entries" }
+                    )
+                })
+                .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
+                .into_any_element(),
+        );
+    }
     let tools = entries
         .iter()
         .filter(|e| matches!(e, WorkEntry::Tool(_)))
@@ -2227,12 +2495,9 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
     } else {
         format!("Worked through {}", parts.join(" and "))
     };
-    let (key, weak) = (item.key.clone(), rc.weak.clone());
-    let hover = p.card_hover.opacity(0.55);
-
-    if settled && !open {
-        return h_flex()
-            .id(SharedString::from(format!("work-{}", item.key)))
+    Some(
+        h_flex()
+            .id(id)
             .gap_2()
             .px_1p5()
             .min_h(px(29.))
@@ -2257,7 +2522,7 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
                     .text_color(p.muted)
                     .child(summary),
             )
-            .when(failed > 0, |el| {
+            .when(failed > 0 && !plan.open, |el| {
                 el.child(
                     h_flex()
                         .gap_1()
@@ -2268,101 +2533,18 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
                         .child(failed.to_string()),
                 )
             })
-            .child(kit::icon(IconName::ChevronRight, 13., p.dim))
-            .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
-            .into_any_element();
-    }
-
-    // Summary runs show as one block, so collapsing counts blocks, not entries.
-    let blocks = group_work(entries);
-    let show_all = settled || open || blocks.len() <= 3;
-    let visible: &[WorkBlock] = if show_all {
-        &blocks
-    } else {
-        &blocks[blocks.len() - 2..]
-    };
-    let hidden = blocks.len() - visible.len();
-    // Only the last row streams: reasoning in an earlier work group of the
-    // turn is done once a reply or another group follows it.
-    let last_live = rc.running && ix == rc.last_ix;
-    let header: Option<AnyElement> = if settled {
-        Some(
-            h_flex()
-                .id(SharedString::from(format!("work-{}", item.key)))
-                .gap_2()
-                .px_1p5()
-                .min_h(px(29.))
-                .rounded(px(8.))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .text_xs()
-                .child(
-                    div()
-                        .w(px(20.))
-                        .flex_none()
-                        .flex()
-                        .justify_center()
-                        .child(kit::icon(IconName::Wrench, 14., p.dim)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_medium()
-                        .text_color(p.muted)
-                        .child(summary),
-                )
-                .child(kit::icon(IconName::ChevronDown, 13., p.dim))
-                .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
-                .into_any_element(),
-        )
-    } else if hidden > 0 || open && blocks.len() > 3 {
-        Some(
-            h_flex()
-                .id(SharedString::from(format!("work-{}", item.key)))
-                .gap_1p5()
-                .px_1p5()
-                .py_1()
-                .rounded(px(8.))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .text_xs()
-                .text_color(p.dim)
-                .child(kit::icon(
-                    if open {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    },
-                    12.,
-                    p.dim,
-                ))
-                .child(if open {
-                    "Show fewer work entries".to_string()
+            .child(kit::icon(
+                if plan.open {
+                    IconName::ChevronDown
                 } else {
-                    format!(
-                        "+{hidden} previous work {}",
-                        if hidden == 1 { "entry" } else { "entries" }
-                    )
-                })
-                .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
-                .into_any_element(),
-        )
-    } else {
-        None
-    };
-    let n = visible.len();
-    v_flex()
-        .w_full()
-        .children(header)
-        .children(visible.iter().enumerate().map(|(i, b)| match b {
-            WorkBlock::Tool(call) => render_tool(call, rc),
-            WorkBlock::Reasoning(thoughts) => {
-                render_reasoning(thoughts, last_live && i + 1 == n, rc)
-            }
-        }))
-        .into_any_element()
+                    IconName::ChevronRight
+                },
+                13.,
+                p.dim,
+            ))
+            .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
+            .into_any_element(),
+    )
 }
 
 /// Copy / change-stats row under the last block of a turn (desktop "response actions").
@@ -2533,11 +2715,7 @@ fn render_user_attachment(key: &str, ix: usize, a: &UserAttachment, rc: &RenderC
 fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
     let p = &rc.p;
     // Response actions appear once the turn has settled, like the desktop app.
-    let actions = rc
-        .turn_end
-        .get(&ix)
-        .copied()
-        .filter(|_| !(rc.running && ix >= rc.last_turn_start));
+    let actions = turn_actions_of(ix, rc);
     let body = match &item.kind {
         ItemKind::User {
             text,
@@ -2701,6 +2879,18 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             .into_any_element(),
         ItemKind::Compaction(c) => render_compaction(item, c, rc),
     };
+    row_frame(ix, body, (true, true), rc)
+}
+
+/// The document column around a row. `(top, bottom)`: the row starts or
+/// ends its item, so it takes the gap between items on that side (rows of a
+/// split work group sit flush against each other).
+fn row_frame(
+    ix: usize,
+    body: AnyElement,
+    (top, bottom): (bool, bool),
+    rc: &RenderCtx,
+) -> AnyElement {
     // Turns rolled back by an undo stay visible, dimmed, until the next prompt.
     let reverted = rc.reverted_from.is_some_and(|r| ix >= r);
     // Center the column like a document; the list itself spans the page.
@@ -2709,10 +2899,127 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
         .flex()
         .justify_center()
         .px_6()
-        .py_1()
+        .when(top, |el| el.pt_1())
+        .when(bottom, |el| el.pb_1())
         .when(reverted, |el| el.opacity(0.5))
         .child(div().w_full().max_w(px(CHAT_MAX)).child(body))
         .into_any_element()
+}
+
+/// One transcript list row: a whole view item, or part of a large work
+/// group (see [`SPLIT_BLOCKS`]).
+#[derive(Clone)]
+struct Row {
+    item: Rc<Item>,
+    /// Index of the item in the view.
+    ix: usize,
+    part: Part,
+    key: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Part {
+    Whole,
+    /// The group's header row.
+    Head,
+    /// One visible block: `entries[range]`.
+    Block {
+        range: Range<usize>,
+        live: bool,
+        /// First row of the group (no header) / last row of the group.
+        first: bool,
+        last: bool,
+    },
+}
+
+/// A row before its item is snapshotted: view index, part and key.
+struct RowSpec {
+    ix: usize,
+    part: Part,
+    key: String,
+}
+
+/// Rows of the view: one per item, and a large expanded work group as its
+/// header plus one row per visible block.
+fn transcript_rows(view: &[Item], rc: &RenderCtx) -> Vec<RowSpec> {
+    let mut rows = Vec::with_capacity(view.len());
+    for (ix, item) in view.iter().enumerate() {
+        let plan = match &item.kind {
+            ItemKind::Work(entries) => Some(WorkPlan::of(ix, item, entries, rc)),
+            _ => None,
+        };
+        let (Some(plan), ItemKind::Work(entries)) = (plan.filter(WorkPlan::split), &item.kind)
+        else {
+            rows.push(RowSpec {
+                key: item.key.clone(),
+                ix,
+                part: Part::Whole,
+            });
+            continue;
+        };
+        if plan.has_header() {
+            rows.push(RowSpec {
+                key: format!("{}#head", item.key),
+                ix,
+                part: Part::Head,
+            });
+        }
+        let visible = plan.visible();
+        let n = visible.len();
+        for (i, block) in visible.iter().enumerate() {
+            rows.push(RowSpec {
+                key: format!("{}#{}", item.key, entries[block.start].id()),
+                ix,
+                part: Part::Block {
+                    range: block.clone(),
+                    live: plan.live_tail && i + 1 == n,
+                    first: i == 0 && !plan.has_header(),
+                    last: i + 1 == n,
+                },
+            });
+        }
+    }
+    rows
+}
+
+fn render_row(row: &Row, rc: &RenderCtx) -> AnyElement {
+    let (ix, item) = (row.ix, row.item.as_ref());
+    match (&row.part, &item.kind) {
+        (Part::Head, ItemKind::Work(entries)) => {
+            let plan = WorkPlan::of(ix, item, entries, rc);
+            let body =
+                work_header(item, entries, &plan, rc).unwrap_or_else(|| div().into_any_element());
+            row_frame(ix, body, (true, false), rc)
+        }
+        (
+            Part::Block {
+                range,
+                live,
+                first,
+                last,
+            },
+            ItemKind::Work(entries),
+        ) => {
+            let actions = last.then(|| turn_actions_of(ix, rc)).flatten();
+            let body = v_flex()
+                .w_full()
+                .child(render_block(&entries[range.clone()], *live, rc))
+                .when_some(actions, |el, stats| {
+                    el.child(turn_actions(ix, item, stats, rc))
+                })
+                .into_any_element();
+            row_frame(ix, body, (*first, *last), rc)
+        }
+        _ => render_item(ix, item, rc),
+    }
+}
+
+/// Response actions of a settled turn's closing item.
+fn turn_actions_of(ix: usize, rc: &RenderCtx) -> Option<(usize, usize, usize)> {
+    rc.turn_end
+        .get(&ix)
+        .copied()
+        .filter(|_| !(rc.running && ix >= rc.last_turn_start))
 }
 
 /// For each turn's closing Agent/Work item, the message id of its user prompt.
@@ -4422,6 +4729,9 @@ impl QmtApp {
         } else {
             let rc2 = rc.clone();
             let render_items = items.clone();
+            // Telemetry: time each row built and the transcript's frame.
+            let timed = crate::telemetry::enabled();
+            let row_probe = self.transcript.probe.clone();
             div()
                 .relative()
                 .flex_1()
@@ -4470,12 +4780,18 @@ impl QmtApp {
                                     self.smooth_scroll.region(
                                         "transcript",
                                         list(self.transcript.list.clone(), move |ix, _, _| {
-                                            let item = render_items.borrow().get(ix).cloned();
-                                            match item {
-                                                Some(item) => {
-                                                    rc2.md.begin_row(&item.key);
-                                                    let el = render_item(ix, &item, &rc2);
+                                            let row = render_items.borrow().get(ix).cloned();
+                                            match row {
+                                                Some(row) => {
+                                                    let started = timed.then(crate::util::now_ms);
+                                                    rc2.md.begin_row(&row.key);
+                                                    let el = render_row(&row, &rc2);
                                                     rc2.md.end_row();
+                                                    if let Some(started) = started {
+                                                        row_probe
+                                                            .borrow_mut()
+                                                            .row_built(&row, started);
+                                                    }
                                                     el
                                                 }
                                                 None => div().into_any_element(),
@@ -4916,7 +5232,7 @@ impl QmtApp {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
-    use super::{WorkBlock, fenced, group_work, reasoning_title};
+    use super::{fenced, reasoning_title, work_blocks};
     use super::{
         humanize_tool_name, is_read, is_shell, link_ranges, tool_label, workspace_relative,
     };
@@ -5049,13 +5365,7 @@ mod tests {
             thought("raw", None),
             thought("c", Some("rs:summary:2")),
         ];
-        let sizes: Vec<usize> = group_work(&entries)
-            .iter()
-            .map(|b| match b {
-                WorkBlock::Reasoning(t) => t.len(),
-                WorkBlock::Tool(_) => 0,
-            })
-            .collect();
+        let sizes: Vec<usize> = work_blocks(&entries).iter().map(|b| b.len()).collect();
         // Raw reasoning breaks a run and is never joined.
         assert_eq!(sizes, [2, 1, 1]);
     }
@@ -5092,19 +5402,11 @@ mod tests {
     use crate::session::ToolCall;
 
     fn call(title: &str, kind: &str) -> ToolCall {
-        ToolCall {
-            id: "t".into(),
-            title: title.into(),
-            kind: kind.into(),
-            status: "completed".into(),
-            input: None,
-            output: String::new(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            stats: (0, 0),
-            synthesized: false,
-            child_session: None,
-        }
+        let mut call = ToolCall::new("t");
+        call.title = title.into();
+        call.kind = kind.into();
+        call.status = "completed".into();
+        call
     }
 
     #[test]
@@ -5215,7 +5517,7 @@ mod tests {
         assert!(skill.content.contains("<content>example</content>"));
         assert!(skill.sample_files.is_none());
         let mut tool = call("skill", "other");
-        tool.output = clipped.into();
+        tool.set_output(clipped.into());
         assert!(super::attaches_to_header(&tool));
         assert_eq!(super::tool_preview_raw(&tool), "rust-skills");
         tool.status = "failed".into();
@@ -5241,17 +5543,17 @@ mod tests {
             assert!(super::SkillContent::parse(output).is_none());
         }
         let mut skill_call = call("skill", "other");
-        skill_call.output = SKILL_OUTPUT.into();
+        skill_call.set_output(SKILL_OUTPUT.into());
         assert_eq!(super::tool_preview_raw(&skill_call), "rust-skills");
         assert!(super::attaches_to_header(&skill_call));
         skill_call.status = "failed".into();
         assert!(!super::attaches_to_header(&skill_call));
         skill_call.status = "completed".into();
-        skill_call.output = "legacy unwrapped skill instructions".into();
+        skill_call.set_output("legacy unwrapped skill instructions".into());
         assert!(!super::attaches_to_header(&skill_call));
         // A non-skill tool returning similar markup must retain its own renderer.
         let mut other = call("custom_tool", "other");
-        other.output = SKILL_OUTPUT.into();
+        other.set_output(SKILL_OUTPUT.into());
         assert!(!super::attaches_to_header(&other));
     }
 
@@ -5262,5 +5564,206 @@ mod tests {
         assert!(!is_read(&call("index", "other")));
         assert!(is_shell(&call("shell", "execute")));
         assert!(!is_shell(&call("read_tool", "other")));
+    }
+}
+
+/// Frame cost of a transcript with one very large work group (run with
+/// `cargo test --release -- --ignored --nocapture transcript_frame_cost`).
+#[cfg(test)]
+mod perf {
+    use gpui_kit::test::TestWindowExt as _;
+    use serde_json::json;
+
+    use super::super::{Page, QmtApp};
+    use crate::session::SessionView;
+
+    /// A running turn of `calls` shell calls with realistic JSON results.
+    pub(super) fn big_session(calls: usize) -> SessionView {
+        let mut view = SessionView::new("test-agent", "s", "/w", "big");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "watch the repo" } }),
+        );
+        let stdout = format!(
+            "## main...origin/main\n{}\n 12 files changed, 340 insertions(+), 120 deletions(-)",
+            (0..40)
+                .map(|i| format!(" M src/module_{i}/file_{i}.rs"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = json!({ "stdout": stdout, "stderr": "", "exit_code": 0 }).to_string();
+        for i in 0..calls {
+            view.apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": format!("t{i}"),
+                "title": "Run shell", "kind": "execute", "status": "completed",
+                "rawInput": { "command": "git --no-optional-locks status --short --branch; git diff --name-status; git diff --cached --shortstat" },
+                "content": [{ "type": "content", "content": { "type": "text", "text": output } }] }));
+        }
+        view.phase = "running".into();
+        view
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "timing measurement, run by hand"]
+    fn transcript_frame_cost(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| {
+                let mut store = crate::store::automations::schedule_ui_fixture();
+                store.session = Some(big_session(1600));
+                store
+            });
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                // Expand the work group ("+N previous work entries").
+                app.expanded_items.insert("work-t0".into());
+            });
+            for _ in 0..3 {
+                window.refresh();
+                window.render_frame(cx);
+            }
+            let frames = 60;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                app.update(cx, |app, _| {
+                    app.transcript.list.scroll_by(gpui_kit::px(-40.))
+                });
+                window.refresh();
+                window.render_frame(cx);
+            }
+            // The group really is one row per call, and the frames scrolled through them.
+            assert!(app.read(cx).transcript.list.item_count() > 1600);
+            let per_frame = started.elapsed().as_secs_f64() * 1000. / f64::from(frames);
+            eprintln!("transcript_frame_cost: {per_frame:.1} ms/frame (1600 calls, expanded)");
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use serde_json::{Value, json};
+
+    use super::super::{Page, QmtApp};
+    use super::perf::big_session;
+
+    struct Harness {
+        handle: gpui_kit::AnyWindowHandle,
+        app: gpui_kit::Entity<QmtApp>,
+    }
+
+    fn app_with(
+        cx: &mut gpui_kit::TestAppContext,
+        view: crate::session::SessionView,
+        methods: Value,
+    ) -> Harness {
+        use gpui_kit::AppContext as _;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let mut store = crate::store::automations::schedule_ui_fixture();
+        store.runtime_mut_for_test("test-agent").capabilities = Some(json!({ "methods": methods }));
+        store.session = Some(view);
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        Harness { handle, app }
+    }
+
+    #[gpui_kit::test]
+    fn an_expanded_large_group_becomes_one_row_per_block(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::test::TestWindowExt as _;
+        let Harness { handle, app, .. } = app_with(cx, big_session(300), json!([]));
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| app.go(Page::Session, cx));
+            window.render_frame(cx);
+            // Running and collapsed: the user prompt, then one row with the
+            // "+N previous" toggle and the last two calls.
+            let rows = |app: &gpui_kit::Entity<QmtApp>, cx: &mut gpui_kit::App| {
+                app.read(cx).transcript.list.item_count()
+            };
+            assert_eq!(rows(&app, cx), 2);
+            app.update(cx, |app, cx| {
+                app.expanded_items.insert("work-t0".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            // Expanded: the prompt, the header, and a row per call.
+            assert_eq!(rows(&app, cx), 1 + 1 + 300);
+            app.update(cx, |app, cx| {
+                app.expanded_items.remove("work-t0");
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(rows(&app, cx), 2);
+        })
+        .unwrap();
+    }
+}
+
+/// Export the transcript metrics of a large session to a collector (run with
+/// `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo test -- --ignored
+/// --nocapture transcript_telemetry_export`).
+#[cfg(test)]
+mod perf_export {
+    use gpui_kit::test::TestWindowExt as _;
+
+    use super::super::{Page, QmtApp};
+    use super::perf::big_session;
+
+    #[gpui_kit::test]
+    #[ignore = "needs a running OTLP collector"]
+    fn transcript_telemetry_export(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        assert!(
+            crate::telemetry::init().is_some(),
+            "set OTEL_EXPORTER_OTLP_ENDPOINT"
+        );
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| {
+                let mut store = crate::store::automations::schedule_ui_fixture();
+                store.session = Some(big_session(1600));
+                store
+            });
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                app.expanded_items.insert("work-t0".into());
+            });
+            for _ in 0..120 {
+                app.update(cx, |app, _| {
+                    app.transcript.list.scroll_by(gpui_kit::px(-40.))
+                });
+                window.refresh();
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+        crate::telemetry::shutdown();
     }
 }
