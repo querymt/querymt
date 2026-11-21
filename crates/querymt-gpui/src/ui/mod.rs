@@ -14,6 +14,7 @@ mod profile_select;
 mod session_view;
 mod sessions;
 mod settings;
+mod setup;
 mod smooth_scroll;
 mod start;
 mod workspace_select;
@@ -40,7 +41,7 @@ const SIDEBAR_W: f32 = 252.;
 /// Width of the collapsed sidebar rail.
 const RAIL_W: f32 = 56.;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Start,
     Inbox,
@@ -51,6 +52,8 @@ pub enum Page {
     Settings,
     /// The open session's transcript.
     Session,
+    /// First-run setup: full window, without the sidebar.
+    Setup,
 }
 
 pub(crate) struct AgentDialog {
@@ -210,6 +213,7 @@ pub struct QmtApp {
     session_query: Entity<InputState>,
     session_filters: SessionFilters,
     automations: automations::AutomationPage,
+    setup: setup::SetupState,
     /// Which Sessions-page groups are open.
     session_groups: sessions::GroupOpenState,
     /// Virtualized Sessions page list.
@@ -440,7 +444,7 @@ impl QmtApp {
             let (store, cwd, scroll) = (store.clone(), cwd.clone(), smooth_scroll.clone());
             cx.new(|cx| workspace_select::WorkspaceField::new(store, cwd, false, scroll, cx))
         };
-        Self {
+        let mut this = Self {
             store,
             page,
             smooth_scroll,
@@ -454,6 +458,7 @@ impl QmtApp {
             session_query,
             session_filters: SessionFilters::default(),
             automations: Default::default(),
+            setup: Default::default(),
             session_groups: Default::default(),
             session_list: Default::default(),
             group_shown: HashMap::new(),
@@ -522,7 +527,9 @@ impl QmtApp {
             dismissed: kit::Dismissed::default(),
             workspace,
             _subs: subs,
-        }
+        };
+        this.watch_first_run(cx);
+        this
     }
 
     /// Open the deep-linked session (`?session=` / `QMT_SESSION`) once the
@@ -1274,7 +1281,9 @@ impl Render for QmtApp {
             Page::Settings => self.render_settings(cx).into_any_element(),
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
             Page::Session => self.render_session(window, cx).into_any_element(),
+            Page::Setup => self.render_setup(cx).into_any_element(),
         };
+        let setup = self.page == Page::Setup;
         let radii = gpui_kit::component::window_corner_radii(window, cx);
         // Full-window scrims must round themselves: GPUI's overflow mask is
         // rectangular, so the frame's `overflow_hidden` can't clip their corners.
@@ -1358,9 +1367,10 @@ impl Render for QmtApp {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child({
+                    // Setup is left only by finishing or skipping it.
+                    .when(!setup, |el| {
                         let sidebar = self.render_sidebar(cx);
-                        self.smooth_scroll.region("sidebar", sidebar)
+                        el.child(self.smooth_scroll.region("sidebar", sidebar))
                     })
                     .child(self.smooth_scroll.region(
                         "page",

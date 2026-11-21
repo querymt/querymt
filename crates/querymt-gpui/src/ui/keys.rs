@@ -77,6 +77,7 @@ enum PaletteTarget {
     SchedulePrompt,
     ScheduleCurrentSession,
     ToggleSidebar,
+    RunSetup,
     Page(Page),
     Session(Box<SessionSummary>),
 }
@@ -94,28 +95,39 @@ const PAGES: [(Page, IconName, &str); 7] = [
 impl QmtApp {
     /// Attach the shortcut handlers to the root element.
     pub(super) fn on_shortcuts(&self, root: Div, cx: &mut Context<Self>) -> Div {
-        root.on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+        // Setup is left only by finishing or skipping it: app shortcuts wait.
+        root.on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+            if this.page != Page::Setup {
+                this.toggle_sidebar(cx)
+            }
+        }))
+        .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+            if this.page != Page::Setup {
+                this.new_session(window, cx)
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+            if this.page != Page::Setup {
                 this.toggle_palette(window, cx)
-            }))
-            .on_action(cx.listener(|this, a: &OpenSidebarSession, window, cx| {
+            }
+        }))
+        .on_action(cx.listener(|this, a: &OpenSidebarSession, window, cx| {
+            if this.page != Page::Setup {
                 this.open_sidebar_session(a.index, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &UndoWorkspace, window, cx| {
-                this.workspace_history(true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &RedoWorkspace, window, cx| {
-                this.workspace_history(false, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
-                if matches!(this.page, Page::Start | Page::Session)
-                    && this.picker_agent(cx).is_some()
-                {
-                    this.open_model_picker(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CycleReasoning, _, cx| this.cycle_reasoning(cx)))
+            }
+        }))
+        .on_action(cx.listener(|this, _: &UndoWorkspace, window, cx| {
+            this.workspace_history(true, window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &RedoWorkspace, window, cx| {
+            this.workspace_history(false, window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
+            if matches!(this.page, Page::Start | Page::Session) && this.picker_agent(cx).is_some() {
+                this.open_model_picker(window, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &CycleReasoning, _, cx| this.cycle_reasoning(cx)))
     }
 
     /// Ctrl/Cmd+T: next reasoning effort, for the open session or new sessions.
@@ -253,6 +265,7 @@ impl QmtApp {
                 return;
             }
             PaletteTarget::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteTarget::RunSetup => return self.open_setup(None, cx),
             PaletteTarget::Page(page) => self.go(page, cx),
             PaletteTarget::Session(s) => self.open_summary(&s, cx),
         }
@@ -336,6 +349,13 @@ impl QmtApp {
                 );
             }
         }
+        action_targets.push(PaletteTarget::RunSetup);
+        actions = actions.item(
+            CommandItem::new()
+                .label("Run setup")
+                .icon(IconName::Wand)
+                .keywords(["onboarding", "first run", "providers"]),
+        );
         let targets: Rc<Vec<Vec<PaletteTarget>>> = Rc::new(vec![
             action_targets,
             PAGES

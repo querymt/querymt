@@ -5,6 +5,7 @@
 //! those two pages. Views observe the entity and re-render on `cx.notify()`.
 
 pub(crate) mod automations;
+pub(crate) mod setup;
 
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
@@ -1130,6 +1131,12 @@ pub struct AgentRuntime {
     /// URL of the invite created most recently in this app session.
     pub last_invite: Option<String>,
     pub providers: Vec<ProviderAuth>,
+    /// `_querymt/auth/status` answered since connecting.
+    pub providers_loaded: bool,
+    /// Why the last `_querymt/auth/status` failed.
+    pub providers_error: Option<String>,
+    /// `_querymt/models` answered (or failed) since connecting.
+    pub models_loaded: bool,
     pub profiles: Vec<Profile>,
     pub oauth: Option<OAuthFlow>,
     /// Error from the last settings/mesh action, shown inline.
@@ -1336,6 +1343,9 @@ pub struct Prefs {
     /// Time zone last picked for an automation; empty: the system zone.
     #[serde(default)]
     pub schedule_timezone: String,
+    /// First-run setup finished or skipped.
+    #[serde(default)]
+    pub onboarding: setup::Onboarding,
 }
 
 impl Prefs {
@@ -1432,6 +1442,10 @@ fn load_persisted() -> Option<Persisted> {
 }
 
 fn save_persisted(state: &Persisted) {
+    // Tests must never overwrite the user's state.
+    if cfg!(test) {
+        return;
+    }
     let Ok(text) = serde_json::to_string_pretty(state) else {
         return;
     };
@@ -1558,12 +1572,26 @@ pub struct AgentsStore {
     /// Permission and input requests waiting for the user (the Inbox).
     pub requests: Vec<PendingRequest>,
     runtime: HashMap<String, AgentRuntime>,
+    /// This start is a fresh install (or follows Reset app data), and setup
+    /// was not finished or skipped yet.
+    pub first_run: bool,
     _launch_task: Option<Task<()>>,
 }
 
 impl AgentsStore {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let persisted = load_persisted().unwrap_or_default();
+        let loaded = load_persisted();
+        // No saved state: a fresh install, decided before anything is saved.
+        // State saved before setup existed is an existing user: setup is done.
+        let first_run = loaded.is_none();
+        let mut persisted = loaded.unwrap_or_default();
+        if !first_run && !persisted.prefs.onboarding.done() {
+            persisted.prefs.onboarding = setup::Onboarding {
+                version: setup::ONBOARDING_VERSION,
+                completed_at: Some(crate::util::rfc3339_now()),
+                skipped_at: None,
+            };
+        }
         let mut configs = persisted.configs;
         for seed in seed_configs() {
             if !configs
@@ -1580,6 +1608,7 @@ impl AgentsStore {
             session: None,
             requests: Vec::new(),
             runtime: HashMap::new(),
+            first_run,
             _launch_task: None,
         };
         this.save();
@@ -2065,6 +2094,8 @@ impl AgentsStore {
         self._launch_task = None;
         self.prefs = Prefs::default();
         self.configs = seed_configs();
+        // Starts over like a fresh install, setup included.
+        self.first_run = true;
         self.save();
         let auto: Vec<String> = self
             .configs
@@ -2449,6 +2480,9 @@ impl AgentsStore {
         rt.generation += 1;
         let generation = rt.generation;
         rt.schedules = Default::default();
+        rt.providers_loaded = false;
+        rt.providers_error = None;
+        rt.models_loaded = false;
         rt.state = ConnState::Connecting;
         rt.pid = None;
         rt.log(format!("Connecting to {}…", config.endpoint_label()));
@@ -4501,10 +4535,13 @@ async fn load_details(
         Ok(v) => Some(parse_models(v)),
         Err(_) => None,
     };
-    apply!(|rt: &mut AgentRuntime| match (&models, parsed.clone()) {
-        (_, Some(models)) => rt.models = models,
-        (Err(err), None) => rt.log(format!("Models unavailable: {err}")),
-        _ => {}
+    apply!(|rt: &mut AgentRuntime| {
+        rt.models_loaded = true;
+        match (&models, parsed.clone()) {
+            (_, Some(models)) => rt.models = models,
+            (Err(err), None) => rt.log(format!("Models unavailable: {err}")),
+            _ => {}
+        }
     });
     // Capabilities (context window, modalities) come from a second call; apply
     // them once they arrive so the list is usable immediately.
@@ -4989,6 +5026,8 @@ async fn load_extras(
     let profiles = rpc.request("_querymt/profiles", json!({})).await;
     apply(
         Box::new(move |rt| {
+            rt.providers_loaded = true;
+            rt.providers_error = auth.as_ref().err().map(ToString::to_string);
             if let Ok(v) = auth {
                 let flag = |p: &Value, k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
                 rt.providers = v
@@ -5172,6 +5211,7 @@ mod tests {
             session: None,
             requests: Vec::new(),
             runtime: HashMap::new(),
+            first_run: false,
             _launch_task: None,
         };
         store.runtime.entry("a".into()).or_default().models = models.clone();
