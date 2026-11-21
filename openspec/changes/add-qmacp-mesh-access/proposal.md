@@ -17,7 +17,7 @@ Server policy or authentication changes, UI work, mesh invite administration, an
 
 ### New Capabilities
 
-- `qmacp-mesh-access`: a CLI for the owner-scoped ACP v1 mesh access methods from `add-mesh-peer-access`.
+- `qmacp-mesh-access`: a CLI for the ACP v1 mesh access methods from `add-mesh-peer-access`.
 
 ## Impact
 

@@ -12,16 +12,16 @@ The resource host SHALL keep one durable grant per transport-authenticated peer 
 - **WHEN** a host grants a peer access, that peer reconnects under a different name or scope, and another peer claims the same identity in a request field
 - **THEN** only the authenticated grantee receives access; no reverse grant or grant for the other peer is created
 
-### Requirement: Only the owner may manage sharing
+### Requirement: The host manages sharing through ACP
 
-The host SHALL expose owner-only operations to read and replace grants and inspect and reset quotas. Requests from mesh peers and non-owner control clients SHALL NOT modify this state, even under a Full access grant. Policy writes SHALL validate the entire grant, persist it before reporting success, and reject edits based on stale revisions rather than overwriting a newer grant.
+The host SHALL expose operations through ACP to read and replace grants and inspect and reset quotas. The mesh peer protocol SHALL NOT expose these operations, even under a Full access grant. Policy writes SHALL validate the entire grant, persist it before reporting success, and reject edits based on stale revisions rather than overwriting a newer grant.
 
 #### Scenario: A peer cannot edit grants
-- **WHEN** a peer with Full access attempts a grant or quota reset through the sharing administration API
+- **WHEN** a peer with Full access attempts a grant or quota reset over the mesh protocol
 - **THEN** the host refuses it and no policy or accounting state changes
 
-#### Scenario: A stale owner edit is refused
-- **WHEN** an owner submits an edit based on a revision that another owner control client already replaced
+#### Scenario: A stale ACP edit is refused
+- **WHEN** an ACP client submits an edit based on a revision that another client already replaced
 - **THEN** the host reports a conflict and retains the persisted policy
 
 ### Requirement: Session and filesystem sharing have separate controls

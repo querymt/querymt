@@ -4,7 +4,7 @@
 
 `qmacp mesh nodes` SHALL read the advertised node listing method. `qmacp mesh get PEER_ID` and writes SHALL require mesh access v1 and the specific advertised method. Reads SHALL report the server's JSON, including unavailable, denied and legacy states without treating them as verified grants.
 
-#### Scenario: Mesh commands do not assume owner support
+#### Scenario: Mesh commands require advertised support
 - **WHEN** a server advertises node discovery but not mesh access v1
 - **THEN** `mesh nodes` can read discovery and `mesh get` and mutations fail without sending a management request
 

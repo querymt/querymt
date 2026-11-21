@@ -2,15 +2,17 @@
 
 ### Requirement: Clients discover mesh access controls on their ACP connection
 
-`querymt/capabilities` SHALL advertise `mesh_access_version: 1` and the mesh access method and notification names only on ACP connections authorized to administer the local host. An owner-capable ACP stdio connection SHALL support v1. WebSocket SHALL support v1 only when the server verifies owner authority for that connection. These methods SHALL be host-scoped, not session- or profile-scoped, and SHALL NOT forward administration to a mesh peer.
+With a mesh access store, `querymt/capabilities` SHALL advertise `mesh_access_version: 1` and the method and notification names. All ACP stdio and WebSocket connections SHALL have access to this contract without credentials. Methods SHALL be host-scoped and SHALL NOT forward administration to a mesh peer.
 
-#### Scenario: ACP advertises sharing controls only to the host owner
-- **WHEN** an owner connects over an owner-controlled stdio path or an owner-authenticated WebSocket, and another client connects without owner authority
-- **THEN** the owner can discover the v1 contract before loading a session; the other connection does not receive the advertisement, and a direct call to a sharing method is refused without disclosing grants or usage
+ACP is unauthenticated; deployments may use a proxy if needed. ACP authentication is out of scope and planned separately.
+
+#### Scenario: Every ACP connection can discover and use sharing controls
+- **WHEN** clients connect over stdio and WebSocket without credentials to an agent with the mesh access store
+- **THEN** each client can discover the v1 contract and call its sharing methods before loading a session
 
 ### Requirement: ACP lists peers and reads directional sharing state
 
-`querymt/mesh/nodes` SHALL remain the discovery entry point. On a v1 owner connection it SHALL include the peer IDs of saved sharing policies, including offline peers. `querymt/mesh/getPeerAccess` SHALL return the local grant, revision and quota status, the local shareable model choices, and the remote peer's effective grant and quota status only when the peer makes those details available. A failed remote lookup SHALL NOT hide the local policy.
+`querymt/mesh/nodes` SHALL remain the discovery entry point. When the mesh access store is configured, it SHALL include the peer IDs of saved sharing policies, including offline peers. `querymt/mesh/getPeerAccess` SHALL return the local grant, revision and quota status, the local shareable model choices, and the remote peer's effective grant and quota status only when the peer makes those details available. A failed remote lookup SHALL NOT hide the local policy.
 
 #### Scenario: ACP separates saved local policy from unavailable remote access
 - **WHEN** a previously granted peer goes offline and the owner opens the peer's sharing settings without an attached session
@@ -30,14 +32,14 @@
 
 ### Requirement: ACP sends a peer-scoped sharing invalidation
 
-`querymt/mesh/peerAccessChanged` SHALL be a server-to-client invalidation identifying the affected peer and direction, not a state snapshot. It SHALL notify authorized owner connections of observed changes to policy, quota status, availability or shareable models. Mutations SHALL notify only after commit. Delivery MAY be coalesced and SHALL NOT require an attached session. Reads SHALL remain authoritative after missed notifications or reconnect.
+`querymt/mesh/peerAccessChanged` SHALL be a server-to-client invalidation identifying the affected peer and direction, not a state snapshot. It SHALL notify all ACP connections with the mesh access store of observed changes to policy, quota status, availability or shareable models. Mutations SHALL notify only after commit. Delivery MAY be coalesced and SHALL NOT require an attached session. Reads SHALL remain authoritative after missed notifications or reconnect.
 
 #### Scenario: A second ACP client refreshes after sharing changes
-- **WHEN** one owner client updates a grant or quota while another owner client is connected
-- **THEN** the second client receives an outgoing invalidation, can read the committed state, and a client without owner authority receives no invalidation
+- **WHEN** one ACP client updates a grant or quota while another ACP client is connected
+- **THEN** the second client receives an outgoing invalidation and can read the committed state
 
 #### Scenario: ACP recovers current peer access without notification replay
-- **WHEN** an owner client misses an incoming change while disconnected and reconnects
+- **WHEN** an ACP client misses an incoming change while disconnected and reconnects
 - **THEN** it can re-read the peer's current access and quota status without replay and does not retain the old grant as current
 
 ### Requirement: Mesh access ACP v1 has explicit JSON shapes
@@ -59,7 +61,7 @@ Object fields use snake_case. The advertised method names are shown below. On th
 | `querymt/mesh/setPeerQuota` | `peer_id`, `expected_revision`, `scope`, `operation`, `limit` | `{version, peer_id, outgoing}` |
 | `querymt/mesh/resetPeerQuota` | `peer_id`, `expected_revision`, `scope` | `{version, peer_id, outgoing}` |
 
-- `peer_id` is the canonical mesh peer ID string, not the node label. It matches `nodes[].id` for mesh peers. The existing `querymt/mesh/nodes` result adds `managed_peer_ids: string[]` on v1 owner connections; it lists peers with saved grants or quota configuration, including offline peers. `nodes[].active_sessions` is omitted when not authorized or known. It is not reported as zero in place of a denial.
+- `peer_id` is the canonical mesh peer ID string, not the node label. It matches `nodes[].id` for mesh peers. The existing `querymt/mesh/nodes` result adds `managed_peer_ids: string[]` when the mesh access store is configured; it lists peers with saved grants or quota configuration, including offline peers. `nodes[].active_sessions` is omitted when not authorized or known. It is not reported as zero in place of a denial.
 - `outgoing` is `{revision, grant, quotas}`. `revision` is an opaque string that also exists for a default No access grant. The client echoes it as `expected_revision` on every mutation. It changes on committed grant/configuration changes and owner resets, not on usage or automatic rollover. A rejected edit does not advance it. Mutation results never depend on a remote lookup.
 - A stored `grant` is `{"mode":"none"}`, `{"mode":"full"}`, or `{"mode":"custom","sessions":bool,"filesystem":bool,"providers":[...]}`. Custom cannot enable shell. Each provider selection is `{provider_id, models}`, where `models` is `{"mode":"all"}` or `{"mode":"selected","model_ids":[...]}` with a non-empty canonical model ID list. The provider list may be empty; omitted providers are not shared. `setPeerAccess` replaces the selection, not quota configuration. A UI presenting Full access must warn about unsandboxed shell as specified by the sharing policy.
 - `scope` is `{provider_id}` for a provider or `{provider_id, model_id}` for a single model. A `limit` is `{"kind":"unlimited"}` or `{"kind":"finite","limit_tokens":"2000000","window":"daily"}`. `window` is `manual`, `daily`, `weekly`, or `monthly`, with `manual` the default when omitted on input. Token counters and limits are exact integer decimal strings; the UI presents them in Mtok. `operation: "update"` changes only the amount of an existing finite quota without a reset; `operation: "reconfigure"` explicitly changes finite/unlimited state or cadence (including adding the first finite cap). Owners can preconfigure quotas before granting access; doing so does not grant access.
@@ -72,7 +74,6 @@ ACP errors SHALL be distinguishable by JSON-RPC error `data.code`, not message t
 
 | `data.code` | Meaning or additional fields |
 | --- | --- |
-| `mesh_access_owner_required` | Local owner authority missing; no policy details. |
 | `mesh_access_unavailable` | No working local sharing authority or store. |
 | `mesh_access_conflict` | Stale write; `expected_revision`, `actual_revision`. |
 | `mesh_quota_reconfigure_required` | An amount-only edit cannot change the quota kind or cadence. |
