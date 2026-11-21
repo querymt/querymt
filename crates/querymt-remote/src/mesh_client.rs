@@ -1,7 +1,8 @@
 use crate::mesh_ingress::{SharingCallError, SharingRejection};
-use crate::peer_access::SharingProtocol;
 use crate::provider_share::guarded::MeteredChat;
-use crate::request_timeout::{SharingAskError, ask_sharing_v1, ask_with_sharing};
+use crate::request_timeout::{
+    SharingAskError, ask_sharing_v1, ask_with_sharing, with_sharing_protocol,
+};
 use crate::{
     AttachStreamConsumer, CancelProviderStreamRequest, GenericProviderStreamRequest,
     GetProviderCatalog, GetProviderContractInfo, GetProviderStreamStatus, MeshHandle, MeshScopeId,
@@ -168,25 +169,24 @@ impl KameoMeshClientTransport {
         R: kameo::reply::Reply<Ok = R, Error = kameo::error::Infallible>
             + serde::de::DeserializeOwned,
     {
-        let peer = host
-            .id()
-            .peer_id()
-            .copied()
-            .ok_or_else(|| sharing_error(SharingCallError::Unavailable))?;
         let timeout = Self::PROVIDER_CONTROL_TIMEOUT;
-        match self
-            .mesh
-            .select_sharing_protocol(peer, timeout)
-            .await
-            .map_err(sharing_error)?
-        {
-            SharingProtocol::V1 => ask_sharing_v1(&self.mesh, host, message, timeout)
-                .await
-                .map_err(provider_ask_error),
-            SharingProtocol::Legacy => crate::ask_remote_with_timeout(host, message, timeout)
-                .await
-                .map_err(remote_send_error_to_llm_error_no_handler),
-        }
+        with_sharing_protocol(
+            &self.mesh,
+            host.id().peer_id().copied(),
+            timeout,
+            async {
+                ask_sharing_v1(&self.mesh, host, message, timeout)
+                    .await
+                    .map_err(provider_ask_error)
+            },
+            async {
+                crate::ask_remote_with_timeout(host, message, timeout)
+                    .await
+                    .map_err(remote_send_error_to_llm_error_no_handler)
+            },
+        )
+        .await
+        .map_err(sharing_error)?
     }
 
     async fn get_or_create_stream_router(
@@ -298,48 +298,48 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: &crate::ProviderChatRequest,
     ) -> Result<crate::ProviderChatResponse, LLMError> {
-        let peer = host
-            .id()
-            .peer_id()
-            .copied()
-            .ok_or(SharingCallError::Unavailable)
-            .map_err(sharing_error)?;
-        if self
-            .mesh
-            .select_sharing_protocol(peer, Self::PROVIDER_CONTROL_TIMEOUT)
-            .await
-            .map_err(sharing_error)?
-            == SharingProtocol::V1
-        {
-            return ask_sharing_v1(
-                &self.mesh,
-                host,
-                &MeteredChat {
-                    request_id: uuid::Uuid::now_v7(),
-                    request: request.clone(),
-                },
-                Self::PROVIDER_CHAT_REPLY_TIMEOUT,
-            )
-            .await
-            .map_err(provider_ask_error);
-        }
-        let encoded_bytes = crate::provider_transport::remote_ask_request_size(
-            host,
-            request,
-            Some(Self::PROVIDER_CONTROL_TIMEOUT),
-            Some(Self::PROVIDER_CHAT_REPLY_TIMEOUT),
-        )?;
-        crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
-
-        host.ask(request)
-            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .reply_timeout(Self::PROVIDER_CHAT_REPLY_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| match crate::remote_send_error_base(e) {
-                Ok(err) => crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes),
-                Err(handler) => LLMError::from_payload(handler.to_payload()),
-            })
+        let control_timeout = Self::PROVIDER_CONTROL_TIMEOUT;
+        let reply_timeout = Self::PROVIDER_CHAT_REPLY_TIMEOUT;
+        with_sharing_protocol(
+            &self.mesh,
+            host.id().peer_id().copied(),
+            control_timeout,
+            async {
+                ask_sharing_v1(
+                    &self.mesh,
+                    host,
+                    &MeteredChat {
+                        request_id: uuid::Uuid::now_v7(),
+                        request: request.clone(),
+                    },
+                    reply_timeout,
+                )
+                .await
+                .map_err(provider_ask_error)
+            },
+            async {
+                let encoded_bytes = crate::provider_transport::remote_ask_request_size(
+                    host,
+                    request,
+                    Some(control_timeout),
+                    Some(reply_timeout),
+                )?;
+                crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
+                host.ask(request)
+                    .mailbox_timeout(control_timeout)
+                    .reply_timeout(reply_timeout)
+                    .send()
+                    .await
+                    .map_err(|e| match crate::remote_send_error_base(e) {
+                        Ok(err) => {
+                            crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes)
+                        }
+                        Err(handler) => LLMError::from_payload(handler.to_payload()),
+                    })
+            },
+        )
+        .await
+        .map_err(sharing_error)?
     }
 
     async fn send_stream_request(
@@ -347,32 +347,30 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GenericProviderStreamRequest<Self::RemoteRouterRef>,
     ) -> Result<(), LLMError> {
-        let peer = host
-            .id()
-            .peer_id()
-            .copied()
-            .ok_or_else(|| sharing_error(SharingCallError::Unavailable))?;
-        if self
-            .mesh
-            .select_sharing_protocol(peer, Self::PROVIDER_CONTROL_TIMEOUT)
-            .await
-            .map_err(sharing_error)?
-            == SharingProtocol::V1
-        {
-            return ask_sharing_v1(&self.mesh, host, &request, Self::PROVIDER_CONTROL_TIMEOUT)
-                .await
-                .map_err(provider_ask_error);
-        }
-        let encoded_bytes =
-            crate::provider_transport::remote_tell_request_size(host, &request, None)?;
-        crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
-
-        host.tell(&request).send_ack().await.map_err(|error| {
-            crate::provider_transport::remap_legacy_oversize_eof(
-                remote_send_error_to_llm_error_no_handler(error),
-                encoded_bytes,
-            )
-        })
+        let timeout = Self::PROVIDER_CONTROL_TIMEOUT;
+        with_sharing_protocol(
+            &self.mesh,
+            host.id().peer_id().copied(),
+            timeout,
+            async {
+                ask_sharing_v1(&self.mesh, host, &request, timeout)
+                    .await
+                    .map_err(provider_ask_error)
+            },
+            async {
+                let encoded_bytes =
+                    crate::provider_transport::remote_tell_request_size(host, &request, None)?;
+                crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
+                host.tell(&request).send_ack().await.map_err(|error| {
+                    crate::provider_transport::remap_legacy_oversize_eof(
+                        remote_send_error_to_llm_error_no_handler(error),
+                        encoded_bytes,
+                    )
+                })
+            },
+        )
+        .await
+        .map_err(sharing_error)?
     }
 
     async fn cancel_stream(

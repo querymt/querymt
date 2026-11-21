@@ -19,7 +19,7 @@ pub struct ProviderShare {
     #[cfg(feature = "kameo-mesh")]
     catalog: Arc<dyn ProviderCatalogBackend>,
     #[cfg(feature = "kameo-mesh")]
-    guarded_registration: Arc<std::sync::OnceLock<Arc<guarded::GuardedProvider>>>,
+    guarded_registration: Arc<std::sync::OnceLock<()>>,
 }
 
 impl ProviderShare {
@@ -78,13 +78,12 @@ impl ProviderShare {
                     self.provider_host.id(),
                 );
                 guarded::streams::install(
-                    provider.clone(),
+                    provider,
                     mesh,
                     router,
                     self.provider_host.id(),
                     &self.provider_host,
                 );
-                provider
             });
         }
         runtime

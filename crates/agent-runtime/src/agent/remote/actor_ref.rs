@@ -647,32 +647,31 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                if let Some(mesh) = mesh {
-                    use querymt_remote::mesh_ingress::SharingCallError;
-                    use querymt_remote::peer_access::SharingProtocol;
-                    let peer = actor_ref.id().peer_id().copied().ok_or_else(|| {
-                        AgentError::from_sharing_ask(SharingCallError::Unavailable.into())
-                    })?;
-                    let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
-                    let protocol = mesh
-                        .select_sharing_protocol(peer, timeout)
-                        .await
-                        .map_err(|error| AgentError::from_sharing_ask(error.into()))?;
-                    if protocol == SharingProtocol::V1 {
-                        return querymt_remote::request_timeout::ask_sharing_v1(
-                            mesh,
-                            actor_ref,
-                            &messages::Cancel,
-                            timeout,
-                        )
-                        .await
-                        .map_err(AgentError::from_sharing_ask);
-                    }
-                }
-                actor_ref
-                    .tell(&messages::Cancel)
-                    .send()
-                    .map_err(Self::map_infallible_remote_send_error)
+                use querymt_remote::request_timeout::{ask_sharing_v1, with_sharing_protocol};
+
+                let legacy = async {
+                    actor_ref
+                        .tell(&messages::Cancel)
+                        .send()
+                        .map_err(Self::map_infallible_remote_send_error)
+                };
+                let Some(mesh) = mesh else {
+                    return legacy.await;
+                };
+                let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
+                with_sharing_protocol(
+                    mesh,
+                    actor_ref.id().peer_id().copied(),
+                    timeout,
+                    async {
+                        ask_sharing_v1(mesh, actor_ref, &messages::Cancel, timeout)
+                            .await
+                            .map_err(AgentError::from_sharing_ask)
+                    },
+                    legacy,
+                )
+                .await
+                .map_err(|error| AgentError::from_sharing_ask(error.into()))?
             }
         }
     }

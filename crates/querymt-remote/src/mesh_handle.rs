@@ -731,7 +731,8 @@ mod tests {
 
     #[tokio::test]
     async fn failure_does_not_trigger_a_legacy_downgrade() {
-        let (_dir, mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        let (_dir, mut mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        mesh.sharing_enabled = true;
         let peer = PeerId::random();
         let exchange = tokio::spawn(async move {
             for result in [
@@ -754,9 +755,19 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
+            let failed: Result<(), _> = crate::request_timeout::with_sharing_protocol(
+                &mesh,
+                Some(peer),
+                Duration::from_secs(1),
+                async { panic!("a failed probe must not run the guarded operation") },
+                async { panic!("a failed probe must not run the legacy operation") },
+            )
+            .await;
             assert!(matches!(
-                mesh.sharing_protocol(peer).await,
-                Err(SharingCallError::Transport(_))
+                failed,
+                Err(SharingCallError::Transport(
+                    libp2p::request_response::OutboundFailure::Timeout
+                ))
             ));
             assert_eq!(
                 mesh.sharing_protocol(peer).await.unwrap(),

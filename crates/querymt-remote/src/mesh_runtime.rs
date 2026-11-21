@@ -155,7 +155,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
 /// Start a mesh with all inbound actor RPCs routed through the authenticated
 /// ingress implementation, including legacy messages. Outbound RPCs and actor
 /// discovery still use Kameo.
-pub async fn bootstrap_mesh_handle_with_ingress(
+#[cfg(test)]
+pub(crate) async fn bootstrap_mesh_handle_with_ingress(
     config: &MeshRuntimeConfig,
     ingress: Arc<dyn MeshIngress>,
 ) -> Result<MeshHandle, MeshError> {

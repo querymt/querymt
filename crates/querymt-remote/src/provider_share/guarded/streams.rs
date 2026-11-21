@@ -23,9 +23,7 @@ pub(in crate::provider_share) fn install(
 ) {
     let host = host.downgrade();
     let start = {
-        // The router owns these handlers. Do not retain it through egress.
-        let mut egress = mesh.clone();
-        egress.policy = None;
+        let egress = mesh.sharing_egress();
         let host = host.clone();
         move |peer, msg| {
             let host = host.clone();

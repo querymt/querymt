@@ -679,42 +679,46 @@ mod access {
     ) -> MeshPeerIncomingAccess {
         use crate::agent::remote::node_manager::GetPeerSharing;
         use crate::error::AgentError;
+        use MeshPeerIncomingAccess::{Incompatible, Legacy, Unavailable};
         use kameo::error::RemoteSendError;
-        use querymt_remote::request_timeout::{SharingAskError, ask_sharing_v1};
+        use querymt_remote::request_timeout::{
+            SharingAskError, ask_sharing_v1, with_sharing_protocol,
+        };
 
         let timeout = LocalAgentHandle::remote_node_info_timeout();
-        let lookup = async {
-            let protocol = mesh
-                .select_sharing_protocol(*peer.as_peer_id(), timeout)
-                .await
-                .ok()?;
-            if protocol == SharingProtocol::Legacy {
-                return Some(MeshPeerIncomingAccess::Legacy);
-            }
-            let reference = agent.find_node_manager(&peer.to_string()).await.ok()?;
-            if reference.id().peer_id() != Some(peer.as_peer_id()) {
-                return None;
-            }
-            match ask_sharing_v1::<_, _, MeshPeerIncomingAccess, AgentError>(
-                mesh,
-                &reference,
-                &GetPeerSharing,
-                timeout,
-            )
-            .await
-            {
-                Ok(value) => Some(value),
-                Err(SharingAskError::Actor(RemoteSendError::UnknownMessage { .. })) => {
-                    Some(MeshPeerIncomingAccess::Incompatible)
+        let lookup = with_sharing_protocol(
+            mesh,
+            Some(*peer.as_peer_id()),
+            timeout,
+            async {
+                let Ok(reference) = agent.find_node_manager(&peer.to_string()).await else {
+                    return Unavailable;
+                };
+                if reference.id().peer_id() != Some(peer.as_peer_id()) {
+                    return Unavailable;
                 }
-                Err(_) => None,
-            }
-        };
+                match ask_sharing_v1::<_, _, MeshPeerIncomingAccess, AgentError>(
+                    mesh,
+                    &reference,
+                    &GetPeerSharing,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(SharingAskError::Actor(RemoteSendError::UnknownMessage { .. })) => {
+                        Incompatible
+                    }
+                    Err(_) => Unavailable,
+                }
+            },
+            async { Legacy },
+        );
         tokio::time::timeout(timeout, lookup)
             .await
             .ok()
-            .flatten()
-            .unwrap_or(MeshPeerIncomingAccess::Unavailable)
+            .and_then(Result::ok)
+            .unwrap_or(Unavailable)
     }
 
     async fn finite_quota_supported(

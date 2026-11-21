@@ -299,6 +299,7 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let grants = Arc::new(FixtureGrants::default());
         let (start_tx, mut starts) = mpsc::unbounded_channel();
+        let (legacy_start_tx, mut legacy_starts) = mpsc::unbounded_channel();
         let (renew_tx, mut renewals) = mpsc::unbounded_channel();
         let mut host = lan(|peer| {
             let router = Arc::new(InboundRouter::new(peer, grants.clone()));
@@ -341,6 +342,21 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
                 InboundDelivery::LegacyAsk,
                 InboundAccess::Full,
                 |_, _| async { Ok(chat_reply(3)) },
+            );
+            router.register::<ProviderHostActor, StreamStart, _, RemoteProviderHostError, _, _>(
+                ActorId::new_with_peer_id(1, peer),
+                InboundDelivery::LegacyTellV1Ask,
+                InboundAccess::Full,
+                move |_, request| {
+                    legacy_start_tx.send(request).unwrap();
+                    async { Ok(()) }
+                },
+            );
+            router.register::<ProviderHostActor, RenewProviderStreamLease, _, kameo::error::Infallible, _, _>(
+                ActorId::new_with_peer_id(1, peer),
+                InboundDelivery::LegacyAsk,
+                InboundAccess::Full,
+                |_, request| async move { Ok(request.lease_ttl_secs == 30) },
             );
             LegacyWire::new(router, Duration::from_secs(3))
         });
@@ -403,12 +419,18 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
             let (session, id) = ("mesh-stream-session", "mesh-stream-request");
             let (chunks, _consumer) = mpsc::unbounded_channel();
             let (router, callback) = transport.prepare_stream_router(&host, session, id, chunks).await.unwrap();
-            transport.send_stream_request(&host, ProviderStreamRequest {
+            let stream_request = ProviderStreamRequest {
                 provider: request.provider, model: request.model, messages: vec![], tools: None,
                 session_id: session.into(), request_id: id.into(), stream_router_ref: callback,
                 reconnect_grace_secs: 3, heartbeat_interval_secs: 5, lease_ttl_secs: 30,
                 params: None, item_aware_contract_version: None, options: None,
-            }).await.unwrap();
+            };
+            let legacy_host = host_ref(legacy_peer);
+            transport.send_stream_request(&legacy_host, stream_request.clone()).await.unwrap();
+            assert_eq!(legacy_starts.try_recv().unwrap().request_id, id);
+            assert!(transport.renew_stream_lease(&legacy_host, session, id, 30).await.unwrap());
+
+            transport.send_stream_request(&host, stream_request.clone()).await.unwrap();
             let (caller, started) = starts.try_recv().unwrap();
             assert_eq!(caller, key);
             assert_eq!(started.request_id, id);
@@ -428,7 +450,9 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
             });
             assert_denied(renewed.unwrap_err());
             assert_denied(transport.renew_stream_lease(&host, session, id, 30).await.unwrap_err());
+            assert_denied(transport.send_stream_request(&host, stream_request).await.unwrap_err());
             assert!(matches!(renewals.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert!(matches!(starts.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
             router.kill();
             mesh.shutdown().await;
         };

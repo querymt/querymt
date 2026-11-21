@@ -105,14 +105,29 @@ where
     <A::Reply as Reply>::Ok: serde::de::DeserializeOwned,
     <A::Reply as Reply>::Error: serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display,
 {
-    let peer = actor_ref
-        .id()
-        .peer_id()
-        .copied()
-        .ok_or(SharingCallError::Unavailable)?;
-    let protocol = mesh.select_sharing_protocol(peer, timeout).await?;
-    match protocol {
-        SharingProtocol::Legacy => Ok(ask_remote_with_timeout(actor_ref, msg, timeout).await?),
-        SharingProtocol::V1 => ask_sharing_v1(mesh, actor_ref, msg, timeout).await,
-    }
+    with_sharing_protocol(
+        mesh,
+        actor_ref.id().peer_id().copied(),
+        timeout,
+        ask_sharing_v1(mesh, actor_ref, msg, timeout),
+        async { Ok(ask_remote_with_timeout(actor_ref, msg, timeout).await?) },
+    )
+    .await?
+}
+
+/// Select a protocol before polling either operation. Only the selected operation
+/// runs, so a failure after selection can never trigger a legacy retry.
+/// Use `None` for an actor reference without a peer ID; this fails closed.
+pub async fn with_sharing_protocol<T>(
+    mesh: &MeshHandle,
+    peer: Option<libp2p::PeerId>,
+    timeout: Duration,
+    guarded: impl Future<Output = T>,
+    legacy: impl Future<Output = T>,
+) -> Result<T, SharingCallError> {
+    let peer = peer.ok_or(SharingCallError::Unavailable)?;
+    Ok(match mesh.select_sharing_protocol(peer, timeout).await? {
+        SharingProtocol::V1 => guarded.await,
+        SharingProtocol::Legacy => legacy.await,
+    })
 }
