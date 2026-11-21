@@ -656,6 +656,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_requires_the_item_aware_contract_before_replaying_native_history() {
+        use querymt::chat::{ChatMessage, ChatOutputItem, ChatReasoningItem};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: seen.clone(),
+        })));
+        let mut request = chat_request(None);
+        request
+            .messages
+            .push(ChatMessage::from_assistant_output(ChatOutput {
+                items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                    encrypted_content: Some("opaque continuation".into()),
+                    id: None,
+                    summary: vec![],
+                    content: vec![],
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                })],
+                ..Default::default()
+            }));
+
+        let result = actor.ask(request.clone()).await;
+        assert!(matches!(result, Err(kameo::error::SendError::HandlerError(
+            RemoteProviderHostError::ProviderChat { operation, .. }
+        )) if operation == "contract_check"));
+        assert!(seen.lock().is_empty());
+
+        request.item_aware_contract_version = Some(ITEM_AWARE_CHAT_CONTRACT_VERSION);
+        actor.ask(request).await.expect("compatible contract");
+        assert_eq!(*seen.lock(), [GenerationOptions::NONE]);
+    }
+
+    #[tokio::test]
     async fn contract_info_reports_the_built_providers_capabilities() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let actor =

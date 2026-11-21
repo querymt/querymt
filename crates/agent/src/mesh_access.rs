@@ -85,7 +85,83 @@ mod tests {
     use crate::agent::remote::mesh::join_mesh_via_invite_with_dns;
     use querymt_remote::invite::InviteStore;
 
-    use super::SqliteMeshAccess;
+    use super::{NodeId, SqliteMeshAccess, open_store};
+    use querymt_remote::identity::load_or_generate_keypair;
+    use querymt_remote::peer_access::quota::{
+        QuotaAttempt, QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow,
+    };
+    use querymt_remote::peer_access::{
+        ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant, SharingProtocol,
+    };
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn opening_mesh_store_reconciles_attempts_for_the_persisted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("mesh").join("node.key");
+        let store = open_store(Some(identity.clone())).await.unwrap();
+        let host = load_or_generate_keypair(Some(&identity))
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(host),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let policy = PeerGrant::Custom {
+            sessions: false,
+            filesystem: false,
+            providers: vec![ProviderGrant {
+                provider_id: "fixture".into(),
+                models: ModelSelection::All,
+            }],
+        };
+        let grant = store
+            .replace_grant(&key, Uuid::nil(), policy.clone())
+            .await
+            .unwrap();
+        let scope = QuotaScope {
+            provider_id: "fixture".into(),
+            model_id: None,
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let revision = store
+            .edit_quota(
+                &key,
+                grant.revision,
+                &scope,
+                QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                    tokens: 100,
+                    window: QuotaWindow::Manual,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        let attempt = store
+            .reserve(QuotaAttempt {
+                peer: key.clone(),
+                grant_revision: revision,
+                protocol: SharingProtocol::V1,
+                provider_id: "fixture".into(),
+                model_id: "model".into(),
+                request_id: Uuid::now_v7(),
+                bound_tokens: Some(40),
+                now,
+            })
+            .await
+            .unwrap();
+        store.mark_dispatched(attempt).await.unwrap();
+        drop(store);
+
+        let reopened = open_store(Some(identity)).await.unwrap();
+        let (grant, quotas) = reopened.access_snapshot(&key, now).await.unwrap();
+        assert_eq!(grant.revision, revision);
+        assert_eq!(grant.grant, policy);
+        let provider_quota = quotas.iter().find(|quota| quota.scope == scope).unwrap();
+        assert_eq!(provider_quota.reserved_tokens, 0);
+        assert_eq!(provider_quota.estimated_tokens, 40);
+    }
 
     #[tokio::test]
     async fn join_checks_invite_before_opening_required_policy_store() {

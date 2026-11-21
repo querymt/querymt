@@ -6,9 +6,10 @@ use crate::mesh_ingress::{
 use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{
     AttemptUsage, QuotaAttempt, QuotaEdit, QuotaScope, QuotaSettlement, QuotaStatus, ReservationId,
+    ReservedAttempt,
 };
 use crate::peer_access::{
-    GrantStore, GrantStoreError, ModelSelection, PeerGrantKey, ProviderGrant,
+    GrantStore, GrantStoreError, ModelSelection, PeerGrantKey, ProviderGrant, SharingProtocol,
 };
 use crate::{
     CancelProviderStreamRequest, GetProviderStreamStatus, MeshHandle, MeshTransportMode, NodeId,
@@ -24,21 +25,26 @@ use kameo::remote::{
 };
 use libp2p::PeerId;
 use parking_lot::Mutex;
-use querymt::chat::{ChatOutput, ChatProvider, ChatStream, FinishReason, StreamChunk};
+use querymt::chat::{
+    ChatCapabilities, ChatOutput, ChatProvider, ChatStream, FinishReason, StreamChunk,
+};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::TransportErrorKind;
 use querymt::{LLMProvider, Usage};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 
 struct Store {
     grants: Mutex<HashMap<PeerGrantKey, PeerGrantState>>,
     attempts: Mutex<HashMap<(PeerGrantKey, Uuid), ReservationId>>,
     settled: Mutex<Vec<(ReservationId, AttemptUsage)>>,
+    pause_reserve: Mutex<Option<PauseReserve>>,
+    released: Notify,
+    fail_next_grant_read: AtomicBool,
     changes: broadcast::Sender<PeerGrantKey>,
 }
 
@@ -48,6 +54,9 @@ impl Default for Store {
             grants: Default::default(),
             attempts: Default::default(),
             settled: Default::default(),
+            pause_reserve: Default::default(),
+            released: Default::default(),
+            fail_next_grant_read: Default::default(),
             changes: broadcast::channel(16).0,
         }
     }
@@ -56,6 +65,11 @@ impl Default for Store {
 #[async_trait]
 impl GrantStore for Store {
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+        if self.fail_next_grant_read.swap(false, Ordering::Relaxed) {
+            return Err(GrantStoreError::Backend(Box::new(std::io::Error::other(
+                "fixture grant read failed",
+            ))));
+        }
         Ok(self.grants.lock().get(key).cloned().unwrap_or_default())
     }
     async fn replace_grant(
@@ -118,21 +132,32 @@ impl QuotaStore for Store {
         assert_eq!(attempt.model_id, "allowed");
         assert_eq!(attempt.bound_tokens, Some(25));
         use std::collections::hash_map::Entry;
-        match self
+        let id = match self
             .attempts
             .lock()
             .entry((attempt.peer, attempt.request_id))
         {
-            Entry::Occupied(_) => Err(QuotaError::DuplicateAttempt),
-            Entry::Vacant(entry) => Ok(*entry.insert(ReservationId(Uuid::now_v7()))),
+            Entry::Occupied(_) => return Err(QuotaError::DuplicateAttempt),
+            Entry::Vacant(entry) => *entry.insert(ReservationId(Uuid::now_v7())),
+        };
+        let pause = self.pause_reserve.lock().take();
+        if let Some(PauseReserve { committed, resume }) = pause {
+            committed.send(()).unwrap();
+            resume.await.unwrap();
         }
+        Ok(id)
     }
     async fn mark_dispatched(&self, id: ReservationId) -> Result<(), QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
         Ok(())
     }
-    async fn release_unused(&self, _: ReservationId) -> Result<(), QuotaError> {
-        unreachable!("preparation succeeds in this fixture")
+    async fn release_unused(&self, id: ReservationId) -> Result<(), QuotaError> {
+        let mut attempts = self.attempts.lock();
+        let before = attempts.len();
+        attempts.retain(|_, reservation| *reservation != id);
+        assert_eq!(before, attempts.len() + 1);
+        self.released.notify_one();
+        Ok(())
     }
     async fn settle(
         &self,
@@ -141,10 +166,34 @@ impl QuotaStore for Store {
     ) -> Result<QuotaSettlement, QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
         self.settled.lock().push((id, usage));
-        Ok(QuotaSettlement::Recorded)
+        Ok(
+            if matches!(usage, AttemptUsage::Observed(tokens) if tokens > 25) {
+                QuotaSettlement::BoundExceeded
+            } else {
+                QuotaSettlement::Recorded
+            },
+        )
     }
     async fn reconcile_startup(&self, _: &NodeId) -> Result<(), QuotaError> {
         unreachable!("no persisted state")
+    }
+}
+
+// Pause after the accounting write, while its caller is still awaiting the result.
+struct PauseReserve {
+    committed: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+impl Store {
+    fn pause_reserve(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (committed_tx, committed) = oneshot::channel();
+        let (resume, resume_rx) = oneshot::channel();
+        *self.pause_reserve.lock() = Some(PauseReserve {
+            committed: committed_tx,
+            resume: resume_rx,
+        });
+        (committed, resume)
     }
 }
 
@@ -154,6 +203,8 @@ enum StreamEnding {
     Done,
     Eof,
     Error,
+    OpenError,
+    OverBound,
 }
 
 struct BlockPreparation {
@@ -209,6 +260,13 @@ struct Provider {
 
 #[async_trait]
 impl ChatProvider for Provider {
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities {
+            streaming: true,
+            ..Default::default()
+        }
+    }
+
     async fn chat(&self, _: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ChatOutput {
@@ -227,6 +285,12 @@ impl ChatProvider for Provider {
     async fn chat_stream(&self, _: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
         use futures_util::{StreamExt, stream};
         self.calls.fetch_add(1, Ordering::Relaxed);
+        if matches!(self.stream_ending, StreamEnding::OpenError) {
+            return Err(LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "fixture stream failed to open".into(),
+            });
+        }
         let finish = self.finish_stream.clone();
         let initial = stream::iter([
             Ok(StreamChunk::Text("started".into())),
@@ -239,9 +303,13 @@ impl ChatProvider for Provider {
         let complete = stream::once(async move {
             finish.notified().await;
             stream::iter(match ending {
-                StreamEnding::Done => vec![
+                StreamEnding::Done | StreamEnding::OverBound => vec![
                     Ok(StreamChunk::Usage(Usage {
-                        input_tokens: 8,
+                        input_tokens: if matches!(ending, StreamEnding::OverBound) {
+                            25
+                        } else {
+                            8
+                        },
                         output_tokens: 4,
                         reasoning_tokens: 2,
                         cache_read: 3,
@@ -257,6 +325,7 @@ impl ChatProvider for Provider {
                     kind: TransportErrorKind::ConnectionClosed,
                     message: "fixture upstream error".into(),
                 })],
+                StreamEnding::OpenError => unreachable!("stream did not open"),
             })
         })
         .flatten();
@@ -1035,6 +1104,14 @@ async fn stopping_host_cancels_and_settles_a_guarded_stream_with_egress_blocked(
     fixture.assert_settled(&request, AttemptUsage::Unknown);
     ack(reply);
     drop(held_reply);
+
+    fixture.host_actor.wait_for_shutdown().await;
+    let result = fixture
+        .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+        .await;
+    assert!(
+        matches!(result, Err(RemoteProviderHostError::Internal(message)) if message == "provider host stopped")
+    );
 }
 
 #[tokio::test]
@@ -1334,5 +1411,175 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
     assert_eq!(
         *store.settled.lock(),
         [(*reservation, AttemptUsage::Observed(18))]
+    );
+}
+
+#[tokio::test]
+async fn guarded_stream_releases_a_reservation_if_policy_becomes_unreadable() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (committed, resume) = fixture.store.pause_reserve();
+
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(fixture.call::<_, ()>(&request), async {
+            committed.await.unwrap();
+            // Fail only the post-reservation check, not the router's response check.
+            fixture
+                .store
+                .fail_next_grant_read
+                .store(true, Ordering::Relaxed);
+            resume.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(code(result.unwrap_err()), "mesh_access_unavailable");
+    assert!(
+        fixture.store.attempts.lock().is_empty(),
+        "admission replied before releasing quota"
+    );
+    assert!(fixture.store.settled.lock().is_empty());
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn dropping_reservation_future_releases_a_late_commit_without_charging() {
+    let store = Arc::new(Store::default());
+    let peer = key(PeerId::random(), PeerId::random());
+    let grant = store
+        .replace_grant(&peer, Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap();
+    let (committed, resume) = store.pause_reserve();
+    let mut pending = Box::pin(ReservedAttempt::reserve(
+        store.clone(),
+        QuotaAttempt {
+            peer,
+            grant_revision: grant.revision,
+            protocol: SharingProtocol::V1,
+            provider_id: "fixture".into(),
+            model_id: "allowed".into(),
+            request_id: Uuid::now_v7(),
+            bound_tokens: Some(25),
+            now: 0,
+        },
+    ));
+
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = committed => result.unwrap(),
+            _ = &mut pending => panic!("reservation returned before the store responded"),
+        }
+        drop(pending);
+        resume.send(()).unwrap();
+        store.released.notified().await;
+    })
+    .await
+    .expect("cancelled reservation was not released");
+    assert!(store.attempts.lock().is_empty());
+    assert!(store.settled.lock().is_empty());
+}
+
+#[tokio::test]
+async fn guarded_stream_settles_an_open_failure_before_delivering_it() {
+    let mut fixture = StreamFixture::new(StreamEnding::OpenError).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_transport(
+        terminal,
+        TransportErrorKind::ConnectionClosed,
+        "fixture stream failed to open",
+    );
+    fixture.assert_settled(&request, AttemptUsage::Unknown);
+    ack(reply);
+}
+
+#[tokio::test]
+async fn hosted_provider_requires_session_access_and_never_passes_unmetered_methods_through() {
+    let store = Arc::new(Store::default());
+    let peer = key(PeerId::random(), PeerId::random());
+    let grant = store
+        .replace_grant(&peer, Uuid::nil(), allowed())
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = MeteredProvider::hosted(
+        Arc::new(Provider {
+            calls: calls.clone(),
+            finish_stream: Default::default(),
+            stream_ending: StreamEnding::Done,
+        }),
+        store.clone(),
+        peer,
+        grant.revision,
+        SharingProtocol::V1,
+        ("fixture".into(), "allowed".into()),
+        |_, _| Some(25),
+    );
+    assert!(provider.capabilities().streaming);
+    let error = provider.chat(&ChatCall::new(&[])).await.unwrap_err();
+    assert_eq!(code(policy_error(error)), "mesh_access_denied");
+    assert!(matches!(
+        provider
+            .complete(&CompletionRequest::builder("test").build())
+            .await,
+        Err(LLMError::NotImplemented(_))
+    ));
+    assert!(matches!(
+        provider.embed(vec!["test".into()]).await,
+        Err(LLMError::NotImplemented(_))
+    ));
+    assert!(store.attempts.lock().is_empty());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn hosted_stream_never_reports_success_when_usage_exceeds_the_bound() {
+    use futures_util::StreamExt;
+
+    let store = Arc::new(Store::default());
+    let peer = key(PeerId::random(), PeerId::random());
+    let grant = store
+        .replace_grant(&peer, Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap();
+    let finish_stream = Arc::new(tokio::sync::Notify::new());
+    let provider = MeteredProvider::hosted(
+        Arc::new(Provider {
+            calls: Default::default(),
+            finish_stream: finish_stream.clone(),
+            stream_ending: StreamEnding::OverBound,
+        }),
+        store.clone(),
+        peer,
+        grant.revision,
+        SharingProtocol::V1,
+        ("fixture".into(), "allowed".into()),
+        |_, streaming| {
+            assert!(streaming);
+            Some(25)
+        },
+    );
+    let stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+    finish_stream.notify_one();
+    let mut chunks = timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let error = chunks.pop().expect("missing terminal error").unwrap_err();
+    assert_eq!(code(policy_error(error)), "mesh_quota_bound_exceeded");
+    assert!(
+        chunks
+            .into_iter()
+            .all(|chunk| !querymt::chat::chunk_is_terminal(&chunk.unwrap()))
+    );
+    let attempts = store.attempts.lock();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        *store.settled.lock(),
+        [(
+            *attempts.values().next().unwrap(),
+            AttemptUsage::Observed(35)
+        )]
     );
 }
