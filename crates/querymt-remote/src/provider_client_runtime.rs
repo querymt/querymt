@@ -51,6 +51,7 @@ pub trait RemoteProviderClientTransport: Send + Sync {
     ) -> Result<ProviderContractInfo, LLMError>;
     async fn prepare_stream_router(
         &self,
+        host: &Self::HostRef,
         session_id: &str,
         request_id: &str,
         consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
@@ -365,12 +366,13 @@ where
 
     pub async fn prepare_stream_router(
         &self,
+        host: &TTransport::HostRef,
         session_id: &str,
         request_id: &str,
         consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(TTransport::RouterRef, TTransport::RemoteRouterRef), LLMError> {
         self.transport
-            .prepare_stream_router(session_id, request_id, consumer_tx)
+            .prepare_stream_router(host, session_id, request_id, consumer_tx)
             .await
     }
 
@@ -677,6 +679,7 @@ mod tests {
         }
         async fn prepare_stream_router(
             &self,
+            _host: &Self::HostRef,
             _session_id: &str,
             _request_id: &str,
             _consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,

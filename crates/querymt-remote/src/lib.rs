@@ -14,6 +14,8 @@ pub mod mesh_events;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_handle;
 #[cfg(feature = "kameo-mesh")]
+pub mod mesh_ingress;
+#[cfg(feature = "kameo-mesh")]
 pub mod mesh_routes;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_runtime;
@@ -21,8 +23,11 @@ pub mod mesh_runtime_config;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_runtime_support;
 pub mod mesh_state;
+mod metered_provider;
+pub use metered_provider::MeteredProvider;
 pub mod names;
 pub mod node_id;
+pub mod peer_access;
 pub mod provider_backend;
 pub mod provider_backend_helpers;
 pub mod provider_catalog;
@@ -65,7 +70,9 @@ pub use mesh_handle::{MeshHandle, ReRegisterFn, RemoteLookupError};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_routes::{MeshRoute, RouteTable};
 #[cfg(feature = "kameo-mesh")]
-pub use mesh_runtime::{bootstrap_mesh_handle, bootstrap_mesh_runtime};
+pub use mesh_runtime::{
+    bootstrap_mesh_handle, bootstrap_mesh_runtime, bootstrap_mesh_runtime_with_policy,
+};
 pub use mesh_runtime_config::{
     DirectoryMode, IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
 };

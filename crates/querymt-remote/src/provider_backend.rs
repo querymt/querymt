@@ -40,6 +40,31 @@ pub trait RemoteProviderBackend: Send + Sync {
         request: ProviderBuildRequest,
     ) -> Result<Arc<dyn LLMProvider>, Self::Error>;
 
+    /// Return a conservative total-token bound for this exact prepared call on
+    /// the host binding. The backend must enforce the output ceiling and account
+    /// for all instructions, tools, media, cached tokens, and reasoning. Leave
+    /// unsupported requests unbounded; a heuristic estimate is not sufficient.
+    fn quota_bound(
+        &self,
+        _request: &ProviderBuildRequest,
+        _call: &querymt::chat::ChatCall<'_>,
+    ) -> Option<i64> {
+        None
+    }
+
+    /// Prepare the exact binding and resolve the bound for one dispatch mode.
+    /// Implementations may use qualified host-side facts from the resolved config.
+    async fn prepare_chat(
+        &self,
+        request: ProviderBuildRequest,
+        call: &querymt::chat::ChatCall<'_>,
+        _streaming: bool,
+    ) -> Result<(Arc<dyn LLMProvider>, Option<i64>), Self::Error> {
+        let bound = self.quota_bound(&request, call);
+        let provider = self.build_provider(request).await?;
+        Ok((provider, bound))
+    }
+
     /// Resolve facts before the first chat request. Backends with generation
     /// defaults override this to report the settings of the provider they build.
     async fn contract_info(

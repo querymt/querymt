@@ -301,6 +301,7 @@ pub(crate) async fn compact_history(
     let token_estimate_u32 = u32_from_usize(token_estimate, "token_estimate", Some(session_id));
     let message_count = u32_from_usize(messages.len(), "messages.len", Some(session_id));
 
+    exec_ctx.require_turn_authority().await?;
     let pre_hook = config
         .hooks
         .run_pre_compaction(PreCompactionRequest {
@@ -402,7 +403,7 @@ pub(crate) async fn compact_history(
         };
         match config
             .compaction
-            .process_with_instructions(
+            .process_authorized(
                 &messages,
                 llm_provider,
                 model,
@@ -412,6 +413,7 @@ pub(crate) async fn compact_history(
                     .and_then(|cfg| cfg.max_prompt_bytes),
                 &ledger,
                 instructions,
+                exec_ctx.turn_authority(),
             )
             .await
         {
@@ -444,6 +446,11 @@ pub(crate) async fn compact_history(
         return Err(error);
     }
 
+    if let Err(error) = exec_ctx.require_turn_authority().await {
+        let error = anyhow::Error::from(error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
     let post_hook = match config
         .hooks
         .run_post_compaction(PostCompactionRequest {

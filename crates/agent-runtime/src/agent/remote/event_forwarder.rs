@@ -13,10 +13,66 @@ use std::sync::Arc;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
 #[cfg(feature = "remote")]
-use kameo::error::{Infallible, RemoteSendError};
+use kameo::error::RemoteSendError;
 
 #[cfg(feature = "remote")]
 use super::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
+#[cfg(feature = "remote")]
+use querymt_remote::{MeshHandle, mesh_ingress::PeerRequest, peer_access::SharingProtocol};
+
+#[cfg(feature = "remote")]
+#[derive(Clone)]
+pub(crate) struct PeerSubscription {
+    pub(crate) egress: MeshHandle,
+    pub(crate) store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    pub(crate) origin: PeerRequest,
+}
+
+#[cfg(feature = "remote")]
+impl PeerSubscription {
+    pub(crate) async fn is_current(&self) -> bool {
+        matches!(self.store.grant(self.origin.key()).await, Ok(state)
+            if state.grant.allows_sessions(self.origin.protocol()))
+    }
+}
+
+#[cfg(feature = "remote")]
+async fn deliver<M>(
+    relay: &RemoteActorRef<EventRelayActor>,
+    message: &M,
+    subscriber: Option<&PeerSubscription>,
+) -> Result<(), (String, bool)>
+where
+    EventRelayActor: kameo::remote::RemoteMessage<M> + kameo::message::Message<M, Reply = ()>,
+    M: serde::Serialize + Send + Sync + 'static,
+{
+    use querymt_remote::request_timeout::{SharingAskError, ask_sharing_v1};
+    let timeout = std::time::Duration::from_secs(3);
+    if let Some(subscriber) = subscriber
+        && subscriber.origin.protocol() == SharingProtocol::V1
+    {
+        return ask_sharing_v1::<_, _, (), crate::error::AgentError>(
+            &subscriber.egress,
+            relay,
+            message,
+            timeout,
+        )
+        .await
+        .map_err(|error| {
+            let terminal = matches!(
+                error,
+                SharingAskError::Actor(RemoteSendError::HandlerError(_))
+            ) || matches!(&error, SharingAskError::Actor(error) if destination_is_gone(error));
+            (error.to_string(), terminal)
+        });
+    }
+    relay
+        .tell(message)
+        .mailbox_timeout(timeout)
+        .send_ack()
+        .await
+        .map_err(|error| (error.to_string(), destination_is_gone(&error)))
+}
 
 /// An owned event-forwarder task. Dropping the handle cancels the task.
 pub struct EventForwarderHandle {
@@ -45,7 +101,7 @@ impl Drop for EventForwarderHandle {
 pub struct EventForwarder;
 
 #[cfg(feature = "remote")]
-fn destination_is_gone(error: &RemoteSendError<Infallible>) -> bool {
+fn destination_is_gone<E>(error: &RemoteSendError<E>) -> bool {
     matches!(
         error,
         RemoteSendError::ActorNotRunning
@@ -72,17 +128,62 @@ impl EventForwarder {
         source_label: String,
         filter_session_id: String,
     ) -> EventForwarderHandle {
+        Self::start_with_policy(fanout, relay_ref, source_label, filter_session_id, None)
+    }
+
+    pub(crate) fn start_with_policy(
+        fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
+        relay_ref: RemoteActorRef<EventRelayActor>,
+        source_label: String,
+        filter_session_id: String,
+        subscriber: Option<PeerSubscription>,
+    ) -> EventForwarderHandle {
         let mut rx = fanout.subscribe();
         let relay_actor_id = relay_ref.id();
+        let changes = subscriber
+            .as_ref()
+            .and_then(|subscriber| subscriber.store.subscribe_changes());
         let task = tokio::spawn(async move {
+            let revoked = async {
+                if let Some(subscriber) = &subscriber {
+                    querymt_remote::peer_access::wait_for_policy_loss(
+                        subscriber.store.as_ref(),
+                        subscriber.origin.key(),
+                        changes,
+                        |grant| {
+                            grant
+                                .allows_sessions(subscriber.origin.protocol())
+                                .then_some(())
+                                .ok_or(())
+                        },
+                        |_| None,
+                        || (),
+                    )
+                    .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(revoked);
             loop {
-                match rx.recv().await {
+                let next = tokio::select! {
+                    biased;
+                    _ = &mut revoked => break,
+                    next = rx.recv() => next,
+                };
+                if next
+                    .as_ref()
+                    .is_ok_and(|event| event.session_id() != filter_session_id)
+                {
+                    continue;
+                }
+                if let Some(subscriber) = &subscriber
+                    && !subscriber.is_current().await
+                {
+                    break;
+                }
+                match next {
                     Ok(envelope) => {
-                        // Only forward events belonging to our session.
-                        if envelope.session_id() != filter_session_id {
-                            continue;
-                        }
-
                         let event: AgentEvent = match &envelope {
                             EventEnvelope::Durable(de) => de.clone().into(),
                             EventEnvelope::Ephemeral(ee) => ee.clone().into(),
@@ -95,15 +196,13 @@ impl EventForwarder {
                             "forwarding event to relay actor"
                         );
 
-                        if let Err(error) = relay_ref
-                            .tell(&RelayedEvent {
-                                event: event.clone(),
-                            })
-                            .mailbox_timeout(std::time::Duration::from_secs(3))
-                            .send_ack()
-                            .await
-                        {
-                            let terminal = destination_is_gone(&error);
+                        let message = RelayedEvent { event };
+                        let result = tokio::select! {
+                            biased;
+                            _ = &mut revoked => break,
+                            result = deliver(&relay_ref, &message, subscriber.as_ref()) => result,
+                        };
+                        if let Err((error, terminal)) = result {
                             tracing::warn!(
                                 target: "remote::event_forwarder",
                                 source = %source_label,
@@ -128,15 +227,19 @@ impl EventForwarder {
                         // Tell the relay so it fetches the durable tail now;
                         // it cannot see a loss at the end of a burst itself.
                         // Best effort: a later event still reveals the gap.
-                        if let Err(error) = relay_ref
-                            .tell(&RelayLagged {
-                                session_id: filter_session_id.clone(),
-                                skipped: n,
-                            })
-                            .mailbox_timeout(std::time::Duration::from_secs(3))
-                            .send_ack()
-                            .await
-                        {
+                        let message = RelayLagged {
+                            session_id: filter_session_id.clone(),
+                            skipped: n,
+                        };
+                        let result = tokio::select! {
+                            biased;
+                            _ = &mut revoked => break,
+                            result = deliver(&relay_ref, &message, subscriber.as_ref()) => result,
+                        };
+                        if let Err((error, terminal)) = result {
+                            if terminal {
+                                break;
+                            }
                             tracing::debug!(
                                 target: "remote::event_forwarder",
                                 source = %source_label,

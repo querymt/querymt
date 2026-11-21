@@ -5,7 +5,7 @@ impl LocalAgentHandle {
     pub async fn list_remote_nodes(&self) -> Vec<crate::agent::remote::NodeInfo> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
         use futures_util::{StreamExt, stream::FuturesUnordered};
-        use querymt_remote::ask_remote_with_timeout;
+        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
 
         let Some(mesh) = self.mesh() else {
             log::debug!("list_remote_nodes: mesh not bootstrapped");
@@ -16,6 +16,8 @@ impl LocalAgentHandle {
 
         let local_peer_id = *mesh.peer_id();
         let timeout = Self::remote_node_info_timeout();
+        // Protected counts and capabilities can change without a topology event.
+        let use_cache = mesh.inbound_router().is_none();
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
@@ -49,7 +51,9 @@ impl LocalAgentHandle {
                     .lookup_actor_no_retry::<RemoteNodeManager>(dht_name.clone())
                     .await
                 {
-                    Ok(Some(node_manager_ref)) => {
+                    Ok(Some(node_manager_ref))
+                        if node_manager_ref.id().peer_id() == Some(&peer_id) =>
+                    {
                         log::debug!(
                             "list_remote_nodes: per-peer DHT hit for peer {} under '{}'",
                             peer_id,
@@ -68,7 +72,7 @@ impl LocalAgentHandle {
                             continue;
                         }
 
-                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                        if use_cache && let Some(info) = self.get_cached_remote_node(&cache_key) {
                             log::debug!(
                                 "list_remote_nodes: cache hit for peer {:?} under '{}'",
                                 Some(peer_id),
@@ -84,16 +88,17 @@ impl LocalAgentHandle {
                             dht_name
                         );
                         let semaphore = Arc::clone(&semaphore);
+                        let mesh = mesh.clone();
                         lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
                             let res =
-                                ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, timeout)
+                                ask_with_sharing(&mesh, &node_manager_ref, &GetNodeInfo, timeout)
                                     .await;
                             drop(permit);
                             (cache_key, Some(peer_id), res)
                         }));
                     }
-                    Ok(None) => {
+                    Ok(_) => {
                         log::debug!(
                             "list_remote_nodes: per-peer DHT miss for peer {} under '{}'",
                             peer_id,
@@ -173,7 +178,7 @@ impl LocalAgentHandle {
                             continue;
                         }
 
-                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                        if use_cache && let Some(info) = self.get_cached_remote_node(&cache_key) {
                             log::debug!(
                                 "list_remote_nodes: cache hit for peer {:?} under '{}'",
                                 peer_id,
@@ -189,10 +194,11 @@ impl LocalAgentHandle {
                             dht_name
                         );
                         let semaphore = Arc::clone(&semaphore);
+                        let mesh = mesh.clone();
                         lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
                             let res =
-                                ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, timeout)
+                                ask_with_sharing(&mesh, &node_manager_ref, &GetNodeInfo, timeout)
                                     .await;
                             drop(permit);
                             (cache_key, peer_id, res)
@@ -218,9 +224,14 @@ impl LocalAgentHandle {
         let mut fetched_nodes = Vec::new();
         while let Some((cache_key, peer_id, result)) = lookups.next().await {
             match result {
-                Ok(info) => {
-                    self.insert_cached_remote_node(cache_key, info.clone());
+                Ok(info) if peer_id == Some(*info.node_id.as_peer_id()) => {
+                    if use_cache {
+                        self.insert_cached_remote_node(cache_key, info.clone());
+                    }
                     fetched_nodes.push(info);
+                }
+                Ok(_) => {
+                    log::warn!("list_remote_nodes: GetNodeInfo returned a different peer identity")
                 }
                 Err(e) => {
                     if let Some(pid) = peer_id {
@@ -234,10 +245,12 @@ impl LocalAgentHandle {
                         );
                     }
                     match e {
-                        kameo::error::RemoteSendError::ReplyTimeout => log::warn!(
-                            "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
-                            peer_id
-                        ),
+                        SharingAskError::Actor(kameo::error::RemoteSendError::ReplyTimeout) => {
+                            log::warn!(
+                                "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
+                                peer_id
+                            )
+                        }
                         other => log::warn!("list_remote_nodes: GetNodeInfo failed: {}", other),
                     }
                 }

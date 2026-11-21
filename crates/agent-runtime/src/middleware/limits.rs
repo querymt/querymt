@@ -229,6 +229,10 @@ impl MiddlewareDriver for LimitsMiddleware {
         "LimitsMiddleware"
     }
 
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
+
     fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
         Some(querymt_agent_core::events::SessionLimits {
             max_steps: self
@@ -307,6 +311,10 @@ impl MiddlewareDriver for MaxStepsMiddleware {
 
     fn name(&self) -> &'static str {
         "MaxStepsMiddleware"
+    }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
     }
 
     fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
@@ -388,6 +396,10 @@ impl MiddlewareDriver for TurnLimitMiddleware {
 
     fn name(&self) -> &'static str {
         "TurnLimitMiddleware"
+    }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
     }
 
     fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
@@ -489,6 +501,10 @@ impl MiddlewareDriver for PriceLimitMiddleware {
 
     fn name(&self) -> &'static str {
         "PriceLimitMiddleware"
+    }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
     }
 
     fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {

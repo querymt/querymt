@@ -2,46 +2,29 @@ use crate::provider_host_error::RemoteProviderHostError;
 use crate::provider_protocol::{
     CancelProviderStreamRequest, GetProviderContractInfo, GetProviderStreamStatus,
     ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderChatResponse,
-    ProviderContractInfo, ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus,
-    RenewProviderStreamLease, StreamRelayMessage, keep_stream_message_buffered,
-    messages_require_item_aware_contract, relay_message_is_terminal, should_ack_relay_message,
+    ProviderContractInfo, ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease,
+    StreamRelayMessage, keep_stream_message_buffered, messages_require_item_aware_contract,
 };
-use crate::stream_router_protocol::RoutedStreamRelayMessage;
 use crate::{RemoteProviderBackend, build_provider_for_request};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
-use parking_lot::Mutex;
-use querymt::chat::{ChatCall, StreamChunk};
-use std::collections::{HashMap, VecDeque};
+use querymt::chat::ChatCall;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
-fn update_active_stream(
-    active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
-    session_id: &str,
-    request_id: &str,
-    f: impl FnOnce(&mut ActiveProviderStream),
-) {
-    let key = (session_id.to_string(), request_id.to_string());
-    if let Some(stream) = active_streams.lock().get_mut(&key) {
-        f(stream);
-    }
-}
+mod streams;
+use streams::{LiveStreams, Owner, Relay, StreamRequest, matching};
 
-fn remove_active_stream(
-    active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
-    session_id: &str,
-    request_id: &str,
-) {
-    active_streams
-        .lock()
-        .remove(&(session_id.to_string(), request_id.to_string()));
-}
+#[cfg(feature = "kameo-mesh")]
+use crate::{
+    MeshHandle,
+    mesh_ingress::PeerRequest,
+    provider_share::guarded::{GuardedProvider, failure, policy_error, quota_error},
+};
 
-fn validate_item_aware_request(
+pub(crate) fn validate_item_aware_request(
     messages: &[querymt::chat::ChatMessage],
     advertised_version: Option<u32>,
 ) -> Result<(), RemoteProviderHostError> {
@@ -61,110 +44,26 @@ fn validate_item_aware_request(
     Ok(())
 }
 
-#[derive(Debug)]
-struct ActiveProviderStream {
-    session_id: String,
-    request_id: String,
-    provider: String,
-    model: String,
-    phase: ProviderStreamPhase,
-    started_at: Instant,
-    last_progress_at: Instant,
-    last_heartbeat_at: Instant,
-    chunk_count: u64,
-    receiver_connected: bool,
-    lease_expires_at: Instant,
-    last_error: Option<String>,
-    cancel_token: CancellationToken,
-}
-
-impl ActiveProviderStream {
-    fn status(&self) -> ProviderStreamStatus {
-        let now = Instant::now();
-        ProviderStreamStatus {
-            session_id: self.session_id.clone(),
-            request_id: self.request_id.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            phase: self.phase,
-            elapsed_ms: now.duration_since(self.started_at).as_millis() as u64,
-            idle_ms: now.duration_since(self.last_progress_at).as_millis() as u64,
-            chunk_count: self.chunk_count,
-            receiver_connected: self.receiver_connected,
-            lease_expires_in_ms: self
-                .lease_expires_at
-                .checked_duration_since(now)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            last_error: self.last_error.clone(),
-        }
-    }
-}
-
 #[derive(Actor)]
 pub struct ProviderHostActor {
     backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>,
-    active_streams: Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
+    active_streams: LiveStreams,
+    shutdown: CancellationToken,
 }
 
 impl ProviderHostActor {
     pub fn new(backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>) -> Self {
         Self {
             backend,
-            active_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_streams: Default::default(),
+            shutdown: CancellationToken::new(),
         }
     }
+}
 
-    fn provider_stream_status(
-        &self,
-        session_id: &str,
-        request_id: Option<&str>,
-    ) -> Option<ProviderStreamStatus> {
-        let streams = self.active_streams.lock();
-        if let Some(request_id) = request_id {
-            let key = (session_id.to_string(), request_id.to_string());
-            return streams.get(&key).map(ActiveProviderStream::status);
-        }
-
-        streams
-            .iter()
-            .find(|((s, _), _)| s == session_id)
-            .map(|(_, stream)| stream.status())
-    }
-
-    fn cancel_streams(
-        &self,
-        session_id: &str,
-        request_id: Option<&str>,
-        reason: Option<&str>,
-    ) -> usize {
-        let reason = reason.unwrap_or("cancel requested").to_string();
-        let mut streams = self.active_streams.lock();
-        let mut cancelled = 0usize;
-        let to_cancel: Vec<(String, String)> = streams
-            .keys()
-            .filter(|(s, r)| s == session_id && request_id.is_none_or(|rid| r == rid))
-            .cloned()
-            .collect();
-        for key in to_cancel {
-            if let Some(stream) = streams.get_mut(&key) {
-                stream.phase = ProviderStreamPhase::Cancelling;
-                stream.last_error = Some(reason.clone());
-                stream.cancel_token.cancel();
-                cancelled += 1;
-            }
-        }
-        cancelled
-    }
-
-    fn renew_stream_lease(&self, session_id: &str, request_id: &str, lease_ttl_secs: u64) -> bool {
-        let mut streams = self.active_streams.lock();
-        let key = (session_id.to_string(), request_id.to_string());
-        let Some(stream) = streams.get_mut(&key) else {
-            return false;
-        };
-        stream.lease_expires_at = Instant::now() + Duration::from_secs(lease_ttl_secs.max(1));
-        true
+impl Drop for ProviderHostActor {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
     }
 }
 
@@ -270,443 +169,27 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
     )]
     async fn handle(
         &mut self,
-        msg: ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>,
+        msg: StreamRequest,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let backend = Arc::clone(&self.backend);
-        let active_streams = Arc::clone(&self.active_streams);
-
+        let backend = self.backend.clone();
+        let streams = self.active_streams.clone();
+        let cancel = self.shutdown.child_token();
         ctx.spawn(async move {
-            use futures_util::StreamExt;
-
-            const MAX_BATCH_SIZE: usize = 16;
-            const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
-            const ACK_WINDOW_BATCHES: u32 = 8;
-            const ACK_WINDOW_INTERVAL: Duration = Duration::from_millis(40);
-
-            let provider_name = msg.provider.clone();
-            let model = msg.model.clone();
-            let session_id = msg.session_id.clone();
-            let request_id = msg.request_id.clone();
-            let reconnect_grace = Duration::from_secs(msg.reconnect_grace_secs.max(1));
-            let heartbeat_interval = Duration::from_secs(msg.heartbeat_interval_secs.max(1));
-            let lease_ttl_secs = msg.lease_ttl_secs.max(1);
-            let lease_ttl = Duration::from_secs(lease_ttl_secs);
-            let cancel_token = CancellationToken::new();
-            let started_at = Instant::now();
-
-            {
-                let mut streams = active_streams.lock();
-                streams.insert(
-                    (session_id.clone(), request_id.clone()),
-                    ActiveProviderStream {
-                        session_id: session_id.clone(),
-                        request_id: request_id.clone(),
-                        provider: provider_name.clone(),
-                        model: model.clone(),
-                        phase: ProviderStreamPhase::OpeningUpstream,
-                        started_at,
-                        last_progress_at: started_at,
-                        last_heartbeat_at: started_at,
-                        chunk_count: 0,
-                        receiver_connected: true,
-                        lease_expires_at: started_at + lease_ttl,
-                        last_error: None,
-                        cancel_token: cancel_token.clone(),
-                    },
-                );
-            }
-
-            let cleanup_request_id = request_id.clone();
-            let cleanup_session_id = session_id.clone();
-            let cleanup_streams = Arc::clone(&active_streams);
-            let stream_router_ref = msg.stream_router_ref;
-
-            let setup_result: Result<_, RemoteProviderHostError> = async {
-                validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
-                let provider = build_provider_for_request(
-                    backend.as_ref(),
-                    &msg.provider,
-                    &msg.model,
-                    msg.params.as_ref(),
-                )
-                .await?;
-
-                let call = ChatCall::new(&msg.messages)
-                    .maybe_tools(msg.tools.as_deref())
-                    .options(msg.options.unwrap_or_default());
-                let stream = provider
-                    .chat_stream(&call)
-                    .await
-                    .map_err(|e| RemoteProviderHostError::provider_chat("chat_stream", &e))?;
-
-                Ok::<_, RemoteProviderHostError>((provider, stream))
-            }
-            .await;
-
-            let (_provider, mut stream) = match setup_result {
-                Ok(tuple) => tuple,
-                Err(e) => {
-                    let _ = stream_router_ref
-                        .tell(&RoutedStreamRelayMessage {
-                            request_id: cleanup_request_id.clone(),
-                            message: StreamRelayMessage::ProviderError {
-                                error: e.to_payload(),
-                            },
-                            seq: Some(0),
-                        })
-                        .send();
-                    remove_active_stream(&cleanup_streams, &cleanup_session_id, &cleanup_request_id);
-                    return Ok(());
+            let relay = Relay::new(
+                streams,
+                &msg,
+                Owner::Local,
+                cancel,
+                #[cfg(feature = "kameo-mesh")]
+                None,
+            )?;
+            match relay.open_local(backend.as_ref(), msg).await {
+                Ok(stream) => {
+                    tokio::spawn(relay.run(std::future::ready(Ok(stream)), None));
                 }
-            };
-
-            tracing::Span::current().record("receiver_found", true);
-            let relay_span = tracing::info_span!(
-                "remote.provider_host.stream.relay",
-                provider = %provider_name,
-                model = %model,
-                session_id = %session_id,
-                request_id = %request_id,
-                chunk_count = tracing::field::Empty,
-                batch_count = tracing::field::Empty,
-                max_batch_size = tracing::field::Empty,
-            );
-            tokio::spawn(
-                async move {
-                    let mut chunk_count = 0usize;
-                    let mut batch_count = 0usize;
-                    let mut max_batch_size = 0usize;
-                    let relay_start = started_at;
-                    let mut buffered = RelayQueue::default();
-                    let mut pending_batch: Vec<StreamChunk> = Vec::new();
-                    let mut disconnected_since: Option<tokio::time::Instant> = None;
-                    let mut upstream_done = false;
-                    let mut terminal_message: Option<StreamRelayMessage> = None;
-                    let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
-                    let mut unacked_batches: u32 = 0;
-                    let mut last_ack_at = Instant::now();
-                    heartbeat_tick.tick().await;
-
-                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                        stream.phase = ProviderStreamPhase::WaitingFirstChunk;
-                    });
-
-                    let flush_batch = |buffered: &mut RelayQueue,
-                                       pending_batch: &mut Vec<StreamChunk>,
-                                       batch_count: &mut usize,
-                                       max_batch_size: &mut usize| {
-                        if pending_batch.is_empty() {
-                            return;
-                        }
-                        *batch_count += 1;
-                        *max_batch_size = (*max_batch_size).max(pending_batch.len());
-                        let message = if pending_batch.len() == 1 {
-                            StreamRelayMessage::Chunk(pending_batch.pop().expect("batch has one chunk"))
-                        } else {
-                            StreamRelayMessage::ChunkBatch(std::mem::take(pending_batch))
-                        };
-                        buffered.push_sequenced(message);
-                    };
-
-                    'outer: loop {
-                        tokio::select! {
-                            _ = cancel_token.cancelled(), if !upstream_done => {
-                                upstream_done = true;
-                                flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
-                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                    stream.phase = ProviderStreamPhase::Cancelling;
-                                    stream.last_error.get_or_insert_with(|| "cancelled".to_string());
-                                });
-                                terminal_message = Some(StreamRelayMessage::TransportFailed {
-                                    error: querymt::error::LLMError::Transport {
-                                        kind: querymt::error::TransportErrorKind::ConnectionClosed,
-                                        message: "provider stream cancelled".to_string(),
-                                    }.to_payload(),
-                                });
-                            }
-                            _ = heartbeat_tick.tick() => {
-                                let now = Instant::now();
-                                let mut lease_expired = false;
-                                let mut status = None;
-                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                    if now >= stream.lease_expires_at {
-                                        lease_expired = true;
-                                        stream.phase = ProviderStreamPhase::LeaseExpired;
-                                        stream.last_error = Some("stream lease expired".to_string());
-                                        stream.cancel_token.cancel();
-                                        return;
-                                    }
-                                    stream.last_heartbeat_at = now;
-                                    status = Some(stream.status());
-                                });
-                                if lease_expired {
-                                    continue;
-                                }
-                                if let Some(status) = status {
-                                    buffered.push_unsequenced(StreamRelayMessage::Heartbeat {
-                                        phase: status.phase,
-                                        elapsed_ms: status.elapsed_ms,
-                                        idle_ms: status.idle_ms,
-                                        chunk_count: status.chunk_count,
-                                    });
-                                }
-                            }
-                            next_chunk = async {
-                                if pending_batch.is_empty() {
-                                    stream.next().await
-                                } else {
-                                    tokio::time::timeout(BATCH_FLUSH_INTERVAL, stream.next()).await.unwrap_or_default()
-                                }
-                            }, if !upstream_done => {
-                                match next_chunk {
-                                    Some(chunk_result) => {
-                                        let mut finish_reason = None;
-                                        match chunk_result {
-                                            Ok(chunk) => {
-                                                let chunk_is_done = querymt::chat::chunk_is_terminal(&chunk);
-                                                if chunk_is_done {
-                                                    finish_reason = match &chunk {
-                                                        StreamChunk::Done { finish_reason: reason } => Some(*reason),
-                                                        _ => None,
-                                                    };
-                                                    upstream_done = true;
-                                                }
-                                                pending_batch.push(chunk);
-                                                if upstream_done || pending_batch.len() >= MAX_BATCH_SIZE {
-                                                    flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
-                                                }
-                                                let chunk_delta = if chunk_is_done { 0 } else { 1 };
-                                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                                    stream.phase = ProviderStreamPhase::Streaming;
-                                                    stream.last_progress_at = Instant::now();
-                                                    stream.receiver_connected = disconnected_since.is_none();
-                                                    stream.chunk_count = stream.chunk_count.saturating_add(chunk_delta as u64);
-                                                });
-                                            }
-                                            Err(e) => {
-                                                flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
-                                                upstream_done = true;
-                                                let payload = e.to_payload();
-                                                let message = e.to_string();
-                                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                                    stream.phase = ProviderStreamPhase::Failed;
-                                                    stream.last_error = Some(message);
-                                                    stream.last_progress_at = Instant::now();
-                                                });
-                                                terminal_message = Some(StreamRelayMessage::ProviderError { error: payload });
-                                            }
-                                        }
-
-                                        if finish_reason.is_some() {
-                                            update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                                stream.phase = ProviderStreamPhase::Completed;
-                                                stream.last_progress_at = Instant::now();
-                                            });
-                                        }
-                                    }
-                                    None => {
-                                        if pending_batch.is_empty() {
-                                            upstream_done = true;
-                                            update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                                stream.phase = ProviderStreamPhase::Completed;
-                                                stream.last_progress_at = Instant::now();
-                                            });
-                                        } else {
-                                            flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(message) = terminal_message.take() {
-                            buffered.push_sequenced(message);
-                        }
-
-                        loop {
-                            if disconnected_since.is_some() {
-                                let replay_count = buffered.replayable_count();
-                                let reconnect_result = stream_router_ref.tell(&RoutedStreamRelayMessage {
-                                    request_id: request_id.clone(),
-                                    message: StreamRelayMessage::TransportReconnected {
-                                        buffered_chunks: replay_count,
-                                    },
-                                    seq: None,
-                                }).send_ack().await;
-                                if reconnect_result.is_ok() {
-                                    let _disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
-                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                        stream.phase = if stream.chunk_count == 0 {
-                                            ProviderStreamPhase::WaitingFirstChunk
-                                        } else {
-                                            ProviderStreamPhase::Streaming
-                                        };
-                                        stream.receiver_connected = true;
-                                    });
-                                    unacked_batches = 0;
-                                    last_ack_at = Instant::now();
-                                } else {
-                                    let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
-                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                        stream.phase = ProviderStreamPhase::ReceiverDisconnected;
-                                        stream.receiver_connected = false;
-                                    });
-                                    if since.elapsed() >= reconnect_grace {
-                                        buffered.push_sequenced(StreamRelayMessage::TransportFailed {
-                                            error: querymt::error::LLMError::Transport {
-                                                kind: querymt::error::TransportErrorKind::Timeout,
-                                                message: format!("reconnect grace expired after {:?}", reconnect_grace),
-                                            }.to_payload(),
-                                        });
-                                        update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                            stream.phase = ProviderStreamPhase::GraceExpired;
-                                            stream.last_error = Some("reconnect grace expired".to_string());
-                                        });
-                                        upstream_done = true;
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(250)).await;
-                                    if upstream_done {
-                                        break 'outer;
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            let Some((front_seq, front)) = buffered.front_cloned() else {
-                                break;
-                            };
-                            let relay = RoutedStreamRelayMessage {
-                                request_id: request_id.clone(),
-                                message: front,
-                                seq: front_seq,
-                            };
-                            let is_terminal = relay_message_is_terminal(&relay.message);
-                            let is_chunk_batch = matches!(
-                                &relay.message,
-                                StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_)
-                            );
-                            let should_ack = should_ack_relay_message(
-                                &relay.message,
-                                unacked_batches,
-                                last_ack_at.elapsed(),
-                                ACK_WINDOW_BATCHES,
-                                ACK_WINDOW_INTERVAL,
-                            );
-                            if is_terminal {
-                                tracing::info!(
-                                    target: "querymt_remote::provider::relay",
-                                    session_id = %session_id,
-                                    request_id = %request_id,
-                                    provider = %provider_name,
-                                    model = %model,
-                                    should_ack,
-                                    buffered_messages = buffered.len(),
-                                    unacked_batches,
-                                    "relaying terminal provider stream message"
-                                );
-                            }
-                            let relay_result = if should_ack {
-                                stream_router_ref.tell(&relay).send_ack().await.map_err(|e| e.to_string())
-                            } else {
-                                stream_router_ref.tell(&relay).send().map_err(|e| e.to_string())
-                            };
-                            if let Err(e) = relay_result {
-                                if is_terminal {
-                                    tracing::warn!(
-                                        target: "querymt_remote::provider::relay",
-                                        session_id = %session_id,
-                                        request_id = %request_id,
-                                        provider = %provider_name,
-                                        model = %model,
-                                        should_ack,
-                                        error = %e,
-                                        "failed to relay terminal provider stream message"
-                                    );
-                                }
-                                if disconnected_since.is_none() {
-                                    disconnected_since = Some(tokio::time::Instant::now());
-                                    let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
-                                        request_id: request_id.clone(),
-                                        message: StreamRelayMessage::TransportDisconnected {
-                                            reason: e.to_string(),
-                                        },
-                                        seq: None,
-                                    }).send();
-                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                        stream.phase = ProviderStreamPhase::ReceiverDisconnected;
-                                        stream.receiver_connected = false;
-                                        stream.last_error = Some(e.to_string());
-                                    });
-                                }
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                                continue;
-                            }
-
-                            if is_terminal {
-                                tracing::info!(
-                                    target: "querymt_remote::provider::relay",
-                                    session_id = %session_id,
-                                    request_id = %request_id,
-                                    provider = %provider_name,
-                                    model = %model,
-                                    should_ack,
-                                    relay_elapsed_ms = relay_start.elapsed().as_millis(),
-                                    "terminal provider stream message relayed successfully"
-                                );
-                            }
-
-                            if is_chunk_batch {
-                                if should_ack {
-                                    unacked_batches = 0;
-                                    last_ack_at = Instant::now();
-                                } else {
-                                    unacked_batches = unacked_batches.saturating_add(1);
-                                }
-                            } else {
-                                unacked_batches = 0;
-                                last_ack_at = Instant::now();
-                            }
-
-                            buffered.pop_front();
-                            let relayed_chunks = match &relay.message {
-                                StreamRelayMessage::Chunk(_) => 1,
-                                StreamRelayMessage::ChunkBatch(chunks) => chunks.len(),
-                                StreamRelayMessage::Heartbeat { .. }
-                                | StreamRelayMessage::ProviderError { .. }
-                                | StreamRelayMessage::TransportDisconnected { .. }
-                                | StreamRelayMessage::TransportReconnected { .. }
-                                | StreamRelayMessage::TransportFailed { .. } => 0,
-                            };
-                            chunk_count += relayed_chunks;
-                            if relayed_chunks > 0 {
-                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                    stream.chunk_count = chunk_count as u64;
-                                    stream.last_progress_at = Instant::now();
-                                });
-                            }
-                            let _elapsed_ms = relay_start.elapsed().as_millis();
-                            if !keep_stream_message_buffered(&relay.message) {
-                                continue;
-                            }
-                            if is_terminal {
-                                break 'outer;
-                            }
-                        }
-
-                        if upstream_done && buffered.is_empty() && pending_batch.is_empty() {
-                            break;
-                        }
-                    }
-
-                    remove_active_stream(&active_streams, &session_id, &request_id);
-                    tracing::Span::current().record("chunk_count", chunk_count);
-                    tracing::Span::current().record("batch_count", batch_count);
-                    tracing::Span::current().record("max_batch_size", max_batch_size);
-                }
-                .instrument(relay_span),
-            );
-
+                Err(error) => relay.local_open_failed(error),
+            }
             Ok(())
         })
     }
@@ -740,11 +223,12 @@ impl RelayQueue {
         self.queue.pop_front();
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.queue.len()
+    fn clear(&mut self) {
+        self.queue.clear();
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
@@ -764,11 +248,16 @@ impl Message<CancelProviderStreamRequest> for ProviderHostActor {
         msg: CancelProviderStreamRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.cancel_streams(
+        let streams = matching(
+            &self.active_streams,
+            &Owner::Local,
             &msg.session_id,
             msg.request_id.as_deref(),
-            msg.reason.as_deref(),
-        )
+        );
+        for stream in &streams {
+            stream.cancel(msg.reason.as_deref());
+        }
+        streams.len()
     }
 }
 
@@ -780,7 +269,14 @@ impl Message<RenewProviderStreamLease> for ProviderHostActor {
         msg: RenewProviderStreamLease,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.renew_stream_lease(&msg.session_id, &msg.request_id, msg.lease_ttl_secs)
+        matching(
+            &self.active_streams,
+            &Owner::Local,
+            &msg.session_id,
+            Some(&msg.request_id),
+        )
+        .first()
+        .is_some_and(|stream| stream.renew(msg.lease_ttl_secs))
     }
 }
 
@@ -792,9 +288,145 @@ impl Message<GetProviderStreamStatus> for ProviderHostActor {
         msg: GetProviderStreamStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.provider_stream_status(&msg.session_id, msg.request_id.as_deref())
+        matching(
+            &self.active_streams,
+            &Owner::Local,
+            &msg.session_id,
+            msg.request_id.as_deref(),
+        )
+        .first()
+        .map(|stream| stream.status())
     }
 }
+
+#[cfg(feature = "kameo-mesh")]
+pub(crate) struct GuardedStreamStart(
+    pub Arc<GuardedProvider>,
+    pub MeshHandle,
+    pub PeerRequest,
+    pub StreamRequest,
+    pub CancellationToken,
+);
+
+#[cfg(feature = "kameo-mesh")]
+impl Message<GuardedStreamStart> for ProviderHostActor {
+    type Reply = kameo::reply::DelegatedReply<Result<(), RemoteProviderHostError>>;
+
+    async fn handle(
+        &mut self,
+        GuardedStreamStart(policy, mesh, peer, mut msg, admission): GuardedStreamStart,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::peer_access::quota::QuotaError;
+        use querymt::error::ProviderErrorKind;
+
+        let streams = self.active_streams.clone();
+        let cancel = self.shutdown.child_token();
+        ctx.spawn(async move {
+            if msg.stream_router_ref.id().peer_id() != Some(peer.key().peer.as_peer_id()) {
+                return Err(quota_error(QuotaError::Denied));
+            }
+            let id = uuid::Uuid::parse_str(&msg.request_id).map_err(|_| {
+                failure(ProviderErrorKind::InvalidRequest, "mesh_stream_id", "invalid stream request ID")
+            })?;
+            validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
+            let request = policy.build_request(&msg.provider, &msg.model, msg.params.take())?;
+            let access = policy.access(&peer, &msg.provider, &msg.model)?;
+            let owner = Owner::peer(&peer)?;
+            let (provider, mut reservation) = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(RemoteProviderHostError::Internal("provider host stopped".into())),
+                _ = admission.cancelled() => return Err(RemoteProviderHostError::Internal("stream admission cancelled".into())),
+                result = async {
+                    let call = streams::call(&msg);
+                    let provider = policy.prepare(&peer, request, &call, id, true).await?;
+                    let reservation = provider.reserve(&call, true).await.map_err(policy_error)?;
+                    Ok::<_, RemoteProviderHostError>((provider, reservation))
+                } => result?,
+            };
+            if admission.is_cancelled() {
+                reservation.release().await.map_err(quota_error)?;
+                return Err(RemoteProviderHostError::Internal("stream admission cancelled".into()));
+            }
+            let relay = Relay::new(streams, &msg, owner, cancel, Some((mesh, access)))?;
+            let settled = reservation.completion();
+            tokio::spawn(relay.run(async move {
+                provider.stream_reserved(&streams::call(&msg), reservation).await
+                    .map_err(|error| RemoteProviderHostError::provider_chat("chat_stream", &error))
+            }, Some(settled)));
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "kameo-mesh")]
+pub(crate) struct GuardedStreamControl<M>(pub PeerRequest, pub M);
+
+#[cfg(feature = "kameo-mesh")]
+macro_rules! guarded_control {
+    ($msg:ty, $result:ty, $request_id:expr, |$streams:ident, $request:ident| $operation:block) => {
+        impl Message<GuardedStreamControl<$msg>> for ProviderHostActor {
+            type Reply = kameo::reply::DelegatedReply<Result<$result, RemoteProviderHostError>>;
+
+            async fn handle(
+                &mut self,
+                GuardedStreamControl(peer, $request): GuardedStreamControl<$msg>,
+                ctx: &mut Context<Self, Self::Reply>,
+            ) -> Self::Reply {
+                let active = self.active_streams.clone();
+                ctx.spawn(async move {
+                    let owner = Owner::peer(&peer)?;
+                    let $streams = matching(&active, &owner, &$request.session_id, $request_id);
+                    $operation
+                })
+            }
+        }
+    };
+}
+
+#[cfg(feature = "kameo-mesh")]
+guarded_control!(
+    GetProviderStreamStatus,
+    Option<ProviderStreamStatus>,
+    msg.request_id.as_deref(),
+    |streams, msg| {
+        if let Some(stream) = streams.first() {
+            stream.authorize().await?;
+            Ok(Some(stream.status()))
+        } else {
+            Ok(None)
+        }
+    }
+);
+
+#[cfg(feature = "kameo-mesh")]
+guarded_control!(
+    RenewProviderStreamLease,
+    bool,
+    Some(&msg.request_id),
+    |streams, msg| {
+        if let Some(stream) = streams.first() {
+            stream.authorize().await?;
+            Ok(stream.renew(msg.lease_ttl_secs))
+        } else {
+            Ok(false)
+        }
+    }
+);
+
+#[cfg(feature = "kameo-mesh")]
+guarded_control!(
+    CancelProviderStreamRequest,
+    usize,
+    msg.request_id.as_deref(),
+    |streams, msg| {
+        for stream in &streams {
+            stream.authorize().await?;
+            stream.cancel(msg.reason.as_deref());
+        }
+        Ok(streams.len())
+    }
+);
 
 impl kameo::remote::RemoteActor for ProviderHostActor {
     const REMOTE_ID: &'static str = "querymt::ProviderHostActor";
@@ -912,9 +544,12 @@ remote_provider_msg_impl!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProviderStreamPhase;
     use async_trait::async_trait;
     use kameo::actor::Spawn;
+    use parking_lot::Mutex;
     use querymt::LLMProvider;
+    use querymt::chat::StreamChunk;
     use querymt::chat::{
         ChatCall, ChatCapabilities, ChatOutput, ChatProvider, GenerationOptionSupport,
         GenerationOptions,
@@ -1017,6 +652,41 @@ mod tests {
             .await
             .expect("chat without options");
 
+        assert_eq!(*seen.lock(), [GenerationOptions::NONE]);
+    }
+
+    #[tokio::test]
+    async fn actor_requires_the_item_aware_contract_before_replaying_native_history() {
+        use querymt::chat::{ChatMessage, ChatOutputItem, ChatReasoningItem};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: seen.clone(),
+        })));
+        let mut request = chat_request(None);
+        request
+            .messages
+            .push(ChatMessage::from_assistant_output(ChatOutput {
+                items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                    encrypted_content: Some("opaque continuation".into()),
+                    id: None,
+                    summary: vec![],
+                    content: vec![],
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                })],
+                ..Default::default()
+            }));
+
+        let result = actor.ask(request.clone()).await;
+        assert!(matches!(result, Err(kameo::error::SendError::HandlerError(
+            RemoteProviderHostError::ProviderChat { operation, .. }
+        )) if operation == "contract_check"));
+        assert!(seen.lock().is_empty());
+
+        request.item_aware_contract_version = Some(ITEM_AWARE_CHAT_CONTRACT_VERSION);
+        actor.ask(request).await.expect("compatible contract");
         assert_eq!(*seen.lock(), [GenerationOptions::NONE]);
     }
 

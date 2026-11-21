@@ -79,6 +79,11 @@ pub struct SessionMcpAttachmentContext {
 /// idempotent.
 #[async_trait]
 pub trait SessionMcpAttachmentSource: Send + Sync {
+    /// Whether resolving attachments is a no-op that cannot start external work.
+    fn is_statically_empty(&self) -> bool {
+        false
+    }
+
     /// Attest that workspace-dependent integrations serve this effective cwd.
     ///
     /// The default implementation accepts integrations whose root is not
@@ -143,6 +148,10 @@ pub struct NoopSessionMcpAttachmentSource;
 
 #[async_trait]
 impl SessionMcpAttachmentSource for NoopSessionMcpAttachmentSource {
+    fn is_statically_empty(&self) -> bool {
+        true
+    }
+
     async fn attachments(
         &self,
         _context: &SessionMcpAttachmentContext,

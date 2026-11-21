@@ -27,7 +27,7 @@ zbus-secret-service = ["querymt-utils/zbus-secret-service"]
 systemd-credentials = ["querymt-utils/systemd-credentials"]
 
 # Enables kameo remote actor support for cross-machine session management.
-remote = ["querymt-agent-runtime/remote", "kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
+remote = ["querymt-agent-runtime/remote", "kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr", "querymt-agent-sqlite/mesh-access"]
 # Collect relay and address-lookup counters in mesh diagnostics.
 remote-metrics = ["remote", "querymt-remote/iroh-metrics"]
 
@@ -116,6 +116,7 @@ env_logger = "0.11"
 clap = { version = "4.5", features = ["derive", "env"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.29"
 
 [[test]]
 name = "embedded_ui_resolver"

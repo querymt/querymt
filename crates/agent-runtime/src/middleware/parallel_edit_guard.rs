@@ -363,6 +363,10 @@ impl MiddlewareDriver for ParallelEditGuard {
     fn name(&self) -> &'static str {
         "ParallelEditGuard"
     }
+
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
 }
 
 /// Factory for creating [`ParallelEditGuard`] from config.

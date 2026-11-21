@@ -56,6 +56,9 @@
 - **BREAKING (profile catalog):** the embedded `coder-delegate` profile is
   written as `[agent]` with `[[delegates]]`, so its `config_kind` is now
   `single`, not `quorum`.
+- **Mesh sharing:** Agent mesh runtimes start with no sharing grants. Joining a
+  scope does not grant access in either direction. Use ACP to grant access
+  explicitly; pre-upgrade clients require Full access on an upgraded host.
 - Configuration: `[agent]` accepts `[[delegates]]`, `[agent.delegation]`
   (`wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`,
   `verification`, `summary`) and `snapshot_policy`. `[quorum]` / `[planner]` is

@@ -64,8 +64,10 @@ impl LLMProviderFactory for LlamaCppFactory {
     }
 
     fn config_schema(&self) -> String {
-        let schema = schema_for!(LlamaCppConfig);
-        serde_json::to_string(&schema).expect("LlamaCppConfig schema should always serialize")
+        let mut schema = schema_for!(LlamaCppConfig).to_value();
+        // Advertise the enforced native binding contract without changing the plugin ABI.
+        schema["x-querymt-chat-token-bound"] = serde_json::json!("llama-cpp-text-stream-n-ctx-v2");
+        schema.to_string()
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {

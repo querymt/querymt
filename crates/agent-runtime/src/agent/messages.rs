@@ -12,6 +12,7 @@
 
 use crate::acp::protocol::{ExtNotification as AcpExtNotification, ExtRequest, PromptRequest};
 use crate::agent::core::AgentMode;
+use crate::agent::session_actor::TurnAuthority;
 use crate::agent::session_control::{
     SessionControlState, SessionControlTransition, SessionModelSelection,
 };
@@ -32,21 +33,55 @@ use typeshare::typeshare;
 ///
 /// The handler uses `ctx.spawn()` to execute the state machine in a
 /// detached task so the actor stays responsive for `Cancel`, `SetMode`, etc.
+/// Turn authority is mailbox-only; mesh ingress supplies it after decoding.
 #[derive(Serialize, Deserialize)]
 pub struct Prompt {
     pub req: PromptRequest,
+    #[serde(skip)]
+    pub(crate) authority: TurnAuthority,
+}
+
+impl Prompt {
+    pub fn new(req: PromptRequest) -> Self {
+        Self {
+            req,
+            authority: TurnAuthority::Local,
+        }
+    }
 }
 
 /// Submit explicitly steered or queued input.
 #[derive(Serialize, Deserialize)]
 pub struct SubmitSessionInput {
     pub input: SubmitInput,
+    #[serde(skip)]
+    pub(crate) authority: TurnAuthority,
+}
+
+impl SubmitSessionInput {
+    pub fn new(input: SubmitInput) -> Self {
+        Self {
+            input,
+            authority: TurnAuthority::Local,
+        }
+    }
 }
 
 /// Remove an input that has not started from the session queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscardQueuedInput {
     pub input_id: String,
+    #[serde(skip)]
+    pub(crate) authority: TurnAuthority,
+}
+
+impl DiscardQueuedInput {
+    pub fn new(input_id: String) -> Self {
+        Self {
+            input_id,
+            authority: TurnAuthority::Local,
+        }
+    }
 }
 
 #[typeshare]
@@ -57,9 +92,24 @@ pub enum DiscardQueuedInputResult {
     NotPending { input_id: String },
 }
 
+// MessagePack encodes a unit struct as an empty array, not the nil used for `()`.
+#[derive(Serialize, Deserialize)]
+struct UnitTurnPayload;
+
 /// Signal cancellation of the running prompt.
 #[derive(Serialize, Deserialize)]
-pub struct Cancel;
+#[serde(transparent)]
+pub struct Cancel {
+    unit: UnitTurnPayload,
+    #[serde(skip)]
+    pub(crate) authority: TurnAuthority,
+}
+
+#[allow(non_upper_case_globals)]
+pub const Cancel: Cancel = Cancel {
+    unit: UnitTurnPayload,
+    authority: TurnAuthority::Local,
+};
 
 /// Internal message sent by the spawned prompt task when it finishes.
 ///
@@ -108,6 +158,8 @@ pub struct ScheduledPrompt {
     pub prompt_text: String,
     /// Optional per-cycle execution limits (max_steps, max_cost_usd).
     pub execution_limits: Option<crate::session::domain_schedule::ScheduleExecutionLimits>,
+    /// Trusted origin loaded by the scheduler from the stored schedule.
+    pub origin: crate::session::domain_schedule::ScheduleOrigin,
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -202,7 +254,18 @@ pub struct GetSessionLimits;
 
 /// Query the current runtime status for stop/resume orchestration.
 #[derive(Serialize, Deserialize)]
-pub struct GetRuntimeStatus;
+#[serde(transparent)]
+pub struct GetRuntimeStatus {
+    unit: UnitTurnPayload,
+    #[serde(skip)]
+    pub(crate) authority: TurnAuthority,
+}
+
+#[allow(non_upper_case_globals)]
+pub const GetRuntimeStatus: GetRuntimeStatus = GetRuntimeStatus {
+    unit: UnitTurnPayload,
+    authority: TurnAuthority::Local,
+};
 
 /// Publish an ordered runtime observation and return its delivery watermark.
 #[derive(Serialize, Deserialize)]
@@ -539,10 +602,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_message_serializes() {
-        let msg = Cancel;
-        let json = serde_json::to_string(&msg).unwrap();
-        let _rt: Cancel = serde_json::from_str(&json).unwrap();
+    fn unit_turn_messages_keep_legacy_wire_payloads() {
+        let legacy = [0x90]; // MessagePack empty array
+        assert_eq!(rmp_serde::to_vec_named(&Cancel).unwrap(), legacy);
+        assert_eq!(rmp_serde::to_vec_named(&GetRuntimeStatus).unwrap(), legacy);
+        let cancel: Cancel = rmp_serde::from_slice(&legacy).unwrap();
+        let status: GetRuntimeStatus = rmp_serde::from_slice(&legacy).unwrap();
+        assert!(matches!(cancel.authority, TurnAuthority::Local));
+        assert!(matches!(status.authority, TurnAuthority::Local));
     }
 
     #[test]

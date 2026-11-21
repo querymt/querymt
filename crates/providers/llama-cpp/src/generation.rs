@@ -732,10 +732,25 @@ pub(crate) fn generate_streaming_with_thinking(
                 "Prompt tokenization resulted in an empty sequence".into(),
             ));
         }
+        let input = u32::try_from(tokens.len())
+            .map_err(|_| LLMError::InvalidRequest("prompt token count exceeds u32".into()))?;
+        let requested = input
+            .checked_add(max_tokens)
+            .and_then(|total| i32::try_from(total).ok())
+            .ok_or_else(|| {
+                LLMError::InvalidRequest(
+                    "prompt and output token count exceeds supported positions".into(),
+                )
+            })?;
+        if cfg.n_ctx.is_some_and(|limit| requested as u32 > limit) {
+            return Err(LLMError::InvalidRequest(
+                "prompt and output exceed configured n_ctx".into(),
+            ));
+        }
         if max_tokens == 0 {
             return Ok((
                 Usage {
-                    input_tokens: tokens.len() as u32,
+                    input_tokens: input,
                     output_tokens: 0,
                     cache_read: 0,
                     cache_write: 0,
@@ -746,10 +761,9 @@ pub(crate) fn generate_streaming_with_thinking(
             ));
         }
 
-        let n_len_total = tokens.len() as i32 + max_tokens as i32;
-        if n_len_total > n_ctx_total {
+        if requested > n_ctx_total {
             return Err(LLMError::InvalidRequest(format!(
-                "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
+                "Prompt + max_tokens ({requested}) exceeds context window ({n_ctx_total})"
             )));
         }
 

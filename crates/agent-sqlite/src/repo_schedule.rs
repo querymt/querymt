@@ -649,6 +649,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_schedule_origin_survives_reopening_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("schedule.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        schema::init_schema(&mut connection).unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let (s, t) = insert_prerequisites(&db, "session-origin", "task-origin");
+        let repo = SqliteScheduleRepository::new(db);
+        let mut schedule = make_schedule(t, s, "task-origin", "session-origin");
+        let origin = ScheduleOrigin::Peer {
+            host: "origin-host".into(),
+            peer: "origin-peer".into(),
+            revision: uuid::Uuid::now_v7(),
+            protocol: SchedulePeerProtocol::V1,
+        };
+        schedule.config.origin = origin.clone();
+        let id = repo.create_schedule(schedule).await.unwrap().public_id;
+        drop(repo);
+
+        let db = Arc::new(Mutex::new(Connection::open(&path).unwrap()));
+        let repo = SqliteScheduleRepository::new(db.clone());
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().config.origin,
+            origin
+        );
+
+        db.lock().execute(
+            "UPDATE schedules SET config_json = json_remove(config_json, '$.origin') WHERE public_id = ?",
+            [&id],
+        ).unwrap();
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().config.origin,
+            ScheduleOrigin::Local
+        );
+    }
+
+    #[tokio::test]
     async fn trigger_serialization_roundtrip_in_db() {
         let db = setup_db();
         let (s, t) = insert_prerequisites(&db, "sess-trig", "task-trig");

@@ -71,6 +71,7 @@ pub(super) async fn transition_before_llm_call(
         return Ok(ExecutionState::Cancelled);
     }
 
+    exec_ctx.require_turn_authority().await?;
     let provider = match super::llm_retry::call_with_retry(
         config,
         &exec_ctx.session_id,
@@ -120,12 +121,24 @@ pub(super) async fn transition_before_llm_call(
     let (tools, tools_json, new_hash) = {
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
-        let tools = config.collect_tools(
+        let mut tools = config.collect_tools(
             provider,
             Some(exec_ctx.runtime.as_ref()),
             Some(&exec_ctx.tool_config),
             exec_ctx.tool_set(config),
         );
+        tools.retain(|tool| exec_ctx.allows_workflow_tool(&tool.function.name));
+        if exec_ctx.restricted_mesh_turn() {
+            tools = tools
+                .into_iter()
+                .filter_map(|tool| {
+                    let name = tool.function.name;
+                    exec_ctx.tool_set(config).find(&name)?;
+                    super::tool_calls::confined_mesh_tool(config, &name)
+                        .map(|(_, definition)| definition)
+                })
+                .collect();
+        }
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
         let new_hash = querymt_agent_core::hash::RapidHash::new(&tools_json);
@@ -173,21 +186,30 @@ pub(super) async fn transition_before_llm_call(
         trigger,
         message_count = messages.len() as u64
     );
-    let hook_result = config
-        .hooks
-        .run_context(crate::hooks::ContextHookRequest {
-            session_id: exec_ctx.session_id.clone(),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: context.model.to_string(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
-            trigger: trigger.to_string(),
-            context_window,
-            messages,
-        })
-        .instrument(hook_span)
-        .await?;
+    exec_ctx.require_turn_authority().await?;
+    let hook_result = if exec_ctx.restricted_mesh_turn() {
+        crate::hooks::ContextHookResult {
+            estimated_tokens: crate::session::pruning::estimate_chat_tokens(&messages),
+            messages: Some(messages),
+            notices: Vec::new(),
+        }
+    } else {
+        config
+            .hooks
+            .run_context(crate::hooks::ContextHookRequest {
+                session_id: exec_ctx.session_id.clone(),
+                mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+                turn_id: exec_ctx.turn_id().to_string(),
+                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+                model: context.model.to_string(),
+                permission_mode: exec_ctx.permission_mode().to_string(),
+                trigger: trigger.to_string(),
+                context_window,
+                messages,
+            })
+            .instrument(hook_span)
+            .await?
+    };
     for notice in hook_result.notices {
         config.emit_event(
             &exec_ctx.session_id,
@@ -765,6 +787,8 @@ pub(super) async fn transition_call_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
+    exec_ctx.require_turn_authority().await?;
+
     // Overrides last for exactly this request. Options the provider does not
     // honour are dropped (and logged); `applied` records what was really sent.
     let options = context
@@ -808,8 +832,12 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    let output: ChatOutput = if tools.is_empty() {
-        // No tools — always use the non-streaming simple submit path.
+    let output: ChatOutput = if tools.is_empty()
+        && !exec_ctx.restricted_mesh_turn()
+        && !session_handle.uses_explicit_mesh_provider()
+    {
+        // Keep the simple local path. A remote binding may enforce finite
+        // capacity only for streaming, even when no tools were requested.
         let cancel = exec_ctx.cancellation_token.clone();
         match super::llm_retry::call_with_retry(
             config,
@@ -835,7 +863,13 @@ pub(super) async fn transition_call_llm(
                         operation,
                         session_handle.billing_basis(),
                         &cancel,
-                        || provider.chat(&call),
+                        || async {
+                            exec_ctx
+                                .require_turn_authority()
+                                .await
+                                .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                            provider.chat(&call).await
+                        },
                     )
                     .await
                 }
@@ -1009,6 +1043,7 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
+                exec_ctx.require_turn_authority().await?;
                 // Durable start before the request is sent; a failure here
                 // means nothing was dispatched.
                 let mut attempt = match operation
@@ -1026,13 +1061,20 @@ pub(super) async fn transition_call_llm(
                         return Err(accounting_failure(error));
                     }
                 };
+                if let Err(error) = exec_ctx.require_turn_authority().await {
+                    attempt
+                        .settle_error(&LLMError::InvalidRequest(error.to_string()), false, None)
+                        .await
+                        .map_err(accounting_failure)?;
+                    return Err(error.into());
+                }
                 let mut response_started = false;
 
                 timing.start();
                 let mut stream = match provider
                     .chat_stream(
                         &ChatCall::new(messages_with_cache)
-                            .tools(tools.as_ref())
+                            .maybe_tools((!tools.is_empty()).then_some(tools.as_ref()))
                             .options(options),
                     )
                     .await
@@ -1495,13 +1537,19 @@ pub(super) async fn transition_call_llm(
                     let operation = &operation;
                     async move {
                         let call = ChatCall::new(messages_with_cache)
-                            .tools(tools)
+                            .maybe_tools((!tools.is_empty()).then_some(tools))
                             .options(options);
                         querymt_agent_services::accounting::run_attempt(
                             operation,
                             session_handle.billing_basis(),
                             &cancel,
-                            || provider.chat(&call),
+                            || async {
+                                exec_ctx
+                                    .require_turn_authority()
+                                    .await
+                                    .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                                provider.chat(&call).await
+                            },
                         )
                         .await
                     }
