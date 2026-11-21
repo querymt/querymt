@@ -2010,6 +2010,7 @@ pub(super) async fn record_tool_side_effects(
                         crate::worktree::DelegationIsolation::Shared
                     }
                 },
+                exec_ctx.turn_authority().stored_origin(),
             )
             .await
         {
@@ -3640,11 +3641,7 @@ mod prepared_call_tests {
             .execution_context()
             .await
             .with_turn_authority(PeerTurn::test_authority(revision, store.clone()));
-        for name in [
-            "delegate",
-            "route_delegation_to_peer",
-            "use_remote_provider",
-        ] {
+        for name in ["route_delegation_to_peer", "use_remote_provider"] {
             let workflow = mock_tool_call("workflow", name, "{}");
             let prepared = prepare_tool_call(&config, &workflow, &exec).await.unwrap();
             assert!(matches!(prepared.disposition, Disposition::Rejected(_)));

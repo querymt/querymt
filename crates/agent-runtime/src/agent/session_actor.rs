@@ -437,6 +437,14 @@ impl std::fmt::Debug for PeerTurn {
 }
 
 impl TurnAuthority {
+    pub(crate) fn stored_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
+        match self {
+            Self::Local => crate::session::domain_schedule::ScheduleOrigin::Local,
+            #[cfg(feature = "remote")]
+            Self::Peer(peer) => peer.schedule_origin(),
+        }
+    }
+
     pub(crate) async fn check(&self) -> Result<(), AgentError> {
         match self {
             Self::Local => Ok(()),
@@ -2885,10 +2893,10 @@ impl SessionActor {
 // 3. Emits ScheduledExecutionCompleted / ScheduledExecutionFailed terminal
 //    events so the SchedulerActor can correlate cycle outcomes.
 
-impl SessionActor {
-    fn schedule_authority(
-        &self,
+impl TurnAuthority {
+    pub(crate) fn from_stored_origin(
         origin: crate::session::domain_schedule::ScheduleOrigin,
+        #[cfg(feature = "remote")] mesh: Option<&querymt_remote::MeshHandle>,
     ) -> Result<TurnAuthority, AgentError> {
         use crate::session::domain_schedule::ScheduleOrigin;
         match origin {
@@ -2906,7 +2914,7 @@ impl SessionActor {
                     peer_access::{PeerGrantKey, SharingProtocol},
                 };
 
-                let mesh = self.mesh.as_ref().ok_or(AgentError::MeshAccessDenied)?;
+                let mesh = mesh.ok_or(AgentError::MeshAccessDenied)?;
                 let store = mesh
                     .quota_store()
                     .ok_or(AgentError::MeshAccessDenied)?
@@ -2929,7 +2937,9 @@ impl SessionActor {
             _ => Err(AgentError::MeshAccessDenied),
         }
     }
+}
 
+impl SessionActor {
     fn emit_scheduled_admission_failure(&self, schedule_public_id: &str, error: &AgentError) {
         self.config.emit_event(
             &self.session_id,
@@ -2955,7 +2965,11 @@ impl Message<ScheduledPrompt> for SessionActor {
             self.session_id, msg.schedule_public_id
         );
 
-        let authority = match self.schedule_authority(msg.origin) {
+        let authority = match TurnAuthority::from_stored_origin(
+            msg.origin,
+            #[cfg(feature = "remote")]
+            self.mesh.as_ref(),
+        ) {
             Ok(authority) => match authority.check().await {
                 Ok(()) => Ok(authority),
                 Err(error) => Err(error),

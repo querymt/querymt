@@ -230,10 +230,7 @@ impl ExecutionContext {
         // The delegation orchestrator and routing tools can outlive this turn.
         // Until they preserve its origin, do not let them borrow host authority.
         matches!(self.turn_authority, TurnAuthority::Local)
-            || !matches!(
-                name,
-                "delegate" | "route_delegation_to_peer" | "use_remote_provider"
-            )
+            || !matches!(name, "route_delegation_to_peer" | "use_remote_provider")
     }
 
     /// Set the knowledge store for this context.

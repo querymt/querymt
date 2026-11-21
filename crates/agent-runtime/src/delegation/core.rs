@@ -1,4 +1,5 @@
 use crate::acp::protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
+use crate::agent::session_actor::TurnAuthority;
 use crate::delegation::roster::{AgentRoster, MemberAgent};
 use crate::hooks::{
     DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
@@ -1011,8 +1012,119 @@ async fn execute_delegation(
     delegation: Delegation,
     cancel_token: CancellationToken,
 ) {
+    let admission = async {
+        let origin = ctx.store.delegation_origin(&delegation.public_id).await?;
+        #[cfg(feature = "remote")]
+        let mesh = ctx.delegator.mesh();
+        let authority = TurnAuthority::from_stored_origin(
+            origin,
+            #[cfg(feature = "remote")]
+            mesh.as_ref(),
+        )?;
+        #[cfg(feature = "remote")]
+        if let TurnAuthority::Peer(peer) = &authority
+            && (target
+                .as_local()
+                .is_none_or(|member| member.config.hooks.is_enabled())
+                || ctx.hooks.is_enabled()
+                || peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full)
+        {
+            return Err(crate::error::AgentError::MeshAccessDenied.into());
+        }
+        Ok::<_, anyhow::Error>(authority)
+    }
+    .await;
+    let authority = match admission {
+        Ok(authority) => authority,
+        Err(error) => {
+            fail_delegation(
+                DelegationFailureContext {
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: None,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: None,
+                    objective: None,
+                    execution_cwd: None,
+                    child_session: None,
+                },
+                &format!("delegation authority unavailable: {error}"),
+            )
+            .await;
+            ctx.active_delegations
+                .lock()
+                .await
+                .remove(&delegation.public_id);
+            return;
+        }
+    };
+    #[cfg(feature = "remote")]
+    if let TurnAuthority::Peer(peer) = &authority {
+        let mut ctx = ctx;
+        // These optional operations cannot inherit the caller's model or process authority.
+        ctx.routing_snapshot = None;
+        ctx.delegation_summarizer = None;
+        ctx.config.run_verification = false;
+        let run = execute_delegation_inner(
+            ctx,
+            target,
+            parent_session_id,
+            delegation,
+            cancel_token.clone(),
+            &authority,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            () = peer.revoked() => {
+                cancel_token.cancel();
+                run.await;
+            }
+            () = &mut run => {},
+        }
+        return;
+    }
+    execute_delegation_inner(
+        ctx,
+        target,
+        parent_session_id,
+        delegation,
+        cancel_token,
+        &authority,
+    )
+    .await;
+}
+
+async fn execute_delegation_inner(
+    ctx: DelegationContext,
+    target: MemberAgent,
+    parent_session_id: String,
+    delegation: Delegation,
+    cancel_token: CancellationToken,
+    authority: &TurnAuthority,
+) {
     let delegation_id = delegation.public_id.clone();
     let mut planning_context_additions = String::new();
+    if let Err(error) = authority.check().await {
+        fail_delegation(
+            DelegationFailureContext {
+                delegator: &ctx.delegator,
+                store: &ctx.store,
+                hooks: None,
+                parent_session_id: &parent_session_id,
+                delegation_id: &delegation_id,
+                target_agent_id: None,
+                objective: None,
+                execution_cwd: None,
+                child_session: None,
+            },
+            &error.to_string(),
+        )
+        .await;
+        ctx.active_delegations.lock().await.remove(&delegation_id);
+        return;
+    }
 
     // Isolated delegation fails closed without a workspace service: a
     // requested isolation never falls back to sharing the parent checkout,
@@ -1804,7 +1916,7 @@ async fn execute_delegation(
     prompt_req.meta = crate::acp::trace_context::inject_current_acp_trace_context();
 
     let prompt_result = tokio::select! {
-        result = session_ref.prompt(prompt_req) => Some(result),
+        result = session_ref.prompt_with_authority(prompt_req, authority) => Some(result),
         _ = cancel_token.cancelled() => {
             ctx.activity.stage(Some(crate::control::delegation_notifications::DelegationStage::CancelRequested));
             // Cancellation — cancel the child session

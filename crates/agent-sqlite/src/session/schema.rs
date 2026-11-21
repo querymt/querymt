@@ -140,6 +140,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             verification_spec TEXT,  -- Structured verification specification (JSON)
             planning_summary TEXT,  -- AI-generated summary of parent planning conversation
             isolation TEXT,  -- Delegation execution isolation: inherit | shared | isolated (NULL = inherit)
+            origin_json TEXT,
             status TEXT NOT NULL,
             retry_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,

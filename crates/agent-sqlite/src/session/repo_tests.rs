@@ -900,6 +900,43 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn peer_delegation_origin_survives_claim_and_updates() {
+            use querymt_agent_core::session::domain_schedule::{
+                ScheduleOrigin, SchedulePeerProtocol,
+            };
+            let (_, session_id, repo) = make_session_and_repo().await;
+            let origin = ScheduleOrigin::Peer {
+                host: "host".into(),
+                peer: "peer".into(),
+                revision: uuid::Uuid::now_v7(),
+                protocol: SchedulePeerProtocol::V1,
+            };
+            let delegated = repo
+                .create_with_origin(
+                    make_delegation(session_id, "local-worker", "inert"),
+                    origin.clone(),
+                )
+                .await
+                .unwrap();
+            let _ = repo.claim_delegation(&delegated.public_id).await.unwrap();
+            repo.set_delegation_planning_summary(&delegated.public_id, "summary")
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.clone().origin(&delegated.public_id).await.unwrap(),
+                origin
+            );
+            let ordinary = repo
+                .create_delegation(make_delegation(session_id, "local-worker", "ordinary"))
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.origin(&ordinary.public_id).await.unwrap(),
+                ScheduleOrigin::Local
+            );
+        }
+
+        #[tokio::test]
         async fn list_delegations_for_session() {
             let (session_public_id, session_id, repo) = make_session_and_repo().await;
             repo.create_delegation(make_delegation(session_id, "agent-a", "obj-1"))

@@ -571,6 +571,29 @@ pub trait SessionStore: Send + Sync {
 
     // Delegation repository methods
     async fn create_delegation(&self, delegation: Delegation) -> SessionResult<Delegation>;
+    /// Persist the initiating authority atomically with a deferred delegation.
+    async fn create_delegation_with_origin(
+        &self,
+        delegation: Delegation,
+        origin: super::domain_schedule::ScheduleOrigin,
+    ) -> SessionResult<Delegation> {
+        use super::domain_schedule::ScheduleOrigin;
+        if origin != ScheduleOrigin::Local {
+            return Err(SessionError::InvalidOperation(
+                "delegation origin storage unavailable".into(),
+            ));
+        }
+        self.create_delegation(delegation).await
+    }
+
+    async fn delegation_origin(
+        &self,
+        _delegation_id: &str,
+    ) -> SessionResult<super::domain_schedule::ScheduleOrigin> {
+        // Backends that don't implement origin storage cannot admit peer work.
+        Ok(super::domain_schedule::ScheduleOrigin::Local)
+    }
+
     async fn get_delegation(&self, delegation_id: &str) -> SessionResult<Option<Delegation>>;
     async fn list_delegations(&self, session_id: &str) -> SessionResult<Vec<Delegation>>;
     async fn claim_delegation(

@@ -419,6 +419,29 @@ impl SessionActorRef {
         }
     }
 
+    pub(crate) async fn prompt_with_authority(
+        &self,
+        req: PromptRequest,
+        authority: &crate::agent::session_actor::TurnAuthority,
+    ) -> Result<PromptResponse, AcpError> {
+        #[cfg(feature = "remote")]
+        if let crate::agent::session_actor::TurnAuthority::Peer(_) = authority {
+            let Self::Local(actor) = self else {
+                return Err(AcpError::from(AgentError::MeshAccessDenied));
+            };
+            return actor
+                .ask(crate::agent::session_actor::PeerTurnMessage {
+                    message: messages::Prompt { req },
+                    authority: authority.clone(),
+                })
+                .await
+                .map_err(Self::map_local_agent_send_error)
+                .map_err(AcpError::from);
+        }
+        let _ = authority;
+        self.prompt(req).await
+    }
+
     pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         self.prompt_agent(req).await.map_err(AcpError::from)
     }
