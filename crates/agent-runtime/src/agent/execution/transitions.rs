@@ -1074,7 +1074,7 @@ pub(super) async fn transition_call_llm(
                 let mut stream = match provider
                     .chat_stream(
                         &ChatCall::new(messages_with_cache)
-                            .tools(tools.as_ref())
+                            .maybe_tools((!tools.is_empty()).then_some(tools.as_ref()))
                             .options(options),
                     )
                     .await
@@ -1537,7 +1537,7 @@ pub(super) async fn transition_call_llm(
                     let operation = &operation;
                     async move {
                         let call = ChatCall::new(messages_with_cache)
-                            .tools(tools)
+                            .maybe_tools((!tools.is_empty()).then_some(tools))
                             .options(options);
                         querymt_agent_services::accounting::run_attempt(
                             operation,
