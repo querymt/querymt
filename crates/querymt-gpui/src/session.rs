@@ -870,6 +870,26 @@ pub struct ParentSession {
     pub parent: Option<Box<ParentSession>>,
 }
 
+/// Where a fork from one turn branches, and what it keeps (desktop
+/// `SessionForkTarget`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkTarget {
+    pub message_id: String,
+    pub prompt: String,
+    pub response: String,
+    /// The fork point is the reply itself, so the fork keeps it.
+    pub includes_response: bool,
+}
+
+/// An item key the agent assigned, not a local echo (`local-`), a streamed
+/// chunk without an id (`msg-`) or a snapshot event without one (`snapshot-`).
+fn agent_identified(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with("local-")
+        && !key.starts_with("msg-")
+        && !key.starts_with("snapshot-")
+}
+
 /// One frame of the workspace undo stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndoFrame {
@@ -1284,6 +1304,76 @@ impl SessionView {
     /// User turn that redo would restore (top of the undo stack).
     pub fn redo_target(&self) -> Option<&str> {
         self.undo_stack.last().map(|f| f.message_id.as_str())
+    }
+
+    /// Message a fork of the turn closing at item `end` branches from
+    /// (desktop `forkMessageId`): the turn's last agent-identified reply or
+    /// reasoning message, else its prompt. `None` while nothing in the turn
+    /// has an agent id yet (local echoes, synthetic keys).
+    pub fn fork_point(&self, end: usize) -> Option<&str> {
+        let start = self.turn_start(end)?;
+        let mut point = None;
+        for item in &self.items[start..=end] {
+            match &item.kind {
+                ItemKind::User { local: false, .. } | ItemKind::Agent { .. }
+                    if agent_identified(&item.key) =>
+                {
+                    point = Some(item.key.as_str());
+                }
+                ItemKind::Work(entries) => {
+                    if let Some(t) = entries.iter().rev().find_map(|e| match e {
+                        WorkEntry::Thought(t) if agent_identified(&t.message) => Some(t),
+                        _ => None,
+                    }) {
+                        point = Some(t.message.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        point
+    }
+
+    /// What a fork of the turn closing at item `end` keeps (desktop
+    /// `getForkTarget`): its prompt and, when the fork point is a reply, the
+    /// reply text.
+    pub fn fork_target(&self, end: usize) -> Option<ForkTarget> {
+        let message_id = self.fork_point(end)?.to_string();
+        let start = self.turn_start(end)?;
+        let turn = &self.items[start..=end];
+        let prompt = match &turn[0].kind {
+            ItemKind::User { text, .. } => text.trim().to_string(),
+            _ => String::new(),
+        };
+        let response = turn
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Agent { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        let includes_response = turn
+            .iter()
+            .any(|i| matches!(i.kind, ItemKind::Agent { .. }) && i.key == message_id);
+        Some(ForkTarget {
+            message_id,
+            prompt,
+            response,
+            includes_response,
+        })
+    }
+
+    /// First item of the turn holding item `end`: its prompt, or the start
+    /// of the transcript when the loaded window begins mid-turn.
+    fn turn_start(&self, end: usize) -> Option<usize> {
+        (end < self.items.len()).then(|| {
+            self.items[..=end]
+                .iter()
+                .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
+                .unwrap_or(0)
+        })
     }
 
     /// Start or settle the active-work clock to match `running()`.
@@ -3021,7 +3111,7 @@ mod input_tests {
 
 #[cfg(test)]
 mod undo_tests {
-    use super::{SessionView, UndoFrame};
+    use super::{ForkTarget, SessionView, UndoFrame};
     use serde_json::json;
 
     fn view_with_turns(ids: &[&str]) -> SessionView {
@@ -3037,6 +3127,37 @@ mod undo_tests {
             );
         }
         view
+    }
+
+    #[test]
+    fn a_fork_branches_after_the_turns_last_reply() {
+        let mut view = view_with_turns(&["u1", "u2"]);
+        // Items: u1, r-u1, u2, r-u2.
+        assert_eq!(view.fork_point(1), Some("r-u1"));
+        let target = view.fork_target(3).unwrap();
+        assert_eq!(
+            target,
+            ForkTarget {
+                message_id: "r-u2".into(),
+                prompt: "prompt".into(),
+                response: "reply".into(),
+                includes_response: true,
+            }
+        );
+        // A turn whose reply has no agent id forks at its prompt, without the reply.
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
+            "content": { "type": "text", "text": "third" } }),
+        );
+        view.apply(&json!({ "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "anonymous" } }));
+        let target = view.fork_target(5).unwrap();
+        assert_eq!(target.message_id, "u3");
+        assert!(!target.includes_response);
+        // A local echo the agent hasn't identified yet can't be forked.
+        view.push_local_user("pending", Vec::new());
+        assert_eq!(view.fork_point(6), None);
+        assert_eq!(view.fork_point(99), None);
     }
 
     #[test]
