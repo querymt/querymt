@@ -36,7 +36,7 @@ impl kameo::remote::RemoteMessage<MeteredChat> for ProviderHostActor {
     const REMOTE_ID: &'static str = "querymt::MeteredChat.v1";
 }
 
-pub(super) struct GuardedProvider {
+pub(crate) struct GuardedProvider {
     pub(super) backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>,
     pub(super) catalog: Arc<dyn ProviderCatalogBackend>,
     pub(super) store: Arc<dyn QuotaStore>,
@@ -162,7 +162,7 @@ impl GuardedProvider {
             .map_err(policy_error)
     }
 
-    fn access(
+    pub(crate) fn access(
         &self,
         peer: &PeerRequest,
         provider: &str,
@@ -178,7 +178,7 @@ impl GuardedProvider {
         .map_err(policy_error)
     }
 
-    fn build_request(
+    pub(crate) fn build_request(
         &self,
         provider: &str,
         model: &str,
@@ -231,7 +231,7 @@ impl GuardedProvider {
             .map_err(|error| RemoteProviderHostError::provider_chat("chat", &error))
     }
 
-    async fn prepare(
+    pub(crate) async fn prepare(
         &self,
         peer: &PeerRequest,
         request: ProviderBuildRequest,
@@ -251,15 +251,15 @@ impl GuardedProvider {
     }
 }
 
-fn policy_error(error: LLMError) -> RemoteProviderHostError {
+pub(crate) fn policy_error(error: LLMError) -> RemoteProviderHostError {
     RemoteProviderHostError::provider_chat("mesh_policy", &error)
 }
 
-fn quota_error(error: QuotaError) -> RemoteProviderHostError {
+pub(crate) fn quota_error(error: QuotaError) -> RemoteProviderHostError {
     RemoteProviderHostError::provider_chat("mesh_policy", &error.into_provider_error())
 }
 
-fn failure(
+pub(crate) fn failure(
     kind: ProviderErrorKind,
     code: &str,
     message: impl Into<String>,

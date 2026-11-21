@@ -77,7 +77,13 @@ impl ProviderShare {
                     self.provider_catalog.id(),
                     self.provider_host.id(),
                 );
-                guarded::streams::install(provider, mesh, router, self.provider_host.id());
+                guarded::streams::install(
+                    provider,
+                    mesh,
+                    router,
+                    self.provider_host.id(),
+                    &self.provider_host,
+                );
             });
         }
         runtime

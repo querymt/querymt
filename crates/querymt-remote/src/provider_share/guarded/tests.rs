@@ -16,6 +16,7 @@ use crate::{
     RoutedStreamRelayMessage, StaticCatalogBackend, StreamRelayMessage,
 };
 use async_trait::async_trait;
+use kameo::actor::{ActorRef, Spawn};
 use kameo::error::RemoteSendError;
 use kameo::remote::{
     RemoteActor, RemoteMessage,
@@ -155,9 +156,15 @@ enum StreamEnding {
     Error,
 }
 
+struct BlockPreparation {
+    started: tokio::sync::oneshot::Sender<()>,
+    dropped: tokio::sync::oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct Backend {
     builds: Mutex<Vec<ProviderBuildRequest>>,
+    block_preparation: Mutex<Option<BlockPreparation>>,
     calls: Arc<AtomicUsize>,
     finish_stream: Arc<tokio::sync::Notify>,
     stream_ending: StreamEnding,
@@ -180,6 +187,12 @@ impl RemoteProviderBackend for Backend {
         request: ProviderBuildRequest,
     ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
         self.builds.lock().push(request);
+        let block = self.block_preparation.lock().take();
+        if let Some(BlockPreparation { started, dropped }) = block {
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+            drop(dropped);
+        }
         Ok(Arc::new(Provider {
             calls: self.calls.clone(),
             finish_stream: self.finish_stream.clone(),
@@ -587,6 +600,7 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
         Duration::from_secs(10),
     );
     let provider_id = ActorId::new_with_peer_id(1, host);
+    let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
     let catalog = Arc::new(StaticCatalogBackend::provider_models(
         host.to_string(),
         None,
@@ -602,6 +616,7 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
         &mesh,
         &ingress,
         provider_id,
+        &host_actor,
     );
     // Kameo deserializes the legacy callback envelope against its process-global
     // registry. V1 delivery itself goes through the normal sharing command path.
@@ -695,6 +710,7 @@ struct StreamFixture {
     host: PeerId,
     peer: PeerId,
     actor: ActorId,
+    host_actor: ActorRef<ProviderHostActor>,
     router: InboundRouter,
     store: Arc<Store>,
     backend: Arc<Backend>,
@@ -731,6 +747,7 @@ impl StreamFixture {
             Duration::from_secs(10),
         );
         let actor = ActorId::new_with_peer_id(1, host);
+        let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
         streams::install(
             Arc::new(GuardedProvider {
                 backend: backend.clone(),
@@ -745,12 +762,14 @@ impl StreamFixture {
             &mesh,
             &router,
             actor,
+            &host_actor,
         );
         init_callback_registry(host);
         Self {
             host,
             peer,
             actor,
+            host_actor,
             router,
             store,
             backend,
@@ -936,6 +955,17 @@ async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_con
     );
     assert!(!fixture.legacy::<_, bool>(&renew).await.unwrap());
     assert_eq!(fixture.legacy::<_, usize>(&cancel).await.unwrap(), 0);
+    // The local actor API also cannot see or mutate peer-owned streams.
+    assert!(
+        fixture
+            .host_actor
+            .ask(status.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fixture.host_actor.ask(renew.clone()).await.unwrap());
+    assert_eq!(fixture.host_actor.ask(cancel.clone()).await.unwrap(), 0);
     let live = fixture
         .call::<_, Option<ProviderStreamStatus>>(&status)
         .await
@@ -963,6 +993,48 @@ async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_con
     );
     assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 0);
     ack(reply);
+}
+
+#[tokio::test]
+async fn dropping_guarded_admission_cancels_an_in_progress_prepare() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (started, prepare_started) = tokio::sync::oneshot::channel();
+    let (dropped, prepare_dropped) = tokio::sync::oneshot::channel();
+    *fixture.backend.block_preparation.lock() = Some(BlockPreparation { started, dropped });
+    let mut call = Box::pin(fixture.call::<_, ()>(&request));
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut call => panic!("preparation unexpectedly returned: {result:?}"),
+            result = prepare_started => result.unwrap(),
+        }
+        drop(call);
+        prepare_dropped.await.unwrap_err();
+    })
+    .await
+    .expect("dropping ingress must cancel preparation");
+    assert!(fixture.store.attempts.lock().is_empty());
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn stopping_host_cancels_and_settles_a_guarded_stream_with_egress_blocked() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, held_reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+
+    fixture.host_actor.stop_gracefully().await.unwrap();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_transport(
+        terminal,
+        TransportErrorKind::ConnectionClosed,
+        "provider stream cancelled",
+    );
+    fixture.assert_settled(&request, AttemptUsage::Unknown);
+    ack(reply);
+    drop(held_reply);
 }
 
 #[tokio::test]
