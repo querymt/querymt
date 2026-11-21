@@ -113,66 +113,167 @@ mod access {
     use querymt_remote::{
         NodeId,
         peer_access::{
-            GrantStoreError, PeerGrant, PeerGrantKey, SharingProtocol,
+            GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant,
+            SharingProtocol,
             quota::{QuotaEdit, QuotaError, QuotaLimit, QuotaScope, QuotaStatus, QuotaWindow},
         },
     };
-    use serde::{Deserialize, de::DeserializeOwned};
-    use serde_json::{Value, json};
+    use serde::{Deserialize, Serialize, de::DeserializeOwned};
+    use serde_json::json;
+    use typeshare::typeshare;
     use uuid::Uuid;
 
+    #[typeshare]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Read {
+    struct GetMeshPeerAccessRequest {
         version: u32,
         peer_id: String,
     }
 
+    #[typeshare]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct SetGrant {
+    struct SetMeshPeerAccessRequest {
         version: u32,
         peer_id: String,
+        #[typeshare(serialized_as = "String")]
         expected_revision: Uuid,
         grant: PeerGrant,
     }
 
+    #[typeshare]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct SetQuota {
+    struct SetMeshPeerQuotaRequest {
         version: u32,
         peer_id: String,
+        #[typeshare(serialized_as = "String")]
         expected_revision: Uuid,
         scope: QuotaScope,
-        operation: Operation,
-        limit: WireLimit,
+        operation: MeshQuotaOperation,
+        limit: MeshQuotaLimit,
     }
 
+    #[typeshare]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Reset {
+    struct ResetMeshPeerQuotaRequest {
         version: u32,
         peer_id: String,
+        #[typeshare(serialized_as = "String")]
         expected_revision: Uuid,
         scope: QuotaScope,
     }
 
+    #[typeshare]
     #[derive(Deserialize)]
     #[serde(rename_all = "snake_case")]
-    enum Operation {
+    enum MeshQuotaOperation {
         Update,
         Reconfigure,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-    enum WireLimit {
+    enum MeshQuotaLimit {
         Unlimited,
         Finite {
             limit_tokens: String,
             #[serde(default)]
             window: QuotaWindow,
         },
+    }
+
+    #[typeshare]
+    #[derive(Serialize, Deserialize)]
+    struct MeshQuotaUsage {
+        known_tokens: String,
+        estimated_tokens: String,
+        has_unknown_usage: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reserved_tokens: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        available_tokens: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window_started_at: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_reset_at: Option<String>,
+    }
+
+    #[typeshare]
+    #[derive(Serialize, Deserialize)]
+    struct MeshPeerQuota {
+        scope: QuotaScope,
+        limit: MeshQuotaLimit,
+        active: bool,
+        usage: MeshQuotaUsage,
+    }
+
+    #[typeshare]
+    #[derive(Serialize)]
+    struct MeshPeerOutgoingAccess {
+        #[typeshare(serialized_as = "String")]
+        revision: Uuid,
+        grant: PeerGrant,
+        quotas: Vec<MeshPeerQuota>,
+    }
+
+    #[typeshare]
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum MeshPeerAccessMode {
+        Full,
+        Custom,
+    }
+
+    #[typeshare]
+    #[derive(Serialize, Deserialize)]
+    struct MeshPeerEffectiveAccess {
+        mode: MeshPeerAccessMode,
+        sessions: bool,
+        filesystem: bool,
+        shell: bool,
+        providers: Vec<ProviderGrant>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum MeshPeerIncomingAccess {
+        Granted {
+            effective: MeshPeerEffectiveAccess,
+            quotas: Vec<MeshPeerQuota>,
+        },
+        Denied,
+        Legacy,
+        Unavailable,
+        Incompatible,
+    }
+
+    #[typeshare]
+    #[derive(Serialize)]
+    struct MeshShareableModel {
+        model_id: String,
+        finite_quota_supported: bool,
+    }
+
+    #[typeshare]
+    #[derive(Serialize)]
+    struct MeshShareableProvider {
+        provider_id: String,
+        models: Vec<MeshShareableModel>,
+    }
+
+    #[typeshare]
+    #[derive(Serialize)]
+    struct MeshPeerAccessResponse {
+        version: u32,
+        peer_id: String,
+        outgoing: MeshPeerOutgoingAccess,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        incoming: Option<MeshPeerIncomingAccess>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shareable_catalog: Option<Vec<MeshShareableProvider>>,
     }
 
     enum Edit {
@@ -226,21 +327,23 @@ mod access {
             .ok()
     }
 
-    fn quota_json(grant: &PeerGrant, quota: QuotaStatus) -> Value {
-        let mut usage = json!({ "known_tokens": quota.known_tokens.to_string(),
-            "estimated_tokens": quota.estimated_tokens.to_string(), "has_unknown_usage": quota.has_unknown_usage });
+    fn quota_wire(grant: &PeerGrant, quota: QuotaStatus) -> MeshPeerQuota {
+        let finite = matches!(quota.limit, QuotaLimit::Finite { .. });
+        let usage = MeshQuotaUsage {
+            known_tokens: quota.known_tokens.to_string(),
+            estimated_tokens: quota.estimated_tokens.to_string(),
+            has_unknown_usage: quota.has_unknown_usage,
+            reserved_tokens: finite.then(|| quota.reserved_tokens.to_string()),
+            available_tokens: quota.available_tokens.map(|count| count.to_string()),
+            window_started_at: quota.window_started_at.and_then(timestamp),
+            next_reset_at: quota.next_reset_at.and_then(timestamp),
+        };
         let limit = match quota.limit {
-            QuotaLimit::Unlimited => json!({"kind": "unlimited"}),
-            QuotaLimit::Finite { tokens, window } => {
-                usage["reserved_tokens"] = json!(quota.reserved_tokens.to_string());
-                usage["available_tokens"] =
-                    json!(quota.available_tokens.map(|count| count.to_string()));
-                usage["window_started_at"] = json!(quota.window_started_at.and_then(timestamp));
-                if let Some(reset) = quota.next_reset_at.and_then(timestamp) {
-                    usage["next_reset_at"] = json!(reset);
-                }
-                json!({"kind": "finite", "limit_tokens": tokens.to_string(), "window": window})
-            }
+            QuotaLimit::Unlimited => MeshQuotaLimit::Unlimited,
+            QuotaLimit::Finite { tokens, window } => MeshQuotaLimit::Finite {
+                limit_tokens: tokens.to_string(),
+                window,
+            },
         };
         let active = match grant {
             PeerGrant::Custom { providers, .. } => {
@@ -253,7 +356,12 @@ mod access {
             }
             _ => false,
         };
-        json!({"scope": quota.scope, "limit": limit, "active": active, "usage": usage})
+        MeshPeerQuota {
+            scope: quota.scope,
+            limit,
+            active,
+            usage,
+        }
     }
 
     type Catalog = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
@@ -283,6 +391,58 @@ mod access {
                             != after.is_some_and(|models| models.contains(model))
                 })
         })
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn typed_peer_access_preserves_the_flat_wire_and_exact_tokens() {
+        let quota = MeshPeerQuota {
+            scope: QuotaScope {
+                provider_id: "fixture".into(),
+                model_id: None,
+            },
+            limit: MeshQuotaLimit::Finite {
+                limit_tokens: "9007199254740993".into(),
+                window: QuotaWindow::Daily,
+            },
+            active: true,
+            usage: MeshQuotaUsage {
+                known_tokens: "1".into(),
+                estimated_tokens: "0".into(),
+                has_unknown_usage: false,
+                reserved_tokens: Some("0".into()),
+                available_tokens: Some("9007199254740992".into()),
+                window_started_at: Some("2024-02-29T00:00:00Z".into()),
+                next_reset_at: None,
+            },
+        };
+        let incoming = MeshPeerIncomingAccess::Granted {
+            effective: MeshPeerEffectiveAccess {
+                mode: MeshPeerAccessMode::Custom,
+                sessions: true,
+                filesystem: false,
+                shell: false,
+                providers: vec![],
+            },
+            quotas: vec![quota],
+        };
+        // An earlier v1 peer used an untyped named map for the same reply.
+        let wire = rmp_serde::to_vec_named(&incoming).unwrap();
+        let legacy_reader: serde_json::Value = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(legacy_reader["status"], "granted");
+        assert_eq!(legacy_reader["effective"]["mode"], "custom");
+        assert_eq!(
+            legacy_reader["quotas"][0]["limit"]["limit_tokens"],
+            "9007199254740993"
+        );
+        assert!(
+            legacy_reader["quotas"][0]["usage"]
+                .get("next_reset_at")
+                .is_none()
+        );
+        let legacy_writer = rmp_serde::to_vec_named(&legacy_reader).unwrap();
+        let typed_reader: MeshPeerIncomingAccess = rmp_serde::from_slice(&legacy_writer).unwrap();
+        assert_eq!(serde_json::to_value(typed_reader).unwrap(), legacy_reader);
     }
 
     #[cfg(test)]
@@ -416,32 +576,59 @@ mod access {
         );
 
         let inventory = handle.model_inventory.clone();
-        router.register_v1_ask::<crate::agent::remote::RemoteNodeManager, GetPeerSharing, _, _, _, _>(
-            actor.id(), InboundAccess::PeerAccess, move |peer: PeerRequest, _| {
-                let store = store.clone();
-                let inventory = inventory.clone();
-                async move {
-                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                    let (state, quotas) = store.access_snapshot(peer.key(), now).await
-                        .map_err(|_| AgentError::MeshNotBootstrapped)?;
-                    if peer.revision() != Some(state.revision) { return Err(AgentError::MeshAccessDenied); }
-                    let cargo_catalog = local_catalog(&inventory);
-                    let effective = match &state.grant {
-                        PeerGrant::None => return Ok(json!({"status": "denied"})),
-                        PeerGrant::Full => {
-                            let providers: Vec<_> = cargo_catalog.keys().map(|provider_id| json!({"provider_id": provider_id, "models": {"mode": "all"}})).collect();
-                            json!({"mode": "full", "sessions": true, "filesystem": true, "shell": true, "providers": providers})
+        router
+            .register_v1_ask::<crate::agent::remote::RemoteNodeManager, GetPeerSharing, _, _, _, _>(
+                actor.id(),
+                InboundAccess::PeerAccess,
+                move |peer: PeerRequest, _| {
+                    let store = store.clone();
+                    let inventory = inventory.clone();
+                    async move {
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let (state, quotas) = store
+                            .access_snapshot(peer.key(), now)
+                            .await
+                            .map_err(|_| AgentError::MeshNotBootstrapped)?;
+                        if peer.revision() != Some(state.revision) {
+                            return Err(AgentError::MeshAccessDenied);
                         }
-                        PeerGrant::Custom { sessions, filesystem, providers } => json!({"mode": "custom", "sessions": sessions, "filesystem": filesystem, "shell": false, "providers": providers}),
-                    };
-                    let quotas: Vec<_> = quotas.into_iter().filter_map(|quota| {
-                        let value = quota_json(&state.grant, quota);
-                        (value["active"] == true).then_some(value)
-                    }).collect();
-                    Ok(json!({"status": "granted", "effective": effective, "quotas": quotas}))
-                }
-            },
-        );
+                        let cargo_catalog = local_catalog(&inventory);
+                        let effective = match &state.grant {
+                            PeerGrant::None => return Ok(MeshPeerIncomingAccess::Denied),
+                            PeerGrant::Full => MeshPeerEffectiveAccess {
+                                mode: MeshPeerAccessMode::Full,
+                                sessions: true,
+                                filesystem: true,
+                                shell: true,
+                                providers: cargo_catalog
+                                    .into_keys()
+                                    .map(|provider_id| ProviderGrant {
+                                        provider_id,
+                                        models: ModelSelection::All,
+                                    })
+                                    .collect(),
+                            },
+                            PeerGrant::Custom {
+                                sessions,
+                                filesystem,
+                                providers,
+                            } => MeshPeerEffectiveAccess {
+                                mode: MeshPeerAccessMode::Custom,
+                                sessions: *sessions,
+                                filesystem: *filesystem,
+                                shell: false,
+                                providers: providers.clone(),
+                            },
+                        };
+                        let quotas = quotas
+                            .into_iter()
+                            .map(|quota| quota_wire(&state.grant, quota))
+                            .filter(|quota| quota.active)
+                            .collect();
+                        Ok(MeshPeerIncomingAccess::Granted { effective, quotas })
+                    }
+                },
+            );
     }
 
     fn notify(
@@ -495,7 +682,7 @@ mod access {
         agent: &LocalAgentHandle,
         mesh: &querymt_remote::MeshHandle,
         peer: &NodeId,
-    ) -> Value {
+    ) -> MeshPeerIncomingAccess {
         use crate::agent::remote::node_manager::GetPeerSharing;
         use crate::error::AgentError;
         use kameo::error::RemoteSendError;
@@ -508,13 +695,13 @@ mod access {
                 .await
                 .ok()?;
             if protocol == SharingProtocol::Legacy {
-                return Some(json!({"status": "legacy"}));
+                return Some(MeshPeerIncomingAccess::Legacy);
             }
             let reference = agent.find_node_manager(&peer.to_string()).await.ok()?;
             if reference.id().peer_id() != Some(peer.as_peer_id()) {
                 return None;
             }
-            match ask_sharing_v1::<_, _, Value, AgentError>(
+            match ask_sharing_v1::<_, _, MeshPeerIncomingAccess, AgentError>(
                 mesh,
                 &reference,
                 &GetPeerSharing,
@@ -524,7 +711,7 @@ mod access {
             {
                 Ok(value) => Some(value),
                 Err(SharingAskError::Actor(RemoteSendError::UnknownMessage { .. })) => {
-                    Some(json!({"status": "incompatible"}))
+                    Some(MeshPeerIncomingAccess::Incompatible)
                 }
                 Err(_) => None,
             }
@@ -533,7 +720,7 @@ mod access {
             .await
             .ok()
             .flatten()
-            .unwrap_or_else(|| json!({"status": "unavailable"}))
+            .unwrap_or(MeshPeerIncomingAccess::Unavailable)
     }
 
     async fn finite_quota_supported(
@@ -576,11 +763,11 @@ mod access {
     ) -> Result<ExtResponse, Error> {
         let (version, peer_id, edit) = match req.method.as_ref() {
             "querymt/mesh/getPeerAccess" => {
-                let Read { version, peer_id } = parse(&req)?;
+                let GetMeshPeerAccessRequest { version, peer_id } = parse(&req)?;
                 (version, peer_id, None)
             }
             "querymt/mesh/setPeerAccess" => {
-                let SetGrant {
+                let SetMeshPeerAccessRequest {
                     version,
                     peer_id,
                     expected_revision,
@@ -593,7 +780,7 @@ mod access {
                 )
             }
             "querymt/mesh/setPeerQuota" => {
-                let SetQuota {
+                let SetMeshPeerQuotaRequest {
                     version,
                     peer_id,
                     expected_revision,
@@ -602,8 +789,8 @@ mod access {
                     limit,
                 } = parse(&req)?;
                 let limit = match limit {
-                    WireLimit::Unlimited => QuotaLimit::Unlimited,
-                    WireLimit::Finite {
+                    MeshQuotaLimit::Unlimited => QuotaLimit::Unlimited,
+                    MeshQuotaLimit::Finite {
                         limit_tokens,
                         window,
                     } => {
@@ -617,8 +804,8 @@ mod access {
                     }
                 };
                 let edit = match operation {
-                    Operation::Update => QuotaEdit::Update(limit),
-                    Operation::Reconfigure => QuotaEdit::Reconfigure(limit),
+                    MeshQuotaOperation::Update => QuotaEdit::Update(limit),
+                    MeshQuotaOperation::Reconfigure => QuotaEdit::Reconfigure(limit),
                 };
                 (
                     version,
@@ -627,7 +814,7 @@ mod access {
                 )
             }
             "querymt/mesh/resetPeerQuota" => {
-                let Reset {
+                let ResetMeshPeerQuotaRequest {
                     version,
                     peer_id,
                     expected_revision,
@@ -688,10 +875,19 @@ mod access {
             .map_err(|error| quota_error(error, None))?;
         let quotas: Vec<_> = statuses
             .into_iter()
-            .map(|quota| quota_json(&state.grant, quota))
+            .map(|quota| quota_wire(&state.grant, quota))
             .collect();
-        let mut response = json!({ "version": 1, "peer_id": peer_id,
-            "outgoing": {"revision": state.revision, "grant": state.grant, "quotas": quotas} });
+        let mut response = MeshPeerAccessResponse {
+            version: 1,
+            peer_id,
+            outgoing: MeshPeerOutgoingAccess {
+                revision: state.revision,
+                grant: state.grant,
+                quotas,
+            },
+            incoming: None,
+            shareable_catalog: None,
+        };
         if req.method.as_ref() == "querymt/mesh/getPeerAccess" {
             let mut catalog = Vec::new();
             for (provider_id, models) in local_catalog(&agent.model_inventory) {
@@ -703,12 +899,18 @@ mod access {
                     } else {
                         false
                     };
-                    rows.push(json!({"model_id": model_id, "finite_quota_supported": supported}));
+                    rows.push(MeshShareableModel {
+                        model_id,
+                        finite_quota_supported: supported,
+                    });
                 }
-                catalog.push(json!({"provider_id": provider_id, "models": rows}));
+                catalog.push(MeshShareableProvider {
+                    provider_id,
+                    models: rows,
+                });
             }
-            response["shareable_catalog"] = json!(catalog);
-            response["incoming"] = incoming(agent, &mesh, &key.peer).await;
+            response.shareable_catalog = Some(catalog);
+            response.incoming = Some(incoming(agent, &mesh, &key.peer).await);
         }
         ext_json_response(&response)
     }

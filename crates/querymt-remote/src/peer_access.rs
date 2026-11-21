@@ -44,6 +44,7 @@ pub enum PeerGrant {
 }
 
 /// A shared provider and its model selection (quota configuration is separate).
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderGrant {

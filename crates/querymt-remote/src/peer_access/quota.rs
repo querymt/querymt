@@ -50,6 +50,7 @@ impl StreamMeter {
 }
 
 /// A provider-wide or model-specific quota on a particular host and peer.
+#[typeshare::typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaScope {
@@ -70,6 +71,7 @@ impl QuotaScope {
 }
 
 /// UTC calendar window of a finite allowance.
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaWindow {
