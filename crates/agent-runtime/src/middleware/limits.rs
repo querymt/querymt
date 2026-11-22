@@ -140,6 +140,10 @@ impl Middleware for LimitsMiddleware {
             .flatten()
     }
 
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
+
     fn limits(&self) -> Option<SessionLimits> {
         Some(SessionLimits {
             max_steps: self

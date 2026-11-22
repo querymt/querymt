@@ -218,6 +218,8 @@ fn acp_session_source_from_meta(
 pub enum AcpSessionListError {
     #[error("invalid session list cursor")]
     InvalidCursor,
+    #[error("mesh access denied")]
+    MeshAccessDenied,
     #[error(transparent)]
     Backend(#[from] anyhow::Error),
 }
@@ -965,6 +967,14 @@ impl AgentSessions {
         } else {
             (None, SessionScope::All)
         };
+        let access_denied = |error: &agent_client_protocol::Error| {
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str)
+                == Some("mesh_access_denied")
+        };
         let owner_page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let manager = agent.find_node_manager(node_id).await?;
             match agent
@@ -991,7 +1001,7 @@ impl AgentSessions {
                         .collect();
                     Ok((entries, response.next_offset, Some(lifecycle_by_id)))
                 }
-                Err(error) if lifecycle.is_filtered() => Err(error),
+                Err(error) if lifecycle.is_filtered() || access_denied(&error) => Err(error),
                 Err(_) => agent
                     .list_remote_sessions(&manager, Some(offset), Some(limit))
                     .await
@@ -1008,6 +1018,9 @@ impl AgentSessions {
                 };
                 validate_acp_remote_page(&response, offset, limit)?;
                 (entries, next_offset, true, remote_lifecycles)
+            }
+            Ok(Err(error)) if access_denied(&error) => {
+                return Err(AcpSessionListError::MeshAccessDenied);
             }
             Ok(Err(error)) if lifecycle.is_filtered() => {
                 return Err(anyhow!(

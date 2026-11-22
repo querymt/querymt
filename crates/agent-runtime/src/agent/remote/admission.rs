@@ -18,6 +18,7 @@ use super::node_manager::{
 };
 use super::scope::{MeshScopeId, scoped_node_manager_for_peer};
 use kameo::error::RemoteSendError;
+use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionPolicy {
@@ -149,6 +150,7 @@ impl AdmissionTransport for MeshAdmissionTransport {
         self.mesh
             .lookup_actor_no_retry::<RemoteNodeManager>(dht_name)
             .await
+            .map(|target| target.filter(|actor| actor.id().peer_id() == Some(&peer_id)))
             .map_err(AdmissionError::transport)
     }
 
@@ -157,11 +159,12 @@ impl AdmissionTransport for MeshAdmissionTransport {
         target: Self::Target,
         request: AdmissionRequest,
     ) -> Result<AdmissionResponse, AdmissionError> {
-        target
-            .ask::<AdmissionRequest>(&request)
+        ask_with_sharing(&self.mesh, &target, &request, Duration::from_secs(10))
             .await
             .map_err(|error| match error {
-                RemoteSendError::HandlerError(rejection) => AdmissionError::from(rejection),
+                SharingAskError::Actor(RemoteSendError::HandlerError(rejection)) => {
+                    AdmissionError::from(rejection)
+                }
                 other => AdmissionError::transport(other),
             })
     }

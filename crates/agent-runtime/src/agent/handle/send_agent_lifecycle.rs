@@ -100,6 +100,9 @@ impl LocalAgentHandle {
                 crate::api::AcpSessionListError::InvalidCursor => {
                     Error::invalid_params().data("invalid session list cursor")
                 }
+                crate::api::AcpSessionListError::MeshAccessDenied => {
+                    crate::error::AgentError::MeshAccessDenied.into()
+                }
                 crate::api::AcpSessionListError::Backend(error) => {
                     Error::internal_error().data(error.to_string())
                 }

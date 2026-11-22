@@ -272,6 +272,9 @@ async fn turn_parts_with(
         turn_mode: crate::agent::core::AgentMode::Build,
         steering: None,
         phase_reporter: None,
+        turn_authority: crate::agent::session_actor::TurnAuthority::Local,
+        restricted_mesh_turn: false,
+        confined_mesh_read: false,
         cycle_accounting,
         tool_set,
     };

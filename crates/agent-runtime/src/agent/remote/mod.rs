@@ -56,7 +56,7 @@ pub(crate) mod provider_host_backend;
 pub mod remote_setup;
 
 #[cfg(feature = "remote")]
-mod remote_actor_impl;
+pub(crate) mod remote_actor_impl;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -104,7 +104,9 @@ pub use event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
-pub use mesh::{MeshError, MeshHandle, PeerEvent, bootstrap_mesh_runtime};
+pub use mesh::{
+    MeshError, MeshHandle, PeerEvent, bootstrap_mesh_runtime, bootstrap_mesh_runtime_with_policy,
+};
 #[cfg(feature = "remote")]
 pub use mesh_state::{MeshLocalRole, MeshStateEntry, MeshStateStore, MeshStatus};
 pub use node_id::NodeId;

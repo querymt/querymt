@@ -100,6 +100,10 @@ impl Middleware for ContextMiddleware {
         "ContextMiddleware"
     }
 
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
+
     fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
         Box::new(ContextTurn {
             config: self.config.clone(),

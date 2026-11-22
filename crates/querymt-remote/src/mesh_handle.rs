@@ -1,4 +1,5 @@
 use kameo::remote;
+use kameo::remote::messaging::{SwarmRequest, SwarmResponse};
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -10,8 +11,11 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::mesh_events::MeshEvent;
+use crate::mesh_ingress::{InboundRouter, SharingCallError, SharingRequest, SharingResponse};
 use crate::mesh_routes::{MeshRoute, RouteTable};
 use crate::mesh_runtime_support::{DialReason, SwarmCommand};
+use crate::peer_access::SharingProtocol;
+use crate::peer_access::quota::QuotaStore;
 use crate::{
     InviteError, InviteGrant, InvitePermissions, InviteStore, MeshScopeId, MeshStateStore,
     MeshTransportMode, NodeId, PeerEntry, SignedInviteGrant, mesh_id_for,
@@ -45,6 +49,12 @@ type PeerNodeResolver = Arc<
 >;
 
 #[derive(Clone)]
+pub(crate) struct MeshPolicy {
+    pub(crate) router: Arc<InboundRouter>,
+    pub(crate) store: Arc<dyn QuotaStore>,
+}
+
+#[derive(Clone)]
 pub struct MeshHandle {
     peer_id: PeerId,
     pub(crate) peer_events_tx: broadcast::Sender<MeshEvent>,
@@ -63,6 +73,9 @@ pub struct MeshHandle {
     pub(crate) catalog_refresh_generation: Arc<std::sync::atomic::AtomicU64>,
     peer_node_resolver: Option<PeerNodeResolver>,
     pub(crate) iroh_diagnostics: crate::iroh_diagnostics::IrohDiagnostics,
+    known_sharing: Arc<RwLock<std::collections::HashSet<PeerId>>>,
+    pub(crate) policy: Option<MeshPolicy>,
+    pub(crate) sharing_enabled: bool,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -111,6 +124,9 @@ impl MeshHandle {
             catalog_refresh_generation: Default::default(),
             peer_node_resolver: None,
             iroh_diagnostics: Default::default(),
+            known_sharing: Default::default(),
+            policy: None,
+            sharing_enabled: false,
         }
     }
 
@@ -126,6 +142,95 @@ impl MeshHandle {
 
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
+    }
+
+    /// The guarded route registry for local resource exports.
+    pub fn inbound_router(&self) -> Option<&Arc<InboundRouter>> {
+        self.policy.as_ref().map(|policy| &policy.router)
+    }
+
+    /// The host's policy store, when this mesh was bootstrapped with one.
+    pub fn quota_store(&self) -> Option<&Arc<dyn QuotaStore>> {
+        self.policy.as_ref().map(|policy| &policy.store)
+    }
+
+    /// An outbound handle that can be retained by a registered ingress handler
+    /// without keeping the ingress router alive through a reference cycle.
+    pub fn sharing_egress(&self) -> Self {
+        let mut egress = self.clone();
+        egress.policy = None;
+        egress
+    }
+
+    /// Probe the remote transport without performing a protected operation.
+    /// Once a peer has negotiated v1 it cannot silently downgrade in this runtime.
+    pub async fn sharing_protocol(
+        &self,
+        peer: PeerId,
+    ) -> Result<SharingProtocol, SharingCallError> {
+        match self.sharing_exchange(peer, SharingRequest::Probe).await {
+            Ok(SharingResponse::Supported) => {
+                self.known_sharing.write().insert(peer);
+                Ok(SharingProtocol::V1)
+            }
+            Ok(_) => Err(SharingCallError::UnexpectedReply),
+            Err(SharingCallError::UnsupportedProtocol)
+                if !self.known_sharing.read().contains(&peer) =>
+            {
+                Ok(SharingProtocol::Legacy)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Select the protocol on a guarded mesh. An older local runtime has only
+    /// the legacy transport; it cannot negotiate v1.
+    pub async fn select_sharing_protocol(
+        &self,
+        peer: PeerId,
+        timeout: Duration,
+    ) -> Result<SharingProtocol, SharingCallError> {
+        if !self.sharing_enabled {
+            return Ok(SharingProtocol::Legacy);
+        }
+        if self.known_sharing.read().contains(&peer) {
+            return Ok(SharingProtocol::V1);
+        }
+        tokio::time::timeout(timeout, self.sharing_protocol(peer))
+            .await
+            .map_err(|_| {
+                SharingCallError::Transport(libp2p::request_response::OutboundFailure::Timeout)
+            })?
+    }
+
+    /// Send a grant-aware operation. Errors never fall back to the legacy route.
+    pub async fn sharing_call(
+        &self,
+        peer: PeerId,
+        request: SwarmRequest,
+    ) -> Result<SwarmResponse, SharingCallError> {
+        match self
+            .sharing_exchange(peer, SharingRequest::Actor(Box::new(request)))
+            .await?
+        {
+            SharingResponse::Actor(result) => {
+                self.known_sharing.write().insert(peer);
+                result.map_err(SharingCallError::from)
+            }
+            SharingResponse::Supported => Err(SharingCallError::UnexpectedReply),
+        }
+    }
+
+    async fn sharing_exchange(
+        &self,
+        peer: PeerId,
+        request: SharingRequest,
+    ) -> Result<SharingResponse, SharingCallError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.swarm_cmd_tx
+            .send(SwarmCommand::Sharing { peer, request, tx })
+            .map_err(|_| SharingCallError::Unavailable)?;
+        rx.await.map_err(|_| SharingCallError::Unavailable)?
     }
 
     pub fn local_hostname(&self) -> &str {
@@ -622,6 +727,80 @@ mod tests {
         );
 
         (dir, mesh, peer_events_rx, swarm_cmd_rx)
+    }
+
+    #[tokio::test]
+    async fn guarded_provider_egress_does_not_issue_a_legacy_lookup() {
+        use crate::{KameoMeshClientTransport, RemoteProviderClientTransport};
+        use querymt::error::{LLMError, ProviderErrorKind};
+
+        let (_dir, mut mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        mesh.sharing_enabled = true;
+        let transport = KameoMeshClientTransport::new(mesh);
+        let result = transport.lookup_host("unused-provider-host").await;
+        let Err(LLMError::ProviderResponseError(failure)) = result else {
+            panic!("guarded provider lookup must return a typed rejection");
+        };
+        assert_eq!(failure.kind(), ProviderErrorKind::UnsupportedOperation);
+        assert_eq!(failure.code(), Some("mesh_access_incompatible"));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failure_does_not_trigger_a_legacy_downgrade() {
+        let (_dir, mut mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        mesh.sharing_enabled = true;
+        let peer = PeerId::random();
+        let exchange = tokio::spawn(async move {
+            for result in [
+                Err(SharingCallError::Transport(
+                    libp2p::request_response::OutboundFailure::Timeout,
+                )),
+                Ok(SharingResponse::Supported),
+                Err(SharingCallError::UnsupportedProtocol),
+            ] {
+                let Some(SwarmCommand::Sharing {
+                    peer: target,
+                    request: SharingRequest::Probe,
+                    tx,
+                }) = commands.recv().await
+                else {
+                    panic!("expected a mesh capability probe");
+                };
+                assert_eq!(target, peer);
+                tx.send(result).unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let failed: Result<(), _> = crate::request_timeout::with_sharing_protocol(
+                &mesh,
+                Some(peer),
+                Duration::from_secs(1),
+                async { panic!("a failed probe must not run the guarded operation") },
+                async { panic!("a failed probe must not run the legacy operation") },
+            )
+            .await;
+            assert!(matches!(
+                failed,
+                Err(SharingCallError::Transport(
+                    libp2p::request_response::OutboundFailure::Timeout
+                ))
+            ));
+            assert_eq!(
+                mesh.sharing_protocol(peer).await.unwrap(),
+                SharingProtocol::V1
+            );
+            assert!(matches!(
+                mesh.sharing_protocol(peer).await,
+                Err(SharingCallError::UnsupportedProtocol)
+            ));
+            exchange.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

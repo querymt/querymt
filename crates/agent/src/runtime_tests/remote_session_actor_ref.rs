@@ -122,6 +122,7 @@ mod session_actor_ref_remote_tests {
             actor_ref: remote_ref,
             peer_label: label.to_string(),
             remote_node_id: None,
+            mesh: None,
         };
 
         (session_ref, local_ref, host_config, session_id)

@@ -285,7 +285,9 @@ impl Run<'_> {
         // Everything from here to request dispatch is agent overhead, not model time.
         let step_started = std::time::Instant::now();
         env.report_phase(RunPhase::Model);
-        wait::reconcile_suspended_delegations(config, env, turn, &mut self.events).await?;
+        if !env.restricted_mesh_turn() {
+            wait::reconcile_suspended_delegations(config, env, turn, &mut self.events).await?;
+        }
         apply_pending_steering(config, env, turn, SteeringBoundary::NextRequest, false).await?;
         let steps = turn.stats.steps;
         let checkpoint_due = crate::agent::objective::progress_review_due(
@@ -542,7 +544,8 @@ impl Run<'_> {
             );
         }
 
-        if config.execution_policy.pruning.enabled
+        if !env.restricted_mesh_turn()
+            && config.execution_policy.pruning.enabled
             && let Err(e) = maintenance::run_pruning(config, env).await
         {
             warn!("Pruning failed: {}", e);
@@ -564,7 +567,10 @@ impl Run<'_> {
         let stop_type = *stop_type;
         info!("Run stopped: {} ({:?})", message, stop_type);
 
-        if stop_type == StopType::ContextThreshold && config.execution_policy.compaction.auto {
+        if stop_type == StopType::ContextThreshold
+            && !env.restricted_mesh_turn()
+            && config.execution_policy.compaction.auto
+        {
             turn.budgets.mark_automatic_compaction()?;
             info!("Context threshold reached, triggering AI compaction");
 

@@ -19,6 +19,113 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify};
 
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn custom_delegate_cannot_dispatch_a_provider_before_sharing() {
+    use crate::agent::session_actor::{PeerTurn, TurnAuthority};
+    use querymt_remote::peer_access::{ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant};
+    use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig, NodeId};
+    use std::time::Duration;
+
+    let harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let store = Arc::new(
+        querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
+            .await
+            .unwrap(),
+    );
+    let config = MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: Default::default(),
+        }),
+        iroh_enabled: false,
+        iroh_gso: true,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        identity_file: Some(harness._temp_dir.path().join("mesh-identity.key")),
+        request_timeout: Duration::from_secs(5),
+        stream_reconnect_grace: Duration::from_secs(5),
+        node_name: None,
+        peers: vec![],
+        auto_fallback: false,
+    };
+    let mesh = querymt_remote::bootstrap_mesh_runtime_with_policy(&config, store)
+        .await
+        .unwrap();
+    let mesh = mesh.as_mesh_handle();
+    harness.delegator.set_mesh(mesh.clone());
+    let store = mesh.quota_store().unwrap();
+    let key = PeerGrantKey {
+        host: NodeId::from_peer_id(*mesh.peer_id()),
+        peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+    };
+    let granted = store
+        .replace_grant(
+            &key,
+            uuid::Uuid::nil(),
+            PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                providers: vec![ProviderGrant {
+                    provider_id: "mock".into(),
+                    models: ModelSelection::All,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let authority = TurnAuthority::Peer(PeerTurn::test_peer(key, granted.grant, store.clone()));
+    let parent = &harness.env.session_id;
+    let delegation = harness
+        .turn
+        .state
+        .record_delegation(
+            "agent".into(),
+            "Report completion without files".into(),
+            None,
+            None,
+            None,
+            crate::worktree::DelegationIsolation::Shared,
+            authority.stored_origin(),
+        )
+        .await
+        .unwrap();
+    let mut events = harness.config.subscribe_events();
+    harness.config.emit_event(
+        parent,
+        AgentEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            match event.kind() {
+                AgentEventKind::DelegationCompleted { delegation_id, .. }
+                    if delegation_id == &delegation.public_id =>
+                {
+                    panic!("guarded child completed without provider sharing");
+                }
+                AgentEventKind::DelegationFailed {
+                    delegation_id,
+                    error,
+                } if delegation_id == &delegation.public_id => {
+                    assert!(error.contains("mesh access denied"), "{error}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("guarded child must report the denial");
+}
+
 // Mock implementations moved to crate::test_utils::mocks
 
 /// An orchestrator over the roster of `config`, bound to a fresh root handle.
@@ -210,9 +317,10 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
             tokio::task::yield_now().await;
             (parent_id, children[0].clone())
         }
+        // Keep the two large fixture futures off the debug-build test thread stack.
         let (first, second) = tokio::join!(
-            run("11111111111111111111111111111111", false),
-            run("22222222222222222222222222222222", true)
+            Box::pin(run("11111111111111111111111111111111", false)),
+            Box::pin(run("22222222222222222222222222222222", true))
         );
         ([first.0, second.0], [first.1, second.1])
     })
