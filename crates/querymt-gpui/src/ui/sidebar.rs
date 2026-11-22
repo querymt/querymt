@@ -54,7 +54,11 @@ pub(super) enum TabLook {
 /// The right-click menu of one session.
 pub(super) struct SideMenu {
     pub(super) session: SessionSummary,
+    /// The list the row is in, for Move to top / bottom.
+    list: SideList,
     at: Point<Pixels>,
+    /// Why "Fork from last turn" failed; the menu stays open to show it.
+    fork_error: Option<String>,
 }
 
 pub(super) struct SideUi {
@@ -326,7 +330,9 @@ impl QmtApp {
                     this.session_menu_open = false;
                     this.side.menu = Some(SideMenu {
                         session: menu_s.clone(),
+                        list,
                         at: ev.position,
+                        fork_error: None,
                     });
                     cx.notify();
                 }),
@@ -339,12 +345,72 @@ impl QmtApp {
             })
     }
 
+    /// "Fork from last turn": fork the menu's session at its last stored
+    /// message and open the fork. The menu shows progress, then closes; a
+    /// failure stays in it.
+    fn fork_from_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.side.menu.as_mut() else {
+            return;
+        };
+        let s = menu.session.clone();
+        let Some(task) = self
+            .store
+            .update(cx, |st, cx| st.fork_session_latest(&s, cx))
+        else {
+            if let Some(menu) = self.side.menu.as_mut() {
+                menu.fork_error = Some("This session can't be forked right now.".into());
+            }
+            cx.notify();
+            return;
+        };
+        menu.fork_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let same = |m: &SideMenu| m.session.agent_id == s.agent_id && m.session.id == s.id;
+                match result {
+                    Ok(fork_id) => {
+                        if this.side.menu.as_ref().is_some_and(same) {
+                            this.side.menu = None;
+                        }
+                        let title = format!("Fork of {}", s.display_title());
+                        this.open_session(&s.agent_id, &fork_id, &s.cwd, &title, cx);
+                    }
+                    Err(err) => {
+                        if let Some(menu) = this.side.menu.as_mut().filter(|m| same(m)) {
+                            menu.fork_error = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The right-click menu of a sidebar session (the actions of the
-    /// session's own menu, and Delete).
+    /// session's own menu, Fork, Move, and Delete).
     pub(super) fn render_side_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.side.menu.as_ref()?;
         let p = *palette(cx);
         let s = menu.session.clone();
+        let (list, fork_error) = (menu.list, menu.fork_error.clone());
+        let key = tab_key(&s);
+        let (can_fork, forking, place) = {
+            let store = self.store.read(cx);
+            let supported = store
+                .runtime(&s.agent_id)
+                .is_some_and(|r| r.can_fork_sessions)
+                && s.remote.is_none();
+            (
+                supported,
+                store.fork_pending_for(&s.agent_id),
+                store.sidebar_place(list, &key),
+            )
+        };
+        let fork_ready = can_fork && !forking && !s.running();
+        let (up, down) = place.map_or((false, false), |(ix, n)| (ix > 0, ix + 1 < n));
         let (pinned, resolved, archived) = (s.pinned, s.resolved, s.archived);
         let (can_pin, can_lifecycle, can_delete) = {
             let rt = self.store.read(cx).runtime(&s.agent_id);
@@ -446,6 +512,76 @@ impl QmtApp {
                 )
             })
             .when(can_pin || can_lifecycle, |el| el.child(rule()))
+            .when(can_fork, |el| {
+                el.child(
+                    item(
+                        "side-fork",
+                        IconName::GitFork,
+                        if forking {
+                            "Forking…"
+                        } else {
+                            "Fork from last turn"
+                        },
+                    )
+                    .when(forking, |el| {
+                        el.child(
+                            div()
+                                .debug_selector(|| "side-fork-spin".into())
+                                .ml_auto()
+                                .child(kit::spinner("side-fork-spin", 12., p.dim)),
+                        )
+                    })
+                    // Mid-turn the last message is not a turn's end.
+                    .when(!fork_ready, |el| el.opacity(0.5).cursor_default())
+                    .when(fork_ready, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.fork_from_menu(cx)))
+                    }),
+                )
+                .when_some(fork_error, |el, error| {
+                    el.child(
+                        h_flex()
+                            .debug_selector(|| "side-fork-error".into())
+                            .px_2()
+                            .pb_1()
+                            .gap_1p5()
+                            .items_start()
+                            .text_xs()
+                            .text_color(p.danger)
+                            .child(kit::icon(IconName::TriangleAlert, 12., p.danger))
+                            .child(div().flex_1().min_w_0().whitespace_normal().child(error)),
+                    )
+                })
+            })
+            .when(up, |el| {
+                let k = key.clone();
+                el.child(
+                    item("side-move-top", IconName::ArrowUpToLine, "Move to top").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.side.menu = None;
+                            this.store.update(cx, |st, cx| {
+                                st.move_sidebar_session_to_end(list, &k, true, cx)
+                            });
+                        }),
+                    ),
+                )
+            })
+            .when(down, |el| {
+                let k = key.clone();
+                el.child(
+                    item(
+                        "side-move-bottom",
+                        IconName::ArrowDownToLine,
+                        "Move to bottom",
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.side.menu = None;
+                        this.store.update(cx, |st, cx| {
+                            st.move_sidebar_session_to_end(list, &k, false, cx)
+                        });
+                    })),
+                )
+            })
+            .when(can_fork || up || down, |el| el.child(rule()))
             // Like the session menu: copy items stay open and read "Copied".
             .when(!cwd.is_empty(), |el| {
                 el.child(
@@ -783,6 +919,120 @@ mod ui_tests {
             );
         });
         app.read_with(cx, |app, _| assert!(app.side.drop_target.is_none()));
+    }
+
+    /// Right-click the row of session `id`.
+    fn menu_on(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) {
+        let selector: &'static str = Box::leak(format!("tab-test-agent/{id}").into_boxed_str());
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        let row = vcx.debug_bounds(selector).expect("row");
+        vcx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+        vcx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+        render(handle, cx);
+    }
+
+    fn click(handle: AnyWindowHandle, id: &'static str, cx: &mut TestAppContext) {
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        let at = vcx.debug_bounds(id).expect(id).center();
+        vcx.simulate_click(at, Modifiers::none());
+        render(handle, cx);
+    }
+
+    fn has(handle: AnyWindowHandle, id: &'static str, cx: &mut TestAppContext) -> bool {
+        VisualTestContext::from_window(handle, cx)
+            .debug_bounds(id)
+            .is_some()
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_moves_a_row_to_the_top_or_bottom(cx: &mut TestAppContext) {
+        let (handle, app, _rpc, _requests) = app(4, cx);
+        menu_on(handle, "s3", cx);
+        click(handle, "side-move-top", cx);
+        assert_eq!(shown_ids(&app, cx), ["s3", "s1", "s2", "s4"]);
+        app.read_with(cx, |app, _| assert!(app.side.menu.is_none()));
+
+        menu_on(handle, "s1", cx);
+        click(handle, "side-move-bottom", cx);
+        assert_eq!(shown_ids(&app, cx), ["s3", "s2", "s4", "s1"]);
+
+        // Each end offers only the way out of it.
+        menu_on(handle, "s1", cx);
+        assert!(has(handle, "side-move-top", cx) && !has(handle, "side-move-bottom", cx));
+        menu_on(handle, "s3", cx);
+        assert!(!has(handle, "side-move-top", cx) && has(handle, "side-move-bottom", cx));
+    }
+
+    /// `app(3)` on an agent that forks, with the menu's Fork clicked on s2.
+    fn fork_from_menu(
+        cx: &mut TestAppContext,
+    ) -> (
+        AnyWindowHandle,
+        gpui_kit::Entity<QmtApp>,
+        std::rc::Rc<crate::rpc::RpcClient>,
+        Value,
+    ) {
+        let (handle, app, rpc, requests) = app(3, cx);
+        let store = app.read_with(cx, |app, _| app.store.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.runtime_mut_for_test("test-agent").can_fork_sessions = true;
+            })
+        });
+        sent(&requests);
+        menu_on(handle, "s2", cx);
+        click(handle, "side-fork", cx);
+        cx.run_until_parked();
+        let request = sent(&requests)
+            .into_iter()
+            .find(|r| r["method"] == "session/fork")
+            .expect("session/fork sent");
+        // From the last turn: no fork point, the agent takes the last message.
+        assert_eq!(request["params"]["sessionId"], "s2");
+        assert!(request["params"].get("_meta").is_none());
+        // Working: the menu stays open and says so.
+        render(handle, cx);
+        app.read_with(cx, |app, _| assert!(app.side.menu.is_some()));
+        assert!(has(handle, "side-fork-spin", cx));
+        (handle, app, rpc, request)
+    }
+
+    #[gpui_kit::test]
+    fn fork_from_last_turn_opens_the_fork(cx: &mut TestAppContext) {
+        let (handle, app, rpc, request) = fork_from_menu(cx);
+        rpc.handle(&json!({ "id": request["id"], "result": { "sessionId": "f1" } }).to_string());
+        cx.run_until_parked();
+        render(handle, cx);
+        app.read_with(cx, |app, cx| {
+            assert!(app.side.menu.is_none());
+            assert_eq!(app.page, crate::ui::Page::Session);
+            let store = app.store.read(cx);
+            let view = store.session.as_ref().expect("fork open");
+            assert_eq!(
+                (view.session_id.as_str(), view.title.as_str()),
+                ("f1", "Fork of Session s2")
+            );
+            let fork = store.session_summary("test-agent", "f1").unwrap();
+            assert_eq!(fork.parent.as_deref(), Some("s2"));
+            assert!(!store.fork_pending_for("test-agent"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_fork_from_the_menu_says_why(cx: &mut TestAppContext) {
+        let (handle, app, rpc, request) = fork_from_menu(cx);
+        rpc.handle(
+            &json!({ "id": request["id"], "error": { "code": -32603, "message": "boom" } })
+                .to_string(),
+        );
+        cx.run_until_parked();
+        render(handle, cx);
+        app.read_with(cx, |app, cx| {
+            let menu = app.side.menu.as_ref().expect("menu stays open");
+            assert!(menu.fork_error.as_deref().unwrap().contains("boom"));
+            assert!(app.store.read(cx).session.is_none());
+        });
+        assert!(has(handle, "side-fork-error", cx));
     }
 
     #[gpui_kit::test]
