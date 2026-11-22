@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          cargo test -p ${{ matrix.cargo_package }}
+          bash scripts/with-test-home.sh cargo test -p ${{ matrix.cargo_package }}
 
       - name: Run Python smoke test
         shell: bash
@@ -93,7 +93,7 @@ jobs:
           fi
 
           maturin develop --manifest-path "${{ matrix.manifest_path }}"
-          ${{ matrix.smoke_command }}
+          bash scripts/with-test-home.sh ${{ matrix.smoke_command }}
 
       - name: Run Python worktree tests
         if: matrix.cargo_package == 'querymt-agent-py'
@@ -104,4 +104,4 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
           python -m pip install pytest
-          QMT_HOME="$(mktemp -d)" python -m pytest crates/py/querymt-agent-py/tests -q
+          bash scripts/with-test-home.sh python -m pytest crates/py/querymt-agent-py/tests -q

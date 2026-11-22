@@ -1,5 +1,14 @@
 # scripts
 
+## Test home isolation
+
+Give tests explicit temporary paths and storage backends. As a backstop, nextest
+uses `with-test-home.sh` on Unix to isolate home and XDG directories for list and
+run commands. For plain Cargo tests (including doctests), CI and local runs can
+use the same launcher: `bash scripts/with-test-home.sh cargo test --doc`.
+The launcher discards its temporary directories and ignores any inherited
+`QMT_SESSIONS_DB`. It is not used for normal `cargo run`.
+
 ## Tool failure report
 
 `tool-failure-report.sql` reports tool-call volume, failures, failure rates and

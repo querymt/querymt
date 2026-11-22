@@ -3,7 +3,7 @@ use querymt::chat::{ChatCall, ChatMessageBuilder, ChatRole};
 use querymt::completion::CompletionRequest;
 use querymt::error::LLMError;
 
-use crate::config::{MistralRSConfig, MistralRSMtpConfig};
+use crate::config::{MistralRSConfig, MistralRSModelKind, MistralRSMtpConfig};
 use crate::factory::create_factory;
 use crate::model::{model_cache_key, mtp_config, paged_attn_config};
 
@@ -45,9 +45,15 @@ fn test_config() -> MistralRSConfig {
     }
 }
 
-fn get_provider() -> Box<dyn LLMProvider> {
+fn get_provider(cache: &std::path::Path) -> Box<dyn LLMProvider> {
     let factory = create_factory();
-    let json_cfg = serde_json::to_string(&test_config()).unwrap();
+    let json_cfg = serde_json::to_string(&MistralRSConfig {
+        model_kind: Some(MistralRSModelKind::Text),
+        token_source: Some("none".into()),
+        hf_cache_path: Some(cache.to_str().expect("UTF-8 cache directory").into()),
+        ..test_config()
+    })
+    .unwrap();
     factory.from_config(&json_cfg).unwrap()
 }
 
@@ -177,26 +183,12 @@ fn malformed_config_is_non_retryable_json_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn mrs_chat_integration_test() {
-    let provider = get_provider();
-    let messages = vec![
-        ChatMessageBuilder::new(ChatRole::User)
-            .text("Hello?")
-            .build(),
-    ];
-
-    let _resp = provider.chat(&ChatCall::new(&messages)).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn embedding_provider_requires_embedding_model() {
-    let provider = get_provider();
+    // One fixture for all checks so nextest does not download the model three times.
+    let cache = tempfile::tempdir().expect("model cache");
+    let provider = get_provider(cache.path());
     let err = provider.embed(vec!["foo".into()]).await.unwrap_err();
     assert!(matches!(err, LLMError::InvalidRequest(_)));
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn completion_provider_is_currently_unimplemented() {
-    let provider = get_provider();
     let dummy_req = CompletionRequest {
         prompt: "test".into(),
         max_tokens: None,
@@ -205,4 +197,11 @@ async fn completion_provider_is_currently_unimplemented() {
     };
     let err = provider.complete(&dummy_req).await.unwrap_err();
     assert!(matches!(err, LLMError::NotImplemented(_)));
+
+    let messages = vec![
+        ChatMessageBuilder::new(ChatRole::User)
+            .text("Hello?")
+            .build(),
+    ];
+    let _resp = provider.chat(&ChatCall::new(&messages)).await.unwrap();
 }

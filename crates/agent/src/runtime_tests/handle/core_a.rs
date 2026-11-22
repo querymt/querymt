@@ -1920,7 +1920,7 @@ paths = ["{}"]
         "alpha",
         AgentInfra {
             plugin_registry: Arc::new(plugin_registry),
-            storage: None,
+            storage: Some(fixture.storage.clone()),
             session_mcp_attachment_source: None,
             event_fanout: None,
         },
@@ -1942,6 +1942,15 @@ paths = ["{}"]
         advertised_command_names(&bound),
         vec!["/docs".to_string(), "/compact".to_string()]
     );
+    let runtime = profiles
+        .runtime_for_profile("alpha")
+        .await
+        .expect("alpha runtime");
+    let fixture_storage: Arc<dyn crate::session::backend::StorageBackend> = fixture.storage.clone();
+    assert!(Arc::ptr_eq(
+        &fixture_storage,
+        &runtime.agent().storage_backend()
+    ));
 
     profiles
         .set_session_binding(

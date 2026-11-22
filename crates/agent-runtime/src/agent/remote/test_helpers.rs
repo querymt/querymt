@@ -171,10 +171,7 @@ pub mod fixtures {
     impl AgentConfigFixture {
         pub async fn new() -> Self {
             let temp_dir = TempDir::new().expect("create temp dir");
-            let config_path = temp_dir.path().join("providers.toml");
-            std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
-            let registry = PluginRegistry::from_path(&config_path).expect("create plugin registry");
-            let plugin_registry = Arc::new(registry);
+            let plugin_registry = Arc::new(PluginRegistry::empty());
 
             let storage = Arc::new(
                 SqliteStorage::connect(":memory:".into())

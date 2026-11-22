@@ -49,6 +49,22 @@ fn ensure_store_initialized() -> io::Result<()> {
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl SecretStore {
+    /// Use a process-local mock instead of opening the OS credential store.
+    pub fn install_test_store() {
+        STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().expect("test store"));
+            Ok(())
+        });
+        assert!(
+            keyring_core::get_default_store()
+                .is_some_and(|store| store.as_any().is::<keyring_core::mock::Store>()),
+            "test credential store must be installed before native store initialization"
+        );
+    }
+}
+
 /// Platform-aware store initialization.
 ///
 /// Creates the appropriate native credential store and sets it as the
@@ -455,8 +471,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a real credential backend; writes and deletes only a unique test-owned key"]
-    fn native_store_sync_and_tokio_roundtrip() {
+    fn test_store_sync_and_tokio_roundtrip() {
+        SecretStore::install_test_store();
         let name = format!(
             "qmt-store-test-{}-{}",
             std::process::id(),

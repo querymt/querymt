@@ -178,7 +178,10 @@ fn empty_registry(dir: &Path) -> Arc<PluginRegistry> {
         "[[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n",
     )
     .expect("write providers config");
-    Arc::new(PluginRegistry::from_path(&config_path).expect("registry"))
+    Arc::new(
+        querymt_agent_runtime::test_utils::plugin_registry_from_path(&config_path)
+            .expect("registry"),
+    )
 }
 
 fn both_layer_options(workspace: &Path, global: &Path) -> DotagentsLoadOptions {
@@ -966,7 +969,10 @@ fn preset_registry(dir: &Path) -> Arc<PluginRegistry> {
          [[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n",
     )
     .expect("write providers config");
-    Arc::new(PluginRegistry::from_path(&config_path).expect("registry"))
+    Arc::new(
+        querymt_agent_runtime::test_utils::plugin_registry_from_path(&config_path)
+            .expect("registry"),
+    )
 }
 
 /// Build a storage backend whose files live under `dir` so it survives the

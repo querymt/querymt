@@ -18,17 +18,7 @@ async fn set_planning_context_preserves_custom_params() {
             .expect("storage"),
     );
 
-    let config_path = {
-        let d = tempfile::TempDir::new().unwrap();
-        let p = d.path().join("providers.toml");
-        std::fs::write(&p, "providers = []\n").unwrap();
-        // Leak the TempDir so the file stays alive for the test
-        let p = p.clone();
-        std::mem::forget(d);
-        p
-    };
-    let registry =
-        Arc::new(querymt::plugin::host::PluginRegistry::from_path(&config_path).expect("registry"));
+    let registry = Arc::new(querymt::plugin::host::PluginRegistry::empty());
 
     // Initial config with custom provider-specific params (llama_cpp-style)
     let initial_config = LLMParams::new()

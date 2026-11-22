@@ -32,12 +32,8 @@ mod provider_host_tests {
         use querymt::LLMParams;
         use querymt::plugin::host::PluginRegistry;
         use std::sync::Arc;
-        use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config_path = temp_dir.path().join("providers.toml");
-        std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
-        let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+        let registry = Arc::new(PluginRegistry::empty());
 
         let storage = Arc::new(
             SqliteStorage::connect(":memory:".into())
@@ -90,12 +86,8 @@ mod provider_host_tests {
         use querymt::plugin::host::PluginRegistry;
         use querymt_remote::ProviderHostActor;
         use std::sync::Arc;
-        use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config_path = temp_dir.path().join("providers.toml");
-        std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
-        let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+        let registry = Arc::new(PluginRegistry::empty());
 
         let storage = Arc::new(
             SqliteStorage::connect(":memory:".into())
