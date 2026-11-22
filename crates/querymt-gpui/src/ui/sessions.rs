@@ -971,7 +971,7 @@ impl QmtApp {
     }
 
     /// Prefill the Start page with this workspace and agent, then focus the prompt.
-    fn new_session_in(
+    pub(super) fn new_session_in(
         &mut self,
         cwd: String,
         agent_id: String,

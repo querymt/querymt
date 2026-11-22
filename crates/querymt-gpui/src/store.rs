@@ -8,6 +8,7 @@ pub(crate) mod automations;
 pub(crate) mod delegates;
 pub(crate) mod fork;
 pub(crate) mod launch;
+pub(crate) mod mcp_notice;
 mod mesh_live;
 mod pins;
 pub(crate) mod setup;
@@ -1234,6 +1235,8 @@ pub struct AgentRuntime {
     pins_refresh_scheduled: bool,
     /// A mesh re-read after `mesh/joined` / `peerExpired` is pending.
     mesh_refresh_scheduled: bool,
+    /// Session id -> MCP servers it had to leave out (sign-in notice).
+    skipped_mcp: HashMap<String, Vec<mcp_notice::SkippedMcp>>,
     /// Session id -> resume authority for re-attaching its pending questions
     /// after a reconnect (`querymt/elicitation/recoveryAuthority`).
     resume_authorities: HashMap<String, String>,
@@ -2837,6 +2840,12 @@ impl AgentsStore {
                     .and_then(Value::as_str)
                     .ok_or("Agent did not return a session id.")?
                     .to_string();
+                let skipped = mcp_notice::from_response(&created);
+                let _ = this.update(cx, |s, _| {
+                    if let Some(rt) = s.runtime.get_mut(&agent_id) {
+                        mcp_notice::record(rt, &session_id, skipped, false);
+                    }
+                });
                 // A worktree session runs in its checkout, not the folder.
                 let cwd = launch::session_cwd(&created).unwrap_or(cwd);
                 let log = |msg: String, cx: &mut AsyncApp| {
@@ -3046,6 +3055,14 @@ impl AgentsStore {
                 match result {
                     Ok(v) => {
                         view.access = crate::session::SessionAccess::parse(&v);
+                        if let Some(rt) = s.runtime.get_mut(&agent_id) {
+                            mcp_notice::record(
+                                rt,
+                                &session_id,
+                                mcp_notice::from_response(&v),
+                                false,
+                            );
+                        }
                         view.apply_config(v.get("configOptions"));
                         view.apply_modes(v.get("modes"));
                         let snap = v.pointer("/_meta/querymt~1sessionLoadSnapshot.v1");
@@ -4482,6 +4499,8 @@ impl AgentsStore {
                     self.on_pins_changed(id, &params, cx);
                 } else if mesh_live::is_membership_change(&method) {
                     self.on_mesh_membership_changed(id, cx);
+                } else if method.trim_start_matches('_') == "querymt/session/mcpAuthRequired" {
+                    self.on_mcp_auth_required(id, &params, cx);
                 } else if method.trim_start_matches('_') == "querymt/schedules/changed" {
                     if self
                         .live(id, generation)

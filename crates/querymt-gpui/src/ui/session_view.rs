@@ -5598,6 +5598,7 @@ impl QmtApp {
         );
 
         // ---- requests + composer
+        let mcp_notice = self.render_mcp_notice(&p, cx);
         let request_cards: Vec<AnyElement> = requests
             .iter()
             .filter_map(|k| self.request_card(k, false, false, window, cx))
@@ -5683,6 +5684,7 @@ impl QmtApp {
                     .w_full()
                     .max_w(px(CHAT_MAX))
                     .gap_2()
+                    .children(mcp_notice)
                     .children(request_cards)
                     .child(dock)
                     .child(self.smooth_scroll.region("composer", composer)),
