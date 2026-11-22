@@ -1411,6 +1411,12 @@ pub struct Prefs {
     pub accent: String,
     #[serde(default)]
     pub show_pinned_sidebar: bool,
+    /// Tab order of the sidebar's open sessions (`agent/session`, top first).
+    #[serde(default)]
+    pub sidebar_open_order: Vec<String>,
+    /// Tab order of the sidebar's pinned sessions.
+    #[serde(default)]
+    pub sidebar_pinned_order: Vec<String>,
     /// Launch mode for new sessions (`build`, `plan`, `review`).
     #[serde(default)]
     pub launch_mode: String,
@@ -1704,6 +1710,8 @@ pub struct AgentsStore {
     /// This start is a fresh install (or follows Reset app data), and setup
     /// was not finished or skipped yet.
     pub first_run: bool,
+    /// Sidebar lists: sessions already seen this run.
+    sidebar: sidebar::SidebarState,
     _launch_task: Option<Task<()>>,
 }
 
@@ -1737,6 +1745,7 @@ impl AgentsStore {
             session: None,
             requests: Vec::new(),
             runtime: HashMap::new(),
+            sidebar: Default::default(),
             first_run,
             _launch_task: None,
         };
@@ -5466,6 +5475,7 @@ mod tests {
             session: None,
             requests: Vec::new(),
             runtime: HashMap::new(),
+            sidebar: Default::default(),
             first_run: false,
             _launch_task: None,
         };

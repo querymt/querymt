@@ -312,6 +312,7 @@ mod tests {
             requests: Vec::new(),
             runtime: HashMap::from([("a".to_string(), AgentRuntime { state, ..runtime })]),
             first_run: false,
+            sidebar: Default::default(),
             _launch_task: None,
         }
     }

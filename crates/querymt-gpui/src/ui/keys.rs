@@ -172,37 +172,10 @@ impl QmtApp {
         self.prompt.update(cx, |s, cx| s.focus(window, cx));
     }
 
-    /// Sessions in sidebar order: the rail's open sessions when collapsed,
-    /// otherwise pinned (when shown) followed by open sessions.
+    /// Sessions as the sidebar shows them, top to bottom (Alt+1…9, palette).
     fn sidebar_sessions(&self, cx: &App) -> Vec<SessionSummary> {
-        let store = self.store.read(cx);
-        let recent = |mut list: Vec<SessionSummary>| {
-            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            list
-        };
-        let collect = |f: &dyn Fn(&SessionSummary) -> bool| -> Vec<SessionSummary> {
-            store
-                .all_sessions()
-                .into_iter()
-                .filter(|s| f(s))
-                .cloned()
-                .collect()
-        };
-        if store.prefs.sidebar_collapsed {
-            let mut open = recent(collect(&|s| s.root && s.open));
-            open.truncate(10);
-            return open;
-        }
-        let show_pinned = store.prefs.show_pinned_sidebar;
-        let mut list = if show_pinned {
-            recent(collect(&|s| s.root && s.pinned && !s.archived))
-        } else {
-            Vec::new()
-        };
-        let mut open = recent(collect(&|s| s.root && s.open && !(show_pinned && s.pinned)));
-        open.truncate(16);
-        list.extend(open);
-        list
+        let shown = self.sidebar_shown(cx);
+        shown.pinned.into_iter().chain(shown.open).collect()
     }
 
     fn open_sidebar_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
