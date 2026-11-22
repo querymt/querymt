@@ -68,6 +68,8 @@ const COPIED_TITLE_PATH: &str = "@title-path";
 const COPIED_TITLE_ID: &str = "@title-id";
 const COPIED_MENU_PATH: &str = "@menu-path";
 const COPIED_MENU_ID: &str = "@menu-id";
+const COPIED_MENU_CHECKOUT: &str = "@menu-checkout";
+const COPIED_DETAILS_CHECKOUT: &str = "@details-checkout";
 /// Copied flash key and expanded-state key of the load-error report.
 const COPIED_ERROR_DETAILS: &str = "@load-error-details";
 const ERROR_DETAILS_KEY: &str = "@load-error-details-open";
@@ -4047,6 +4049,72 @@ impl QmtApp {
             let mono = |el: Div| el.font_family(kit::MONO);
             let section_rule = || kit::divider(p).bg(p.border.opacity(0.6));
 
+            // ---- worktree (desktop details list: branch, checkout, baseline, state)
+            let worktree = summary.and_then(|s| s.worktree.clone()).map(|w| {
+                let row = |id: &'static str, label: &'static str, value: AnyElement| {
+                    h_flex()
+                        .id(id)
+                        .gap_3()
+                        .py_0p5()
+                        .text_xs()
+                        .child(div().flex_none().text_color(p.muted).child(label))
+                        .child(h_flex().flex_1().min_w_0().justify_end().child(value))
+                };
+                let text = |s: String, color: Hsla| {
+                    mono(div()).min_w_0().truncate().text_color(color).child(s).into_any_element()
+                };
+                let usable = w.lifecycle.as_deref().is_none_or(|l| l == "ready");
+                let checkout = w.checkout_path.clone().filter(|c| !c.is_empty()).map(|path| {
+                    let done = self.copied.as_deref() == Some(COPIED_DETAILS_CHECKOUT);
+                    let (hover, tip) = (p.card_hover, path.clone());
+                    h_flex()
+                        .id("details-checkout")
+                        .debug_selector(|| "details-checkout".into())
+                        .min_w_0()
+                        .gap_1()
+                        .px_1()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .child(text(path.clone(), p.text))
+                        .child(kit::icon(
+                            if done { IconName::Check } else { IconName::Copy },
+                            12.,
+                            if done { p.success } else { p.dim },
+                        ))
+                        .tooltip(move |window, cx| {
+                            let tip = if done { "Copied".to_string() } else { format!("Copy checkout path\n{tip}") };
+                            kit::wrap_tip(tip).build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                            this.flash_copied(COPIED_DETAILS_CHECKOUT.into(), cx);
+                        }))
+                        .into_any_element()
+                });
+                v_flex()
+                    .gap_0p5()
+                    .child(row(
+                        "wt-branch",
+                        "Worktree branch",
+                        text(w.branch.clone().unwrap_or_else(|| "Unknown".into()), p.text),
+                    ))
+                    .children(checkout.map(|c| row("wt-checkout", "Checkout", c)))
+                    .children(w.baseline_mode.clone().map(|b| {
+                        row("wt-baseline", "Baseline", text(b.replace('_', " "), p.text))
+                    }))
+                    .children(w.lifecycle.clone().map(|l| {
+                        row(
+                            "wt-state",
+                            "Worktree state",
+                            text(l, if usable { p.text } else { p.warn }),
+                        )
+                    }))
+                    .when(w.handed_off_to.is_some(), |el| {
+                        el.child(row("wt-handed-off", "Handed off", text("Yes".into(), p.text)))
+                    })
+            });
+
             // ---- context
             let context = usage.map(|(used, size)| {
                 let exact = format!("{} / {} context tokens", usage::format_exact(used), if size > 0 { usage::format_exact(size) } else { "unknown".into() });
@@ -4216,6 +4284,7 @@ impl QmtApp {
                         .child(div().text_size(px(11.)).font_semibold().text_color(p.dim).child("SESSION"))
                         .child(h_flex().gap_1p5().text_xs().font_medium().text_color(p.text).child(kit::dot(status_color)).child(status_label)),
                 )
+                .when_some(worktree, |el, w| el.child(w).child(section_rule()))
                 .children(context)
                 .children(breakdown_view)
                 .when(!cost_rows.is_empty(), |el| el.child(section_rule()).children(cost_rows))
@@ -4258,6 +4327,10 @@ impl QmtApp {
             let (a2, s2) = (agent_id.clone(), session_id.clone());
             let (a3, s3) = (agent_id.clone(), session_id.clone());
             let (cwd, sid) = (view.cwd.clone(), session_id.clone());
+            let checkout = summary
+                .and_then(|s| s.worktree.as_ref())
+                .and_then(|w| w.checkout_path.clone())
+                .filter(|c| !c.is_empty());
             v_flex()
                 .id("session-menu-panel")
                 .absolute()
@@ -4358,6 +4431,24 @@ impl QmtApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(cwd.clone()));
                             this.flash_copied(COPIED_MENU_PATH.into(), cx);
+                        })),
+                    )
+                })
+                .when_some(checkout, |el, checkout| {
+                    let done = self.copied.as_deref() == Some(COPIED_MENU_CHECKOUT);
+                    el.child(
+                        item(
+                            "m-copy-checkout",
+                            if done {
+                                IconName::Check
+                            } else {
+                                IconName::GitBranch
+                            },
+                            if done { "Copied" } else { "Copy checkout path" }.into(),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(checkout.clone()));
+                            this.flash_copied(COPIED_MENU_CHECKOUT.into(), cx);
                         })),
                     )
                 })

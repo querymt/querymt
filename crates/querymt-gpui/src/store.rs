@@ -4214,11 +4214,14 @@ impl AgentsStore {
         self.resolve_request(key, result, resolution.into(), action == "accept", cx);
     }
 
+    /// The listed session `session_id`: in the root catalog, else in an
+    /// expanded parent's children (worktree children and forks only show
+    /// up there).
     pub fn session_summary(&self, agent_id: &str, session_id: &str) -> Option<&SessionSummary> {
-        self.runtime
-            .get(agent_id)?
-            .sessions
+        let rt = self.runtime.get(agent_id)?;
+        rt.sessions
             .iter()
+            .chain(rt.children.values().flat_map(|c| c.sessions.iter()))
             .find(|s| s.id == session_id)
     }
 
