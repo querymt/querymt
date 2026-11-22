@@ -10,7 +10,7 @@ use similarity_core::{
 use similarity_py::python_parser::PythonParser;
 use similarity_rs::rust_parser::RustParser;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use tracing::instrument;
 
 /// Stack size of the parse pool threads.
@@ -31,11 +31,17 @@ pub(crate) fn parse_pool() -> Result<&'static rayon::ThreadPool, rayon::ThreadPo
     if let Some(pool) = PARSE_POOL.get() {
         return Ok(pool);
     }
+    // Serialise first-time construction so concurrent callers do not each spawn a pool of
+    // large-stack threads; the loser re-checks and reuses the published pool.
+    static BUILD_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(pool) = PARSE_POOL.get() {
+        return Ok(pool);
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|index| format!("qmt-parse-{index}"))
         .stack_size(PARSE_STACK_BYTES)
         .build()?;
-    // If another thread won the race its pool is kept and ours is dropped.
     Ok(PARSE_POOL.get_or_init(|| pool))
 }
 

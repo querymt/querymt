@@ -344,6 +344,36 @@ mod tests {
         }
     }
 
+    fn nesting_depth(symbols: &[SymbolEntry]) -> usize {
+        symbols
+            .iter()
+            .map(|symbol| 1 + nesting_depth(&symbol.children))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The extractors bound how deep nested configuration becomes symbol children, so the
+    /// recursive conversions and drops on the owner thread cannot exhaust its stack.
+    #[test]
+    fn deeply_nested_config_files_yield_bounded_symbol_depth() {
+        let depth = 2000;
+        let json = format!("{}1{}", "{\"k\":".repeat(depth), "}".repeat(depth),);
+        // Deeper than the cap but within the YAML grammar's own indentation-stack limit.
+        let yaml: String = (0..200).map(|n| format!("{}k:\n", " ".repeat(n))).collect();
+        for (path, source) in [("deep.json", json), ("deep.yaml", yaml)] {
+            let direct = SymbolIndex::from_source_for_path(Path::new(path), &source)
+                .unwrap_or_else(|error| panic!("{path}: {error:?}"));
+            let found = nesting_depth(&direct.symbols);
+            assert!(found > 1, "{path}: nesting is still reported");
+            assert!(found <= 130, "{path}: depth {found} is bounded");
+
+            let restored = SymbolsResult::from_symbols(&direct.symbols)
+                .to_index()
+                .expect(path);
+            assert_eq!(restored.symbols, direct.symbols, "{path}: round trip");
+        }
+    }
+
     #[test]
     fn symbols_result_preserves_errors_of_the_direct_parse() {
         let unsupported = Path::new("notes.unknownext");

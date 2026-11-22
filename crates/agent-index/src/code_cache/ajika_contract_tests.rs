@@ -12,35 +12,25 @@ type Db<'a> = ajika::Db<'a, ()>;
 
 struct WorkspaceRoot(PathBuf);
 
-// (e) The input declaration syntax used by the cache: an `Arc`-shared text field and a plain
-// flag field, each with its own lazy initializer reading under `Inputs::with_state`.
+// (e) The input declaration syntax used by the cache: one `Arc`-shared optional text, `None`
+// when the file cannot be read, with a lazy initializer reading under `Inputs::with_state`.
+// Readability and text come from one read, exactly as in production.
 #[ajika::input(key = String)]
 struct ContractFile {
     #[input(arc, initialize = read_text)]
-    text: String,
-    #[input(initialize = read_readable)]
-    readable: bool,
+    text: Option<String>,
 }
 
-fn read_text(key: &String, cx: &dyn InputInit) -> ajika::Result<String> {
+fn read_text(key: &String, cx: &dyn InputInit) -> ajika::Result<Option<String>> {
     cx.check_cancelled()?;
     let root = cx.state::<WorkspaceRoot>()?;
-    Ok(fs::read_to_string(root.0.join(key)).unwrap_or_default())
-}
-
-fn read_readable(key: &String, cx: &dyn InputInit) -> ajika::Result<bool> {
-    cx.check_cancelled()?;
-    let root = cx.state::<WorkspaceRoot>()?;
-    Ok(fs::read_to_string(root.0.join(key)).is_ok())
+    Ok(fs::read_to_string(root.0.join(key)).ok())
 }
 
 #[ajika::query]
 fn line_count(db: &Db, path: String) -> ajika::Result<usize> {
-    let file = ContractFile::at(path);
-    if !file.readable(db)? {
-        return Ok(0);
-    }
-    Ok(file.text(db)?.lines().count())
+    let text = ContractFile::at(path).text(db)?;
+    Ok(text.as_deref().map_or(0, |text| text.lines().count()))
 }
 
 fn options() -> DatabaseOptions {
@@ -94,11 +84,8 @@ fn ajika_contract_forget_then_reacquire_equal_text_validates_without_executing()
     let mut db = open(&storage, &root, "epoch").expect("open");
     let file = ContractFile::at("a.txt".to_owned());
 
-    db.update_inputs(|update| {
-        file.set_text(update, "one\ntwo\n".to_owned())?;
-        file.set_readable(update, true)
-    })
-    .expect("set inputs");
+    db.update_inputs(|update| file.set_text(update, Some("one\ntwo\n".to_owned())))
+        .expect("set inputs");
     assert_eq!(
         *db.run(|db| line_count(db, "a.txt".into())).expect("run"),
         2
@@ -107,7 +94,6 @@ fn ajika_contract_forget_then_reacquire_equal_text_validates_without_executing()
 
     db.update_inputs(|update| {
         update.forget(ContractFile::TEXT, "a.txt".to_owned());
-        update.forget(ContractFile::READABLE, "a.txt".to_owned());
         Ok(())
     })
     .expect("forget");
@@ -135,6 +121,44 @@ fn ajika_contract_forget_then_reacquire_equal_text_validates_without_executing()
     assert_eq!(db.statistics().executed, 1);
 }
 
+/// A file that was unreadable (`None`) and is created later: after the host forgets the
+/// observation, the query runs again and sees the new text.
+#[test]
+fn ajika_contract_forget_after_unreadable_then_created_executes_again() {
+    let (_dir, root, storage) = workspace("one\ntwo\n");
+    let mut db = open(&storage, &root, "epoch").expect("open");
+    let forget = |db: &mut Database| {
+        db.update_inputs(|update| {
+            update.forget(ContractFile::TEXT, "late.txt".to_owned());
+            Ok(())
+        })
+        .expect("forget");
+    };
+
+    // Acquired through the initializer while the file does not exist: `None`.
+    assert_eq!(
+        *db.run(|db| line_count(db, "late.txt".into())).expect("run"),
+        0
+    );
+    assert_eq!(db.statistics().executed, 1);
+    forget(&mut db);
+
+    fs::write(root.join("late.txt"), "a\nb\nc\n").expect("create file");
+    assert_eq!(
+        *db.run(|db| line_count(db, "late.txt".into())).expect("run"),
+        3
+    );
+    assert_eq!(db.statistics().executed, 1, "the new text must be seen");
+
+    // Control: equal text after forgetting still validates without executing.
+    forget(&mut db);
+    assert_eq!(
+        *db.run(|db| line_count(db, "late.txt".into())).expect("run"),
+        3
+    );
+    assert_eq!(db.statistics().executed, 0);
+}
+
 /// (c) Setting equal text neither executes nor invalidates the stored result
 /// (`validated == 0`), i.e. it does not create a revision that anything depends on.
 /// Design D6 keeps the owner-side comparison anyway; this records the observed behaviour.
@@ -145,11 +169,8 @@ fn ajika_contract_setting_equal_text_does_not_invalidate() {
     let file = ContractFile::at("a.txt".to_owned());
     let set = |db: &mut Database, text: &str| {
         let text = text.to_owned();
-        db.update_inputs(|update| {
-            file.set_text(update, text)?;
-            file.set_readable(update, true)
-        })
-        .expect("set inputs");
+        db.update_inputs(|update| file.set_text(update, Some(text)))
+            .expect("set inputs");
     };
 
     set(&mut db, "one\ntwo\n");

@@ -19,6 +19,11 @@ use super::helpers::{SymbolResolver, parse_paths, resolve_root, resolve_target};
 /// Files read and resolved per workspace-index lookup during a directory search.
 const DIR_SEARCH_BATCH: usize = 256;
 
+/// Source text buffered for one indexed lookup. A batch ends at this many bytes or
+/// [`DIR_SEARCH_BATCH`] files, whichever comes first (a file that crosses the budget still
+/// belongs to its batch).
+const DIR_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct FindSymbolReferencesTool;
 
 impl FindSymbolReferencesTool {
@@ -204,26 +209,20 @@ impl FindSymbolReferencesTool {
         );
     }
 
-    /// Read up to [`DIR_SEARCH_BATCH`] files, ask the workspace index about all of them with
-    /// one lookup, then scan them in the order given until `matches` holds `limit` entries.
+    /// Ask the workspace index about all of `readable` with one lookup, then scan the files
+    /// in the order given until `matches` holds `limit` entries.
     ///
     /// Files the index did not answer are parsed directly, and only when they are scanned, so
     /// a search that fills up early does not parse the rest of the batch.
     async fn search_batch(
         &self,
         resolver: &mut SymbolResolver,
-        paths: &[PathBuf],
+        readable: &[(PathBuf, String)],
         symbols: &[String],
         find_type: &str,
         limit: usize,
         matches: &mut Vec<RefMatch>,
     ) {
-        let mut readable: Vec<(&PathBuf, String)> = Vec::with_capacity(paths.len());
-        for path in paths {
-            if let Ok(content) = tokio::fs::read_to_string(path).await {
-                readable.push((path, content));
-            }
-        }
         let files: Vec<(&Path, &str)> = readable
             .iter()
             .map(|(path, content)| (path.as_path(), content.as_str()))
@@ -285,8 +284,27 @@ impl FindSymbolReferencesTool {
             .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
             .map(|entry| entry.into_path());
 
+        // Without an index nothing is gained by batching, so files are read and scanned one
+        // at a time; with one, each batch is bounded by file count and buffered bytes and is
+        // scanned before more files are read.
+        let (max_files, max_bytes) = if resolver.has_index() {
+            (DIR_SEARCH_BATCH, DIR_SEARCH_BATCH_BYTES)
+        } else {
+            (1, usize::MAX)
+        };
         while matches.len() < limit {
-            let batch: Vec<PathBuf> = files.by_ref().take(DIR_SEARCH_BATCH).collect();
+            let mut batch: Vec<(PathBuf, String)> = Vec::new();
+            let mut bytes = 0usize;
+            while batch.len() < max_files && bytes < max_bytes {
+                let Some(path) = files.next() else {
+                    break;
+                };
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    bytes = bytes.saturating_add(content.len());
+                    batch.push((path, content));
+                }
+            }
+            // Unreadable files are skipped above, so an empty batch means the walk is done.
             if batch.is_empty() {
                 break;
             }

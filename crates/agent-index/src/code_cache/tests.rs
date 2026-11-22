@@ -466,6 +466,149 @@ async fn cache_base_is_private() {
     client.index_all(&[ws.path("a.rs")]).await.expect("index");
     let mode = fs::metadata(&ws.base).expect("base").permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
+    let own = ws.options().cache_directory(&ws.root).expect("own");
+    let mode = fs::metadata(own).expect("directory").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_cache_base_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    fs::create_dir_all(&ws.base).expect("base");
+    fs::set_permissions(&ws.base, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let client = ws.start(ws.options());
+    client.index_all(&[ws.path("a.rs")]).await.expect("index");
+
+    let mode = fs::metadata(&ws.base).expect("base").permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "a caller-supplied base is not ours to change"
+    );
+    let own = ws.options().cache_directory(&ws.root).expect("own");
+    let mode = fs::metadata(own).expect("directory").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "the cache directory itself is private");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn directories_without_a_lock_file_are_not_swept() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let options = ws.options();
+    let unmarked = ws.base.join("00000000000000cc");
+    fs::create_dir_all(&unmarked).expect("unmarked");
+    fs::write(unmarked.join("data"), b"not ours").expect("data");
+    let old = std::time::SystemTime::now() - options.max_idle - Duration::from_secs(60);
+    fs::File::open(&unmarked)
+        .and_then(|dir| dir.set_modified(old))
+        .expect("age directory");
+
+    let client = ws.start(options);
+    client.index_all(&[ws.path("a.rs")]).await.expect("index");
+
+    assert!(unmarked.join("data").exists(), "unmarked directory kept");
+}
+
+#[tokio::test]
+async fn owner_is_shared_only_when_every_cache_option_matches() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let first = ws.start(ws.options());
+    first.index_all(&[ws.path("a.rs")]).await.expect("index");
+
+    let same = ws.start(ws.options());
+    assert_eq!(
+        same.stats().await.expect("stats").storage,
+        CacheStorageKind::Disk
+    );
+
+    let mut other = ws.options();
+    other.schema_version += 1;
+    let different = ws.start(other);
+    assert_eq!(
+        different.stats().await.expect("stats").storage,
+        CacheStorageKind::Memory,
+        "a different epoch must not borrow the registered owner"
+    );
+    assert_eq!(
+        first.stats().await.expect("stats").storage,
+        CacheStorageKind::Disk
+    );
+}
+
+#[tokio::test]
+async fn symbols_for_one_path_with_different_texts_match_each_text() {
+    use crate::symbol_index::SymbolIndex;
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let client = ws.start(ws.options());
+    let path = ws.path("a.rs");
+    let texts = [
+        function_source("one"),
+        function_source("two"),
+        function_source("one"),
+    ];
+
+    let answers = client
+        .symbols(
+            texts
+                .iter()
+                .map(|text| (path.clone(), Arc::<str>::from(text.as_str())))
+                .collect(),
+        )
+        .await
+        .expect("symbols");
+
+    assert_eq!(answers.len(), texts.len());
+    for (answer, text) in answers.into_iter().zip(&texts) {
+        let expected = SymbolIndex::from_source_for_path(&path, text).expect("direct parse");
+        let names = |index: &SymbolIndex| -> Vec<String> {
+            index.symbols.iter().map(|s| s.name.clone()).collect()
+        };
+        assert_eq!(names(&answer.expect("answer")), names(&expected));
+    }
+}
+
+#[tokio::test]
+async fn symbol_lookups_beyond_the_queue_limit_are_refused() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let client = CodeCacheClient::unresponsive(&ws.root);
+    let lookup = || client.symbols(vec![(ws.path("a.rs"), Arc::<str>::from("fn a() {}"))]);
+
+    // Each lookup times out but its command stays queued behind the owner that never answers.
+    for _ in 0..super::owner::MAX_PENDING_SYMBOLS {
+        let waited = tokio::time::timeout(Duration::from_millis(20), lookup()).await;
+        assert!(waited.is_err(), "the owner never answers");
+    }
+    assert!(matches!(lookup().await, Err(super::CodeCacheError::Busy)));
+}
+
+#[tokio::test]
+async fn full_index_in_chunks_keeps_request_order() {
+    let count = super::owner::INDEX_CHUNK_FILES * 2 + 3;
+    let ws = Workspace::new(&[]);
+    let paths: Vec<PathBuf> = (0..count)
+        .map(|n| {
+            let name = format!("f{n:05}.rs");
+            ws.write(&name, &function_source(&format!("function_{n}")));
+            ws.path(&name)
+        })
+        .collect();
+
+    let client = ws.start(ws.options());
+    let entries = client.index_all(&paths).await.expect("index");
+
+    assert_eq!(entries.len(), count);
+    for (n, ((path, found), expected)) in entries.iter().zip(&paths).enumerate() {
+        assert_eq!(path, expected);
+        assert_eq!(names_of(&entries, path), [format!("function_{n}")]);
+        assert_eq!(found.len(), 1);
+    }
+    assert_eq!(
+        client.stats().await.expect("stats").parsed_files,
+        count as u64
+    );
 }
 
 #[tokio::test]

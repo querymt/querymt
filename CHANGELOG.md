@@ -38,8 +38,9 @@
 
 - **Persistent code index.** Workspace indexes now keep per-file symbols and
   function entries in a disk cache under
-  `<platform cache dir>/querymt/code-index/<workspace hash>`, bounded to 256 MiB,
-  200,000 entries and 30 days idle. A restart parses only changed files, and
+  `<platform cache dir>/querymt/code-index/<workspace hash>`, retaining at most
+  256 MiB of results (the files on disk may take up to twice that), 200,000
+  entries and 30 days idle. A restart parses only changed files, and
   `index`, `get_symbol`, `get_function`, `replace_symbol` and
   `find_symbol_references` reuse results for unchanged files with identical
   output. A locked or unusable cache directory falls back to memory with a

@@ -125,6 +125,9 @@ fn file_functions(db: &Db, path: String) -> ajika::Result<FunctionsResult> {
     let Some(text) = text.as_deref() else {
         return Ok(FunctionsResult::default());
     };
+    // `index_file_entries` turns a pool startup failure into an empty list, which must not
+    // be stored as this file's answer, so fail the operation before computing anything.
+    parse_pool().map_err(ajika::Error::application)?;
     // `index_file_entries` applies the oversize skip and runs on the parse pool.
     let entries = index_file_entries(Path::new(&path), text, &config);
     let result = FunctionsResult::from_entries(&entries);

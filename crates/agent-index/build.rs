@@ -18,6 +18,11 @@ const SOURCE_PATHS: &[&str] = &[
     "src/code_cache/queries.rs",
 ];
 
+/// Sources outside this crate that also determine stored results (symbol digests use
+/// `RapidHash`). They exist in a workspace checkout; a packaged build has no sibling crate
+/// directory, where the pinned `rapidhash` and package versions identify them instead.
+const WORKSPACE_SOURCE_PATHS: &[&str] = &["../agent-core/src/hash.rs"];
+
 /// Lockfile packages whose versions determine stored results.
 const PARSER_PACKAGE_PREFIXES: &[&str] = &[
     "tree-sitter",
@@ -48,17 +53,27 @@ impl Fnv {
     }
 }
 
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
-    if path.is_dir() {
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            collect_files(&entry.path(), files);
+/// Collect the `.rs` files under `path`. Symlinks are skipped, and any traversal error is
+/// returned with the path it concerns, so a partial walk never yields a fingerprint.
+fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let file_type = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot stat {}: {error}", path.display()))?
+        .file_type();
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        let entries = fs::read_dir(path)
+            .map_err(|error| format!("cannot read directory {}: {error}", path.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("cannot read entry of {}: {error}", path.display()))?;
+            collect_files(&entry.path(), files)?;
         }
     } else if path.extension().is_some_and(|ext| ext == "rs") {
         files.push(path.to_path_buf());
     }
+    Ok(())
 }
 
 fn find_lockfile(start: &Path) -> Option<PathBuf> {
@@ -92,36 +107,51 @@ fn hash_parser_packages(lockfile: &str, hash: &mut Fnv) {
     }
 }
 
-fn main() {
-    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+fn fingerprint(manifest: &Path) -> Result<u64, String> {
     let mut hash = Fnv::new();
 
     let mut files = Vec::new();
     for source in SOURCE_PATHS {
         let path = manifest.join(source);
         println!("cargo:rerun-if-changed={}", path.display());
-        collect_files(&path, &mut files);
+        collect_files(&path, &mut files)?;
+    }
+    for source in WORKSPACE_SOURCE_PATHS {
+        let path = manifest.join(source);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            collect_files(&path, &mut files)?;
+        }
     }
     files.sort();
     for file in files {
-        let relative = file.strip_prefix(&manifest).unwrap_or(&file);
+        let relative = file.strip_prefix(manifest).unwrap_or(&file);
         hash.write(relative.to_string_lossy().replace('\\', "/").as_bytes());
         // Normalise line endings so a CRLF checkout fingerprints like an LF one.
         let text = fs::read_to_string(&file)
-            .unwrap_or_default()
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?
             .replace("\r\n", "\n");
         hash.write(text.as_bytes());
     }
 
     // Outside a workspace (for example a registry build without a lockfile) only the sources
     // and the package version identify the extractors.
-    if let Some(lockfile) = find_lockfile(&manifest) {
+    if let Some(lockfile) = find_lockfile(manifest) {
         println!("cargo:rerun-if-changed={}", lockfile.display());
-        hash_parser_packages(
-            &fs::read_to_string(&lockfile).unwrap_or_default(),
-            &mut hash,
-        );
+        let text = fs::read_to_string(&lockfile)
+            .map_err(|error| format!("cannot read {}: {error}", lockfile.display()))?;
+        hash_parser_packages(&text, &mut hash);
     }
+    Ok(hash.0)
+}
 
-    println!("cargo:rustc-env=QMT_CODE_INDEX_FINGERPRINT={:016x}", hash.0);
+fn main() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    match fingerprint(&manifest) {
+        Ok(hash) => println!("cargo:rustc-env=QMT_CODE_INDEX_FINGERPRINT={hash:016x}"),
+        Err(error) => {
+            eprintln!("code index fingerprint: {error}");
+            std::process::exit(1);
+        }
+    }
 }

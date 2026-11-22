@@ -45,6 +45,12 @@ impl SymbolResolver {
         }
     }
 
+    /// Whether lookups can be answered by a workspace index at all. Without one, batching
+    /// files only buffers text for no gain.
+    pub fn has_index(&self) -> bool {
+        self.index.is_some()
+    }
+
     /// Resolve one file from the text the tool read.
     pub async fn resolve(&mut self, path: &Path, text: &str) -> Result<SymbolIndex, SymbolError> {
         match self.from_index(&[(path, text)]).await.pop().flatten() {

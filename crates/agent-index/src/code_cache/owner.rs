@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
@@ -22,13 +22,24 @@ use rayon::prelude::*;
 use tokio::sync::oneshot;
 
 use super::queries::{CacheServices, Db, IndexSettings, SourceFile, functions_for, symbols_for};
-use super::storage::{CacheStorageKind, CodeIndexCacheOptions, open_database, touch};
+use super::storage::{
+    CacheStorageKind, CodeIndexCacheOptions, CodeIndexStorage, open_database, touch,
+};
 use super::values::{FunctionsResult, SymbolsResult};
 use crate::function_index::{FunctionIndexConfig, IndexedFunctionEntry, parse_pool};
 use crate::symbol_index::{SymbolError, SymbolIndex};
 
 /// How long a new owner waits for the previous owner of the same directory to release it.
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// Symbol lookups that may wait in the owner's queue at once. Each holds the texts of up to a
+/// directory batch, so a longer queue would retain them while the owner is busy; further
+/// lookups fail with [`CodeCacheError::Busy`] and the caller parses directly.
+pub(super) const MAX_PENDING_SYMBOLS: usize = 4;
+
+/// Files computed per Ajika operation during a full index. Source text is released after
+/// each chunk, so a large workspace never holds every file's text at once.
+pub(super) const INDEX_CHUNK_FILES: usize = 512;
 
 /// Failure talking to the cache owner.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +57,9 @@ pub enum CodeCacheError {
     /// The parse thread pool could not be created.
     #[error("failed to build the parse thread pool: {0}")]
     ParsePool(#[source] rayon::ThreadPoolBuildError),
+    /// Too many symbol lookups are already waiting for the owner.
+    #[error("code cache owner is busy")]
+    Busy,
 }
 
 /// Cumulative counts since the cache owner started (design D7).
@@ -88,6 +102,8 @@ enum Command {
     },
     Symbols {
         files: Vec<Change>,
+        /// Counts this command against [`MAX_PENDING_SYMBOLS`] until it is dropped.
+        _permit: SymbolPermit,
         reply: oneshot::Sender<Result<Vec<Result<SymbolIndex, SymbolError>>, CodeCacheError>>,
     },
     /// Waits until the database is open, then replies.
@@ -155,6 +171,29 @@ struct OwnerState {
     storage: OnceLock<CacheStorageKind>,
     /// Set once the owner was asked to stop or has stopped; such an owner is never shared.
     stopped: AtomicBool,
+    /// Symbol lookups queued or running.
+    pending_symbols: AtomicUsize,
+}
+
+/// Admission of one symbol lookup; releases its place when the command is dropped, whether
+/// it was served, skipped or never delivered.
+struct SymbolPermit(Arc<OwnerState>);
+
+impl SymbolPermit {
+    fn acquire(state: &Arc<OwnerState>) -> Result<Self, CodeCacheError> {
+        let previous = state.pending_symbols.fetch_add(1, Ordering::AcqRel);
+        if previous >= MAX_PENDING_SYMBOLS {
+            state.pending_symbols.fetch_sub(1, Ordering::AcqRel);
+            return Err(CodeCacheError::Busy);
+        }
+        Ok(Self(Arc::clone(state)))
+    }
+}
+
+impl Drop for SymbolPermit {
+    fn drop(&mut self) {
+        self.0.pending_symbols.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl OwnerState {
@@ -205,8 +244,33 @@ struct OwnerLink {
 /// Registry entry for an on-disk cache directory.
 struct Slot {
     link: Weak<OwnerLink>,
-    settings: (u32, usize),
+    settings: SharedSettings,
     released: Arc<Released>,
+}
+
+/// Everything that must match for two clients to share one owner: the index settings and
+/// the cache's epoch and retention, which the owner fixed when it opened the directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SharedSettings {
+    min_function_lines: u32,
+    max_file_bytes: usize,
+    schema_version: u32,
+    max_bytes: u64,
+    max_entries: u64,
+    max_idle: Duration,
+}
+
+impl SharedSettings {
+    fn new(options: &CodeIndexCacheOptions, function_config: &FunctionIndexConfig) -> Self {
+        Self {
+            min_function_lines: function_config.min_function_lines,
+            max_file_bytes: function_config.max_file_bytes,
+            schema_version: options.schema_version,
+            max_bytes: options.max_bytes,
+            max_entries: options.max_entries,
+            max_idle: options.max_idle,
+        }
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<PathBuf, Slot>> {
@@ -283,10 +347,7 @@ impl CodeCacheClient {
             return Ok(Self { link, roots });
         };
 
-        let settings = (
-            function_config.min_function_lines,
-            function_config.max_file_bytes,
-        );
+        let settings = SharedSettings::new(&options, &function_config);
         let mut slots = registry().lock().unwrap_or_else(PoisonError::into_inner);
         // Drop entries whose owner is gone and has released its directory.
         slots.retain(|_, slot| slot.link.strong_count() > 0 || !slot.released.is_done());
@@ -297,8 +358,13 @@ impl CodeCacheClient {
                     if slot.settings == settings {
                         return Ok(Self { link, roots });
                     }
-                    // A live owner with other settings holds the directory: this owner falls
-                    // back to memory and does not replace the registered one.
+                    // A live owner with other settings holds the directory: this owner stays
+                    // in memory (it never opens the directory, so it cannot win it from the
+                    // registered owner) and does not replace the registered one.
+                    let options = CodeIndexCacheOptions {
+                        storage: CodeIndexStorage::Memory,
+                        ..options
+                    };
                     let link = start_owner(root, options, function_config, None, Arc::default())?;
                     return Ok(Self { link, roots });
                 }
@@ -395,11 +461,13 @@ impl CodeCacheClient {
 
     /// Symbols of each file for the text the caller supplies, in order.
     ///
-    /// Each entry equals `SymbolIndex::from_source_for_path` on the same text.
+    /// Each entry equals `SymbolIndex::from_source_for_path` on that entry's own text, also
+    /// when several entries name the same path with different texts.
     ///
     /// # Errors
     ///
-    /// Fails if a path cannot be keyed, the owner stopped, or the operation failed.
+    /// Fails if a path cannot be keyed, the owner stopped, the operation failed, or too many
+    /// lookups are already waiting ([`CodeCacheError::Busy`]).
     pub async fn symbols(
         &self,
         files: Vec<(PathBuf, Arc<str>)>,
@@ -413,8 +481,13 @@ impl CodeCacheClient {
                 })
             })
             .collect::<Result<Vec<_>, CodeCacheError>>()?;
-        self.request(|reply| Command::Symbols { files, reply })
-            .await?
+        let permit = SymbolPermit::acquire(&self.link.state)?;
+        self.request(|reply| Command::Symbols {
+            files,
+            _permit: permit,
+            reply,
+        })
+        .await?
     }
 
     /// Cumulative parse/reuse counts.
@@ -553,7 +626,7 @@ impl Owner {
             } => {
                 let _ = reply.send(self.apply(&changed, &removed));
             }
-            Command::Symbols { files, reply } => {
+            Command::Symbols { files, reply, .. } => {
                 // A lookup whose caller already timed out is not worth running.
                 if !reply.is_closed() {
                     let _ = reply.send(self.symbols(&files));
@@ -646,13 +719,20 @@ impl Owner {
         }
     }
 
+    /// Processes `files` in chunks of [`INDEX_CHUNK_FILES`]: each chunk is one Ajika
+    /// operation whose source texts are released before the next chunk starts. The result
+    /// keeps request order.
     fn index_all(&mut self, files: &[FileRef]) -> Result<FileEntries, CodeCacheError> {
-        let keys: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
-        let touched: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let results = self.run_batch(&[], &touched, keys.len(), |db| functions_for(db, &keys));
-        let fresh = self.db.services().take_fresh_functions();
-        let files: Vec<&FileRef> = files.iter().collect();
-        function_entries(&files, &results?, fresh)
+        let mut entries = Vec::with_capacity(files.len());
+        for chunk in files.chunks(INDEX_CHUNK_FILES) {
+            let keys: Vec<String> = chunk.iter().map(|f| f.key.clone()).collect();
+            let touched: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let results = self.run_batch(&[], &touched, keys.len(), |db| functions_for(db, &keys));
+            let fresh = self.db.services().take_fresh_functions();
+            let refs: Vec<&FileRef> = chunk.iter().collect();
+            entries.extend(function_entries(&refs, &results?, fresh)?);
+        }
+        Ok(entries)
     }
 
     fn apply(
@@ -683,18 +763,49 @@ impl Owner {
         &mut self,
         files: &[Change],
     ) -> Result<Vec<Result<SymbolIndex, SymbolError>>, CodeCacheError> {
-        let installed: Vec<(&str, &Arc<str>)> = files
+        // One stored result exists per key, so only the first text given for a key goes
+        // through the cache. An entry repeating that text shares its result; an entry with a
+        // different text for the same key is parsed directly, so no entry ever receives
+        // symbols computed from another entry's text.
+        let mut first: HashMap<&str, &Arc<str>> = HashMap::new();
+        let mut cached: Vec<&Change> = Vec::new();
+        let mut conflicting = vec![false; files.len()];
+        for (position, change) in files.iter().enumerate() {
+            match first.get(change.file.key.as_str()) {
+                None => {
+                    first.insert(change.file.key.as_str(), &change.text);
+                    cached.push(change);
+                }
+                Some(text) if ***text == *change.text => {}
+                Some(_) => conflicting[position] = true,
+            }
+        }
+
+        let installed: Vec<(&str, &Arc<str>)> = cached
             .iter()
             .map(|c| (c.file.key.as_str(), &c.text))
             .collect();
-        let keys: Vec<String> = files.iter().map(|c| c.file.key.clone()).collect();
+        let keys: Vec<String> = cached.iter().map(|c| c.file.key.clone()).collect();
         let touched: Vec<&str> = keys.iter().map(String::as_str).collect();
         let results = self.run_batch(&installed, &touched, keys.len(), |db| {
             symbols_for(db, &keys)
         })?;
-        Ok(results
+        let by_key: HashMap<&str, &Arc<SymbolsResult>> =
+            keys.iter().map(String::as_str).zip(&results).collect();
+
+        let pool = if conflicting.contains(&true) {
+            Some(parse_pool().map_err(CodeCacheError::ParsePool)?)
+        } else {
+            None
+        };
+        Ok(files
             .iter()
-            .map(|result| SymbolsResult::to_index(result))
+            .zip(&conflicting)
+            .map(|(change, &conflict)| match pool {
+                Some(pool) if conflict => pool
+                    .install(|| SymbolIndex::from_source_for_path(&change.file.path, &change.text)),
+                _ => by_key[change.file.key.as_str()].to_index(),
+            })
             .collect())
     }
 }

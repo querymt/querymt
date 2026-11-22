@@ -93,7 +93,9 @@ impl CodeIndexCacheOptions {
             CodeIndexStorage::Memory => return None,
         };
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let hash = RapidHash::new(canonical.to_string_lossy().as_bytes());
+        // The platform's own encoding: identical to the UTF-8 bytes for valid UTF-8 paths,
+        // and distinct for roots that differ only in invalid bytes.
+        let hash = RapidHash::new(canonical.as_os_str().as_encoded_bytes());
         Some(base.join(format!("{:016x}", hash.as_u64())))
     }
 
@@ -156,25 +158,25 @@ fn open_memory(root: &Path, options: &CodeIndexCacheOptions) -> Database<CacheSe
 /// this name is checked by `stale_directories_are_swept` on every upgrade.
 const OWNER_LOCK: &str = "owner.lock";
 
-/// Create the cache base directory readable only by the current user: stored results
-/// include function bodies and configuration values.
-fn create_private_base(base: &Path) -> std::io::Result<()> {
-    if let Some(parent) = base.parent() {
+/// Create `directory` readable only by the current user when it does not exist yet: stored
+/// results include function bodies and configuration values. A directory that already
+/// exists was not created by this code, so its permissions (and, for a symlink, its target)
+/// are left as they are.
+fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+    if let Some(parent) = directory.parent() {
         fs::create_dir_all(parent)?;
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        match fs::DirBuilder::new().mode(0o700).create(base) {
+        use std::os::unix::fs::DirBuilderExt;
+        match fs::DirBuilder::new().mode(0o700).create(directory) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
     #[cfg(not(unix))]
-    fs::create_dir_all(base)?;
+    fs::create_dir_all(directory)?;
     Ok(())
 }
 
@@ -208,6 +210,9 @@ fn is_cache_directory_name(name: &std::ffi::OsStr) -> bool {
 /// `max_idle` ago, such as caches of deleted worktrees. Retention inside a cache only runs
 /// while its root is open, so without this sweep such directories would never be reclaimed.
 ///
+/// Only directories that contain Ajika's lock file are caches this code can vouch for;
+/// anything else under `base` is left alone, whatever its name.
+///
 /// Returns the number of removed directories.
 pub(crate) fn sweep_stale(base: &Path, keep: &Path, max_idle: Duration) -> usize {
     let Ok(entries) = fs::read_dir(base) else {
@@ -233,10 +238,11 @@ pub(crate) fn sweep_stale(base: &Path, keep: &Path, max_idle: Duration) -> usize
             .open(path.join(OWNER_LOCK))
         {
             Ok(lock) => match lock.try_lock() {
-                Ok(()) => Some(lock),
+                Ok(()) => lock,
                 Err(_) => continue,
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // No lock file: not a cache directory of ours (or not one that can be vouched
+            // for), so it is not ours to delete.
             Err(_) => continue,
         };
         // Unix can remove a directory while its lock is held, which closes the window in
@@ -280,10 +286,15 @@ pub(crate) fn open_database(
         (open_memory(root, options), CacheStorageKind::Memory, None)
     };
 
+    // The base (when absent) and the workspace directory under it are created private. The
+    // contents Ajika writes inside inherit that protection.
     if let Some(base) = directory.parent()
-        && let Err(error) = create_private_base(base)
+        && let Err(error) = create_private_dir(base)
     {
         return memory(format!("cannot create {base:?} ({error})"));
+    }
+    if let Err(error) = create_private_dir(&directory) {
+        return memory(format!("cannot create {directory:?} ({error})"));
     }
 
     let epoch = options.epoch();
