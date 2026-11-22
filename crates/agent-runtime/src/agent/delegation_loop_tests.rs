@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify};
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn custom_delegate_cannot_dispatch_a_provider_before_sharing() {
+async fn custom_delegate_runs_on_host_under_its_stored_authority() {
     use crate::agent::session_actor::{PeerTurn, TurnAuthority};
     use querymt_remote::peer_access::{ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant};
     use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig, NodeId};
@@ -111,24 +111,29 @@ async fn custom_delegate_cannot_dispatch_a_provider_before_sharing() {
         loop {
             let event = events.recv().await.unwrap();
             match event.kind() {
-                AgentEventKind::DelegationCompleted { delegation_id, .. }
-                    if delegation_id == &delegation.public_id =>
-                {
-                    panic!("guarded child completed without provider sharing");
+                AgentEventKind::DelegationCompleted {
+                    delegation_id,
+                    result,
+                } if delegation_id == &delegation.public_id => {
+                    assert!(
+                        result
+                            .as_deref()
+                            .is_some_and(|result| result.contains("Task complete"))
+                    );
+                    break;
                 }
                 AgentEventKind::DelegationFailed {
                     delegation_id,
                     error,
                 } if delegation_id == &delegation.public_id => {
-                    assert!(error.contains("mesh access denied"), "{error}");
-                    break;
+                    panic!("confined child failed: {error}")
                 }
                 _ => {}
             }
         }
     })
     .await
-    .expect("guarded child must report the denial");
+    .expect("confined child must finish");
 }
 
 // Mock implementations moved to crate::test_utils::mocks

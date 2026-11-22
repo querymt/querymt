@@ -236,43 +236,75 @@ async fn grant_aware_route_authorizes_custom_sessions_only_on_v1() {
 }
 
 #[tokio::test]
-async fn guarded_provider_rpc_is_unsupported_even_with_a_full_grant() {
-    use crate::{GetProviderCatalog, ProviderCatalogActor};
+async fn provider_relay_requires_expected_host_and_active_request_without_reverse_grant() {
+    use crate::StreamRelayMessage;
+    use crate::provider_stream_router::{
+        AttachStreamConsumer, ProviderStreamRouterActor, RegisterRequest, register_peer_relay,
+    };
+    use crate::stream_router_protocol::RoutedStreamRelayMessage;
+    use kameo::actor::Spawn;
+    use querymt::chat::StreamChunk;
 
+    let client = PeerId::random();
     let host = PeerId::random();
-    let peer = PeerId::random();
-    let actor = ActorId::new_with_peer_id(17, host);
-    let store = Arc::new(TestStore::default());
-    store
-        .replace_grant(&key(host, peer), Uuid::nil(), PeerGrant::Full)
+    let ingress = InboundRouter::new(client, Arc::new(TestStore::default()));
+    let actor = ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+    let actor_id = ActorId::new_with_peer_id(actor.id().sequence_id(), client);
+    register_peer_relay(&ingress, actor_id, &actor, host);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    actor
+        .ask(RegisterRequest {
+            request_id: "active".into(),
+        })
         .await
         .unwrap();
-    let router = InboundRouter::new(host, store);
-    router.register::<ProviderCatalogActor, GetProviderCatalog, (), String, _, _>(
-        actor,
-        InboundDelivery::Ask,
-        InboundAccess::Full,
-        |_, _| async { panic!("provider dispatch is disabled on guarded ingress") },
-    );
-    let rpc = || SwarmRequest::Ask {
-        actor_id: actor,
-        actor_remote_id: <ProviderCatalogActor as RemoteActor>::REMOTE_ID.into(),
-        message_remote_id: <ProviderCatalogActor as RemoteMessage<GetProviderCatalog>>::REMOTE_ID
-            .into(),
-        payload: rmp_serde::to_vec_named(&GetProviderCatalog).unwrap(),
+    actor
+        .ask(AttachStreamConsumer {
+            request_id: "active".into(),
+            consumer_tx: tx,
+        })
+        .await
+        .unwrap();
+
+    let relay = |request_id: &str, text: &str| SwarmRequest::Tell {
+        actor_id,
+        actor_remote_id: <ProviderStreamRouterActor as RemoteActor>::REMOTE_ID.into(),
+        message_remote_id:
+            <ProviderStreamRouterActor as RemoteMessage<RoutedStreamRelayMessage>>::REMOTE_ID.into(),
+        payload: rmp_serde::to_vec_named(&RoutedStreamRelayMessage {
+            request_id: request_id.into(),
+            message: StreamRelayMessage::Chunk(StreamChunk::Text(text.into())),
+            seq: None,
+        })
+        .unwrap(),
         mailbox_timeout: None,
-        reply_timeout: None,
         immediate: false,
     };
     assert!(matches!(
-        router.handle_v1(peer, rpc()).await,
-        Err(SharingRejection::UnsupportedOperation)
+        ingress
+            .handle_legacy(PeerId::random(), relay("active", "wrong host"))
+            .await,
+        SwarmResponse::Tell(Err(_))
     ));
     assert!(matches!(
-        router.handle_legacy(peer, rpc()).await,
-        SwarmResponse::Ask(Err(RemoteSendError::DeserializeMessage(message)))
-            if message == SharingRejection::UnsupportedOperation.to_string()
+        ingress
+            .handle_legacy(host, relay("missing", "wrong request"))
+            .await,
+        SwarmResponse::Tell(Err(_))
     ));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        ingress
+            .handle_legacy(host, relay("active", "legacy data"))
+            .await,
+        SwarmResponse::Tell(Ok(()))
+    ));
+    assert!(
+        matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "legacy data")
+    );
 }
 
 #[tokio::test]

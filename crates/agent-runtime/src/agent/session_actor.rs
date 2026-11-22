@@ -531,29 +531,7 @@ impl std::fmt::Debug for PeerTurn {
     }
 }
 
-#[cfg(feature = "remote")]
-impl crate::session::provider::SessionHandle {
-    async fn check_peer_binding(
-        &self,
-        peer: &PeerTurn,
-    ) -> Result<querymt_remote::peer_access::PeerGrant, AgentError> {
-        let config = self.llm_config().ok_or(AgentError::MeshAccessDenied)?;
-        peer.grant_for(Some((&config.provider, &config.model)))
-            .await
-    }
-}
-
 impl TurnAuthority {
-    /// Guarded peers can use session APIs, but cannot dispatch providers until
-    /// a metered provider path is available.
-    pub(crate) fn require_provider_dispatch(&self) -> Result<(), AgentError> {
-        match self {
-            Self::Local => Ok(()),
-            #[cfg(feature = "remote")]
-            Self::Peer(_) => Err(AgentError::MeshAccessDenied),
-        }
-    }
-
     pub(crate) fn stored_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
         match self {
             Self::Local => crate::session::domain_schedule::ScheduleOrigin::Local,
@@ -3598,10 +3576,11 @@ async fn execute_prompt_inner(
                     StopReason::Cancelled,
                 )));
             }
-            let session = pinned_session
+            let binding = pinned_session
                 .as_ref()
-                .ok_or(AgentError::MeshAccessDenied)?;
-            Some((peer, session.check_peer_binding(peer).await?))
+                .and_then(|session| session.llm_config())
+                .map(|config| (config.provider.as_str(), config.model.as_str()));
+            Some((peer, peer.grant_for(binding).await?))
         }
     };
     #[cfg(feature = "remote")]
@@ -3629,8 +3608,6 @@ async fn execute_prompt_inner(
         return Err(AgentError::MeshAccessDenied);
     }
 
-    authority.require_provider_dispatch()?;
-
     // Clean up revert state if a new prompt is sent while in reverted state.
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
@@ -3656,6 +3633,13 @@ async fn execute_prompt_inner(
             .with_session(&session_id)
             .await
             .map_err(|e| AgentError::Internal(e.to_string()))?,
+    };
+
+    #[cfg(feature = "remote")]
+    let session_handle = if let Some((peer, grant)) = peer_grant {
+        session_handle.for_mesh_turn(peer, &grant, config.fallback_context_tokens())?
+    } else {
+        session_handle
     };
 
     // Slash-command expansion can alter text, but never attachment capability.

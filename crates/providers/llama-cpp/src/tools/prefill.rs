@@ -144,8 +144,22 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         ));
     }
 
-    let input_tokens = tokens.len() as u32;
-    let n_ctx_needed = input_tokens + max_tokens;
+    let input_tokens = u32::try_from(tokens.len())
+        .map_err(|_| LLMError::InvalidRequest("prompt token count exceeds u32".into()))?;
+    let n_len_total = input_tokens
+        .checked_add(max_tokens)
+        .and_then(|total| i32::try_from(total).ok())
+        .ok_or_else(|| {
+            LLMError::InvalidRequest(
+                "prompt and output token count exceeds supported positions".into(),
+            )
+        })?;
+    let n_ctx_needed = n_len_total as u32;
+    if cfg.n_ctx.is_some_and(|limit| n_ctx_needed > limit) {
+        return Err(LLMError::InvalidRequest(
+            "prompt and output exceed configured n_ctx".into(),
+        ));
+    }
     let n_ctx_raw = cfg
         .n_ctx
         .unwrap_or_else(|| n_ctx_needed.min(model.n_ctx_train()));
@@ -182,7 +196,6 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         })?;
 
     let n_ctx_total = ctx.n_ctx() as i32;
-    let n_len_total = tokens.len() as i32 + max_tokens as i32;
     if n_len_total > n_ctx_total {
         return Err(LLMError::InvalidRequest(format!(
             "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"

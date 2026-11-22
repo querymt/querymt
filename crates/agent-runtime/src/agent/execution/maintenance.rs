@@ -253,7 +253,6 @@ pub(crate) async fn compact_history_with(
         return Ok(CompactionOutcome::NothingToCompact);
     }
 
-    env.turn_authority().require_provider_dispatch()?;
     let prompt_limit = env.execution_config().and_then(|cfg| cfg.max_prompt_bytes);
     let tool_changes = env.model.profile.capabilities.tool_updates;
     let token_estimate =
@@ -377,7 +376,7 @@ pub(crate) async fn compact_history_with(
         let ledger = compaction_ledger(config, env, &built);
         match config
             .compaction
-            .process(
+            .process_authorized(
                 &messages,
                 prompt_limit,
                 instructions,
@@ -387,6 +386,7 @@ pub(crate) async fn compact_history_with(
                     cancel: &env.cancellation_token,
                     ledger: &ledger,
                 },
+                env.turn_authority(),
             )
             .await
         {

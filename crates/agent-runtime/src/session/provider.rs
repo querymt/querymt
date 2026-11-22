@@ -27,6 +27,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+// Keep accepting the documented node selector on existing requests and rows.
+#[cfg(feature = "remote")]
+const LOCAL_PROVIDER_NODE: &str = "local";
+
 /// Cached provider entry: `(config_id, provider_node_id, allow_mesh_fallback, provider)`.
 ///
 /// `provider_node_id` is stored separately from `llm_configs` (in the `sessions`
@@ -478,6 +482,22 @@ impl SessionProvider {
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<ProviderSnapshot> {
+        self.build_provider_snapshot_with_route(req, false).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn build_local_provider_snapshot(
+        &self,
+        req: ProviderRequest<'_>,
+    ) -> SessionResult<ProviderSnapshot> {
+        self.build_provider_snapshot_with_route(req, true).await
+    }
+
+    async fn build_provider_snapshot_with_route(
+        &self,
+        req: ProviderRequest<'_>,
+        _local_only: bool,
+    ) -> SessionResult<ProviderSnapshot> {
         let provider_name = req.provider_name;
         let model = req.model;
         let params = req.params;
@@ -485,14 +505,15 @@ impl SessionProvider {
         let session_id = req.session_id;
 
         #[cfg(feature = "remote")]
-        let explicitly_local = req.provider_node_id.is_some_and(|node| {
-            node == "local"
-                || self
-                    .mesh
-                    .borrow()
-                    .as_deref()
-                    .is_some_and(|mesh| mesh.peer_id().to_string() == node)
-        });
+        let explicitly_local = _local_only
+            || req.provider_node_id.is_some_and(|node| {
+                node == LOCAL_PROVIDER_NODE
+                    || self
+                        .mesh
+                        .borrow()
+                        .as_deref()
+                        .is_some_and(|mesh| mesh.peer_id().to_string() == node)
+            });
         // An owner-local selection can arrive with an explicit node ID from a viewer.
         // Resolve it locally, without falling back to another node on failure.
         #[cfg(feature = "remote")]
@@ -634,6 +655,8 @@ impl SessionProvider {
             resolved_cfg.pruned_config_str,
             self.cache_ttl_secs.load(Ordering::Relaxed),
         )?;
+        #[cfg(feature = "remote")]
+        let llama_cpp_n_ctx = llama_cpp_context_limit(factory.name(), &pruned_config_str);
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -695,6 +718,8 @@ impl SessionProvider {
                     settings,
                     output_caps,
                     reasoning_effort,
+                    #[cfg(feature = "remote")]
+                    llama_cpp_n_ctx,
                 });
             }
 
@@ -717,6 +742,8 @@ impl SessionProvider {
                     settings,
                     output_caps,
                     reasoning_effort,
+                    #[cfg(feature = "remote")]
+                    llama_cpp_n_ctx,
                 });
             }
 
@@ -731,6 +758,8 @@ impl SessionProvider {
                 settings,
                 output_caps,
                 reasoning_effort,
+                #[cfg(feature = "remote")]
+                llama_cpp_n_ctx,
             });
         }
 
@@ -743,6 +772,8 @@ impl SessionProvider {
             settings,
             output_caps,
             reasoning_effort,
+            #[cfg(feature = "remote")]
+            llama_cpp_n_ctx,
         })
     }
 }
@@ -942,7 +973,9 @@ pub(crate) struct CompactionModel {
 }
 
 pub(crate) struct ProviderSnapshot {
-    provider: Arc<dyn LLMProvider>,
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    #[cfg(feature = "remote")]
+    llama_cpp_n_ctx: Option<u64>,
     settings: crate::agent::utils::genai::GenerationSettings,
     /// Output caps resolved with the provider; `None` when unknown.
     output_caps: Option<OutputCaps>,
@@ -950,7 +983,54 @@ pub(crate) struct ProviderSnapshot {
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 }
 
+#[cfg(feature = "remote")]
+fn llama_cpp_context_limit(factory_name: &str, resolved_config: &str) -> Option<u64> {
+    // The logical provider ID can be an alias. Only the native factory's
+    // resolved n_ctx is relevant; a context middleware override is not.
+    if !matches!(factory_name, "llama_cpp" | "llama.cpp") {
+        return None;
+    }
+    let config: serde_json::Value = serde_json::from_str(resolved_config).ok()?;
+    config.get("n_ctx")?.as_u64().filter(|&limit| limit > 0)
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderQuotaInputs {
+    initial_max_tokens: Option<u32>,
+    llama_cpp_n_ctx: Option<u64>,
+    context_fallback: Option<usize>,
+}
+
+#[cfg(feature = "remote")]
+impl ProviderQuotaInputs {
+    pub(crate) fn estimate(
+        self,
+        provider: &str,
+        model: &str,
+        call: &querymt::chat::ChatCall<'_>,
+    ) -> querymt_remote::peer_access::quota::QuotaEstimate {
+        querymt_remote::peer_access::quota::QuotaEstimate::for_chat(
+            provider,
+            model,
+            call,
+            self.initial_max_tokens,
+            self.llama_cpp_n_ctx,
+            self.context_fallback,
+        )
+    }
+}
+
 impl ProviderSnapshot {
+    #[cfg(feature = "remote")]
+    pub(crate) fn quota_inputs(&self, context_fallback: Option<usize>) -> ProviderQuotaInputs {
+        ProviderQuotaInputs {
+            initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+            llama_cpp_n_ctx: self.llama_cpp_n_ctx,
+            context_fallback,
+        }
+    }
+
     #[cfg(feature = "remote")]
     async fn remote(provider: querymt_remote::MeshChatProvider) -> SessionResult<Self> {
         let info = provider.negotiate_contract().await?;
@@ -971,6 +1051,7 @@ impl ProviderSnapshot {
                 .zip(info.generation.output_ceiling)
                 .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
             reasoning_effort: info.generation.reasoning_effort,
+            llama_cpp_n_ctx: None,
         }
     }
 
@@ -1017,6 +1098,8 @@ pub struct SessionHandle {
     /// turn instead of once per clone (the state machine clones the handle on
     /// every step). A failed init is not cached, so retries still rebuild.
     cached_llm_provider: Arc<tokio::sync::OnceCell<ProviderSnapshot>>,
+    #[cfg(feature = "remote")]
+    mesh_turn: Option<(Arc<crate::agent::session_actor::PeerTurn>, Option<usize>)>,
 }
 
 impl Clone for SessionHandle {
@@ -1028,6 +1111,8 @@ impl Clone for SessionHandle {
             provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
             cached_llm_provider: Arc::clone(&self.cached_llm_provider),
+            #[cfg(feature = "remote")]
+            mesh_turn: self.mesh_turn.clone(),
         }
     }
 }
@@ -1069,7 +1154,34 @@ impl SessionHandle {
             provider_node_id,
             execution_config,
             cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(feature = "remote")]
+            mesh_turn: None,
         })
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn for_mesh_turn(
+        mut self,
+        peer: &Arc<crate::agent::session_actor::PeerTurn>,
+        grant: &querymt_remote::peer_access::PeerGrant,
+        context_fallback: Option<usize>,
+    ) -> Result<Self, crate::error::AgentError> {
+        use crate::error::AgentError;
+        let config = self
+            .llm_config
+            .as_ref()
+            .ok_or(AgentError::MeshAccessDenied)?;
+        if !grant.allows_model(peer.protocol, &config.provider, &config.model)
+            || self.provider_node_id.as_deref().is_some_and(|node| {
+                node != LOCAL_PROVIDER_NODE && node != peer.key.host.to_string()
+            })
+        {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        // Never reuse an unguarded provider or route a peer's spend onward.
+        self.cached_llm_provider = Arc::new(tokio::sync::OnceCell::new());
+        self.mesh_turn = Some((peer.clone(), context_fallback));
+        Ok(self)
     }
 
     /// Get the session information
@@ -1077,7 +1189,25 @@ impl SessionHandle {
         &self.session
     }
 
-    /// Get the LLM config captured at handle creation time (turn-pinned).
+    pub(crate) fn uses_explicit_mesh_provider(&self) -> bool {
+        #[cfg(feature = "remote")]
+        {
+            self.mesh_turn.is_none()
+                && self.provider_node_id.as_deref().is_some_and(|node| {
+                    node != LOCAL_PROVIDER_NODE
+                        && self
+                            .provider
+                            .mesh_handle()
+                            .as_deref()
+                            .is_none_or(|mesh| mesh.peer_id().to_string() != node)
+                })
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            false
+        }
+    }
+
     /// A handle for the same session pinned to `model`, for tests that
     /// change the model between two requests of one run.
     #[cfg(test)]
@@ -1089,6 +1219,7 @@ impl SessionHandle {
         next
     }
 
+    /// Get the LLM config captured at handle creation time (turn-pinned).
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.llm_config.as_ref()
     }
@@ -1152,11 +1283,43 @@ impl SessionHandle {
                     // Filled in by `record_auth_source` during credential resolution.
                     auth.source = tracing::field::Empty,
                 );
-                tracing::Instrument::instrument(
-                    self.provider.build_provider_snapshot(request),
+                let built = tracing::Instrument::instrument(
+                    async {
+                        #[cfg(feature = "remote")]
+                        if self.mesh_turn.is_some() {
+                            return self.provider.build_local_provider_snapshot(request).await;
+                        }
+                        self.provider.build_provider_snapshot(request).await
+                    },
                     span,
                 )
-                .await
+                .await?;
+                #[cfg(feature = "remote")]
+                if let Some((peer, context_fallback)) = &self.mesh_turn {
+                    let mesh = self.provider.mesh_handle().ok_or_else(|| {
+                        SessionError::InvalidOperation("mesh access store unavailable".into())
+                    })?;
+                    let store = mesh
+                        .quota_store()
+                        .filter(|_| mesh.peer_id() == peer.key.host.as_peer_id())
+                        .cloned()
+                        .ok_or_else(|| {
+                            SessionError::InvalidOperation("mesh access store unavailable".into())
+                        })?;
+                    let mut built = built;
+                    let quota_inputs = built.quota_inputs(*context_fallback);
+                    built.provider = Arc::new(
+                        crate::agent::remote::provider_host_backend::hosted_provider(
+                            built.provider,
+                            peer,
+                            store,
+                            (config.provider.clone(), config.model.clone()),
+                            quota_inputs,
+                        ),
+                    );
+                    return Ok(built);
+                }
+                Ok(built)
             })
             .await
     }
@@ -1196,13 +1359,24 @@ impl SessionHandle {
         &self,
         policy: &crate::config::CompactionConfig,
     ) -> SessionResult<CompactionTarget> {
-        policy.validate().map_err(SessionError::InvalidOperation)?;
+        let policy = Some(policy);
+        // Hosted turns compact through their pinned, metered binding, not
+        // through the owner's alternate compaction route.
+        #[cfg(feature = "remote")]
+        let policy = policy.filter(|_| self.mesh_turn.is_none());
+        if let Some(policy) = policy {
+            policy.validate().map_err(SessionError::InvalidOperation)?;
+        }
         let session = self.llm_config.as_ref().ok_or_else(|| {
             SessionError::InvalidOperation("Session has no LLM config".to_string())
         })?;
-        let provider = policy.provider.as_deref().unwrap_or(&session.provider);
+        let provider = policy
+            .and_then(|policy| policy.provider.as_deref())
+            .unwrap_or(&session.provider);
         let provider_changed = provider != session.provider;
-        let model = policy.model.as_deref().unwrap_or(&session.model);
+        let model = policy
+            .and_then(|policy| policy.model.as_deref())
+            .unwrap_or(&session.model);
         Ok(CompactionTarget {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -1902,6 +2076,15 @@ pub mod tests {
 
     #[cfg(feature = "remote")]
     #[test]
+    fn quota_context_limit_reads_only_the_llama_cpp_factory_config() {
+        let config = r#"{"n_ctx":4096,"speculative":{}}"#;
+        assert_eq!(llama_cpp_context_limit("llama_cpp", config), Some(4096));
+        assert_eq!(llama_cpp_context_limit("fixture", config), None);
+        assert_eq!(llama_cpp_context_limit("llama_cpp", "{}"), None);
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
     fn remote_snapshot_preserves_host_resolved_caps_and_effort() {
         for caps in [
             OutputCaps {
@@ -1918,7 +2101,12 @@ pub mod tests {
                 settings: Default::default(),
                 output_caps: Some(caps),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+                llama_cpp_n_ctx: None,
             };
+            assert_eq!(
+                host.quota_inputs(None).initial_max_tokens,
+                Some(caps.initial)
+            );
             let contract = host.contract_info();
             let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
             assert_eq!(remote.output_caps, Some(caps));

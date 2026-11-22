@@ -453,6 +453,16 @@ impl PluginRegistry {
         self.factories.read().unwrap().values().cloned().collect()
     }
 
+    /// Loaded factories keyed by their configured logical names, including aliases.
+    pub fn list_bindings(&self) -> Vec<(String, Arc<dyn LLMProviderFactory>)> {
+        self.factories
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(name, factory)| (name.clone(), factory.clone()))
+            .collect()
+    }
+
     /// Force-update all OCI-based provider plugins, reporting progress via callback.
     ///
     /// Returns a vec of `(provider_name, result)` pairs, one per OCI provider found

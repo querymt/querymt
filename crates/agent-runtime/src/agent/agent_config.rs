@@ -35,6 +35,13 @@ pub struct SessionBridgeRoute {
 }
 
 impl AgentConfig {
+    #[cfg(feature = "remote")]
+    pub(crate) fn fallback_context_tokens(&self) -> Option<usize> {
+        self.middleware_drivers
+            .iter()
+            .find_map(|driver| driver.fallback_context_tokens())
+    }
+
     /// Workspace-query capability for a locally hosted session.
     ///
     /// Returns the transport connection currently attached to the session on
