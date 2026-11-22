@@ -3019,10 +3019,13 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
     // `get_history` / `load_working_context` only sees the surviving messages.
+    let event_stream = config.event_sink.session_stream(&session_id);
     if let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
         &config.provider,
         &**config.event_sink.journal(),
+        Some(&event_stream),
         &session_id,
+        Some(&run_id.to_string()),
     )
     .await
     {
@@ -3949,13 +3952,14 @@ mod tests {
             self.inner.load_global_stream(after_seq, limit).await
         }
 
-        async fn delete_session_events_from(
+        async fn delete_session_events_range(
             &self,
             session_id: &str,
             from_seq: i64,
+            before_seq: Option<i64>,
         ) -> SessionResult<usize> {
             self.inner
-                .delete_session_events_from(session_id, from_seq)
+                .delete_session_events_range(session_id, from_seq, before_seq)
                 .await
         }
 

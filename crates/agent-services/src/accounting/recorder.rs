@@ -209,8 +209,13 @@ pub(crate) mod tests {
         ) -> SessionResult<Vec<DurableEvent>> {
             self.inner.load_global_stream(a, l).await
         }
-        async fn delete_session_events_from(&self, s: &str, f: i64) -> SessionResult<usize> {
-            self.inner.delete_session_events_from(s, f).await
+        async fn delete_session_events_range(
+            &self,
+            s: &str,
+            f: i64,
+            b: Option<i64>,
+        ) -> SessionResult<usize> {
+            self.inner.delete_session_events_range(s, f, b).await
         }
         async fn append_durable_from_source(
             &self,

@@ -403,12 +403,14 @@ impl EventJournal for SqliteStorage {
         .await
     }
 
-    async fn delete_session_events_from(
+    async fn delete_session_events_range(
         &self,
         session_id: &str,
         from_seq: i64,
+        before_seq: Option<i64>,
     ) -> SessionResult<usize> {
         let session_id = session_id.to_string();
+        let before_seq = before_seq.unwrap_or(i64::MAX);
 
         blocking::with_conn_sqlite(&self.conn, move |conn| {
             // Conversation-tail deletion must not erase incurred spend or the
@@ -417,19 +419,25 @@ impl EventJournal for SqliteStorage {
             // * a request-end without `accounting` is a legacy generation
             //   record whose cost cannot be reconstructed, so it is kept to
             //   keep historical coverage honestly incomplete.
+            // Run lifecycle rows are kept as well: the delete starts at a
+            // prompt inside a run, so removing only some of a run's
+            // start/completion pair would leave it open or start-less.
             // Retained rows keep their numbers; the resulting gaps are valid.
             let tx = conn.unchecked_transaction()?;
             let deleted = tx.execute(
                 "DELETE FROM event_journal \
-                 WHERE session_id = ?1 AND stream_seq >= ?2 \
-                    AND kind NOT IN (?3, ?4) \
-                   AND NOT (kind = ?5 \
+                 WHERE session_id = ?1 AND stream_seq >= ?2 AND stream_seq < ?3 \
+                    AND kind NOT IN (?4, ?5, ?6, ?7) \
+                   AND NOT (kind = ?8 \
                             AND json_extract(payload_json, '$.data.accounting') IS NULL)",
                 params![
                     session_id,
                     from_seq,
+                    before_seq,
                     AgentEventKind::LLM_ATTEMPT_STARTED_TAG,
                     AgentEventKind::LLM_ATTEMPT_SETTLED_TAG,
+                    AgentEventKind::RUN_STARTED_TAG,
+                    AgentEventKind::RUN_COMPLETED_TAG,
                     AgentEventKind::LLM_REQUEST_END_TAG,
                 ],
             )?;

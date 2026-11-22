@@ -894,12 +894,15 @@ mod tests {
         {
             self.inner.load_global_stream(after, limit).await
         }
-        async fn delete_session_events_from(
+        async fn delete_session_events_range(
             &self,
             session: &str,
             from: i64,
+            before: Option<i64>,
         ) -> crate::session::error::SessionResult<usize> {
-            self.inner.delete_session_events_from(session, from).await
+            self.inner
+                .delete_session_events_range(session, from, before)
+                .await
         }
         async fn append_durable_from_source(
             &self,

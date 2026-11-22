@@ -793,10 +793,11 @@ mod tests {
                 Ok(vec![])
             }
 
-            async fn delete_session_events_from(
+            async fn delete_session_events_range(
                 &self,
                 _session_id: &str,
                 _from_seq: i64,
+                _before_seq: Option<i64>,
             ) -> SessionResult<usize> {
                 Ok(0)
             }
