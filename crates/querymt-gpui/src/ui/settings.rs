@@ -558,18 +558,33 @@ impl QmtApp {
                             .update(cx, |s, cx| s.update_prefs(|p| p.image_send_mode = mode, cx))
                     }))
             }));
-            settings_card(p).child(simple_row(
-                "Image attachment encoding",
-                "Send images as native ACP image blocks or embedded resources.",
-                encoding,
-                true,
-                p,
-            ))
+            settings_card(p)
+                .child(simple_row(
+                    "Image attachment encoding",
+                    "Send images as native ACP image blocks or embedded resources.",
+                    encoding,
+                    true,
+                    p,
+                ))
+                .child(simple_row(
+                    "Developer mode",
+                    "Show developer-only tools: protocol debug events and message metadata.",
+                    div().debug_selector(|| "sw-developer".into()).child(
+                        kit::switch("sw-developer")
+                            .checked(prefs.developer_mode)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.store.update(cx, |s, cx| s.set_developer_mode(v, cx));
+                            })),
+                    ),
+                    false,
+                    p,
+                ))
         });
         let advanced = disclosure(
             "general-advanced",
             "Advanced",
-            "How prompts are sent to agents.",
+            "How prompts are sent to agents, and developer tools.",
             advanced_open,
             cx.listener(|this, _, _, cx| {
                 this.general_advanced_open = !this.general_advanced_open;
@@ -2069,6 +2084,38 @@ mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::test::TestWindowExt as _;
     use serde_json::{Value, json};
+
+    #[gpui_kit::test]
+    fn developer_mode_is_a_general_setting(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let store = crate::store::automations::schedule_ui_fixture();
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        let store = cx.update(|cx| app.read(cx).store.clone());
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Settings, cx);
+                app.settings_tab = SettingsTab::General;
+                app.general_advanced_open = true;
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let switch = vcx
+            .debug_bounds("sw-developer")
+            .expect("Developer mode switch");
+        vcx.simulate_click(switch.center(), gpui_kit::Modifiers::none());
+        assert!(store.read_with(cx, |s, _| s.prefs.developer_mode));
+    }
 
     #[gpui_kit::test]
     fn plugin_update_shows_progress_then_the_outcome(cx: &mut gpui_kit::TestAppContext) {
