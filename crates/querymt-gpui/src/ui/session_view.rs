@@ -4939,6 +4939,7 @@ impl QmtApp {
         let Some(view) = store.session.as_ref() else {
             let busy = store.launch.busy;
             let err = store.launch.error.clone();
+            let progress = store.launch_progress_label();
             return v_flex()
                 .size_full()
                 .items_center()
@@ -4947,7 +4948,7 @@ impl QmtApp {
                 .text_color(p.muted)
                 .when(busy, |el| {
                     el.child(kit::spinner("starting", 22., p.accent))
-                        .child("Starting session…")
+                        .child(progress)
                 })
                 .when(!busy, |el| {
                     el.child(err.unwrap_or_else(|| "No session open.".into()))
