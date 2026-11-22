@@ -479,8 +479,9 @@ fn load_stored_iroh_scopes() -> anyhow::Result<Vec<querymt_agent::agent::remote:
     use querymt_agent::agent::remote::mesh_state::{MeshStateStore, default_mesh_state_path};
 
     let path = default_mesh_state_path()?;
-    let store = MeshStateStore::load_or_create(&path)?;
+    let store = MeshStateStore::shared(&path)?;
     Ok(store
+        .read()
         .active_mesh_ids()
         .into_iter()
         .map(|mesh_id| IrohMeshConfig {
