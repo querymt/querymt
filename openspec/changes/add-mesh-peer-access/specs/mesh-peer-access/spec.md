@@ -12,6 +12,14 @@ The resource host SHALL keep one durable grant per transport-authenticated peer 
 - **WHEN** a host grants a peer access, that peer reconnects under a different name or scope, and another peer claims the same identity in a request field
 - **THEN** only the authenticated grantee receives access; no reverse grant or grant for the other peer is created
 
+### Requirement: Mesh state stores peer access alongside membership
+
+The host SHALL store grants, quota caps, and settled usage in the peer-access section of `mesh_state.json` version 2. A single in-process owner SHALL serialize membership and peer-access writes. Saves SHALL write and sync a temporary file in the same directory before renaming it in place. Older builds saving `mesh_state.json` drop the peer-access section.
+
+#### Scenario: Version 1 mesh state upgrades without granting access
+- **WHEN** the host loads version 1 mesh state or starts without an existing file
+- **THEN** it uses version 2 with empty peer-access state and preserves any existing membership and invite records
+
 ### Requirement: The host manages sharing through ACP
 
 The host SHALL expose operations through ACP to read and replace grants and inspect and reset quotas. The mesh peer protocol SHALL NOT expose these operations, even under a Full access grant. Policy writes SHALL validate the entire grant, persist it before reporting success, and reject edits based on stale revisions rather than overwriting a newer grant.
@@ -26,7 +34,7 @@ The host SHALL expose operations through ACP to read and replace grants and insp
 
 ### Requirement: Session and filesystem sharing have separate controls
 
-Sessions **Off** SHALL block all remote session operations, even through prior references. Sessions **On** SHALL allow host-wide session access subject to other grants. Filesystem **Off** SHALL block fresh workspace access. Filesystem **On** SHALL require Sessions **On** and preserve workspace confinement. Restricted sessions SHALL deny any tool or action whose capabilities the host cannot enforce, at execution as well as discovery.
+Sessions **Off** SHALL block all remote session operations, even through prior references. Sessions **On** SHALL allow host-wide session access subject to other grants. Filesystem **Off** SHALL block fresh workspace access. Filesystem **On** SHALL require Sessions **On** and preserve workspace confinement. Except for explicitly enabled Shell, Custom sessions SHALL deny tools or actions whose capabilities the host cannot enforce, at execution as well as discovery.
 
 #### Scenario: Sessions off blocks an existing reference
 - **WHEN** a peer with Sessions Off calls a session it can identify using a prior remote reference
@@ -40,13 +48,21 @@ Sessions **Off** SHALL block all remote session operations, even through prior r
 - **WHEN** a peer with both toggles On uses a supported workspace file operation against an in-workspace path and a path outside that workspace
 - **THEN** the in-workspace operation proceeds subject to normal host rules and the out-of-workspace operation is refused
 
+### Requirement: Custom grants have an explicit Shell control
+
+Shell: allows the unsandboxed shell. In Custom grants, Shell SHALL default to Off. Shell **On** SHALL require Filesystem **On**. Shell **Off** SHALL refuse shell execution through the session.
+
+#### Scenario: Custom shell follows the grant
+- **WHEN** a Custom peer requests shell execution with Shell On or Off
+- **THEN** the host applies the Shell control at discovery and execution, subject to existing tool policy
+
+#### Scenario: Invalid Custom combinations are refused
+- **WHEN** an owner submits Shell On without Filesystem On or Filesystem On without Sessions On
+- **THEN** the host reports an invalid grant without changing access
+
 ### Requirement: Full access is explicit and does not prompt for mesh approval
 
-Full access SHALL grant sessions, filesystem, the existing shell, and all providers and models with unlimited capacity. The owner SHALL be warned that the shell runs with the host process's OS permissions. Custom SHALL NOT allow unsandboxed shell or equivalent unrestricted execution. Standing grants SHALL NOT add per-request mesh approvals or override existing host approvals, denials, or agent questions.
-
-#### Scenario: Custom cannot include unsandboxed shell
-- **WHEN** an owner tries to save Custom with shell enabled or a restricted peer requests equivalent execution through a session
-- **THEN** the invalid edit or execution is refused without expanding any grant
+Full access SHALL grant sessions, filesystem, shell, and all providers and models with unlimited capacity. Standing grants SHALL NOT add per-request mesh approvals or override existing host approvals, denials, or agent questions.
 
 #### Scenario: Full access does not add approval prompts
 - **WHEN** a Full access peer uses a shareable operation that the host's existing policies already allow without a prompt

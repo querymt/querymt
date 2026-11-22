@@ -10,14 +10,16 @@
 
 ### Requirement: Mesh writes are explicit and revision checked
 
-`mesh set PEER_ID --expected-revision REV --grant JSON` SHALL send an explicit grant replacement. Full requires `--allow-host-shell`. `mesh set-quota` SHALL take a provider ID, optional model ID, a limit and update or reconfigure intent. `mesh reset-quota` SHALL target the supplied scope. Each write SHALL require an explicit revision and return the confirmed state without automatic retry.
+`mesh set PEER_ID --expected-revision REV --grant JSON` SHALL send an explicit grant replacement. `mesh set-quota` SHALL take a provider ID, optional model ID, a limit and update or reconfigure intent. `mesh reset-quota` SHALL target the supplied scope. Each write SHALL require an explicit revision and return the confirmed state without automatic retry.
 
-#### Scenario: Mesh grant edits require an explicit revision and Full acknowledgement
-- **WHEN** a client requests a Full grant with and without its acknowledgement, or omits the revision
-- **THEN** only a correctly acknowledged, revision-bearing command sends the Full replacement
+#### Scenario: Mesh grant edits require an explicit revision
+- **WHEN** a client requests a Full or Custom grant with and without a revision
+- **THEN** only the revision-bearing command sends the replacement
+
+Finite quotas SHALL use `--tokens` with a plain integer or a number with a `k` or `M` suffix. The command SHALL reject fractions of a token and overflow.
 
 #### Scenario: Mesh quota requests retain exact scoped limits
-- **WHEN** the owner submits a model limit of `2.000001` Mtok and a daily window, then requests a reset for that scope and revision
+- **WHEN** the owner submits a model limit of `--tokens 2.000001M` and a daily window, then requests a reset for that scope and revision
 - **THEN** the client sends `2000001` whole tokens and a model scope, and the reset targets only that scope
 
 #### Scenario: Mesh mutation rejection is not automatically retried

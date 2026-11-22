@@ -22,7 +22,7 @@ A Custom grant SHALL allow selected host providers, each with all currently and 
 
 ### Requirement: Provider and model quotas apply together
 
-Each peer SHALL have an independent allowance per provider and per model within that provider. The default is unlimited; finite caps SHALL be positive whole tokens expressed exactly in Mtok (1 Mtok = 1,000,000 tokens). Invalid or overflowing values SHALL be rejected. All models share the provider cap. Each attempt SHALL count once against every applicable finite cap, even if the other scope is unlimited.
+Each peer SHALL have an independent allowance per provider and per model within that provider. The default is unlimited; finite caps SHALL be positive whole tokens. Invalid or overflowing values SHALL be rejected. All models share the provider cap. Each attempt SHALL count once against every applicable finite cap, even if the other scope is unlimited.
 
 #### Scenario: Session inference and direct inference share an allowance
 - **WHEN** a peer spends tokens in a direct stream and then through a hosted session using the same model, and also calls a different allowed model on that provider
@@ -94,11 +94,15 @@ The host SHALL settle each dispatched attempt once at its actual normalized tota
 
 ### Requirement: Quotas survive restart and access edits
 
-Reservations and usage SHALL survive restart. Editing access or an existing finite amount SHALL NOT reset quotas or interrupt admitted work solely due to exhaustion. Grant revocation stays in effect. Changing between unlimited and finite or changing cadence SHALL require explicit reconfiguration that starts a new accounting period. Saved Custom quotas SHALL survive switches to No access or Full. Full attempts SHALL NOT spend Custom quotas.
+Quota configuration and settled usage SHALL survive restart. Reservations SHALL live in memory. A crash forgets the charge of requests in flight. Access or amount edits SHALL NOT reset quotas. Full attempts SHALL NOT spend saved Custom quotas. A change of quota kind or cadence SHALL require explicit reconfiguration.
 
 #### Scenario: Restart and regrant do not top up an allowance
-- **WHEN** the host restarts with a possibly dispatched attempt and the owner disables and reenables access to its provider or model within the same window
-- **THEN** the unresolved attempt is accounted for under the missing-usage rule and neither applicable quota is reset
+- **WHEN** the host restarts after settling usage and the owner disables and reenables access within the same window
+- **THEN** the settled usage counts against both applicable quotas
+
+#### Scenario: A crash forgets in-flight charges
+- **WHEN** the host restarts after a crash with previously unsettled attempts
+- **THEN** their reservations and charges are gone, but saved caps and settled usage remain
 
 #### Scenario: Changing a cap preserves consumption
 - **WHEN** the owner edits the amount of an existing finite provider or model cap without changing its schedule
@@ -114,7 +118,7 @@ Reservations and usage SHALL survive restart. Editing access or an existing fini
 
 ### Requirement: Owner resets apply to one quota scope
 
-A reset, first finite cap, or reconfiguration to a new finite period SHALL target one provider or model scope and be refused while attempts at that scope are outstanding. It SHALL retain prior usage and leave other scopes unchanged. A reset without a schedule change SHALL NOT move the current renewal boundary.
+A reset or reconfiguration SHALL target one provider or model scope and be refused while attempts at that scope are outstanding. It SHALL retain prior usage and leave other scopes unchanged. A reset without a schedule change SHALL NOT move the current renewal boundary.
 
 #### Scenario: Reset waits for outstanding attempts
 - **WHEN** the owner requests a model reset with an attempt outstanding and retries after it settles
@@ -122,7 +126,7 @@ A reset, first finite cap, or reconfiguration to a new finite period SHALL targe
 
 ### Requirement: Quota ledger prunes expired history
 
-The host SHALL retain the current and previous quota period for each scope and all open reservations regardless of age. Completed attempt records and their replay IDs expire once they no longer belong to a retained quota period. The host SHALL prune them at startup and on period rollover without a new setting.
+The host SHALL retain the current and previous quota period for each scope and all open reservations regardless of age. Open attempts are tracked in memory. Completed replay records expire when the periods they charged are no longer retained. The host SHALL prune expired quota periods without a new setting.
 
 #### Scenario: Pruning preserves late settlement and status
 - **WHEN** the host starts or quota renews with older settled history and an outstanding reservation from an older period
