@@ -659,9 +659,15 @@ fn schedule_mesh_config(
 async fn bootstrap_guarded_schedule_mesh(
     config: &querymt_remote::MeshRuntimeConfig,
 ) -> Result<querymt_remote::MeshRuntimeHandle, querymt_remote::MeshError> {
-    let store = querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
-        .await
-        .expect("create test policy store");
+    let identity = config
+        .identity_file
+        .as_ref()
+        .expect("isolated mesh identity");
+    let mut path = identity.as_os_str().to_os_string();
+    path.push(".mesh_state.json");
+    let store = querymt_remote::MeshAccessStore::new(
+        querymt_remote::MeshStateStore::shared(Path::new(&path)).expect("create test policy store"),
+    );
     querymt_remote::bootstrap_mesh_runtime_with_policy(config, Arc::new(store)).await
 }
 

@@ -1289,6 +1289,7 @@ mod node_manager_tests {
                 grant: PeerGrant::Custom {
                     sessions: true,
                     filesystem: false,
+                    shell: false,
                     providers: vec![],
                 },
             }),
@@ -1351,6 +1352,7 @@ mod node_manager_tests {
                 grant: PeerGrant::Custom {
                     sessions: true,
                     filesystem: true,
+                    shell: false,
                     providers: vec![],
                 },
             };
@@ -1643,6 +1645,7 @@ mod node_manager_tests {
         set_grant(PeerGrant::Custom {
             sessions: false,
             filesystem: false,
+            shell: false,
             providers: vec![],
         });
         assert!(matches!(
@@ -1990,6 +1993,7 @@ mod node_manager_tests {
         let grant = PeerGrant::Custom {
             sessions: true,
             filesystem: false,
+            shell: false,
             providers: vec![],
         };
         let initial = store.grant(&key).await.unwrap();
@@ -2436,13 +2440,12 @@ mod node_manager_tests {
     async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {
         use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
 
-        let store = Arc::new(
-            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open_exclusive(
-                dir.path().join("guarded-host.access.sqlite3"),
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &dir.path().join("guarded-host.key.mesh_state.json"),
             )
-            .await
             .unwrap(),
-        );
+        ));
         let config = MeshRuntimeConfig {
             enabled: true,
             lan: Some(LanMeshConfig {
@@ -2608,6 +2611,7 @@ mod node_manager_tests {
         let custom = PeerGrant::Custom {
             sessions: true,
             filesystem: false,
+            shell: false,
             providers: vec![querymt_remote::peer_access::ProviderGrant {
                 provider_id: "mock".into(),
                 models: querymt_remote::peer_access::ModelSelection::All,

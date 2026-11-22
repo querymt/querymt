@@ -93,8 +93,9 @@ mod access {
             PeerGrant::Custom {
                 sessions,
                 filesystem,
+                shell,
                 ..
-            } => ("custom", sessions, filesystem, false),
+            } => ("custom", sessions, filesystem, shell),
         };
         // Keep the peer reply shape without advertising unavailable services.
         json!({
@@ -118,7 +119,6 @@ mod access {
             RemoteActor, RemoteMessage,
             messaging::{SwarmRequest, SwarmResponse},
         };
-        use querymt_agent_sqlite::mesh_access::SqliteMeshAccess;
         use querymt_remote::{
             NodeId,
             mesh_ingress::MeshIngress,
@@ -128,7 +128,11 @@ mod access {
 
         #[tokio::test]
         async fn peer_access_read_is_caller_scoped_and_omits_unavailable_providers() {
-            let store = Arc::new(SqliteMeshAccess::open(":memory:").await.unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(querymt_remote::MeshAccessStore::new(
+                querymt_remote::MeshStateStore::shared(&dir.path().join("mesh_state.json"))
+                    .unwrap(),
+            ));
             let host = libp2p::PeerId::random();
             let peer = libp2p::PeerId::random();
             let key = PeerGrantKey {
@@ -169,6 +173,7 @@ mod access {
                     PeerGrant::Custom {
                         sessions: true,
                         filesystem: false,
+                        shell: false,
                         providers: vec![ProviderGrant {
                             provider_id: "fixture".into(),
                             models: ModelSelection::All,

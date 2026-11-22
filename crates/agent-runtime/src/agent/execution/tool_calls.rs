@@ -265,19 +265,9 @@ async fn prepare_tool_call_inner(
             Vec::new(),
         ));
     }
-    let tool = env.tool_set().find(&call.function.name);
+    let name = &call.function.name;
     let (tool, target, schema) = if env.restricted_mesh_turn() {
-        let name = &call.function.name;
-        if tool.is_none() || !env.tool_config.allows(ToolRef::builtin(name)) {
-            return Ok(reject(
-                args,
-                Vec::new(),
-                "Error: confined read is unavailable".into(),
-                "blocked",
-                Vec::new(),
-            ));
-        }
-        let Some((reader, definition)) = confined_mesh_tool(config, name) else {
+        let Some((builtin, definition)) = restricted_mesh_tool(config, env, name) else {
             return Ok(reject(
                 args,
                 Vec::new(),
@@ -288,13 +278,14 @@ async fn prepare_tool_call_inner(
         };
         let schema = definition.function.parameters;
         (
-            Some(reader.clone()),
-            ToolTarget::Builtin(reader),
+            Some(builtin.clone()),
+            ToolTarget::Builtin(builtin),
             Some(schema),
         )
     } else {
-        let target = ToolTarget::resolve(tool.clone(), env, &call.function.name);
-        let schema = resolve_tool_schema(env, &call.function.name).await;
+        let tool = env.tool_set().find(name);
+        let target = ToolTarget::resolve(tool.clone(), env, name);
+        let schema = resolve_tool_schema(env, name).await;
         (tool, target, schema)
     };
     let mut repairs: Vec<Repair> = Vec::new();
@@ -1141,12 +1132,22 @@ fn begin_snapshot(config: &AgentConfig, env: &TurnEnv, call: &MiddlewareToolCall
     })
 }
 
-/// Invoke the resolved target.
-pub(super) fn confined_mesh_tool(
+/// Resolve the host tool to offer and execute on a restricted turn. Never
+/// substitute an MCP or provider tool with the same name.
+pub(super) fn restricted_mesh_tool(
     config: &AgentConfig,
+    env: &TurnEnv,
     name: &str,
 ) -> Option<(Arc<dyn Tool>, querymt::chat::Tool)> {
+    let builtin = env.tool_set().find(name)?;
+    if !env.tool_config.allows(ToolRef::builtin(name)) {
+        return None;
+    }
     match name {
+        "shell" if env.tool_config.policy != crate::agent::core::ToolPolicy::ProviderOnly => {
+            let definition = builtin.definition();
+            Some((builtin, definition))
+        }
         "read_tool" => Some((
             Arc::new(crate::tools::builtins::ReadTool::new()),
             confined_read_definition(),
@@ -3716,7 +3717,6 @@ mod prepared_call_tests {
             ("read_tool", r#"{"path":".secret"}"#),
             ("read_tool", r#"{"path":"../visible.txt"}"#),
             ("read_tool", r#"{"path":"visible.txt","root":"/tmp"}"#),
-            ("shell", "{}"),
         ] {
             let call = mock_tool_call("bad", tool, args);
             let result = execute_tool_call(&config, &call, &exec, &turn)
@@ -3732,43 +3732,166 @@ mod prepared_call_tests {
     }
 
     #[cfg(feature = "remote")]
-    #[tokio::test]
-    async fn revoked_peer_cannot_dispatch_prepared_tool_or_run_a_new_hook() {
-        use crate::agent::session_actor::PeerTurn;
-        use crate::error::AgentError;
-        use querymt_remote::NodeId;
-        use querymt_remote::peer_access::{
-            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
-        };
+    use crate::{agent::session_actor::PeerTurn, error::AgentError};
+    #[cfg(feature = "remote")]
+    use querymt_remote::{
+        NodeId,
+        peer_access::{
+            GrantStore, GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, PeerGrantState,
+            ProviderGrant,
+        },
+    };
 
-        struct Store(parking_lot::Mutex<PeerGrantState>);
-        #[async_trait::async_trait]
-        impl GrantStore for Store {
-            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
-                Ok(self.0.lock().clone())
-            }
+    #[cfg(feature = "remote")]
+    #[derive(Default)]
+    struct Store(parking_lot::Mutex<PeerGrantState>);
 
-            async fn replace_grant(
-                &self,
-                _: &PeerGrantKey,
-                _: Uuid,
-                _: PeerGrant,
-            ) -> Result<PeerGrantState, GrantStoreError> {
-                unreachable!("test changes the policy directly")
-            }
-
-            async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
-                unreachable!("unused by tool dispatch")
-            }
+    #[cfg(feature = "remote")]
+    #[async_trait::async_trait]
+    impl GrantStore for Store {
+        async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+            Ok(self.0.lock().clone())
         }
 
+        async fn replace_grant(
+            &self,
+            _: &PeerGrantKey,
+            _: Uuid,
+            _: PeerGrant,
+        ) -> Result<PeerGrantState, GrantStoreError> {
+            unreachable!("test changes the policy directly")
+        }
+
+        async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+            unreachable!("unused by tool dispatch")
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    impl Store {
+        fn set(&self, grant: PeerGrant) {
+            *self.0.lock() = PeerGrantState {
+                revision: Uuid::now_v7(),
+                grant,
+            };
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    fn custom(shell: bool) -> PeerGrant {
+        PeerGrant::Custom {
+            sessions: true,
+            filesystem: true,
+            shell,
+            providers: vec![ProviderGrant {
+                provider_id: "mock".into(),
+                models: ModelSelection::All,
+            }],
+        }
+    }
+
+    #[cfg(all(feature = "remote", unix))]
+    #[tokio::test]
+    async fn custom_shell_offer_and_dispatch_follow_pinned_and_live_grants() {
+        use crate::agent::execution::{Step, transitions::transition_before_llm_call_in_test};
+        use crate::tools::builtins::ShellTool;
+
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        let mut registry = ToolRegistry::new();
+        let shell = ShellTool::new();
+        let shell_definition = shell.definition();
+        registry.add(Arc::new(shell));
+        registry.add(Arc::new(crate::tools::builtins::WriteFileTool::new()));
+        config.tool_registry = Arc::new(registry);
+        let store = Arc::new(Store::default());
+        let (exec, mut turn) = fx
+            .agent
+            .turn_in(fx.agent._tempdir.path().to_path_buf())
+            .await;
+        let mut exec = exec.tools_from(&config);
+        exec.restricted_mesh_turn = true;
+        exec.turn_authority = PeerTurn::test_authority(custom(false), store.clone());
+        let call = mock_tool_call(
+            "shell",
+            "shell",
+            r#"{"command":"printf 'mesh shell fixture' > shell-marker"}"#,
+        );
+        let marker = fx.agent._tempdir.path().join("shell-marker");
+
+        // A wider live grant cannot upgrade an already admitted restricted turn.
+        for live_shell in [false, true] {
+            store.set(custom(live_shell));
+            let Step::Continue(Stage::CallModel(request)) =
+                transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected a model request");
+            };
+            assert!(request.tools.is_empty());
+            let result = execute_tool_call(&config, &call, &exec, &turn)
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            assert!(text(&result).contains("not available to mesh-hosted turns"));
+            assert!(!marker.exists());
+        }
+
+        exec.turn_authority = PeerTurn::test_authority(custom(true), store.clone());
+
+        // The grant permits the builtin, but cannot override the host's tool policy.
+        exec.tool_config.deny = ["shell".parse().unwrap()].into_iter().collect();
+        let Step::Continue(Stage::CallModel(request)) =
+            transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a model request");
+        };
+        assert!(request.tools.is_empty());
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(!marker.exists());
+        exec.tool_config.deny = Default::default();
+
+        let Step::Continue(Stage::CallModel(request)) =
+            transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a model request");
+        };
+        assert_eq!(request.tools.as_ref(), &[shell_definition]);
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "mesh shell fixture"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let prepared = prepare_tool_call(&config, &call, &exec).await.unwrap();
+        assert!(matches!(prepared.disposition, Disposition::Ready));
+        store.set(custom(false));
+        let result = execute_prepared_tool_call(&config, &call, prepared, &exec, &turn).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn downgraded_full_peer_cannot_dispatch_prepared_tool_or_run_a_new_hook() {
         let fx = Fixture::new().await;
         let config = fx.config(Some(fx.hooks(json!({}))));
-        let revision = Uuid::now_v7();
-        let store = Arc::new(Store(parking_lot::Mutex::new(PeerGrantState {
-            revision,
-            grant: PeerGrant::Full,
-        })));
+        let store = Arc::new(Store::default());
+        store.set(PeerGrant::Full);
         let (exec, turn) = fx.agent.turn().await;
         let mut exec = exec.tools_from(&config);
         exec.turn_authority = PeerTurn::test_authority(PeerGrant::Full, store.clone());
@@ -3790,10 +3913,7 @@ mod prepared_call_tests {
         assert!(matches!(prepared.disposition, Disposition::Ready));
         assert_eq!(fx.hook_inputs().len(), 1);
 
-        *store.0.lock() = PeerGrantState {
-            revision: Uuid::now_v7(),
-            grant: PeerGrant::None,
-        };
+        store.set(custom(true));
         let result = execute_prepared_tool_call(&config, &call, prepared, &exec, &turn).await;
         assert!(
             matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))

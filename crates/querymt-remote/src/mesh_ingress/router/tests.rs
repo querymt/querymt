@@ -135,6 +135,7 @@ async fn legacy_router_requires_transport_bound_full_grant() {
             PeerGrant::Custom {
                 sessions: true,
                 filesystem: false,
+                shell: false,
                 providers: vec![],
             },
         )
@@ -214,6 +215,7 @@ async fn grant_aware_route_authorizes_custom_sessions_only_on_v1() {
             PeerGrant::Custom {
                 sessions: true,
                 filesystem: false,
+                shell: false,
                 providers: vec![],
             },
         )
@@ -288,6 +290,7 @@ async fn shared_ask_uses_the_negotiated_protocol_for_access() {
             PeerGrant::Custom {
                 sessions: true,
                 filesystem: false,
+                shell: false,
                 providers: vec![],
             },
         )

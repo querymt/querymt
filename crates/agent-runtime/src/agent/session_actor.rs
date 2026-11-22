@@ -424,13 +424,25 @@ impl PeerTurn {
         Ok(self.pinned.clone())
     }
 
+    pub(crate) fn allows_shell(&self) -> bool {
+        self.grant_allows_shell(&self.pinned)
+    }
+
+    fn grant_allows_shell(&self, grant: &querymt_remote::peer_access::PeerGrant) -> bool {
+        grant.allows_shell(self.protocol)
+    }
+
     fn check_grant(
         &self,
         grant: &querymt_remote::peer_access::PeerGrant,
         binding: Option<(&str, &str)>,
     ) -> Result<(), AgentError> {
+        use querymt_remote::peer_access::PeerGrant;
+
         if !grant.allows_sessions(self.protocol)
-            || self.pinned.allows_shell() && !grant.allows_shell()
+            // Even a Custom grant with shell does not authorize a Full turn's other tools.
+            || self.pinned == PeerGrant::Full && *grant != PeerGrant::Full
+            || self.allows_shell() && !self.grant_allows_shell(grant)
             || self.pinned.allows_filesystem(self.protocol)
                 && !grant.allows_filesystem(self.protocol)
             || binding.is_some_and(|(provider, model)| {

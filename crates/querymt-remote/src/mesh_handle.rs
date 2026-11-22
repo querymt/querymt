@@ -803,6 +803,91 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn guarded_rejection_is_not_replayed_and_legacy_uses_only_legacy() {
+        use crate::mesh_ingress::SharingRejection;
+        use crate::request_timeout::with_sharing_protocol;
+        use kameo::actor::ActorId;
+
+        let (_dir, mut mesh, _, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        mesh.sharing_enabled = true;
+        let guarded = PeerId::random();
+        let legacy = PeerId::random();
+        let actor_id = ActorId::new_with_peer_id(7, guarded);
+        let timeout = Duration::from_secs(2);
+        let exchange = tokio::spawn(async move {
+            for (expected, response) in [
+                (guarded, Ok(SharingResponse::Supported)),
+                (legacy, Err(SharingCallError::UnsupportedProtocol)),
+            ] {
+                let Some(SwarmCommand::Sharing {
+                    peer,
+                    request: SharingRequest::Probe,
+                    tx,
+                }) = commands.recv().await
+                else {
+                    panic!("expected a probe to {expected}");
+                };
+                assert_eq!(peer, expected);
+                tx.send(response).unwrap();
+                if expected == guarded {
+                    let Some(SwarmCommand::Sharing {
+                        peer,
+                        request: SharingRequest::Actor(request),
+                        tx,
+                    }) = commands.recv().await
+                    else {
+                        panic!("expected the v1 actor call");
+                    };
+                    assert_eq!(peer, guarded);
+                    assert!(
+                        matches!(*request, SwarmRequest::Ask { actor_id: id, .. } if id == actor_id)
+                    );
+                    tx.send(Ok(SharingResponse::Actor(Err(SharingRejection::Denied))))
+                        .unwrap();
+                }
+            }
+        });
+        let result = with_sharing_protocol(
+            &mesh,
+            Some(guarded),
+            timeout,
+            mesh.sharing_call(
+                guarded,
+                SwarmRequest::Ask {
+                    actor_id,
+                    actor_remote_id: "fixture.actor".into(),
+                    message_remote_id: "fixture.request".into(),
+                    payload: vec![],
+                    mailbox_timeout: Some(timeout),
+                    reply_timeout: Some(timeout),
+                    immediate: false,
+                },
+            ),
+            async { panic!("must not replay a rejected call as legacy") },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(SharingCallError::Rejected(SharingRejection::Denied))
+        ));
+        let result = with_sharing_protocol(
+            &mesh,
+            Some(legacy),
+            timeout,
+            async { panic!("a legacy peer must not receive a v1 actor request") },
+            async { "legacy" },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "legacy");
+        tokio::time::timeout(timeout, exchange)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn leave_iroh_scope_removes_membership_emits_event_and_notifies_swarm() {
         let (_dir, mesh, mut events_rx, mut swarm_cmd_rx) =

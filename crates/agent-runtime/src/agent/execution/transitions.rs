@@ -149,9 +149,7 @@ pub(super) async fn transition_before_llm_call(
             tools = tools
                 .into_iter()
                 .filter_map(|tool| {
-                    let name = tool.function.name;
-                    env.tool_set().find(&name)?;
-                    super::tool_calls::confined_mesh_tool(config, &name)
+                    super::tool_calls::restricted_mesh_tool(config, env, &tool.function.name)
                         .map(|(_, definition)| definition)
                 })
                 .collect();

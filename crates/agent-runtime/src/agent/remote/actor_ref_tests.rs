@@ -380,13 +380,12 @@ mod remote_paths {
         );
 
         let peer = libp2p::PeerId::random();
-        let store = Arc::new(
-            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(
-                fixture._tempdir.path().join("mesh.sqlite3"),
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &fixture._tempdir.path().join("mesh_state.json"),
             )
-            .await
             .unwrap(),
-        );
+        ));
         let key = PeerGrantKey {
             host: NodeId::from_peer_id(host),
             peer: NodeId::from_peer_id(peer),
@@ -394,6 +393,7 @@ mod remote_paths {
         let grant = |filesystem| PeerGrant::Custom {
             sessions: true,
             filesystem,
+            shell: false,
             providers: vec![],
         };
         let allowed = store

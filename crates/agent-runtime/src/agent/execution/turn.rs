@@ -143,7 +143,15 @@ impl TurnEnv {
 
     pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
         if self.restricted_mesh_turn() {
-            return name == "delegate" || self.confined_mesh_read && name == "read_tool";
+            return match name {
+                "delegate" => true,
+                "read_tool" => self.confined_mesh_read,
+                #[cfg(feature = "remote")]
+                "shell" => {
+                    matches!(&self.turn_authority, TurnAuthority::Peer(peer) if peer.allows_shell())
+                }
+                _ => false,
+            };
         }
         // These routes can outlive the turn and do not preserve its origin.
         matches!(self.turn_authority, TurnAuthority::Local)

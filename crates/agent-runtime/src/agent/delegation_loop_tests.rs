@@ -28,11 +28,15 @@ async fn custom_delegate_cannot_dispatch_a_provider_before_sharing() {
     use std::time::Duration;
 
     let harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
-    let store = Arc::new(
-        querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open(":memory:")
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(querymt_remote::MeshAccessStore::new(
+        querymt_remote::MeshStateStore::shared(
+            &harness
+                ._temp_dir
+                .path()
+                .join("mesh-identity.key.mesh_state.json"),
+        )
+        .unwrap(),
+    ));
     let config = MeshRuntimeConfig {
         enabled: true,
         lan: Some(LanMeshConfig {
@@ -68,6 +72,7 @@ async fn custom_delegate_cannot_dispatch_a_provider_before_sharing() {
             PeerGrant::Custom {
                 sessions: true,
                 filesystem: false,
+                shell: false,
                 providers: vec![ProviderGrant {
                     provider_id: "mock".into(),
                     models: ModelSelection::All,

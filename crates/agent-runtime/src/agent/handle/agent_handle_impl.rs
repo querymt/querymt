@@ -123,13 +123,12 @@ mod tests {
         let fixture =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let store = Arc::new(
-            querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open_exclusive(
-                fixture._tempdir.path().join("peer-access.db"),
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &fixture._tempdir.path().join("mesh_state.json"),
             )
-            .await
             .unwrap(),
-        );
+        ));
         let key = PeerGrantKey {
             host: NodeId::from_peer_id(libp2p::PeerId::random()),
             peer: NodeId::from_peer_id(libp2p::PeerId::random()),
@@ -141,6 +140,7 @@ mod tests {
                 PeerGrant::Custom {
                     sessions: true,
                     filesystem: false,
+                    shell: false,
                     providers: vec![],
                 },
             )
