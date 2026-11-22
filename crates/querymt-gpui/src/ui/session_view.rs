@@ -4468,18 +4468,6 @@ impl QmtApp {
                         this.flash_copied(COPIED_MENU_ID.into(), cx);
                     }))
                 })
-                .child(div().my_1().child(kit::divider(p)))
-                .child(
-                    item(
-                        "m-open-sessions",
-                        IconName::MessagesSquare,
-                        "All sessions".into(),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.session_menu_open = false;
-                        this.go(Page::Sessions, cx);
-                    })),
-                )
         });
 
         // Plan: icon + `done/total`, items in a popover.
