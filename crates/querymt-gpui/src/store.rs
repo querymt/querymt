@@ -4,6 +4,7 @@
 //! Mirrors `querymt-desktop/src/lib/stores/agents.svelte.ts` at the scope of
 //! those two pages. Views observe the entity and re-render on `cx.notify()`.
 
+pub(crate) mod agent_log;
 pub(crate) mod automations;
 pub(crate) mod delegates;
 mod devtools;
@@ -1225,7 +1226,7 @@ pub struct AgentRuntime {
     pub plugin_progress: Option<plugins::PluginProgress>,
     /// Names of actions in flight (e.g. `invite`, `key:xai`).
     pub pending: std::collections::HashSet<String>,
-    pub logs: Vec<String>,
+    pub log: agent_log::AgentLog,
     pub pid: Option<u32>,
     pub connected_at: Option<f64>,
     pub busy: bool,
@@ -1279,21 +1280,40 @@ impl AgentRuntime {
     fn end_session_action(&mut self, session_id: &str, error: Option<String>) {
         self.session_pending.remove(session_id);
         if let Some(error) = error {
-            self.log(error.clone());
+            self.log_error(error.clone());
             self.session_errors.insert(session_id.to_string(), error);
         }
     }
 
+    /// Note something about this agent in its log.
     fn log(&mut self, line: impl Into<String>) {
-        let line = line.into();
+        self.log_at(agent_log::Level::Info, line.into());
+    }
+
+    /// A request or capability that did not work; the agent still runs.
+    fn log_warn(&mut self, line: impl Into<String>) {
+        self.log_at(agent_log::Level::Warn, line.into());
+    }
+
+    fn log_error(&mut self, line: impl Into<String>) {
+        self.log_at(agent_log::Level::Error, line.into());
+    }
+
+    fn log_at(&mut self, level: agent_log::Level, line: String) {
         #[cfg(not(target_family = "wasm"))]
         if std::env::var_os("QMT_DEBUG").is_some() {
             eprintln!("[agent] {line}");
         }
-        self.logs.push(line);
-        if self.logs.len() > 300 {
-            self.logs.drain(..self.logs.len() - 300);
+        self.log.push_app(level, line);
+    }
+
+    /// One stderr line of the agent process.
+    fn log_agent(&mut self, line: &str) {
+        #[cfg(not(target_family = "wasm"))]
+        if std::env::var_os("QMT_DEBUG").is_some() {
+            eprintln!("[agent stderr] {line}");
         }
+        self.log.push_agent(line);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -2317,7 +2337,7 @@ impl AgentsStore {
                 Err(err) => {
                     let _ = this.update(cx, |s, cx| {
                         if let Some(rt) = s.live(&id, generation) {
-                            rt.log(format!("Models unavailable: {err}"));
+                            rt.log_warn(format!("Models unavailable: {err}"));
                             rt.pending.remove("models");
                         }
                         cx.notify();
@@ -2588,6 +2608,14 @@ impl AgentsStore {
                             Inbound::Log(line) => {
                                 let _ = this.update(cx, |s, cx| {
                                     if let Some(rt) = s.live(&id, generation) {
+                                        rt.log_agent(&line);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                            Inbound::Note(line) => {
+                                let _ = this.update(cx, |s, cx| {
+                                    if let Some(rt) = s.live(&id, generation) {
                                         rt.log(line);
                                         cx.notify();
                                     }
@@ -2824,7 +2852,7 @@ impl AgentsStore {
                     let agent_id = agent_id.clone();
                     let _ = this.update(cx, |s, _| {
                         if let Some(rt) = s.runtime.get_mut(&agent_id) {
-                            rt.log(msg);
+                            rt.log_warn(msg);
                         }
                     });
                 };
@@ -3938,7 +3966,7 @@ impl AgentsStore {
             }
         }
         if let (Err(err), Some(rt)) = (&result, self.runtime.get_mut(agent_id)) {
-            rt.log(format!("Prompt failed: {err}"));
+            rt.log_error(format!("Prompt failed: {err}"));
         }
         // A finished turn adds an undo target and drops stale redo frames.
         if self
@@ -4288,7 +4316,7 @@ impl AgentsStore {
         if let Some(rpc) = rt.rpc.take() {
             rpc.close();
         }
-        rt.log(format!("Error: {reason}"));
+        rt.log_error(format!("Error: {reason}"));
         rt.state = ConnState::Failed(reason);
         rt.busy = false;
         self.retire_requests(id);
@@ -4312,7 +4340,7 @@ impl AgentsStore {
         };
         let delay = reconnect_delay(rt.reconnect_attempt);
         rt.reconnect_attempt += 1;
-        rt.log(format!(
+        rt.log_warn(format!(
             "Reconnecting in {:.1}s (attempt {})…",
             delay.as_secs_f32(),
             rt.reconnect_attempt
@@ -4772,7 +4800,7 @@ async fn load_details(
     let recovery = caps.as_ref().is_ok_and(supports_elicitation_recovery);
     apply!(|rt: &mut AgentRuntime| match caps {
         Ok(caps) => rt.capabilities = Some(caps),
-        Err(err) => rt.log(format!("Capabilities unavailable: {err}")),
+        Err(err) => rt.log_warn(format!("Capabilities unavailable: {err}")),
     });
     if recovery {
         recover_elicitations(&this, &id, generation, &rpc, cx)
@@ -4792,7 +4820,7 @@ async fn load_details(
         rt.models_loaded = true;
         match (&models, parsed.clone()) {
             (_, Some(models)) => rt.models = models,
-            (Err(err), None) => rt.log(format!("Models unavailable: {err}")),
+            (Err(err), None) => rt.log_warn(format!("Models unavailable: {err}")),
             _ => {}
         }
     });
@@ -4833,7 +4861,7 @@ async fn load_details(
             rt.children.clear();
         }
         Err(err) => {
-            rt.log(format!("Sessions unavailable: {err}"));
+            rt.log_warn(format!("Sessions unavailable: {err}"));
             rt.sessions_loaded = true;
             rt.catalog_loading = false;
             rt.sessions_error = Some(err);
@@ -4906,7 +4934,7 @@ async fn load_details(
     apply!(|rt: &mut AgentRuntime| {
         rt.catalog_loading = false;
         if let Err(err) = rest {
-            rt.log(format!("Older sessions unavailable: {err}"));
+            rt.log_warn(format!("Older sessions unavailable: {err}"));
         }
     });
     if let Ok(Some(count)) =

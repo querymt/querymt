@@ -21,8 +21,10 @@ pub enum Target {
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub enum Inbound {
     Message(String),
-    /// Diagnostic line (process stderr, transport notes).
+    /// A line the agent process wrote to stderr.
     Log(String),
+    /// Something the transport itself reports (the process it started).
+    Note(String),
     Closed(String),
 }
 
@@ -183,7 +185,7 @@ mod native {
         let mut stdin = child.stdin.take().ok_or("No stdin")?;
         let stdout = child.stdout.take().ok_or("No stdout")?;
         let stderr = child.stderr.take().ok_or("No stderr")?;
-        let _ = in_tx.try_send(Inbound::Log(format!(
+        let _ = in_tx.try_send(Inbound::Note(format!(
             "Started `{command_line}` (pid {pid})."
         )));
 

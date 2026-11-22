@@ -11,6 +11,7 @@ use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
 use super::{AgentDialog, Page, QmtApp, kit};
+use crate::store::agent_log::{Level, clock};
 use crate::store::{AgentConfig, ConnState, Endpoint, normalize_address};
 use crate::theme::{Palette, palette};
 
@@ -475,6 +476,7 @@ impl QmtApp {
                 let (a1, a2, a3, a4) = (app.clone(), app.clone(), app.clone(), store_h.clone());
                 let (i1, i3, i4) = (id.clone(), id.clone(), id.clone());
                 let (a5, i5) = (store_h.clone(), id.clone());
+                let (a6, i6) = (app.clone(), id.clone());
                 let config = config.clone();
                 menu.item(
                     PopupMenuItem::new("Details")
@@ -484,6 +486,13 @@ impl QmtApp {
                                 this.details = Some(i1.clone());
                                 cx.notify();
                             });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Logs…")
+                        .icon(Icon::new(IconName::ScrollText))
+                        .on_click(move |_, window, cx| {
+                            let _ = a6.update(cx, |this, cx| this.open_agent_logs(&i6, window, cx));
                         }),
                 )
                 .when(live, |m| {
@@ -1033,9 +1042,17 @@ impl QmtApp {
             .map(|r| r.capability_flags("features"))
             .unwrap_or_default();
         let methods = rt.map_or(0, |r| r.method_count());
-        let logs: Vec<String> = rt
-            .map(|r| r.logs.iter().rev().take(80).cloned().collect())
-            .unwrap_or_default();
+        // The log itself opens full size; the sheet only sums it up.
+        let log_summary = rt.map(|r| {
+            let entries = r.log.entries();
+            let count = |level| entries.iter().filter(|e| e.level == level).count();
+            (
+                entries.len(),
+                count(Level::Error),
+                count(Level::Warn),
+                entries.back().cloned(),
+            )
+        });
         let mesh = rt.and_then(|r| r.mesh.clone());
 
         let row = |label: &'static str, value: String, mono: bool| {
@@ -1077,10 +1094,10 @@ impl QmtApp {
         let panel = v_flex()
             .id("details-panel")
             // Centred like the other modals; tall content scrolls in the body.
-            .w(px(520.))
+            .w(px(600.))
             .max_w(relative(0.92))
             .h(relative(0.86))
-            .max_h(px(760.))
+            .max_h(px(900.))
             .rounded(px(16.))
             .bg(p.surface)
             .border_1()
@@ -1273,21 +1290,63 @@ impl QmtApp {
                             .child("Not loaded. Connect the agent to read its capabilities.")
                             .into_any_element()
                     })
-                    .child(section("Log", "Most recent first."))
-                    .child(
-                        v_flex()
-                            .p_3()
-                            .gap_0p5()
-                            .rounded(px(10.))
-                            .bg(p.bg)
-                            .border_1()
-                            .border_color(p.border)
-                            .font_family(kit::MONO)
-                            .text_xs()
-                            .text_color(p.muted)
-                            .when(logs.is_empty(), |el| el.child("No log lines yet."))
-                            .children(logs.into_iter().map(|l| div().child(l))),
-                    )
+                    .child(section("Log", "What the agent and this app reported."))
+                    .child({
+                        let (total, errors, warnings, last) =
+                            log_summary.unwrap_or((0, 0, 0, None));
+                        let mut counts = vec![format!(
+                            "{} {}",
+                            kit::short_num(total as u64),
+                            if total == 1 { "line" } else { "lines" }
+                        )];
+                        if errors > 0 {
+                            counts.push(format!(
+                                "{errors} {}",
+                                if errors == 1 { "error" } else { "errors" }
+                            ));
+                        }
+                        if warnings > 0 {
+                            counts.push(format!(
+                                "{warnings} {}",
+                                if warnings == 1 { "warning" } else { "warnings" }
+                            ));
+                        }
+                        let open_id = c.id.clone();
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(if errors > 0 { p.danger } else { p.text })
+                                            .child(counts.join(" · ")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family(kit::MONO)
+                                            .text_color(p.dim)
+                                            .truncate()
+                                            .child(last.map_or_else(
+                                                || "No log lines yet.".to_string(),
+                                                |e| format!("{} {}", clock(e.at_ms), e.text),
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                kit::flat_btn("details-open-logs", true, true, p)
+                                    .debug_selector(|| "details-open-logs".into())
+                                    .child(kit::icon(IconName::ScrollText, 14., p.text))
+                                    .child("Open logs…")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_agent_logs(&open_id, window, cx)
+                                    })),
+                            )
+                    })
                     .map(|el| self.smooth_scroll.region("agent-details", el)),
             );
 
