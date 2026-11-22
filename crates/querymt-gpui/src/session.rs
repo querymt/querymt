@@ -872,6 +872,24 @@ pub struct ParentSession {
     pub parent: Option<Box<ParentSession>>,
 }
 
+/// One file a turn changed (desktop `SessionTurnDiffFile`).
+#[derive(Clone, Debug, Default)]
+pub struct TurnDiffFile {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    /// One per tool call that edited the file, in order.
+    pub changes: Vec<TurnDiffChange>,
+}
+
+/// One tool call's edit of a file: its hunks.
+#[derive(Clone, Debug, Default)]
+pub struct TurnDiffChange {
+    /// Tool call id.
+    pub id: String,
+    pub hunks: Vec<Diff>,
+}
+
 /// Why a session can only be read (desktop `SessionAccessInfo`): its
 /// worktree was handed off or archived.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1411,6 +1429,65 @@ impl SessionView {
             response,
             includes_response,
         })
+    }
+
+    /// Key of the first item of the turn holding item `end`: identifies the
+    /// turn while items stream in after it.
+    pub fn turn_key(&self, end: usize) -> Option<&str> {
+        self.turn_start(end).map(|ix| self.items[ix].key.as_str())
+    }
+
+    /// Items of the turn that starts at the item keyed `key`, up to the next
+    /// prompt.
+    pub fn turn_range(&self, key: &str) -> Option<std::ops::Range<usize>> {
+        let start = self.items.iter().position(|i| i.key == key)?;
+        let end = self.items[start + 1..]
+            .iter()
+            .position(|i| matches!(i.kind, ItemKind::User { .. }))
+            .map_or(self.items.len(), |n| start + 1 + n);
+        Some(start..end)
+    }
+
+    /// Files the turn in `range` changed (desktop `buildSessionTurnDiffs`):
+    /// in first-touched order, each tool's change kept apart because
+    /// successive edits don't share one baseline.
+    pub fn turn_diffs(&self, range: std::ops::Range<usize>) -> Vec<TurnDiffFile> {
+        let mut files: Vec<TurnDiffFile> = Vec::new();
+        for item in &self.items[range] {
+            let ItemKind::Work(entries) = &item.kind else {
+                continue;
+            };
+            for call in entries.iter().filter_map(|e| match e {
+                WorkEntry::Tool(call) => Some(call),
+                _ => None,
+            }) {
+                for d in &call.diffs {
+                    let path = d.path.trim_start_matches("./");
+                    let ix = match files.iter().position(|f| f.path == path) {
+                        Some(ix) => ix,
+                        None => {
+                            files.push(TurnDiffFile {
+                                path: path.to_string(),
+                                ..Default::default()
+                            });
+                            files.len() - 1
+                        }
+                    };
+                    let file = &mut files[ix];
+                    let (a, r) = diff_stats(d);
+                    file.added += a;
+                    file.removed += r;
+                    match file.changes.last_mut().filter(|c| c.id == call.id) {
+                        Some(change) => change.hunks.push(d.clone()),
+                        None => file.changes.push(TurnDiffChange {
+                            id: call.id.clone(),
+                            hunks: vec![d.clone()],
+                        }),
+                    }
+                }
+            }
+        }
+        files
     }
 
     /// First item of the turn holding item `end`: its prompt, or the start
@@ -3159,7 +3236,7 @@ mod input_tests {
 }
 
 #[cfg(test)]
-mod undo_tests {
+pub(crate) mod undo_tests {
     use super::{ForkTarget, SessionView, UndoFrame};
     use serde_json::json;
 
@@ -3176,6 +3253,39 @@ mod undo_tests {
             );
         }
         view
+    }
+
+    /// Edit tool call `id` changing `path` from `old` to `new`.
+    pub(crate) fn edit(id: &str, path: &str, old: &str, new: &str) -> serde_json::Value {
+        json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": "edit",
+            "kind": "edit", "status": "completed",
+            "content": [{ "type": "diff", "path": path, "oldText": old, "newText": new }] })
+    }
+
+    #[test]
+    fn a_turn_diff_groups_changes_by_file() {
+        let mut view = view_with_turns(&["u1"]);
+        view.apply(&edit("t1", "./src/a.rs", "a\nb\n", "a\nB\n"));
+        view.apply(&edit("t2", "src/b.rs", "", "x\ny\n"));
+        view.apply(&edit("t3", "src/a.rs", "a\nB\n", "a\nB\nc\n"));
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u2",
+            "content": { "type": "text", "text": "next" } }),
+        );
+        view.apply(&edit("t4", "src/c.rs", "", "z\n"));
+        let range = view.turn_range("u1").unwrap();
+        let files = view.turn_diffs(range);
+        let summary: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.added, f.removed, f.changes.len()))
+            .collect();
+        // First-touched order, `./` dropped, each tool's change kept apart;
+        // the next turn's edit isn't included.
+        assert_eq!(summary, [("src/a.rs", 2, 1, 2), ("src/b.rs", 2, 0, 1)]);
+        assert_eq!(files[0].changes[1].id, "t3");
+        let end = view.items.len() - 1;
+        assert_eq!(view.turn_key(end), Some("u2"));
+        assert_eq!(view.turn_range("nope"), None);
     }
 
     #[test]

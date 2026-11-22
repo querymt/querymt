@@ -56,7 +56,7 @@ const COMPOSER_VEIL: f32 = 0.72;
 const TRANSCRIPT_TOP_FADE_H: f32 = COMPOSER_HALO_SPREAD + COMPOSER_HALO_BLUR;
 /// Attached tool cards scroll inside fixed-height blocks, like the desktop:
 /// read and terminal output `max-height: 18rem`, diffs 40 lines tall.
-const TOOL_LINE_H: f32 = 18.;
+pub(super) const TOOL_LINE_H: f32 = 18.;
 const READ_BLOCK_MAX_H: f32 = 288.;
 const TERMINAL_BLOCK_MAX_H: f32 = 288.;
 const DIFF_BLOCK_MAX_H: f32 = TOOL_LINE_H * 40.;
@@ -112,7 +112,7 @@ fn copy_tooltip(value: Option<String>, hint: &'static str, dim: Hsla, mono: bool
 }
 
 /// Desktop `--session-chat-max` (52rem).
-const CHAT_MAX: f32 = 832.;
+pub(super) const CHAT_MAX: f32 = 832.;
 /// Hover group of a tool row (status ↔ chevron swap).
 const TOOL_ROW_GROUP: &str = "tool-row";
 
@@ -327,6 +327,8 @@ struct RenderCtx {
     /// Turn-closing items whose turn can be forked now (supported, idle,
     /// not rolled back, with an agent-identified fork point).
     fork_points: HashSet<usize>,
+    /// Turn-closing item of the turn whose diff panel is open.
+    diff_open: Option<usize>,
     /// Items from this index on were rolled back by an undo (shown dimmed).
     reverted_from: Option<usize>,
     /// Agent of the open session; delegated child sessions live on it too.
@@ -339,6 +341,11 @@ struct RenderCtx {
 }
 
 impl RenderCtx {
+    /// Item `ix` belongs to the turn still running.
+    fn live_turn(&self, ix: usize) -> bool {
+        self.running && ix >= self.last_turn_start
+    }
+
     fn block_scroll(&self, key: &str) -> ScrollHandle {
         self.block_scrolls
             .borrow_mut()
@@ -396,12 +403,14 @@ impl RenderCtx {
     /// actions, undo/redo, dimming after an undo, the copied flash, theme.
     fn hash_turn(&self, ix: usize, item: &Item, h: &mut DefaultHasher) {
         self.turn_end.get(&ix).hash(h);
+        self.live_turn(ix).hash(h);
         if let Some(user) = self.turn_user.get(&ix) {
             self.undo_ready.hash(h);
             self.undoable.contains(user).hash(h);
             (self.redo_target.as_ref() == Some(user)).hash(h);
         }
         self.fork_points.contains(&ix).hash(h);
+        (self.diff_open == Some(ix)).hash(h);
         self.reverted_from.is_some_and(|r| ix >= r).hash(h);
         (self.copied.as_deref() == Some(item.key.as_str())).hash(h);
         self.hash_globals(h);
@@ -1256,7 +1265,11 @@ fn detail_section(
 /// (edit arguments) show every line; whole-file diffs collapse unchanged runs.
 /// Diff rows of one hunk plus its (added, removed) counts.
 /// Rows of a hunk, at most `cap`; also the lines it adds, removes and has.
-fn diff_rows(d: &Diff, cap: usize, p: &Palette) -> (Vec<AnyElement>, usize, usize, usize) {
+pub(super) fn diff_rows(
+    d: &Diff,
+    cap: usize,
+    p: &Palette,
+) -> (Vec<AnyElement>, usize, usize, usize) {
     let old = d.old.clone().unwrap_or_default();
     let diff = similar::TextDiff::from_lines(&old, &d.new);
     let (mut adds, mut dels) = (0usize, 0usize);
@@ -1365,7 +1378,7 @@ fn diff_rows(d: &Diff, cap: usize, p: &Palette) -> (Vec<AnyElement>, usize, usiz
 
 /// GitHub-style hunk marker (`@@ -10,2 +10,3 @@`); between hunks it doubles as
 /// a dashed divider so one file's edits read as a single block.
-fn hunk_marker(d: &Diff, first: bool, p: &Palette) -> AnyElement {
+pub(super) fn hunk_marker(d: &Diff, first: bool, p: &Palette) -> AnyElement {
     let count = |s: &str| {
         if s.is_empty() {
             0
@@ -2770,27 +2783,31 @@ fn turn_actions(
     let undo_to = user.filter(|u| rc.undoable.contains(*u)).cloned();
     let redo = user.is_some_and(|u| rc.redo_target.as_ref() == Some(u));
     let fork = rc.fork_points.contains(&ix);
+    let diff_open = rc.diff_open == Some(ix);
+    let live = rc.live_turn(ix);
     h_flex()
         .gap_1()
         .pl_1()
         .pt_0p5()
         .text_color(p.muted)
-        .child(
-            kit::icon_button(
-                SharedString::from(format!("copy-{}", item.key)),
-                if copied {
-                    IconName::Check
-                } else {
-                    IconName::Copy
-                },
-                if copied { "Copied" } else { "Copy response" },
+        .when(!live, |el| {
+            el.child(
+                kit::icon_button(
+                    SharedString::from(format!("copy-{}", item.key)),
+                    if copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    },
+                    if copied { "Copied" } else { "Copy response" },
+                )
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    let key = key.clone();
+                    let _ = weak.update(cx, |this, cx| this.copy_turn(ix, key, cx));
+                }),
             )
-            .xsmall()
-            .on_click(move |_, _, cx| {
-                let key = key.clone();
-                let _ = weak.update(cx, |this, cx| this.copy_turn(ix, key, cx));
-            }),
-        )
+        })
         .when_some(undo_to, |el, message_id| {
             let weak = rc.weak.clone();
             el.child(
@@ -2839,9 +2856,34 @@ fn turn_actions(
         .child(div().flex_1())
         .when(adds > 0 || dels > 0, |el| {
             // Desktop `.session-turn-diff-pill`: 0.28rem/0.5rem padding,
-            // 0.68rem mono at line-height 1, 0.35rem gap, 13px icon.
+            // 0.68rem mono at line-height 1, 0.35rem gap, 13px icon. It
+            // opens (and closes) the turn diff panel.
+            let (weak, hover) = (rc.weak.clone(), p.card_hover);
+            let plural = |n: usize, one: &str, many: &str| {
+                format!("{n} {}", if n == 1 { one } else { many })
+            };
+            let tip = format!(
+                "Turn changes: {} added, {} deleted{}",
+                plural(adds, "line", "lines"),
+                plural(dels, "line", "lines"),
+                if files > 0 {
+                    format!(", {} changed", plural(files, "file", "files"))
+                } else {
+                    String::new()
+                }
+            );
             el.child(
                 h_flex()
+                    .id(SharedString::from(format!("diff-pill-{}", item.key)))
+                    .debug_selector(|| format!("diff-pill-{ix}"))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .when(diff_open, |el| el.bg(hover))
+                    .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
+                    .on_mouse_down(MouseButton::Left, kit::claim_press)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| this.toggle_turn_diff(ix, cx));
+                    })
                     .flex_none()
                     .gap(px(5.6))
                     .px(px(8.))
@@ -2860,6 +2902,12 @@ fn turn_actions(
                     .child(div().text_color(p.success).child(format!("+{adds}")))
                     .when(dels > 0, |el| {
                         el.child(div().text_color(p.danger).child(format!("-{dels}")))
+                    })
+                    // Desktop: the arrow turns around, in the accent, while open.
+                    .child(if diff_open {
+                        kit::icon(IconName::ArrowDownLeft, 12., p.accent)
+                    } else {
+                        kit::icon(IconName::ArrowUpRight, 12., p.dim)
                     }),
             )
         })
@@ -3236,12 +3284,14 @@ fn render_row(row: &Row, rc: &RenderCtx) -> AnyElement {
     }
 }
 
-/// Response actions of a settled turn's closing item.
+/// Response actions of a turn's closing item. The running turn gets only
+/// its change pill, once it changed something (desktop: the pill is there
+/// while the turn works; copy, undo and fork wait until it settles).
 fn turn_actions_of(ix: usize, rc: &RenderCtx) -> Option<(usize, usize, usize)> {
     rc.turn_end
         .get(&ix)
         .copied()
-        .filter(|_| !(rc.running && ix >= rc.last_turn_start))
+        .filter(|&(adds, dels, _)| !rc.live_turn(ix) || adds > 0 || dels > 0)
 }
 
 /// For each turn's closing Agent/Work item, the message id of its user prompt.
@@ -4829,6 +4879,9 @@ impl QmtApp {
         } else {
             HashSet::new()
         };
+        let diff_open = self
+            .turn_diff_range(cx)
+            .and_then(|r| turn_end.keys().copied().filter(|ix| r.contains(ix)).max());
         let rc = Rc::new(RenderCtx {
             p,
             syntax: gpui_kit::component::ActiveTheme::theme(&**cx)
@@ -4859,6 +4912,7 @@ impl QmtApp {
                 .collect(),
             redo_target: view.redo_target().map(str::to_owned),
             fork_points,
+            diff_open,
             reverted_from,
             agent_id: view.agent_id.clone(),
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
@@ -5495,7 +5549,7 @@ impl QmtApp {
                     .child(self.smooth_scroll.region("composer", composer)),
             );
 
-        v_flex()
+        let chat = v_flex()
             .size_full()
             .when_some(error.filter(|_| !empty), |el, err| {
                 el.child(
@@ -5523,7 +5577,8 @@ impl QmtApp {
                     .child(transcript)
                     .child(bottom),
             )
-            .into_any_element()
+            .into_any_element();
+        self.with_turn_diff(chat, window, cx)
     }
 }
 

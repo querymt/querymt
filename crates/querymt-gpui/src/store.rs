@@ -1320,6 +1320,10 @@ pub struct Prefs {
     pub primary_agent: Option<String>,
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Width of the turn diff panel the user dragged it to; `None` keeps the
+    /// default (44% of the page, at most the chat width).
+    #[serde(default)]
+    pub turn_diff_width: Option<f32>,
     /// Accent preset id (`orange`, `blue`, …).
     #[serde(default)]
     pub accent: String,

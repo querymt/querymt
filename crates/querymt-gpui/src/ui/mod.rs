@@ -19,6 +19,7 @@ mod settings;
 mod setup;
 mod smooth_scroll;
 mod start;
+mod turn_diff;
 mod workspace_select;
 mod workspaces;
 mod worktree;
@@ -271,6 +272,8 @@ pub struct QmtApp {
     fork: Option<fork::ForkDialog>,
     /// New worktree session / worktree handoff dialog.
     worktree: Option<worktree::WorktreeDialog>,
+    /// Turn diff panel beside the chat.
+    turn_diff: turn_diff::TurnDiff,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
     appearance_scroll_open: bool,
     key_input: Entity<InputState>,
@@ -510,6 +513,7 @@ impl QmtApp {
             confirm_undo: None,
             fork: None,
             worktree: None,
+            turn_diff: Default::default(),
             appearance_scroll_open: false,
             key_input,
             oauth_code,
@@ -635,7 +639,8 @@ impl QmtApp {
         {
             return true;
         }
-        false
+        // Below every popover and dialog: Escape closes those first.
+        self.page == Page::Session && self.close_turn_diff()
     }
 
     fn start_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
