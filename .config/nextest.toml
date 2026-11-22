@@ -1,3 +1,9 @@
+experimental = ["wrapper-scripts"]
+
+[scripts.wrapper.test-home]
+command = { command-line = "scripts/with-test-home.sh", relative-to = "workspace-root" }
+target-runner = "within-wrapper"
+
 [profile.default]
 # Kill any test that takes longer than 60 s (2 strikes = termination).
 # This prevents a single stuck mesh/networking test from blocking the entire
@@ -9,6 +15,12 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(mesh) | test(remote) | test(relay) | test(forwarder)'
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+# Isolate discovery as well as execution, without affecting cargo run.
+[[profile.default.scripts]]
+platform = { host = 'cfg(unix)' }
+list-wrapper = 'test-home'
+run-wrapper = 'test-home'
 
 # Used by CI (`cargo nextest run --profile ci`): report every failure instead of
 # stopping at the first. Per-test overrides from the default profile still apply.

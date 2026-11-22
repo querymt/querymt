@@ -15,6 +15,7 @@ fn unavailable_store_does_not_block_provider_listing_but_secret_commands_fail() 
             .args(["--provider-config", config.to_str().unwrap()])
             .args(args)
             .env("QMT_CONFIG_DIR", root.path())
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
             .env("QMT_NO_TELEMETRY", "1")
             .env("QMT_SECRET_STORE", "secret-service")
             .env(

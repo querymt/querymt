@@ -1,5 +1,4 @@
 use querymt::LLMParams;
-use querymt::plugin::host::PluginRegistry;
 use querymt_agent::session::provider::SessionProvider;
 use querymt_agent::session::sqlite_storage::SqliteStorage;
 use querymt_agent::session::store::{SessionExecutionConfig, SessionStore};
@@ -25,7 +24,10 @@ async fn create_test_provider() -> (TempDir, Arc<SessionProvider>) {
         "[[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n",
     )
     .expect("write config");
-    let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+    let registry = Arc::new(
+        querymt_agent_runtime::test_utils::plugin_registry_from_path(&config_path)
+            .expect("registry"),
+    );
 
     let provider = Arc::new(SessionProvider::new(
         registry,
@@ -150,7 +152,10 @@ async fn test_config_without_system_gets_none_in_params() {
         "[[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n",
     )
     .expect("write config");
-    let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+    let registry = Arc::new(
+        querymt_agent_runtime::test_utils::plugin_registry_from_path(&config_path)
+            .expect("registry"),
+    );
     let provider = Arc::new(SessionProvider::new(
         registry,
         Arc::new(store) as Arc<dyn SessionStore>,

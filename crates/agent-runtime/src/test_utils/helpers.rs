@@ -243,8 +243,33 @@ pub fn empty_plugin_registry() -> Result<(PluginRegistry, TempDir)> {
     let temp_dir = TempDir::new()?;
     let config_path = temp_dir.path().join("providers.toml");
     std::fs::write(&config_path, "providers = []\n")?;
-    let registry = PluginRegistry::from_path(&config_path)?;
+    let registry = plugin_registry_from_path(&config_path)?;
     Ok((registry, temp_dir))
+}
+
+/// Load a fixture's providers and keep the plugin cache beside its config.
+pub fn plugin_registry_from_path(path: &std::path::Path) -> Result<PluginRegistry> {
+    querymt_utils::secret_store::SecretStore::install_test_store();
+    let config = querymt::plugin::host::PluginConfig::from_path(path)?;
+    Ok(PluginRegistry::from_config_with_cache_path(
+        config,
+        path.with_extension("cache"),
+    )?)
+}
+
+#[cfg(test)]
+#[test]
+fn plugin_fixture_does_not_fall_back_when_local_paths_fail() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("providers.toml");
+    let cache = config.with_extension("cache");
+    assert!(plugin_registry_from_path(&config).is_err());
+    assert!(!cache.exists());
+
+    std::fs::write(&config, "providers = []\n").unwrap();
+    std::fs::write(&cache, "not a directory").unwrap();
+    assert!(plugin_registry_from_path(&config).is_err());
+    assert!(cache.is_file());
 }
 
 /// Creates a plugin registry with a mock provider for LLM interaction tests.
@@ -299,7 +324,7 @@ pub fn mock_plugin_registry_for(
         ),
     )?;
 
-    let mut registry = PluginRegistry::from_path(&config_path)?;
+    let mut registry = plugin_registry_from_path(&config_path)?;
     registry.register_loader(Box::new(TestPluginLoader { factory }));
     Ok(registry)
 }

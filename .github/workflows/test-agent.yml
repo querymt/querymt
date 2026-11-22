@@ -240,7 +240,7 @@ jobs:
       - name: Run doctests
         run: |
           source "$RUNNER_TEMP/llvm-cov-env.sh"
-          cargo test --doc \
+          bash scripts/with-test-home.sh cargo test --doc \
             ${{ needs.detect.outputs.test_args }} \
             ${{ needs.detect.outputs.features }}
 

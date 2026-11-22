@@ -561,18 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn from_path_parses_config_and_builds_registry() {
-        let cfg_path = unique_tmp_path("providers").with_extension("toml");
+    fn parsed_config_builds_registry_with_fixture_cache() {
+        let root = unique_tmp_path("providers");
+        fs::create_dir(&root).unwrap();
+        let cfg_path = root.join("providers.toml");
+        let cache_path = root.join("plugin-cache");
         fs::write(&cfg_path, "providers = []\n").unwrap();
 
-        let registry = PluginRegistry::from_path(&cfg_path).expect("from_path should succeed");
+        let config = PluginConfig::from_path(&cfg_path).expect("parse providers");
+        let registry = PluginRegistry::from_config_with_cache_path(config, cache_path.clone())
+            .expect("build registry");
 
-        assert!(registry.cache_path.ends_with("querymt"));
-        assert!(
-            registry.cache_path.is_dir(),
-            "default cache dir should exist"
-        );
+        assert_eq!(registry.cache_path, cache_path);
+        assert!(registry.cache_path.is_dir());
         assert!(registry.config.providers.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     // ── Progress type re-export tests ─────────────────────────────────────────

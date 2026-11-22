@@ -253,7 +253,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("providers.toml");
         std::fs::write(&config_path, config_body).expect("write config");
-        let registry = PluginRegistry::from_path(&config_path).expect("registry");
+        let config = crate::plugin::host::PluginConfig::from_path(&config_path).expect("providers");
+        let registry =
+            PluginRegistry::from_config_with_cache_path(config, temp.path().join("cache"))
+                .expect("registry");
         std::mem::forget(temp);
         registry
     }

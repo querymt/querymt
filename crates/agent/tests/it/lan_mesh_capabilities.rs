@@ -14,9 +14,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     let dir = tempfile::tempdir().expect("test directory");
-    let providers = dir.path().join("providers.toml");
-    std::fs::write(&providers, "providers = []\n").expect("empty provider config");
-    let registry = Arc::new(PluginRegistry::from_path(&providers).expect("registry"));
+    let registry = Arc::new(PluginRegistry::empty());
     let storage = Arc::new(
         SqliteStorage::connect(":memory:".into())
             .await

@@ -21,6 +21,7 @@ api = []
 # Test helpers for the layers above (design D6): `TestAgent`, the mock LLM
 # provider, `mcp_harness` and the drivers.
 test-support = [
+    "querymt-utils/test-support",
     "querymt-agent-core/test-support",
     "querymt-agent-services/test-support",
     "dep:querymt-agent-sqlite",
@@ -105,6 +106,7 @@ libc = "0.2"
 rmcp = { version = "3.11", features = ["transport-streamable-http-client-unix-socket"] }
 
 [dev-dependencies]
+querymt-utils = { path = "../querymt-utils", features = ["test-support"] }
 rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
