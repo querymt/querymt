@@ -1292,6 +1292,7 @@ mod tests {
         );
         PluginBuilder::new(Manifest::new([Wasm::data(wasm.into_bytes())]))
             .with_wasi(true)
+            .with_cache_disabled()
             .build()
             .expect("test plugin should build")
     }
