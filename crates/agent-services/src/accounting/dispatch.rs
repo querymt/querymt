@@ -519,6 +519,18 @@ impl ActiveAttempt {
         .await
     }
 
+    /// The attempt was cancelled before its provider request was first
+    /// polled: nothing was sent, so nothing can have been billed.
+    pub async fn settle_cancelled_before_send(self) -> Result<(), AccountingError> {
+        self.settle(
+            UsageDisposition::NotSent,
+            AttemptOutcome::Cancelled,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// The attempt ended in a provider/transport error or cancellation.
     pub async fn settle_error(
         mut self,
@@ -784,6 +796,26 @@ mod tests {
         let t = totals(&acct);
         assert_eq!((t.unresolved_attempts, t.priced_attempts), (0, 1));
         assert!((t.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_send_settles_with_no_charge() {
+        let (op, acct) = fixture().await;
+        let attempt = op
+            .begin(DispatchMode::NonStreaming, metered())
+            .await
+            .unwrap();
+        attempt.settle_cancelled_before_send().await.unwrap();
+        let t = totals(&acct);
+        assert_eq!(
+            (
+                t.unresolved_attempts,
+                t.priced_attempts,
+                t.incomplete_attempts
+            ),
+            (0, 0, 0),
+            "nothing was sent: settled, free and not uncertain"
+        );
     }
 
     /// One session accounting shared by one operation per budget snapshot,

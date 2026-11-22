@@ -381,6 +381,7 @@ impl SessionCompaction {
                 &attempts,
                 cancel,
                 |error| error.is_retryable() && !is_request_timeout(error),
+                |reply| matches!(reply, Reply::Rejected(_)),
                 || Self::send_once(messages, dispatch, streaming, &timing, &chat_span, &fatal),
             )
             .await;
@@ -487,17 +488,15 @@ impl SessionCompaction {
             .await
         } else {
             let call = ChatCall::new(messages);
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err(StreamFailure::cancelled(false, None)),
-                reply = provider.chat(&call) => {
-                    reply.map_err(|error| StreamFailure {
-                        error,
-                        response_started: false,
-                        usage: None,
-                        output: None,
-                    })
-                }
+            match unless_cancelled(cancel, provider.chat(&call)).await {
+                Ok(reply) => reply.map_err(|error| StreamFailure {
+                    error,
+                    response_started: false,
+                    usage: None,
+                    output: None,
+                    sent: true,
+                }),
+                Err(sent) => Err(StreamFailure::cancelled_before_reply(sent)),
             }
         };
 
@@ -522,6 +521,9 @@ impl SessionCompaction {
             Err(failure) => {
                 match &failure.output {
                     Some(output) => attempt_record.settle_rejected_output(output, true).await,
+                    // Cancelled before the request was ever polled: nothing
+                    // was sent, so nothing can have been billed.
+                    None if !failure.sent => attempt_record.settle_cancelled_before_send().await,
                     None => {
                         attempt_record
                             .settle_error(
@@ -557,17 +559,15 @@ impl SessionCompaction {
     ) -> std::result::Result<ChatOutput, StreamFailure> {
         timing.start();
         let call = ChatCall::new(messages);
-        let mut stream = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(StreamFailure::cancelled(false, None)),
-            opened = provider.chat_stream(&call) => {
-                opened.map_err(|error| StreamFailure {
-                    error,
-                    response_started: false,
-                    usage: None,
-                    output: None,
-                })?
-            }
+        let mut stream = match unless_cancelled(cancel, provider.chat_stream(&call)).await {
+            Ok(opened) => opened.map_err(|error| StreamFailure {
+                error,
+                response_started: false,
+                usage: None,
+                output: None,
+                sent: true,
+            })?,
+            Err(sent) => return Err(StreamFailure::cancelled_before_reply(sent)),
         };
         timing.headers_received(chat_span);
         let mut accumulator = ChatStreamAccumulator::new();
@@ -599,6 +599,7 @@ impl SessionCompaction {
                         response_started,
                         usage: accumulator.output().usage,
                         output: None,
+                        sent: true,
                     });
                 }
             };
@@ -610,6 +611,7 @@ impl SessionCompaction {
                     response_started,
                     usage: accumulator.output().usage,
                     output: None,
+                    sent: true,
                 });
             }
             if querymt::chat::chunk_is_terminal(&chunk) {
@@ -628,6 +630,7 @@ impl SessionCompaction {
                 response_started,
                 usage: accumulator.output().usage,
                 output: None,
+                sent: true,
             });
         }
         timing.finish(chat_span);
@@ -662,6 +665,7 @@ impl SessionCompaction {
                     response_started,
                     usage: output.usage.clone(),
                     output: Some(Box::new(output)),
+                    sent: true,
                 })
             }
             ChatStreamFinish::Failed { output, error } => {
@@ -671,6 +675,7 @@ impl SessionCompaction {
                     response_started,
                     usage: output.usage.clone(),
                     output: Some(Box::new(output)),
+                    sent: true,
                 })
             }
         }
@@ -779,6 +784,9 @@ struct StreamFailure {
     usage: Option<querymt::Usage>,
     /// Partial canonical output, when the stream reached finalization.
     output: Option<Box<ChatOutput>>,
+    /// False only when the provider request was never polled: nothing was
+    /// sent, so the attempt cannot have been billed.
+    sent: bool,
 }
 
 impl StreamFailure {
@@ -789,8 +797,41 @@ impl StreamFailure {
             response_started,
             usage,
             output: None,
+            sent: true,
         }
     }
+
+    /// The compaction was cancelled before any reply arrived; `sent` says
+    /// whether the provider request had been polled by then.
+    fn cancelled_before_reply(sent: bool) -> Self {
+        Self {
+            sent,
+            ..Self::cancelled(false, None)
+        }
+    }
+}
+
+/// Run `request` unless `cancel` fires first (cancellation wins a tie). On
+/// cancellation, `Err` says whether `request` had been polled: until it is,
+/// a provider request cannot have been sent.
+async fn unless_cancelled<T>(
+    cancel: &CancellationToken,
+    request: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, bool> {
+    let mut polled = false;
+    let outcome = {
+        let mut request = std::pin::pin!(request);
+        let tracked = std::future::poll_fn(|cx| {
+            polled = true;
+            request.as_mut().poll(cx)
+        });
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            reply = tracked => Some(reply),
+        }
+    };
+    outcome.ok_or(polled)
 }
 
 fn accounting_failure(error: AccountingError) -> anyhow::Error {
@@ -1361,6 +1402,79 @@ mod tests {
         assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
         assert_eq!(attempt_events(chat), vec![(1, None)]);
         assert_private(&spans);
+    }
+
+    /// A reply rejected as a summary is not a successful attempt: its event
+    /// carries an `error.type`, and the next summary attempt follows.
+    #[tokio::test]
+    async fn rejected_summary_attempt_is_reported_as_rejected_output() {
+        use querymt_agent_services::tools::trace_support::genai_trace::{assert_private, capture};
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::Stream(structured_summary(" ", true).into_iter().map(Ok).collect()),
+                Attempt::Stream(
+                    structured_summary("SECRET_RESPONSE", true)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
+        let config = config_with(|config| {
+            config.execution_policy.compaction.retry.max_retries = 1;
+            config.execution_policy.compaction.retry.initial_backoff_ms = 0;
+        })
+        .await;
+        let (result, spans) = capture(SessionCompaction::new().process(
+            &[MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "SECRET_PROMPT",
+            )],
+            None,
+            None,
+            &CompactionDispatch {
+                provider: provider.clone(),
+                config: &config,
+                cancel: &CancellationToken::new(),
+                ledger: &test_ledger().await,
+            },
+        ))
+        .await;
+
+        assert_eq!(result.unwrap().summary, "SECRET_RESPONSE");
+        let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+        assert_eq!(
+            attempt_events(chat),
+            vec![(1, Some("output_rejected".to_string())), (2, None)]
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_request_is_polled_reports_it_unsent() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polled = AtomicUsize::new(0);
+        let request = std::future::poll_fn(|_| {
+            polled.fetch_add(1, Ordering::Relaxed);
+            std::task::Poll::<()>::Pending
+        });
+        assert_eq!(unless_cancelled(&cancel, request).await, Err(false));
+        assert_eq!(polled.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_the_request_was_polled_reports_it_possibly_sent() {
+        let cancel = CancellationToken::new();
+        let request = std::future::pending::<()>();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+        assert_eq!(unless_cancelled(&cancel, request).await, Err(true));
     }
 
     enum Attempt {

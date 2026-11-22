@@ -40,6 +40,7 @@ where
         cancel_token,
         None,
         LLMError::is_retryable,
+        |_: &T| false,
         call_fn,
     )
     .await
@@ -71,6 +72,7 @@ where
         cancel_token,
         Some(attempts),
         LLMError::is_retryable,
+        |_: &T| false,
         call_fn,
     )
     .await
@@ -81,9 +83,14 @@ where
 /// `retryable` only decides whether another one follows. For a caller that
 /// must not resend after an error `LLMError::is_retryable` accepts (a request
 /// timeout: the remote is probably still working).
+///
+/// `rejected` says whether a reply the provider returned is one the caller
+/// rejects as output: its attempt is reported as a rejected output (with an
+/// `error.type`), not as a success, but the reply is still returned and never
+/// retried here, because it is not a provider error.
 #[instrument(
     name = "agent.llm.call_with_retry",
-    skip(config, attempts, cancel_token, retryable, call_fn),
+    skip(config, attempts, cancel_token, retryable, rejected, call_fn),
     fields(session_id = %session_id, operation = "chat", attempt = tracing::field::Empty, retrying = tracing::field::Empty)
 )]
 pub(crate) async fn call_chat_with_retry_if<T, F, Fut>(
@@ -92,6 +99,7 @@ pub(crate) async fn call_chat_with_retry_if<T, F, Fut>(
     attempts: &RequestAttempts,
     cancel_token: &CancellationToken,
     retryable: impl Fn(&LLMError) -> bool,
+    rejected: impl Fn(&T) -> bool,
     call_fn: F,
 ) -> Result<T, LLMError>
 where
@@ -104,6 +112,7 @@ where
         cancel_token,
         Some(attempts),
         retryable,
+        rejected,
         call_fn,
     )
     .await
@@ -115,6 +124,7 @@ async fn call_with_retry_mode<T, F, Fut>(
     cancel_token: &CancellationToken,
     attempts: Option<&RequestAttempts>,
     retryable: impl Fn(&LLMError) -> bool,
+    rejected: impl Fn(&T) -> bool,
     mut call_fn: F,
 ) -> Result<T, LLMError>
 where
@@ -138,7 +148,11 @@ where
             Ok(response) => {
                 Span::current().record("attempt", attempt);
                 if let Some(attempts) = attempts {
-                    attempts.succeeded();
+                    if rejected(&response) {
+                        attempts.rejected();
+                    } else {
+                        attempts.succeeded();
+                    }
                 }
                 return Ok(response);
             }

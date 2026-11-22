@@ -6140,7 +6140,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_consistency_steering_drain_publishes_new_revision_without_phase_change() {
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         let (mut exec, mut turn) = fixture.turn().await;
         let mut actor = SessionActor::new(
             fixture.config.clone(),

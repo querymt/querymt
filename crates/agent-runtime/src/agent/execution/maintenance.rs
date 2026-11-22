@@ -499,6 +499,14 @@ pub(crate) async fn compact_history_with(
         return Err(error);
     }
 
+    // The post-compaction hook can take a while: a cancel that arrived during
+    // it must still stop the compaction before any boundary is written.
+    if env.cancellation_token.is_cancelled() {
+        let error = anyhow::anyhow!("Compaction cancelled");
+        emit_compaction_cancelled(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
+
     info!(
         "Compaction generated summary: {} tokens -> {} tokens",
         result.original_token_count, result.summary_token_count

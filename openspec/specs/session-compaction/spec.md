@@ -27,8 +27,8 @@ A provider error during a compaction request SHALL be handled by the rules of a 
 - **AND** the stored history is unchanged
 
 #### Scenario: Provider error with the summary budget at zero
-- **WHEN** `[agent.execution.compaction.retry]` `max_retries` is `0` and the compaction request fails once with a retryable provider error
-- **THEN** the request is retried and the summary is stored
+- **WHEN** `[agent.execution.compaction.retry]` `max_retries` is `0`, `[agent.execution.rate_limit]` `max_retries` allows a second request, and the compaction request fails once with a retryable provider error before the second request returns a valid summary
+- **THEN** the request is retried and the summary of the second request is stored
 
 #### Scenario: Retry wait during compaction is reported
 - **WHEN** a compaction request waits before a retry
@@ -73,3 +73,7 @@ The span of a compaction request SHALL carry the attribute `gen_ai.request.attem
 #### Scenario: Compaction request without a retry
 - **WHEN** a compaction request succeeds on its first attempt
 - **THEN** its span has `gen_ai.request.attempt = 1` and one attempt event without `error.type`
+
+#### Scenario: Rejected summary attempt
+- **WHEN** a compaction reply is rejected as a summary and the next reply is a valid summary
+- **THEN** the first attempt event carries `error.type = output_rejected` and the second carries no `error.type`

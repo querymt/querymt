@@ -612,20 +612,24 @@ mod tests {
 
         #[tokio::test]
         async fn cwd_is_none_without_a_workspace() {
-            let (env, _turn) = TestAgent::new().await.turn().await;
+            let (env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             assert!(env.cwd().is_none());
         }
 
         #[tokio::test]
         async fn cwd_is_the_runtime_workspace() {
             let cwd = std::path::PathBuf::from("/tmp/my-workspace");
-            let (env, _turn) = TestAgent::new().await.turn_in(cwd.clone()).await;
+            let (env, _turn) = TestAgent::new()
+                .await
+                .with_inert_model()
+                .turn_in(cwd.clone())
+                .await;
             assert_eq!(env.cwd(), Some(cwd.as_path()));
         }
 
         #[tokio::test]
         async fn llm_config_is_the_one_pinned_to_the_session() {
-            let (env, _turn) = TestAgent::new().await.turn().await;
+            let (env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             let config = env.llm_config().expect("session has an llm config");
             assert_eq!(config.provider, "mock");
             assert_eq!(config.model, "mock");
@@ -639,7 +643,7 @@ mod tests {
 
             let knowledge_store: Arc<dyn KnowledgeStore> =
                 Arc::new(SqliteKnowledgeStore::new(sqlite_conn_with_schema()));
-            let (mut env, _turn) = TestAgent::new().await.turn().await;
+            let (mut env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             env.knowledge_store = Some(knowledge_store);
 
             assert!(
@@ -650,13 +654,13 @@ mod tests {
 
         #[tokio::test]
         async fn tool_context_has_no_knowledge_store_when_not_set() {
-            let (env, _turn) = TestAgent::new().await.turn().await;
+            let (env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             assert!(env.tool_context(None).knowledge_store().is_none());
         }
 
         #[tokio::test]
         async fn tool_context_propagates_checkout_mutation_gate() {
-            let (env, _turn) = TestAgent::new().await.turn().await;
+            let (env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             let storage = tempfile::TempDir::new().unwrap();
             let checkout = tempfile::TempDir::new().unwrap();
             let gate = Arc::new(
@@ -673,7 +677,7 @@ mod tests {
         async fn tool_context_propagates_repository_knowledge_only_when_set() {
             use crate::config::RepositoryKnowledgeSettings;
 
-            let (mut env, _turn) = TestAgent::new().await.turn().await;
+            let (mut env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
             assert!(
                 env.tool_context(None).repository_knowledge().is_none(),
                 "absent unless host-enabled"

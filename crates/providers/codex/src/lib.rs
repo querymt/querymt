@@ -178,7 +178,10 @@ impl HTTPChatProvider for Codex {
         &self,
         _context: serde_json::Value,
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(CodexStreamParser::default()))
+        Ok(Box::new(CodexStreamParser {
+            model: Some(self.model.clone()),
+            ..CodexStreamParser::default()
+        }))
     }
 
     /// Declares no prompt-cache breakpoints: the ChatGPT backend rejects
@@ -191,8 +194,9 @@ impl HTTPChatProvider for Codex {
             .with_streaming(true)
     }
 
-    /// Codex stamps every reply with `codex_provenance()` and replays output
-    /// natively only when it carries exactly this identity (`api.rs`).
+    /// Codex stamps every reply with `codex_provenance()` and the configured
+    /// model (`CodexStreamParser`), and replays output natively only when it
+    /// carries exactly this identity (`api.rs`).
     fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
         let stamped = codex_provenance();
         Some(querymt::chat::ChatOutputProvenance {
@@ -210,6 +214,10 @@ struct CodexStreamParser {
     policy: qmt_openai::api::ResponsesStreamPolicy,
     initialized: bool,
     completed: bool,
+    /// The configured model, stamped on the output's provenance in place of
+    /// the model the backend reports: native replay matches the configured
+    /// model exactly, and the backend may report another name for it.
+    model: Option<String>,
 }
 
 impl ChatStreamParser for CodexStreamParser {
@@ -221,11 +229,24 @@ impl ChatStreamParser for CodexStreamParser {
             self.policy.terminal_usage_log_target = Some("qmt_codex");
             self.initialized = true;
         }
-        let chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
+        let mut chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
             chunk,
             &mut self.state,
             &self.policy,
         )?;
+        if let Some(model) = &self.model {
+            for chunk in &mut chunks {
+                if let StreamChunk::Structured(
+                    querymt::chat::StructuredStreamEvent::ResponseMetadata {
+                        provenance: Some(provenance),
+                        ..
+                    },
+                ) = chunk
+                {
+                    provenance.model.clone_from(model);
+                }
+            }
+        }
         if chunks.iter().any(|chunk| {
             matches!(
                 chunk,
@@ -409,6 +430,41 @@ mod provenance_tests {
         assert_eq!(stated.protocol, stamped.protocol);
         assert_eq!(stated.endpoint, stamped.endpoint);
         assert_eq!(stated.model, "gpt-5.6");
+    }
+
+    /// The stream stamps the declared identity even when the backend reports
+    /// another model name, so stored output keeps its native replay.
+    #[test]
+    fn stream_stamps_the_configured_model_not_the_reported_one() {
+        use querymt::chat::{StreamChunk, StructuredStreamEvent};
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let mut parser = HTTPChatProvider::chat_stream_parser(&provider, serde_json::Value::Null)
+            .expect("stream parser");
+        let events = parser
+            .parse_chunk(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-2026-01-01"}}
+
+"#,
+            )
+            .unwrap();
+        let stamped = events
+            .iter()
+            .find_map(|event| match event {
+                StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                    provenance: Some(provenance),
+                    ..
+                }) => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect("response metadata with provenance");
+        assert_eq!(
+            Some(stamped),
+            HTTPChatProvider::output_provenance(&provider)
+        );
     }
 }
 

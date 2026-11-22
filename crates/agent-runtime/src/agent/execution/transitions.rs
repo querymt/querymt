@@ -6693,7 +6693,7 @@ mod tests {
     // ── map_failed_llm_call ───────────────────────────────────────────────────
 
     async fn llm_env() -> TurnEnv {
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         fixture.turn().await.0
     }
 

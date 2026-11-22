@@ -23,6 +23,9 @@ pub struct TestAgent {
     pub config: Arc<crate::agent::agent_config::AgentConfig>,
     pub handle: Arc<AgentHandle>,
     pub _tempdir: TempDir,
+    /// Whether runs get the inert model instead of resolving one; set by
+    /// [`TestAgent::with_inert_model`].
+    inert_model: bool,
 }
 
 impl TestAgent {
@@ -49,11 +52,23 @@ impl TestAgent {
             config,
             handle,
             _tempdir: tempdir,
+            inert_model: false,
         }
     }
 
+    /// This agent, with runs that use the inert model of
+    /// [`inert_turn_parts`] instead of resolving the session's provider: for
+    /// tests that use the environment for something other than a model
+    /// request and have no provider to resolve.
+    pub(crate) fn with_inert_model(mut self) -> Self {
+        self.inert_model = true;
+        self
+    }
+
     /// A run over a new session: the read-only [`TurnEnv`] and the mutable
-    /// [`Turn`], built as `execute_prompt_inner` builds them.
+    /// [`Turn`], built as `execute_prompt_inner` builds them. The session's
+    /// model is resolved, and a failure to resolve it fails the test, unless
+    /// the agent was built [`with_inert_model`](Self::with_inert_model).
     pub(crate) async fn turn(&self) -> (TurnEnv, Turn) {
         self.turn_with_mcp(crate::agent::core::McpToolState::empty())
             .await
@@ -93,7 +108,11 @@ impl TestAgent {
         .unwrap();
         let runtime =
             crate::agent::core::SessionRuntime::new(cwd, Default::default(), mcp_tool_state);
-        turn_parts(&self.config, session_handle, runtime, state).await
+        if self.inert_model {
+            inert_turn_parts(&self.config, session_handle, runtime, state).await
+        } else {
+            turn_parts(&self.config, session_handle, runtime, state).await
+        }
     }
 
     /// Minimal agent with in-memory SQLite, no event observer.
@@ -116,6 +135,7 @@ impl TestAgent {
             config,
             handle,
             _tempdir: tempdir,
+            inert_model: false,
         }
     }
 
@@ -141,6 +161,7 @@ impl TestAgent {
             config,
             handle,
             _tempdir: tempdir,
+            inert_model: false,
         }
     }
 
@@ -166,6 +187,7 @@ impl TestAgent {
             config,
             handle,
             _tempdir: tempdir,
+            inert_model: false,
         }
     }
 
@@ -183,11 +205,48 @@ impl TestAgent {
 /// The read-only [`TurnEnv`] and mutable [`Turn`] of a run over `session_handle`,
 /// with the defaults of an interactive build-mode run: no steering, no phase
 /// reporter, no knowledge store, a fresh cancellation token and cycle accounting.
+///
+/// A run resolves its model before its environment exists, as the session
+/// actor does; a fixture whose provider cannot be resolved fails here, with
+/// the resolution error. Tests that need no provider use
+/// [`inert_turn_parts`].
 pub(crate) async fn turn_parts(
     config: &crate::agent::agent_config::AgentConfig,
     session_handle: crate::session::provider::SessionHandle,
     runtime: Arc<crate::agent::core::SessionRuntime>,
     state: crate::session::runtime::RuntimeContext,
+) -> (TurnEnv, Turn) {
+    let model = session_handle
+        .resolve_model()
+        .await
+        .expect("the fixture's provider resolves");
+    turn_parts_with(config, session_handle, runtime, state, model).await
+}
+
+/// [`turn_parts`] for a test that uses the environment for something other
+/// than a model request: its model is an inert one that declares nothing and
+/// answers no request (mockall panics on an unexpected call), whatever the
+/// session's provider is.
+pub(crate) async fn inert_turn_parts(
+    config: &crate::agent::agent_config::AgentConfig,
+    session_handle: crate::session::provider::SessionHandle,
+    runtime: Arc<crate::agent::core::SessionRuntime>,
+    state: crate::session::runtime::RuntimeContext,
+) -> (TurnEnv, Turn) {
+    let model = crate::session::provider::ResolvedModel {
+        provider: Arc::new(crate::test_utils::MockLlmProvider::new()),
+        profile: Arc::new(crate::middleware::ModelProfile::default()),
+        provenance: None,
+    };
+    turn_parts_with(config, session_handle, runtime, state, model).await
+}
+
+async fn turn_parts_with(
+    config: &crate::agent::agent_config::AgentConfig,
+    session_handle: crate::session::provider::SessionHandle,
+    runtime: Arc<crate::agent::core::SessionRuntime>,
+    state: crate::session::runtime::RuntimeContext,
+    model: crate::session::provider::ResolvedModel,
 ) -> (TurnEnv, Turn) {
     let session_id = session_handle.session().public_id.clone();
     let cycle_accounting = querymt_agent_services::accounting::CycleAccounting::begin(
@@ -198,19 +257,6 @@ pub(crate) async fn turn_parts(
     );
     let tool_config = crate::agent::core::ToolConfig::default();
     let tool_set = TurnEnv::build_tool_set(config, &runtime, &tool_config);
-    // A run resolves its model before its environment exists, as the session
-    // actor does. A fixture without a registered provider has none to
-    // resolve: it gets an inert one that declares nothing and answers no
-    // request (mockall panics on an unexpected call), for the tests that use
-    // the environment for something else.
-    let model = match session_handle.resolve_model().await {
-        Ok(model) => model,
-        Err(_) => crate::session::provider::ResolvedModel {
-            provider: Arc::new(crate::test_utils::MockLlmProvider::new()),
-            profile: Arc::new(crate::middleware::ModelProfile::default()),
-            provenance: None,
-        },
-    };
     let env = TurnEnv {
         session_id,
         turn_id: querymt_agent_core::model::TurnId::new(),

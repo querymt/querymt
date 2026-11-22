@@ -138,8 +138,10 @@ auto = true               # Enable automatic compaction
 # priced for them. Unset keys are the session's: `model` alone is that model on
 # the session's provider (and mesh node); `provider` needs a `model`, because
 # the session's model belongs to another provider (a `provider` without a
-# `model` is refused when the configuration loads). The session's own settings
-# (system prompt, reasoning effort, local-model options) are not carried over.
+# `model` is refused when the configuration loads). A target built separately
+# from the session's does not carry the session's own settings (system prompt,
+# reasoning effort, local-model options); a target that names the session's own
+# provider and model reuses the session's provider, so its settings apply.
 provider = "anthropic"    # Optional: different provider for compaction
 model = "claude-haiku"    # Optional: cheaper model for compaction
 
@@ -192,8 +194,8 @@ error naming `transport_wait_secs`.
 The compaction request follows the same rules as a model request when the
 provider fails. A provider error is retried only if it can succeed on a second
 try (an overloaded or rate-limited provider, a 5xx status, a lost connection),
-after the wait described above, for at most `rate_limit.max_retries` requests in
-total, and clients receive the same retry notices as for a model request. A
+after the wait described above, for at most `max(1, rate_limit.max_retries)`
+requests in total (a `max_retries` of `0` still sends the first request), and clients receive the same retry notices as for a model request. A
 rejected credential or an invalid request fails the compaction after that one
 request. A request that times out is not retried, because the remote side may
 still be working on it, and a cancelled run stops waiting to retry.
@@ -201,7 +203,7 @@ still be working on it, and a cancelled run stops waiting to retry.
 summary (empty, refused or cut off), and each of those attempts has its own
 provider retries. In the worst case, where retryable provider errors and
 rejected summaries alternate, one compaction sends
-`(compaction.retry.max_retries + 1) × rate_limit.max_retries` requests: 12 with
+`(compaction.retry.max_retries + 1) × max(1, rate_limit.max_retries)` requests: 12 with
 the defaults (it was 4). Every request is recorded in the cost accounting. If you
 set `compaction.retry.max_retries = 0` to make compaction fail fast, a provider
 error is now still retried, by `rate_limit`.

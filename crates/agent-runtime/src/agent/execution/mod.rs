@@ -727,7 +727,7 @@ mod tests {
             )
             .await
             .expect("queue steering");
-        let (mut env, mut turn) = crate::test_utils::turn_parts(
+        let (mut env, mut turn) = crate::test_utils::inert_turn_parts(
             &fixture.config,
             session_handle,
             runtime,
@@ -885,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_results_stay_ahead_of_steering_in_live_and_reloaded_history() {
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
             querymt_agent_core::model::TurnId::new(),
         ));
@@ -967,7 +967,7 @@ mod tests {
         crate::agent::execution::turn::TurnEnv,
         Turn,
     ) {
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         let (env, mut turn) = fixture.turn().await;
         let calls = assistant_calling(&env.session_id, &[("call-1", "."), ("call-2", "..")]);
         let results = results_for(&env.session_id, &[("call-1", "one"), ("call-2", "two")]);
@@ -1176,7 +1176,7 @@ mod tests {
     async fn steering_reaches_the_model_once_and_objective_events_fire_without_the_objective() {
         use querymt_agent_core::events::AgentEventKind;
 
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
             querymt_agent_core::model::TurnId::new(),
         ));

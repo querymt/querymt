@@ -617,6 +617,12 @@ pub(crate) mod genai {
             self.event(None);
         }
 
+        /// The current attempt produced a response the caller rejected as
+        /// output (empty, refused, cut off): an error, but not a provider one.
+        pub(crate) fn rejected(&self) {
+            self.event(Some("output_rejected"));
+        }
+
         /// The current attempt failed with `error`.
         pub(crate) fn failed(&self, error: &LLMError) {
             if let Some(error_type) = llm_error_type(error) {

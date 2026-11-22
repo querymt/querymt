@@ -678,7 +678,8 @@ mod tests {
             Default::default(),
             crate::agent::core::McpToolState::empty(),
         );
-        let (exec, turn) = crate::test_utils::turn_parts(&config, handle, runtime, state).await;
+        let (exec, turn) =
+            crate::test_utils::inert_turn_parts(&config, handle, runtime, state).await;
         (config, exec, turn, dir)
     }
 

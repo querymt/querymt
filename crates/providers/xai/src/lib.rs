@@ -234,9 +234,10 @@ impl HTTPChatProvider for Xai {
         &self,
         _context: serde_json::Value,
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(XaiStreamParser::new(
-            self.should_use_responses_api(),
-        )))
+        Ok(Box::new(
+            XaiStreamParser::new(self.should_use_responses_api())
+                .with_responses_endpoint(self.responses_endpoint()),
+        ))
     }
 
     fn capabilities(&self) -> ChatCapabilities {
@@ -244,16 +245,16 @@ impl HTTPChatProvider for Xai {
     }
 
     /// The Responses path stamps its output with this identity (the stream
-    /// parser and `parse_chat` use `Xai::responses_endpoint`, and replayed
-    /// output is checked against the same values). The Chat Completions path
-    /// carries no provenance.
+    /// parser uses `Xai::responses_endpoint`, the endpoint the request is
+    /// sent to, and replayed output is checked against the same values). The
+    /// Chat Completions path carries no provenance.
     fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
         self.should_use_responses_api()
             .then(|| querymt::chat::ChatOutputProvenance {
                 provider: "xai".to_string(),
                 protocol: "responses".to_string(),
                 model: self.model.clone(),
-                endpoint: Xai::responses_endpoint(),
+                endpoint: self.responses_endpoint(),
             })
     }
 }
@@ -340,6 +341,8 @@ impl HTTPCompletionProvider for Xai {
 
 struct XaiStreamParser {
     use_responses_api: bool,
+    /// The Responses endpoint stamped on the output's provenance.
+    responses_endpoint: String,
     responses_completed: bool,
     responses_state: qmt_openai::api::OpenAIResponsesStreamState,
     responses_initialized: bool,
@@ -350,11 +353,17 @@ impl XaiStreamParser {
     fn new(use_responses_api: bool) -> Self {
         Self {
             use_responses_api,
+            responses_endpoint: Xai::default_responses_endpoint(),
             responses_completed: false,
             responses_state: qmt_openai::api::OpenAIResponsesStreamState::default(),
             responses_initialized: false,
             openai_tool_state: HashMap::new(),
         }
+    }
+
+    fn with_responses_endpoint(mut self, endpoint: String) -> Self {
+        self.responses_endpoint = endpoint;
+        self
     }
 }
 
@@ -366,7 +375,7 @@ impl ChatStreamParser for XaiStreamParser {
                     qmt_openai::api::ResponsesCodecProvider::with_endpoint(
                         "xai",
                         "responses",
-                        Xai::responses_endpoint(),
+                        self.responses_endpoint.clone(),
                     ),
                 );
                 self.responses_initialized = true;
@@ -504,9 +513,15 @@ impl Xai {
         Url::parse("https://api.x.ai/v1/").unwrap()
     }
 
-    /// Normalized Responses endpoint recorded in streamed output provenance.
-    fn responses_endpoint() -> String {
-        "https://api.x.ai/v1/responses".to_string()
+    /// Normalized Responses endpoint recorded in streamed output provenance:
+    /// the one the request is sent to, under the configured base URL.
+    fn responses_endpoint(&self) -> String {
+        xai_responses_endpoint(&self.base_url)
+    }
+
+    /// The Responses endpoint under the default base URL.
+    fn default_responses_endpoint() -> String {
+        xai_responses_endpoint(&Xai::default_base_url())
     }
 
     /// Detects when targeting xAI endpoints that support Responses-style API
@@ -807,6 +822,7 @@ fn xai_attachment(media: &MediaPart) -> Result<XaiAttachment, LLMError> {
 fn to_xai_responses_input(
     messages: &[ChatMessage],
     model: &str,
+    endpoint: &str,
 ) -> Result<Vec<XaiResponsesInputItem>, LLMError> {
     // Materialize all owned canonical parts up front so the borrowed input
     // items built below can reference stable storage that outlives the loop.
@@ -835,7 +851,7 @@ fn to_xai_responses_input(
                 origin.provider == "xai"
                     && origin.protocol == "responses"
                     && origin.model == model
-                    && origin.endpoint == Xai::responses_endpoint()
+                    && origin.endpoint == endpoint
             });
             convert_structured_output_to_xai(output, &mut inputs, native_replay)?;
             continue;
@@ -1105,6 +1121,15 @@ fn is_supported_xai_list_model(model: &str) -> bool {
     model != "grok-imagine" && !model.starts_with("grok-imagine-")
 }
 
+/// The Responses endpoint under `base_url`: where the Responses request is
+/// sent, and the endpoint its output provenance names.
+fn xai_responses_endpoint(base_url: &Url) -> String {
+    base_url
+        .join("responses")
+        .map(|url| url.to_string())
+        .unwrap_or_default()
+}
+
 fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
     cfg: &C,
     messages: &[ChatMessage],
@@ -1134,7 +1159,11 @@ fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
     let instructions = cfg.system().join("\n");
     let body = XaiResponsesRequest {
         model: cfg.model(),
-        input: to_xai_responses_input(messages, cfg.model())?,
+        input: to_xai_responses_input(
+            messages,
+            cfg.model(),
+            &xai_responses_endpoint(cfg.base_url()),
+        )?,
         instructions: instructions.as_str(),
         store: false,
         stream: true,
@@ -1277,7 +1306,47 @@ mod tests {
         assert_eq!(stated.provider, "xai");
         assert_eq!(stated.protocol, "responses");
         assert_eq!(stated.model, "grok-test");
-        assert_eq!(stated.endpoint, Xai::responses_endpoint());
+        assert_eq!(stated.endpoint, Xai::default_responses_endpoint());
+    }
+
+    /// OAuth through a custom base URL uses the Responses path: the stated,
+    /// stamped and replay-checked endpoint is the one the request goes to.
+    #[test]
+    fn oauth_custom_base_url_states_and_stamps_its_own_endpoint() {
+        let mut provider = test_xai("key");
+        provider.base_url = Url::parse("https://proxy.example.test/xai/v1/").unwrap();
+        provider.auth_type = Some(AuthType::OAuth);
+        assert!(provider.should_use_responses_api());
+        let expected = "https://proxy.example.test/xai/v1/responses";
+
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("the Responses path stamps provenance");
+        assert_eq!(stated.endpoint, expected);
+
+        let mut parser = HTTPChatProvider::chat_stream_parser(&provider, serde_json::Value::Null)
+            .expect("stream parser");
+        let events = parser
+            .parse_chunk(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","model":"grok-test"}}
+
+"#,
+            )
+            .unwrap();
+        let stamped = events
+            .iter()
+            .find_map(|event| match event {
+                StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                    provenance: Some(provenance),
+                    ..
+                }) => Some(provenance.endpoint.clone()),
+                _ => None,
+            })
+            .expect("response metadata with provenance");
+        assert_eq!(stamped, expected);
+
+        let request = HTTPChatProvider::prepare_chat_request(&provider, &ChatCall::new(&[]), true)
+            .expect("request");
+        assert_eq!(request.request.uri().to_string(), expected);
     }
 
     #[test]
@@ -1839,7 +1908,7 @@ mod tests {
                         provider: "xai".into(),
                         protocol: "responses".into(),
                         model: "grok-test".into(),
-                        endpoint: Xai::responses_endpoint(),
+                        endpoint: Xai::default_responses_endpoint(),
                     },
                 },
             ),
@@ -1945,7 +2014,7 @@ mod tests {
                 provider: "xai".into(),
                 protocol: "responses".into(),
                 model: "grok-test".into(),
-                endpoint: Xai::responses_endpoint(),
+                endpoint: Xai::default_responses_endpoint(),
             }),
             items: vec![
                 ChatOutputItem::Reasoning(ChatReasoningItem {
@@ -2037,7 +2106,7 @@ mod tests {
                 provider: "xai".into(),
                 protocol: "responses".into(),
                 model: "grok-test".into(),
-                endpoint: Xai::responses_endpoint(),
+                endpoint: Xai::default_responses_endpoint(),
             }),
             items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
                 id: Some("rs_empty".to_string()),
@@ -2085,7 +2154,7 @@ mod tests {
                 provider: "xai".into(),
                 protocol: "responses".into(),
                 model: "grok-test".into(),
-                endpoint: Xai::responses_endpoint(),
+                endpoint: Xai::default_responses_endpoint(),
             }),
             items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
                 id: Some("rs_1".to_string()),

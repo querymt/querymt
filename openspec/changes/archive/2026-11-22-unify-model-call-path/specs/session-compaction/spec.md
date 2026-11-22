@@ -27,8 +27,8 @@ A provider error during a compaction request SHALL be handled by the rules of a 
 - **AND** the stored history is unchanged
 
 #### Scenario: Provider error with the summary budget at zero
-- **WHEN** `[agent.execution.compaction.retry]` `max_retries` is `0` and the compaction request fails once with a retryable provider error
-- **THEN** the request is retried and the summary is stored
+- **WHEN** `[agent.execution.compaction.retry]` `max_retries` is `0`, `[agent.execution.rate_limit]` `max_retries` allows a second request, and the compaction request fails once with a retryable provider error before the second request returns a valid summary
+- **THEN** the request is retried and the summary of the second request is stored
 
 #### Scenario: Retry wait during compaction is reported
 - **WHEN** a compaction request waits before a retry

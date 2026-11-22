@@ -585,44 +585,29 @@ impl LocalAgentHandle {
         let dispatch = crate::session::compaction::CompactionDispatch {
             provider: target.provider.clone(),
             config: &self.config,
-            // Stops the waits between retries; the race below stops a request
-            // in flight.
+            // The dispatcher watches it everywhere it waits (between retries,
+            // for a reply, between stream chunks) and settles the attempt in
+            // flight, with the usage seen so far, when it fires.
             cancel: cancel.token(),
             ledger: &ledger,
         };
-        let request = self
+        let result = self
             .config
             .compaction
-            .process(&messages, None, None, &dispatch);
-        // A cancelled summary drops the request: its attempt in flight is
-        // settled as cancelled and nothing has been created yet.
-        let outcome = tokio::select! {
-            biased;
-            () = cancel.token().cancelled() => None,
-            result = request => Some(result),
-        };
-        let result = match outcome {
-            Some(result) if !cancel.token().is_cancelled() => result
-                .map_err(|err| match ledger.operation.budget_refusal() {
-                    // Nothing was sent: say so, instead of blaming the provider.
-                    Some((cap, spent)) => failed(format!(
-                        "summary not requested: price limit reached: ${spent:.4} >= ${cap:.2}"
-                    )),
-                    None => failed(err.to_string()),
-                })
-                .and_then(|result| {
-                    crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
-                        .map(|()| result.summary)
-                        .map_err(|err| failed(err.to_string()))
-                }),
-            // Cancelled, including a cancel that arrived as the summary
-            // finished: the handoff has created nothing, so nothing is left
-            // behind.
-            _ => Err(WorktreeOpError::rejected(
-                "summary_cancelled",
-                "the handoff summary was cancelled; ownership is unchanged",
-            )),
-        };
+            .process(&messages, None, None, &dispatch)
+            .await
+            .map_err(|err| match ledger.operation.budget_refusal() {
+                // Nothing was sent: say so, instead of blaming the provider.
+                Some((cap, spent)) => failed(format!(
+                    "summary not requested: price limit reached: ${spent:.4} >= ${cap:.2}"
+                )),
+                None => failed(err.to_string()),
+            })
+            .and_then(|result| {
+                crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
+                    .map(|()| result.summary)
+                    .map_err(|err| failed(err.to_string()))
+            });
         // The previous owner was unloaded by quiesce, so no actor retires the
         // stream and accounting set up above. Release them now so no later
         // failure leaks them; a successful announcement reopens the stream.
@@ -630,6 +615,18 @@ impl LocalAgentHandle {
         drop(ledger);
         drop(cycle);
         self.config.event_sink.retire_session_stream(previous).await;
+        // The step stays cancellable until here: deregister it, then honour
+        // any cancel it accepted, including one that arrived as the summary
+        // finished or while the stream was retired. The handoff has created
+        // nothing, so nothing is left behind.
+        let token = cancel.token().clone();
+        drop(cancel);
+        if token.is_cancelled() {
+            return Err(WorktreeOpError::rejected(
+                "summary_cancelled",
+                "the handoff summary was cancelled; ownership is unchanged",
+            ));
+        }
         result.map(Some)
     }
 
