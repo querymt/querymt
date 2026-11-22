@@ -15,6 +15,7 @@ mod mesh_live;
 mod pins;
 pub(crate) mod plugins;
 pub(crate) mod setup;
+pub(crate) mod sidebar;
 pub(crate) mod worktree;
 
 use std::{collections::HashMap, rc::Rc, time::Duration};

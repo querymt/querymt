@@ -19,6 +19,7 @@ mod session_view;
 mod sessions;
 mod settings;
 mod setup;
+mod sidebar;
 mod smooth_scroll;
 mod start;
 mod turn_diff;
@@ -692,6 +693,28 @@ impl QmtApp {
     ) -> Stateful<Div> {
         let active = self.page == page;
         let store = self.store.read(cx);
+        // Agents in trouble (desktop `agentsNeedingAttention`): a dot that
+        // says which and why.
+        let trouble: Option<SharedString> = (page == Page::Agents)
+            .then(|| store.agents_needing_attention())
+            .filter(|list| !list.is_empty())
+            .map(|list| {
+                list.into_iter()
+                    .map(|(name, why)| format!("{name} {why}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into()
+            });
+        let trouble_dot = |t: SharedString| {
+            div()
+                .id("agents-attention")
+                .debug_selector(|| "agents-attention".into())
+                .flex_none()
+                .size(px(7.))
+                .rounded_full()
+                .bg(p.warn)
+                .tooltip(move |window, cx| kit::wrap_tip(t.clone()).build(window, cx))
+        };
         if store.prefs.sidebar_collapsed {
             let badge = match page {
                 Page::Inbox => Some((store.pending_request_count(), p.accent)),
@@ -723,14 +746,30 @@ impl QmtApp {
                         count.to_string()
                     })
             });
+            let tip: SharedString = match &trouble {
+                Some(t) => format!("{label}\n{t}").into(),
+                None => label.into(),
+            };
             return kit::rail_button(label, active, p)
-                .tooltip(move |window, cx| kit::wrap_tip(label).build(window, cx))
+                .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
                 .child(kit::icon(
                     icon,
                     18.,
                     if active { p.accent } else { p.muted },
                 ))
                 .children(badge)
+                .when_some(trouble, |el, t| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(1.))
+                            .right(px(1.))
+                            .p(px(1.5))
+                            .rounded_full()
+                            .bg(p.bg)
+                            .child(trouble_dot(t)),
+                    )
+                })
                 .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)));
         }
         // Flat list row on the shell background: selection is an accent tint
@@ -753,6 +792,7 @@ impl QmtApp {
                 if active { p.accent } else { p.muted },
             ))
             .child(div().flex_1().child(label))
+            .children(trouble.map(trouble_dot))
             .children(trailing)
             .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
     }
@@ -786,6 +826,7 @@ impl QmtApp {
             .collect();
         open.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         open.truncate(10);
+        let waiting = store.sessions_waiting();
         let separator = || {
             div()
                 .flex_none()
@@ -895,6 +936,21 @@ impl QmtApp {
                                             )),
                                     )
                                 })
+                                .when(
+                                    waiting.contains(&format!("{}/{}", s.agent_id, s.id)),
+                                    |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(1.))
+                                                .right(px(1.))
+                                                .p(px(1.5))
+                                                .rounded_full()
+                                                .bg(p.bg)
+                                                .child(sidebar::waiting_dot(&s.id, &p)),
+                                        )
+                                    },
+                                )
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_summary(&s, cx)),
                                 )
@@ -938,6 +994,8 @@ impl QmtApp {
             .cloned()
             .collect();
         pinned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let waiting = store.sessions_waiting();
+        let is_waiting = |s: &SessionSummary| waiting.contains(&format!("{}/{}", s.agent_id, s.id));
         let connected = store.connected_ids();
         let total = store.configs.len();
         let peers = connected
@@ -1072,6 +1130,9 @@ impl QmtApp {
                                     p.bg,
                                     p.bg.blend(hover_bg),
                                 ))
+                                .when(is_waiting(s), |el| {
+                                    el.child(sidebar::waiting_dot(&s.id, &p))
+                                })
                                 .when(s.running(), |el| {
                                     el.child(kit::spinner(
                                         kit::keyed("pin-spin", s.id.clone()),
@@ -1121,6 +1182,9 @@ impl QmtApp {
                                     .text_color(if current { p.text } else { p.muted })
                                     .when(current, |el| el.font_medium()),
                                 )
+                                .when(is_waiting(&s), |el| {
+                                    el.child(sidebar::waiting_dot(&s.id, &p))
+                                })
                                 .when(s.running(), |el| {
                                     el.child(kit::spinner(
                                         kit::keyed("sb-spin", s.id.clone()),
