@@ -4,6 +4,10 @@ use super::super::types::SymbolDigest;
 use super::safe_slice;
 use crate::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
 
+/// Deepest object nesting that yields child symbols. Deeper objects are listed without
+/// children, which bounds the recursion here and in every later conversion of the result.
+const MAX_NESTING: usize = 128;
+
 pub fn extract(source: &str) -> Result<Vec<SymbolEntry>, SymbolError> {
     let mut parser = Parser::new();
     parser
@@ -21,12 +25,12 @@ pub fn extract(source: &str) -> Result<Vec<SymbolEntry>, SymbolError> {
     if let Some(container) = root.named_children(&mut cursor).next()
         && container.kind() == "object"
     {
-        collect_pairs(&container, source, &mut symbols);
+        collect_pairs(&container, source, &mut symbols, 0);
     }
     Ok(symbols)
 }
 
-fn collect_pairs(object: &Node, source: &str, symbols: &mut Vec<SymbolEntry>) {
+fn collect_pairs(object: &Node, source: &str, symbols: &mut Vec<SymbolEntry>, depth: usize) {
     let mut cursor = object.walk();
     for pair in object.named_children(&mut cursor) {
         if pair.kind() != "pair" {
@@ -39,9 +43,9 @@ fn collect_pairs(object: &Node, source: &str, symbols: &mut Vec<SymbolEntry>) {
         let value = pair.child_by_field_name("value");
 
         let children = match &value {
-            Some(v) if v.kind() == "object" => {
+            Some(v) if v.kind() == "object" && depth < MAX_NESTING => {
                 let mut nested = Vec::new();
-                collect_pairs(v, source, &mut nested);
+                collect_pairs(v, source, &mut nested, depth + 1);
                 nested
             }
             _ => Vec::new(),

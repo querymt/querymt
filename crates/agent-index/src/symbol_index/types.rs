@@ -107,7 +107,7 @@ pub fn parse_kind_filter(value: &str) -> Result<Option<SymbolKind>, String> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolEntry {
     pub kind: SymbolKind,
     pub name: String,

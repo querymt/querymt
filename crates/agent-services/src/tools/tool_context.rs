@@ -95,6 +95,14 @@ pub trait ToolContext: Send + Sync {
         None
     }
 
+    /// The session's workspace code index cache, once the workspace index is ready.
+    ///
+    /// Symbol tools resolve symbols through it so unchanged files are not parsed again.
+    /// `None` (the default) means tools parse files directly.
+    fn workspace_index(&self) -> Option<querymt_agent_index::CodeCacheClient> {
+        None
+    }
+
     /// Durable session store, for tools that resolve persisted records.
     fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
         None

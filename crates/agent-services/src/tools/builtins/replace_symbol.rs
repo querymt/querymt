@@ -14,9 +14,9 @@ use crate::tools::{
     AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
     WrapRule, effective_root, resolve_arg_path,
 };
-use querymt_agent_index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
+use querymt_agent_index::symbol_index::{SymbolDigest, SymbolKind, parse_kind_filter};
 
-use super::helpers::{resolve_root, resolve_target};
+use super::helpers::{SymbolResolver, resolve_root, resolve_target};
 
 /// Compatibility spellings accepted inside `replacements` items (never advertised).
 const REPLACE_SYMBOL_ARG_ALIASES: &[ArgAlias] = &[
@@ -205,6 +205,7 @@ impl Tool for ReplaceSymbolTool {
             // Phase 1: Read all files and resolve all symbols.
             let mut file_contents: HashMap<PathBuf, String> = HashMap::new();
             let mut resolved: Vec<ResolvedReplacement> = Vec::new();
+            let mut resolver = SymbolResolver::new(context);
 
             for req in &requests {
                 let target = resolve_target("path", &req.path, &root)?;
@@ -224,7 +225,9 @@ impl Tool for ReplaceSymbolTool {
                     }
                 };
 
-                let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
+                let symbol_index = resolver
+                    .resolve(&target, &content)
+                    .await
                     .map_err(|e| ToolError::ProviderError(e.to_string()))?;
 
                 let matches = symbol_index.find_by_name(&req.symbol, req.kind);

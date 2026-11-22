@@ -19,6 +19,19 @@ pub fn extract_outline(
         .map_err(symbol_error_to_outline)
 }
 
+/// Project already-extracted symbols into outline sections.
+///
+/// Maps a symbol extraction failure to the same [`OutlineError`] that [`extract_outline`]
+/// reports for the same input.
+pub fn outline_from_symbols(
+    symbols: Result<SymbolIndex, SymbolError>,
+    options: &IndexOptions,
+) -> Result<Vec<Section>, OutlineError> {
+    symbols
+        .map(|index| symbols_to_sections(&index.symbols, options))
+        .map_err(symbol_error_to_outline)
+}
+
 fn symbol_error_to_outline(error: SymbolError) -> OutlineError {
     match error {
         SymbolError::Io(msg) => OutlineError::Io(msg),

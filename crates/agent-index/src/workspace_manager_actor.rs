@@ -3,6 +3,7 @@
 //! Manages a pool of `WorkspaceIndexActor` instances, one per workspace root.
 //! TTL-based eviction is performed on each `GetOrCreate` call.
 
+use super::code_cache::CodeIndexCacheOptions;
 use super::error::IndexError;
 use super::file_index::FileIndexConfig;
 use super::function_index::FunctionIndexConfig;
@@ -23,6 +24,8 @@ use std::time::{Duration, Instant};
 pub struct WorkspaceIndexManagerConfig {
     pub max_indexes: usize,
     pub idle_ttl: Duration,
+    /// Location, limits and schema version of each workspace's persistent code cache.
+    pub cache: CodeIndexCacheOptions,
 }
 
 impl Default for WorkspaceIndexManagerConfig {
@@ -30,6 +33,7 @@ impl Default for WorkspaceIndexManagerConfig {
         Self {
             max_indexes: 5,
             idle_ttl: Duration::from_secs(15 * 60),
+            cache: CodeIndexCacheOptions::default(),
         }
     }
 }
@@ -137,6 +141,7 @@ impl Message<GetOrCreate> for WorkspaceIndexManagerActor {
             root.clone(),
             FileIndexConfig::default(),
             FunctionIndexConfig::default(),
+            self.config.cache.clone(),
         )
         .await?;
 

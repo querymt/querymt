@@ -12,8 +12,9 @@ mod tests;
 
 pub use common::{IndexOptions, OutlineError, Section, SkeletonEntry};
 
+use crate::symbol_index::{SymbolError, SymbolIndex};
 use common::get_language_for_extension;
-use extractors::extract_outline;
+use extractors::{extract_outline, outline_from_symbols};
 use std::path::Path;
 
 /// Maximum file size (bytes) that the outline index will attempt to parse.
@@ -25,14 +26,7 @@ const DEFAULT_MAX_FILE_BYTES: usize = 1024 * 1024; // 1 MB
 /// each containing [`SkeletonEntry`] items with exact line ranges.
 pub fn index_file(path: &Path, options: &IndexOptions) -> Result<Vec<Section>, OutlineError> {
     let source = std::fs::read_to_string(path).map_err(|e| OutlineError::Io(e.to_string()))?;
-
-    let max_bytes = options.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES);
-    if source.len() > max_bytes {
-        return Err(OutlineError::FileTooLarge {
-            size: source.len(),
-            limit: max_bytes,
-        });
-    }
+    check_file_size(&source, options)?;
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -40,6 +34,22 @@ pub fn index_file(path: &Path, options: &IndexOptions) -> Result<Vec<Section>, O
         .ok_or_else(|| OutlineError::UnsupportedLanguage(ext.to_string()))?;
 
     index_source(&source, language, options)
+}
+
+/// Reject sources larger than the configured (or default 1 MB) outline limit.
+///
+/// # Errors
+///
+/// Returns [`OutlineError::FileTooLarge`] when `source` exceeds the limit.
+pub fn check_file_size(source: &str, options: &IndexOptions) -> Result<(), OutlineError> {
+    let max_bytes = options.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES);
+    if source.len() > max_bytes {
+        return Err(OutlineError::FileTooLarge {
+            size: source.len(),
+            limit: max_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// Produce a structural skeleton from source text and a known language name.
@@ -52,6 +62,22 @@ pub fn index_source(
     options: &IndexOptions,
 ) -> Result<Vec<Section>, OutlineError> {
     extract_outline(source, language, options)
+}
+
+/// Produce a structural skeleton from symbols that were already extracted, for example by the
+/// code cache.
+///
+/// The result equals [`index_source`] on the text the symbols came from, including the
+/// [`OutlineError`] mapping of a failed extraction.
+///
+/// # Errors
+///
+/// Returns the [`OutlineError`] corresponding to `symbols` when it is an `Err`.
+pub fn index_symbols(
+    symbols: Result<SymbolIndex, SymbolError>,
+    options: &IndexOptions,
+) -> Result<Vec<Section>, OutlineError> {
+    outline_from_symbols(symbols, options)
 }
 
 /// Format an outline as compact plain text suitable for LLM consumption.

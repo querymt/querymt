@@ -12,7 +12,7 @@ use crate::tools::{
 };
 use querymt_agent_index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
 
-use super::helpers::{parse_paths, resolve_root, resolve_target};
+use super::helpers::{SymbolResolver, parse_paths, resolve_root, resolve_target};
 
 pub struct GetFunctionTool;
 
@@ -100,12 +100,15 @@ impl Tool for GetFunctionTool {
         let root = resolve_root(&args, context)?;
 
         let mut file_results = Vec::new();
+        let mut resolver = SymbolResolver::new(context);
         for path_str in &path_strs {
             let target = resolve_target("path", path_str, &root)?;
             let content = tokio::fs::read_to_string(&target)
                 .await
                 .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {e}")))?;
-            let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
+            let symbol_index = resolver
+                .resolve(&target, &content)
+                .await
                 .map_err(|e| ToolError::ProviderError(e.to_string()))?;
 
             let mut symbol_results = Vec::new();

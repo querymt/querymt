@@ -22,4 +22,7 @@ pub enum IndexError {
     /// The parser thread pool could not be created.
     #[error("failed to build index thread pool: {0}")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
+    /// The code cache owner thread could not be started.
+    #[error("failed to start code cache thread: {0}")]
+    CacheThread(#[source] std::io::Error),
 }

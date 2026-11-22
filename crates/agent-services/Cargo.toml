@@ -71,6 +71,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
+querymt-agent-index = { path = "../agent-index", features = ["test-support"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
 rusqlite = { workspace = true, features = ["uuid", "time"] }

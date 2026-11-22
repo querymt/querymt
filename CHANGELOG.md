@@ -36,6 +36,19 @@
   providers implement it. The plugin contract is unchanged, so an Extism
   provider reports `None`.
 
+- **Persistent code index.** Workspace indexes now keep per-file symbols and
+  function entries in a disk cache under
+  `<platform cache dir>/querymt/code-index/<workspace hash>`, retaining at most
+  256 MiB of results (the files on disk may take up to twice that), 200,000
+  entries and 30 days idle. A restart parses only changed files, and
+  `index`, `get_symbol`, `get_function`, `replace_symbol` and
+  `find_symbol_references` reuse results for unchanged files with identical
+  output. A locked or unusable cache directory falls back to memory with a
+  warning; only damaged contents are deleted. Caches of workspaces not opened
+  for 30 days (such as removed worktrees) are deleted, the cache directory is
+  private to the user on Unix, and a change to the extractors or parser
+  grammars discards old results. Deleting the directory is safe.
+
 ### Behavior changes
 
 - **The replay identity of a stored reply comes from the provider.** The agent
@@ -275,6 +288,21 @@
   (unknown message part kind), like `notice` above.
 - **Compaction:** the summary is followed by the session's active task, so a
   compacted session keeps its task commitment.
+- **BREAKING (Rust API, `querymt-agent-index`):** `WorkspaceIndexManagerConfig`
+  gains a `cache: CodeIndexCacheOptions` field;
+  `WorkspaceIndexActor::create` takes a `CodeIndexCacheOptions` argument;
+  `WorkspaceHandle` gains `code_cache`; `WorkspaceIndexStats` gains
+  `parsed_files` and `reused_files`; `SymbolEntry` now implements `PartialEq`;
+  `FunctionIndexConfig::cache_path` and `with_cache_path` are removed. New:
+  `FunctionIndex::from_entries` / `set_file_entries`,
+  `outline_index::{index_symbols, check_file_size}` and the `code_cache`
+  types. In `querymt-agent-services`, `ToolContext::workspace_index()` (default
+  `None`), `AgentToolContext::with_workspace_index` and the builtin-tool
+  helper `SymbolResolver` are added.
+  `find_symbol_references` now lists files in walk order instead of an
+  arbitrary order, applies `max_results` to the total across all `paths`
+  (a directory after an earlier path is no longer skipped), and shows the
+  "Results capped" note when results were capped (it was never shown).
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /

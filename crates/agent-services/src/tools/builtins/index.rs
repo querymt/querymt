@@ -13,9 +13,11 @@ use crate::tools::{
     resolve_arg_path,
 };
 use querymt_agent_index::outline_index::common::get_language_for_extension;
-use querymt_agent_index::outline_index::{IndexOptions, OutlineError, format_outline, index_file};
+use querymt_agent_index::outline_index::{
+    IndexOptions, OutlineError, check_file_size, format_outline, index_symbols,
+};
 
-use super::helpers::{resolve_root, resolve_target};
+use super::helpers::{resolve_root, resolve_symbols, resolve_target};
 
 pub struct IndexTool;
 
@@ -146,7 +148,22 @@ impl ToolTrait for IndexTool {
             include_tests,
         };
 
-        let sections = index_file(&target, &options).map_err(|e| match e {
+        // Read the file and apply the size limit here, as `index_file` does, then resolve
+        // symbols through the workspace index (or directly) for the text just read.
+        let source = tokio::fs::read_to_string(&target)
+            .await
+            .map_err(|e| OutlineError::Io(e.to_string()));
+        let outline = match source {
+            Ok(source) => match check_file_size(&source, &options) {
+                Ok(()) => {
+                    let symbols = resolve_symbols(context, &target, &source).await;
+                    index_symbols(symbols, &options)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let sections = outline.map_err(|e| match e {
             OutlineError::UnsupportedLanguage(ext) => ToolError::InvalidRequest(format!(
                 "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua, svelte, sh, bash, php, kt, kts, swift, json, yaml, yml, toml, md, markdown",
                 ext

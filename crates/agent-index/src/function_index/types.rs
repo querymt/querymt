@@ -18,8 +18,6 @@ pub struct FunctionIndexConfig {
     pub similarity_threshold: f64,
     /// Minimum number of lines for a function to be indexed
     pub min_function_lines: u32,
-    /// Optional path for caching the index to disk
-    pub cache_path: Option<PathBuf>,
     /// Maximum source file size (in bytes) to index. Files larger than this are
     /// skipped to prevent stack overflows from deeply nested ASTs.
     pub max_file_bytes: usize,
@@ -30,7 +28,6 @@ impl Default for FunctionIndexConfig {
         Self {
             similarity_threshold: 0.8,
             min_function_lines: 5,
-            cache_path: None,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
@@ -44,11 +41,6 @@ impl FunctionIndexConfig {
 
     pub fn with_min_lines(mut self, min_lines: u32) -> Self {
         self.min_function_lines = min_lines;
-        self
-    }
-
-    pub fn with_cache_path(mut self, path: PathBuf) -> Self {
-        self.cache_path = Some(path);
         self
     }
 }

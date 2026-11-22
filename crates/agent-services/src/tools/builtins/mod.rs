@@ -1,5 +1,7 @@
 pub mod accept_delegation_result;
 pub mod browse;
+#[cfg(test)]
+mod code_index_tests;
 pub mod create_task;
 pub mod delete_file;
 pub mod edit;

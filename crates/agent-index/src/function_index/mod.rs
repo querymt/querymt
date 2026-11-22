@@ -13,4 +13,7 @@ mod tests;
 
 // Public API — unchanged from the old single-file module
 pub use core::FunctionIndex;
+pub(crate) use indexing::{
+    collect_source_files, get_language_category, index_file_entries, parse_pool,
+};
 pub use types::{FunctionIndexConfig, IndexedFunctionEntry, SimilarFunctionMatch};
