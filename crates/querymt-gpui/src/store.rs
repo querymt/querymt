@@ -502,6 +502,41 @@ pub struct ProviderAuth {
     pub preferred_method: Option<String>,
 }
 
+/// Auth ids of MCP server logins: `mcp:<server>` (desktop `isMcpAuthId`).
+const MCP_AUTH_PREFIX: &str = "mcp:";
+
+impl ProviderAuth {
+    /// An MCP server login, not a model provider.
+    pub fn is_mcp(&self) -> bool {
+        self.provider.starts_with(MCP_AUTH_PREFIX)
+    }
+}
+
+/// `_querymt/auth/status` entries split into model providers and MCP server
+/// logins (desktop `splitAuthEntries`).
+fn parse_auth_status(v: &Value) -> (Vec<ProviderAuth>, Vec<ProviderAuth>) {
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let flag = |p: &Value, k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
+    v.get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let provider = text(p, "provider")?;
+            Some(ProviderAuth {
+                display_name: text(p, "display_name").unwrap_or_else(|| provider.clone()),
+                provider,
+                oauth_status: text(p, "oauth_status"),
+                has_stored_api_key: flag(p, "has_stored_api_key"),
+                has_env_api_key: flag(p, "has_env_api_key"),
+                env_var_name: text(p, "env_var_name"),
+                supports_oauth: flag(p, "supports_oauth"),
+                preferred_method: text(p, "preferred_method"),
+            })
+        })
+        .partition(|p| !p.is_mcp())
+}
+
 /// Profile id that lets the agent use its active profile.
 pub const DEFAULT_PROFILE: &str = "default";
 
@@ -1157,7 +1192,11 @@ pub struct AgentRuntime {
     pub mesh_invites: Vec<MeshInvite>,
     /// URL of the invite created most recently in this app session.
     pub last_invite: Option<String>,
+    /// Model providers of `_querymt/auth/status`.
     pub providers: Vec<ProviderAuth>,
+    /// MCP server logins (`mcp:<server>`) of `_querymt/auth/status`: they
+    /// share the auth methods but are not model providers.
+    pub mcp_servers: Vec<ProviderAuth>,
     /// `_querymt/auth/status` answered since connecting.
     pub providers_loaded: bool,
     /// Why the last `_querymt/auth/status` failed.
@@ -5242,27 +5281,7 @@ async fn load_extras(
             rt.providers_loaded = true;
             rt.providers_error = auth.as_ref().err().map(ToString::to_string);
             if let Ok(v) = auth {
-                let flag = |p: &Value, k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
-                rt.providers = v
-                    .get("providers")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| {
-                        let provider = text(p, "provider")?;
-                        Some(ProviderAuth {
-                            display_name: text(p, "display_name")
-                                .unwrap_or_else(|| provider.clone()),
-                            provider,
-                            oauth_status: text(p, "oauth_status"),
-                            has_stored_api_key: flag(p, "has_stored_api_key"),
-                            has_env_api_key: flag(p, "has_env_api_key"),
-                            env_var_name: text(p, "env_var_name"),
-                            supports_oauth: flag(p, "supports_oauth"),
-                            preferred_method: text(p, "preferred_method"),
-                        })
-                    })
-                    .collect();
+                (rt.providers, rt.mcp_servers) = parse_auth_status(&v);
             }
             if let Ok(v) = profiles {
                 rt.profiles = parse_profiles(&v);
