@@ -339,6 +339,8 @@ pub struct QmtApp {
     workspace: Entity<workspace_select::WorkspaceField>,
     /// Full-size log viewer (agent logs).
     log_view: log_view::LogView,
+    /// Sidebar session tabs: paging, dragging, the right-click menu.
+    side: sidebar::SideUi,
     _subs: Vec<Subscription>,
 }
 
@@ -558,6 +560,7 @@ impl QmtApp {
             dismissed: kit::Dismissed::default(),
             workspace,
             log_view,
+            side: Default::default(),
             _subs: subs,
         };
         this.watch_first_run(cx);
@@ -622,6 +625,9 @@ impl QmtApp {
     /// Close the top-most overlay. Returns whether one was open.
     fn close_topmost(&mut self) -> bool {
         if self.preview.take().is_some() || std::mem::take(&mut self.palette_open) {
+            return true;
+        }
+        if self.side.menu.take().is_some() {
             return true;
         }
         if self.close_log_view() {
@@ -817,16 +823,15 @@ impl QmtApp {
 
     fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
-        let store = self.store.read(cx);
-        let mut open: Vec<SessionSummary> = store
-            .all_sessions()
-            .into_iter()
-            .filter(|s| s.root && s.open)
-            .cloned()
-            .collect();
-        open.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        open.truncate(10);
-        let waiting = store.sessions_waiting();
+        // Pinned then open, in their tab order (see `sidebar_shown`).
+        let open = self.sidebar_shown(cx).open;
+        let waiting = self.store.read(cx).sessions_waiting();
+        let current_tab = self
+            .store
+            .read(cx)
+            .session
+            .as_ref()
+            .map(|v| format!("{}/{}", v.agent_id, v.session_id));
         let separator = || {
             div()
                 .flex_none()
@@ -901,14 +906,24 @@ impl QmtApp {
                             .w_full()
                             .items_center()
                             .gap_1p5()
-                            .children(open.into_iter().map(|s| {
+                            .children(open.into_iter().enumerate().map(|(ix, s)| {
+                                let key = crate::store::sidebar::tab_key(&s);
                                 let current = self.page == Page::Session
-                                    && store.session.as_ref().is_some_and(|v| {
-                                        v.agent_id == s.agent_id && v.session_id == s.id
-                                    });
-                                let title =
-                                    format!("{}\n{}", s.display_title(), workspace_name(&s.cwd));
-                                kit::rail_button(
+                                    && current_tab.as_deref() == Some(key.as_str());
+                                let is_waiting = waiting.contains(&key);
+                                let title = format!(
+                                    "{}\n{}{}",
+                                    s.display_title(),
+                                    workspace_name(&s.cwd),
+                                    if is_waiting { "\nWaiting for you" } else { "" }
+                                );
+                                let list =
+                                    if s.pinned && self.store.read(cx).prefs.show_pinned_sidebar {
+                                        crate::store::sidebar::SideList::Pinned
+                                    } else {
+                                        crate::store::sidebar::SideList::Open
+                                    };
+                                let tile = kit::rail_button(
                                     SharedString::from(format!(
                                         "rail-session-{}-{}",
                                         s.agent_id, s.id
@@ -936,24 +951,25 @@ impl QmtApp {
                                             )),
                                     )
                                 })
-                                .when(
-                                    waiting.contains(&format!("{}/{}", s.agent_id, s.id)),
-                                    |el| {
-                                        el.child(
-                                            div()
-                                                .absolute()
-                                                .bottom(px(1.))
-                                                .right(px(1.))
-                                                .p(px(1.5))
-                                                .rounded_full()
-                                                .bg(p.bg)
-                                                .child(sidebar::waiting_dot(&s.id, &p)),
-                                        )
-                                    },
-                                )
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.open_summary(&s, cx)),
-                                )
+                                .when(is_waiting, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(1.))
+                                            .right(px(1.))
+                                            .p(px(1.5))
+                                            .rounded_full()
+                                            .bg(p.bg)
+                                            .child(sidebar::waiting_dot(&s.id, &p)),
+                                    )
+                                });
+                                let s2 = s.clone();
+                                self.tab_row(tile, list, ix, &s, sidebar::TabLook::Tile, 6., &p, cx)
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_summary(&s2, cx)
+                                        }),
+                                    )
                             })),
                     )
                     .child(separator())
@@ -981,36 +997,44 @@ impl QmtApp {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.store.read(cx).prefs.sidebar_collapsed {
-            return self.render_sidebar_rail(cx);
-        }
+        // The right-click menu floats over everything; it lives here so it
+        // shows on every page.
+        let menu = self.render_side_menu(cx);
+        let bar = if self.store.read(cx).prefs.sidebar_collapsed {
+            self.render_sidebar_rail(cx)
+        } else {
+            self.render_sidebar_full(cx)
+        };
+        h_flex()
+            .flex_none()
+            .h_full()
+            .child(bar)
+            .children(menu)
+            .into_any_element()
+    }
+
+    fn render_sidebar_full(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
         let show_pinned = self.store.read(cx).prefs.show_pinned_sidebar;
+        // Tab order, within the shown limits (see `sidebar_shown`).
+        let sidebar::Shown {
+            pinned,
+            pinned_total,
+            open,
+            open_total,
+        } = self.sidebar_shown(cx);
+        let waiting = self.store.read(cx).sessions_waiting();
+        let current_tab = (self.page == Page::Session)
+            .then(|| self.store.read(cx).session.as_ref())
+            .flatten()
+            .map(|v| format!("{}/{}", v.agent_id, v.session_id));
         let store = self.store.read(cx);
-        let mut pinned: Vec<SessionSummary> = store
-            .all_sessions()
-            .into_iter()
-            .filter(|s| s.root && s.pinned && !s.archived)
-            .cloned()
-            .collect();
-        pinned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let waiting = store.sessions_waiting();
-        let is_waiting = |s: &SessionSummary| waiting.contains(&format!("{}/{}", s.agent_id, s.id));
         let connected = store.connected_ids();
         let total = store.configs.len();
         let peers = connected
             .iter()
             .filter_map(|id| store.runtime(id)?.mesh.as_ref().map(|m| m.peers))
             .max();
-        let mut open: Vec<SessionSummary> = store
-            .all_sessions()
-            .into_iter()
-            .filter(|s| s.root && s.open && !(show_pinned && s.pinned))
-            .cloned()
-            .collect();
-        open.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let open_total = open.len();
-        open.truncate(16);
         let any_connecting = store.configs.iter().any(|c| {
             store.state(&c.id) == ConnState::Connecting
                 || store
@@ -1050,6 +1074,156 @@ impl QmtApp {
             )
             .child(div().text_color(p.dim).child(format!(" / {total}")))
             .into_any_element();
+
+        // Rows are built first: they borrow `cx` for their listeners.
+        let pinned_shown = show_pinned && !pinned.is_empty();
+        let pinned_more = pinned_total.saturating_sub(pinned.len());
+        let open_empty = open.is_empty();
+        let pinned_rows: Vec<AnyElement> = pinned
+            .iter()
+            .enumerate()
+            .map(|(ix, s)| {
+                let hover_bg = p.card_hover;
+                let key = crate::store::sidebar::tab_key(s);
+                let current = current_tab.as_deref() == Some(key.as_str());
+                let group = SharedString::from(format!("pinned-session-title-{}", s.id));
+                let background = if current {
+                    p.bg.blend(p.accent_dim)
+                } else {
+                    p.bg
+                };
+                let row = h_flex()
+                    .id(kit::keyed("pinned-session", s.id.clone()))
+                    .group(group.clone())
+                    .gap_2()
+                    .px_2()
+                    .h(px(28.))
+                    .rounded(px(8.))
+                    .text_color(if current { p.text } else { p.muted })
+                    .when(current, |el| el.bg(p.accent_dim))
+                    .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
+                    .cursor_pointer()
+                    .child(kit::identicon(&s.id, 14.))
+                    .child(kit::fading_title(
+                        s.display_title(),
+                        group,
+                        background,
+                        if current {
+                            background
+                        } else {
+                            p.bg.blend(hover_bg)
+                        },
+                    ))
+                    .when(waiting.contains(&key), |el| {
+                        el.child(sidebar::waiting_dot(&s.id, &p))
+                    })
+                    .when(s.running(), |el| {
+                        el.child(kit::spinner(
+                            kit::keyed("pin-spin", s.id.clone()),
+                            12.,
+                            p.success,
+                        ))
+                    });
+                let s2 = s.clone();
+                self.tab_row(
+                    row,
+                    crate::store::sidebar::SideList::Pinned,
+                    ix,
+                    s,
+                    sidebar::TabLook::Pinned,
+                    1.,
+                    &p,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
+                .into_any_element()
+            })
+            .collect();
+        let open_rows: Vec<AnyElement> = open
+            .iter()
+            .enumerate()
+            .map(|(ix, s)| {
+                let hover_bg = p.card_hover;
+                let key = crate::store::sidebar::tab_key(s);
+                let current = current_tab.as_deref() == Some(key.as_str());
+                let s2 = s.clone();
+                let group = SharedString::from(format!("open-session-title-{}", s.id));
+                let background = if current {
+                    p.bg.blend(p.accent_dim)
+                } else {
+                    p.bg
+                };
+                let row = v_flex()
+                    .id(kit::keyed("open-session", s.id.clone()))
+                    .group(group.clone())
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1p5()
+                    .gap_0p5()
+                    .rounded(px(8.))
+                    .when(current, |el| el.bg(p.accent_dim))
+                    .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                kit::fading_title(
+                                    s.display_title(),
+                                    group,
+                                    background,
+                                    if current {
+                                        background
+                                    } else {
+                                        p.bg.blend(hover_bg)
+                                    },
+                                )
+                                .text_color(if current { p.text } else { p.muted })
+                                .when(current, |el| el.font_medium()),
+                            )
+                            .when(waiting.contains(&key), |el| {
+                                el.child(sidebar::waiting_dot(&s.id, &p))
+                            })
+                            .when(s.running(), |el| {
+                                el.child(kit::spinner(
+                                    kit::keyed("sb-spin", s.id.clone()),
+                                    13.,
+                                    p.success,
+                                ))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(p.dim)
+                            .child(kit::identicon(&s.id, 14.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(workspace_name(&s.cwd)),
+                            )
+                            .child(div().flex_none().child(short_time(&s.updated_at))),
+                    );
+                self.tab_row(
+                    row,
+                    crate::store::sidebar::SideList::Open,
+                    ix,
+                    s,
+                    sidebar::TabLook::Open {
+                        workspace: workspace_name(&s.cwd).into(),
+                        time: short_time(&s.updated_at).into(),
+                    },
+                    1.,
+                    &p,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
+                .into_any_element()
+            })
+            .collect();
+        let open_more = open_total > open.len();
 
         // "Open sessions" doubles as a link to the full list; the count on the
         // right tells how many there are beyond the rows that fit here.
@@ -1091,8 +1265,11 @@ impl QmtApp {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
+                .track_scroll(&self.side.scroll)
+                // The next page of open sessions loads near the end (desktop rail).
+                .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| this.sidebar_near_bottom(cx)))
                 .gap_px()
-                .when(open.is_empty(), |el| {
+                .when(open_empty, |el| {
                     el.child(div().px_2().py_1().text_xs().text_color(p.dim).child(
                         if any_connecting {
                             "Loading sessions…"
@@ -1103,112 +1280,37 @@ impl QmtApp {
                         },
                     ))
                 })
-                .when(show_pinned && !pinned.is_empty(), |el| {
+                .when(pinned_shown, |el| {
                     el.child(section("Pinned"))
-                        .children(pinned.iter().map(|s| {
-                            let hover_bg = p.card_hover;
-                            let group =
-                                SharedString::from(format!("pinned-session-title-{}", s.id));
-                            h_flex()
-                                .id(kit::keyed("pinned-session", s.id.clone()))
-                                .group(group.clone())
-                                .gap_2()
-                                .px_2()
-                                .h(px(28.))
-                                .rounded(px(8.))
-                                .text_color(p.muted)
-                                .hover(move |el| el.bg(hover_bg))
-                                .cursor_pointer()
-                                .on_click({
-                                    let s = s.clone();
-                                    cx.listener(move |this, _, _, cx| this.open_summary(&s, cx))
-                                })
-                                .child(kit::identicon(&s.id, 14.))
-                                .child(kit::fading_title(
-                                    s.display_title(),
-                                    group,
-                                    p.bg,
-                                    p.bg.blend(hover_bg),
-                                ))
-                                .when(is_waiting(s), |el| {
-                                    el.child(sidebar::waiting_dot(&s.id, &p))
-                                })
-                                .when(s.running(), |el| {
-                                    el.child(kit::spinner(
-                                        kit::keyed("pin-spin", s.id.clone()),
-                                        12.,
-                                        p.success,
-                                    ))
-                                })
-                        }))
+                        .children(pinned_rows)
+                        .when(pinned_more > 0, |el| {
+                            el.child(
+                                div()
+                                    .id("sidebar-more-pinned")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(8.))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(p.dim)
+                                    .hover(move |s| s.bg(p.card_hover).text_color(p.muted))
+                                    .child(format!("Show more pinned ({pinned_more})"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.side.pinned_limit += sidebar::PINNED_PAGE;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                         .child(open_header())
                 })
-                .children(open.into_iter().map(|s| {
-                    let hover_bg = p.card_hover;
-                    let current = self.page == Page::Session
-                        && store.session.as_ref().is_some_and(|v| v.session_id == s.id);
-                    let s2 = s.clone();
-                    let group = SharedString::from(format!("open-session-title-{}", s.id));
-                    let background = if current {
-                        p.bg.blend(p.accent_dim)
-                    } else {
-                        p.bg
-                    };
-                    v_flex()
-                        .id(kit::keyed("open-session", s.id.clone()))
-                        .group(group.clone())
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
-                        .px_2()
-                        .py_1p5()
-                        .gap_0p5()
-                        .rounded(px(8.))
-                        .when(current, |el| el.bg(p.accent_dim))
-                        .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    kit::fading_title(
-                                        s.display_title(),
-                                        group,
-                                        background,
-                                        if current {
-                                            background
-                                        } else {
-                                            p.bg.blend(hover_bg)
-                                        },
-                                    )
-                                    .text_color(if current { p.text } else { p.muted })
-                                    .when(current, |el| el.font_medium()),
-                                )
-                                .when(is_waiting(&s), |el| {
-                                    el.child(sidebar::waiting_dot(&s.id, &p))
-                                })
-                                .when(s.running(), |el| {
-                                    el.child(kit::spinner(
-                                        kit::keyed("sb-spin", s.id.clone()),
-                                        13.,
-                                        p.success,
-                                    ))
-                                }),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .text_xs()
-                                .text_color(p.dim)
-                                .child(kit::identicon(&s.id, 14.))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(workspace_name(&s.cwd)),
-                                )
-                                .child(div().flex_none().child(short_time(&s.updated_at))),
-                        )
-                }));
+                .children(open_rows)
+                .when(open_more, |el| {
+                    el.child(h_flex().justify_center().py_2().child(kit::spinner(
+                        "sidebar-more-open",
+                        12.,
+                        p.dim,
+                    )))
+                });
 
         // No card: the sidebar is a column of the window chrome, on the same
         // `p.bg` plane as the title bar and the collapsed rail. The 9px gutter
@@ -1291,9 +1393,7 @@ impl QmtApp {
                         cx,
                     ))
                     .child(div().pt_3().child(hairline()))
-                    .when(!(show_pinned && !pinned.is_empty()), |el| {
-                        el.child(open_header())
-                    })
+                    .when(!pinned_shown, |el| el.child(open_header()))
                     .child(sessions_list)
                     .child(div().pt_1().pb_1().child(hairline()))
                     .child(
@@ -1390,6 +1490,12 @@ impl Render for QmtApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *palette(cx);
         let render_started = crate::util::now_ms();
+        // Sessions that came and went since the last frame take or leave
+        // their place in the sidebar.
+        self.store.update(cx, |s, _| s.sync_sidebar_order());
+        if self.side.drop_target.is_some() && !cx.has_active_drag() {
+            self.side.drop_target = None;
+        }
         let body = match self.page {
             Page::Start => self.render_start(cx).into_any_element(),
             Page::Sessions => self.render_sessions(cx).into_any_element(),
