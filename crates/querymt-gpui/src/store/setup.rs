@@ -376,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_in_mcp_server_is_not_a_provider() {
+        let mut rt = auth_agent();
+        let status = json!({ "providers": [
+            { "provider": "mcp:linear", "display_name": "mcp:linear", "oauth_status": "connected", "supports_oauth": true },
+            { "provider": "openai", "display_name": "OpenAI", "oauth_status": "not_authenticated" }
+        ]});
+        (rt.providers, rt.mcp_servers) = super::super::parse_auth_status(&status);
+        assert_eq!(rt.providers.len(), 1);
+        assert_eq!(rt.mcp_servers.len(), 1);
+        assert_eq!(rt.mcp_servers[0].provider, "mcp:linear");
+        let r = store(ConnState::Connected, rt).readiness();
+        assert_eq!(r.check(CheckId::Providers).status, CheckStatus::Blocked);
+    }
+
+    #[test]
     fn ready_once_a_model_is_chosen() {
         let mut rt = auth_agent();
         rt.providers = vec![ProviderAuth {
