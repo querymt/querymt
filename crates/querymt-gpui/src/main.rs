@@ -14,6 +14,7 @@
 mod highlight;
 mod profile_templates;
 mod rpc;
+mod rpc_log;
 mod session;
 mod store;
 mod telemetry;
