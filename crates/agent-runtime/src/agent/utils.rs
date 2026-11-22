@@ -159,37 +159,31 @@ pub(crate) mod genai {
         });
     }
 
-    /// Keep only typed successful summaries, projected alongside the effective history.
-    /// Canonical assistant output supersedes legacy parts, including compaction parts.
-    pub(crate) fn compaction_summaries(
-        history: &[AgentMessage],
-        projected: &[ChatMessage],
-    ) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .zip(projected)
-            .filter(|(message, _)| {
-                message.parts.iter().any(|part| {
-                    matches!(part, MessagePart::Compaction { summary, .. } if !summary.trim().is_empty())
-                }) && !(message.role == ChatRole::Assistant
-                    && message.parts.iter().any(|part| matches!(part, MessagePart::Output { .. })))
-            })
-            .map(|(_, projected)| projected.clone())
-            .collect()
-    }
-
+    /// Mark the span when the request carries a typed successful compaction
+    /// summary of the stored history. Canonical assistant output supersedes
+    /// legacy parts, including compaction parts.
     pub(crate) fn conversation_compacted(
         span: &Span,
-        summaries: &[ChatMessage],
+        history: &[AgentMessage],
         messages: &[ChatMessage],
     ) {
         // Hooks/middleware can replace the final request; cache hints are not content.
-        if summaries.iter().any(|summary| {
-            messages.iter().any(|message| {
+        let summaries = history.iter().filter(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, MessagePart::Compaction { summary, .. } if !summary.trim().is_empty())
+            }) && !(message.role == ChatRole::Assistant
+                && message.parts.iter().any(|part| matches!(part, MessagePart::Output { .. })))
+        });
+        for summary in summaries {
+            let Ok(summary) = summary.to_chat_message() else {
+                continue;
+            };
+            if messages.iter().any(|message| {
                 message.role == summary.role && message.payload() == summary.payload()
-            })
-        }) {
-            span.set_attribute("gen_ai.conversation.compacted", true);
+            }) {
+                span.set_attribute("gen_ai.conversation.compacted", true);
+                return;
+            }
         }
     }
 
@@ -561,9 +555,11 @@ pub(crate) mod genai {
             );
     }
 
-    pub(crate) fn llm_error(error: &LLMError) {
-        let error_type = match error {
-            LLMError::Cancelled => return,
+    /// The low-cardinality `error.type` of a failed model call. A cancellation
+    /// is not a failure and has none.
+    fn llm_error_type(error: &LLMError) -> Option<&'static str> {
+        Some(match error {
+            LLMError::Cancelled => return None,
             LLMError::AuthError(_) => "authentication",
             LLMError::RateLimited { .. } => "rate_limited",
             LLMError::InvalidRequest(_) => "invalid_request",
@@ -573,8 +569,75 @@ pub(crate) mod genai {
                 "transport"
             }
             _ => "provider_error",
-        };
-        self::error(error_type);
+        })
+    }
+
+    pub(crate) fn llm_error(error: &LLMError) {
+        if let Some(error_type) = llm_error_type(error) {
+            self::error(error_type);
+        }
+    }
+
+    /// Name of the attribute and of the per-attempt span event.
+    const REQUEST_ATTEMPT: &str = "gen_ai.request.attempt";
+
+    /// Attempts made for one model request, recorded on its `chat` span.
+    ///
+    /// The span carries `gen_ai.request.attempt` with the number of attempts
+    /// started so far (set when an attempt starts, so it is right even if the
+    /// attempt is dropped), and one event of the same name per attempt that
+    /// ended, in order. A failed attempt's event carries `error.type`, never
+    /// the error message, which can echo endpoints or credentials. A cancelled
+    /// attempt adds no event. Clones share one counter.
+    #[derive(Clone)]
+    pub(crate) struct RequestAttempts {
+        span: Span,
+        count: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    impl RequestAttempts {
+        pub(crate) fn new(span: &Span) -> Self {
+            Self {
+                span: span.clone(),
+                count: std::sync::Arc::default(),
+            }
+        }
+
+        /// An attempt is about to be sent.
+        pub(crate) fn start(&self) {
+            let attempt = self
+                .count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            self.span.set_attribute(REQUEST_ATTEMPT, attempt);
+        }
+
+        /// The current attempt produced a response.
+        pub(crate) fn succeeded(&self) {
+            self.event(None);
+        }
+
+        /// The current attempt produced a response the caller rejected as
+        /// output (empty, refused, cut off): an error, but not a provider one.
+        pub(crate) fn rejected(&self) {
+            self.event(Some("output_rejected"));
+        }
+
+        /// The current attempt failed with `error`.
+        pub(crate) fn failed(&self, error: &LLMError) {
+            if let Some(error_type) = llm_error_type(error) {
+                self.event(Some(error_type));
+            }
+        }
+
+        fn event(&self, error_type: Option<&'static str>) {
+            let attempt = self.count.load(std::sync::atomic::Ordering::Relaxed);
+            let mut attributes = vec![opentelemetry::KeyValue::new(REQUEST_ATTEMPT, attempt)];
+            if let Some(error_type) = error_type {
+                attributes.push(opentelemetry::KeyValue::new("error.type", error_type));
+            }
+            self.span.add_event(REQUEST_ATTEMPT, attributes);
+        }
     }
 
     pub(crate) fn output(output: &ChatOutput) {

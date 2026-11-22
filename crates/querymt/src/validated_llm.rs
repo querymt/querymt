@@ -110,6 +110,10 @@ impl ChatProvider for ValidatedLLM {
         self.inner.capabilities()
     }
 
+    fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+        self.inner.output_provenance()
+    }
+
     /// Sends a chat request and validates the response.
     ///
     /// If validation fails, retries with feedback to the model about the

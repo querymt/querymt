@@ -192,6 +192,16 @@ impl AttemptOperation {
         &self.identity.operation_id
     }
 
+    /// The session that initiated this operation (the cycle's session).
+    pub fn session_id(&self) -> &str {
+        &self.identity.session_id
+    }
+
+    /// The model every attempt of this operation is recorded against.
+    pub fn model(&self) -> &str {
+        &self.identity.model
+    }
+
     /// Request-end accounting detail for this operation's attempts so far.
     pub fn request_accounting(&self) -> super::RequestAccounting {
         let totals = self.totals();
@@ -509,6 +519,18 @@ impl ActiveAttempt {
         .await
     }
 
+    /// The attempt was cancelled before its provider request was first
+    /// polled: nothing was sent, so nothing can have been billed.
+    pub async fn settle_cancelled_before_send(self) -> Result<(), AccountingError> {
+        self.settle(
+            UsageDisposition::NotSent,
+            AttemptOutcome::Cancelled,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// The attempt ended in a provider/transport error or cancellation.
     pub async fn settle_error(
         mut self,
@@ -774,6 +796,26 @@ mod tests {
         let t = totals(&acct);
         assert_eq!((t.unresolved_attempts, t.priced_attempts), (0, 1));
         assert!((t.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_send_settles_with_no_charge() {
+        let (op, acct) = fixture().await;
+        let attempt = op
+            .begin(DispatchMode::NonStreaming, metered())
+            .await
+            .unwrap();
+        attempt.settle_cancelled_before_send().await.unwrap();
+        let t = totals(&acct);
+        assert_eq!(
+            (
+                t.unresolved_attempts,
+                t.priced_attempts,
+                t.incomplete_attempts
+            ),
+            (0, 0, 0),
+            "nothing was sent: settled, free and not uncertain"
+        );
     }
 
     /// One session accounting shared by one operation per budget snapshot,

@@ -335,14 +335,62 @@ async fn worktree_fixture_inner(
     default_baseline: crate::worktree::BaselineMode,
     reject_announcements: bool,
 ) -> WorktreeExtFixture {
+    worktree_fixture_tweaked(
+        configure_service,
+        default_baseline,
+        reject_announcements,
+        |_| {},
+    )
+    .await
+}
+
+/// Like [`worktree_fixture`] with a service, after `tweak` edited the built
+/// agent configuration (its execution policy, its middleware).
+async fn worktree_fixture_with_config(tweak: impl FnOnce(&mut AgentConfig)) -> WorktreeExtFixture {
+    worktree_fixture_tweaked(true, crate::worktree::BaselineMode::Commit, false, tweak).await
+}
+
+async fn worktree_fixture_tweaked(
+    configure_service: bool,
+    default_baseline: crate::worktree::BaselineMode,
+    reject_announcements: bool,
+    tweak: impl FnOnce(&mut AgentConfig),
+) -> WorktreeExtFixture {
+    worktree_fixture_built(
+        configure_service,
+        default_baseline,
+        reject_announcements,
+        None,
+        tweak,
+    )
+    .await
+}
+
+/// [`worktree_fixture_tweaked`] with `factory` serving the `mock` provider
+/// instead of the scripted mock.
+async fn worktree_fixture_built(
+    configure_service: bool,
+    default_baseline: crate::worktree::BaselineMode,
+    reject_announcements: bool,
+    factory_override: Option<Arc<dyn querymt::plugin::LLMProviderFactory>>,
+    tweak: impl FnOnce(&mut AgentConfig),
+) -> WorktreeExtFixture {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     let llm = provider.clone();
     let shared = SharedLlmProvider {
         inner: provider,
         tools: vec![].into_boxed_slice(),
     };
-    let factory = Arc::new(TestProviderFactory::new(shared));
-    let (plugin_registry, plugin_dir) = mock_plugin_registry(factory).expect("plugin registry");
+    let (plugin_registry, plugin_dir) = match factory_override {
+        Some(factory) => {
+            let dir = tempfile::TempDir::new().unwrap();
+            let registry = crate::test_utils::mock_plugin_registry_for(dir.path(), factory)
+                .expect("plugin registry");
+            (registry, dir)
+        }
+        None => mock_plugin_registry(Arc::new(TestProviderFactory::new(shared)))
+            .expect("plugin registry"),
+    };
 
     let storage = Arc::new(
         crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
@@ -383,7 +431,9 @@ async fn worktree_fixture_inner(
     if configure_service {
         builder = builder.with_workspace_service(service.clone());
     }
-    let handle = LocalAgentHandle::from_config(Arc::new(builder.build()));
+    let mut config = builder.build();
+    tweak(&mut config);
+    let handle = LocalAgentHandle::from_config(Arc::new(config));
     WorktreeExtFixture {
         handle,
         service,
@@ -1871,6 +1921,234 @@ async fn handoff_summary_failure_creates_nothing_and_keeps_ownership() {
         f.service.registry().transferred_to(&owner).await.unwrap(),
         None
     );
+}
+
+/// The handoff summary is sent where `[agent.execution.compaction]` says, as
+/// any compaction is: a provider without a model is refused before a request.
+#[tokio::test]
+async fn handoff_summary_follows_the_compaction_policy_and_sends_nothing_when_refused() {
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture_with_config(|config| {
+        config.execution_policy.compaction.provider = Some("other".into());
+    })
+    .await;
+    f.llm.lock().await.expect_chat().times(0);
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &owner).await;
+
+    let err = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(owner),
+            HandoffOptions {
+                name: None,
+                summary: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), "summary_failed");
+    assert!(
+        err.to_string().contains("needs a compaction model"),
+        "{err}"
+    );
+}
+
+/// A budget refusal of the handoff summary says so instead of blaming the
+/// provider, and nothing is sent.
+#[tokio::test]
+async fn handoff_summary_reports_a_price_limit_refusal() {
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture_with_config(|config| {
+        // A zero cap is already reached by a cycle with no spend.
+        config
+            .middleware_drivers
+            .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                crate::middleware::LimitsConfig::default().max_price_usd(0.0),
+            )));
+    })
+    .await;
+    f.llm.lock().await.expect_chat().times(0);
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &owner).await;
+
+    let err = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(owner),
+            HandoffOptions {
+                name: None,
+                summary: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), "summary_failed");
+    assert!(err.to_string().contains("price limit reached"), "{err}");
+}
+
+/// A provider whose chat request never answers; it says when one arrives.
+struct HangingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl querymt::chat::ChatProvider for HangingProvider {
+    async fn chat(
+        &self,
+        _call: &querymt::chat::ChatCall<'_>,
+    ) -> Result<querymt::chat::ChatOutput, querymt::error::LLMError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::completion::CompletionProvider for HangingProvider {
+    async fn complete(
+        &self,
+        _req: &querymt::completion::CompletionRequest,
+    ) -> Result<querymt::completion::CompletionResponse, querymt::error::LLMError> {
+        Err(querymt::error::LLMError::NotImplemented(
+            "completion".into(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::embedding::EmbeddingProvider for HangingProvider {
+    async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, querymt::error::LLMError> {
+        Err(querymt::error::LLMError::NotImplemented("embedding".into()))
+    }
+}
+
+impl querymt::LLMProvider for HangingProvider {}
+
+struct HangingFactory {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl querymt::plugin::LLMProviderFactory for HangingFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn config_schema(&self) -> String {
+        "{}".to_string()
+    }
+
+    fn from_config(
+        &self,
+        _cfg: &str,
+    ) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+        Ok(Box::new(HangingProvider {
+            started: self.started.clone(),
+        }))
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _cfg: &str,
+    ) -> querymt::plugin::Fut<'a, Result<Vec<String>, querymt::error::LLMError>> {
+        Box::pin(async { Ok(vec!["mock-model".to_string()]) })
+    }
+}
+
+/// The owner's actor is unloaded for a handoff, so `session/cancel` has no
+/// actor to stop: it must still stop a summary that is waiting on a provider,
+/// release the workspace and leave ownership as it was.
+#[tokio::test]
+async fn cancelling_the_owner_stops_a_handoff_summary_in_flight() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let f = worktree_fixture_built(
+        true,
+        crate::worktree::BaselineMode::Commit,
+        false,
+        Some(Arc::new(HangingFactory {
+            started: started.clone(),
+        })),
+        |_| {},
+    )
+    .await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &owner).await;
+    let sessions_before = f.storage.list_sessions().await.unwrap().len();
+
+    let target = WorkspaceTarget::Session(owner.clone());
+    let handoff = ops.handoff(
+        &f.handle,
+        &target,
+        HandoffOptions {
+            name: None,
+            summary: true,
+        },
+    );
+    let cancel = async {
+        // The summary is in flight once the provider has its request.
+        started.notified().await;
+        let began = std::time::Instant::now();
+        f.handle
+            .cancel(CancelNotification::new(SessionId::from(owner.clone())))
+            .await
+            .unwrap();
+        began
+    };
+    let (result, cancelled_at) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::join!(handoff, cancel)
+    })
+    .await
+    .expect("a cancelled summary must not wait for the provider");
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), "summary_cancelled", "{err}");
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(5),
+        "the handoff ended promptly after the cancel"
+    );
+    // Nothing was created and ownership did not move.
+    assert_eq!(
+        f.storage.list_sessions().await.unwrap().len(),
+        sessions_before
+    );
+    assert_eq!(
+        f.service.registry().transferred_to(&owner).await.unwrap(),
+        None
+    );
+    // The exclusive checkout lease is gone: another exclusive activity can
+    // take it at once.
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&owner)
+        .await
+        .unwrap()
+        .expect("the owner still has its workspace");
+    ops.acquire_exclusive_activity(&record)
+        .await
+        .expect("the workspace is usable after a cancelled handoff");
+}
+
+/// A cancel for a session that has no administration step in progress and no
+/// actor is still the no-op it was.
+#[tokio::test]
+async fn cancelling_a_session_without_a_step_or_actor_is_a_no_op() {
+    let f = worktree_fixture(true).await;
+    f.handle
+        .cancel(CancelNotification::new(SessionId::from(
+            "no-such-session".to_string(),
+        )))
+        .await
+        .unwrap();
 }
 
 /// 24.5: native command, ext method and the typed core agree, with stable

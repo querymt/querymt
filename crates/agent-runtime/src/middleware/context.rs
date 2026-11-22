@@ -1,12 +1,11 @@
 use async_trait::async_trait;
-use log::{debug, trace, warn};
-use parking_lot::Mutex;
+use log::{debug, warn};
 use std::sync::Arc;
 
-use super::{ExecutionState, MiddlewareDriver, Result};
-use crate::middleware::ConversationContext;
+use super::{HookCx, Middleware, Result, StepVerdict, Stop, TurnInfo, TurnMiddleware};
 use crate::middleware::factory::MiddlewareFactory;
 use querymt_agent_core::events::StopType;
+use querymt_agent_core::model::NoticeSource;
 use querymt_agent_services::model_info::{ModelInfoSource, get_model_info};
 use serde::Deserialize;
 
@@ -84,8 +83,6 @@ impl ContextConfig {
 /// Middleware that handles context warnings and optional auto-compaction
 pub struct ContextMiddleware {
     config: ContextConfig,
-    warned_sessions: Mutex<std::collections::HashSet<Arc<str>>>,
-    last_model: Mutex<Option<(String, String)>>, // (provider, model)
 }
 
 impl ContextMiddleware {
@@ -94,25 +91,43 @@ impl ContextMiddleware {
             "Creating ContextMiddleware with warn_at_percent={}, auto_compact={}, context_source={:?}",
             config.warn_at_percent, config.auto_compact, config.context_source
         );
-        Self {
-            config,
-            warned_sessions: Mutex::new(std::collections::HashSet::new()),
-            last_model: Mutex::new(None),
-        }
+        Self { config }
+    }
+}
+
+impl Middleware for ContextMiddleware {
+    fn name(&self) -> &'static str {
+        "ContextMiddleware"
     }
 
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(ContextTurn {
+            config: self.config.clone(),
+            warned: false,
+        })
+    }
+}
+
+/// The context checks of one run.
+struct ContextTurn {
+    config: ContextConfig,
+    /// The usage warning was stored in this run.
+    warned: bool,
+}
+
+impl ContextTurn {
     /// Get max tokens for this context, fetching dynamically if needed
-    fn get_max_tokens(&self, context: &ConversationContext) -> usize {
+    fn max_tokens(&self, provider: &str, model: &str) -> usize {
         match &self.config.context_source {
             ModelInfoSource::FromSession => {
                 // Fetch from model constraints using new ModelInfo methods
-                get_model_info(&context.provider, &context.model)
+                get_model_info(provider, model)
                     .and_then(|m| m.context_limit())
                     .map(|c| c as usize)
                     .unwrap_or_else(|| {
                         warn!(
                             "No context limit found for {}/{}, using fallback: {}",
-                            context.provider, context.model, self.config.fallback_max_tokens
+                            provider, model, self.config.fallback_max_tokens
                         );
                         self.config.fallback_max_tokens
                     })
@@ -123,35 +138,9 @@ impl ContextMiddleware {
         }
     }
 
-    /// Check if provider changed and reset state if needed
-    fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock();
-        let current = (context.provider.to_string(), context.model.to_string());
-
-        if last.as_ref() != Some(&current) {
-            // Provider changed - reset warned sessions
-            let mut warned = self.warned_sessions.lock();
-            warned.clear();
-            *last = Some(current.clone());
-            debug!(
-                "Provider changed to {}/{}, reset context warnings",
-                current.0, current.1
-            );
-        }
-    }
-
-    fn should_warn(
-        &self,
-        session_id: &Arc<str>,
-        current_tokens: usize,
-        max_tokens: usize,
-    ) -> Option<String> {
-        if max_tokens == 0 || self.config.warn_at_percent == 0 {
-            return None;
-        }
-
-        let mut warned = self.warned_sessions.lock();
-        if warned.contains(session_id) {
+    /// The usage warning, once per run, when usage reaches the threshold.
+    fn warning(&mut self, current_tokens: usize, max_tokens: usize) -> Option<String> {
+        if max_tokens == 0 || self.config.warn_at_percent == 0 || self.warned {
             return None;
         }
 
@@ -161,7 +150,7 @@ impl ContextMiddleware {
             return None;
         }
 
-        warned.insert(session_id.clone());
+        self.warned = true;
         let percent = (current_tokens as f64 / max_tokens as f64) * 100.0;
         Some(format!(
             "Warning: context usage is at {:.0}% ({} / {} tokens)",
@@ -171,83 +160,40 @@ impl ContextMiddleware {
 }
 
 #[async_trait]
-impl MiddlewareDriver for ContextMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        trace!(
-            "ContextMiddleware::on_step_start entering state: {}",
-            state.name()
-        );
-
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => {
-                // Check if provider changed
-                self.check_provider_changed(context);
-
-                // Get max tokens dynamically
-                let max_tokens = self.get_max_tokens(context);
-
-                if max_tokens == 0 {
-                    return Ok(state);
-                }
-
-                let current_tokens = context.stats.context_tokens;
-
-                let compact_threshold = (max_tokens as f64
-                    * (self.config.compact_at_percent.min(100) as f64 / 100.0))
-                    as usize;
-
-                if self.config.auto_compact && current_tokens >= compact_threshold {
-                    debug!(
-                        "ContextMiddleware: requesting compaction, {} >= {} tokens ({}% of {})",
-                        current_tokens,
-                        compact_threshold,
-                        self.config.compact_at_percent,
-                        max_tokens
-                    );
-                    return Ok(ExecutionState::Stopped {
-                        message: format!(
-                            "Context token threshold ({} / {} tokens, {}%) reached, requesting compaction",
-                            current_tokens, max_tokens, self.config.compact_at_percent
-                        )
-                        .into(),
-                        stop_type: StopType::ContextThreshold,
-                        context: Some(context.clone()),
-                    });
-                }
-
-                if let Some(warning) =
-                    self.should_warn(&context.session_id, current_tokens, max_tokens)
-                {
-                    debug!(
-                        "ContextMiddleware: usage warning injected for session {}",
-                        context.session_id
-                    );
-                    let new_context = context.inject_message(warning);
-                    return Ok(ExecutionState::BeforeLlmCall {
-                        context: Arc::new(new_context),
-                    });
-                }
-
-                Ok(state)
-            }
-            _ => Ok(state),
+impl TurnMiddleware for ContextTurn {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        let max_tokens = self.max_tokens(cx.provider(), cx.model());
+        if max_tokens == 0 {
+            return Ok(StepVerdict::Proceed);
         }
-    }
 
-    fn reset(&self) {
-        debug!("ContextMiddleware::reset - clearing warned sessions and model cache");
-        let mut warned = self.warned_sessions.lock();
-        warned.clear();
-        let mut last = self.last_model.lock();
-        *last = None;
-    }
+        let current_tokens = cx.stats().context_tokens;
+        let compact_threshold =
+            (max_tokens as f64 * (self.config.compact_at_percent.min(100) as f64 / 100.0)) as usize;
 
-    fn name(&self) -> &'static str {
-        "ContextMiddleware"
+        if self.config.auto_compact && current_tokens >= compact_threshold {
+            debug!(
+                "ContextMiddleware: requesting compaction, {} >= {} tokens ({}% of {})",
+                current_tokens, compact_threshold, self.config.compact_at_percent, max_tokens
+            );
+            return Ok(StepVerdict::Stop(Stop::new(
+                StopType::ContextThreshold,
+                format!(
+                    "Context token threshold ({} / {} tokens, {}%) reached, requesting compaction",
+                    current_tokens, max_tokens, self.config.compact_at_percent
+                ),
+            )));
+        }
+
+        if let Some(warning) = self.warning(current_tokens, max_tokens) {
+            debug!(
+                "ContextMiddleware: usage warning queued for session {}",
+                cx.session_id()
+            );
+            cx.queue_notice(NoticeSource::ContextUsage, warning);
+        }
+
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -284,7 +230,7 @@ impl MiddlewareFactory for ContextFactory {
         &self,
         config: &serde_json::Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
         let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
 
         if !cfg.enabled {
@@ -321,7 +267,10 @@ impl MiddlewareFactory for ContextFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_context;
+    use crate::agent::execution::{Stage, Step};
+    use crate::middleware::Stop;
+    use crate::middleware::{PendingNotice, TurnStack};
+    use crate::test_utils::HookRig;
 
     // ========================================================================
     // Fixtures for ContextMiddleware Tests
@@ -329,35 +278,44 @@ mod tests {
 
     struct ContextMiddlewareFixture {
         middleware: ContextMiddleware,
+        config: ContextConfig,
+        stack: tokio::sync::Mutex<TurnStack>,
+    }
+
+    /// What one step of a run came to: the state the loop moves to and the
+    /// notices the middleware queued.
+    struct Stepped {
+        state: Step,
+        queued: Vec<PendingNotice>,
     }
 
     impl ContextMiddlewareFixture {
-        fn with_defaults() -> Self {
+        fn from_config(config: ContextConfig) -> Self {
+            let middleware = ContextMiddleware::new(config.clone());
+            let stack = HookRig::stack_of(ContextMiddleware::new(config.clone()));
             Self {
-                middleware: ContextMiddleware::new(ContextConfig::default()),
+                middleware,
+                config,
+                stack: tokio::sync::Mutex::new(stack),
             }
+        }
+
+        fn with_defaults() -> Self {
+            Self::from_config(ContextConfig::default())
         }
 
         fn with_warn_percent(warn_at_percent: u32) -> Self {
-            Self {
-                middleware: ContextMiddleware::new(
-                    ContextConfig::default().warn_at_percent(warn_at_percent),
-                ),
-            }
+            Self::from_config(ContextConfig::default().warn_at_percent(warn_at_percent))
         }
 
         fn with_manual_limit_and_auto_compact(max_tokens: usize, auto_compact: bool) -> Self {
-            Self {
-                middleware: ContextMiddleware::new(
-                    ContextConfig::with_manual_limit(max_tokens).auto_compact(auto_compact),
-                ),
-            }
+            Self::from_config(
+                ContextConfig::with_manual_limit(max_tokens).auto_compact(auto_compact),
+            )
         }
 
         fn with_manual_limit(max_tokens: usize) -> Self {
-            Self {
-                middleware: ContextMiddleware::new(ContextConfig::with_manual_limit(max_tokens)),
-            }
+            Self::from_config(ContextConfig::with_manual_limit(max_tokens))
         }
 
         fn with_manual_limit_compact_and_warn_percent(
@@ -365,25 +323,43 @@ mod tests {
             compact_percent: u32,
             warn_percent: u32,
         ) -> Self {
-            Self {
-                middleware: ContextMiddleware::new(
-                    ContextConfig::with_manual_limit(max_tokens)
-                        .compact_at_percent(compact_percent)
-                        .warn_at_percent(warn_percent),
-                ),
-            }
+            Self::from_config(
+                ContextConfig::with_manual_limit(max_tokens)
+                    .compact_at_percent(compact_percent)
+                    .warn_at_percent(warn_percent),
+            )
         }
 
         fn with_manual_limit_and_warn_percent(max_tokens: usize, warn_percent: u32) -> Self {
-            Self {
-                middleware: ContextMiddleware::new(
-                    ContextConfig::with_manual_limit(max_tokens).warn_at_percent(warn_percent),
-                ),
+            Self::from_config(
+                ContextConfig::with_manual_limit(max_tokens).warn_at_percent(warn_percent),
+            )
+        }
+
+        /// The state of one run's checks, for the unit tests of its helpers.
+        fn turn(&self) -> ContextTurn {
+            ContextTurn {
+                config: self.config.clone(),
+                warned: false,
             }
         }
 
-        async fn run_step(&self, state: ExecutionState) -> Result<ExecutionState> {
-            self.middleware.on_step_start(state, None).await
+        /// One step of the fixture's run, with `context_tokens` in use.
+        async fn run_step(&self, context_tokens: usize) -> Result<Stepped> {
+            self.run_step_on("mock-model", context_tokens).await
+        }
+
+        /// One step of the fixture's run on `model`.
+        async fn run_step_on(&self, model: &str, context_tokens: usize) -> Result<Stepped> {
+            let mut stack = self.stack.lock().await;
+            let mut rig = HookRig::at_step("test-session", 0);
+            rig.model = model.to_string();
+            rig.stats.context_tokens = context_tokens;
+            let state = rig.step_start(&mut stack).await?;
+            Ok(Stepped {
+                state,
+                queued: rig.pending,
+            })
         }
     }
 
@@ -461,20 +437,20 @@ mod tests {
     #[test]
     fn test_should_warn_below_threshold() {
         let fixture = ContextMiddlewareFixture::with_warn_percent(80);
-        let session_id: Arc<str> = "test-session".into();
+        let mut turn = fixture.turn();
 
         // 50% usage, threshold is 80% -> should not warn
-        let result = fixture.middleware.should_warn(&session_id, 5000, 10000);
+        let result = turn.warning(5000, 10000);
         assert!(result.is_none(), "Should not warn below threshold");
     }
 
     #[test]
     fn test_should_warn_at_threshold() {
         let fixture = ContextMiddlewareFixture::with_warn_percent(80);
-        let session_id: Arc<str> = "test-session".into();
+        let mut turn = fixture.turn();
 
         // 80% usage -> should warn
-        let result = fixture.middleware.should_warn(&session_id, 8000, 10000);
+        let result = turn.warning(8000, 10000);
         assert!(result.is_some(), "Should warn at or above threshold");
         assert!(result.unwrap().contains("80"));
     }
@@ -482,14 +458,14 @@ mod tests {
     #[test]
     fn test_should_warn_only_once_per_session() {
         let fixture = ContextMiddlewareFixture::with_warn_percent(80);
-        let session_id: Arc<str> = "test-session".into();
+        let mut turn = fixture.turn();
 
         // First call at 80% -> should warn
-        let first_warning = fixture.middleware.should_warn(&session_id, 8000, 10000);
+        let first_warning = turn.warning(8000, 10000);
         assert!(first_warning.is_some());
 
         // Second call at 90% -> should NOT warn again (already warned for session)
-        let second_warning = fixture.middleware.should_warn(&session_id, 9000, 10000);
+        let second_warning = turn.warning(9000, 10000);
         assert!(
             second_warning.is_none(),
             "Should only warn once per session"
@@ -497,80 +473,40 @@ mod tests {
     }
 
     #[test]
-    fn test_should_warn_reset_on_provider_change() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let session_id: Arc<str> = "test-session".into();
-
-        // Warn for provider1/model1
-        let ctx1 = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "provider1".into(),
-                model: "model1".into(),
-                ..(*ctx1).clone()
-            }));
-
-        let first_warning = fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(first_warning.is_some());
-
-        // Check provider change to provider2/model2
-        let ctx2 = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "provider2".into(),
-                model: "model2".into(),
-                ..(*ctx2).clone()
-            }));
-
-        // Second call should warn again (session warned set was cleared)
-        let second_warning = fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(
-            second_warning.is_some(),
-            "Should reset warnings on provider change"
-        );
-    }
-
-    #[test]
     fn test_should_warn_zero_max_tokens_skips() {
         let fixture = ContextMiddlewareFixture::with_defaults();
-        let session_id: Arc<str> = "test-session".into();
+        let mut turn = fixture.turn();
 
-        let result = fixture.middleware.should_warn(&session_id, 5000, 0);
+        let result = turn.warning(5000, 0);
         assert!(result.is_none(), "Should skip warning if max_tokens is 0");
     }
 
     #[test]
     fn test_should_warn_zero_percent_skips() {
         let fixture = ContextMiddlewareFixture::with_warn_percent(0);
-        let session_id: Arc<str> = "test-session".into();
+        let mut turn = fixture.turn();
 
-        let result = fixture.middleware.should_warn(&session_id, 5000, 10000);
+        let result = turn.warning(5000, 10000);
         assert!(
             result.is_none(),
             "Should skip warning if warn_at_percent is 0"
         );
     }
 
+    fn stops_for_context(stepped: &Stepped) -> bool {
+        matches!(
+            stepped.state,
+            Step::Continue(Stage::Stopping(Stop { stop_type, .. })) if stop_type == StopType::ContextThreshold
+        )
+    }
+
     #[tokio::test]
     async fn test_on_step_start_below_threshold_passes_through() {
         let fixture = ContextMiddlewareFixture::with_manual_limit(10000);
-        let context = test_context("test-session", 0);
-        // Modify to set lower token count
-        let mut context_mut = (*context).clone();
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 5000, // Below 80% threshold
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
-
-        let result = fixture.run_step(state).await.unwrap();
-        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+        // 5000 tokens: below the 80% threshold.
+        let result = fixture.run_step(5000).await.unwrap();
+        assert!(matches!(result.state, Step::Continue(Stage::BeforeRequest)));
     }
 
     #[tokio::test]
@@ -578,24 +514,11 @@ mod tests {
         // compact_at_percent=85, limit=10000 -> threshold=8500
         let fixture =
             ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        // Exactly at 85% threshold
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 8500,
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
-
-        let result = fixture.run_step(state).await.unwrap();
+        let result = fixture.run_step(8500).await.unwrap();
 
         assert!(
-            matches!(result, ExecutionState::Stopped { stop_type, .. }
-                                if stop_type == StopType::ContextThreshold),
+            stops_for_context(&result),
             "Should stop with ContextThreshold at compact_at_percent threshold"
         );
     }
@@ -605,23 +528,11 @@ mod tests {
         // compact_at_percent=85, limit=10000 -> threshold=8500; tokens=8499 -> no compaction
         let fixture =
             ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 8499,
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
-
-        let result = fixture.run_step(state).await.unwrap();
+        let result = fixture.run_step(8499).await.unwrap();
 
         assert!(
-            !matches!(result, ExecutionState::Stopped { stop_type, .. }
-                                if stop_type == StopType::ContextThreshold),
+            !stops_for_context(&result),
             "Should not compact below compact_at_percent threshold"
         );
     }
@@ -632,38 +543,19 @@ mod tests {
         // At 75% (7500 tokens): warn fires, compact does not
         let fixture =
             ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 7500,
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
+        let result = fixture.run_step(7500).await.unwrap();
 
-        let result = fixture.run_step(state).await.unwrap();
-
-        // Should inject warning, not stop for compaction
-        match result {
-            ExecutionState::BeforeLlmCall {
-                context: new_context,
-            } => {
-                assert!(
-                    new_context.messages.len() > context.messages.len(),
-                    "Should inject warning message before compact threshold"
-                );
-            }
-            ExecutionState::Stopped {
-                stop_type: StopType::ContextThreshold,
-                ..
-            } => {
-                panic!("Should not compact below compact_at_percent threshold");
-            }
-            _ => panic!("Unexpected state"),
-        }
+        // Should queue a warning, not stop for compaction
+        assert!(
+            matches!(result.state, Step::Continue(Stage::BeforeRequest)),
+            "Should not compact below compact_at_percent threshold"
+        );
+        assert_eq!(
+            result.queued.len(),
+            1,
+            "Should queue warning notice before compact threshold"
+        );
     }
 
     #[tokio::test]
@@ -672,23 +564,11 @@ mod tests {
         // Default compact_at_percent=85, limit=10000 -> threshold=8500
         // Set tokens to 10000 (above threshold) -> should compact
         let fixture = ContextMiddlewareFixture::with_manual_limit_and_auto_compact(10000, true);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 10000,
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
-
-        let result = fixture.run_step(state).await.unwrap();
+        let result = fixture.run_step(10000).await.unwrap();
 
         assert!(
-            matches!(result, ExecutionState::Stopped { stop_type, .. }
-                                if stop_type == StopType::ContextThreshold),
+            stops_for_context(&result),
             "Should stop with ContextThreshold when above compact_at_percent with auto_compact=true"
         );
     }
@@ -697,143 +577,33 @@ mod tests {
     async fn test_on_step_start_at_threshold_without_auto_compact() {
         // Use manual limit for predictable threshold, but auto_compact=false
         let fixture = ContextMiddlewareFixture::with_manual_limit_and_auto_compact(10000, false);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        // Set to 9000 tokens (90% of 10000) -> triggers warning at 80% threshold
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 9000,
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
+        // 9000 tokens (90% of 10000) -> triggers warning at 80% threshold
+        let result = fixture.run_step(9000).await.unwrap();
 
-        let result = fixture.run_step(state).await.unwrap();
-
-        // Should not stop, but should inject warning instead
-        match result {
-            ExecutionState::BeforeLlmCall {
-                context: result_ctx,
-            } => {
-                // Warning should be injected in the messages
-                assert_ne!(
-                    context.messages.len(),
-                    result_ctx.messages.len(),
-                    "Should inject warning message"
-                );
-            }
-            ExecutionState::Stopped { .. } => {
-                panic!("Should not stop when auto_compact=false");
-            }
-            _ => panic!("Unexpected state"),
-        }
+        // Should not stop, but should queue a warning instead
+        assert!(
+            matches!(result.state, Step::Continue(Stage::BeforeRequest)),
+            "Should not stop when auto_compact=false"
+        );
+        assert_eq!(result.queued.len(), 1, "Should queue warning notice");
     }
 
     #[tokio::test]
     async fn test_on_step_start_injects_warning_message() {
         // Use manual limit with 50% warning threshold
         let fixture = ContextMiddlewareFixture::with_manual_limit_and_warn_percent(10000, 50);
-        let context = test_context("test-session", 0);
-        let mut context_mut = (*context).clone();
-        context_mut.stats = Arc::new(crate::middleware::AgentStats {
-            context_tokens: 6000, // 60% of 10000, exceeds 50% threshold
-            ..Default::default()
-        });
-        let context = Arc::new(context_mut);
 
-        let state = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
+        // 60% of 10000, exceeds the 50% threshold
+        let result = fixture.run_step(6000).await.unwrap();
 
-        let result = fixture.run_step(state).await.unwrap();
-
-        match result {
-            ExecutionState::BeforeLlmCall {
-                context: new_context,
-            } => {
-                // Message should be injected - new context has more messages
-                assert!(
-                    new_context.messages.len() > context.messages.len(),
-                    "Should inject warning message"
-                );
-            }
-            _ => panic!("Expected BeforeLlmCall with injected message"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_on_step_start_ignores_non_before_llm_call_states() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let context = test_context("test-session", 0);
-
-        let state = ExecutionState::CallLlm {
-            context: context.clone(),
-            request: Arc::new(crate::middleware::PreparedModelRequest {
-                messages: Arc::from([]),
-                tools: Arc::from([]),
-                estimated_tokens: 0,
-                options: Default::default(),
-            }),
-        };
-
-        let result = fixture.run_step(state).await.unwrap();
-        assert!(matches!(result, ExecutionState::CallLlm { .. }));
-    }
-
-    #[test]
-    fn test_reset_clears_warned_sessions() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let session_id: Arc<str> = "test-session".into();
-
-        // Add a warning
-        fixture.middleware.should_warn(&session_id, 8000, 10000);
-
-        // Verify it was recorded
-        assert!(
-            fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .contains(&session_id)
+        assert!(matches!(result.state, Step::Continue(Stage::BeforeRequest)));
+        // The warning is queued as a `context_usage` notice.
+        assert_eq!(result.queued.len(), 1);
+        assert_eq!(
+            result.queued[0].source,
+            querymt_agent_core::model::NoticeSource::ContextUsage
         );
-
-        // Reset
-        fixture.middleware.reset();
-
-        // Verify it was cleared
-        assert!(
-            !fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .contains(&session_id)
-        );
-    }
-
-    #[test]
-    fn test_reset_clears_model_cache() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-
-        // Set model info
-        let ctx = test_context("test", 0);
-        fixture
-            .middleware
-            .check_provider_changed(&Arc::new(ConversationContext {
-                provider: "test-provider".into(),
-                model: "test-model".into(),
-                ..(*ctx).clone()
-            }));
-
-        // Verify it was set
-        assert!(fixture.middleware.last_model.lock().is_some());
-
-        // Reset
-        fixture.middleware.reset();
-
-        // Verify it was cleared
-        assert!(fixture.middleware.last_model.lock().is_none());
     }
 
     #[test]
@@ -873,77 +643,49 @@ mod tests {
     #[test]
     fn test_get_max_tokens_with_manual_source() {
         let fixture = ContextMiddlewareFixture::with_manual_limit(50_000);
-        let context = test_context("test", 0);
 
-        let max_tokens = fixture.middleware.get_max_tokens(&context);
+        let max_tokens = fixture.turn().max_tokens("mock", "mock-model");
         assert_eq!(max_tokens, 50_000);
     }
 
     #[test]
     fn test_get_max_tokens_uses_fallback_when_model_info_missing() {
         let fixture = ContextMiddlewareFixture::with_defaults();
-        let context = test_context("test", 0);
 
-        let max_tokens = fixture.middleware.get_max_tokens(&context);
+        let max_tokens = fixture.turn().max_tokens("mock", "mock-model");
         // Should use fallback since we don't have real model info
         assert_eq!(max_tokens, ContextConfig::default().fallback_max_tokens);
     }
 
-    #[test]
-    fn test_check_provider_changed_detects_change() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let ctx = test_context("test", 0);
+    #[tokio::test]
+    async fn a_new_run_warns_again() {
+        let fixture = ContextMiddlewareFixture::with_manual_limit(10_000);
 
-        let ctx1 = Arc::new(ConversationContext {
-            provider: "provider1".into(),
-            model: "model1".into(),
-            ..(*ctx).clone()
-        });
-
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let ctx2 = Arc::new(ConversationContext {
-            provider: "provider2".into(),
-            model: "model2".into(),
-            ..(*ctx).clone()
-        });
-
-        // Before calling check_provider_changed with ctx2, add a warned session
-        let session_id: Arc<str> = "test".into();
-        fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(!fixture.middleware.warned_sessions.lock().is_empty());
-
-        fixture.middleware.check_provider_changed(&ctx2);
-
-        // Warned sessions should be cleared on provider change
-        assert!(fixture.middleware.warned_sessions.lock().is_empty());
-    }
-
-    #[test]
-    fn test_check_provider_not_changed_preserves_state() {
-        let fixture = ContextMiddlewareFixture::with_defaults();
-        let ctx = test_context("test", 0);
-
-        let ctx1 = Arc::new(ConversationContext {
-            provider: "provider1".into(),
-            model: "model1".into(),
-            ..(*ctx).clone()
-        });
-
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let session_id: Arc<str> = "test".into();
-        fixture.middleware.should_warn(&session_id, 8000, 10000);
-        let warned_count_before = fixture.middleware.warned_sessions.lock().len();
-
-        // Check same provider again
-        fixture.middleware.check_provider_changed(&ctx1);
-
-        let warned_count_after = fixture.middleware.warned_sessions.lock().len();
+        let first_run = fixture.run_step(8_200).await.unwrap();
+        let same_run = fixture.run_step(8_200).await.unwrap();
+        let next_run = ContextMiddlewareFixture::with_manual_limit(10_000)
+            .run_step(8_200)
+            .await
+            .unwrap();
 
         assert_eq!(
-            warned_count_before, warned_count_after,
-            "State should be preserved if provider didn't change"
+            (
+                first_run.queued.len(),
+                same_run.queued.len(),
+                next_run.queued.len()
+            ),
+            (1, 0, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn model_change_within_a_run_does_not_warn_again() {
+        let fixture = ContextMiddlewareFixture::with_manual_limit(10_000);
+
+        let first = fixture.run_step_on("model-1", 8_200).await.unwrap();
+        let second = fixture.run_step_on("model-2", 8_200).await.unwrap();
+
+        assert_eq!(first.queued.len(), 1);
+        assert_eq!(second.queued.len(), 0, "one warning per run");
     }
 }

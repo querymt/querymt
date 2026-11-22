@@ -182,6 +182,8 @@
               LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
               BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
               QMT_UI_DIST = "${dashboardUi}";
+              # Use the same bundled native libraries as a direct Cargo build.
+              dontCargoUseSystemLibs = true;
               # cargo-auditable currently fails on this workspace's `dep:` feature
               # metadata resolution; we can re-enable it later if embedded
               # dependency metadata in binaries becomes a requirement.

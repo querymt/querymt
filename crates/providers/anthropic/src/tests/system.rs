@@ -34,6 +34,22 @@ fn portable_instruction_hints_map_to_anthropic_cache_control() {
 }
 
 #[test]
+fn requested_lifetime_rounds_up_to_a_supported_one() {
+    use crate::wire::system::cache_control_from_hint;
+    use querymt::chat::CacheHint;
+    let ttl = |seconds| {
+        cache_control_from_hint(&CacheHint::Ephemeral {
+            ttl_seconds: Some(seconds),
+        })
+        .ttl
+    };
+    assert_eq!(ttl(120), Some(CacheTTL::FiveMinutes));
+    assert_eq!(ttl(300), Some(CacheTTL::FiveMinutes));
+    assert_eq!(ttl(600), Some(CacheTTL::OneHour));
+    assert_eq!(ttl(3600), Some(CacheTTL::OneHour));
+}
+
+#[test]
 fn portable_defaults_match_legacy_wire_controls() {
     let portable: AnthropicSystemPrompt = serde_json::from_value(serde_json::json!([
         {"text": "stable", "cache": {"ephemeral": {}}}

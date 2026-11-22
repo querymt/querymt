@@ -5,17 +5,17 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::delegation::roster::{Member, MemberAgent, MemberOrigin};
 use crate::delegation::{AgentInfo, DelegationOrchestrator};
-use crate::middleware::{ExecutionState, MiddlewareDriver};
+use crate::middleware::{HookCx, Middleware, StepVerdict, Stop, TurnInfo, TurnMiddleware};
 use crate::session::backend::StorageBackend;
 use crate::session::runtime::RuntimeContext;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{SessionExecutionConfig, SessionStore};
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
-    mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
+    Act, MockChatResponse, MockLlmProvider, ScriptedMiddleware, SharedLlmProvider,
+    TestProviderFactory, mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
 };
 use mockall::Sequence;
 use querymt::LLMParams;
@@ -27,107 +27,55 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify};
 
-/// A middleware that immediately stops execution with `StepLimit`,
-/// simulating what happens when a delegate is stopped by middleware before
-/// completing its work. Uses `StepLimit` (maps to `StopReason::MaxTurnRequests`)
-/// rather than `ContextThreshold` to avoid triggering the auto-compaction loop
-/// in the execution state machine.
-pub struct AlwaysStopMiddleware;
+/// Stops before the first model request with `StepLimit`, simulating a
+/// delegate stopped by middleware before completing its work. `StepLimit`
+/// (maps to `StopReason::MaxTurnRequests`) rather than `ContextThreshold`
+/// avoids triggering the auto-compaction loop.
+fn always_stop() -> ScriptedMiddleware {
+    ScriptedMiddleware::default().step_start([Act::Say(StepVerdict::Stop(Stop::new(
+        StopType::StepLimit,
+        "Step limit reached",
+    )))])
+}
 
-#[async_trait::async_trait]
-impl MiddlewareDriver for AlwaysStopMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => Ok(ExecutionState::Stopped {
-                message: "Step limit reached".into(),
-                stop_type: StopType::StepLimit,
-                context: Some(context.clone()),
-            }),
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "AlwaysStopMiddleware"
-    }
+/// Fires `ContextThreshold` on the first step, then passes through. This
+/// simulates a full context window that triggers AI compaction.
+fn context_threshold_once() -> ScriptedMiddleware {
+    ScriptedMiddleware::default().step_start([
+        Act::Say(StepVerdict::Stop(Stop::new(
+            StopType::ContextThreshold,
+            "Context token threshold reached, requesting compaction",
+        ))),
+        Act::Say(StepVerdict::Proceed),
+    ])
 }
 
 /// Hold a delegate before its first LLM call to make cancellation deterministic.
+#[derive(Clone)]
 pub struct CancellationGateMiddleware {
     pub entered: Arc<Notify>,
     pub release: Arc<Notify>,
 }
 
-#[async_trait::async_trait]
-impl MiddlewareDriver for CancellationGateMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            before @ ExecutionState::BeforeLlmCall { .. } => {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(before)
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
+impl Middleware for CancellationGateMiddleware {
     fn name(&self) -> &'static str {
         "CancellationGateMiddleware"
     }
-}
 
-/// Fires `ContextThreshold` on the first `BeforeLlmCall`, then passes through.
-/// This simulates a full context window that triggers AI compaction.
-#[derive(Default)]
-pub struct ContextThresholdOnceMiddleware {
-    pub fired: std::sync::atomic::AtomicBool,
-}
-
-impl ContextThresholdOnceMiddleware {
-    pub fn new() -> Self {
-        Self::default()
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(self.clone())
     }
 }
 
 #[async_trait::async_trait]
-impl MiddlewareDriver for ContextThresholdOnceMiddleware {
+impl TurnMiddleware for CancellationGateMiddleware {
     async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context }
-                if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) =>
-            {
-                Ok(ExecutionState::Stopped {
-                    message: "Context token threshold reached, requesting compaction".into(),
-                    stop_type: StopType::ContextThreshold,
-                    context: Some(context.clone()),
-                })
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {
-        self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn name(&self) -> &'static str {
-        "ContextThresholdOnceMiddleware"
+        &mut self,
+        _cx: &mut HookCx<'_>,
+    ) -> crate::middleware::Result<StepVerdict> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -156,7 +104,8 @@ pub struct TestHarness {
     pub config: Arc<AgentConfig>,
     /// The root handle the orchestrator is weakly bound to.
     pub delegator: Arc<crate::agent::LocalAgentHandle>,
-    pub(crate) exec_ctx: ExecutionContext,
+    pub(crate) env: TurnEnv,
+    pub(crate) turn: Turn,
     pub provider: Arc<Mutex<MockLlmProvider>>,
     pub orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
     pub _temp_dir: TempDir,
@@ -265,19 +214,14 @@ impl TestHarness {
             crate::agent::core::McpToolState::empty(),
         );
 
-        let exec_ctx = ExecutionContext::new(
-            session_id,
-            querymt_agent_core::model::TurnId::new(),
-            session_runtime,
-            runtime_context,
-            context,
-            crate::agent::core::ToolConfig::default(),
-        );
+        let (env, turn) =
+            crate::test_utils::turn_parts(&config, context, session_runtime, runtime_context).await;
 
         Self {
             config,
             delegator,
-            exec_ctx,
+            env,
+            turn,
             provider,
             orchestrator_handle,
             _temp_dir: temp_dir,
@@ -291,9 +235,13 @@ impl TestHarness {
     }
 
     pub async fn run(&mut self) -> CycleOutcome {
-        crate::agent::execution::execute_cycle_state_machine(
+        self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
+            .await
+            .expect("history loads");
+        crate::agent::execution::run_turn(
             &self.config,
-            &mut self.exec_ctx,
+            &self.env,
+            &mut self.turn,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -303,7 +251,7 @@ impl TestHarness {
     pub async fn set_parent_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
         let store = self.config.provider.history_store();
         let current = store
-            .get_session_llm_config(&self.exec_ctx.session_id)
+            .get_session_llm_config(&self.env.session_id)
             .await
             .expect("parent config lookup")
             .expect("parent config");
@@ -321,7 +269,7 @@ impl TestHarness {
             .await
             .expect("create parent config");
         store
-            .set_session_llm_config(&self.exec_ctx.session_id, updated.id)
+            .set_session_llm_config(&self.env.session_id, updated.id)
             .await
             .expect("set parent config");
     }
@@ -417,7 +365,7 @@ impl TestHarness {
         self.config
             .provider
             .history_store()
-            .list_child_sessions(&self.exec_ctx.session_id)
+            .list_child_sessions(&self.env.session_id)
             .await
             .expect("child sessions")
     }
@@ -437,7 +385,7 @@ impl TestHarness {
     pub async fn child_llm_params(&self) -> (String, LLMParams) {
         let store = self.config.provider.history_store();
         let child_sessions = store
-            .list_child_sessions(&self.exec_ctx.session_id)
+            .list_child_sessions(&self.env.session_id)
             .await
             .expect("child sessions");
         let child_session_id = child_sessions.first().expect("child session id");
@@ -581,7 +529,7 @@ pub async fn build_delegate_handle(
     }
 
     if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
-        builder = builder.with_middleware(AlwaysStopMiddleware);
+        builder = builder.with_middleware(always_stop());
     }
 
     if matches!(
@@ -590,7 +538,7 @@ pub async fn build_delegate_handle(
             | DelegateBehavior::ContextThresholdCompactionFails
     ) {
         // Install middleware that triggers ContextThreshold once, then passes through.
-        builder = builder.with_middleware(ContextThresholdOnceMiddleware::new());
+        builder = builder.with_middleware(context_threshold_once());
 
         // Enable auto-compaction with zero retries so the test doesn't sleep.
         builder = builder.with_compaction_config(crate::config::CompactionConfig {

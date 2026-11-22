@@ -14,14 +14,11 @@ pub fn resolved_storage_root(settings: &WorkspaceSettings) -> Result<PathBuf> {
 }
 
 fn expand_tilde(path: &Path) -> Result<PathBuf> {
-    let starts_with_tilde = path
-        .components()
-        .next()
-        .is_some_and(|c| c.as_os_str() == "~");
-    if !starts_with_tilde {
+    // A path that is not valid UTF-8 cannot be a `~` spelling.
+    let Some(raw) = path.to_str() else {
         return Ok(path.to_path_buf());
-    }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("workspace storage_root uses `~` but no home directory exists"))?;
-    Ok(home.join(path.components().skip(1).collect::<PathBuf>()))
+    };
+    querymt_agent_core::path::expand_tilde(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| anyhow!("workspace storage_root uses `~` but no home directory exists"))
 }

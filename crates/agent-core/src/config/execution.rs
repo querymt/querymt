@@ -166,6 +166,10 @@ impl Default for RetryConfig {
 }
 
 /// Configuration for AI compaction (Layer 3) - runs on context overflow
+///
+/// Deserializing is lenient: sessions store their policy, and one saved before
+/// `provider` needed a `model` must still load. A configuration file is
+/// checked with [`CompactionConfig::validate`] when it is loaded.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
@@ -173,10 +177,13 @@ pub struct CompactionConfig {
     #[serde(default = "default_true")]
     pub auto: bool,
 
-    /// Optional: different provider for compaction (cheaper model)
+    /// Optional: different provider for compaction. Needs `model`, because the
+    /// session's model belongs to another provider.
     pub provider: Option<String>,
 
-    /// Optional: different model for compaction (cheaper model)
+    /// Optional: different model for compaction (cheaper model), on the
+    /// session's provider unless `provider` is set. The request, its cost
+    /// accounting and its pricing all use it.
     pub model: Option<String>,
 
     /// Retry configuration for compaction LLM calls
@@ -191,6 +198,22 @@ impl Default for CompactionConfig {
             provider: None,
             model: None,
             retry: RetryConfig::default(),
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// A compaction `provider` needs a `model`: the session's model belongs to
+    /// another provider. Checked when a configuration file loads, and by the
+    /// runtime for a policy that never went through a file (built in code, or
+    /// stored with a session by an earlier version).
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.provider, &self.model) {
+            (Some(provider), None) => Err(format!(
+                "compaction.provider = \"{provider}\" needs a compaction model \
+                 (compaction.model): the session's model belongs to another provider"
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -221,6 +244,13 @@ pub const DEFAULT_RATE_LIMIT_JITTER_RATIO: f64 = 0.2;
 /// Default upper bound for calculated retry delays
 pub const DEFAULT_RATE_LIMIT_MAX_WAIT_SECS: u64 = 300;
 
+/// Default base wait in seconds before retrying a failure the provider never
+/// answered (connection failure, timeout, broken stream).
+pub const DEFAULT_RATE_LIMIT_TRANSPORT_WAIT_SECS: u64 = 10;
+
+/// Largest accepted `transport_wait_secs`.
+pub const MAX_RATE_LIMIT_TRANSPORT_WAIT_SECS: u64 = 300;
+
 fn default_rate_limit_max_retries() -> usize {
     DEFAULT_RATE_LIMIT_MAX_RETRIES
 }
@@ -243,6 +273,23 @@ fn default_rate_limit_jitter_ratio() -> f64 {
 
 fn default_rate_limit_max_wait_secs() -> u64 {
     DEFAULT_RATE_LIMIT_MAX_WAIT_SECS
+}
+
+fn default_rate_limit_transport_wait_secs() -> u64 {
+    DEFAULT_RATE_LIMIT_TRANSPORT_WAIT_SECS
+}
+
+/// Parse `transport_wait_secs` so a wrong type or a negative number names the
+/// key, which serde's own message for `u64` does not.
+fn deserialize_transport_wait_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map_err(|error| {
+        serde::de::Error::custom(format!(
+            "rate_limit.transport_wait_secs must be an integer in 0..={MAX_RATE_LIMIT_TRANSPORT_WAIT_SECS}: {error}"
+        ))
+    })
 }
 
 fn default_task_completion_guard() -> bool {
@@ -306,6 +353,17 @@ pub struct RateLimitConfig {
     /// TODO(session-compat): persist with `jitter_ratio` when ready.
     #[serde(default = "default_rate_limit_max_wait_secs", skip_serializing)]
     pub max_wait_secs: u64,
+
+    /// Base wait in seconds before retrying a failure the provider never
+    /// answered (connection refused or reset, DNS failure, timeout, broken
+    /// stream). Backoff, jitter and `max_wait_secs` apply as for
+    /// `default_wait_secs`; failures the provider did answer keep using the
+    /// provider's delay or `default_wait_secs`. Range `0..=300` (default: 10).
+    ///
+    /// Runtime-only for now — same session-compat rationale as `jitter_ratio`.
+    /// TODO(session-compat): persist with `jitter_ratio` when ready.
+    #[serde(default = "default_rate_limit_transport_wait_secs", skip_serializing)]
+    pub transport_wait_secs: u64,
 }
 
 impl RateLimitConfig {
@@ -333,6 +391,12 @@ impl RateLimitConfig {
         if self.max_wait_secs == 0 {
             return Err("rate_limit.max_wait_secs must be >= 1".into());
         }
+        if self.transport_wait_secs > MAX_RATE_LIMIT_TRANSPORT_WAIT_SECS {
+            return Err(format!(
+                "rate_limit.transport_wait_secs must be in 0..={MAX_RATE_LIMIT_TRANSPORT_WAIT_SECS}, got {}",
+                self.transport_wait_secs
+            ));
+        }
         Ok(())
     }
 }
@@ -346,6 +410,7 @@ impl Default for RateLimitConfig {
             max_stream_retries: DEFAULT_STREAM_MAX_RETRIES,
             jitter_ratio: DEFAULT_RATE_LIMIT_JITTER_RATIO,
             max_wait_secs: DEFAULT_RATE_LIMIT_MAX_WAIT_SECS,
+            transport_wait_secs: DEFAULT_RATE_LIMIT_TRANSPORT_WAIT_SECS,
         }
     }
 }
@@ -370,6 +435,11 @@ impl<'de> Deserialize<'de> for RateLimitConfig {
             jitter_ratio: f64,
             #[serde(default = "default_rate_limit_max_wait_secs")]
             max_wait_secs: u64,
+            #[serde(
+                default = "default_rate_limit_transport_wait_secs",
+                deserialize_with = "deserialize_transport_wait_secs"
+            )]
+            transport_wait_secs: u64,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -380,6 +450,7 @@ impl<'de> Deserialize<'de> for RateLimitConfig {
             max_stream_retries: raw.max_stream_retries,
             jitter_ratio: raw.jitter_ratio,
             max_wait_secs: raw.max_wait_secs,
+            transport_wait_secs: raw.transport_wait_secs,
         };
         cfg.validate().map_err(serde::de::Error::custom)?;
         Ok(cfg)
@@ -388,6 +459,76 @@ impl<'de> Deserialize<'de> for RateLimitConfig {
 
 // ============================================================================
 // End Rate Limit Configuration
+// ============================================================================
+
+// ============================================================================
+// Prompt Cache Configuration
+// ============================================================================
+
+/// Largest accepted `[agent.execution.prompt_cache] ttl_secs` (24 hours).
+pub const MAX_PROMPT_CACHE_TTL_SECS: u32 = 86_400;
+
+/// Parse `ttl_secs` so a wrong type, a negative number or a value above
+/// [`MAX_PROMPT_CACHE_TTL_SECS`] names the key, which serde's own messages do
+/// not.
+fn deserialize_prompt_cache_ttl_secs<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let named = |detail: String| {
+        serde::de::Error::custom(format!(
+            "prompt_cache.ttl_secs must be an integer in 0..={MAX_PROMPT_CACHE_TTL_SECS}: {detail}"
+        ))
+    };
+    let secs = u64::deserialize(deserializer).map_err(|error| named(error.to_string()))?;
+    u32::try_from(secs)
+        .ok()
+        .filter(|secs| *secs <= MAX_PROMPT_CACHE_TTL_SECS)
+        .ok_or_else(|| named(format!("got {secs}")))
+}
+
+/// Prompt cache settings (`[agent.execution.prompt_cache]`).
+///
+/// ```toml
+/// [agent.execution.prompt_cache]
+/// ttl_secs = 3600
+/// ```
+#[derive(Debug, Clone, Copy, Default, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCacheConfig {
+    /// Cache lifetime in seconds that default cache hints request, capped at
+    /// the longest lifetime the provider offers and rounded up by the provider
+    /// to one it supports. `0` (the default) keeps the provider's default
+    /// lifetime. Range `0..=86400`.
+    ///
+    /// A longer lifetime is not free: Anthropic bills a 1-hour cache write at
+    /// 2x the input price against 1.25x for 5 minutes.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 86400))]
+    pub ttl_secs: u32,
+}
+
+impl<'de> Deserialize<'de> for PromptCacheConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default, deserialize_with = "deserialize_prompt_cache_ttl_secs")]
+            ttl_secs: u32,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            ttl_secs: raw.ttl_secs,
+        })
+    }
+}
+
+// ============================================================================
+// End Prompt Cache Configuration
 // ============================================================================
 
 // ============================================================================
@@ -568,6 +709,13 @@ pub struct ExecutionPolicy {
     /// step within one turn (default: 1). `0` makes Stop hooks advisory only.
     #[serde(default = "default_max_stop_hook_continuations")]
     pub max_stop_hook_continuations: u32,
+    /// Send the rendered run objective with every model request (default:
+    /// `false`). The objective is still tracked and its events are emitted
+    /// when this is off.
+    #[serde(default)]
+    pub run_objective: bool,
+    /// Prompt cache settings (default cache hint lifetime)
+    pub prompt_cache: PromptCacheConfig,
 }
 
 impl Default for ExecutionPolicy {
@@ -581,6 +729,8 @@ impl Default for ExecutionPolicy {
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
             max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
+            run_objective: false,
+            prompt_cache: PromptCacheConfig::default(),
         }
     }
 }
@@ -596,6 +746,8 @@ pub struct RuntimeExecutionPolicy {
     pub task_completion_guard: bool,
     pub max_stop_recoveries: u8,
     pub max_stop_hook_continuations: u32,
+    pub run_objective: bool,
+    pub prompt_cache: PromptCacheConfig,
 }
 
 impl Default for RuntimeExecutionPolicy {
@@ -608,6 +760,8 @@ impl Default for RuntimeExecutionPolicy {
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
             max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
+            run_objective: false,
+            prompt_cache: PromptCacheConfig::default(),
         }
     }
 }
@@ -622,6 +776,8 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             task_completion_guard: ep.task_completion_guard,
             max_stop_recoveries: ep.max_stop_recoveries,
             max_stop_hook_continuations: ep.max_stop_hook_continuations,
+            run_objective: ep.run_objective,
+            prompt_cache: ep.prompt_cache,
         }
     }
 }
@@ -703,6 +859,10 @@ mod tests {
         assert!(
             !obj.contains_key("max_wait_secs"),
             "max_wait_secs must stay runtime-only until session-compat is ready: {value}"
+        );
+        assert!(
+            !obj.contains_key("transport_wait_secs"),
+            "transport_wait_secs must stay runtime-only until session-compat is ready: {value}"
         );
 
         // Stable keys older qmtcode already understands.
@@ -786,6 +946,40 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_config_transport_wait_defaults_when_omitted() {
+        let cfg: RateLimitConfig = serde_json::from_value(json!({})).expect("empty table");
+        assert_eq!(cfg.transport_wait_secs, 10);
+        assert_eq!(RateLimitConfig::default().transport_wait_secs, 10);
+    }
+
+    #[test]
+    fn rate_limit_config_accepts_boundary_transport_wait() {
+        for secs in [0u64, 300] {
+            let cfg: RateLimitConfig = serde_json::from_value(json!({
+                "transport_wait_secs": secs,
+            }))
+            .unwrap_or_else(|e| panic!("transport_wait_secs={secs} should be valid: {e}"));
+            assert_eq!(cfg.transport_wait_secs, secs);
+        }
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_out_of_range_transport_wait() {
+        for value in [json!(900), json!(301), json!(-1), json!("soon")] {
+            let err = serde_json::from_value::<RateLimitConfig>(json!({
+                "transport_wait_secs": value,
+            }))
+            .expect_err("out-of-range transport_wait_secs must fail at parse");
+            // A wrong type or negative value is rejected by serde before
+            // `validate`, and serde names the field in both cases.
+            assert!(
+                err.to_string().contains("transport_wait_secs"),
+                "error should name the field for {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn rate_limit_config_accepts_boundary_jitter_ratio() {
         for ratio in [0.0, 1.0] {
             let cfg: RateLimitConfig = serde_json::from_value(json!({
@@ -794,5 +988,37 @@ mod tests {
             .unwrap_or_else(|e| panic!("jitter_ratio={ratio} should be valid: {e}"));
             assert!((cfg.jitter_ratio - ratio).abs() < f64::EPSILON);
         }
+    }
+    #[test]
+    fn compaction_provider_without_a_model_is_invalid_but_still_deserializes() {
+        // A session stored before the rule must still load.
+        let stored: CompactionConfig =
+            serde_json::from_value(json!({"provider": "anthropic"})).unwrap();
+        let error = stored.validate().unwrap_err();
+        assert!(error.contains("needs a compaction model"), "{error}");
+        assert!(error.contains("anthropic"), "{error}");
+    }
+
+    #[test]
+    fn compaction_provider_with_a_model_and_the_other_shapes_are_valid() {
+        let both: CompactionConfig =
+            serde_json::from_value(json!({"provider": "anthropic", "model": "haiku"})).unwrap();
+        assert_eq!(both.provider.as_deref(), Some("anthropic"));
+        assert_eq!(both.model.as_deref(), Some("haiku"));
+        assert!(both.validate().is_ok());
+
+        let model_only: CompactionConfig =
+            serde_json::from_value(json!({"model": "haiku"})).unwrap();
+        assert!(model_only.provider.is_none());
+        assert!(model_only.validate().is_ok());
+
+        let defaults: CompactionConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(defaults.auto);
+        assert!(defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn compaction_config_still_rejects_unknown_keys() {
+        assert!(serde_json::from_value::<CompactionConfig>(json!({"modle": "x"})).is_err());
     }
 }

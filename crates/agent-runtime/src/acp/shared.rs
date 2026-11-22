@@ -7543,6 +7543,8 @@ mod session_update_tests {
                 context_tokens,
                 metrics: Default::default(),
                 accounting: None,
+                prefix_change: None,
+                idle_secs: None,
             },
         )
     }
@@ -7573,6 +7575,8 @@ mod session_update_tests {
             context_tokens,
             metrics: Default::default(),
             accounting: accounted_end_accounting(),
+            prefix_change: None,
+            idle_secs: None,
         }
     }
 
@@ -8134,6 +8138,8 @@ mod session_update_tests {
                 finish_reason: None,
                 metrics: Default::default(),
                 accounting: None,
+                prefix_change: None,
+                idle_secs: None,
             },
         )
     }
@@ -9417,6 +9423,8 @@ mod session_update_tests {
                     context_tokens: 50,
                     metrics: Default::default(),
                     accounting: accounted_end_accounting(),
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
             agent_event(

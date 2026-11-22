@@ -5,7 +5,8 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, Tool, ToolChoice,
+        ChatCall, ChatCapabilities, ChatOutput, PromptCacheCapabilities, StreamChunk, Tool,
+        ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -177,11 +178,33 @@ impl HTTPChatProvider for Codex {
         &self,
         _context: serde_json::Value,
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(CodexStreamParser::default()))
+        Ok(Box::new(CodexStreamParser {
+            model: Some(self.model.clone()),
+            ..CodexStreamParser::default()
+        }))
     }
 
+    /// Declares no prompt-cache breakpoints: the ChatGPT backend rejects
+    /// `prompt_cache_breakpoint` and `prompt_cache_options` (hints are dropped
+    /// in `codex_chat_request`), so default hints would only be discarded.
+    /// The default `PromptCacheCapabilities::NONE` states that explicitly.
     fn capabilities(&self) -> ChatCapabilities {
-        ChatCapabilities::NONE.with_streaming(true)
+        ChatCapabilities::NONE
+            .with_prompt_cache(PromptCacheCapabilities::NONE)
+            .with_streaming(true)
+    }
+
+    /// Codex stamps every reply with `codex_provenance()` and the configured
+    /// model (`CodexStreamParser`), and replays output natively only when it
+    /// carries exactly this identity (`api.rs`).
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        let stamped = codex_provenance();
+        Some(querymt::chat::ChatOutputProvenance {
+            provider: stamped.name.to_string(),
+            protocol: stamped.protocol.to_string(),
+            model: self.model.clone(),
+            endpoint: stamped.endpoint,
+        })
     }
 }
 
@@ -191,6 +214,10 @@ struct CodexStreamParser {
     policy: qmt_openai::api::ResponsesStreamPolicy,
     initialized: bool,
     completed: bool,
+    /// The configured model, stamped on the output's provenance in place of
+    /// the model the backend reports: native replay matches the configured
+    /// model exactly, and the backend may report another name for it.
+    model: Option<String>,
 }
 
 impl ChatStreamParser for CodexStreamParser {
@@ -202,11 +229,24 @@ impl ChatStreamParser for CodexStreamParser {
             self.policy.terminal_usage_log_target = Some("qmt_codex");
             self.initialized = true;
         }
-        let chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
+        let mut chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
             chunk,
             &mut self.state,
             &self.policy,
         )?;
+        if let Some(model) = &self.model {
+            for chunk in &mut chunks {
+                if let StreamChunk::Structured(
+                    querymt::chat::StructuredStreamEvent::ResponseMetadata {
+                        provenance: Some(provenance),
+                        ..
+                    },
+                ) = chunk
+                {
+                    provenance.model.clone_from(model);
+                }
+            }
+        }
         if chunks.iter().any(|chunk| {
             matches!(
                 chunk,
@@ -351,6 +391,80 @@ mod extism_exports {
         config = Codex,
         factory = CodexFactory,
         name   = "codex",
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::{Codex, HTTPChatProvider, PromptCacheCapabilities};
+
+    #[test]
+    fn chatgpt_backend_declares_no_explicit_breakpoints() {
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let caps = HTTPChatProvider::capabilities(&provider);
+        assert!(caps.streaming);
+        assert_eq!(caps.prompt_cache, PromptCacheCapabilities::NONE);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::{Codex, HTTPChatProvider, codex_provenance};
+
+    #[test]
+    fn codex_states_the_provenance_it_stamps_on_its_output() {
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("Codex stamps provenance on every reply");
+        // The same identity the response and stream stamping use.
+        let stamped = codex_provenance();
+        assert_eq!(stated.provider, stamped.name);
+        assert_eq!(stated.protocol, stamped.protocol);
+        assert_eq!(stated.endpoint, stamped.endpoint);
+        assert_eq!(stated.model, "gpt-5.6");
+    }
+
+    /// The stream stamps the declared identity even when the backend reports
+    /// another model name, so stored output keeps its native replay.
+    #[test]
+    fn stream_stamps_the_configured_model_not_the_reported_one() {
+        use querymt::chat::{StreamChunk, StructuredStreamEvent};
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let mut parser = HTTPChatProvider::chat_stream_parser(&provider, serde_json::Value::Null)
+            .expect("stream parser");
+        let events = parser
+            .parse_chunk(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-2026-01-01"}}
+
+"#,
+            )
+            .unwrap();
+        let stamped = events
+            .iter()
+            .find_map(|event| match event {
+                StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                    provenance: Some(provenance),
+                    ..
+                }) => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect("response metadata with provenance");
+        assert_eq!(
+            Some(stamped),
+            HTTPChatProvider::output_provenance(&provider)
+        );
     }
 }
 

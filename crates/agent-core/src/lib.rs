@@ -23,6 +23,7 @@ pub mod knowledge;
 pub mod meta;
 pub mod model;
 pub mod path;
+pub mod projection;
 pub mod prompt_text;
 pub mod protocol;
 pub mod run_lease_path;

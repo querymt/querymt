@@ -37,7 +37,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -386,11 +386,15 @@ impl LLMProviderFactory for ExtismFactory {
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
+            capabilities: OnceLock::new(),
         };
 
         if self.supports_http_adapter_abi() {
             let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
-            return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
+            let name = LLMProviderFactory::name(self).to_string();
+            return Ok(Box::new(
+                LLMProviderFromHTTP::new(http_provider).with_name(name),
+            ));
         }
 
         Ok(Box::new(provider))
@@ -523,6 +527,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
+            capabilities: OnceLock::new(),
         };
         Ok(Box::new(provider))
     }
@@ -590,6 +595,9 @@ pub struct ExtismProvider {
     config: Value,
     user_data: Option<extism::UserData<functions::HostState>>,
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+    /// What the plugin declared, kept for the provider's lifetime. Filled by the
+    /// first read that succeeds; a failed read stores nothing.
+    capabilities: OnceLock<ChatCapabilities>,
 }
 
 impl ExtismProvider {
@@ -657,21 +665,36 @@ impl ExtismProvider {
     /// A plugin without a `capabilities` export falls back to streaming being
     /// available when all stream-parser exports exist, and no per-request
     /// options, so options are never sent to plugins that cannot honour them.
+    ///
+    /// The answer cannot change once the provider is built, so the first
+    /// successful read is kept. A poisoned plugin mutex or a failing export
+    /// returns [`ChatCapabilities::NONE`] and stores nothing, so the next read
+    /// asks the plugin again.
     fn plugin_capabilities(&self) -> ChatCapabilities {
+        if let Some(caps) = self.capabilities.get() {
+            return *caps;
+        }
         let Ok(mut plug) = self.plugin.lock() else {
             return ChatCapabilities::NONE;
         };
-        if plug.function_exists("capabilities") {
-            return plug
-                .call::<_, Json<ChatCapabilities>>("capabilities", Json(self.config.clone()))
-                .map(|Json(caps)| caps)
-                .unwrap_or(ChatCapabilities::NONE);
+        // Another reader may have filled it while this one waited for the lock.
+        if let Some(caps) = self.capabilities.get() {
+            return *caps;
         }
-        ChatCapabilities::NONE.with_streaming(
-            ["start", "parse", "finish", "close"]
-                .iter()
-                .all(|op| plug.function_exists(format!("chat_stream_parser_{op}"))),
-        )
+        let caps = if plug.function_exists("capabilities") {
+            match plug.call::<_, Json<ChatCapabilities>>("capabilities", Json(self.config.clone()))
+            {
+                Ok(Json(caps)) => caps,
+                Err(_) => return ChatCapabilities::NONE,
+            }
+        } else {
+            ChatCapabilities::NONE.with_streaming(
+                ["start", "parse", "finish", "close"]
+                    .iter()
+                    .all(|op| plug.function_exists(format!("chat_stream_parser_{op}"))),
+            )
+        };
+        *self.capabilities.get_or_init(|| caps)
     }
 
     fn call_short_blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
@@ -1253,6 +1276,28 @@ mod tests {
 
     // Each export writes to WASI stdout, exercising Wasmtime's synchronous Tokio bridge.
     fn export(name: &str, output: &str) -> String {
+        export_counting(name, output, None)
+    }
+
+    /// Like [`export`], but the export counts its calls in the module's
+    /// mutable `$calls` global and traps on call number `trap_on` (1-based).
+    /// A counting export does not write to WASI stdout: its tests call it from
+    /// inside a Tokio runtime, where Wasmtime's blocking bridge cannot run.
+    fn export_counting(name: &str, output: &str, trap_on: Option<u32>) -> String {
+        let (count, stdout) = match trap_on {
+            Some(n) => (
+                format!(
+                    r#"(global.set $calls (i32.add (global.get $calls) (i32.const 1)))
+                (if (i32.eq (global.get $calls) (i32.const {n})) (then unreachable))"#
+                ),
+                String::new(),
+            ),
+            None => (
+                String::new(),
+                "(drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)))"
+                    .to_string(),
+            ),
+        };
         let stores = output
             .bytes()
             .enumerate()
@@ -1266,7 +1311,8 @@ mod tests {
         format!(
             r#"(func (export "{name}") (result i32)
                 (local $ptr i64)
-                (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)))
+                {count}
+                {stdout}
                 (local.set $ptr (call $alloc (i64.const {len})))
                 {stores}
                 (call $output_set (local.get $ptr) (i64.const {len}))
@@ -1280,6 +1326,16 @@ mod tests {
             .iter()
             .map(|(name, output)| export(name, output))
             .collect::<String>();
+        wat_plugin_from(funcs)
+    }
+
+    /// A plugin whose `capabilities` export returns `output` and traps on call
+    /// number `trap_on`.
+    fn capabilities_plugin_trapping_on(output: &str, trap_on: u32) -> Plugin {
+        wat_plugin_from(export_counting("capabilities", output, Some(trap_on)))
+    }
+
+    fn wat_plugin_from(funcs: String) -> Plugin {
         let wasm = format!(
             r#"(module
                 (import "wasi_snapshot_preview1" "fd_write"
@@ -1288,6 +1344,7 @@ mod tests {
                 (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
                 (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
                 (memory (export "memory") 1)
+                (global $calls (mut i32) (i32.const 0))
                 {funcs})"#
         );
         PluginBuilder::new(Manifest::new([Wasm::data(wasm.into_bytes())]))
@@ -1302,6 +1359,7 @@ mod tests {
             config: serde_json::json!({}),
             user_data: None,
             key_resolver: None,
+            capabilities: OnceLock::new(),
         }
     }
 
@@ -1350,12 +1408,90 @@ mod tests {
     }
 
     #[test]
-    fn plugin_without_capabilities_export_supports_no_options() {
+    fn plugin_capabilities_without_prompt_cache_declare_no_breakpoints() {
+        // Built before the declaration existed: the export omits the field.
+        let caps = r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#;
+        let provider = provider_over(wat_plugin(&[("capabilities", caps)]));
+
+        let caps = HTTPChatProvider::capabilities(&provider);
+
+        assert!(caps.streaming);
+        assert_eq!(
+            caps.prompt_cache,
+            crate::chat::PromptCacheCapabilities::NONE
+        );
+    }
+
+    #[test]
+    fn plugin_capabilities_carry_the_prompt_cache_declaration() {
+        let caps = r#"{"prompt_cache":{"explicit_breakpoints":true,"max_ttl_secs":3600}}"#;
+        let provider = provider_over(wat_plugin(&[("capabilities", caps)]));
+
+        let caps = HTTPChatProvider::capabilities(&provider);
+
+        assert!(caps.prompt_cache.explicit_breakpoints);
+        assert_eq!(caps.prompt_cache.max_ttl_secs, Some(3600));
+    }
+
+    #[test]
+    fn plugin_without_a_capability_declaration() {
+        // No `capabilities` export and no stream parser: nothing is declared.
         let provider = provider_over(wat_plugin(&[]));
+        assert_eq!(
+            HTTPChatProvider::capabilities(&provider),
+            ChatCapabilities::NONE
+        );
+
+        // The four stream parser exports declare streaming, and nothing else.
+        let provider = provider_over(wat_plugin(&[
+            ("chat_stream_parser_start", "{}"),
+            ("chat_stream_parser_parse", "{}"),
+            ("chat_stream_parser_finish", "{}"),
+            ("chat_stream_parser_close", "{}"),
+        ]));
+        assert_eq!(
+            HTTPChatProvider::capabilities(&provider),
+            ChatCapabilities::NONE.with_streaming(true)
+        );
+    }
+
+    const DECLARED: &str =
+        r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#;
+
+    fn declared_capabilities() -> ChatCapabilities {
+        serde_json::from_str(DECLARED).expect("declared capabilities parse")
+    }
+
+    #[tokio::test]
+    async fn several_requests_through_one_plugin_provider() {
+        // The export traps on its second call: a provider that asks the plugin
+        // again for every read sees the trap and reports no capabilities.
+        let provider = provider_over(capabilities_plugin_trapping_on(DECLARED, 2));
+        let adapter = LLMProviderFromHTTP::new(Box::new(provider));
+        let messages = [ChatMessage::user().text("hi").build()];
+
+        for _ in 0..3 {
+            // The request itself fails (the plugin has no chat contract); what
+            // matters is how often the request path asks for capabilities.
+            let _ = adapter.chat(&ChatCall::new(&messages)).await;
+            assert_eq!(
+                ChatProvider::capabilities(&adapter),
+                declared_capabilities()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_capability_read_is_not_kept() {
+        let provider = provider_over(capabilities_plugin_trapping_on(DECLARED, 1));
 
         assert_eq!(
             HTTPChatProvider::capabilities(&provider),
-            crate::chat::ChatCapabilities::NONE
+            ChatCapabilities::NONE
+        );
+        assert_eq!(
+            HTTPChatProvider::capabilities(&provider),
+            declared_capabilities()
         );
     }
 

@@ -4,19 +4,23 @@
 //! to wait for external events (like delegation completions).
 
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::TurnError;
+use crate::agent::execution::turn::{Turn, TurnEnv};
+use crate::agent::execution::{CycleOutcome, Stage, Step};
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
-use crate::middleware::{ExecutionState, WaitCondition, WaitReason};
+use crate::middleware::{WaitCondition, WaitReason};
 use log::{debug, warn};
 use querymt::chat::ChatRole;
 use querymt_agent_core::events::{AgentEventKind, StopType};
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 use std::collections::HashSet;
-use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) struct DelegationRecovery {
-    outcomes: futures_util::future::BoxFuture<'static, Vec<WaitEventOutcome>>,
+    /// Wrapped so that a run (`Turn`) holding it stays `Sync`: the tool wave
+    /// shares the run by `&`. Only `&mut` access ever polls it.
+    outcomes:
+        sync_wrapper::SyncWrapper<futures_util::future::BoxFuture<'static, Vec<WaitEventOutcome>>>,
     ids: HashSet<String>,
     dirty: bool,
 }
@@ -29,7 +33,7 @@ impl DelegationRecovery {
         Self {
             ids: covered_ids,
             dirty: false,
-            outcomes: Box::pin(async move {
+            outcomes: sync_wrapper::SyncWrapper::new(Box::pin(async move {
                 let mut delay = std::time::Duration::from_millis(100);
                 loop {
                     match durable_wait_outcomes(journal.as_ref(), &session_id, &ids).await {
@@ -41,14 +45,14 @@ impl DelegationRecovery {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(std::time::Duration::from_secs(1));
                 }
-            }),
+            })),
         }
     }
 }
 
 async fn recovery_outcomes(recovery: &mut Option<DelegationRecovery>) -> Vec<WaitEventOutcome> {
     match recovery {
-        Some(recovery) => recovery.outcomes.as_mut().await,
+        Some(recovery) => recovery.outcomes.get_mut().as_mut().await,
         None => std::future::pending().await,
     }
 }
@@ -72,8 +76,8 @@ enum WaitEventOutcome {
 /// This function blocks until matching events are received or execution is cancelled.
 /// For delegation waits, policy controls whether we resume on first result (Any)
 /// or wait for all requested delegations (All), with optional timeout cleanup.
-async fn wait_for_pending_steering(exec_ctx: &ExecutionContext) {
-    let Some(inbox) = &exec_ctx.steering else {
+async fn wait_for_pending_steering(env: &TurnEnv) {
+    let Some(inbox) = &env.steering else {
         std::future::pending::<()>().await;
         return;
     };
@@ -91,58 +95,54 @@ async fn wait_for_pending_steering(exec_ctx: &ExecutionContext) {
 pub(super) async fn transition_waiting_for_event(
     config: &AgentConfig,
     wait: &WaitCondition,
-    context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
-) -> Result<ExecutionState, anyhow::Error> {
+) -> Result<Step, TurnError> {
     debug!(
         "WaitingForEvent: session={}, reason={:?}",
-        exec_ctx.session_id, wait.reason
+        env.session_id, wait.reason
     );
 
-    if exec_ctx.cancellation_token.is_cancelled() {
-        return Ok(ExecutionState::Cancelled);
+    if env.cancellation_token.is_cancelled() {
+        return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
     if wait.reason != WaitReason::Delegation {
-        return Ok(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        });
+        return Ok(Step::Continue(Stage::BeforeRequest));
     }
 
     if config.delegation_wait_policy == crate::config::DelegationWaitPolicy::Any {
         let mut recovery = Some(DelegationRecovery::new(
             config,
-            &exec_ctx.session_id,
+            &env.session_id,
             wait.correlation_ids.clone(),
         ));
         loop {
             tokio::select! {
                 biased;
-                _ = exec_ctx.cancellation_token.cancelled() => {
-                    return Ok(ExecutionState::Cancelled);
+                _ = env.cancellation_token.cancelled() => {
+                    return Ok(Step::Break(CycleOutcome::Cancelled));
                 }
-                _ = wait_for_pending_steering(exec_ctx) => {
-                    exec_ctx
+                _ = wait_for_pending_steering(env) => {
+                    turn
                         .suspended_delegations
-                        .lock()
-                        .await
                         .extend(wait.correlation_ids.iter().cloned());
                     let pending = wait.correlation_ids.join(", ");
                     let message = format!(
                         "New user steering was received. Delegations still running and awaiting later reconciliation: {pending}"
                     );
-                    let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
-                    return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                    inject_wait_message(config, env, &mut turn.history, message).await?;
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
                 recovered = recovery_outcomes(&mut recovery) => {
                     let dirty = recovery.take().is_some_and(|read| read.dirty);
                     if dirty {
-                        recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, wait.correlation_ids.clone()));
+                        recovery = Some(DelegationRecovery::new(config, &env.session_id, wait.correlation_ids.clone()));
                     }
                     if let Some(outcome) = recovered.into_iter().next() {
-                        let new_context = inject_wait_message(config, context, exec_ctx, format_wait_outcome(&outcome)).await?;
-                        return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                        inject_wait_message(config, env, &mut turn.history, format_wait_outcome(&outcome)).await?;
+                        return Ok(Step::Continue(Stage::BeforeRequest));
                     }
                 }
                 event = event_rx.recv() => {
@@ -152,27 +152,26 @@ pub(super) async fn transition_waiting_for_event(
                             if let Some(read) = &mut recovery {
                                 read.dirty = true;
                             } else {
-                                recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, wait.correlation_ids.clone()));
+                                recovery = Some(DelegationRecovery::new(config, &env.session_id, wait.correlation_ids.clone()));
                             }
                             continue;
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Ok(ExecutionState::Stopped {
-                                message: "Event stream closed while waiting".into(),
-                                stop_type: StopType::Other,
-                                context: Some(context.clone()),
-                            });
+                            return Ok(super::stopping(
+                                StopType::Other,
+                                "Event stream closed while waiting",
+                            ));
                         }
                     };
 
-                    if event.session_id() != exec_ctx.session_id {
+                    if event.session_id() != env.session_id {
                         continue;
                     }
 
                     if let Some(outcome) = match_wait_event(wait, &event) {
                         let message = format_wait_outcome(&outcome);
-                        let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
-                        return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                        inject_wait_message(config, env, &mut turn.history, message).await?;
+                        return Ok(Step::Continue(Stage::BeforeRequest));
                     }
                 }
             }
@@ -181,9 +180,7 @@ pub(super) async fn transition_waiting_for_event(
 
     let mut pending: HashSet<String> = wait.correlation_ids.iter().cloned().collect();
     if pending.is_empty() {
-        return Ok(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        });
+        return Ok(Step::Continue(Stage::BeforeRequest));
     }
 
     let mut outcomes: Vec<String> = Vec::new();
@@ -208,39 +205,37 @@ pub(super) async fn transition_waiting_for_event(
     tokio::pin!(sleep);
     let mut recovery = Some(DelegationRecovery::new(
         config,
-        &exec_ctx.session_id,
+        &env.session_id,
         pending.iter().cloned().collect(),
     ));
 
     loop {
         tokio::select! {
             biased;
-            _ = exec_ctx.cancellation_token.cancelled() => {
-                return Ok(ExecutionState::Cancelled);
+            _ = env.cancellation_token.cancelled() => {
+                return Ok(Step::Break(CycleOutcome::Cancelled));
             }
-            _ = wait_for_pending_steering(exec_ctx) => {
-                exec_ctx
+            _ = wait_for_pending_steering(env) => {
+                turn
                     .suspended_delegations
-                    .lock()
-                    .await
                     .extend(pending.iter().cloned());
                 let message = format!(
                     "New user steering was received. Delegations still running and awaiting later reconciliation: {}",
                     pending.iter().cloned().collect::<Vec<_>>().join(", ")
                 );
-                let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
-                return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                inject_wait_message(config, env, &mut turn.history, message).await?;
+                return Ok(Step::Continue(Stage::BeforeRequest));
             }
             _ = &mut sleep, if timeout_secs > 0 => {
                 let timed_out_ids: Vec<String> = pending.iter().cloned().collect();
-                cleanup_timed_out_delegations(config, exec_ctx, &timed_out_ids).await;
+                cleanup_timed_out_delegations(config, env, turn, &timed_out_ids).await;
                 outcomes.extend(timed_out_ids.iter().map(|id| {
                     format!("- {}: timed out after {}s of inactivity (cancel requested)", id, timeout_secs)
                 }));
 
                 let message = format_wait_all_summary(&outcomes);
-                let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
-                return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                inject_wait_message(config, env, &mut turn.history, message).await?;
+                return Ok(Step::Continue(Stage::BeforeRequest));
             }
             recovered = recovery_outcomes(&mut recovery) => {
                 let dirty = recovery.take().is_some_and(|read| read.dirty);
@@ -252,14 +247,14 @@ pub(super) async fn transition_waiting_for_event(
                     }
                 }
                 if pending.is_empty() {
-                    let new_context = inject_wait_message(config, context, exec_ctx, format_wait_all_summary(&outcomes)).await?;
-                    return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                    inject_wait_message(config, env, &mut turn.history, format_wait_all_summary(&outcomes)).await?;
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
                 if progressed && timeout_secs > 0 {
                     sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs));
                 }
                 if dirty {
-                    recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, pending.iter().cloned().collect()));
+                    recovery = Some(DelegationRecovery::new(config, &env.session_id, pending.iter().cloned().collect()));
                 }
             }
             event = event_rx.recv() => {
@@ -269,20 +264,19 @@ pub(super) async fn transition_waiting_for_event(
                         if let Some(read) = &mut recovery {
                             read.dirty = true;
                         } else {
-                            recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, pending.iter().cloned().collect()));
+                            recovery = Some(DelegationRecovery::new(config, &env.session_id, pending.iter().cloned().collect()));
                         }
                         continue;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Ok(ExecutionState::Stopped {
-                            message: "Event stream closed while waiting".into(),
-                            stop_type: StopType::Other,
-                            context: Some(context.clone()),
-                        });
+                        return Ok(super::stopping(
+                            StopType::Other,
+                            "Event stream closed while waiting",
+                        ));
                     }
                 };
 
-                if event.session_id() != exec_ctx.session_id {
+                if event.session_id() != env.session_id {
                     continue;
                 }
 
@@ -303,8 +297,8 @@ pub(super) async fn transition_waiting_for_event(
                 outcomes.push(format_wait_all_item(&outcome));
                 if pending.is_empty() {
                     let message = format_wait_all_summary(&outcomes);
-                    let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
-                    return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                    inject_wait_message(config, env, &mut turn.history, message).await?;
+                    return Ok(Step::Continue(Stage::BeforeRequest));
                 }
 
                 // Progress was made: reset the inactivity deadline so the next
@@ -322,14 +316,13 @@ pub(super) async fn transition_waiting_for_event(
 
 pub(super) async fn reconcile_suspended_delegations(
     config: &AgentConfig,
-    context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
-) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
-    let mut context = context.clone();
-    if exec_ctx.suspended_delegations.lock().await.is_empty() {
-        *exec_ctx.suspended_recovery.lock().await = None;
-        return Ok(context);
+) -> Result<(), anyhow::Error> {
+    if turn.suspended_delegations.is_empty() {
+        turn.suspended_recovery = None;
+        return Ok(());
     }
     let mut lagged = false;
     loop {
@@ -342,10 +335,10 @@ pub(super) async fn reconcile_suspended_delegations(
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         };
-        if event.session_id() != exec_ctx.session_id {
+        if event.session_id() != env.session_id {
             continue;
         }
-        let suspended = exec_ctx.suspended_delegations.lock().await.clone();
+        let suspended = turn.suspended_delegations.clone();
         if suspended.is_empty() {
             break;
         }
@@ -361,39 +354,34 @@ pub(super) async fn reconcile_suspended_delegations(
             | WaitEventOutcome::Failed { delegation_id, .. }
             | WaitEventOutcome::Cancelled { delegation_id } => delegation_id,
         };
-        exec_ctx
-            .suspended_delegations
-            .lock()
-            .await
-            .remove(delegation_id);
-        context =
-            inject_wait_message(config, &context, exec_ctx, format_wait_outcome(&outcome)).await?;
+        turn.suspended_delegations.remove(delegation_id);
+        inject_wait_message(
+            config,
+            env,
+            &mut turn.history,
+            format_wait_outcome(&outcome),
+        )
+        .await?;
     }
-    recover_suspended(config, context, exec_ctx, lagged).await
+    recover_suspended(config, env, turn, lagged).await
 }
 
 async fn recover_suspended(
     config: &AgentConfig,
-    mut context: Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     lagged: bool,
-) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
-    let ids: Vec<_> = exec_ctx
-        .suspended_delegations
-        .lock()
-        .await
-        .iter()
-        .cloned()
-        .collect();
-    let mut recovery = exec_ctx.suspended_recovery.lock().await;
+) -> Result<(), anyhow::Error> {
+    let ids: Vec<_> = turn.suspended_delegations.iter().cloned().collect();
+    let recovery = &mut turn.suspended_recovery;
     if ids.is_empty() {
         *recovery = None;
-        return Ok(context);
+        return Ok(());
     }
     if let Some(read) = recovery.as_mut() {
         read.dirty |= lagged || ids.iter().any(|id| !read.ids.contains(id));
     } else {
-        *recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, ids));
+        *recovery = Some(DelegationRecovery::new(config, &env.session_id, ids));
     }
     // Keep the captured read, but remember newer lag/IDs need one follow-up.
     // Both reads share a bounded BeforeModel budget, including across boundaries.
@@ -402,37 +390,34 @@ async fn recover_suspended(
     loop {
         let outcomes = tokio::select! {
             biased;
-            _ = exec_ctx.cancellation_token.cancelled() => return Ok(context),
-            _ = &mut budget => return Ok(context),
-            outcomes = recovery_outcomes(&mut recovery) => outcomes,
+            _ = env.cancellation_token.cancelled() => return Ok(()),
+            _ = &mut budget => return Ok(()),
+            outcomes = recovery_outcomes(recovery) => outcomes,
         };
         let dirty = recovery.take().is_some_and(|read| read.dirty);
         for outcome in outcomes {
-            if exec_ctx
-                .suspended_delegations
-                .lock()
-                .await
-                .remove(outcome_id(&outcome))
-            {
-                context =
-                    inject_wait_message(config, &context, exec_ctx, format_wait_outcome(&outcome))
-                        .await?;
+            if turn.suspended_delegations.remove(outcome_id(&outcome)) {
+                inject_wait_message(
+                    config,
+                    env,
+                    &mut turn.history,
+                    format_wait_outcome(&outcome),
+                )
+                .await?;
             }
         }
         if !dirty {
-            return Ok(context);
+            return Ok(());
         }
-        let ids = exec_ctx
+        let ids = turn
             .suspended_delegations
-            .lock()
-            .await
             .iter()
             .cloned()
             .collect::<Vec<_>>();
         if ids.is_empty() {
-            return Ok(context);
+            return Ok(());
         }
-        *recovery = Some(DelegationRecovery::new(config, &exec_ctx.session_id, ids));
+        *recovery = Some(DelegationRecovery::new(config, &env.session_id, ids));
     }
 }
 
@@ -564,11 +549,12 @@ fn format_wait_all_summary(items: &[String]) -> String {
 
 pub(crate) async fn cleanup_timed_out_delegations(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     delegation_ids: &[String],
 ) {
     for delegation_id in delegation_ids {
-        let transitioned = match exec_ctx
+        let transitioned = match turn
             .state
             .store
             .transition_delegation_status(
@@ -579,7 +565,7 @@ pub(crate) async fn cleanup_timed_out_delegations(
             .await
         {
             Ok(true) => true,
-            Ok(false) => exec_ctx
+            Ok(false) => turn
                 .state
                 .store
                 .transition_delegation_status(
@@ -608,13 +594,13 @@ pub(crate) async fn cleanup_timed_out_delegations(
         }
 
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::DelegationCancelRequested {
                 delegation_id: delegation_id.clone(),
             },
         );
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::DelegationCancelled {
                 delegation_id: delegation_id.clone(),
             },
@@ -622,18 +608,16 @@ pub(crate) async fn cleanup_timed_out_delegations(
     }
 }
 
-/// Inject a wait completion message into the conversation history.
-///
-/// This stores the message and returns an updated context with the message injected.
+/// Store a wait completion message as a user message of the run.
 async fn inject_wait_message(
     config: &AgentConfig,
-    context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    history: &mut super::turn::History,
     content: String,
-) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+) -> Result<(), TurnError> {
     let agent_msg = AgentMessage {
         id: Uuid::new_v4().to_string(),
-        session_id: exec_ctx.session_id.clone(),
+        session_id: env.session_id.clone(),
         role: ChatRole::User,
         parts: vec![MessagePart::Text {
             content: content.clone(),
@@ -643,33 +627,29 @@ async fn inject_wait_message(
         source_provider: None,
         source_model: None,
     };
+    agent_msg
+        .to_chat_message()
+        .map_err(|e| anyhow::anyhow!("Invalid wait message content: {}", e))?;
 
-    exec_ctx
-        .add_message(agent_msg)
+    history
+        .commit(&env.session_handle, vec![agent_msg])
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to store wait message: {}", e))?;
+        .map_err(TurnError::history("Failed to store wait message"))?;
 
     config.emit_event(
-        &exec_ctx.session_id,
-        AgentEventKind::UserMessageStored {
-            content: content.clone(),
-        },
+        &env.session_id,
+        AgentEventKind::UserMessageStored { content },
     );
-
-    Ok(Arc::new(context.inject_message(content)))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::{backend::StorageBackend, sqlite_storage::SqliteStorage};
+    use std::sync::Arc;
 
-    async fn fixture() -> (
-        AgentConfig,
-        ExecutionContext,
-        Arc<crate::middleware::ConversationContext>,
-        tempfile::TempDir,
-    ) {
+    async fn fixture() -> (AgentConfig, TurnEnv, Turn, tempfile::TempDir) {
         let (plugins, dir) = crate::test_utils::empty_plugin_registry().unwrap();
         let storage = Arc::new(
             SqliteStorage::connect(dir.path().join("wait.db"))
@@ -698,22 +678,9 @@ mod tests {
             Default::default(),
             crate::agent::core::McpToolState::empty(),
         );
-        let exec = ExecutionContext::new(
-            session.public_id.clone(),
-            querymt_agent_core::model::TurnId::new(),
-            runtime,
-            state,
-            handle,
-            config.tool_config.clone(),
-        );
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            Arc::from(session.public_id.as_str()),
-            Arc::from([]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            Arc::from("mock"),
-            Arc::from("mock-model"),
-        ));
-        (config, exec, context, dir)
+        let (exec, turn) =
+            crate::test_utils::inert_turn_parts(&config, handle, runtime, state).await;
+        (config, exec, turn, dir)
     }
 
     #[tokio::test]
@@ -723,7 +690,7 @@ mod tests {
             crate::config::DelegationWaitPolicy::All,
         ] {
             for late_entry in [false, true] {
-                let (mut config, exec, context, _dir) = fixture().await;
+                let (mut config, exec, mut turn, _dir) = fixture().await;
                 config.delegation_wait_policy = policy.clone();
                 let mut rx = config.subscribe_events();
                 config
@@ -764,11 +731,11 @@ mod tests {
                 };
                 let result = tokio::time::timeout(
                     std::time::Duration::from_millis(200),
-                    transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx),
+                    transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx),
                 )
                 .await;
                 assert!(
-                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall { .. }))),
+                    matches!(result, Ok(Ok(Step::Continue(Stage::BeforeRequest)))),
                     "terminal outcome lost for {policy:?}, late_entry={late_entry}"
                 );
             }
@@ -781,7 +748,7 @@ mod tests {
             crate::config::DelegationWaitPolicy::Any,
             crate::config::DelegationWaitPolicy::All,
         ] {
-            let (mut config, exec, context, _dir) = fixture().await;
+            let (mut config, exec, mut turn, _dir) = fixture().await;
             config.delegation_wait_policy = policy;
             let mut rx = config.subscribe_events();
             let mut lag_witness = config.subscribe_events();
@@ -789,7 +756,7 @@ mod tests {
                 reason: WaitReason::Delegation,
                 correlation_ids: vec!["mid-wait-child".into()],
             };
-            let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+            let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
             tokio::pin!(waiting);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiting)
@@ -826,7 +793,7 @@ mod tests {
             ));
             assert!(matches!(
                 tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting).await,
-                Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+                Ok(Ok(Step::Continue(Stage::BeforeRequest)))
             ));
         }
     }
@@ -982,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn delayed_durable_recovery_preserves_cancellation_and_inactivity_timeout() {
         for cancel in [true, false] {
-            let (mut config, exec, context, _dir) = fixture().await;
+            let (mut config, exec, mut turn, _dir) = fixture().await;
             config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
             config.delegation_wait_timeout_secs = 1;
             let gate = Arc::new(TerminalReadGate::new(
@@ -1008,16 +975,19 @@ mod tests {
             });
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(1500),
-                transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx),
+                transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx),
             )
             .await;
             gate.release.notify_waiters();
             trigger.abort();
             if cancel {
-                assert!(matches!(result, Ok(Ok(ExecutionState::Cancelled))));
+                assert!(matches!(
+                    result,
+                    Ok(Ok(Step::Break(CycleOutcome::Cancelled)))
+                ));
             } else {
                 assert!(
-                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall { .. }))),
+                    matches!(result, Ok(Ok(Step::Continue(Stage::BeforeRequest)))),
                     "terminal read must not defeat existing inactivity timeout"
                 );
             }
@@ -1043,7 +1013,7 @@ mod tests {
             crate::config::DelegationWaitPolicy::All,
         ] {
             for lag in [false, true] {
-                let (mut config, exec, context, _dir) = fixture().await;
+                let (mut config, exec, mut turn, _dir) = fixture().await;
                 config.delegation_wait_policy = policy.clone();
                 let gate = gated_sink(&mut config, usize::from(lag));
                 let mut rx = config.subscribe_events();
@@ -1052,7 +1022,7 @@ mod tests {
                     correlation_ids: vec!["live-child".into()],
                 };
                 let waiting =
-                    transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+                    transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
                 tokio::pin!(waiting);
                 tokio::select! {
                     _ = gate.entered.notified() => {},
@@ -1106,7 +1076,7 @@ mod tests {
                     matches!(
                         tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiting)
                             .await,
-                        Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+                        Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                     ),
                     "live completion blocked by recovery: {policy:?} lag={lag}"
                 );
@@ -1116,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_all_progress_resets_inactivity_while_recovery_is_pending() {
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
         config.delegation_wait_timeout_secs = 1;
         let gate = gated_sink(&mut config, 0);
@@ -1125,7 +1095,7 @@ mod tests {
             reason: WaitReason::Delegation,
             correlation_ids: vec!["a".into(), "b".into()],
         };
-        let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+        let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
         tokio::pin!(waiting);
         tokio::select! { _ = gate.entered.notified() => {}, _ = &mut waiting => panic!("early wait exit") }
         for id in ["a", "b"] {
@@ -1145,7 +1115,7 @@ mod tests {
         }
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiting).await,
-            Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+            Ok(Ok(Step::Continue(Stage::BeforeRequest)))
         ));
         let history = config
             .provider
@@ -1168,7 +1138,7 @@ mod tests {
             crate::config::DelegationWaitPolicy::All,
         ] {
             for lag in [false, true] {
-                let (mut config, exec, context, _dir) = fixture().await;
+                let (mut config, exec, mut turn, _dir) = fixture().await;
                 config.delegation_wait_policy = policy.clone();
                 let gate = gated_sink(&mut config, usize::MAX);
                 let mut rx = config.subscribe_events();
@@ -1180,7 +1150,7 @@ mod tests {
                     gate.failures.store(1, Ordering::SeqCst);
                 }
                 let waiting =
-                    transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+                    transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
                 tokio::pin!(waiting);
                 assert!(
                     tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiting)
@@ -1217,11 +1187,11 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiting).await,
-                    Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+                    Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                 ));
             }
         }
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         let gate = gated_sink(&mut config, usize::MAX);
         config
             .emit_event_persisted(
@@ -1233,33 +1203,27 @@ mod tests {
             )
             .await
             .unwrap();
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("saved".into());
+        turn.suspended_delegations.insert("saved".into());
         let mut rx = config.subscribe_events();
         gate.failures.store(1, Ordering::SeqCst);
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .expect("transient read must not fail BeforeModel");
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .unwrap();
         assert!(
-            exec.suspended_delegations.lock().await.is_empty(),
+            turn.suspended_delegations.is_empty(),
             "pending IDs must survive and retry durable recovery"
         );
     }
 
     #[tokio::test]
     async fn suspended_live_progress_does_not_wait_for_stalled_recovery() {
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         let gate = gated_sink(&mut config, 0);
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("live".into());
+        turn.suspended_delegations.insert("live".into());
         let mut rx = config.subscribe_events();
         // The stream base resolves off the caller's path; wait for it so the
         // ephemeral event below is published inline.
@@ -1279,14 +1243,14 @@ mod tests {
             matches!(
                 tokio::time::timeout(
                     std::time::Duration::from_millis(150),
-                    reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+                    reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
                 )
                 .await,
                 Ok(Ok(_))
             ),
             "BeforeModel blocked by a supplementary recovery read"
         );
-        assert!(exec.suspended_delegations.lock().await.is_empty());
+        assert!(turn.suspended_delegations.is_empty());
         drop(gate);
     }
 
@@ -1297,7 +1261,7 @@ mod tests {
             crate::config::DelegationWaitPolicy::Any,
             crate::config::DelegationWaitPolicy::All,
         ] {
-            let (mut config, exec, context, _dir) = fixture().await;
+            let (mut config, exec, mut turn, _dir) = fixture().await;
             config.delegation_wait_policy = policy;
             let gate = gated_sink(&mut config, 0);
             gate.snapshot_before_wait.store(true, Ordering::SeqCst);
@@ -1307,7 +1271,7 @@ mod tests {
                 reason: WaitReason::Delegation,
                 correlation_ids: vec!["lost-after-snapshot".into()],
             };
-            let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+            let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
             tokio::pin!(waiting);
             tokio::select! { _ = gate.entered.notified() => {}, _ = &mut waiting => panic!("early wait exit") }
             // The actual query has already returned an empty snapshot; only its delivery is held.
@@ -1345,7 +1309,7 @@ mod tests {
             assert!(
                 matches!(
                     tokio::time::timeout(std::time::Duration::from_millis(250), &mut waiting).await,
-                    Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+                    Ok(Ok(Step::Continue(Stage::BeforeRequest)))
                 ),
                 "lag during a retained old read must not lose the durable wakeup"
             );
@@ -1356,25 +1320,19 @@ mod tests {
     #[tokio::test]
     async fn suspended_recovery_retains_new_ids_and_lag_during_a_captured_read() {
         use std::sync::atomic::Ordering;
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         let gate = gated_sink(&mut config, 0);
         gate.snapshot_before_wait.store(true, Ordering::SeqCst);
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("older".into());
+        turn.suspended_delegations.insert("older".into());
         let mut rx = config.subscribe_events();
         tokio::time::timeout(
             std::time::Duration::from_millis(150),
-            reconcile_suspended_delegations(&config, &context, &exec, &mut rx),
+            reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx),
         )
         .await
         .unwrap()
         .unwrap();
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("newer".into());
+        turn.suspended_delegations.insert("newer".into());
         for id in ["older", "newer"] {
             config
                 .emit_event_persisted(
@@ -1396,7 +1354,7 @@ mod tests {
                 },
             );
         }
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .unwrap();
         assert_eq!(
@@ -1406,11 +1364,11 @@ mod tests {
         );
         gate.blocking.store(false, Ordering::SeqCst);
         gate.release.notify_one();
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .unwrap();
         assert!(
-            exec.suspended_delegations.lock().await.is_empty(),
+            turn.suspended_delegations.is_empty(),
             "lag and new IDs must survive the old query result"
         );
         assert_eq!(gate.reads.load(Ordering::SeqCst), 2);
@@ -1419,7 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_live_and_recovered_outcomes_do_not_renew_all_inactivity() {
         use std::sync::atomic::Ordering;
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
         config.delegation_wait_timeout_secs = 1;
         let gate = gated_sink(&mut config, 0);
@@ -1439,7 +1397,7 @@ mod tests {
             reason: WaitReason::Delegation,
             correlation_ids: vec!["a".into(), "b".into()],
         };
-        let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+        let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
         tokio::pin!(waiting);
         tokio::select! { _ = gate.entered.notified() => {}, _ = &mut waiting => panic!("early wait exit") }
         assert!(
@@ -1470,7 +1428,7 @@ mod tests {
         assert!(
             matches!(
                 tokio::time::timeout(std::time::Duration::from_millis(650), waiting).await,
-                Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+                Ok(Ok(Step::Continue(Stage::BeforeRequest)))
             ),
             "duplicates must not postpone b's original inactivity deadline"
         );
@@ -1493,7 +1451,7 @@ mod tests {
     async fn persistent_recovery_errors_keep_cancel_timeout_and_pending_ids() {
         use std::sync::atomic::Ordering;
         for cancel in [true, false] {
-            let (mut config, exec, context, _dir) = fixture().await;
+            let (mut config, exec, mut turn, _dir) = fixture().await;
             config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
             config.delegation_wait_timeout_secs = 1;
             let gate = gated_sink(&mut config, usize::MAX);
@@ -1503,7 +1461,7 @@ mod tests {
                 reason: WaitReason::Delegation,
                 correlation_ids: vec!["pending".into()],
             };
-            let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+            let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
             tokio::pin!(waiting);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(250), &mut waiting)
@@ -1523,9 +1481,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if cancel {
-                assert!(matches!(result, ExecutionState::Cancelled));
+                assert!(matches!(result, Step::Break(CycleOutcome::Cancelled)));
             } else {
-                assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+                assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
                 assert!(
                     format!(
                         "{:?}",
@@ -1541,25 +1499,22 @@ mod tests {
             }
             assert!(gate.reads.load(Ordering::SeqCst) <= 5);
         }
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         let gate = gated_sink(&mut config, usize::MAX);
         gate.failures.store(usize::MAX, Ordering::SeqCst);
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("pending".into());
+        turn.suspended_delegations.insert("pending".into());
         let mut rx = config.subscribe_events();
         tokio::time::timeout(
             std::time::Duration::from_millis(150),
-            reconcile_suspended_delegations(&config, &context, &exec, &mut rx),
+            reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(exec.suspended_delegations.lock().await.contains("pending"));
-        assert!(exec.suspended_recovery.lock().await.is_some());
+        assert!(turn.suspended_delegations.contains("pending"));
+        assert!(turn.suspended_recovery.is_some());
         exec.cancellation_token.cancel();
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .unwrap();
         assert_eq!(gate.reads.load(Ordering::SeqCst), 1);
@@ -1572,14 +1527,14 @@ mod tests {
             crate::config::DelegationWaitPolicy::Any,
             crate::config::DelegationWaitPolicy::All,
         ] {
-            let (mut config, exec, context, _dir) = fixture().await;
+            let (mut config, mut exec, mut turn, _dir) = fixture().await;
             config.delegation_wait_policy = policy.clone();
             let gate = gated_sink(&mut config, usize::MAX);
             gate.failures.store(usize::MAX, Ordering::SeqCst);
             let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
                 querymt_agent_core::model::TurnId::new(),
             ));
-            let exec = exec.with_steering(inbox.clone());
+            exec.steering = Some(inbox.clone());
             let mut rx = config.subscribe_events();
             let wait = WaitCondition {
                 reason: WaitReason::Delegation,
@@ -1587,7 +1542,7 @@ mod tests {
             };
             {
                 let waiting =
-                    transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+                    transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
                 tokio::pin!(waiting);
                 tokio::select! { _ = gate.entered.notified() => {}, _ = &mut waiting => panic!("early wait exit") }
                 if policy == crate::config::DelegationWaitPolicy::All {
@@ -1619,9 +1574,9 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+                assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
             }
-            let suspended = exec.suspended_delegations.lock().await.clone();
+            let suspended = turn.suspended_delegations.clone();
             assert!(suspended.contains("b"));
             assert_eq!(
                 suspended.contains("a"),
@@ -1645,23 +1600,23 @@ mod tests {
                     .await
                     .unwrap();
             }
-            reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+            reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
                 .await
                 .unwrap();
-            assert!(exec.suspended_delegations.lock().await.is_empty());
+            assert!(turn.suspended_delegations.is_empty());
         }
     }
 
     #[tokio::test]
     async fn live_completion_still_propagates_real_wait_message_write_failure() {
-        let (mut config, exec, context, _dir) = fixture().await;
+        let (mut config, exec, mut turn, _dir) = fixture().await;
         let gate = gated_sink(&mut config, 0);
         let mut rx = config.subscribe_events();
         let wait = WaitCondition {
             reason: WaitReason::Delegation,
             correlation_ids: vec!["live".into()],
         };
-        let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+        let waiting = transition_waiting_for_event(&config, &wait, &exec, &mut turn, &mut rx);
         tokio::pin!(waiting);
         tokio::select! { _ = gate.entered.notified() => {}, _ = &mut waiting => panic!("early wait exit") }
         config
@@ -1690,11 +1645,8 @@ mod tests {
 
     #[tokio::test]
     async fn suspended_delegation_recovery_does_not_depend_on_live_receiver() {
-        let (config, exec, context, _dir) = fixture().await;
-        exec.suspended_delegations
-            .lock()
-            .await
-            .insert("finished-child".into());
+        let (config, exec, mut turn, _dir) = fixture().await;
+        turn.suspended_delegations.insert("finished-child".into());
         config
             .emit_event_persisted(
                 &exec.session_id,
@@ -1706,11 +1658,11 @@ mod tests {
             .await
             .unwrap();
         let mut rx = config.subscribe_events();
-        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+        reconcile_suspended_delegations(&config, &exec, &mut turn, &mut rx)
             .await
             .unwrap();
         assert!(
-            exec.suspended_delegations.lock().await.is_empty(),
+            turn.suspended_delegations.is_empty(),
             "durable result must resolve suspended steering wait"
         );
     }

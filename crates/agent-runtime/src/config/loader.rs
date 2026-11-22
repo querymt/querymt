@@ -116,6 +116,13 @@ async fn build_config_from_toml_value(
             &config.mcp.iter().collect::<Vec<_>>(),
         )?;
         validate_agent_delegation(&config)?;
+        validate_compaction("agent", &config.agent.execution.compaction)?;
+        for delegate in &config.delegates {
+            validate_compaction(
+                &format!("delegate '{}'", delegate.id),
+                &delegate.execution.compaction,
+            )?;
+        }
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -160,6 +167,13 @@ async fn build_config_from_toml_value(
             validate_mcp_servers(&delegate.mcp)?;
         }
         validate_peer_delegates(&config.delegates, &config.mesh)?;
+        validate_compaction("planner", &config.planner.execution.compaction)?;
+        for delegate in &config.delegates {
+            validate_compaction(
+                &format!("delegate '{}'", delegate.id),
+                &delegate.execution.compaction,
+            )?;
+        }
         validate_permissions(
             "planner",
             &config.planner.tools,
@@ -405,6 +419,18 @@ pub(crate) fn validate_permissions(
 }
 
 /// Validate MCP servers have unique names and consistent settings
+/// A compaction `provider` needs a `model` (see
+/// [`crate::config::CompactionConfig::validate`]). Refused here, when the file
+/// loads, and not when the policy deserializes: sessions store their policy.
+pub(crate) fn validate_compaction(
+    context: &str,
+    compaction: &crate::config::CompactionConfig,
+) -> Result<()> {
+    compaction
+        .validate()
+        .map_err(|error| anyhow!("{context}.execution.compaction: {error}"))
+}
+
 pub(crate) fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
     let mut seen = HashSet::new();
     for server in servers {

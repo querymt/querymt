@@ -1,394 +1,387 @@
-use crate::middleware::PreparedModelRequest;
+use crate::agent::execution::{CycleOutcome, Stage, Step};
 use crate::middleware::{
-    AgentStats, CompositeDriver, ConversationContext, ExecutionState, LimitsConfig,
-    LimitsMiddleware, MaxStepsMiddleware, MiddlewareDriver, PriceLimitMiddleware,
-    TurnLimitMiddleware,
+    CompositeDriver, EndVerdict, LimitsConfig, LimitsMiddleware, Middleware, ReplyVerdict,
+    StepVerdict, Stop, StopVerdict,
 };
-use crate::test_utils::{
-    CancelDriver, CompleteDriver, CountingDriver, ErrorDriver, PassThroughDriver, StopDriver,
-    test_context, test_context_with_user_messages,
-};
+use crate::test_utils::{Act, HookRig, ScriptedMiddleware};
 use querymt_agent_core::events::StopType;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
-#[tokio::test]
-async fn test_composite_driver_empty_passes_through() {
-    let composite = CompositeDriver::new(vec![]);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+fn other_stop(message: &'static str) -> Act<StepVerdict> {
+    Act::Say(StepVerdict::Stop(Stop::new(StopType::Other, message)))
+}
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
+fn stack_of(middleware: &[&ScriptedMiddleware]) -> crate::middleware::TurnStack {
+    HookRig::stack(
+        middleware
+            .iter()
+            .map(|m| Arc::new((*m).clone()) as Arc<dyn Middleware>)
+            .collect(),
+    )
+}
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+/// One step of `middleware` over the run `rig` holds, as the loop would take it.
+async fn step(middleware: &LimitsMiddleware, mut rig: HookRig) -> Step {
+    let mut stack = HookRig::stack_of(middleware.clone());
+    rig.step_start(&mut stack).await.unwrap()
 }
 
 #[tokio::test]
-async fn test_composite_driver_single_driver() {
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(PassThroughDriver)];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+async fn an_empty_stack_passes_every_stage() {
+    let mut rig = HookRig::new();
+    let mut stack = HookRig::stack(vec![]);
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
+    let state = rig.step_start(&mut stack).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
+    assert!(stack.is_empty());
 }
 
 #[tokio::test]
-async fn test_composite_driver_chain_order() {
-    let counter1 = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
-    let counter2 = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
+async fn stop_before_a_model_request() {
+    let stopper = ScriptedMiddleware::default().step_start([other_stop("enough")]);
+    let mut stack = stack_of(&[&stopper]);
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![counter1.clone(), counter2.clone()];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    composite.run_turn_start(state, None).await.unwrap();
-
-    assert_eq!(counter1.count.load(Ordering::SeqCst), 1);
-    assert_eq!(counter2.count.load(Ordering::SeqCst), 1);
+    let Step::Continue(Stage::Stopping(Stop { message, stop_type })) = state else {
+        panic!("expected a stop");
+    };
+    assert_eq!((&*message, stop_type), ("enough", StopType::Other));
 }
 
 #[tokio::test]
-async fn test_composite_driver_stopped_halts() {
-    let counter = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
+async fn stop_at_run_start_ends_the_stage() {
+    let stopper = ScriptedMiddleware::default().turn_start([other_stop("at start")]);
+    let mut stack = stack_of(&[&stopper]);
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![
-        Arc::new(StopDriver {
-            stop_type: StopType::Other,
-            message: "stopped",
-        }),
-        counter.clone(),
-    ];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let state = HookRig::new().turn_start(&mut stack).await.unwrap();
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
-
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
-    assert_eq!(counter.count.load(Ordering::SeqCst), 0);
+    assert!(matches!(state, Step::Continue(Stage::Stopping(_))));
+    assert_eq!(stopper.count("turn_start"), 1);
 }
 
 #[tokio::test]
-async fn test_composite_driver_complete_halts() {
-    let counter = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
+async fn earlier_stop_skips_later_middleware() {
+    let first = ScriptedMiddleware::default().step_start([other_stop("first")]);
+    let second = ScriptedMiddleware::default();
+    let mut stack = stack_of(&[&first, &second]);
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(CompleteDriver), counter.clone()];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
-
-    assert!(matches!(result, ExecutionState::Complete { .. }));
-    assert_eq!(counter.count.load(Ordering::SeqCst), 0);
+    assert!(matches!(state, Step::Continue(Stage::Stopping(_))));
+    assert_eq!(second.count("step_start"), 0);
 }
 
 #[tokio::test]
-async fn test_composite_driver_cancelled_halts() {
-    let counter = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
+async fn every_middleware_is_consulted_when_all_pass() {
+    let first = ScriptedMiddleware::default();
+    let second = ScriptedMiddleware::default();
+    let mut stack = stack_of(&[&first, &second]);
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(CancelDriver), counter.clone()];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let state = HookRig::new().step_start(&mut stack).await.unwrap();
 
-    let result = composite.run_turn_start(state, None).await.unwrap();
-
-    assert!(matches!(result, ExecutionState::Cancelled));
-    assert_eq!(counter.count.load(Ordering::SeqCst), 0);
-}
-
-struct PendingDriver {
-    started: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl MiddlewareDriver for PendingDriver {
-    async fn on_turn_end(
-        &self,
-        _state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        self.started.notify_one();
-        std::future::pending().await
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "PendingDriver"
-    }
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
+    assert_eq!(
+        (first.count("step_start"), second.count("step_start")),
+        (1, 1)
+    );
 }
 
 #[tokio::test]
-async fn test_composite_driver_skips_middleware_when_already_cancelled() {
-    let counter = Arc::new(CountingDriver {
-        count: AtomicUsize::new(0),
-    });
-    let composite = CompositeDriver::new(vec![counter.clone()]);
-    let context = test_context("sess-1", 0);
-    let token = CancellationToken::new();
-    token.cancel();
+async fn reply_discarded_and_retried_by_middleware() {
+    let retrier = ScriptedMiddleware::default().after_llm([Act::Say(ReplyVerdict::Retry)]);
+    let mut stack = stack_of(&[&retrier]);
+    let usage = querymt::Usage {
+        input_tokens: 100,
+        output_tokens: 40,
+        ..Default::default()
+    };
+    let response = Box::new(crate::middleware::LlmResponse::new(
+        "cut".into(),
+        vec![],
+        Some(usage),
+        Some(querymt::chat::FinishReason::Length),
+    ));
+    let mut rig = HookRig::new();
 
-    let result = composite
-        .run_turn_start_cancellable(ExecutionState::BeforeLlmCall { context }, None, &token)
+    let state = rig.after_llm(&mut stack, response).await.unwrap();
+
+    assert!(
+        matches!(state, Step::Continue(Stage::BeforeRequest)),
+        "a retry sends the request again"
+    );
+    assert_eq!(
+        rig.stats.total_input_tokens, 100,
+        "usage of the discarded reply counts"
+    );
+    assert_eq!(rig.stats.total_output_tokens, 40);
+}
+
+#[tokio::test]
+async fn continuation_at_the_end_of_a_run() {
+    let continuer = ScriptedMiddleware::default().turn_end([
+        Act::Notice("one more thing", EndVerdict::Continue),
+        Act::Say(EndVerdict::Finish),
+    ]);
+    let mut stack = stack_of(&[&continuer]);
+    let mut rig = HookRig::new();
+
+    let first = rig.turn_end(&mut stack).await.unwrap();
+    let queued = rig.pending.clone();
+    let second = rig.turn_end(&mut stack).await.unwrap();
+
+    assert!(
+        matches!(first, Step::Continue(Stage::BeforeRequest)),
+        "expected a continuation"
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].content, "one more thing");
+    assert!(matches!(second, Step::Continue(Stage::Ending)));
+}
+
+#[tokio::test]
+async fn stop_passed_on_by_every_middleware() {
+    let first = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Pass)]);
+    let second = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Pass)]);
+    let mut stack = stack_of(&[&first, &second]);
+
+    let state = HookRig::new()
+        .stopped(&mut stack, StopType::ModelTokenLimit, "cut off")
         .await
         .unwrap();
 
-    assert!(matches!(result, ExecutionState::Cancelled));
-    assert_eq!(counter.count.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        state,
+        Step::Continue(Stage::Stopping(Stop {
+            stop_type: StopType::ModelTokenLimit,
+            ..
+        }))
+    ));
+    assert_eq!((first.count("stopped"), second.count("stopped")), (1, 1));
 }
 
 #[tokio::test]
-async fn test_composite_driver_interrupts_running_middleware() {
-    let middleware_started = Arc::new(Notify::new());
-    let composite = Arc::new(CompositeDriver::new(vec![Arc::new(PendingDriver {
-        started: middleware_started.clone(),
-    })]));
-    let context = test_context("sess-1", 0);
-    let token = CancellationToken::new();
-    let task_token = token.clone();
-    let task = tokio::spawn(async move {
-        composite
-            .run_turn_end_cancellable(ExecutionState::Complete { context }, None, &task_token)
-            .await
-    });
+async fn recovery_ends_the_stop_stage() {
+    let first = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Pass)]);
+    let recovers = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Recover)]);
+    let never = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Recover)]);
+    let mut stack = stack_of(&[&first, &recovers, &never]);
 
-    middleware_started.notified().await;
-    token.cancel();
+    let state = HookRig::new()
+        .stopped(&mut stack, StopType::ModelTokenLimit, "cut off")
+        .await
+        .unwrap();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+    assert!(matches!(state, Step::Continue(Stage::BeforeRequest)));
+    assert_eq!(never.count("stopped"), 0);
+}
+
+#[tokio::test]
+async fn notices_queued_before_a_stop_survive_a_recovery() {
+    let queues =
+        ScriptedMiddleware::default().step_start([Act::Notice("kept", StepVerdict::Proceed)]);
+    let stops = ScriptedMiddleware::default().step_start([other_stop("stop")]);
+    let recovers = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Recover)]);
+    let mut stack = stack_of(&[&queues, &stops, &recovers]);
+    let mut rig = HookRig::new();
+
+    let _ = rig.step_start(&mut stack).await.unwrap();
+    let recovered = rig
+        .stopped(&mut stack, StopType::Other, "stop")
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(recovered, Step::Continue(Stage::BeforeRequest)),
+        "expected a recovery"
+    );
+    assert_eq!(rig.pending.len(), 1);
+    assert_eq!(rig.pending[0].content, "kept");
+}
+
+#[tokio::test]
+async fn notices_queued_before_a_published_stop_are_not_stored() {
+    let queues =
+        ScriptedMiddleware::default().step_start([Act::Notice("lost", StepVerdict::Proceed)]);
+    let stops = ScriptedMiddleware::default().step_start([other_stop("stop")]);
+    let passes = ScriptedMiddleware::default().stopped([Act::Say(StopVerdict::Pass)]);
+    let mut stack = stack_of(&[&queues, &stops, &passes]);
+    let mut rig = HookRig::new();
+
+    let _ = rig.step_start(&mut stack).await.unwrap();
+    let queued_before = rig.pending.len();
+    let published = rig
+        .stopped(&mut stack, StopType::Other, "stop")
+        .await
+        .unwrap();
+
+    // The stop is published as it was; the notice queued before it stays on
+    // the run, which ends without storing it.
+    assert!(matches!(published, Step::Continue(Stage::Stopping(_))));
+    assert_eq!(queued_before, 1);
+}
+
+#[tokio::test]
+async fn cancel_while_a_middleware_is_running() {
+    let hangs = ScriptedMiddleware::default().step_start([Act::Hang]);
+    let mut stack = stack_of(&[&hangs]);
+    let mut rig = HookRig::new();
+    let cancel = rig.cancel.clone();
+    let task = tokio::spawn(async move { rig.step_start(&mut stack).await });
+
+    while hangs.count("step_start") == 0 {
+        tokio::task::yield_now().await;
+    }
+    cancel.cancel();
+
+    let state = tokio::time::timeout(std::time::Duration::from_secs(1), task)
         .await
         .expect("middleware cancellation should be prompt")
         .expect("middleware task should not panic")
         .expect("middleware cancellation should not error");
-    assert!(matches!(result, ExecutionState::Cancelled));
+    assert!(matches!(state, Step::Break(CycleOutcome::Cancelled)));
 }
 
 #[tokio::test]
-async fn test_composite_driver_reset_all() {
-    let counter1 = Arc::new(CountingDriver {
-        count: AtomicUsize::new(5),
-    });
-    let counter2 = Arc::new(CountingDriver {
-        count: AtomicUsize::new(10),
-    });
+async fn already_cancelled_run_consults_nobody() {
+    let counter = ScriptedMiddleware::default();
+    let mut stack = stack_of(&[&counter]);
+    let mut rig = HookRig::new();
+    rig.cancel.cancel();
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![counter1.clone(), counter2.clone()];
-    let composite = CompositeDriver::new(drivers);
+    let state = rig.step_start(&mut stack).await.unwrap();
 
-    composite.reset();
-
-    assert_eq!(counter1.count.load(Ordering::SeqCst), 0);
-    assert_eq!(counter2.count.load(Ordering::SeqCst), 0);
+    assert!(matches!(state, Step::Break(CycleOutcome::Cancelled)));
+    assert_eq!(counter.count("step_start"), 0);
 }
 
 #[tokio::test]
-async fn test_composite_driver_error_propagates() {
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> =
-        vec![Arc::new(PassThroughDriver), Arc::new(ErrorDriver)];
-    let composite = CompositeDriver::new(drivers);
-    let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeLlmCall { context };
+async fn middleware_error_propagates() {
+    let fails = ScriptedMiddleware::default().step_start([Act::Fail]);
+    let mut stack = stack_of(&[&ScriptedMiddleware::default(), &fails]);
 
-    let result = composite.run_turn_start(state, None).await;
+    let result = HookRig::new().step_start(&mut stack).await;
 
     assert!(result.is_err());
 }
 
 #[test]
-fn test_composite_driver_len_and_is_empty() {
+fn composite_driver_len_and_is_empty() {
     let empty = CompositeDriver::new(vec![]);
     assert!(empty.is_empty());
     assert_eq!(empty.len(), 0);
 
-    let drivers: Vec<Arc<dyn MiddlewareDriver>> =
-        vec![Arc::new(PassThroughDriver), Arc::new(PassThroughDriver)];
-    let composite = CompositeDriver::new(drivers);
+    let composite = CompositeDriver::new(vec![
+        Arc::new(ScriptedMiddleware::default()),
+        Arc::new(ScriptedMiddleware::default()),
+    ]);
     assert!(!composite.is_empty());
     assert_eq!(composite.len(), 2);
 }
 
 #[tokio::test]
 async fn test_max_steps_at_limit_stops() {
-    let middleware = MaxStepsMiddleware::new(5);
-    let context = test_context("sess-1", 5);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let middleware = LimitsMiddleware::new(LimitsConfig::default().max_steps(5));
 
-    let result = middleware.on_step_start(state, None).await.unwrap();
+    let result = step(&middleware, HookRig::at_step("sess-1", 5)).await;
 
     assert!(matches!(
         result,
-        ExecutionState::Stopped {
+        Step::Continue(Stage::Stopping(Stop {
             stop_type: StopType::StepLimit,
             ..
-        }
+        }))
     ));
 }
 
 #[tokio::test]
 async fn test_max_steps_below_limit_continues() {
-    let middleware = MaxStepsMiddleware::new(5);
-    let context = test_context("sess-1", 3);
-    let state = ExecutionState::BeforeLlmCall { context };
+    let middleware = LimitsMiddleware::new(LimitsConfig::default().max_steps(5));
 
-    let result = middleware.on_step_start(state, None).await.unwrap();
+    let result = step(&middleware, HookRig::at_step("sess-1", 3)).await;
 
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
-}
-
-#[tokio::test]
-async fn test_max_steps_ignores_other_states() {
-    let middleware = MaxStepsMiddleware::new(5);
-    let context = test_context("sess-1", 10);
-
-    let state = ExecutionState::CallLlm {
-        context: context.clone(),
-        request: Arc::new(PreparedModelRequest {
-            messages: Arc::from([]),
-            tools: Arc::from([]),
-            estimated_tokens: 0,
-            options: Default::default(),
-        }),
-    };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::CallLlm { .. }));
-
-    let state = ExecutionState::Complete { context };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::Complete { .. }));
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
 async fn test_turn_limit_middleware() {
-    let middleware = TurnLimitMiddleware::new(3);
+    let middleware = LimitsMiddleware::new(LimitsConfig::default().max_turns(3));
 
     // With 2 user messages, should continue (2 < 3)
-    let context = test_context_with_user_messages("sess-1", 2);
-    let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    let result = step(&middleware, HookRig::with_user_messages("sess-1", 2)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 
     // With 3 user messages, should stop (3 >= 3)
-    let context = test_context_with_user_messages("sess-1", 3);
-    let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    let result = step(&middleware, HookRig::with_user_messages("sess-1", 3)).await;
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 }
 
-fn budget_context(budget_cost_usd: f64) -> Arc<ConversationContext> {
-    let stats = Arc::new(AgentStats {
-        steps: 1,
-        // Token counters are irrelevant to the check: only recorded cycle
-        // charges count.
-        total_input_tokens: 1_000_000_000,
-        total_output_tokens: 1_000_000_000,
-        budget_cost_usd,
-        ..Default::default()
-    });
-    Arc::new(ConversationContext::new(
-        "sess-1".into(),
-        Arc::from([]),
-        stats,
-        "mock".into(),
-        "mock-model".into(),
-    ))
+fn budget_rig(budget_cost_usd: f64) -> HookRig {
+    let mut rig = HookRig::at_step("sess-1", 1);
+    // Token counters are irrelevant to the check: only recorded cycle
+    // charges count.
+    rig.stats.total_input_tokens = 1_000_000_000;
+    rig.stats.total_output_tokens = 1_000_000_000;
+    rig.stats.budget_cost_usd = budget_cost_usd;
+    rig
 }
 
-fn is_price_stop(state: &ExecutionState) -> bool {
+fn is_price_stop(state: &Step) -> bool {
     matches!(
         state,
-        ExecutionState::Stopped {
+        Step::Continue(Stage::Stopping(Stop {
             stop_type: StopType::PriceLimit,
             ..
-        }
+        }))
     )
 }
 
 #[tokio::test]
 async fn test_price_limit_over_budget() {
-    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
-    let state = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.25),
-    };
-    assert!(is_price_stop(
-        &middleware.on_step_start(state, None).await.unwrap()
-    ));
+    let middleware =
+        LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(0.10));
+    assert!(is_price_stop(&step(&middleware, budget_rig(0.25)).await));
 }
 
 #[tokio::test]
 async fn test_price_limit_stops_exactly_at_the_cap() {
-    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
-    let state = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.10),
-    };
-    assert!(is_price_stop(
-        &middleware.on_step_start(state, None).await.unwrap()
-    ));
+    let middleware =
+        LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(0.10));
+    assert!(is_price_stop(&step(&middleware, budget_rig(0.10)).await));
 }
 
 #[tokio::test]
 async fn test_price_limit_under_budget() {
-    let middleware = PriceLimitMiddleware::new(1.0, 3.0, 15.0);
-    let state = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.05),
-    };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    let middleware =
+        LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(1.0));
+    let result = step(&middleware, budget_rig(0.05)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
 async fn test_new_cycle_with_zero_cycle_spend_is_not_exhausted() {
     // Prior-cycle spend never reaches the stats of a new cycle.
-    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
-    let state = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.0),
-    };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    let middleware =
+        LimitsMiddleware::new(LimitsConfig::with_manual_pricing(3.0, 15.0).max_price_usd(0.10));
+    let result = step(&middleware, budget_rig(0.0)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
 async fn test_limits_middleware_enforces_the_same_cycle_budget() {
     let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
-    let over = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.10),
-    };
-    assert!(is_price_stop(
-        &middleware.on_step_start(over, None).await.unwrap()
-    ));
-    let under = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.09),
-    };
-    let result = middleware.on_step_start(under, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    assert!(is_price_stop(&step(&middleware, budget_rig(0.10)).await));
+    let result = step(&middleware, budget_rig(0.09)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
 async fn test_price_limit_without_known_spend_passes_through() {
     // No recorded charge (for example an all-unpriced cycle): nothing to stop on.
     let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
-    let state = ExecutionState::BeforeLlmCall {
-        context: budget_context(0.0),
-    };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    let result = step(&middleware, budget_rig(0.0)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 }
 
 #[tokio::test]
@@ -399,15 +392,9 @@ async fn test_limits_middleware_combined() {
         .max_price_usd(1.0);
     let middleware = LimitsMiddleware::new(config);
 
-    let context = test_context("sess-1", 2);
-    let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+    let result = step(&middleware, HookRig::at_step("sess-1", 2)).await;
+    assert!(matches!(result, Step::Continue(Stage::BeforeRequest)));
 
-    let context = test_context("sess-1", 10);
-    let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::Stopped { .. }));
+    let result = step(&middleware, HookRig::at_step("sess-1", 10)).await;
+    assert!(matches!(result, Step::Continue(Stage::Stopping(_))));
 }
-
-// test_context moved to crate::test_utils::helpers

@@ -10,18 +10,22 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::{BillingClass, ModelPricing};
 use querymt::{
     LLMProvider,
-    chat::{ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions},
+    chat::{GenerationOptions, PromptCacheCapabilities},
     error::LLMError,
+    plugin::LLMProviderFactory,
 };
-use querymt_agent_core::model::{AgentMessage, MessagePart, OutputTarget};
+use querymt_agent_core::model::AgentMessage;
 use querymt_agent_services::accounting::{
     BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
 };
-use querymt_agent_services::model_heuristics::OutputCaps;
+use querymt_agent_services::model_heuristics::{OutputCaps, apply_system_cache_defaults};
 use querymt_agent_services::model_info::get_model_info;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 #[cfg(feature = "remote")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Cached provider entry: `(config_id, provider_node_id, allow_mesh_fallback, provider)`.
 ///
@@ -35,24 +39,10 @@ type ProviderCacheEntry = (i64, Option<String>, bool, Arc<dyn LLMProvider>);
 /// writes (model switch, mesh fallback toggle) use `ArcSwap::store`.
 type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
 
-/// Keeps the requested per-request overrides the provider honours.
-///
-/// Dropped overrides are logged at debug level; the request then runs with the
-/// provider's configured values.
-pub(crate) fn supported_overrides(
-    provider: &dyn LLMProvider,
-    requested: GenerationOptions,
-) -> GenerationOptions {
-    let supported = provider.capabilities().options.retain_supported(requested);
-    if supported != requested {
-        tracing::debug!(
-            ?requested,
-            ?supported,
-            "provider does not honour some per-request generation options; skipping them"
-        );
-    }
-    supported
-}
+/// Prompt-cache declarations read from built providers, keyed by a hash of the
+/// provider configuration (the hash is never persisted, so it does not expose
+/// the API key). Lets a rebuild of a known configuration skip the probe.
+type DeclarationCache = Arc<Mutex<HashMap<u64, PromptCacheCapabilities>>>;
 
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 ///
@@ -80,6 +70,13 @@ pub struct SessionProvider {
     /// Lock-free single-entry provider cache keyed on `LLMConfig.id`.
     /// Uses a single-entry cache to ensure safe VRAM management for GPU models.
     cached_provider: ProviderCache,
+    /// Prompt-cache declarations per provider configuration.
+    declarations: DeclarationCache,
+    /// `[agent.execution.prompt_cache] ttl_secs`: the lifetime default system
+    /// cache hints request, capped at what the provider declares. 0 means the
+    /// provider's default lifetime. Shared by clones, like the other runtime
+    /// settings, because the agent builder sets it after the provider is shared.
+    cache_ttl_secs: Arc<AtomicU32>,
     /// Agent identifier used for `{{ agent_id }}` in system prompt templates.
     /// Set at build time via `with_agent_id` so that session creation can
     /// resolve per-agent template variables.
@@ -112,12 +109,25 @@ impl SessionProvider {
             history_store: store,
             initial_config,
             cached_provider: Arc::new(ArcSwap::from_pointee(None)),
+            declarations: Arc::default(),
+            cache_ttl_secs: Arc::default(),
             agent_id: None,
             #[cfg(feature = "remote")]
             mesh: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets the lifetime default system cache hints request (seconds, 0 for the
+    /// provider's default). Applies to providers built after the call.
+    pub fn set_cache_ttl_secs(&self, ttl_secs: u32) {
+        self.cache_ttl_secs.store(ttl_secs, Ordering::Relaxed);
+    }
+
+    /// The lifetime default system cache hints request (0: provider default).
+    pub fn cache_ttl_secs(&self) -> u32 {
+        self.cache_ttl_secs.load(Ordering::Relaxed)
     }
 
     pub fn with_provider_resolver(mut self, resolver: Arc<dyn ProviderResolver>) -> Self {
@@ -624,7 +634,14 @@ impl SessionProvider {
 
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
-        let pruned_config_str = resolved_cfg.pruned_config_str;
+        let HintedConfig {
+            config: pruned_config_str,
+            provider: prebuilt,
+        } = self.with_default_cache_hints(
+            factory.as_ref(),
+            resolved_cfg.pruned_config_str,
+            self.cache_ttl_secs.load(Ordering::Relaxed),
+        )?;
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -668,7 +685,11 @@ impl SessionProvider {
             ));
 
             // Generic path — works for Extism providers that implement set_key_resolver.
-            let mut provider = factory.from_config(&pruned_config_str)?;
+            let mut prebuilt = prebuilt;
+            let mut provider = match prebuilt.take() {
+                Some(provider) => provider,
+                None => factory.from_config(&pruned_config_str)?,
+            };
             provider.set_key_resolver(resolver.clone());
 
             if provider.key_resolver().is_some() {
@@ -697,7 +718,8 @@ impl SessionProvider {
                     model
                 );
 
-                let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider);
+                let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider)
+                    .with_name(provider_name);
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
                     settings,
@@ -720,13 +742,87 @@ impl SessionProvider {
             });
         }
 
-        let provider = factory.from_config(&pruned_config_str)?;
+        let provider = match prebuilt {
+            Some(provider) => provider,
+            None => factory.from_config(&pruned_config_str)?,
+        };
         Ok(ProviderSnapshot {
             provider: Arc::from(provider),
             settings,
             output_caps,
             reasoning_effort,
         })
+    }
+}
+
+/// A provider configuration after default cache hints were considered, with
+/// the provider built from it when one is already at hand.
+struct HintedConfig {
+    config: String,
+    provider: Option<Box<dyn LLMProvider>>,
+}
+
+impl SessionProvider {
+    /// Adds default cache hints to the system prompt when the provider
+    /// declares explicit breakpoints.
+    ///
+    /// The declaration comes from a provider built without default hints. That
+    /// build is returned for reuse unless the hints change the configuration,
+    /// so a provider that declares nothing (every local-model provider) is
+    /// built once. A known configuration skips the probe and is built once
+    /// with its hints.
+    fn with_default_cache_hints(
+        &self,
+        factory: &dyn LLMProviderFactory,
+        config: String,
+        ttl_secs: u32,
+    ) -> SessionResult<HintedConfig> {
+        let unchanged = |config, provider| Ok(HintedConfig { config, provider });
+        let mut value: serde_json::Value = serde_json::from_str(&config)
+            .map_err(|e| SessionError::ProviderError(LLMError::from(e)))?;
+        // Without a system prompt no default hint is due.
+        if value.get("system").is_none() {
+            return unchanged(config, None);
+        }
+
+        // The pruned configuration keeps only the keys the provider's schema
+        // lists, so two providers can end up with the same text. What a
+        // configuration declares depends on the provider that reads it.
+        let key = {
+            let mut hasher = DefaultHasher::new();
+            factory.name().hash(&mut hasher);
+            config.hash(&mut hasher);
+            hasher.finish()
+        };
+        let known = self
+            .declarations
+            .lock()
+            .ok()
+            .and_then(|known| known.get(&key).copied());
+        let (declaration, probe) = match known {
+            Some(declaration) => (declaration, None),
+            None => {
+                let probe = factory.from_config(&config)?;
+                let declaration = probe.capabilities().prompt_cache;
+                if let Ok(mut known) = self.declarations.lock() {
+                    known.insert(key, declaration);
+                }
+                (declaration, Some(probe))
+            }
+        };
+
+        if !declaration.explicit_breakpoints {
+            return unchanged(config, probe);
+        }
+        let before = value.clone();
+        apply_system_cache_defaults(&mut value, &declaration, ttl_secs);
+        if value == before {
+            return unchanged(config, probe);
+        }
+        let hinted = serde_json::to_string(&value)
+            .map_err(|e| SessionError::ProviderError(LLMError::from(e)))?;
+        // The probe was built without the hints, so it cannot be reused.
+        unchanged(hinted, None)
     }
 }
 
@@ -738,6 +834,8 @@ impl Clone for SessionProvider {
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
             cached_provider: Arc::clone(&self.cached_provider),
+            declarations: Arc::clone(&self.declarations),
+            cache_ttl_secs: Arc::clone(&self.cache_ttl_secs),
             agent_id: self.agent_id.clone(),
             // Share the same Arcs/atomics so all clones see runtime updates.
             #[cfg(feature = "remote")]
@@ -746,6 +844,109 @@ impl Clone for SessionProvider {
             allow_mesh_fallback: Arc::clone(&self.allow_mesh_fallback),
         }
     }
+}
+
+/// The provider a run talks to and the facts about its model. Resolved once
+/// per run by [`SessionHandle::resolve_model`] and fixed for the run; what the
+/// run offers the model (its tools) is not part of it.
+#[derive(Clone)]
+pub(crate) struct ResolvedModel {
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    /// Capabilities, output caps and configured effort.
+    pub(crate) profile: Arc<ModelProfile>,
+    /// The provenance the provider stamps on its output, read once when the
+    /// model is resolved; `None` when it does not say (see
+    /// [`SessionHandle::output_target`]).
+    pub(crate) provenance: Option<querymt::chat::ChatOutputProvenance>,
+}
+
+impl ResolvedModel {
+    /// A stand-in for a session whose provider could not be built, for the
+    /// one run that can still make progress without it: native `/compact`
+    /// (see `compact_history_with`). It has no capabilities and no
+    /// provenance, and its provider fails every call with `reason`; nothing
+    /// that sends a model request may be given one.
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            provider: Arc::new(UnavailableProvider {
+                reason: reason.into(),
+            }),
+            profile: Arc::new(ModelProfile::default()),
+            provenance: None,
+        }
+    }
+}
+
+/// The provider of [`ResolvedModel::unavailable`]: every call fails.
+struct UnavailableProvider {
+    reason: String,
+}
+
+impl UnavailableProvider {
+    fn error(&self) -> LLMError {
+        LLMError::ProviderError(format!("provider unavailable: {}", self.reason))
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::chat::ChatProvider for UnavailableProvider {
+    async fn chat(
+        &self,
+        _call: &querymt::chat::ChatCall<'_>,
+    ) -> Result<querymt::chat::ChatOutput, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::completion::CompletionProvider for UnavailableProvider {
+    async fn complete(
+        &self,
+        _req: &querymt::completion::CompletionRequest,
+    ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::embedding::EmbeddingProvider for UnavailableProvider {
+    async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for UnavailableProvider {}
+
+/// The provider and model a compaction request is sent to, by name; see
+/// [`SessionHandle::compaction_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionTarget {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// The target's provider is the session's.
+    is_session_provider: bool,
+    /// The target is the session's own provider and model.
+    is_session_model: bool,
+}
+
+impl CompactionTarget {
+    /// The request goes to the provider the session itself talks to, so
+    /// building it is the session's own provider build (and fails when that
+    /// does).
+    pub(crate) fn is_session_model(&self) -> bool {
+        self.is_session_model
+    }
+}
+
+/// Where one compaction request is sent and how it is billed; see
+/// [`SessionHandle::build_compaction_model`].
+pub(crate) struct CompactionModel {
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    /// The provider's name, as the accounting attempts record it.
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) basis: BillingBasis,
 }
 
 pub(crate) struct ProviderSnapshot {
@@ -885,8 +1086,44 @@ impl SessionHandle {
     }
 
     /// Get the LLM config captured at handle creation time (turn-pinned).
+    /// A handle for the same session pinned to `model`, for tests that
+    /// change the model between two requests of one run.
+    #[cfg(test)]
+    pub(crate) fn with_model_for_test(&self, model: &str) -> Self {
+        let mut next = self.clone();
+        if let Some(config) = next.llm_config.as_mut() {
+            config.model = model.to_string();
+        }
+        next
+    }
+
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.llm_config.as_ref()
+    }
+
+    /// The identity native replay is checked against for this session's model
+    /// (`None` when no model is pinned: nothing native replays).
+    ///
+    /// A provider stamps its output with a protocol and an endpoint, which the
+    /// session store does not record. The identity comes from the resolved
+    /// model: the provenance the provider states for the configuration it was
+    /// built with, so a reply stamped at another endpoint is sent in portable
+    /// form.
+    ///
+    /// A provider that states nothing (an Extism plugin, a mesh provider, an
+    /// OpenAI provider in Chat Completions mode) falls back to completing the
+    /// identity from the latest stored output of the same provider and model in
+    /// `history`. That fallback does not prove the endpoint is the one
+    /// configured now; the provider that is sent the messages re-checks every
+    /// output's provenance against its own configuration where it can.
+    pub(crate) fn output_target(
+        &self,
+        model: &ResolvedModel,
+        history: &[AgentMessage],
+    ) -> Option<querymt_agent_core::model::OutputTarget> {
+        self.llm_config
+            .as_ref()
+            .map(|llm| complete_output_target(llm, model.provenance.as_ref(), history))
     }
 
     /// Get the session execution config captured at handle creation time (turn-pinned).
@@ -894,7 +1131,16 @@ impl SessionHandle {
         self.execution_config.as_ref()
     }
 
+    /// The provider this turn talks to, built on first use.
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
+        self.snapshot()
+            .await
+            .map(|built| Arc::clone(&built.provider))
+    }
+
+    /// The provider with what was resolved alongside it, built on first use
+    /// and shared by every clone of the handle. A failed build is not cached.
+    async fn snapshot(&self) -> SessionResult<&ProviderSnapshot> {
         self.cached_llm_provider
             .get_or_try_init(|| async {
                 let config = self.llm_config.as_ref().ok_or_else(|| {
@@ -921,26 +1167,123 @@ impl SessionHandle {
                 .await
             })
             .await
-            .map(|built| Arc::clone(&built.provider))
     }
 
-    /// The facts about this turn's model: output caps, what the provider
-    /// honours per request, configured effort and pricing.
+    /// The provider this turn talks to and the facts about its model (output
+    /// caps, what the provider honours per request, configured effort), both
+    /// read from the same build.
     ///
-    /// Builds (and caches) the provider if needed. When the provider cannot be
-    /// built the profile is empty (no caps, no per-request options); the real
-    /// request surfaces the error. A model switch builds a new handle and so a
-    /// new profile.
-    pub(crate) async fn profile(&self) -> Arc<ModelProfile> {
-        let Ok(provider) = self.provider().await else {
-            return Arc::new(ModelProfile::default());
-        };
-        let built = self.cached_llm_provider.get();
-        Arc::new(ModelProfile {
-            caps: built.and_then(|built| built.output_caps),
-            capabilities: provider.capabilities(),
-            reasoning_effort: built.and_then(|built| built.reasoning_effort),
+    /// Builds (and caches) the provider if needed and returns the error when
+    /// that fails: there is no empty profile to fall back on. A model switch
+    /// builds a new handle and so a new model.
+    pub(crate) async fn resolve_model(&self) -> SessionResult<ResolvedModel> {
+        let built = self.snapshot().await?;
+        Ok(ResolvedModel {
+            provider: Arc::clone(&built.provider),
+            provenance: built.provider.output_provenance(),
+            profile: Arc::new(ModelProfile {
+                caps: built.output_caps,
+                capabilities: built.provider.capabilities(),
+                reasoning_effort: built.reasoning_effort,
+            }),
         })
+    }
+
+    /// The provider and model one compaction request is sent to, by name.
+    ///
+    /// `[agent.execution.compaction]` `provider` and `model` select them; what
+    /// is left unset is the session's. Nothing is built, so this is what the
+    /// compaction hooks are told before any provider exists.
+    ///
+    /// - Neither differs from the session's: the session's own pair.
+    /// - Only the model differs: that model on the session's provider.
+    /// - The provider is set: it needs a `model`, because the session's model
+    ///   belongs to another provider. Loading a configuration file already
+    ///   refuses that; this covers a configuration built in code.
+    pub(crate) fn compaction_target(
+        &self,
+        policy: &crate::config::CompactionConfig,
+    ) -> SessionResult<CompactionTarget> {
+        policy.validate().map_err(SessionError::InvalidOperation)?;
+        let session = self.llm_config.as_ref().ok_or_else(|| {
+            SessionError::InvalidOperation("Session has no LLM config".to_string())
+        })?;
+        let provider = policy.provider.as_deref().unwrap_or(&session.provider);
+        let provider_changed = provider != session.provider;
+        let model = policy.model.as_deref().unwrap_or(&session.model);
+        Ok(CompactionTarget {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            is_session_provider: !provider_changed,
+            is_session_model: !provider_changed && model == session.model,
+        })
+    }
+
+    /// Builds the provider for a [`CompactionTarget`], with what it is priced
+    /// for. The same pair is what the request runs on and what its accounting
+    /// attempts and span name, so the three cannot disagree.
+    ///
+    /// The session's own provider is reused when the target is the session's
+    /// own pair. Another model is built with
+    /// [`SessionProvider::selection_params`], so the session's own settings
+    /// (system prompt, effort, a local model's context size) do not leak into
+    /// a request for it. A model on the session's provider keeps the session's
+    /// mesh node. Another provider drops the session's pinned node and is
+    /// resolved like any provider: locally first, then on the mesh when mesh
+    /// fallback is enabled and the provider is not available locally.
+    pub(crate) async fn build_compaction_model(
+        &self,
+        target: &CompactionTarget,
+    ) -> SessionResult<CompactionModel> {
+        let (provider_name, model) = (target.provider.as_str(), target.model.as_str());
+        if target.is_session_model {
+            return Ok(CompactionModel {
+                provider: self.provider().await?,
+                provider_name: target.provider.clone(),
+                model: target.model.clone(),
+                basis: self.billing_basis_for_model(model),
+            });
+        }
+
+        let (_, _, params) = crate::session::store::extract_llm_config_values(
+            &self.provider.selection_params(provider_name, model),
+        )?;
+        let request = ProviderRequest::new(provider_name, model)
+            .with_params(params.as_ref())
+            .with_session_id(&self.session.public_id);
+        #[cfg(feature = "remote")]
+        let request = request.with_provider_node_id(if target.is_session_provider {
+            self.provider_node_id.as_deref()
+        } else {
+            None
+        });
+        let span = tracing::info_span!(
+            "agent.provider.build",
+            provider = %provider_name,
+            model = %model,
+            compaction = true,
+            auth.source = tracing::field::Empty,
+        );
+        let built =
+            tracing::Instrument::instrument(self.provider.build_provider_snapshot(request), span)
+                .await?;
+        let oauth_backed = built.provider.key_resolver().is_some();
+        Ok(CompactionModel {
+            basis: resolve_billing_basis(provider_name, model, oauth_backed),
+            provider: built.provider,
+            provider_name: target.provider.clone(),
+            model: target.model.clone(),
+        })
+    }
+
+    /// [`Self::compaction_target`] and [`Self::build_compaction_model`] in one
+    /// step, for a caller that runs no hook between them.
+    pub(crate) async fn resolve_compaction_model(
+        &self,
+        policy: &crate::config::CompactionConfig,
+    ) -> SessionResult<CompactionModel> {
+        self.build_compaction_model(&self.compaction_target(policy)?)
+            .await
     }
 
     /// Record the request settings on the chat span: the configured values
@@ -981,48 +1324,8 @@ impl SessionHandle {
         Ok(messages)
     }
 
-    /// Get the session history converted to standard ChatMessages for the LLM.
-    pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
-        let agent_msgs = self.get_effective_agent_history().await?;
-        self.project_history(&agent_msgs)
-    }
-
-    pub(crate) async fn history_with_compaction(
-        &self,
-    ) -> SessionResult<(Vec<ChatMessage>, Vec<ChatMessage>)> {
-        let agent_msgs = self.get_effective_agent_history().await?;
-        let messages = self.project_history(&agent_msgs)?;
-        let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
-        Ok((messages, summaries))
-    }
-
-    fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
-        // Build the full target identity so native provider state (encrypted
-        // reasoning, opaque items) may only replay to the exact same
-        // provider/protocol/model/endpoint; any other target gets the portable
-        // projection.
-        let target = self.llm_config.as_ref().map(|cfg| {
-            let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone());
-            target.protocol = cfg.protocol.clone();
-            target.endpoint = cfg.endpoint.clone();
-            target
-        });
-        let max_prompt_bytes = self
-            .execution_config
-            .as_ref()
-            .and_then(|cfg| cfg.max_prompt_bytes);
-        agent_msgs
-            .iter()
-            .map(|message| {
-                message
-                    .to_chat_message_with_output_target(target.as_ref(), max_prompt_bytes)
-                    .map_err(|error| SessionError::InvalidOperation(error.to_string()))
-            })
-            .collect()
-    }
-
     /// Persist an AgentMessage to the store
-    pub async fn add_message(&self, message: AgentMessage) -> SessionResult<()> {
+    pub(crate) async fn add_message(&self, message: AgentMessage) -> SessionResult<()> {
         self.provider
             .history_store
             .add_message(&self.session.public_id, message)
@@ -1037,61 +1340,6 @@ impl SessionHandle {
     ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError> {
         let provider = self.provider().await?;
         provider.call_tool(name, args).await
-    }
-
-    /// Submit a chat call to the LLM without auto-saving.
-    ///
-    /// Per-request options the provider does not honour are dropped (see
-    /// [`supported_overrides`]); the request then runs with the configured
-    /// values.
-    ///
-    /// This is a paid request, so the caller supplies the `ledger` that
-    /// records it: the start is durable before dispatch and the attempt is
-    /// settled with the reported usage (or its absence). There is no
-    /// unrecorded variant.
-    pub async fn submit_request(
-        &self,
-        call: &ChatCall<'_>,
-        ledger: &querymt_agent_services::accounting::DispatchLedger,
-    ) -> Result<ChatOutput, LLMError> {
-        let provider = self.provider().await?;
-        let options = supported_overrides(provider.as_ref(), call.options);
-        let call = call.options(options);
-        querymt_agent_services::accounting::run_attempt(
-            &ledger.operation,
-            ledger.basis.clone(),
-            &tokio_util::sync::CancellationToken::new(),
-            || provider.chat(&call),
-        )
-        .await
-    }
-
-    /// Higher-level chat interface (used by CLI) that handles conversion and storage
-    pub async fn chat(
-        &self,
-        messages: &[ChatMessage],
-        ledger: &querymt_agent_services::accounting::DispatchLedger,
-    ) -> SessionResult<ChatOutput> {
-        // 1. Store incoming messages (User or Tool Result)
-        for msg in messages {
-            let agent_msg = self.convert_chat_to_agent(msg);
-            self.add_message(agent_msg).await?;
-        }
-
-        // 2. Fetch full history for context
-        let llm_messages = self.history().await?;
-
-        // 3. Call LLM
-        let response = self
-            .submit_request(&ChatCall::new(&llm_messages), ledger)
-            .await?;
-
-        // 4. Store response
-        let response_msg: ChatMessage = response.clone().into();
-        let agent_response = self.convert_chat_to_agent(&response_msg);
-        self.add_message(agent_response).await?;
-
-        Ok(response)
     }
 
     /// Get pricing information for this session's model.
@@ -1139,107 +1387,6 @@ impl SessionHandle {
                 },
                 pricing: None,
             },
-        }
-    }
-
-    pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
-        let mut parts = Vec::new();
-
-        // A structured assistant turn stores its canonical output once; the
-        // projected content blocks are not duplicated as additional parts.
-        if msg.role == ChatRole::Assistant
-            && let Some(output) = msg.output()
-        {
-            parts.push(MessagePart::Output {
-                output: output.clone(),
-            });
-            let source_provider = self.llm_config.as_ref().map(|cfg| cfg.provider.clone());
-            let source_model = self.llm_config.as_ref().map(|cfg| cfg.model.clone());
-            return Self::finish_agent_message(
-                self.session.public_id.clone(),
-                source_provider,
-                source_model,
-                msg,
-                parts,
-            );
-        }
-
-        for part in msg.portable_input_parts() {
-            match part {
-                querymt::chat::ChatInputPart::Text { text } => {
-                    parts.push(MessagePart::Text { content: text });
-                }
-                querymt::chat::ChatInputPart::Attachment(media) => {
-                    // Attachments render as a display projection.
-                    let desc = match media.source() {
-                        querymt::chat::MediaSource::Inline { data } => format!(
-                            "[Attachment: {}, {} bytes]",
-                            media
-                                .media_type()
-                                .map(ToString::to_string)
-                                .unwrap_or_default(),
-                            data.len()
-                        ),
-                        querymt::chat::MediaSource::DataUrl { url }
-                        | querymt::chat::MediaSource::Url { url } => {
-                            format!("[Attached resource: {url}]")
-                        }
-                        querymt::chat::MediaSource::ProviderFile { file_id, .. } => {
-                            format!("[Provider file: {file_id}]")
-                        }
-                    };
-                    parts.push(MessagePart::Text { content: desc });
-                }
-                querymt::chat::ChatInputPart::ToolResult(result) => {
-                    parts.push(MessagePart::ToolResult {
-                        call_id: result.call_id,
-                        content: result.parts,
-                        is_error: result.is_error,
-                        tool_name: result.name,
-                        tool_arguments: None,
-                        compacted_at: None,
-                    });
-                }
-            }
-        }
-
-        let source_provider = if msg.role == ChatRole::Assistant {
-            self.llm_config.as_ref().map(|cfg| cfg.provider.clone())
-        } else {
-            None
-        };
-        let source_model = if msg.role == ChatRole::Assistant {
-            self.llm_config.as_ref().map(|cfg| cfg.model.clone())
-        } else {
-            None
-        };
-
-        Self::finish_agent_message(
-            self.session.public_id.clone(),
-            source_provider,
-            source_model,
-            msg,
-            parts,
-        )
-    }
-
-    /// Assemble the AgentMessage envelope for converted chat content.
-    fn finish_agent_message(
-        session_id: String,
-        source_provider: Option<String>,
-        source_model: Option<String>,
-        msg: &ChatMessage,
-        parts: Vec<MessagePart>,
-    ) -> AgentMessage {
-        AgentMessage {
-            id: uuid::Uuid::now_v7().to_string(),
-            session_id,
-            role: msg.role,
-            parts,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-            source_provider,
-            source_model,
         }
     }
 }
@@ -1443,6 +1590,61 @@ pub(crate) fn record_auth_source(source: AuthSource) {
     tracing::Span::current().record("auth.source", source.as_str());
 }
 
+/// The replay identity of `llm`.
+///
+/// When the provider states its provenance (`provenance`), that is the
+/// identity, all four fields of it: provider, protocol, model and endpoint are
+/// exactly what it stamps on its own output, whatever name the session
+/// configuration gives the provider (a logical alias) or the model. Without a
+/// stated identity, the session's provider and model are used and the
+/// protocol and endpoint, which the store does not record, are taken from the
+/// latest output of the same provider and model in `history` (see
+/// [`SessionHandle::output_target`]).
+fn complete_output_target(
+    llm: &LLMConfig,
+    provenance: Option<&querymt::chat::ChatOutputProvenance>,
+    history: &[AgentMessage],
+) -> querymt_agent_core::model::OutputTarget {
+    use querymt_agent_core::model::{MessagePart, OutputTarget};
+    if let Some(stated) = provenance {
+        let mut target = OutputTarget::new(stated.provider.clone(), stated.model.clone())
+            .with_protocol(stated.protocol.clone())
+            .with_endpoint(stated.endpoint.clone());
+        // `fallback_provider_model` lets stored output that carries no
+        // provenance replay natively when only its provider and model match
+        // the target. That is a guess about an origin nobody recorded. A
+        // provider that states its full identity is the case where the guess
+        // is not needed and not safe: output without provenance may come from
+        // any endpoint, so it is replayed in portable form (no encrypted
+        // reasoning or signatures), and only output stamped with exactly this
+        // identity replays natively.
+        target.fallback_provider_model = false;
+        return target;
+    }
+    let mut target = OutputTarget::new(llm.provider.clone(), llm.model.clone());
+    target.protocol = llm.protocol.clone();
+    target.endpoint = llm.endpoint.clone();
+    if target.endpoint.is_empty() {
+        let own = history
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter().rev())
+            .find_map(|part| match part {
+                MessagePart::Output { output } => output.provenance.as_ref().filter(|origin| {
+                    !origin.endpoint.is_empty()
+                        && origin.provider == llm.provider
+                        && origin.model == llm.model
+                }),
+                _ => None,
+            });
+        if let Some(origin) = own {
+            target.protocol = origin.protocol.clone();
+            target.endpoint = origin.endpoint.clone();
+        }
+    }
+    target
+}
+
 /// True when `error` means stored OAuth tokens could not be refreshed.
 fn is_oauth_refresh_failure(error: &SessionError) -> bool {
     matches!(error, SessionError::CredentialRefresh { .. })
@@ -1563,7 +1765,7 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatOutput, FinishReason};
+    use querymt::chat::{ChatCall, ChatOutput, ChatRole, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
@@ -1575,6 +1777,136 @@ pub mod tests {
     use crate::agent::core::AgentMode;
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
+
+    #[test]
+    fn output_target_is_completed_from_the_latest_output_of_the_same_model() {
+        use querymt::chat::ChatOutputProvenance;
+        use querymt_agent_core::model::MessagePart;
+        let llm = LLMConfig {
+            id: 1,
+            name: None,
+            provider: "p".into(),
+            model: "m".into(),
+            protocol: String::new(),
+            endpoint: String::new(),
+            params: None,
+            created_at: None,
+            updated_at: None,
+            provider_node_id: None,
+        };
+        let reply = |provider: &str, model: &str, endpoint: &str| {
+            let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+            message.parts.push(MessagePart::Output {
+                output: ChatOutput {
+                    provenance: Some(ChatOutputProvenance {
+                        provider: provider.into(),
+                        protocol: "responses".into(),
+                        model: model.into(),
+                        endpoint: endpoint.into(),
+                    }),
+                    ..ChatOutput::default()
+                },
+            });
+            message
+        };
+
+        // The latest reply of another model, and of another provider, is not
+        // the identity of this one.
+        let history = vec![
+            reply("p", "m", "https://a"),
+            reply("p", "other", "https://b"),
+            reply("q", "m", "https://c"),
+        ];
+        let target = complete_output_target(&llm, None, &history);
+        assert_eq!(target.endpoint, "https://a");
+        assert_eq!(target.protocol, "responses");
+
+        // Without a reply of its own the identity stays incomplete, which
+        // never authorizes native replay.
+        assert_eq!(complete_output_target(&llm, None, &[]).endpoint, "");
+        assert_eq!(
+            complete_output_target(&llm, None, &history[1..]).endpoint,
+            "",
+            "replies of other models do not complete it"
+        );
+
+        // What the provider states is the identity; the stored replies, which
+        // may come from another endpoint, do not complete it.
+        let stated = ChatOutputProvenance {
+            provider: "p".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            endpoint: "https://now".into(),
+        };
+        let target = complete_output_target(&llm, Some(&stated), &history);
+        assert_eq!(target.endpoint, "https://now");
+        assert_eq!(target.protocol, "chat");
+        assert_eq!(target.provider, "p");
+        assert_eq!(target.model, "m");
+        assert_eq!(
+            complete_output_target(&llm, Some(&stated), &[]).endpoint,
+            "https://now",
+            "a stated identity needs no history"
+        );
+        assert!(
+            !target.fallback_provider_model,
+            "a stated identity never replays output of unknown origin natively"
+        );
+        assert!(
+            complete_output_target(&llm, None, &history).fallback_provider_model,
+            "without a stated identity the legacy comparison stays available"
+        );
+
+        // The session may name the provider by an alias; the stated identity,
+        // which is what the output is stamped with, is used as it is.
+        let aliased = LLMConfig {
+            provider: "work-openai".into(),
+            model: "alias-of-m".into(),
+            ..llm.clone()
+        };
+        let target = complete_output_target(&aliased, Some(&stated), &[]);
+        assert_eq!(target.provider, "p");
+        assert_eq!(target.model, "m");
+
+        // Output stamped with exactly that identity replays natively (its
+        // reasoning signature is kept); the same output after the endpoint
+        // moved, and output without provenance even from the same provider
+        // and model, are portable.
+        let replays = |provenance: Option<ChatOutputProvenance>| {
+            use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart};
+            let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+            message.source_provider = Some("p".into());
+            message.source_model = Some("m".into());
+            message.parts.push(MessagePart::Output {
+                output: ChatOutput {
+                    provenance,
+                    items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                        id: None,
+                        summary: vec![ChatReasoningPart::text("visible")],
+                        content: Vec::new(),
+                        encrypted_content: None,
+                        signature: Some("sig".into()),
+                        status: None,
+                        extensions: Default::default(),
+                    })],
+                    ..ChatOutput::default()
+                },
+            });
+            let chat = message
+                .to_chat_message_with_output_target(Some(&target), None)
+                .unwrap();
+            chat.output().and_then(|output| output.signature()) == Some("sig".to_string())
+        };
+        let at = |endpoint: &str| {
+            Some(ChatOutputProvenance {
+                endpoint: endpoint.into(),
+                ..stated.clone()
+            })
+        };
+        assert!(replays(at("https://now")));
+        assert!(!replays(at("https://before")));
+        assert!(!replays(None));
+    }
 
     #[cfg(feature = "remote")]
     #[test]
@@ -1771,47 +2103,223 @@ pub mod tests {
         }
     }
 
+    /// Provider that only reports a prompt-cache declaration.
+    struct DeclaringProvider(PromptCacheCapabilities);
+
+    #[async_trait::async_trait]
+    impl querymt::chat::ChatProvider for DeclaringProvider {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            Err(LLMError::NotImplemented("not used".into()))
+        }
+
+        fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+            querymt::chat::ChatCapabilities::NONE.with_prompt_cache(self.0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl querymt::completion::CompletionProvider for DeclaringProvider {
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("not used".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl querymt::embedding::EmbeddingProvider for DeclaringProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("not used".into()))
+        }
+    }
+
+    impl LLMProvider for DeclaringProvider {}
+
+    /// Factory for a provider with a fixed declaration; counts its builds.
+    struct DeclaringFactory {
+        name: &'static str,
+        declaration: PromptCacheCapabilities,
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeclaringFactory {
+        fn new(declaration: PromptCacheCapabilities) -> Self {
+            Self {
+                // A name no provider list has ever contained.
+                name: "acme",
+                declaration,
+                builds: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn named(mut self, name: &'static str) -> Self {
+            self.name = name;
+            self
+        }
+
+        fn builds(&self) -> usize {
+            self.builds.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LLMProviderFactory for DeclaringFactory {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn config_schema(&self) -> String {
+            "{}".into()
+        }
+
+        fn from_config(&self, _cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+            self.builds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(DeclaringProvider(self.declaration)))
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _cfg: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    async fn session_provider() -> SessionProvider {
+        provider_with_profile(LLMParams::new()).await
+    }
+
+    fn hinted_sections(config: &str) -> Vec<bool> {
+        let value: serde_json::Value = serde_json::from_str(config).unwrap();
+        let sections: Vec<querymt::params::SystemPrompt> =
+            serde_json::from_value(value["system"].clone()).unwrap();
+        sections.iter().map(|s| s.cache().is_some()).collect()
+    }
+
     #[tokio::test]
-    async fn chat_skips_provider_when_history_conversion_fails() {
-        use crate::acp::protocol::{ContentBlock, ImageContent};
-        use crate::test_utils::{MockSessionStore, mock_llm_config, mock_session};
-        use querymt_agent_core::model::MessagePart;
+    async fn declaring_provider_gets_hints_on_first_and_last_section_only() {
+        let factory =
+            DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600));
+        let config = r#"{"model":"m","system":["one","two","three","four"]}"#.to_string();
 
-        let invalid_message = AgentMessage {
-            id: "invalid".to_string(),
-            session_id: "session".to_string(),
-            role: ChatRole::User,
-            parts: vec![MessagePart::Prompt {
-                blocks: vec![ContentBlock::Image(ImageContent::new("%%%", "image/png"))],
-            }],
-            created_at: 0,
-            parent_message_id: None,
-            source_provider: None,
-            source_model: None,
-        };
-        let mut store = MockSessionStore::new();
-        store
-            .expect_get_effective_history()
-            .return_once(move |_| Ok(vec![invalid_message]));
-        let (registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
-        let provider = Arc::new(SessionProvider::new(
-            Arc::new(registry),
-            Arc::new(store),
-            LLMParams::new().provider("mock").model("model"),
-        ));
-        let handle = SessionHandle {
-            provider,
-            session: mock_session("session"),
-            llm_config: Some(mock_llm_config()),
-            provider_node_id: None,
-            execution_config: None,
-            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
-        };
+        let hinted = session_provider()
+            .await
+            .with_default_cache_hints(&factory, config, 0)
+            .unwrap();
 
-        let ledger = crate::test_utils::test_ledger().await;
-        let error = handle.chat(&[], &ledger).await.unwrap_err();
+        assert_eq!(hinted_sections(&hinted.config), [true, false, false, true]);
+        // The probe was built without hints, so a second build carries them.
+        assert!(hinted.provider.is_none());
+        assert_eq!(factory.builds(), 1);
+    }
 
-        assert!(matches!(error, SessionError::InvalidOperation(_)));
+    #[tokio::test]
+    async fn single_section_gets_one_hint() {
+        let factory = DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS);
+        let config = r#"{"model":"m","system":"only"}"#.to_string();
+
+        let hinted = session_provider()
+            .await
+            .with_default_cache_hints(&factory, config, 0)
+            .unwrap();
+
+        assert_eq!(hinted_sections(&hinted.config), [true]);
+    }
+
+    #[tokio::test]
+    async fn provider_without_a_declaration_is_untouched_and_built_once() {
+        // A plugin built before the declaration existed, or a local-model
+        // provider: capabilities carry no `prompt_cache`.
+        let factory = DeclaringFactory::new(PromptCacheCapabilities::NONE);
+        let config = r#"{"model":"m","system":["one","two","three"]}"#.to_string();
+
+        let hinted = session_provider()
+            .await
+            .with_default_cache_hints(&factory, config.clone(), 3600)
+            .unwrap();
+
+        assert_eq!(hinted.config, config);
+        // The probe is handed back for reuse: no second build.
+        assert!(hinted.provider.is_some());
+        assert_eq!(factory.builds(), 1);
+    }
+
+    #[tokio::test]
+    async fn configuration_without_a_system_prompt_is_not_probed() {
+        let factory = DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS);
+        let config = r#"{"model":"m"}"#.to_string();
+
+        let hinted = session_provider()
+            .await
+            .with_default_cache_hints(&factory, config.clone(), 0)
+            .unwrap();
+
+        assert_eq!(hinted.config, config);
+        assert!(hinted.provider.is_none());
+        assert_eq!(factory.builds(), 0);
+    }
+
+    #[tokio::test]
+    async fn configured_lifetime_is_requested_up_to_the_declared_maximum() {
+        let factory =
+            DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(1800));
+        let config = r#"{"model":"m","system":["one","two"]}"#.to_string();
+
+        let hinted = session_provider()
+            .await
+            .with_default_cache_hints(&factory, config, 3600)
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&hinted.config).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                value["system"][index]["cache"],
+                serde_json::json!({"ephemeral": {"ttl_seconds": 1800}})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_configuration_skips_the_probe() {
+        let factory = DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS);
+        let provider = session_provider().await;
+        let config = r#"{"model":"m","system":["one","two"]}"#.to_string();
+
+        let first = provider
+            .with_default_cache_hints(&factory, config.clone(), 0)
+            .unwrap();
+        let second = provider
+            .with_default_cache_hints(&factory, config, 0)
+            .unwrap();
+
+        // Only the first call probed; both yield the same hinted configuration.
+        assert_eq!(factory.builds(), 1);
+        assert_eq!(first.config, second.config);
+        assert_eq!(hinted_sections(&second.config), [true, true]);
+    }
+
+    #[tokio::test]
+    async fn providers_with_the_same_pruned_configuration_keep_their_own_declaration() {
+        // Pruning leaves only the keys a schema lists, so two providers can
+        // read the same text. The declaration of the first must not decide
+        // what the second gets.
+        let declaring = DeclaringFactory::new(PromptCacheCapabilities::BREAKPOINTS).named("alpha");
+        let silent = DeclaringFactory::new(PromptCacheCapabilities::NONE).named("beta");
+        let provider = session_provider().await;
+        let config = r#"{"model":"m","system":["one","two"]}"#.to_string();
+
+        let first = provider
+            .with_default_cache_hints(&declaring, config.clone(), 0)
+            .unwrap();
+        let second = provider
+            .with_default_cache_hints(&silent, config.clone(), 0)
+            .unwrap();
+
+        assert_eq!(hinted_sections(&first.config), [true, true]);
+        assert_eq!(
+            second.config, config,
+            "no hints for a provider declaring none"
+        );
+        // The second provider was probed itself, not answered from the cache.
+        assert_eq!(silent.builds(), 1);
     }
 
     #[tokio::test]

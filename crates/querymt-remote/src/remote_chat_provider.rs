@@ -1,7 +1,9 @@
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
 use futures_util::StreamExt;
 use querymt::LLMProvider;
-use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream};
+use querymt::chat::{
+    ChatCall, ChatCapabilities, ChatOutput, ChatOutputProvenance, ChatProvider, ChatStream,
+};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -61,6 +63,13 @@ where
 {
     fn capabilities(&self) -> ChatCapabilities {
         self.core.capabilities()
+    }
+
+    /// A remote provider cannot say where its peer's output comes from: the
+    /// provider contract negotiates capabilities, not provenance. Callers keep
+    /// to what stored output records (`None`).
+    fn output_provenance(&self) -> Option<ChatOutputProvenance> {
+        None
     }
 
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {

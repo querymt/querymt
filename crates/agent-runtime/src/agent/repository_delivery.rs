@@ -8,7 +8,7 @@
 //! the tool call.
 
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::hooks::HookContextContribution;
 use crate::knowledge::repository::adapters::{
     IndexCall, PromptInput, orientation_contributions, post_index_contributions,
@@ -51,11 +51,9 @@ const GET_TOOL: &str = "repo_knowledge_get";
 /// Whether cards may name `repo_knowledge_get`: the tool is registered for
 /// this agent and allowed by the session's tool policy. Otherwise cards keep
 /// navigable relative citations without suggesting an unavailable call.
-fn fetch_available(config: &AgentConfig, exec_ctx: &ExecutionContext) -> bool {
+fn fetch_available(config: &AgentConfig, tool_config: &crate::agent::core::ToolConfig) -> bool {
     config.tool_registry.find(GET_TOOL).is_some()
-        && exec_ctx
-            .tool_config
-            .allows(crate::config::ToolRef::builtin(GET_TOOL))
+        && tool_config.allows(crate::config::ToolRef::builtin(GET_TOOL))
 }
 
 /// Whether the stable retrieval policy applies: repository knowledge is
@@ -133,7 +131,13 @@ fn append_policy_once(system: &mut Vec<querymt::params::SystemPrompt>) -> bool {
 /// compaction) count as represented, and the compaction epoch is the number of
 /// compactions so far. Nothing here depends on a diagnostics cache, so losing
 /// one never causes reinjection. A history failure leaves the state as it was.
-pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionContext) {
+pub(crate) async fn restore_state(config: &AgentConfig, env: &TurnEnv, turn: &mut Turn) {
+    restore_state_of(config, &env.session_id, turn).await;
+}
+
+/// [`restore_state`] for a caller that has the session's id and no
+/// [`TurnEnv`] yet.
+async fn restore_state_of(config: &AgentConfig, session_id: &str, turn: &mut Turn) {
     use querymt_agent_core::model::MessagePart;
     let Some(registry) = config.repository_knowledge() else {
         return;
@@ -144,20 +148,15 @@ pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionCont
     // History is read once per budget lifetime. Cards admitted afterwards are
     // tracked by the budget itself; compaction resets the budget, which
     // makes the next call rebuild it from the surviving history.
-    if exec_ctx
+    if turn
         .delivery_budget
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .is_some_and(|budget| budget.is_restored())
     {
         return;
     }
-    let Ok(Ok(history)) = tokio::time::timeout(
-        DELIVERY_TIMEOUT,
-        exec_ctx.state.store.get_history(&exec_ctx.session_id),
-    )
-    .await
+    let Ok(Ok(history)) =
+        tokio::time::timeout(DELIVERY_TIMEOUT, turn.state.store.get_history(session_id)).await
     else {
         return;
     };
@@ -183,11 +182,7 @@ pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionCont
             _ => None,
         })
         .collect();
-    let mut guard = exec_ctx
-        .delivery_budget
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard
+    turn.delivery_budget
         .get_or_insert_with(|| {
             crate::knowledge::repository::budget::DeliveryBudget::new(&registry.settings().delivery)
         })
@@ -199,17 +194,13 @@ pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionCont
 /// as delivered); foreign hook context passes through untouched.
 pub(crate) fn allocate(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    turn: &mut Turn,
     contributions: Vec<HookContextContribution>,
 ) -> Vec<HookContextContribution> {
     let Some(registry) = config.repository_knowledge() else {
         return contributions;
     };
-    let mut guard = exec_ctx
-        .delivery_budget
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let budget = guard.get_or_insert_with(|| {
+    let budget = turn.delivery_budget.get_or_insert_with(|| {
         crate::knowledge::repository::budget::DeliveryBudget::new(&registry.settings().delivery)
     });
     // Counts matched/delivered/suppressed per stage; no card text is kept.
@@ -253,9 +244,16 @@ fn orientation_deadline(
 }
 
 /// Orientation cards for an accepted prompt, when the host enabled that stage.
+///
+/// It runs before the user's prompt is stored, and so before the run's model
+/// is resolved and its [`TurnEnv`] exists: it takes the three things it reads
+/// of the run (the session, its working directory and its tool policy).
 pub(crate) async fn orientation_contexts(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    session_id: &str,
+    cwd: Option<&std::path::Path>,
+    tool_config: &crate::agent::core::ToolConfig,
+    turn: &mut Turn,
     prompt: &str,
     existing: &[HookContextContribution],
 ) -> Vec<HookContextContribution> {
@@ -266,23 +264,19 @@ pub(crate) async fn orientation_contexts(
         return Vec::new();
     }
     let max_cards = registry.settings().delivery.effective_max_cards();
-    restore_state(config, exec_ctx).await;
+    restore_state_of(config, session_id, turn).await;
     // First task of the session: nothing from the user is stored yet. A
     // history failure reads as "not first", the conservative answer.
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
-    let history = tokio::time::timeout_at(
-        deadline,
-        exec_ctx.state.store.get_history(&exec_ctx.session_id),
-    )
-    .await;
+    let history = tokio::time::timeout_at(deadline, turn.state.store.get_history(session_id)).await;
     let first_task = match history {
         Ok(Ok(history)) => !history
             .iter()
             .any(|message| message.role == querymt::chat::ChatRole::User),
         _ => false,
     };
-    let fetch = fetch_available(config, exec_ctx);
-    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let fetch = fetch_available(config, tool_config);
+    let cwd = cwd.map(|path| path.to_path_buf());
     let prompt = prompt.to_string();
     let existing = existing.to_vec();
     let started = Instant::now();
@@ -314,7 +308,7 @@ pub(crate) async fn orientation_contexts(
         started,
     );
     // Orientation is charged first, ahead of any index card of the turn.
-    allocate(config, exec_ctx, selected)
+    allocate(config, turn, selected)
 }
 
 /// What the post-tool stage needs to know about one finished call.
@@ -360,7 +354,7 @@ impl OwnedCall {
 /// host enabled that stage.
 pub(crate) async fn index_contexts(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     call: &FinishedCall<'_>,
     existing: &[HookContextContribution],
 ) -> Vec<HookContextContribution> {
@@ -371,8 +365,8 @@ pub(crate) async fn index_contexts(
         return Vec::new();
     }
     let max_cards = registry.settings().delivery.effective_max_cards();
-    let fetch = fetch_available(config, exec_ctx);
-    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let fetch = fetch_available(config, &env.tool_config);
+    let cwd = env.cwd().map(|path| path.to_path_buf());
     let owned = OwnedCall {
         tool_name: call.tool_name.to_string(),
         tool_source: call.tool_source.to_string(),
@@ -424,7 +418,8 @@ const RECENT_PATHS: usize = 3;
 /// history, used only to find the active task and recently indexed paths.
 pub(crate) async fn post_compaction_contexts(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     before: &[querymt_agent_core::model::AgentMessage],
 ) -> Vec<HookContextContribution> {
     use querymt_agent_core::model::MessagePart;
@@ -490,13 +485,10 @@ pub(crate) async fn post_compaction_contexts(
         }
     }
     // The new epoch starts with an empty allowance and the surviving history.
-    *exec_ctx
-        .delivery_budget
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    restore_state(config, exec_ctx).await;
+    turn.delivery_budget = None;
+    restore_state(config, env, turn).await;
     let surviving: Vec<HookContextContribution> =
-        match exec_ctx.state.store.get_history(&exec_ctx.session_id).await {
+        match turn.state.store.get_history(&env.session_id).await {
             Ok(history) => crate::session::compaction::filter_to_effective_history(history)
                 .iter()
                 .flat_map(|m| m.parts.iter())
@@ -521,8 +513,8 @@ pub(crate) async fn post_compaction_contexts(
     let orientation = settings.orientation_active();
     let index = settings.index_context_active();
     let max_cards = settings.delivery.effective_max_cards();
-    let fetch = fetch_available(config, exec_ctx);
-    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let fetch = fetch_available(config, &env.tool_config);
+    let cwd = env.cwd().map(|path| path.to_path_buf());
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
     let until = deadline.into_std();
     let selected = run_bounded(deadline, move || {
@@ -555,7 +547,7 @@ pub(crate) async fn post_compaction_contexts(
         Some(out)
     })
     .await;
-    allocate(config, exec_ctx, selected)
+    allocate(config, turn, selected)
 }
 
 /// Run selection off the executor and give up at `deadline`. A selection that

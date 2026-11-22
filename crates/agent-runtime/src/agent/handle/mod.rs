@@ -1,6 +1,7 @@
 //! `LocalAgentHandle`: the handle of a local agent, bundling shared config, the kameo session registry, and
 //! connection-level mutable state.
 
+pub(crate) mod admin_cancel;
 pub(crate) mod agent_handle_impl;
 pub(crate) mod core;
 pub(crate) mod ext;
@@ -176,6 +177,10 @@ pub struct LocalAgentHandle {
     /// The delegation service this handle owns when it is a runtime's root:
     /// the orchestrator and its listener task. Stopped by `shutdown()`.
     delegation_service: ParkingMutex<Option<DelegationService>>,
+
+    /// Cancellable administration steps that run without a session actor (a
+    /// handoff summary), reached by `session/cancel`.
+    pub(crate) admin_cancels: admin_cancel::AdminCancels,
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,

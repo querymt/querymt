@@ -5,7 +5,9 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SnapshotPolicy;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::Stage;
+use crate::agent::execution::TurnError;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::agent::utils::genai;
 use crate::config::{ApprovalNeed, ToolRef};
@@ -14,7 +16,7 @@ use crate::hooks::{
     UpdatedDelegation,
 };
 use crate::middleware::ToolCall as MiddlewareToolCall;
-use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
+use crate::middleware::{ToolResult, WaitCondition};
 use crate::session::domain::TaskStatus;
 use crate::tools::Tool;
 use crate::tools::args::{Repair, normalize_arguments};
@@ -36,11 +38,7 @@ use uuid::Uuid;
 /// [`PreparedCall`], so preparation and execution are reported on one span
 /// per call. Its duration therefore includes any time the prepared call waits
 /// for earlier conflicting calls to finish.
-fn open_tool_span(
-    config: &AgentConfig,
-    call: &MiddlewareToolCall,
-    exec_ctx: &ExecutionContext,
-) -> Span {
+fn open_tool_span(config: &AgentConfig, call: &MiddlewareToolCall, env: &TurnEnv) -> Span {
     let span = info_span!(
         "agent.tool.execute",
         otel.name = %format!("execute_tool {}", call.function.name),
@@ -48,9 +46,9 @@ fn open_tool_span(
         gen_ai.operation.name = "execute_tool",
         gen_ai.tool.name = %call.function.name,
         gen_ai.tool.call.id = %call.id,
-        gen_ai.conversation.id = %exec_ctx.session_id,
-        session.id = %exec_ctx.session_id,
-        session_id = %exec_ctx.session_id,
+        gen_ai.conversation.id = %env.session_id,
+        session.id = %env.session_id,
+        session_id = %env.session_id,
         tool_name = %call.function.name,
         tool_call_id = %call.id,
         tool_source = tracing::field::Empty,
@@ -71,10 +69,11 @@ fn open_tool_span(
 pub(super) async fn execute_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
 ) -> Result<ToolResult, anyhow::Error> {
-    let prepared = prepare_tool_call(config, call, exec_ctx).await?;
-    execute_prepared_tool_call(config, call, prepared, exec_ctx).await
+    let prepared = prepare_tool_call(config, call, env).await?;
+    execute_prepared_tool_call(config, call, prepared, env, turn).await
 }
 
 /// Why a prepared call will not reach its tool.
@@ -180,18 +179,18 @@ fn rejection_result(
 pub(super) async fn prepare_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
 ) -> Result<PreparedCall, anyhow::Error> {
     debug!(
         "Preparing tool: session={}, tool={}",
-        exec_ctx.session_id, call.function.name
+        env.session_id, call.function.name
     );
-    let span = open_tool_span(config, call, exec_ctx);
-    let mut prepared = prepare_tool_call_inner(config, call, exec_ctx)
+    let span = open_tool_span(config, call, env);
+    let mut prepared = prepare_tool_call_inner(config, call, env)
         .instrument(span.clone())
         .await
         .inspect_err(|_| {
-            if !exec_ctx.cancellation_token.is_cancelled() {
+            if !env.cancellation_token.is_cancelled() {
                 span.in_scope(|| genai::error("tool_pipeline_error"));
             }
         })?;
@@ -216,7 +215,7 @@ pub(super) fn record_rejected_outcome(call: &MiddlewareToolCall, repaired: bool)
 async fn prepare_tool_call_inner(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
 ) -> Result<PreparedCall, anyhow::Error> {
     // Invalid outer input never executes and never degrades to `{}`. It is
     // rejected before hooks, permissions or invocation.
@@ -235,9 +234,9 @@ async fn prepare_tool_call_inner(
         });
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
-    let tool = exec_ctx.tool_set(config).find(&call.function.name);
-    let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
-    let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
+    let tool = env.tool_set().find(&call.function.name);
+    let target = ToolTarget::resolve(tool.clone(), env, &call.function.name);
+    let schema = resolve_tool_schema(env, &call.function.name).await;
     let mut repairs: Vec<Repair> = Vec::new();
 
     let reject = |args: serde_json::Value,
@@ -278,16 +277,16 @@ async fn prepare_tool_call_inner(
     let hook_result = config
         .hooks
         .run_pre_tool_use(PreToolUseRequest {
-            session_id: exec_ctx.session_id.clone(),
+            session_id: env.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: exec_ctx
+            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
+            turn_id: env.turn_id().to_string(),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
+            model: env
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             tool_name: call.function.name.clone(),
             tool_input: args.clone(),
             tool_use_id: call.id.clone(),
@@ -298,7 +297,7 @@ async fn prepare_tool_call_inner(
         })?;
     for notice in hook_result.notices {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::HookNotice {
                 event_name: notice.event_name,
                 message: notice.message,
@@ -357,7 +356,7 @@ async fn prepare_tool_call_inner(
         ));
     }
 
-    if let Err(error) = validate_tool_arguments(exec_ctx, schema.as_ref(), &args).await {
+    if let Err(error) = validate_tool_arguments(env, schema.as_ref(), &args).await {
         Span::current().set_attribute("querymt.tool.execution", "validation_rejected");
         genai::error("invalid_tool_arguments");
         return Ok(reject(
@@ -393,26 +392,62 @@ pub(super) async fn execute_prepared_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     prepared: PreparedCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
 ) -> Result<ToolResult, anyhow::Error> {
     let span = prepared.span.clone();
     let repaired = !prepared.repairs.is_empty();
-    execute_prepared_inner(config, call, prepared, exec_ctx)
+    execute_prepared_inner(config, call, prepared, env, turn)
         .instrument(span.clone())
         .await
         .inspect_err(|_| {
-            if !exec_ctx.cancellation_token.is_cancelled() {
+            if !env.cancellation_token.is_cancelled() {
                 span.in_scope(|| genai::error("tool_pipeline_error"));
                 genai::tool_call_outcome(&call.function.name, repaired, "error");
             }
         })
 }
 
+/// Ends a started call whose execution stops before its own `ToolCallEnd`: the
+/// future was dropped (run cancelled, the cancel signal won the race against the
+/// tool) or an infrastructure error returned early. Every `ToolCallStart` then
+/// has exactly one end event.
+struct ToolCallEndGuard<'a> {
+    config: &'a AgentConfig,
+    env: &'a TurnEnv,
+    call: &'a MiddlewareToolCall,
+    /// Cleared right before the call emits its own end event.
+    armed: bool,
+}
+
+impl Drop for ToolCallEndGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let result = if self.env.cancellation_token.is_cancelled() {
+            "Error: Cancelled by user"
+        } else {
+            "Error: internal tool execution failed"
+        };
+        self.config.emit_event(
+            &self.env.session_id,
+            AgentEventKind::ToolCallEnd {
+                tool_call_id: self.call.id.clone(),
+                tool_name: self.call.function.name.clone(),
+                is_error: true,
+                result: result.to_owned(),
+            },
+        );
+    }
+}
+
 async fn execute_prepared_inner(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     prepared: PreparedCall,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
 ) -> Result<ToolResult, anyhow::Error> {
     let repaired = !prepared.repairs.is_empty();
     let PreparedCall {
@@ -430,18 +465,24 @@ async fn execute_prepared_inner(
     }
 
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::ToolCallStart {
             tool_call_id: call.id.clone(),
             tool_name: call.function.name.clone(),
             arguments: arguments_json.clone(),
         },
     );
+    let mut end_guard = ToolCallEndGuard {
+        config,
+        env,
+        call,
+        armed: true,
+    };
 
     // Progress recording is observational — a failure here must not abort the
     // tool call itself, otherwise the tool_use block ends up without a matching
     // tool_result and the session becomes permanently broken.
-    match exec_ctx
+    match turn
         .state
         .record_progress(
             crate::session::domain::ProgressKind::ToolCall,
@@ -452,7 +493,7 @@ async fn execute_prepared_inner(
     {
         Ok(progress_entry) => {
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::ProgressRecorded { progress_entry },
             );
         }
@@ -460,13 +501,13 @@ async fn execute_prepared_inner(
             log::warn!(
                 "Failed to record progress for tool {} (session {}): {}",
                 call.function.name,
-                exec_ctx.session_id,
+                env.session_id,
                 e
             );
         }
     }
 
-    let (outcome, snapshot) = dispatch(config, exec_ctx, call, &args, &target, approval).await?;
+    let (outcome, snapshot) = dispatch(config, env, turn, call, &args, &target, approval).await?;
     let ToolOutcome {
         parts: raw_result_blocks,
         is_error,
@@ -478,7 +519,7 @@ async fn execute_prepared_inner(
     span.record("tool_source", tool_source.as_str());
     span.record("is_error", is_error);
     span.set_attribute("querymt.tool.execution", execution.as_str());
-    if is_error && !exec_ctx.cancellation_token.is_cancelled() {
+    if is_error && !env.cancellation_token.is_cancelled() {
         genai::error(execution.error_type());
     }
 
@@ -490,16 +531,16 @@ async fn execute_prepared_inner(
     let post_hook = config
         .hooks
         .run_post_tool_use(PostToolUseRequest {
-            session_id: exec_ctx.session_id.clone(),
+            session_id: env.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: exec_ctx
+            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
+            turn_id: env.turn_id().to_string(),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
+            model: env
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             tool_name: call.function.name.clone(),
             tool_input: args.clone(),
             content: result_blocks.clone(),
@@ -525,7 +566,7 @@ async fn execute_prepared_inner(
         || post_hook.is_error.is_some_and(|flag| flag != is_error);
     for notice in post_hook.notices {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::HookNotice {
                 event_name: notice.event_name,
                 message: notice.message,
@@ -541,7 +582,7 @@ async fn execute_prepared_inner(
     }
     result_blocks = truncate_model_tool_output(
         config,
-        exec_ctx,
+        env,
         &call.id,
         &call.function.name,
         result_blocks,
@@ -556,8 +597,9 @@ async fn execute_prepared_inner(
         .collect::<Vec<_>>()
         .join("\n");
 
+    end_guard.armed = false;
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::ToolCallEnd {
             tool_call_id: call.id.clone(),
             tool_name: call.function.name.clone(),
@@ -570,7 +612,7 @@ async fn execute_prepared_inner(
         SnapshotState::Diff { pre_tree, root } => {
             let (post_tree, changed_paths) = info_span!(
                 "agent.tool.snapshot.diff",
-                session_id = %exec_ctx.session_id,
+                session_id = %env.session_id,
                 tool_name = %call.function.name,
                 tool_call_id = %call.id,
             )
@@ -583,9 +625,9 @@ async fn execute_prepared_inner(
                 (post_tree, changed_paths)
             });
             let root_hash = post_tree.root_hash;
-            *exec_ctx.runtime.last_snapshot_tree.lock() = Some((root, Arc::new(post_tree)));
+            *env.runtime.last_snapshot_tree.lock() = Some((root, Arc::new(post_tree)));
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::SnapshotEnd {
                     summary: Some(changed_paths.summary()),
                 },
@@ -598,15 +640,12 @@ async fn execute_prepared_inner(
         SnapshotState::Metadata { root } => {
             let (part, summary) = info_span!(
                 "agent.tool.snapshot.metadata",
-                session_id = %exec_ctx.session_id,
+                session_id = %env.session_id,
                 tool_name = %call.function.name,
                 tool_call_id = %call.id,
             )
             .in_scope(|| snapshot_metadata(root.as_path()));
-            config.emit_event(
-                &exec_ctx.session_id,
-                AgentEventKind::SnapshotEnd { summary },
-            );
+            config.emit_event(&env.session_id, AgentEventKind::SnapshotEnd { summary });
             Some(part)
         }
         SnapshotState::None => None,
@@ -620,7 +659,7 @@ async fn execute_prepared_inner(
     // a command-hook wrapper) are not delivered again.
     let enrichment = crate::agent::repository_delivery::index_contexts(
         config,
-        exec_ctx,
+        env,
         &crate::agent::repository_delivery::FinishedCall {
             tool_name: &call.function.name,
             tool_source: tool_source.as_str(),
@@ -663,18 +702,13 @@ async fn execute_prepared_inner(
 
 /// Parameter schema of a tool: builtin registry, then MCP tool state, then
 /// provider tools. `None` when the tool is unknown (nothing to validate).
-async fn resolve_tool_schema(
-    config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-    tool_name: &str,
-) -> Option<serde_json::Value> {
-    let schema = exec_ctx
-        .tool_set(config)
+async fn resolve_tool_schema(env: &TurnEnv, tool_name: &str) -> Option<serde_json::Value> {
+    let schema = env
+        .tool_set()
         .definition(tool_name)
         .map(|tool| tool.function.parameters)
         .or_else(|| {
-            exec_ctx
-                .runtime
+            env.runtime
                 .mcp_tool_state
                 .load()
                 .tool_defs
@@ -684,7 +718,7 @@ async fn resolve_tool_schema(
         });
     match schema {
         Some(schema) => Some(schema),
-        None => exec_ctx
+        None => env
             .session_handle
             .provider()
             .await
@@ -702,7 +736,7 @@ async fn resolve_tool_schema(
 
 /// Validate effective arguments against an already-resolved schema.
 async fn validate_tool_arguments(
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     schema: Option<&serde_json::Value>,
     arguments: &serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -711,7 +745,7 @@ async fn validate_tool_arguments(
     };
     let schema_key = serde_json::to_string(schema)?;
     let validator = {
-        let cache = exec_ctx.runtime.tool_validator_cache.lock();
+        let cache = env.runtime.tool_validator_cache.lock();
         cache.get(&schema_key).cloned()
     };
     let validator = match validator {
@@ -721,8 +755,7 @@ async fn validate_tool_arguments(
                 jsonschema::validator_for(schema)
                     .map_err(|error| anyhow::anyhow!("invalid tool schema: {}", error))?,
             );
-            exec_ctx
-                .runtime
+            env.runtime
                 .tool_validator_cache
                 .lock()
                 .insert(schema_key, validator.clone());
@@ -737,7 +770,7 @@ async fn validate_tool_arguments(
 
 async fn truncate_model_tool_output(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     call_id: &str,
     tool_name: &str,
     blocks: Vec<querymt::chat::ToolResultPart>,
@@ -767,7 +800,7 @@ async fn truncate_model_tool_output(
     }
     let overflow_content = raw_text.clone();
     let overflow_storage = policy.overflow_storage.clone();
-    let overflow_session_id = exec_ctx.session_id.clone();
+    let overflow_session_id = env.session_id.clone();
     let overflow_call_id = call_id.to_string();
     let overflow = tokio::task::spawn_blocking(move || {
         save_overflow_output(
@@ -785,8 +818,8 @@ async fn truncate_model_tool_output(
             error: Some(format!("Failed to join overflow writer: {}", error)),
         },
     );
-    let hint = exec_ctx
-        .tool_set(config)
+    let hint = env
+        .tool_set()
         .find(tool_name)
         .and_then(|tool| tool.truncation_hint());
     let suffix = format_truncation_message_with_overflow(
@@ -819,20 +852,16 @@ pub(super) enum ToolTarget {
 /// Whether a call to `name` can leave workspace files untouched, using the same
 /// target resolution (built-in, then MCP, then provider) as snapshot
 /// preparation, so both agree on what counts as read-only.
-pub(super) fn call_is_read_only(
-    config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-    name: &str,
-) -> bool {
-    ToolTarget::resolve(exec_ctx.tool_set(config).find(name), exec_ctx, name).is_read_only()
+pub(super) fn call_is_read_only(env: &TurnEnv, name: &str) -> bool {
+    ToolTarget::resolve(env.tool_set().find(name), env, name).is_read_only()
 }
 
 impl ToolTarget {
-    fn resolve(builtin: Option<Arc<dyn Tool>>, exec_ctx: &ExecutionContext, name: &str) -> Self {
+    fn resolve(builtin: Option<Arc<dyn Tool>>, env: &TurnEnv, name: &str) -> Self {
         if let Some(tool) = builtin {
             return Self::Builtin(tool);
         }
-        let snapshot = exec_ctx.runtime.mcp_tool_state.load();
+        let snapshot = env.runtime.mcp_tool_state.load();
         match snapshot.tools.get(name) {
             Some(adapter) => Self::Mcp(Arc::clone(adapter)),
             None => Self::Provider,
@@ -969,7 +998,8 @@ impl ToolOutcome {
 /// tool; no snapshot is taken for it.
 async fn dispatch(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call: &MiddlewareToolCall,
     args: &serde_json::Value,
     target: &ToolTarget,
@@ -978,7 +1008,7 @@ async fn dispatch(
     let tool = target.tool_ref(&call.function.name);
 
     // Per-session config so that runtime SetAllowedTools / SetDeniedTools apply.
-    if !exec_ctx.tool_config.allows(tool) {
+    if !env.tool_config.allows(tool) {
         let text = format!("Error: tool '{}' is not allowed", call.function.name);
         return Ok((
             ToolOutcome::error_text(text, ToolSource::Blocked, Execution::PolicyBlocked),
@@ -987,12 +1017,12 @@ async fn dispatch(
     }
 
     if !matches!(approval, ApprovalNeed::None) {
-        let approved = request_approval(config, exec_ctx, &call.id, tool, args, approval)
+        let approved = request_approval(config, env, turn, &call.id, tool, args, approval)
             .instrument(info_span!(
                 "agent.tool.permission_wait",
                 tool_name = %call.function.name,
                 tool_call_id = %call.id,
-                session_id = %exec_ctx.session_id,
+                session_id = %env.session_id,
             ))
             .await
             .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?;
@@ -1008,30 +1038,26 @@ async fn dispatch(
     let snapshot = if target.is_read_only() {
         SnapshotState::None
     } else {
-        begin_snapshot(config, exec_ctx, call)
+        begin_snapshot(config, env, call)
     };
-    let outcome = run_tool(config, exec_ctx, call, args, target).await;
+    let outcome = run_tool(config, env, turn, call, args, target).await;
     Ok((outcome, snapshot))
 }
 
 /// Capture the pre-call state of the workspace, per the snapshot policy.
-fn begin_snapshot(
-    config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
-    call: &MiddlewareToolCall,
-) -> SnapshotState {
+fn begin_snapshot(config: &AgentConfig, env: &TurnEnv, call: &MiddlewareToolCall) -> SnapshotState {
     info_span!(
         "agent.tool.snapshot.prepare",
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         tool_name = %call.function.name,
         tool_call_id = %call.id,
     )
     .in_scope(|| {
         config
-            .prepare_snapshot(exec_ctx.cwd())
+            .prepare_snapshot(env.cwd())
             .map(|(root, policy)| {
                 config.emit_event(
-                    &exec_ctx.session_id,
+                    &env.session_id,
                     AgentEventKind::SnapshotStart {
                         policy: policy.to_string(),
                     },
@@ -1040,7 +1066,7 @@ fn begin_snapshot(
                     SnapshotPolicy::Diff => {
                         // Seed with the previous post-call tree so only files whose
                         // size or mtime changed since then are re-hashed.
-                        let previous = exec_ctx
+                        let previous = env
                             .runtime
                             .last_snapshot_tree
                             .lock()
@@ -1064,7 +1090,8 @@ fn begin_snapshot(
 /// Invoke the resolved target.
 async fn run_tool(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call: &MiddlewareToolCall,
     args: &serde_json::Value,
     target: &ToolTarget,
@@ -1072,7 +1099,7 @@ async fn run_tool(
     let source = target.source();
     match target {
         ToolTarget::Builtin(tool) => {
-            let tool_context = tool_context_for_call(config, exec_ctx, call);
+            let tool_context = tool_context_for_call(config, env, turn, call);
             let result = genai::tool_scope(
                 Span::current(),
                 tool.call(args.clone(), &tool_context)
@@ -1096,9 +1123,9 @@ async fn run_tool(
                 }
             }
         }
-        ToolTarget::Mcp(adapter) => run_mcp_tool(config, exec_ctx, call, args, adapter).await,
+        ToolTarget::Mcp(adapter) => run_mcp_tool(config, env, call, args, adapter).await,
         ToolTarget::Provider => {
-            let result = exec_ctx
+            let result = env
                 .session_handle
                 .call_tool(&call.function.name, args.clone())
                 .instrument(info_span!(
@@ -1120,7 +1147,7 @@ async fn run_tool(
 
 async fn run_mcp_tool(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
     call: &MiddlewareToolCall,
     args: &serde_json::Value,
     adapter: &McpToolAdapter,
@@ -1133,7 +1160,7 @@ async fn run_mcp_tool(
     let (progress_sink, _close_progress) = {
         let event_sink = config.event_sink.clone();
         let (session_id, tool_call_id, tool_name) = (
-            exec_ctx.session_id.clone(),
+            env.session_id.clone(),
             call.id.clone(),
             call.function.name.clone(),
         );
@@ -1172,9 +1199,9 @@ async fn run_mcp_tool(
     if let Some(text) = crate::agent::mcp::report_auth_required(
         &e,
         server,
-        exec_ctx.runtime.mcp_tool_state.is_oauth_server(server),
+        env.runtime.mcp_tool_state.is_oauth_server(server),
         &config.event_sink,
-        &exec_ctx.session_id,
+        &env.session_id,
     ) {
         return ToolOutcome::error_text(text, SOURCE, Execution::Executed);
     }
@@ -1322,7 +1349,8 @@ impl ElicitationRelay {
 /// to the pending-interaction registry for this call.
 fn tool_context_for_call(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call: &MiddlewareToolCall,
 ) -> crate::tools::AgentToolContext {
     let (elicitation_tx, mut elicitation_rx) =
@@ -1330,11 +1358,11 @@ fn tool_context_for_call(
 
     let relay = ElicitationRelay {
         event_sink: config.event_sink.clone(),
-        session_id: exec_ctx.session_id.clone(),
-        run_id: exec_ctx.turn_id().to_string(),
+        session_id: env.session_id.clone(),
+        run_id: env.turn_id().to_string(),
         tool_call_id: call.id.clone(),
         pending: config.pending_elicitations.clone(),
-        cancellation_token: exec_ctx.cancellation_token.clone(),
+        cancellation_token: env.cancellation_token.clone(),
     };
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
@@ -1353,15 +1381,14 @@ fn tool_context_for_call(
         .await;
     });
 
-    exec_ctx
-        .tool_context(Some(elicitation_tx))
+    env.tool_context(Some(elicitation_tx))
         .with_tool_call_id(call.id.clone())
         .with_workspace_service(config.workspace_service())
         .with_todo_store(config.todo_store.clone())
-        .with_session_store(exec_ctx.state.store.clone())
+        .with_session_store(turn.state.store.clone())
         .with_task_service(crate::session::TaskService::new(
-            exec_ctx.state.store.clone(),
-            exec_ctx.session_id.clone(),
+            turn.state.store.clone(),
+            env.session_id.clone(),
             call.id.clone(),
         ))
 }
@@ -1432,7 +1459,7 @@ async fn sleep_or_pending(timeout: Option<Duration>) {
     name = "agent.tool.permission",
     skip_all,
     fields(
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         tool_name = %tool.name,
         tool_call_id = %call_id,
         session_grant = tracing::field::Empty,
@@ -1441,21 +1468,23 @@ async fn sleep_or_pending(timeout: Option<Duration>) {
 )]
 pub(super) async fn request_approval(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call_id: &str,
     tool: ToolRef<'_>,
     args: &serde_json::Value,
     need: ApprovalNeed,
 ) -> Result<Approval, agent_client_protocol::Error> {
     let span = Span::current();
-    let approval = decide_approval(config, exec_ctx, call_id, tool, args, need).await?;
+    let approval = decide_approval(config, env, turn, call_id, tool, args, need).await?;
     span.record("granted", matches!(approval, Approval::Granted));
     Ok(approval)
 }
 
 async fn decide_approval(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call_id: &str,
     tool: ToolRef<'_>,
     args: &serde_json::Value,
@@ -1466,32 +1495,32 @@ async fn decide_approval(
     }
 
     if matches!(need, ApprovalNeed::Session) {
-        let granted = exec_ctx.runtime.session_grants.lock().contains(tool);
+        let granted = env.runtime.session_grants.lock().contains(tool);
         Span::current().record("session_grant", granted);
         if granted {
             return Ok(Approval::Granted);
         }
     }
 
-    if let Some(task) = &exec_ctx.state.active_task
+    if let Some(task) = &turn.state.active_task
         && task.status != TaskStatus::Active
     {
         return Ok(Approval::Denied(Denial::TaskInactive));
     }
 
-    let turn_id = exec_ctx.turn_id().to_string();
+    let turn_id = env.turn_id().to_string();
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
-            session_id: exec_ctx.session_id.clone(),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+            session_id: env.session_id.clone(),
+            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
             turn_id: turn_id.clone(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: exec_ctx
+            cwd: env.cwd().map(|path| path.to_path_buf()),
+            model: env
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
+            permission_mode: env.permission_mode().to_string(),
             tool_name: tool.name.to_string(),
             tool_input: args.clone(),
         })
@@ -1499,7 +1528,7 @@ async fn decide_approval(
         .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
     for notice in hook_decision.notices {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::HookNotice {
                 event_name: notice.event_name,
                 message: notice.message,
@@ -1512,7 +1541,7 @@ async fn decide_approval(
         Some(PermissionRequestDecision::Deny { message }) => {
             log::debug!(
                 "Session {}: permission hook denied {}: {}",
-                exec_ctx.session_id,
+                env.session_id,
                 tool,
                 message
             );
@@ -1521,18 +1550,18 @@ async fn decide_approval(
         None => {}
     }
 
-    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, &turn_id).await)
+    Ok(prompt_user(config, env, turn, call_id, tool, args, &need).await)
 }
 
 /// Register a permission interaction, announce it, and wait for the outcome.
 async fn prompt_user(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     call_id: &str,
     tool: ToolRef<'_>,
     args: &serde_json::Value,
     need: &ApprovalNeed,
-    turn_id: &str,
 ) -> Approval {
     use crate::acp::protocol::{
         RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
@@ -1571,7 +1600,7 @@ async fn prompt_user(
     );
 
     let request = RequestPermissionRequest::new(
-        exec_ctx.session_id.clone(),
+        env.session_id.clone(),
         ToolCallUpdate::new(ToolCallId::from(call_id.to_string()), tool_update_fields),
         permission_options(need),
     )
@@ -1581,9 +1610,9 @@ async fn prompt_user(
     crate::elicitation::register_pending_permission(
         &config.pending_elicitations,
         permission_id.clone(),
-        exec_ctx.session_id.clone(),
+        env.session_id.clone(),
         request.clone(),
-        Some(turn_id.to_string()),
+        Some(env.turn_id().to_string()),
         Some(call_id.to_string()),
         response_tx,
     )
@@ -1599,10 +1628,10 @@ async fn prompt_user(
     if let Err(err) = config
         .event_sink
         .emit_durable(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::PermissionRequested {
                 permission_id: permission_id.clone(),
-                task_id: exec_ctx
+                task_id: turn
                     .state
                     .active_task
                     .as_ref()
@@ -1627,7 +1656,7 @@ async fn prompt_user(
     let timeout = config.permissions.timeout;
     let answer = tokio::select! {
         response = response_rx => response.map_err(|_| Denial::Cancelled),
-        _ = exec_ctx.cancellation_token.cancelled() => Err(Denial::Cancelled),
+        _ = env.cancellation_token.cancelled() => Err(Denial::Cancelled),
         _ = sleep_or_pending(timeout) => Err(Denial::TimedOut(timeout.unwrap_or_default())),
     };
 
@@ -1647,7 +1676,7 @@ async fn prompt_user(
     });
 
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::PermissionGranted {
             permission_id,
             granted: decision.is_ok(),
@@ -1657,7 +1686,7 @@ async fn prompt_user(
     match decision {
         Ok(session_wide) => {
             if session_wide && matches!(need, ApprovalNeed::Session) {
-                exec_ctx.runtime.session_grants.lock().insert(tool);
+                env.runtime.session_grants.lock().insert(tool);
             }
             Approval::Granted
         }
@@ -1689,9 +1718,10 @@ impl Drop for PendingPermissionGuard {
 /// (e.g., delegation).
 #[instrument(
     name = "agent.tool.side_effects",
-    skip(config, result, exec_ctx),
+    level = "debug",
+    skip(config, result, env, turn),
     fields(
-        session_id = %exec_ctx.session_id,
+        session_id = %env.session_id,
         tool_call_id = %result.call_id,
         tool_name = result.tool_name.as_deref().unwrap_or("unknown")
     )
@@ -1699,7 +1729,8 @@ impl Drop for PendingPermissionGuard {
 pub(super) async fn record_tool_side_effects(
     config: &AgentConfig,
     result: &mut ToolResult,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &Turn,
     batch_id: Option<&str>,
 ) -> Result<Option<WaitCondition>, anyhow::Error> {
     if result.execution_is_error {
@@ -1719,7 +1750,7 @@ pub(super) async fn record_tool_side_effects(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if let Ok(artifact) = exec_ctx
+        if let Ok(artifact) = turn
             .state
             .record_artifact(
                 "file".to_string(),
@@ -1730,7 +1761,7 @@ pub(super) async fn record_tool_side_effects(
             .await
         {
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::ArtifactRecorded { artifact },
             );
         }
@@ -1773,14 +1804,14 @@ pub(super) async fn record_tool_side_effects(
         let pre_hook = config
             .hooks
             .run_pre_delegation(PreDelegationRequest {
-                session_id: exec_ctx.session_id.clone(),
-                turn_id: exec_ctx.turn_id().to_string(),
-                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-                model: exec_ctx
+                session_id: env.session_id.clone(),
+                turn_id: env.turn_id().to_string(),
+                cwd: env.cwd().map(|path| path.to_path_buf()),
+                model: env
                     .llm_config()
                     .map(|cfg| cfg.model.clone())
                     .unwrap_or_default(),
-                permission_mode: exec_ctx.permission_mode().to_string(),
+                permission_mode: env.permission_mode().to_string(),
                 tool_use_id: result.call_id.clone(),
                 target_agent_id: target_agent_id.clone(),
                 objective: objective.clone(),
@@ -1792,7 +1823,7 @@ pub(super) async fn record_tool_side_effects(
             .await?;
         for notice in pre_hook.notices {
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::HookNotice {
                     event_name: notice.event_name,
                     message: notice.message,
@@ -1843,7 +1874,7 @@ pub(super) async fn record_tool_side_effects(
         // execution mode. The resolved policy is persisted with the request
         // and disclosed to the caller.
         let parent_mode = match config.workspace_service() {
-            Some(service) => match service.session_execution_mode(&exec_ctx.session_id).await {
+            Some(service) => match service.session_execution_mode(&env.session_id).await {
                 Ok(mode) => mode,
                 Err(err) => {
                     return Err(anyhow::anyhow!(
@@ -1897,7 +1928,7 @@ pub(super) async fn record_tool_side_effects(
             ),
         });
 
-        if let Ok(delegation) = exec_ctx
+        if let Ok(delegation) = turn
             .state
             .record_delegation(
                 target_agent_id.clone(),
@@ -1917,15 +1948,12 @@ pub(super) async fn record_tool_side_effects(
             .await
         {
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::DelegationRequested {
                     delegation: delegation.clone(),
                     tool_call_id: Some(result.call_id.clone()),
                     batch_id: batch_id.map(str::to_owned),
-                    cycle_id: exec_ctx
-                        .cycle_accounting
-                        .get()
-                        .map(|cycle| cycle.cycle_id().to_string()),
+                    cycle_id: Some(env.cycle_accounting.cycle_id().to_string()),
                 },
             );
             return Ok(Some(WaitCondition::delegation(
@@ -1944,20 +1972,21 @@ pub(super) async fn record_tool_side_effects(
 /// assistant tool-call message) keep their relative order and go at the end.
 fn order_results_by_call_position(
     results: &[ToolResult],
-    messages: &[querymt::chat::ChatMessage],
+    history: &[AgentMessage],
 ) -> Vec<ToolResult> {
     let mut ordered = results.to_vec();
-    let Some(assistant) = messages
+    let Some(assistant) = history
         .iter()
         .rfind(|message| message.role == ChatRole::Assistant)
     else {
         return ordered;
     };
 
+    let calls = assistant.function_calls();
     let mut positions: HashMap<&str, usize> = HashMap::new();
-    for (position, call) in assistant.function_calls().enumerate() {
+    for (position, call) in calls.iter().enumerate() {
         // First occurrence wins if an id is (unexpectedly) repeated.
-        positions.entry(call.call_id.as_str()).or_insert(position);
+        positions.entry(call.id.as_str()).or_insert(position);
     }
     // `sort_by_key` is stable, so unknown ids (usize::MAX) keep their order.
     ordered.sort_by_key(|result| {
@@ -1987,38 +2016,38 @@ fn resolved_isolation_label(resolved: crate::worktree::ResolvedIsolation) -> &'s
 /// 5. Returns either WaitingForEvent (if delegation) or BeforeLlmCall
 #[instrument(
     name = "agent.tools.store_all_results",
-    skip(config, results, context, exec_ctx),
-    fields(session_id = %exec_ctx.session_id, result_count = results.len())
+    skip(config, results, env, turn, steering),
+    fields(session_id = %env.session_id, result_count = results.len())
 )]
 pub(super) async fn store_all_tool_results(
     config: &AgentConfig,
-    results: &Arc<[ToolResult]>,
-    context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &mut ExecutionContext,
-) -> Result<ExecutionState, anyhow::Error> {
+    results: &[ToolResult],
+    env: &TurnEnv,
+    turn: &mut Turn,
+    steering: super::DrainedSteering,
+) -> Result<Stage, TurnError> {
     debug!(
         "Storing all tool results: session={}, count={}",
-        exec_ctx.session_id,
+        env.session_id,
         results.len()
     );
 
-    let mut messages = (*context.messages).to_vec();
     let mut wait_conditions = Vec::new();
 
     // Middleware may pre-fill `results` (e.g. rejected calls), so the incoming
     // order is not necessarily the order of the assistant's tool calls. Store
     // results in call order.
-    let ordered_results = order_results_by_call_position(results, &context.messages);
+    let ordered_results = order_results_by_call_position(results, turn.history.as_slice());
 
     // Record per-result side effects (delegations, artifacts, etc.) before
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
     let batch_id = Uuid::new_v4().to_string();
-    crate::agent::repository_delivery::restore_state(config, exec_ctx).await;
+    crate::agent::repository_delivery::restore_state(config, env, turn).await;
     let mut adjusted_results = Vec::with_capacity(ordered_results.len());
     for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
-            record_tool_side_effects(config, &mut result, exec_ctx, Some(&batch_id)).await?
+            record_tool_side_effects(config, &mut result, env, turn, Some(&batch_id)).await?
         {
             wait_conditions.push(wait_condition);
         }
@@ -2026,8 +2055,7 @@ pub(super) async fn store_all_tool_results(
         // stable tool-call order (not completion order). Cards that do not
         // fit are dropped whole, so they are never recorded as delivered.
         let contexts = std::mem::take(&mut result.hook_contexts);
-        result.hook_contexts =
-            crate::agent::repository_delivery::allocate(config, exec_ctx, contexts);
+        result.hook_contexts = crate::agent::repository_delivery::allocate(config, turn, contexts);
         adjusted_results.push(result);
     }
 
@@ -2066,7 +2094,7 @@ pub(super) async fn store_all_tool_results(
 
     let result_msg = AgentMessage {
         id: Uuid::new_v4().to_string(),
-        session_id: exec_ctx.session_id.clone(),
+        session_id: env.session_id.clone(),
         role: ChatRole::User,
         parts: result_parts,
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -2075,37 +2103,18 @@ pub(super) async fn store_all_tool_results(
         source_model: None,
     };
 
-    exec_ctx
-        .add_message(result_msg.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
-
-    // Steering may have been accepted after the assistant requested these tools.
-    // Persist its original order, but keep the request's result batch adjacent
-    // to the assistant instead of inserting a user message between them.
-    let result_index = messages
-        .iter()
-        .rposition(|message| message.role == ChatRole::Assistant)
-        .map_or(messages.len(), |index| index + 1);
-    messages.insert(
-        result_index,
-        result_msg
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid stored tool result content: {error}"))?,
-    );
-
-    let new_context = Arc::new(
-        crate::middleware::ConversationContext::new(
-            context.session_id.clone(),
-            Arc::from(messages.into_boxed_slice()),
-            context.stats.clone(),
-            context.provider.clone(),
-            context.model.clone(),
-        )
-        .with_session_mode(context.session_mode)
-        .with_profile(context.profile.clone())
-        .with_last_applied(context.last_applied),
-    );
+    // The results are stored directly after the assistant message that made
+    // the calls. Steering accepted before the batch started is stored after
+    // them, so the stored order is the order the model is sent.
+    super::commit_steering(
+        config,
+        env,
+        turn,
+        steering,
+        vec![result_msg],
+        "Failed to store tool results",
+    )
+    .await?;
 
     // Aggregate changed file paths from tool results for dedup check
     let mut combined = querymt_agent_index::DiffPaths::default();
@@ -2118,25 +2127,19 @@ pub(super) async fn store_all_tool_results(
     }
 
     if !combined.is_empty() {
-        exec_ctx.runtime.turn_diffs.lock().merge(combined);
+        turn.changed_paths.merge(combined);
     }
 
     if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {
-        return Ok(ExecutionState::WaitingForEvent {
-            context: new_context,
-            wait: wait_condition,
-        });
+        return Ok(Stage::Waiting(wait_condition));
     }
 
-    Ok(ExecutionState::BeforeLlmCall {
-        context: new_context,
-    })
+    Ok(Stage::BeforeRequest)
 }
 
 #[cfg(test)]
 mod result_order_tests {
     use super::*;
-    use querymt::chat::ChatMessage;
 
     fn result(call_id: &str) -> ToolResult {
         ToolResult::new(
@@ -2152,12 +2155,22 @@ mod result_order_tests {
         results.iter().map(|r| r.call_id.as_str()).collect()
     }
 
-    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
-        let mut builder = ChatMessage::assistant();
-        for id in ids {
-            builder = builder.tool_use(*id, "edit", serde_json::json!({}));
-        }
-        builder.build()
+    fn assistant_with_calls(ids: &[&str]) -> AgentMessage {
+        let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+        message.parts = ids
+            .iter()
+            .map(|id| {
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: id.to_string(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "edit".into(),
+                        arguments: "{}".into(),
+                    },
+                })
+            })
+            .collect();
+        message
     }
 
     #[test]
@@ -2280,7 +2293,7 @@ mod genai_trace_tests {
         for mode in ["success", "rewrite", "unknown", "blocked", "custom"] {
             // The turn's tool set is cached per context, so each mode (own
             // config and catalog) needs its own context.
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let mut permissions = SkillPermissions::default();
             if mode == "blocked" {
                 permissions
@@ -2321,6 +2334,7 @@ mod genai_trace_tests {
                 })).unwrap()).unwrap());
             }
             let config = builder.build();
+            let exec = exec.tools_from(&config);
             let requested = if matches!(mode, "unknown" | "rewrite") {
                 "SECRET_PROMPT"
             } else {
@@ -2331,7 +2345,8 @@ mod genai_trace_tests {
                 "skill",
                 &serde_json::json!({"name":requested}).to_string(),
             );
-            let (result, spans) = capture_info(execute_tool_call(&config, &call, &exec)).await;
+            let (result, spans) =
+                capture_info(execute_tool_call(&config, &call, &exec, &turn)).await;
             let verified = matches!(mode, "success" | "rewrite");
             let result = result.unwrap();
             assert_eq!(
@@ -2455,7 +2470,7 @@ mod genai_trace_tests {
             "custom",
         ] {
             // The turn's tool set is cached per context: one context per mode.
-            let mut exec = fixture.execution_context().await;
+            let (mut exec, turn) = fixture.turn().await;
             let mut registry = ToolRegistry::new();
             if mode == "custom" {
                 registry.add(Arc::new(CustomShell));
@@ -2479,6 +2494,9 @@ mod genai_trace_tests {
                 })).unwrap()).unwrap());
             }
             let config = builder.build();
+            // Built last: the tool set reflects both the registry in `config`
+            // and the deny list set on `exec.tool_config` above.
+            let exec = exec.tools_from(&config);
             let command = match mode {
                 "symlink" => symlink.to_str().unwrap(),
                 "script" => script.to_str().unwrap(),
@@ -2496,7 +2514,8 @@ mod genai_trace_tests {
                 args["args"] = serde_json::json!(["-c", "sleep 0.2; kill -TERM $$"]);
             }
             let call = mock_tool_call(mode, "shell", &args.to_string());
-            let (result, spans) = capture_info(execute_tool_call(&config, &call, &exec)).await;
+            let (result, spans) =
+                capture_info(execute_tool_call(&config, &call, &exec, &turn)).await;
             let result = result.unwrap();
             let ran = matches!(mode, "direct" | "symlink" | "script" | "wrapper" | "signal");
             assert_eq!(
@@ -2575,7 +2594,7 @@ mod genai_trace_tests {
                 }
             });
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let config = AgentConfigBuilder::from_provider(
                 fixture.storage.clone(), fixture.config.provider.clone(), fixture.storage.event_journal(),
             ).with_hooks(hooks("post_tool_use", serde_json::json!({
@@ -2587,7 +2606,7 @@ mod genai_trace_tests {
                 r#"{"secret":"SECRET_ARGUMENT"}"#,
             );
             let (result, spans) = capture(async {
-                execute_tool_call(&config, &call, &exec)
+                execute_tool_call(&config, &call, &exec, &turn)
                     .instrument(info_span!("test-parent"))
                     .await
             })
@@ -2647,7 +2666,7 @@ mod genai_trace_tests {
         let fixture =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let mut exec = fixture.execution_context().await;
+        let (mut exec, turn) = fixture.turn().await;
         exec.runtime = crate::agent::core::SessionRuntime::new(
             Some(fixture._tempdir.path().join("nonexistent-hook-cwd")),
             Default::default(),
@@ -2665,7 +2684,7 @@ mod genai_trace_tests {
             "telemetry_tool",
             r#"{"secret":"SECRET_ARGUMENT"}"#,
         );
-        let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
+        let (result, spans) = capture(execute_tool_call(&config, &call, &exec, &turn)).await;
         assert!(result.is_err());
         let tool = spans
             .iter()
@@ -2696,7 +2715,7 @@ mod genai_trace_tests {
         for hook_blocked in [false, true] {
             let mock = MockLlmProvider::new(); // No execution expectation: rejection must not call it.
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
-            let exec = fixture.execution_context().await;
+            let (exec, turn) = fixture.turn().await;
             let mut builder = AgentConfigBuilder::from_provider(
                 fixture.storage.clone(),
                 fixture.config.provider.clone(),
@@ -2718,7 +2737,7 @@ mod genai_trace_tests {
                 "telemetry_tool",
                 r#"{"secret":"SECRET_ARGUMENT"}"#,
             );
-            let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
+            let (result, spans) = capture(execute_tool_call(&config, &call, &exec, &turn)).await;
             assert!(result.unwrap().is_error);
             let tool = spans
                 .iter()
@@ -2760,12 +2779,12 @@ mod permission_interaction_tests {
 
     const SHELL: ToolRef<'static> = ToolRef::builtin("shell");
 
-    async fn fixture() -> (TestAgent, ExecutionContext) {
+    async fn fixture() -> (TestAgent, TurnEnv, Turn) {
         let fixture =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let exec = fixture.execution_context().await;
-        (fixture, exec)
+        let (exec, turn) = fixture.turn().await;
+        (fixture, exec, turn)
     }
 
     fn every_call() -> ApprovalNeed {
@@ -2774,14 +2793,23 @@ mod permission_interaction_tests {
 
     async fn approve(
         config: &AgentConfig,
-        exec: &ExecutionContext,
+        exec: &TurnEnv,
+        turn: &Turn,
         call_id: &str,
         tool: ToolRef<'_>,
         need: ApprovalNeed,
     ) -> Approval {
-        request_approval(config, exec, call_id, tool, &serde_json::json!({}), need)
-            .await
-            .unwrap()
+        request_approval(
+            config,
+            exec,
+            turn,
+            call_id,
+            tool,
+            &serde_json::json!({}),
+            need,
+        )
+        .await
+        .unwrap()
     }
 
     /// Wait until a permission interaction for `tool_call_id` is pending and
@@ -2837,13 +2865,14 @@ mod permission_interaction_tests {
     /// Prompt for `call_id`, answer it with `option` and return the outcome.
     async fn prompt_and_answer(
         config: &AgentConfig,
-        exec: &ExecutionContext,
+        exec: &TurnEnv,
+        turn: &Turn,
         call_id: &str,
         tool: ToolRef<'_>,
         need: ApprovalNeed,
         option: &str,
     ) -> Approval {
-        let request = approve(config, exec, call_id, tool, need);
+        let request = approve(config, exec, turn, call_id, tool, need);
         let driver = async {
             let id = wait_pending(config, call_id).await;
             answer(config, &exec.session_id, &id, option).await;
@@ -2864,30 +2893,32 @@ mod permission_interaction_tests {
 
     async fn assert_prompts(
         config: &AgentConfig,
-        exec: &ExecutionContext,
+        exec: &TurnEnv,
+        turn: &Turn,
         call_id: &str,
         tool: ToolRef<'_>,
         need: ApprovalNeed,
     ) {
-        let outcome = prompt_and_answer(config, exec, call_id, tool, need, OPTION_REJECT).await;
+        let outcome =
+            prompt_and_answer(config, exec, turn, call_id, tool, need, OPTION_REJECT).await;
         assert!(matches!(outcome, Approval::Denied(Denial::Rejected)));
     }
 
     #[tokio::test]
     async fn no_need_is_granted_without_a_prompt() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
-        let outcome = approve(config, &exec, "call-n", SHELL, ApprovalNeed::None).await;
+        let outcome = approve(config, &exec, &turn, "call-n", SHELL, ApprovalNeed::None).await;
         assert!(matches!(outcome, Approval::Granted));
         assert!(config.pending_elicitations.lock().await.is_empty());
     }
 
     #[tokio::test]
     async fn waits_without_client_then_answer_decides() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
-        let request = approve(config, &exec, "call-1", SHELL, ApprovalNeed::Session);
+        let request = approve(config, &exec, &turn, "call-1", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-1").await;
             // No client answers yet: the call must still be waiting, not granted.
@@ -2902,10 +2933,10 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn request_carries_its_interaction_id_in_meta() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
-        let request = approve(config, &exec, "call-i", SHELL, ApprovalNeed::Session);
+        let request = approve(config, &exec, &turn, "call-i", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-i").await;
             let wire_id = {
@@ -2931,7 +2962,7 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn options_follow_the_need() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         let needs = [
             (
@@ -2948,7 +2979,7 @@ mod permission_interaction_tests {
         ];
         for (index, (need, expected)) in needs.into_iter().enumerate() {
             let call_id = format!("call-o{index}");
-            let request = approve(config, &exec, &call_id, SHELL, need);
+            let request = approve(config, &exec, &turn, &call_id, SHELL, need);
             let driver = async {
                 let id = wait_pending(config, &call_id).await;
                 assert_eq!(option_ids(config, &id).await, expected);
@@ -2961,13 +2992,13 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn hook_reason_is_the_request_title() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         let need = ApprovalNeed::EveryCall {
             reason: Some("EDIT a.rs".into()),
         };
 
-        let request = approve(config, &exec, "call-t", SHELL, need);
+        let request = approve(config, &exec, &turn, "call-t", SHELL, need);
         let driver = async {
             let id = wait_pending(config, "call-t").await;
             let title = {
@@ -2986,14 +3017,23 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn reject_option_denies_call_and_is_not_remembered() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
-        assert_prompts(config, &exec, "call-r1", SHELL, ApprovalNeed::Session).await;
+        assert_prompts(
+            config,
+            &exec,
+            &turn,
+            "call-r1",
+            SHELL,
+            ApprovalNeed::Session,
+        )
+        .await;
         // The same tool prompts again, and can then be allowed.
         let second = prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-r2",
             SHELL,
             ApprovalNeed::Session,
@@ -3005,10 +3045,10 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn unknown_option_stays_pending() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
-        let request = approve(config, &exec, "call-m", SHELL, ApprovalNeed::Session);
+        let request = approve(config, &exec, &turn, "call-m", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-m").await;
             let err = crate::elicitation::resolve_in_map(
@@ -3030,10 +3070,10 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn cancel_while_waiting_does_not_grant() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
-        let request = approve(config, &exec, "call-c", SHELL, ApprovalNeed::Session);
+        let request = approve(config, &exec, &turn, "call-c", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-c").await;
             exec.cancellation_token.cancel();
@@ -3058,12 +3098,13 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn allow_session_skips_later_prompts_for_the_same_tool() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
 
         let first = prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-a",
             SHELL,
             ApprovalNeed::Session,
@@ -3072,18 +3113,19 @@ mod permission_interaction_tests {
         .await;
         assert!(matches!(first, Approval::Granted));
 
-        let second = approve(config, &exec, "call-b", SHELL, ApprovalNeed::Session).await;
+        let second = approve(config, &exec, &turn, "call-b", SHELL, ApprovalNeed::Session).await;
         assert!(matches!(second, Approval::Granted));
         assert!(config.pending_elicitations.lock().await.is_empty());
     }
 
     #[tokio::test]
     async fn allow_session_does_not_cover_every_call_needs() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-a",
             SHELL,
             ApprovalNeed::Session,
@@ -3092,20 +3134,21 @@ mod permission_interaction_tests {
         .await;
 
         // always_ask and hook asks still prompt, and never record a grant.
-        assert_prompts(config, &exec, "call-e1", SHELL, every_call()).await;
+        assert_prompts(config, &exec, &turn, "call-e1", SHELL, every_call()).await;
         let hook_ask = ApprovalNeed::EveryCall {
             reason: Some("EDIT a.rs".into()),
         };
-        assert_prompts(config, &exec, "call-e2", SHELL, hook_ask).await;
+        assert_prompts(config, &exec, &turn, "call-e2", SHELL, hook_ask).await;
     }
 
     #[tokio::test]
     async fn every_call_never_records_a_session_grant() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         let first = prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-1",
             SHELL,
             every_call(),
@@ -3114,18 +3157,19 @@ mod permission_interaction_tests {
         .await;
         assert!(matches!(first, Approval::Granted));
         // Even a plain `ask` need prompts: nothing was remembered.
-        assert_prompts(config, &exec, "call-2", SHELL, ApprovalNeed::Session).await;
+        assert_prompts(config, &exec, &turn, "call-2", SHELL, ApprovalNeed::Session).await;
     }
 
     #[tokio::test]
     async fn allow_session_is_per_server_qualified_tool() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         let alpha = ToolRef::mcp("alpha", "lookup");
         let beta = ToolRef::mcp("beta", "lookup");
         prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-a",
             alpha,
             ApprovalNeed::Session,
@@ -3133,18 +3177,27 @@ mod permission_interaction_tests {
         )
         .await;
 
-        let again = approve(config, &exec, "call-a2", alpha, ApprovalNeed::Session).await;
+        let again = approve(
+            config,
+            &exec,
+            &turn,
+            "call-a2",
+            alpha,
+            ApprovalNeed::Session,
+        )
+        .await;
         assert!(matches!(again, Approval::Granted));
-        assert_prompts(config, &exec, "call-b", beta, ApprovalNeed::Session).await;
+        assert_prompts(config, &exec, &turn, "call-b", beta, ApprovalNeed::Session).await;
     }
 
     #[tokio::test]
     async fn allow_session_does_not_leak_into_a_new_session() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let config = fixture.config.as_ref();
         prompt_and_answer(
             config,
             &exec,
+            &turn,
             "call-a",
             SHELL,
             ApprovalNeed::Session,
@@ -3152,18 +3205,34 @@ mod permission_interaction_tests {
         )
         .await;
 
-        let other = fixture.execution_context().await;
-        assert_prompts(config, &other, "call-o", SHELL, ApprovalNeed::Session).await;
+        let (other, other_turn) = fixture.turn().await;
+        assert_prompts(
+            config,
+            &other,
+            &other_turn,
+            "call-o",
+            SHELL,
+            ApprovalNeed::Session,
+        )
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn unanswered_request_times_out_and_is_retired() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let mut config = fixture.config.as_ref().clone();
         config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(120));
 
         let started = tokio::time::Instant::now();
-        let approval = approve(&config, &exec, "call-t", SHELL, ApprovalNeed::Session).await;
+        let approval = approve(
+            &config,
+            &exec,
+            &turn,
+            "call-t",
+            SHELL,
+            ApprovalNeed::Session,
+        )
+        .await;
 
         assert!(matches!(
             approval,
@@ -3176,27 +3245,28 @@ mod permission_interaction_tests {
 
     #[tokio::test(start_paused = true)]
     async fn timeout_applies_to_every_call_needs_with_empty_lists() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let mut config = fixture.config.as_ref().clone();
         config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(30));
         let need = ApprovalNeed::EveryCall {
             reason: Some("hook says ask".into()),
         };
 
-        let approval = approve(&config, &exec, "call-t", SHELL, need).await;
+        let approval = approve(&config, &exec, &turn, "call-t", SHELL, need).await;
 
         assert!(matches!(approval, Approval::Denied(Denial::TimedOut(_))));
     }
 
     #[tokio::test(start_paused = true)]
     async fn answer_before_the_timeout_wins() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         let mut config = fixture.config.as_ref().clone();
         config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(120));
 
         let approval = prompt_and_answer(
             &config,
             &exec,
+            &turn,
             "call-t",
             SHELL,
             ApprovalNeed::Session,
@@ -3209,10 +3279,10 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn paused_task_denies_without_prompting() {
-        let (fixture, mut exec) = fixture().await;
+        let (fixture, exec, mut turn) = fixture().await;
         let config = fixture.config.as_ref();
         let now = time::OffsetDateTime::now_utc();
-        exec.state.active_task = Some(Task {
+        turn.state.active_task = Some(Task {
             id: 1,
             public_id: "task-1".into(),
             session_id: 1,
@@ -3228,7 +3298,7 @@ mod permission_interaction_tests {
             updated_at: now,
         });
 
-        let approval = approve(config, &exec, "call-p", SHELL, ApprovalNeed::Session).await;
+        let approval = approve(config, &exec, &turn, "call-p", SHELL, ApprovalNeed::Session).await;
 
         assert!(matches!(approval, Approval::Denied(Denial::TaskInactive)));
         assert!(config.pending_elicitations.lock().await.is_empty());
@@ -3236,7 +3306,7 @@ mod permission_interaction_tests {
 
     #[tokio::test]
     async fn permission_request_hook_decision_skips_prompt() {
-        let (fixture, exec) = fixture().await;
+        let (fixture, exec, turn) = fixture().await;
         for behavior in ["allow", "deny"] {
             let output = serde_json::json!({
                 "continue": true,
@@ -3267,7 +3337,14 @@ mod permission_interaction_tests {
             .build();
             let approval = tokio::time::timeout(
                 Duration::from_secs(10),
-                approve(&config, &exec, "call-h", SHELL, ApprovalNeed::Session),
+                approve(
+                    &config,
+                    &exec,
+                    &turn,
+                    "call-h",
+                    SHELL,
+                    ApprovalNeed::Session,
+                ),
             )
             .await
             .expect("hook decision must not wait for a user");
@@ -3451,9 +3528,12 @@ mod prepared_call_tests {
         config: &crate::agent::agent_config::AgentConfig,
         args: Value,
     ) -> ToolResult {
-        let exec = fixture.agent.execution_context().await;
+        let (exec, turn) = fixture.agent.turn().await;
+        let exec = exec.tools_from(config);
         let call = mock_tool_call("call-1", "rec_edit", &args.to_string());
-        execute_tool_call(config, &call, &exec).await.unwrap()
+        execute_tool_call(config, &call, &exec, &turn)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3596,17 +3676,17 @@ mod prepared_call_tests {
 
     async fn run_in_workspace(fx: &Fixture, read_only: bool) -> ToolResult {
         let dir = tempfile::tempdir().unwrap();
-        let exec = fx
-            .agent
-            .execution_context_in(dir.path().to_path_buf())
-            .await;
+        let (exec, turn) = fx.agent.turn_in(dir.path().to_path_buf()).await;
         let config = snapshot_config(fx, read_only);
+        let exec = exec.tools_from(&config);
         let call = mock_tool_call(
             "call-1",
             "rec_edit",
             &json!({"file_path": "a.rs", "new_string": "y"}).to_string(),
         );
-        execute_tool_call(&config, &call, &exec).await.unwrap()
+        execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3676,21 +3756,23 @@ mod prepared_call_tests {
     /// Runs `rec_edit` once in `exec` under `config`.
     async fn run_in(
         config: &crate::agent::agent_config::AgentConfig,
-        exec: &crate::agent::execution_context::ExecutionContext,
+        exec: &TurnEnv,
+        turn: &Turn,
         id: &str,
     ) -> ToolResult {
         let call = mock_tool_call(id, "rec_edit", r#"{"file_path":"a.rs","new_string":"y"}"#);
-        execute_tool_call(config, &call, exec).await.unwrap()
+        execute_tool_call(config, &call, exec, turn).await.unwrap()
     }
 
     #[tokio::test]
     async fn session_default_approval_prompts_until_granted_for_the_session() {
         let fx = Fixture::new().await;
         let config = config_with_approval(&fx, ApprovalNeed::Session, None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
 
         // No grant yet: the prompt is raised and (unanswered) times out.
-        let denied = run_in(&config, &exec, "c1").await;
+        let denied = run_in(&config, &exec, &turn, "c1").await;
         assert!(denied.is_error, "{}", text(&denied));
         assert!(fx.invoked().is_empty());
 
@@ -3699,7 +3781,7 @@ mod prepared_call_tests {
             .session_grants
             .lock()
             .insert(ToolRef::builtin("rec_edit"));
-        let allowed = run_in(&config, &exec, "c2").await;
+        let allowed = run_in(&config, &exec, &turn, "c2").await;
         assert!(!allowed.is_error, "{}", text(&allowed));
         assert_eq!(fx.invoked().len(), 1);
     }
@@ -3711,13 +3793,14 @@ mod prepared_call_tests {
         config.permissions = crate::config::Permissions::new()
             .always_ask(["rec_edit".parse().unwrap()])
             .timeout(std::time::Duration::from_millis(50));
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
         exec.runtime
             .session_grants
             .lock()
             .insert(ToolRef::builtin("rec_edit"));
 
-        let result = run_in(&config, &exec, "c1").await;
+        let result = run_in(&config, &exec, &turn, "c1").await;
 
         assert!(result.is_error, "every-call need ignores session grants");
         assert!(fx.invoked().is_empty());
@@ -3750,14 +3833,17 @@ mod prepared_call_tests {
         read_only: bool,
         dir: &std::path::Path,
     ) -> ToolResult {
-        let exec = fx.agent.execution_context_in(dir.to_path_buf()).await;
+        let (exec, turn) = fx.agent.turn_in(dir.to_path_buf()).await;
         let config = snapshot_config(fx, read_only);
+        let exec = exec.tools_from(&config);
         let call = mock_tool_call(
             "call-1",
             "rec_edit",
             &json!({"file_path": "a.rs", "new_string": "y"}).to_string(),
         );
-        execute_tool_call(&config, &call, &exec).await.unwrap()
+        execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3765,10 +3851,7 @@ mod prepared_call_tests {
         let fx = Fixture::new().await;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "one").unwrap();
-        let exec = fx
-            .agent
-            .execution_context_in(dir.path().to_path_buf())
-            .await;
+        let (exec, turn) = fx.agent.turn_in(dir.path().to_path_buf()).await;
         let mut registry = ToolRegistry::new();
         registry.add(Arc::new(Recorder {
             invocations: fx.invocations.clone(),
@@ -3783,6 +3866,7 @@ mod prepared_call_tests {
         .with_tool_registry(registry)
         .with_snapshot_policy(SnapshotPolicy::Diff)
         .build();
+        let exec = exec.tools_from(&config);
         let call = |id: &str| {
             mock_tool_call(
                 id,
@@ -3791,7 +3875,7 @@ mod prepared_call_tests {
             )
         };
 
-        let first = execute_tool_call(&config, &call("c1"), &exec)
+        let first = execute_tool_call(&config, &call("c1"), &exec, &turn)
             .await
             .unwrap();
         assert!(first.snapshot_part.is_some());
@@ -3806,7 +3890,7 @@ mod prepared_call_tests {
             .map(|(_, tree)| tree.root_hash)
             .unwrap();
         std::fs::write(dir.path().join("b.rs"), "new file").unwrap();
-        let second = execute_tool_call(&config, &call("c2"), &exec)
+        let second = execute_tool_call(&config, &call("c2"), &exec, &turn)
             .await
             .unwrap();
         assert!(second.snapshot_part.is_some());
@@ -3903,10 +3987,13 @@ mod prepared_call_tests {
         raw: &str,
         invalid_input: bool,
     ) -> ToolResult {
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(config);
         let mut call = mock_tool_call("call-1", "rec_edit", raw);
         call.invalid_input = invalid_input;
-        execute_tool_call(config, &call, &exec).await.unwrap()
+        execute_tool_call(config, &call, &exec, &turn)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -4103,7 +4190,8 @@ mod prepared_call_tests {
     async fn prepare_returns_one_rejection_and_effective_arguments() {
         let fx = Fixture::new().await;
         let config = fx.config(None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, _turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
 
         let ok = prepare_tool_call(
             &config,
@@ -4159,11 +4247,12 @@ mod prepared_call_tests {
         genai_metrics::install();
         let fx = Fixture::new().await;
         let config = fx.config(None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
         let call = mock_tool_call("c1", "rec_edit", r#"{"filePath":"a","newString":"b"}"#);
         let before = repaired("alias");
 
-        let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
+        let (result, spans) = capture(execute_tool_call(&config, &call, &exec, &turn)).await;
 
         assert!(!result.unwrap().is_error);
         assert_eq!(repaired("alias") - before, 2, "one count per renamed key");
@@ -4187,11 +4276,12 @@ mod prepared_call_tests {
         genai_metrics::install();
         let fx = Fixture::new().await;
         let config = fx.config(None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
         let call = mock_tool_call("c1", "rec_edit", r#"{"file_path":"a","new_string":"b"}"#);
         let (before, clean_before) = (repaired("alias"), calls(false, "success"));
 
-        let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
+        let (result, spans) = capture(execute_tool_call(&config, &call, &exec, &turn)).await;
 
         assert!(!result.unwrap().is_error);
         assert_eq!(repaired("alias"), before);
@@ -4208,7 +4298,8 @@ mod prepared_call_tests {
         genai_metrics::install();
         let fx = Fixture::new().await;
         let config = fx.config(None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
         let (ok_before, rejected_before) = (calls(true, "success"), calls(true, "rejected"));
         let alias_before = repaired("alias");
 
@@ -4217,6 +4308,7 @@ mod prepared_call_tests {
             &config,
             &mock_tool_call("c1", "rec_edit", r#"{"filePath":"a","newString":"b"}"#),
             &exec,
+            &turn,
         )
         .await
         .unwrap();
@@ -4225,6 +4317,7 @@ mod prepared_call_tests {
             &config,
             &mock_tool_call("c2", "rec_edit", r#"{"filePath":"a"}"#),
             &exec,
+            &turn,
         )
         .await
         .unwrap();
@@ -4241,7 +4334,7 @@ mod prepared_call_tests {
     async fn hook_replacement_repairs_count_once_and_canonical_replacement_adds_none() {
         genai_metrics::install();
         let fx = Fixture::new().await;
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
         let before = repaired("alias");
 
         // The model sends canonical names; the hook replaces them with aliases.
@@ -4250,10 +4343,12 @@ mod prepared_call_tests {
             "permission_decision": "allow",
             "updated_input": {"filePath": "r.rs", "newString": "z"}
         }}))));
+        let exec = exec.tools_from(&aliased_hook);
         execute_tool_call(
             &aliased_hook,
             &mock_tool_call("c1", "rec_edit", r#"{"file_path":"a","new_string":"y"}"#),
             &exec,
+            &turn,
         )
         .await
         .unwrap();
@@ -4269,6 +4364,7 @@ mod prepared_call_tests {
             &canonical_hook,
             &mock_tool_call("c2", "rec_edit", r#"{"file_path":"a","new_string":"y"}"#),
             &exec,
+            &turn,
         )
         .await
         .unwrap();
@@ -4280,7 +4376,8 @@ mod prepared_call_tests {
         genai_metrics::install();
         let fx = Fixture::new().await;
         let config = fx.config(None);
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
+        let exec = exec.tools_from(&config);
         let before = repaired("alias");
 
         // Preparing reports the repairs once; executing the prepared call (as the
@@ -4288,7 +4385,7 @@ mod prepared_call_tests {
         let call = mock_tool_call("c1", "rec_edit", r#"{"filePath":"a","newString":"b"}"#);
         let prepared = prepare_tool_call(&config, &call, &exec).await.unwrap();
         assert_eq!(repaired("alias") - before, 2);
-        execute_prepared_tool_call(&config, &call, prepared, &exec)
+        execute_prepared_tool_call(&config, &call, prepared, &exec, &turn)
             .await
             .unwrap();
         assert_eq!(repaired("alias") - before, 2);
@@ -4308,7 +4405,7 @@ mod prepared_call_tests {
         opentelemetry::global::set_meter_provider(provider.clone());
 
         let fx = Fixture::new().await;
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
         let plain = fx.config(None);
         let blocking = fx.config(Some(
             fx.hooks(json!({"decision": "block", "reason": "nope"})),
@@ -4326,6 +4423,7 @@ mod prepared_call_tests {
                 config,
                 &mock_tool_call(&format!("otlp{index}"), "rec_edit", arguments),
                 &exec,
+                &turn,
             )
             .await
             .unwrap();
@@ -4430,9 +4528,10 @@ mod prepared_call_tests {
         assert_eq!(covered, 111, "fixtures cover every baseline schema failure");
 
         let fx = Fixture::new().await;
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
         let log = Arc::new(Mutex::new(Vec::new()));
         let config = replay_config(&fx, &log).await;
+        let exec = exec.tools_from(&config);
 
         let mut table = Vec::new();
         for (index, class) in classes.iter().enumerate() {
@@ -4441,7 +4540,9 @@ mod prepared_call_tests {
             let args = fill(&class["args"]);
             let before = log.lock().unwrap().len();
             let call = mock_tool_call(&format!("replay{index}"), tool, &args.to_string());
-            let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+            let result = execute_tool_call(&config, &call, &exec, &turn)
+                .await
+                .unwrap();
             let invoked: Vec<(String, Value)> = log.lock().unwrap()[before..].to_vec();
 
             match class["expect"].as_str().unwrap() {
@@ -4496,7 +4597,7 @@ mod prepared_call_tests {
     #[tokio::test]
     async fn invalid_outer_json_never_executes() {
         let fx = Fixture::new().await;
-        let exec = fx.agent.execution_context().await;
+        let (exec, turn) = fx.agent.turn().await;
         let log = Arc::new(Mutex::new(Vec::new()));
         let config = replay_config(&fx, &log).await;
 
@@ -4511,7 +4612,9 @@ mod prepared_call_tests {
         .enumerate()
         {
             let call = mock_tool_call(&format!("outer{index}"), "multiedit", raw);
-            let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+            let result = execute_tool_call(&config, &call, &exec, &turn)
+                .await
+                .unwrap();
             assert!(result.is_error, "{raw}");
             assert!(
                 text(&result).contains("INVALID_JSON"),
@@ -4537,7 +4640,8 @@ mod mcp_tool_tests {
     struct Fixture {
         agent: TestAgent,
         harness: McpHarness,
-        exec: ExecutionContext,
+        exec: TurnEnv,
+        turn: Turn,
         events: broadcast::Receiver<EventEnvelope>,
     }
 
@@ -4546,14 +4650,13 @@ mod mcp_tool_tests {
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
         let harness = McpHarness::start(HarnessOptions::default()).await;
-        let exec = agent
-            .execution_context_with_mcp(harness.tool_state.clone())
-            .await;
+        let (exec, turn) = agent.turn_with_mcp(harness.tool_state.clone()).await;
         let events = agent.config.event_sink.fanout().subscribe();
         Fixture {
             agent,
             harness,
             exec,
+            turn,
             events,
         }
     }
@@ -4632,12 +4735,12 @@ mod mcp_tool_tests {
         planner_config.roster = Some(roster);
         let planner = crate::agent::LocalAgentHandle::from_config(Arc::new(planner_config));
 
-        let exec = agent
-            .execution_context_with_mcp(harness.tool_state.clone())
-            .await;
+        let (exec, turn) = agent.turn_with_mcp(harness.tool_state.clone()).await;
+
+        let exec = exec.tools_from(&config);
         let mut events = config.event_sink.fanout().subscribe();
         let call = mock_tool_call("call-9", "skill", r#"{"name":"harness.a"}"#);
-        let run = execute_tool_call(&config, &call, &exec);
+        let run = execute_tool_call(&config, &call, &exec, &turn);
         let answer = async {
             let deadline = Duration::from_secs(5);
             let id = loop {
@@ -4766,13 +4869,11 @@ mod mcp_tool_tests {
 
         let fx = protocol_target_fixture().await;
         let config = fx.target.config.clone();
-        let exec = fx
-            .agent
-            .execution_context_with_mcp(fx.harness.tool_state.clone())
-            .await;
+        let (exec, turn) = fx.agent.turn_with_mcp(fx.harness.tool_state.clone()).await;
+        let exec = exec.tools_from(&config);
         let mut events = fx.agent.config.event_sink.fanout().subscribe();
         let call = mock_tool_call("call-p", "skill", r#"{"name":"harness.a"}"#);
-        let run = execute_tool_call(&config, &call, &exec);
+        let run = execute_tool_call(&config, &call, &exec, &turn);
         let answer = async {
             // The request reaches the stream the parent's client reads.
             let (id, schema) = loop {
@@ -4838,17 +4939,15 @@ mod mcp_tool_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("note.txt");
         std::fs::write(&file, "hello").unwrap();
-        let exec = fx
-            .agent
-            .execution_context_in(dir.path().to_path_buf())
-            .await;
+        let (exec, turn) = fx.agent.turn_in(dir.path().to_path_buf()).await;
+        let exec = exec.tools_from(&config);
         let mut events = fx.agent.config.event_sink.fanout().subscribe();
         let call = mock_tool_call(
             "call-q",
             "read_tool",
             &json!({"path": file.display().to_string()}).to_string(),
         );
-        let run = execute_tool_call(&config, &call, &exec);
+        let run = execute_tool_call(&config, &call, &exec, &turn);
         let answer = async {
             let id = loop {
                 let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -4901,7 +5000,8 @@ mod mcp_tool_tests {
     async fn run_skill_call(
         config: &AgentConfig,
         handle: &crate::agent::LocalAgentHandle,
-        exec: &ExecutionContext,
+        exec: &TurnEnv,
+        turn: &Turn,
         answer: Option<&str>,
     ) -> (crate::middleware::ToolResult, Vec<String>) {
         use crate::elicitation::{ElicitationAction, ElicitationResponse};
@@ -4911,7 +5011,7 @@ mod mcp_tool_tests {
         // events counted below.
         let mut counted = config.event_sink.fanout().subscribe();
         let call = mock_tool_call("call-s", "skill", r#"{"name":"harness.a"}"#);
-        let run = execute_tool_call(config, &call, exec);
+        let run = execute_tool_call(config, &call, exec, turn);
         let answer_task = async {
             let Some(label) = answer else {
                 return;
@@ -5057,12 +5157,16 @@ mod mcp_tool_tests {
         use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
-        let exec = f
-            .agent
-            .execution_context_with_mcp(f.harness.tool_state.clone())
-            .await;
-        let (result, requested) =
-            run_skill_call(&f.config, &f.handle, &exec, Some("Allow for this session")).await;
+        let (exec, turn) = f.agent.turn_with_mcp(f.harness.tool_state.clone()).await;
+        let exec = exec.tools_from(&f.config);
+        let (result, requested) = run_skill_call(
+            &f.config,
+            &f.handle,
+            &exec,
+            &turn,
+            Some("Allow for this session"),
+        )
+        .await;
         assert!(!result.is_error, "{:?}", result.content);
         assert_eq!(requested.len(), 1);
 
@@ -5089,14 +5193,14 @@ mod mcp_tool_tests {
         use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
-        let exec = f.agent.execution_context().await;
+        let (exec, turn) = f.agent.turn().await;
         let mut events = f.config.event_sink.fanout().subscribe();
         let call = mock_tool_call(
             "call-q",
             "question",
             r#"{"questions":[{"question":"Which?","header":"Pick","options":[{"label":"A","description":"a"}]}]}"#,
         );
-        let run = execute_tool_call(&f.config, &call, &exec);
+        let run = execute_tool_call(&f.config, &call, &exec, &turn);
         let decline = async {
             let id = next_request_id(&mut events).await;
             assert!(id.starts_with("question_"), "{id}");
@@ -5132,13 +5236,11 @@ mod mcp_tool_tests {
         use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
-        let exec = f
-            .agent
-            .execution_context_with_mcp(f.harness.tool_state.clone())
-            .await;
+        let (exec, turn) = f.agent.turn_with_mcp(f.harness.tool_state.clone()).await;
+        let exec = exec.tools_from(&f.config);
         let mut events = f.config.event_sink.fanout().subscribe();
         let call = mock_tool_call("call-x", "skill", r#"{"name":"harness.a"}"#);
-        let run = execute_tool_call(&f.config, &call, &exec);
+        let run = execute_tool_call(&f.config, &call, &exec, &turn);
         let cancel = async {
             let id = next_request_id(&mut events).await;
             // What the session actor does on `Cancel`.
@@ -5191,26 +5293,31 @@ mod mcp_tool_tests {
             std::path::PathBuf::from("."),
         )));
         let handle = crate::agent::LocalAgentHandle::from_config(Arc::new(config.clone()));
-        let first = agent
-            .execution_context_with_mcp(harness.tool_state.clone())
-            .await;
-        let second = agent
-            .execution_context_with_mcp(harness.tool_state.clone())
-            .await;
+        let (first, first_turn) = agent.turn_with_mcp(harness.tool_state.clone()).await;
+        let (second, second_turn) = agent.turn_with_mcp(harness.tool_state.clone()).await;
+        let first = first.tools_from(&config);
+        let second = second.tools_from(&config);
 
         // The first session answers "Allow for this session".
-        let (result, requested) =
-            run_skill_call(&config, &handle, &first, Some("Allow for this session")).await;
+        let (result, requested) = run_skill_call(
+            &config,
+            &handle,
+            &first,
+            &first_turn,
+            Some("Allow for this session"),
+        )
+        .await;
         assert!(!result.is_error, "{:?}", result.content);
         assert_eq!(requested.len(), 1);
 
         // The same session loads the skill again without a prompt.
-        let (result, requested) = run_skill_call(&config, &handle, &first, None).await;
+        let (result, requested) = run_skill_call(&config, &handle, &first, &first_turn, None).await;
         assert!(!result.is_error, "{:?}", result.content);
         assert!(requested.is_empty(), "granted session asked again");
 
         // Another session of the same agent is asked on its own.
-        let (result, requested) = run_skill_call(&config, &handle, &second, Some("Allow")).await;
+        let (result, requested) =
+            run_skill_call(&config, &handle, &second, &second_turn, Some("Allow")).await;
         assert!(!result.is_error, "{:?}", result.content);
         assert_eq!(requested.len(), 1, "other session must get its own prompt");
     }
@@ -5225,7 +5332,9 @@ mod mcp_tool_tests {
         let call = mock_tool_call("c-ask", "echo", r#"{"text":"hi"}"#);
 
         // Nobody answers: the server must never see the call.
-        let result = execute_tool_call(&config, &call, &f.exec).await.unwrap();
+        let result = execute_tool_call(&config, &call, &f.exec, &f.turn)
+            .await
+            .unwrap();
 
         assert!(result.is_error);
         assert_eq!(result.tool_source, "blocked");
@@ -5245,7 +5354,7 @@ mod mcp_tool_tests {
             crate::config::Permissions::new().ask(["harness.echo".parse().unwrap()]);
         let call = mock_tool_call("c-ok", "echo", r#"{"text":"hi"}"#);
 
-        let run = execute_tool_call(&config, &call, &f.exec);
+        let run = execute_tool_call(&config, &call, &f.exec, &f.turn);
         let driver = async {
             for _ in 0..200 {
                 let id = config
@@ -5286,7 +5395,7 @@ mod mcp_tool_tests {
         let mut f = fixture().await;
         let call = mock_tool_call("c1", "error", "{}");
 
-        let result = execute_tool_call(&f.agent.config, &call, &f.exec)
+        let result = execute_tool_call(&f.agent.config, &call, &f.exec, &f.turn)
             .await
             .unwrap();
 
@@ -5344,7 +5453,7 @@ mod mcp_tool_tests {
                 skill_servers: Default::default(),
             });
         let call = mock_tool_call("c1", "missing", "{}");
-        let result = execute_tool_call(&f.agent.config, &call, &f.exec)
+        let result = execute_tool_call(&f.agent.config, &call, &f.exec, &f.turn)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -5362,7 +5471,7 @@ mod mcp_tool_tests {
         let args = json!({"count": 20, "total": 20, "gap_ms": 5, "hold_ms": 500}).to_string();
         let call = mock_tool_call("c1", "progress", &args);
 
-        execute_tool_call(&f.agent.config, &call, &f.exec)
+        execute_tool_call(&f.agent.config, &call, &f.exec, &f.turn)
             .await
             .unwrap();
 
@@ -5430,11 +5539,11 @@ mod mcp_tool_tests {
             .find(|n| n.contains("long-running"))
             .expect("server exposes a long-running (progress) tool")
             .clone();
-        let exec = agent.execution_context_with_mcp(tool_state.clone()).await;
+        let (exec, turn) = agent.turn_with_mcp(tool_state.clone()).await;
         let mut events = agent.config.event_sink.fanout().subscribe();
         let args = json!({"duration": 2, "steps": 4}).to_string();
         let call = mock_tool_call("smoke1", &long, &args);
-        let result = execute_tool_call(&agent.config, &call, &exec)
+        let result = execute_tool_call(&agent.config, &call, &exec, &turn)
             .await
             .unwrap();
         let seen = collect(&mut events, Duration::from_millis(500)).await;
@@ -5507,7 +5616,7 @@ mod mcp_tool_tests {
         let agent =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let exec = agent.execution_context_with_mcp(tool_state).await;
+        let (exec, turn) = agent.turn_with_mcp(tool_state).await;
         let mut config = (*agent.config).clone();
         config.mcp_servers = vec![server];
         let mut events = agent.config.event_sink.fanout().subscribe();
@@ -5518,7 +5627,9 @@ mod mcp_tool_tests {
         mock.reject_refresh
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let call = mock_tool_call("c1", "secret", "{}");
-        let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
 
         assert!(result.is_error);
         let text: String = result.content.iter().filter_map(|b| b.as_text()).collect();
@@ -5557,7 +5668,7 @@ mod mcp_tool_tests {
         // Burst, then the call ends at once: the pending update must be dropped.
         let call = mock_tool_call("c1", "progress", &json!({"count": 20}).to_string());
 
-        execute_tool_call(&f.agent.config, &call, &f.exec)
+        execute_tool_call(&f.agent.config, &call, &f.exec, &f.turn)
             .await
             .unwrap();
 

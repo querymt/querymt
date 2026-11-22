@@ -4,7 +4,49 @@
 //! tool calls refer to the same file, regardless of how the model spelled the
 //! path (`a.md`, `./a.md`, an absolute path, or through a symlinked directory).
 
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
+
+/// A path argument starts with `~` but the process has no home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomeDirectoryUnknown;
+
+/// Expand a leading `~` or `~/` of a path argument against `home`.
+///
+/// Only a value that is exactly `~` or starts with `~/` (also `~\` on Windows)
+/// is expanded. Every other value is returned as written: `~alice/x` (a user
+/// name), `a/~b` (a `~` that is not first) and plain paths. A value that needs
+/// expanding while `home` is `None` is an error, so the caller can fail the call
+/// naming the argument instead of reading a directory literally called `~`.
+pub fn expand_leading_tilde<'a>(
+    raw: &'a str,
+    home: Option<&Path>,
+) -> Result<Cow<'a, Path>, HomeDirectoryUnknown> {
+    let rest = if raw == "~" {
+        Some("")
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        Some(rest)
+    } else if cfg!(windows) {
+        raw.strip_prefix("~\\")
+    } else {
+        None
+    };
+    let Some(rest) = rest else {
+        return Ok(Cow::Borrowed(Path::new(raw)));
+    };
+    let home = home.ok_or(HomeDirectoryUnknown)?;
+    Ok(Cow::Owned(if rest.is_empty() {
+        home.to_path_buf()
+    } else {
+        home.join(rest)
+    }))
+}
+
+/// [`expand_leading_tilde`] against the home directory of the user running the
+/// agent process.
+pub fn expand_tilde(raw: &str) -> Result<Cow<'_, Path>, HomeDirectoryUnknown> {
+    expand_leading_tilde(raw, dirs::home_dir().as_deref())
+}
 
 /// Normalise a tool-call path into a stable identity key.
 ///
@@ -39,11 +81,24 @@ pub fn normalize_tool_path(raw: impl AsRef<Path>, cwd: Option<&Path>) -> PathBuf
 /// Build a normalised path from a string argument, mirroring
 /// `ToolContext::resolve_path`: a relative path without a `cwd` cannot be
 /// resolved, so the tool would fail and `None` is returned.
+///
+/// A leading `~` is expanded first ([`expand_leading_tilde`]), so scheduling and
+/// approval see the path the tool will open. When the home directory is unknown
+/// the call fails in the tool itself, so `None` is returned here too.
 pub fn resolve_arg_path(raw: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-    if !Path::new(raw).is_absolute() && cwd.is_none() {
+    resolve_arg_path_with_home(raw, cwd, dirs::home_dir().as_deref())
+}
+
+fn resolve_arg_path_with_home(
+    raw: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let expanded = expand_leading_tilde(raw, home).ok()?;
+    if !expanded.is_absolute() && cwd.is_none() {
         return None;
     }
-    Some(normalize_tool_path(raw, cwd))
+    Some(normalize_tool_path(expanded, cwd))
 }
 
 /// The normalised directory that relative target paths are resolved against:
@@ -138,6 +193,102 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dunce::canonicalize(dir.path()).expect("canonical tempdir");
         (dir, root)
+    }
+
+    fn home() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\wiking")
+        } else {
+            PathBuf::from("/Users/wiking")
+        }
+    }
+
+    #[test]
+    fn tilde_directory_under_the_home_directory() {
+        let home = home();
+        let expanded = expand_leading_tilde("~/.local/share", Some(&home)).unwrap();
+        assert_eq!(expanded, home.join(".local/share"));
+    }
+
+    #[test]
+    fn bare_tilde_is_the_home_directory() {
+        let home = home();
+        assert_eq!(expand_leading_tilde("~", Some(&home)).unwrap(), home);
+        assert_eq!(expand_leading_tilde("~/", Some(&home)).unwrap(), home);
+    }
+
+    #[test]
+    fn tilde_with_a_user_name_is_not_expanded() {
+        let home = home();
+        for raw in ["~alice/notes.md", "~alice", "~.", "~~"] {
+            assert_eq!(
+                expand_leading_tilde(raw, Some(&home)).unwrap(),
+                Path::new(raw),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_inside_a_path_is_literal() {
+        let home = home();
+        for raw in ["backup/~old/notes.md", "./~", "a~/b", "/abs/~/x"] {
+            assert_eq!(
+                expand_leading_tilde(raw, Some(&home)).unwrap(),
+                Path::new(raw),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_directory_unknown_is_an_error_only_when_expansion_is_needed() {
+        assert_eq!(
+            expand_leading_tilde("~/data", None),
+            Err(HomeDirectoryUnknown)
+        );
+        assert_eq!(expand_leading_tilde("~", None), Err(HomeDirectoryUnknown));
+        assert_eq!(
+            expand_leading_tilde("data/x", None).unwrap(),
+            Path::new("data/x")
+        );
+        assert_eq!(
+            expand_leading_tilde("~alice/x", None).unwrap(),
+            Path::new("~alice/x")
+        );
+    }
+
+    #[test]
+    fn arg_path_with_tilde_is_the_same_file_as_the_absolute_spelling() {
+        let (_guard, root) = canonical_tmp();
+        // The home directory is a temp dir here, so nothing real is touched.
+        let tilde = resolve_arg_path_with_home("~/x/y.md", Some(&root), Some(&root)).unwrap();
+        let absolute = resolve_arg_path_with_home(
+            root.join("x/y.md").to_str().unwrap(),
+            Some(&root),
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(tilde, absolute);
+        assert_eq!(tilde, root.join("x/y.md"));
+    }
+
+    #[test]
+    fn arg_path_with_tilde_needs_no_cwd_and_fails_without_home() {
+        let (_guard, root) = canonical_tmp();
+        assert_eq!(
+            resolve_arg_path_with_home("~/a.md", None, Some(&root)),
+            Some(root.join("a.md"))
+        );
+        assert_eq!(
+            resolve_arg_path_with_home("~/a.md", Some(&root), None),
+            None
+        );
+        // `~alice` is a relative path like any other.
+        assert_eq!(
+            resolve_arg_path_with_home("~alice/a.md", Some(&root), Some(&root)),
+            Some(root.join("~alice/a.md"))
+        );
     }
 
     #[test]

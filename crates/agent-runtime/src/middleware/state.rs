@@ -1,8 +1,7 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationOptions};
+use querymt::chat::{ChatMessage, ChatOutput, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
-use querymt_agent_core::events::StopType;
-use querymt_agent_core::model::MessagePart;
+use querymt_agent_core::model::{MessagePart, NoticeSource};
 
 /// Statistics about agent execution
 #[derive(Debug, Clone, Default)]
@@ -107,34 +106,34 @@ pub struct ToolFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ContextPriority {
-    Normal,
-    High,
-}
-
+/// Harness text waiting to be stored as a notice before the next model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextFragment {
-    pub key: &'static str,
+pub struct PendingNotice {
+    pub source: NoticeSource,
     pub content: String,
-    pub priority: ContextPriority,
 }
 
 /// Context passed to middleware during state transitions
 #[derive(Debug, Clone)]
 pub struct PreparedModelRequest {
     pub messages: Arc<[ChatMessage]>,
+    /// The request's tool list. For a provider that takes tool changes as
+    /// messages this is the list the session's tool baseline recorded, which
+    /// later tool changes in `messages` add to and remove from: it is not the
+    /// set of tools the model can call. Read `offered_tools` for that.
     pub tools: Arc<[querymt::chat::Tool]>,
+    /// The tools the model can call in this request: `tools` with the tool
+    /// changes in `messages` applied. Equal to `tools` when there are none.
+    pub offered_tools: Arc<[querymt::chat::Tool]>,
     pub estimated_tokens: usize,
-    /// Per-request generation overrides copied from
-    /// [`ConversationContext::request_overrides`].
+    /// Per-request generation overrides, from the run's `request_overrides`.
     pub options: GenerationOptions,
 }
 
 /// Per-session facts about the model a session talks to.
 ///
 /// Resolved together with the provider, replaced when the model is switched and
-/// carried on [`ConversationContext`], so middleware never has to reconstruct
+/// carried on the run, so middleware never has to reconstruct
 /// them from "the last request".
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
@@ -144,211 +143,6 @@ pub struct ModelProfile {
     pub capabilities: querymt::chat::ChatCapabilities,
     /// Reasoning effort the provider is configured with, when known.
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
-}
-
-/// Context passed to middleware during state transitions
-#[derive(Debug, Clone)]
-pub struct ConversationContext {
-    pub session_id: Arc<str>,
-    pub messages: Arc<[ChatMessage]>,
-    pub fragments: Arc<[ContextFragment]>,
-    pub stats: Arc<AgentStats>,
-    /// Current provider for the session (for dynamic model info lookup)
-    pub provider: Arc<str>,
-    /// Current model for the session (for dynamic model info lookup)
-    pub model: Arc<str>,
-    /// Per-session agent mode (Build, Plan, Review).
-    /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
-    /// Defaults to `Build` for backward compatibility.
-    pub session_mode: crate::agent::core::AgentMode,
-    /// Generation overrides for the next model request only.
-    ///
-    /// Middleware sets these when it returns to `BeforeLlmCall` (e.g. to raise
-    /// `max_tokens`). They are consumed by exactly one request: the context built
-    /// after that request does not carry them forward.
-    pub request_overrides: GenerationOptions,
-    /// Facts about the session's model (caps, capabilities, effort, pricing).
-    pub profile: Arc<ModelProfile>,
-    /// Options the most recent model request was actually sent with.
-    ///
-    /// Carried to the `Stopped` state so `on_stopped` knows which cap was hit.
-    /// Cleared at turn start.
-    pub last_applied: GenerationOptions,
-}
-
-impl ConversationContext {
-    pub fn new(
-        session_id: Arc<str>,
-        messages: Arc<[ChatMessage]>,
-        stats: Arc<AgentStats>,
-        provider: Arc<str>,
-        model: Arc<str>,
-    ) -> Self {
-        Self {
-            session_id,
-            messages,
-            fragments: Arc::from([]),
-            stats,
-            provider,
-            model,
-            session_mode: crate::agent::core::AgentMode::Build,
-            request_overrides: GenerationOptions::NONE,
-            profile: Arc::new(ModelProfile::default()),
-            last_applied: GenerationOptions::NONE,
-        }
-    }
-
-    /// Set the model profile (builder-style).
-    #[must_use]
-    pub fn with_profile(mut self, profile: Arc<ModelProfile>) -> Self {
-        self.profile = profile;
-        self
-    }
-
-    /// Set the options the last request was sent with (builder-style).
-    #[must_use]
-    pub fn with_last_applied(mut self, applied: GenerationOptions) -> Self {
-        self.last_applied = applied;
-        self
-    }
-
-    /// Returns the number of user messages in the conversation
-    pub fn user_message_count(&self) -> usize {
-        self.messages
-            .iter()
-            .filter(|msg| matches!(msg.role, ChatRole::User))
-            .count()
-    }
-
-    /// Creates a new context with an injected message added
-    pub fn inject_message(&self, content: String) -> Self {
-        let mut messages = Vec::from(&*self.messages);
-
-        let injected_msg = ChatMessage::user().text(content).build();
-
-        messages.push(injected_msg);
-
-        Self {
-            session_id: self.session_id.clone(),
-            messages: Arc::from(messages.into_boxed_slice()),
-            fragments: self.fragments.clone(),
-            stats: self.stats.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            session_mode: self.session_mode,
-            request_overrides: self.request_overrides,
-            profile: self.profile.clone(),
-            last_applied: self.last_applied,
-        }
-    }
-
-    pub fn upsert_fragment(
-        &self,
-        key: &'static str,
-        content: String,
-        priority: ContextPriority,
-    ) -> Self {
-        let mut fragments = self.fragments.to_vec();
-        fragments.retain(|fragment| fragment.key != key);
-        if !content.trim().is_empty() {
-            fragments.push(ContextFragment {
-                key,
-                content,
-                priority,
-            });
-            fragments.sort_by_key(|fragment| (fragment.priority, fragment.key));
-        }
-        let mut next = self.clone();
-        next.fragments = Arc::from(fragments.into_boxed_slice());
-        next
-    }
-
-    pub fn remove_fragment(&self, key: &str) -> Self {
-        let mut next = self.clone();
-        next.fragments = Arc::from(
-            self.fragments
-                .iter()
-                .filter(|fragment| fragment.key != key)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        next
-    }
-
-    pub fn fragment_messages(&self) -> Vec<ChatMessage> {
-        self.fragments
-            .iter()
-            .map(|fragment| ChatMessage::user().text(fragment.content.clone()).build())
-            .collect()
-    }
-
-    pub fn request_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self.messages.to_vec();
-        let fragments = self.fragment_messages();
-        if fragments.is_empty() {
-            return messages;
-        }
-
-        // Keep the latest durable turn last. This preserves delegation and other
-        // resumed-turn feedback while still avoiding a message between tool use
-        // and its immediately following result.
-        if messages
-            .last()
-            .is_some_and(|last| last.role == ChatRole::User && last.has_tool_result())
-        {
-            if let Some(mut latest) = messages.pop() {
-                for fragment in fragments {
-                    for part in fragment.portable_input_parts() {
-                        latest.push_input_part(part);
-                    }
-                }
-                messages.push(latest);
-            }
-        } else if messages
-            .last()
-            .is_some_and(|last| last.role == ChatRole::Assistant)
-        {
-            // A retained partial reply must be followed by guidance, not used as prefill.
-            messages.extend(fragments);
-        } else if let Some(latest) = messages.pop() {
-            messages.extend(fragments);
-            messages.push(latest);
-        } else {
-            messages.extend(fragments);
-        }
-        messages
-    }
-
-    /// Set the per-session mode on this context (builder-style).
-    pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
-        self.session_mode = mode;
-        self
-    }
-
-    pub fn with_fragments(mut self, fragments: Arc<[ContextFragment]>) -> Self {
-        self.fragments = fragments;
-        self
-    }
-
-    /// Set the overrides applied to the next model request (builder-style).
-    #[must_use]
-    pub fn with_request_overrides(mut self, overrides: GenerationOptions) -> Self {
-        self.request_overrides = overrides;
-        self
-    }
-
-    /// Returns a copy of this context whose overrides are cleared, so a
-    /// consumed override never leaks into a later request.
-    #[must_use]
-    pub fn without_request_overrides(&self) -> Self {
-        self.clone().with_request_overrides(GenerationOptions::NONE)
-    }
-
-    /// Returns true if this is the first user turn
-    pub fn is_first_turn(&self) -> bool {
-        self.stats.turns <= 1
-    }
 }
 
 /// Response from the LLM provider
@@ -564,171 +358,10 @@ impl WaitCondition {
     }
 }
 
-/// Represents the complete state of agent execution
-#[derive(Debug)]
-pub enum ExecutionState {
-    /// Before calling the LLM - middleware can inject messages or stop
-    BeforeLlmCall { context: Arc<ConversationContext> },
-
-    /// Ready to call the LLM with tools
-    CallLlm {
-        context: Arc<ConversationContext>,
-        request: Arc<PreparedModelRequest>,
-    },
-
-    /// After receiving LLM response
-    AfterLlm {
-        response: Arc<LlmResponse>,
-        context: Arc<ConversationContext>,
-    },
-
-    /// Processing multiple tool calls from a single LLM response
-    ProcessingToolCalls {
-        /// Remaining tool calls to process
-        remaining_calls: Arc<[ToolCall]>,
-        /// Tool results collected so far
-        results: Arc<[ToolResult]>,
-        /// Current conversation context
-        context: Arc<ConversationContext>,
-    },
-
-    /// Waiting for an external event before continuing
-    WaitingForEvent {
-        context: Arc<ConversationContext>,
-        wait: WaitCondition,
-    },
-
-    /// Execution completed successfully
-    Complete { context: Arc<ConversationContext> },
-
-    /// Execution stopped by middleware
-    Stopped {
-        message: Arc<str>,
-        stop_type: StopType,
-        context: Option<Arc<ConversationContext>>,
-    },
-
-    /// Execution cancelled by user
-    Cancelled,
-}
-
-impl ExecutionState {
-    /// Returns a human-readable name for the state
-    pub fn name(&self) -> &'static str {
-        match self {
-            ExecutionState::BeforeLlmCall { .. } => "BeforeLlmCall",
-            ExecutionState::CallLlm { .. } => "CallLlm",
-            ExecutionState::AfterLlm { .. } => "AfterLlm",
-            ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
-            ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
-            ExecutionState::Complete { .. } => "Complete",
-            ExecutionState::Stopped { .. } => "Stopped",
-            ExecutionState::Cancelled => "Cancelled",
-        }
-    }
-
-    /// Returns the context if this state has one
-    pub fn context(&self) -> Option<&Arc<ConversationContext>> {
-        match self {
-            ExecutionState::BeforeLlmCall { context } => Some(context),
-            ExecutionState::CallLlm { context, .. } => Some(context),
-            ExecutionState::AfterLlm { context, .. } => Some(context),
-            ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
-            ExecutionState::WaitingForEvent { context, .. } => Some(context),
-            ExecutionState::Complete { context } => Some(context),
-            ExecutionState::Stopped { context, .. } => context.as_ref(),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use querymt::chat::ToolResultPart;
-
-    #[test]
-    fn append_only_history_preserves_prepared_cache_prefix() {
-        let hint = querymt::chat::CacheHint::Ephemeral {
-            ttl_seconds: Some(1800),
-        };
-        let first = ChatMessage::user().text("reference").cache(hint).build();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([first.clone()]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        );
-        let previous = context.request_messages();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([
-                first,
-                ChatMessage::assistant().text("answer").build(),
-                ChatMessage::user().text("follow-up").build(),
-            ]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        );
-        let current = context.request_messages();
-        assert_eq!(
-            serde_json::to_value(&previous).unwrap(),
-            serde_json::to_value(&current[..previous.len()]).unwrap()
-        );
-    }
-
-    #[test]
-    fn request_messages_keep_latest_feedback_after_context_fragments() {
-        let latest = ChatMessage::user().text("Delegation completed").build();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([latest]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        )
-        .upsert_fragment(
-            "run_objective",
-            "objective".to_string(),
-            ContextPriority::High,
-        );
-
-        let messages = context.request_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].text(), "objective");
-        assert_eq!(messages[1].text(), "Delegation completed");
-    }
-
-    #[test]
-    fn request_messages_append_fragments_after_tool_results() {
-        let latest = ChatMessage::user()
-            .part(querymt::chat::ChatInputPart::tool_result(
-                querymt::chat::ToolResult::text("call-1", "result"),
-            ))
-            .build();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([latest]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        )
-        .upsert_fragment(
-            "run_objective",
-            "objective".to_string(),
-            ContextPriority::High,
-        );
-
-        let messages = context.request_messages();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].portable_input_parts()[0].is_tool_result());
-        assert_eq!(
-            messages[0].portable_input_parts()[1].as_text(),
-            Some("objective")
-        );
-    }
 
     #[test]
     fn test_tool_result_with_snapshot() {

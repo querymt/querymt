@@ -162,6 +162,8 @@ mod session_atif_tests {
                     context_tokens: 50,
                     metrics,
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
             ev(
@@ -191,6 +193,8 @@ mod session_atif_tests {
                     context_tokens: 10,
                     metrics: ExecutionMetrics::default(),
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ];

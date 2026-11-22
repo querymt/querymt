@@ -61,10 +61,16 @@ impl From<&Task> for TaskCommitment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProgressReview {
-    pub reason: String,
-    pub step: usize,
+/// Stored as a `progress_review` notice at step 7 and every fourth step after.
+/// Includes the completion sentence, so it does not depend on the run objective
+/// being sent.
+pub const PROGRESS_REVIEW_NOTICE: &str = "Progress review (does not alter scope or precedence):\nReview progress against the latest instruction and applicable acceptance criteria. If incomplete, take the next coherent action. If blocked, report the blocker precisely. Completed investigation is not completion of requested implementation. Do not narrow scope or limit work to one fact or one tool call.\n\nCompletion means satisfying the latest instruction and applicable acceptance criteria, or reporting a real blocker.";
+
+/// Whether a progress review is due before the request at `steps` completed
+/// model steps: at step 7, then every fourth step after the last review.
+pub fn progress_review_due(steps: usize, last_review_step: usize) -> bool {
+    (steps >= 7 && last_review_step == 0)
+        || (last_review_step > 0 && steps.saturating_sub(last_review_step) >= 4)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +93,6 @@ pub struct RunObjective {
     pub execution_origin: String,
     /// Recovery metadata only. It is deliberately excluded from rendering.
     pub historical_intent: Option<IntentSnapshot>,
-    pub progress_review: Option<ProgressReview>,
     pub completion_disposition: CompletionDisposition,
 }
 
@@ -125,7 +130,6 @@ impl RunObjective {
             current_task,
             execution_origin,
             historical_intent,
-            progress_review: None,
             completion_disposition,
         }
     }
@@ -158,10 +162,6 @@ impl RunObjective {
                 application_boundary: Some("tool_result".to_string()),
             },
         });
-    }
-
-    pub fn set_progress_review(&mut self, review: Option<ProgressReview>) {
-        self.progress_review = review;
     }
 
     pub fn render(&self) -> String {
@@ -197,12 +197,6 @@ impl RunObjective {
                     .to_string(),
             );
             sections.push(lines.join("\n"));
-        }
-        if self.progress_review.is_some() {
-            sections.push(
-                "Progress review (does not alter scope or precedence):\nReview progress against the latest instruction and applicable acceptance criteria. If incomplete, take the next coherent action. If blocked, report the blocker precisely. Completed investigation is not completion of requested implementation. Do not narrow scope or limit work to one fact or one tool call."
-                    .to_string(),
-            );
         }
         sections.push(
             "Completion means satisfying the latest instruction and applicable acceptance criteria, or reporting a real blocker."
@@ -244,21 +238,33 @@ mod tests {
     }
 
     #[test]
-    fn progress_review_does_not_narrow_scope() {
-        let mut objective = RunObjective::new(
+    fn progress_review_notice_does_not_narrow_scope() {
+        assert!(PROGRESS_REVIEW_NOTICE.contains("does not alter scope or precedence"));
+        assert!(PROGRESS_REVIEW_NOTICE.contains("Completion means satisfying"));
+        assert!(!PROGRESS_REVIEW_NOTICE.contains("exactly one"));
+    }
+
+    #[test]
+    fn rendered_objective_has_no_progress_review_text() {
+        let objective = RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
             "Implement the fix".into(),
             "interactive".into(),
             None,
             None,
         );
-        objective.set_progress_review(Some(ProgressReview {
-            reason: "periodic_progress_review".into(),
-            step: 7,
-        }));
         let rendered = objective.render();
-        assert!(rendered.contains("does not alter scope or precedence"));
-        assert!(!rendered.contains("exactly one"));
+        assert!(!rendered.contains("Progress review"));
+        assert!(rendered.contains("Completion means satisfying"));
+    }
+
+    #[test]
+    fn progress_review_is_due_at_step_seven_then_every_fourth_step() {
+        assert!(!progress_review_due(6, 0));
+        assert!(progress_review_due(7, 0));
+        assert!(!progress_review_due(10, 7));
+        assert!(progress_review_due(11, 7));
+        assert!(!progress_review_due(12, 11));
     }
 
     #[test]

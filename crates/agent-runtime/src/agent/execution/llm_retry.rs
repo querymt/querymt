@@ -3,6 +3,7 @@
 //! This module handles retrying transient LLM failures with configurable backoff.
 
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::utils::genai::RequestAttempts;
 use crate::agent::utils::u32_from_usize;
 use futures_util::{Stream, StreamExt};
 use log::{info, warn};
@@ -33,13 +34,97 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, LLMError>>,
 {
-    call_with_retry_mode(config, session_id, cancel_token, call_fn).await
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        None,
+        LLMError::is_retryable,
+        |_: &T| false,
+        call_fn,
+    )
+    .await
+}
+
+/// [`call_with_retry`] for the model request itself (`operation` is `chat`):
+/// every attempt is also reported on the request's span through `attempts`.
+/// Provider setup retries are not attempts of a request and use
+/// [`call_with_retry`].
+#[instrument(
+    name = "agent.llm.call_with_retry",
+    skip(config, attempts, cancel_token, call_fn),
+    fields(session_id = %session_id, operation = "chat", attempt = tracing::field::Empty, retrying = tracing::field::Empty)
+)]
+pub(crate) async fn call_chat_with_retry<T, F, Fut>(
+    config: &AgentConfig,
+    session_id: &str,
+    attempts: &RequestAttempts,
+    cancel_token: &CancellationToken,
+    call_fn: F,
+) -> Result<T, LLMError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LLMError>>,
+{
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        Some(attempts),
+        LLMError::is_retryable,
+        |_: &T| false,
+        call_fn,
+    )
+    .await
+}
+
+/// [`call_chat_with_retry`] with its own decision on which errors are worth
+/// another request. The attempt is reported on the span as failed either way;
+/// `retryable` only decides whether another one follows. For a caller that
+/// must not resend after an error `LLMError::is_retryable` accepts (a request
+/// timeout: the remote is probably still working).
+///
+/// `rejected` says whether a reply the provider returned is one the caller
+/// rejects as output: its attempt is reported as a rejected output (with an
+/// `error.type`), not as a success, but the reply is still returned and never
+/// retried here, because it is not a provider error.
+#[instrument(
+    name = "agent.llm.call_with_retry",
+    skip(config, attempts, cancel_token, retryable, rejected, call_fn),
+    fields(session_id = %session_id, operation = "chat", attempt = tracing::field::Empty, retrying = tracing::field::Empty)
+)]
+pub(crate) async fn call_chat_with_retry_if<T, F, Fut>(
+    config: &AgentConfig,
+    session_id: &str,
+    attempts: &RequestAttempts,
+    cancel_token: &CancellationToken,
+    retryable: impl Fn(&LLMError) -> bool,
+    rejected: impl Fn(&T) -> bool,
+    call_fn: F,
+) -> Result<T, LLMError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LLMError>>,
+{
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        Some(attempts),
+        retryable,
+        rejected,
+        call_fn,
+    )
+    .await
 }
 
 async fn call_with_retry_mode<T, F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     cancel_token: &CancellationToken,
+    attempts: Option<&RequestAttempts>,
+    retryable: impl Fn(&LLMError) -> bool,
+    rejected: impl Fn(&T) -> bool,
     mut call_fn: F,
 ) -> Result<T, LLMError>
 where
@@ -56,14 +141,27 @@ where
             return Err(LLMError::Cancelled);
         }
 
+        if let Some(attempts) = attempts {
+            attempts.start();
+        }
         match call_fn().await {
             Ok(response) => {
                 Span::current().record("attempt", attempt);
+                if let Some(attempts) = attempts {
+                    if rejected(&response) {
+                        attempts.rejected();
+                    } else {
+                        attempts.succeeded();
+                    }
+                }
                 return Ok(response);
             }
             Err(error) => {
                 Span::current().record("attempt", attempt);
-                if !error.is_retryable() || attempt >= max_attempts {
+                if let Some(attempts) = attempts {
+                    attempts.failed(&error);
+                }
+                if !retryable(&error) || attempt >= max_attempts {
                     return Err(error);
                 }
 
@@ -83,6 +181,16 @@ where
             }
         }
     }
+}
+
+/// Whether the request failed without an answer from the provider: a failed
+/// connection, a timeout, or a response stream that broke or could not be
+/// decoded. `PluginError` stays out because its cause is unknown.
+fn is_transport_failure(error: &LLMError) -> bool {
+    matches!(
+        error,
+        LLMError::Transport { .. } | LLMError::HttpError(_) | LLMError::IoError(_)
+    )
 }
 
 /// Calculate a bounded retry delay, preferring a provider hint when present.
@@ -106,7 +214,16 @@ pub(super) fn retry_delay_secs(
         return bounded;
     }
 
-    let base = policy.default_wait_secs as f64;
+    // A failure the provider never answered carries no retry hint and is
+    // usually brief, so it gets its own, shorter base wait. Everything else
+    // (overloaded, rate limited, 5xx, plugin errors of unknown cause) keeps
+    // `default_wait_secs`.
+    let base_secs = if is_transport_failure(error) {
+        policy.transport_wait_secs
+    } else {
+        policy.default_wait_secs
+    };
+    let base = base_secs as f64;
     let multiplier = policy.backoff_multiplier;
     let calculated = base * multiplier.powi(retry_ordinal.saturating_sub(1) as i32);
     apply_jitter(calculated, policy.jitter_ratio, jitter_sample()).min(policy.max_wait_secs)
@@ -278,6 +395,8 @@ pub(super) struct StreamRetryBudget {
     max_stream_retries: usize,
     attempts_used: usize,
     max_attempts: usize,
+    /// Where attempts are reported on the request's span, when it has one.
+    reported: Option<RequestAttempts>,
 }
 
 impl StreamRetryBudget {
@@ -287,7 +406,14 @@ impl StreamRetryBudget {
             max_stream_retries,
             attempts_used: 0,
             max_attempts: max_attempts.max(1),
+            reported: None,
         }
+    }
+
+    /// Report every attempt of this budget on the request's span.
+    pub(super) fn with_attempts(mut self, attempts: RequestAttempts) -> Self {
+        self.reported = Some(attempts);
+        self
     }
 
     pub(super) fn reserve_attempt(&mut self) -> Option<usize> {
@@ -295,6 +421,9 @@ impl StreamRetryBudget {
             return None;
         }
         self.attempts_used += 1;
+        if let Some(reported) = &self.reported {
+            reported.start();
+        }
         Some(self.attempts_used)
     }
 
@@ -337,6 +466,10 @@ pub(super) async fn handle_stream_failure(
     message_id: Option<String>,
     cancel_token: &CancellationToken,
 ) -> StreamFailureAction {
+    // Every failed attempt passes through here; a cancellation adds no event.
+    if let Some(reported) = &budget.reported {
+        reported.failed(&error);
+    }
     if matches!(error, LLMError::Cancelled) || cancel_token.is_cancelled() {
         return StreamFailureAction::Cancelled;
     }
@@ -468,6 +601,7 @@ mod tests {
         let mut policy = RuntimeExecutionPolicy::default();
         policy.rate_limit.max_retries = 3;
         policy.rate_limit.default_wait_secs = 1;
+        policy.rate_limit.transport_wait_secs = 1;
         policy.rate_limit.backoff_multiplier = 2.0;
 
         let config = Arc::new(
@@ -632,6 +766,172 @@ mod tests {
             retry_after_secs: Some(60),
         };
         assert_eq!(retry_delay_secs(config, &error, 1), 10);
+    }
+
+    // ── retry wait by error class ────────────────────────────────────────────
+
+    /// Config with the spec's waits (transport 10 s, provider 60 s), no jitter.
+    async fn class_wait_config() -> (Arc<AgentConfig>, tempfile::TempDir) {
+        let (mut config, temp) = make_config().await;
+        let policy = &mut Arc::get_mut(&mut config)
+            .expect("config is uniquely owned")
+            .execution_policy
+            .rate_limit;
+        policy.default_wait_secs = 60;
+        policy.transport_wait_secs = 10;
+        policy.backoff_multiplier = 2.0;
+        policy.jitter_ratio = 0.0;
+        policy.max_wait_secs = 300;
+        (config, temp)
+    }
+
+    fn transport(kind: querymt::error::TransportErrorKind) -> LLMError {
+        LLMError::Transport {
+            kind,
+            message: "transport failure".to_string(),
+        }
+    }
+
+    fn overloaded(retry_after_secs: Option<u64>) -> LLMError {
+        LLMError::from(
+            ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "overloaded")
+                .with_retry_after_secs(retry_after_secs),
+        )
+    }
+
+    #[tokio::test]
+    async fn first_retry_after_a_network_timeout_uses_the_transport_wait() {
+        let (config, _temp) = class_wait_config().await;
+        let error = transport(querymt::error::TransportErrorKind::Timeout);
+        assert_eq!(retry_delay_secs(&config, &error, 1), 10);
+    }
+
+    #[tokio::test]
+    async fn second_transport_retry_backs_off() {
+        let (config, _temp) = class_wait_config().await;
+        let error = transport(querymt::error::TransportErrorKind::ConnectionReset);
+        assert_eq!(retry_delay_secs(&config, &error, 2), 20);
+    }
+
+    #[tokio::test]
+    async fn broken_stream_and_io_failures_use_the_transport_wait() {
+        let (config, _temp) = class_wait_config().await;
+        for error in [
+            LLMError::HttpError("error decoding response body".to_string()),
+            transport(querymt::error::TransportErrorKind::Other),
+            transport(querymt::error::TransportErrorKind::Dns),
+            LLMError::IoError(std::io::Error::other("pipe closed")),
+        ] {
+            assert_eq!(retry_delay_secs(&config, &error, 1), 10, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_wait_of_zero_retries_immediately() {
+        let (mut config, _temp) = class_wait_config().await;
+        Arc::get_mut(&mut config)
+            .expect("config is uniquely owned")
+            .execution_policy
+            .rate_limit
+            .transport_wait_secs = 0;
+        let error = transport(querymt::error::TransportErrorKind::ConnectionRefused);
+        assert_eq!(retry_delay_secs(&config, &error, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_wait_is_capped_by_max_wait() {
+        let (mut config, _temp) = class_wait_config().await;
+        let policy = &mut Arc::get_mut(&mut config)
+            .expect("config is uniquely owned")
+            .execution_policy
+            .rate_limit;
+        policy.transport_wait_secs = 200;
+        policy.max_wait_secs = 30;
+        let error = transport(querymt::error::TransportErrorKind::Timeout);
+        assert_eq!(retry_delay_secs(&config, &error, 1), 30);
+    }
+
+    #[tokio::test]
+    async fn provider_overload_without_a_hint_keeps_the_provider_wait() {
+        let (config, _temp) = class_wait_config().await;
+        assert_eq!(retry_delay_secs(&config, &overloaded(None), 1), 60);
+        let unavailable = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".to_string(),
+            retry_after_secs: None,
+        };
+        assert_eq!(retry_delay_secs(&config, &unavailable, 1), 60);
+        // A plugin failure has an unknown cause, so it stays in the provider class.
+        let plugin = LLMError::PluginError("wasm trap".to_string());
+        assert_eq!(retry_delay_secs(&config, &plugin, 1), 60);
+    }
+
+    #[tokio::test]
+    async fn provider_hint_is_used_and_capped_whatever_the_transport_wait() {
+        let (mut config, _temp) = class_wait_config().await;
+        assert_eq!(retry_delay_secs(&config, &overloaded(Some(20)), 1), 20);
+        let rate_limited = LLMError::RateLimited {
+            message: "slow down".to_string(),
+            retry_after_secs: Some(20),
+        };
+        assert_eq!(retry_delay_secs(&config, &rate_limited, 1), 20);
+
+        Arc::get_mut(&mut config)
+            .expect("config is uniquely owned")
+            .execution_policy
+            .rate_limit
+            .max_wait_secs = 300;
+        assert_eq!(retry_delay_secs(&config, &overloaded(Some(900)), 1), 300);
+    }
+
+    #[tokio::test]
+    async fn mixed_failures_exhaust_one_attempt_budget() {
+        let (config, _temp) = class_wait_config().await;
+        let mut config = config;
+        let policy = &mut Arc::get_mut(&mut config)
+            .expect("config is uniquely owned")
+            .execution_policy
+            .rate_limit;
+        policy.max_retries = 3;
+        policy.transport_wait_secs = 0;
+        policy.default_wait_secs = 0;
+        let token = CancellationToken::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result: Result<(), LLMError> = call_with_retry(&config, "s", "test", &token, || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Err(if call == 1 {
+                    overloaded(None)
+                } else {
+                    transport(querymt::error::TransportErrorKind::Timeout)
+                })
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_is_not_retried() {
+        let (config, _temp) = class_wait_config().await;
+        let token = CancellationToken::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result: Result<(), LLMError> = call_with_retry(&config, "s", "test", &token, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                Err(transport(
+                    querymt::error::TransportErrorKind::ProtocolMismatch,
+                ))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     // ── is_retryable tests ─────────────────────────────────────────────────
@@ -1140,6 +1440,7 @@ mod tests {
         let (mut config, _temp) = make_config().await;
         let config_mut = Arc::get_mut(&mut config).expect("config uniquely owned");
         config_mut.execution_policy.rate_limit.default_wait_secs = 0;
+        config_mut.execution_policy.rate_limit.transport_wait_secs = 0;
         let token = CancellationToken::new();
         let mut budget = StreamRetryBudget::new(2, 3);
 
@@ -1188,6 +1489,7 @@ mod tests {
         let (mut config, _temp) = make_config().await;
         let config_mut = Arc::get_mut(&mut config).expect("config uniquely owned");
         config_mut.execution_policy.rate_limit.default_wait_secs = 0;
+        config_mut.execution_policy.rate_limit.transport_wait_secs = 0;
         let token = CancellationToken::new();
         let mut budget = StreamRetryBudget::new(2, 3);
 
@@ -1260,6 +1562,7 @@ mod tests {
         let (mut config, _temp) = make_config().await;
         let config_mut = Arc::get_mut(&mut config).expect("config uniquely owned");
         config_mut.execution_policy.rate_limit.default_wait_secs = 0;
+        config_mut.execution_policy.rate_limit.transport_wait_secs = 0;
         config_mut.execution_policy.rate_limit.max_stream_retries = 2;
         let mut events = config.subscribe_events();
         let token = CancellationToken::new();

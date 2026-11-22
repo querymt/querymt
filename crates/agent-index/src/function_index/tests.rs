@@ -782,3 +782,84 @@ pub fn tiny(x: i32) -> i32 {
         "size-ratio filter should reject tiny vs huge function pairs"
     );
 }
+
+/// Records `(span name, file field)` of every span a layer is asked to see.
+#[derive(Clone, Default)]
+struct RecordedSpans(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl RecordedSpans {
+    fn spans(&self) -> Vec<(String, String)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[derive(Default)]
+struct FileField(String);
+
+impl tracing::field::Visit for FileField {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "file" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedSpans {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut file = FileField::default();
+        attrs.record(&mut file);
+        self.0
+            .lock()
+            .unwrap()
+            .push((attrs.metadata().name().to_string(), file.0));
+    }
+}
+
+/// Run `remove_file` under a subscriber that keeps spans up to `level`.
+fn remove_file_spans(
+    index: &mut FunctionIndex,
+    path: &Path,
+    level: tracing_subscriber::filter::LevelFilter,
+) -> Vec<(String, String)> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let recorded = RecordedSpans::default();
+    let subscriber = tracing_subscriber::registry().with(recorded.clone().with_filter(level));
+    tracing::subscriber::with_default(subscriber, || index.remove_file(path));
+    recorded.spans()
+}
+
+/// `function_index.remove_file` is bookkeeping, so it is a debug-level span:
+/// not exported at the default (info) level, exported with its `file` at debug.
+#[tokio::test]
+async fn remove_file_span_is_exported_only_at_debug_level() {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut index = FunctionIndex::build(temp_dir.path(), FunctionIndexConfig::default())
+        .await
+        .unwrap();
+    let path = temp_dir.path().join("gone.ts");
+
+    let at_info = remove_file_spans(&mut index, &path, LevelFilter::INFO);
+    assert!(
+        at_info
+            .iter()
+            .all(|(name, _)| name != "function_index.remove_file"),
+        "exported at info: {at_info:?}"
+    );
+
+    let at_debug = remove_file_spans(&mut index, &path, LevelFilter::DEBUG);
+    let removed: Vec<_> = at_debug
+        .iter()
+        .filter(|(name, _)| name == "function_index.remove_file")
+        .collect();
+    assert_eq!(removed.len(), 1, "{at_debug:?}");
+    assert_eq!(removed[0].1, path.display().to_string());
+}

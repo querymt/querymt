@@ -5,11 +5,10 @@
 //! provides the coder with context about decisions made, files to modify, patterns
 //! to follow, and implementation steps.
 
-use crate::agent::utils::{genai, render_prompt_for_display, render_prompt_for_llm};
+use crate::agent::utils::{genai, render_prompt_for_display};
 use crate::config::DelegationSummaryConfig;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider::{ProviderRequest, SessionProvider};
-use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use futures_util::{FutureExt, StreamExt};
 use querymt::LLMProvider;
 use querymt::chat::{
@@ -61,7 +60,6 @@ pub struct DelegationSummarizer {
     model: String,
     timeout: Duration,
     min_history_tokens: usize,
-    estimator: Arc<dyn TokenEstimator>,
 }
 
 impl DelegationSummarizer {
@@ -93,7 +91,6 @@ impl DelegationSummarizer {
             model: config.model.clone(),
             timeout: Duration::from_secs(config.timeout_secs),
             min_history_tokens: config.min_history_tokens,
-            estimator: Arc::new(SimpleTokenEstimator),
         })
     }
 
@@ -177,7 +174,10 @@ impl DelegationSummarizer {
 
         // Check token threshold — below threshold, inject raw formatted history
         // directly into the delegate context (no LLM summarization needed)
-        let estimated_tokens = self.estimate_history_tokens(parent_history);
+        // A history that cannot be projected is too large to inline.
+        let estimated_tokens =
+            crate::session::pruning::estimate_history_tokens(parent_history, None, false)
+                .unwrap_or(usize::MAX);
         span.record("estimated_tokens", estimated_tokens as u64);
         if estimated_tokens < self.min_history_tokens {
             span.record("strategy", "raw");
@@ -436,40 +436,6 @@ impl DelegationSummarizer {
             )));
         }
         Ok(())
-    }
-
-    /// Estimate token count for a list of messages using the configured estimator
-    fn estimate_history_tokens(&self, history: &[AgentMessage]) -> usize {
-        history
-            .iter()
-            .map(|m| {
-                m.parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
-                        MessagePart::Prompt { blocks } => self
-                            .estimator
-                            .estimate(&render_prompt_for_llm(blocks, None)),
-                        MessagePart::ToolResult { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .filter_map(|b| b.as_text())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.estimator.estimate(&text)
-                        }
-                        MessagePart::Reasoning { item, .. } => {
-                            self.estimator.estimate(&item.visible_text())
-                        }
-                        MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
-                        MessagePart::Output { output } => {
-                            self.estimator.estimate(&output.estimate_text())
-                        }
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum()
     }
 
     /// If the last message in history is a compaction (no messages after it),
@@ -1570,7 +1536,6 @@ mod tests {
             model: "requested-summary-model".into(),
             timeout,
             min_history_tokens: 0,
-            estimator: Arc::new(SimpleTokenEstimator),
         }
     }
 

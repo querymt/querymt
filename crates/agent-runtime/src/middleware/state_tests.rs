@@ -1,183 +1,54 @@
+use crate::agent::execution::Stage;
 use crate::middleware::{
-    AgentStats, ConversationContext, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult,
-    WaitCondition, WaitReason,
+    AgentStats, LlmResponse, PreparedModelRequest, Stop, ToolResult, WaitCondition, WaitReason,
 };
-use crate::test_utils::{mock_tool_call, test_context};
-use querymt::chat::{ChatMessage, ChatRole, FinishReason, ToolResultPart};
+use crate::test_utils::mock_tool_call;
+use querymt::chat::{FinishReason, ToolResultPart};
 use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
 #[test]
-fn test_execution_state_name_all_variants() {
-    let context = test_context("sess-1", 0);
-    let response = Arc::new(LlmResponse::new(
+fn stage_names_all_variants() {
+    let response = Box::new(LlmResponse::new(
         "".to_string(),
         vec![],
         None,
         Some(FinishReason::Stop),
     ));
-    let states = vec![
+    let stages = vec![
+        (Stage::BeforeRequest, "BeforeRequest"),
         (
-            ExecutionState::BeforeLlmCall {
-                context: context.clone(),
-            },
-            "BeforeLlmCall",
-        ),
-        (
-            ExecutionState::CallLlm {
-                context: context.clone(),
-                request: Arc::new(PreparedModelRequest {
-                    messages: Arc::from([]),
-                    tools: Arc::from([]),
-                    estimated_tokens: 0,
-                    options: Default::default(),
-                }),
-            },
-            "CallLlm",
-        ),
-        (
-            ExecutionState::AfterLlm {
-                response: response.clone(),
-                context: context.clone(),
-            },
-            "AfterLlm",
-        ),
-        (
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls: Arc::from([]),
-                results: Arc::from([]),
-                context: context.clone(),
-            },
-            "ProcessingToolCalls",
-        ),
-        (
-            ExecutionState::WaitingForEvent {
-                context: context.clone(),
-                wait: WaitCondition::delegation("del-1".to_string()),
-            },
-            "WaitingForEvent",
-        ),
-        (
-            ExecutionState::Complete {
-                context: context.clone(),
-            },
-            "Complete",
-        ),
-        (
-            ExecutionState::Stopped {
-                message: "done".into(),
-                stop_type: StopType::Other,
-                context: None,
-            },
-            "Stopped",
-        ),
-        (ExecutionState::Cancelled, "Cancelled"),
-    ];
-
-    for (state, expected) in states {
-        assert_eq!(state.name(), expected);
-    }
-}
-
-#[test]
-fn test_execution_state_context_accessors() {
-    let context = test_context("sess-1", 0);
-    let response = Arc::new(LlmResponse::new(
-        "".to_string(),
-        vec![],
-        None,
-        Some(FinishReason::Stop),
-    ));
-
-    let stateful_states = vec![
-        ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        },
-        ExecutionState::CallLlm {
-            context: context.clone(),
-            request: Arc::new(PreparedModelRequest {
+            Stage::CallModel(Box::new(PreparedModelRequest {
                 messages: Arc::from([]),
                 tools: Arc::from([]),
+                offered_tools: Arc::from([]),
                 estimated_tokens: 0,
                 options: Default::default(),
-            }),
-        },
-        ExecutionState::AfterLlm {
-            response: response.clone(),
-            context: context.clone(),
-        },
-        ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from([]),
-            results: Arc::from([]),
-            context: context.clone(),
-        },
-        ExecutionState::WaitingForEvent {
-            context: context.clone(),
-            wait: WaitCondition::delegation("del-1".to_string()),
-        },
-        ExecutionState::Complete {
-            context: context.clone(),
-        },
+            })),
+            "CallModel",
+        ),
+        (Stage::AfterReply(response), "AfterReply"),
+        (
+            Stage::ToolCalls {
+                calls: Vec::new(),
+                results: Vec::new(),
+            },
+            "ToolCalls",
+        ),
+        (
+            Stage::Waiting(WaitCondition::delegation("del-1".to_string())),
+            "Waiting",
+        ),
+        (Stage::Ending, "Ending"),
+        (
+            Stage::Stopping(Stop::new(StopType::Other, "done")),
+            "Stopping",
+        ),
     ];
 
-    for state in stateful_states {
-        assert!(state.context().is_some());
+    for (stage, expected) in stages {
+        assert_eq!(<&'static str>::from(&stage), expected);
     }
-
-    let terminal_states = vec![
-        ExecutionState::Stopped {
-            message: "done".into(),
-            stop_type: StopType::Other,
-            context: None,
-        },
-        ExecutionState::Cancelled,
-    ];
-
-    for state in terminal_states {
-        assert!(state.context().is_none());
-    }
-}
-
-#[test]
-fn test_conversation_context_counts_user_messages() {
-    let messages = vec![
-        ChatMessage::user().text("one").build(),
-        ChatMessage::assistant().text("two").build(),
-        ChatMessage::user().text("three").build(),
-    ];
-    let stats = AgentStats {
-        turns: 2,
-        ..Default::default()
-    };
-    let context = ConversationContext::new(
-        "sess-1".into(),
-        Arc::from(messages.into_boxed_slice()),
-        Arc::new(stats),
-        "mock".into(),
-        "mock-model".into(),
-    );
-
-    assert_eq!(context.user_message_count(), 2);
-    assert!(!context.is_first_turn());
-}
-
-#[test]
-fn test_conversation_context_inject_message() {
-    let context = ConversationContext::new(
-        "sess-1".into(),
-        Arc::from([]),
-        Arc::new(AgentStats::default()),
-        "mock".into(),
-        "mock-model".into(),
-    );
-
-    let injected = context.inject_message("hello".to_string());
-
-    assert_eq!(context.messages.len(), 0);
-    assert_eq!(injected.messages.len(), 1);
-    assert!(matches!(injected.messages[0].role, ChatRole::User));
-    assert_eq!(injected.messages[0].text(), "hello");
-    assert!(injected.is_first_turn());
 }
 
 #[test]

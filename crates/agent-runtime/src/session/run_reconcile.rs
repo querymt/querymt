@@ -3,11 +3,18 @@
 //! A run whose `run_started` has no `run_completed`, and whose session run
 //! lease is free, has no live owner. Reconciliation journals
 //! `run_completed { outcome: "interrupted" }` for it while holding the lease,
-//! which serializes concurrent reconcilers and a racing run start.
+//! which serializes concurrent reconcilers and a racing run start. Tool calls
+//! of that run that have no end event are closed first, as interrupted.
+
+use std::collections::HashSet;
 
 use crate::agent::agent_config::AgentConfig;
 use crate::session::run_lease::RunLeaseRoot;
-use querymt_agent_core::events::{AgentEventKind, RunOutcome};
+use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventOrigin, RunOutcome};
+
+/// Result recorded for a tool call that was running when its process died.
+const INTERRUPTED_CALL_RESULT: &str =
+    "Error: the call was interrupted because the agent process stopped";
 
 /// Upper bound on orphaned runs closed in one call (a journal can hold several
 /// unmatched `run_started` events, e.g. after repeated crashes).
@@ -76,8 +83,11 @@ async fn reconcile_with_root(
     };
 
     // Under the lease no run of this session can start, so every unmatched
-    // run_started is an orphan. Re-query each time: another reconciler may
-    // have closed some between the first query and the lock.
+    // run_started is an orphan, and so is every call it left open.
+    close_open_tool_calls(config, session_id).await;
+
+    // Re-query each time: another reconciler may have closed some between
+    // the first query and the lock.
     let mut closed = Vec::new();
     for _ in 0..MAX_RUNS_PER_RECONCILE {
         let run_id = match journal.last_unfinished_run(session_id).await {
@@ -116,6 +126,76 @@ async fn reconcile_with_root(
         }
     }
     Some(closed)
+}
+
+/// Journal an interrupted `tool_call_end` for every call started inside an
+/// unfinished run that has no end event. Best-effort, like the caller.
+async fn close_open_tool_calls(config: &AgentConfig, session_id: &str) {
+    let events = match config
+        .event_sink
+        .journal()
+        .load_session_stream(session_id, None, None)
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            log::warn!("open tool calls of {session_id} not closed: journal read failed: {error}");
+            return;
+        }
+    };
+    for (tool_call_id, tool_name) in open_tool_calls(&events) {
+        let end = AgentEventKind::ToolCallEnd {
+            tool_call_id,
+            tool_name,
+            is_error: true,
+            result: INTERRUPTED_CALL_RESULT.to_owned(),
+        };
+        if let Err(error) = config.event_sink.emit_durable(session_id, end).await {
+            log::warn!("failed to close an open tool call of {session_id}: {error}");
+            return;
+        }
+    }
+}
+
+/// `(tool_call_id, tool_name)` of calls started inside a run that has no
+/// `run_completed` and that have no `tool_call_end`, in start order. Only this
+/// node's events count, as for the runs themselves.
+fn open_tool_calls(events: &[DurableEvent]) -> Vec<(String, String)> {
+    let mut completed_runs = HashSet::new();
+    let mut ended_calls = HashSet::new();
+    let mut current_run: Option<&str> = None;
+    let mut started = Vec::new();
+    for event in events.iter().filter(|e| e.origin == EventOrigin::Local) {
+        match &event.kind {
+            AgentEventKind::RunStarted { run_id, .. } => current_run = Some(run_id),
+            AgentEventKind::RunCompleted { run_id, .. } => {
+                completed_runs.insert(run_id.as_str());
+                if current_run == Some(run_id) {
+                    current_run = None;
+                }
+            }
+            AgentEventKind::ToolCallStart {
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                if let Some(run_id) = current_run {
+                    started.push((run_id, tool_call_id, tool_name));
+                }
+            }
+            AgentEventKind::ToolCallEnd { tool_call_id, .. } => {
+                ended_calls.insert(tool_call_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    started
+        .into_iter()
+        .filter(|(run_id, id, _)| {
+            !completed_runs.contains(run_id) && !ended_calls.contains(id.as_str())
+        })
+        .map(|(_, id, name)| (id.clone(), name.clone()))
+        .collect()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -235,6 +315,80 @@ pub mod tests {
         assert_eq!(interrupted_count(&f.storage, SID).await, 1);
         // The lease is released afterwards.
         assert!(f.lease_root.try_acquire(SID).unwrap().is_some());
+    }
+
+    fn tool_start(id: &str) -> AgentEventKind {
+        AgentEventKind::ToolCallStart {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            arguments: r#"{"command":"sleep 600"}"#.into(),
+        }
+    }
+
+    fn tool_end(id: &str) -> AgentEventKind {
+        AgentEventKind::ToolCallEnd {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            is_error: false,
+            result: "done".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_open_when_the_process_died_is_closed_once() {
+        use crate::session::projection::EventJournal;
+        let f = fixture().await;
+        // A finished run with an unmatched start (journaled by an older build)
+        // stays as it is: only calls of the interrupted run are closed.
+        seed(&f.storage, SID, started("r0")).await;
+        seed(&f.storage, SID, tool_start("old")).await;
+        seed(
+            &f.storage,
+            SID,
+            AgentEventKind::RunCompleted {
+                run_id: "r0".into(),
+                outcome: RunOutcome::Completed.into(),
+                stop_type: None,
+                reason: None,
+            },
+        )
+        .await;
+        seed(&f.storage, SID, started("r1")).await;
+        seed(&f.storage, SID, tool_start("done")).await;
+        seed(&f.storage, SID, tool_end("done")).await;
+        seed(&f.storage, SID, tool_start("open")).await;
+
+        assert_eq!(reconcile_orphaned_run(&f.config, SID).await, vec!["r1"]);
+        assert!(reconcile_orphaned_run(&f.config, SID).await.is_empty());
+
+        let events = f
+            .storage
+            .load_session_stream(SID, None, None)
+            .await
+            .unwrap();
+        let ends: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, e)| match &e.kind {
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id,
+                    is_error,
+                    result,
+                    ..
+                } => Some((position, tool_call_id.as_str(), *is_error, result.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        let (position, id, is_error, result) = &ends[1];
+        assert_eq!(*id, "open");
+        assert!(*is_error);
+        assert!(result.contains("interrupted"), "{result}");
+        let completed = events
+            .iter()
+            .position(|e| matches!(&e.kind, AgentEventKind::RunCompleted { run_id, .. } if run_id == "r1"))
+            .expect("run closed");
+        assert!(*position < completed, "the call is closed before its run");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::delegation::{DelegationOrchestrator, DelegationSummarizer};
 use crate::dotagents::{DotagentsSubAgentPlans, merge_protocol_targets};
-use crate::middleware::MiddlewareDriver;
+use crate::middleware::Middleware;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use anyhow::{Context, Result};
@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Builds a middleware driver once the root's configuration exists.
-pub type MiddlewareFactory = Box<dyn FnOnce(&LocalAgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
+pub type MiddlewareFactory = Box<dyn FnOnce(&LocalAgentHandle) -> Arc<dyn Middleware> + Send>;
 
 /// A delegate whose LLM calls run on a mesh peer.
 #[cfg(feature = "remote")]
@@ -168,7 +168,7 @@ pub async fn build_root(
     let temp_handle = Arc::new(LocalAgentHandle::from_config(initial_config.clone()));
     // Drivers the builder already holds come first; `with_middleware`
     // replaces the list, so they are carried over.
-    let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> =
+    let mut middleware_drivers: Vec<Arc<dyn Middleware>> =
         initial_config.middleware_drivers.clone();
     for factory in delegation.middleware_factories {
         middleware_drivers.push(factory(&temp_handle));

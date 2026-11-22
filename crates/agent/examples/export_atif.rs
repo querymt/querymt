@@ -99,6 +99,8 @@ fn main() {
                 context_tokens: 195,
                 metrics: ExecutionMetrics { steps: 1, turns: 1 },
                 accounting: None,
+                prefix_change: None,
+                idle_secs: None,
             },
         },
         AgentEvent {
@@ -144,6 +146,8 @@ fn main() {
                 context_tokens: 205,
                 metrics: ExecutionMetrics { steps: 2, turns: 1 },
                 accounting: None,
+                prefix_change: None,
+                idle_secs: None,
             },
         },
     ];

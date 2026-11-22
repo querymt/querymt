@@ -6,8 +6,8 @@ use http::{Request, Response};
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, StructuredOutputFormat, Tool,
-        ToolChoice,
+        ChatCall, ChatCapabilities, ChatOutput, PromptCacheCapabilities, StreamChunk,
+        StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -268,12 +268,56 @@ impl HTTPChatProvider for OpenAI {
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         match self.api_mode {
             ApiMode::ChatCompletions => Ok(Box::new(OpenAIStreamParser::default())),
-            ApiMode::Responses => Ok(Box::new(OpenAIResponsesStreamParser::default())),
+            ApiMode::Responses => {
+                use api::OpenAIProviderConfig as _;
+                // Streamed output is stamped with the endpoint this provider
+                // sends to, as `parse_chat` stamps it and as
+                // `output_provenance` states it; a default (empty) endpoint
+                // would never authorize native replay of the stream's output.
+                Ok(Box::new(OpenAIResponsesStreamParser::new(
+                    api::ResponsesCodecProvider {
+                        endpoint: self.responses_endpoint(),
+                        ..Default::default()
+                    },
+                )))
+            }
         }
     }
 
     fn capabilities(&self) -> ChatCapabilities {
-        ChatCapabilities::NONE.with_streaming(true)
+        ChatCapabilities::NONE
+            .with_prompt_cache(self.prompt_cache_capabilities())
+            .with_streaming(true)
+    }
+
+    /// Responses mode stamps its output with the provider, protocol, model and
+    /// endpoint below (`openai_responses_request` checks replayed output
+    /// against the same values). Chat Completions output carries no provenance.
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        use api::OpenAIProviderConfig as _;
+        (self.api_mode == ApiMode::Responses).then(|| querymt::chat::ChatOutputProvenance {
+            provider: self.responses_provider().to_string(),
+            protocol: self.responses_protocol().to_string(),
+            model: self.model().to_string(),
+            endpoint: self.responses_endpoint(),
+        })
+    }
+}
+
+/// The only cache lifetime the Responses API accepts (`prompt_cache_options.ttl`).
+const RESPONSES_MAX_TTL_SECS: u32 = 1800;
+
+impl OpenAI {
+    /// Explicit breakpoints exist in Responses mode only, on an endpoint and
+    /// model that support them. Chat Completions declares nothing.
+    fn prompt_cache_capabilities(&self) -> PromptCacheCapabilities {
+        if self.api_mode == ApiMode::Responses
+            && api::OpenAIProviderConfig::supports_cache_breakpoints(self)
+        {
+            PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(RESPONSES_MAX_TTL_SECS)
+        } else {
+            PromptCacheCapabilities::NONE
+        }
     }
 }
 
@@ -292,9 +336,18 @@ impl ChatStreamParser for OpenAIStreamParser {
 ///
 /// State (response identity, terminal status, whether a local call was seen) is
 /// scoped to this parser instance, so concurrent streams never share it.
-#[derive(Default)]
 struct OpenAIResponsesStreamParser {
     state: api::OpenAIResponsesStreamState,
+}
+
+impl OpenAIResponsesStreamParser {
+    /// A parser that records `provenance` (provider identity and endpoint) on
+    /// the output it yields.
+    fn new(provenance: api::ResponsesCodecProvider) -> Self {
+        Self {
+            state: api::OpenAIResponsesStreamState::for_provider(provenance),
+        }
+    }
 }
 
 impl ChatStreamParser for OpenAIResponsesStreamParser {
@@ -393,6 +446,142 @@ mod tests {
         error::LLMError,
     };
     use serde_json::Value;
+
+    fn provider_with(model: &str, extra: serde_json::Value) -> OpenAI {
+        let mut cfg = serde_json::json!({"api_key": "test-key", "model": model});
+        cfg.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(cfg).unwrap()
+    }
+
+    #[test]
+    fn responses_declaration_follows_the_model() {
+        let provider = provider_with("gpt-5.6", serde_json::json!({"api_mode": "responses"}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(cache.explicit_breakpoints);
+        assert_eq!(cache.max_ttl_secs, Some(1800));
+    }
+
+    fn empty_responses_reply(model: &str) -> http::Response<Vec<u8>> {
+        let body = serde_json::json!({
+            "id": "resp_1", "model": model, "status": "completed", "output": []
+        });
+        http::Response::builder()
+            .status(200)
+            .body(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn responses_mode_states_the_provenance_it_stamps_on_its_output() {
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({"api_mode": "responses", "base_url": "https://llm.example.test/v1"}),
+        );
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("Responses mode stamps provenance");
+        assert_eq!(stated.provider, "openai");
+        assert_eq!(stated.protocol, "responses");
+        assert_eq!(stated.model, "gpt-5.6");
+        assert_eq!(stated.endpoint, "https://llm.example.test/v1/responses");
+
+        // It is what a reply is stamped with, not a parallel guess.
+        let output = provider
+            .parse_chat(empty_responses_reply("gpt-5.6"), Value::Null)
+            .unwrap();
+        assert_eq!(output.provenance, Some(stated));
+    }
+
+    #[test]
+    fn streamed_output_is_stamped_with_the_stated_provenance() {
+        use querymt::chat::StructuredStreamEvent;
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({"api_mode": "responses", "base_url": "https://llm.example.test/v1/"}),
+        );
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("Responses mode stamps provenance");
+        assert_eq!(stated.endpoint, "https://llm.example.test/v1/responses");
+
+        let mut parser = provider.chat_stream_parser(Value::Null).unwrap();
+        let chunks = parser
+            .parse_chunk(
+                b"data: {\"type\":\"response.created\",\"response\":\
+                  {\"id\":\"resp_1\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\"}}\n\n",
+            )
+            .unwrap();
+        let streamed = chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                    provenance: Some(provenance),
+                    ..
+                }) => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect("the stream's metadata carries provenance");
+        assert_eq!(streamed, stated);
+    }
+
+    #[test]
+    fn a_different_base_url_states_a_different_endpoint() {
+        let at = |url: &str| {
+            HTTPChatProvider::output_provenance(&provider_with(
+                "gpt-5.6",
+                serde_json::json!({"api_mode": "responses", "base_url": url}),
+            ))
+            .unwrap()
+            .endpoint
+        };
+        assert_ne!(
+            at("https://one.example.test/v1"),
+            at("https://two.example.test/v1")
+        );
+    }
+
+    #[test]
+    fn chat_completions_mode_states_no_provenance() {
+        let provider = provider_with("gpt-5.6", serde_json::json!({}));
+        assert_eq!(HTTPChatProvider::output_provenance(&provider), None);
+    }
+
+    #[test]
+    fn model_without_breakpoint_support_declares_none() {
+        let provider = provider_with("gpt-5.4", serde_json::json!({"api_mode": "responses"}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(!cache.explicit_breakpoints);
+        assert_eq!(cache.max_ttl_secs, None);
+    }
+
+    #[test]
+    fn chat_completions_declares_no_breakpoints_even_for_a_new_model() {
+        let provider = provider_with("gpt-5.6", serde_json::json!({}));
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert_eq!(cache, super::PromptCacheCapabilities::NONE);
+    }
+
+    #[test]
+    fn compatible_endpoint_declares_no_breakpoints_unless_overridden() {
+        let url = "https://llm.example.test/v1";
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({"api_mode": "responses", "base_url": url}),
+        );
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(!cache.explicit_breakpoints);
+
+        let provider = provider_with(
+            "gpt-5.6",
+            serde_json::json!({
+                "api_mode": "responses",
+                "base_url": url,
+                "supports_prompt_cache_breakpoints": true
+            }),
+        );
+        let cache = HTTPChatProvider::capabilities(&provider).prompt_cache;
+        assert!(cache.explicit_breakpoints);
+    }
 
     #[test]
     fn api_mode_defaults_to_chat_completions_when_omitted() {

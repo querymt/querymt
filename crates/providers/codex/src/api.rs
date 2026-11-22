@@ -856,7 +856,8 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                         CodexAttachment::File(file) => CodexInputContent::InputFile(file),
                     });
                 }
-                ChatInputPart::ToolResult(_) => {}
+                // Tool changes are rejected by the host adapter (no `tool_updates`).
+                ChatInputPart::ToolResult(_) | ChatInputPart::ToolChange(_) => {}
             }
         }
 

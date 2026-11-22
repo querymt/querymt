@@ -51,6 +51,7 @@ async-trait.workspace = true
 http.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+strum.workspace = true
 log.workspace = true
 tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
 serde.workspace = true
@@ -74,6 +75,7 @@ rmcp = { version = "3.11", features = ["client", "transport-child-process", "tra
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+sync_wrapper = "1.0"
 toml.workspace = true
 minijinja = { version = "3", default-features = false, features = ["serde"] }
 iana-time-zone = "0.1"

@@ -30,21 +30,20 @@
 //! min_lines = 5
 //! ```
 
+#[cfg(test)]
+use crate::middleware::ToolResult;
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{
-    ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult,
-};
+use crate::middleware::{EndVerdict, HookCx, Middleware, Result, TurnInfo, TurnMiddleware};
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 pub use querymt_agent_core::dedup::{DuplicateWarning, FunctionLocation, SimilarMatch};
 use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::model::NoticeSource;
 use querymt_agent_index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
 use querymt_agent_index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
 use querymt_agent_services::event_sink::EventSink;
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Mutex;
 use tracing::instrument;
 
 /// Maximum number of warnings shown inline in the injected summary message.
@@ -89,6 +88,7 @@ fn similar_match(m: &SimilarFunctionMatch) -> SimilarMatch {
 }
 
 /// Middleware that checks for duplicate/similar code after file mutations
+#[derive(Clone)]
 pub struct DedupCheckMiddleware {
     /// Whether duplicate detection is enabled
     enabled: bool,
@@ -96,14 +96,8 @@ pub struct DedupCheckMiddleware {
     threshold: f64,
     /// Minimum number of lines for a function to be analyzed
     min_lines: usize,
-    /// Accumulated tool results from the current batch (reset each cycle)
-    pending_results: Arc<Mutex<Vec<ToolResult>>>,
     /// Optional event sink for emitting duplicate detection events
     event_sink: Option<Arc<EventSink>>,
-    /// Guard to prevent multiple reviews in the same turn
-    already_reviewed_this_turn: AtomicBool,
-    /// Last context seen, used for building BeforeLlmCall state in on_turn_end
-    last_context: Arc<Mutex<Option<Arc<ConversationContext>>>>,
 }
 
 impl Default for DedupCheckMiddleware {
@@ -124,10 +118,7 @@ impl DedupCheckMiddleware {
             enabled: true,
             threshold: 0.8,
             min_lines: 5,
-            pending_results: Arc::new(Mutex::new(Vec::new())),
             event_sink: None,
-            already_reviewed_this_turn: AtomicBool::new(false),
-            last_context: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -599,105 +590,68 @@ impl DedupCheckMiddleware {
     }
 }
 
-#[async_trait]
-impl MiddlewareDriver for DedupCheckMiddleware {
-    /// Capture the latest context for use in on_turn_end
-    async fn on_after_llm(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        // Capture the latest context for use in on_turn_end
-        if let Some(ctx) = state.context() {
-            *self.last_context.lock().await = Some(ctx.clone());
-        }
-        Ok(state)
+impl Middleware for DedupCheckMiddleware {
+    fn name(&self) -> &'static str {
+        "DedupCheckMiddleware"
     }
 
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(DedupCheckTurn {
+            check: self.clone(),
+            reviewed: false,
+        })
+    }
+}
+
+/// The review of one run. It happens once per run, whichever way the run's
+/// first end turns out.
+struct DedupCheckTurn {
+    check: DedupCheckMiddleware,
+    reviewed: bool,
+}
+
+#[async_trait]
+impl TurnMiddleware for DedupCheckTurn {
     #[instrument(
         name = "middleware.dedup_check.turn_end",
-        skip(self, state, runtime),
+        skip(self, cx),
         fields(
-            input_state = %state.name(),
-            output_state = tracing::field::Empty,
             files_checked = tracing::field::Empty,
             duplicates_found = tracing::field::Empty,
             review_injected = tracing::field::Empty
         )
     )]
-    async fn on_turn_end(
-        &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        log::debug!(
-            "DedupCheckMiddleware: on_turn_end called, state={}",
-            state.name()
-        );
-
-        if !self.enabled {
+    async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict> {
+        if !self.check.enabled {
             log::debug!("DedupCheckMiddleware: skipping — disabled");
-            tracing::Span::current().record("output_state", state.name());
-            return Ok(state);
+            return Ok(EndVerdict::Finish);
         }
 
-        // Only run on Complete state
-        if !matches!(state, ExecutionState::Complete { .. }) {
-            log::debug!(
-                "DedupCheckMiddleware: skipping — state is {} (not Complete)",
-                state.name()
-            );
-            tracing::Span::current().record("output_state", state.name());
-            return Ok(state);
+        // Guard: only review once per run
+        if std::mem::replace(&mut self.reviewed, true) {
+            log::debug!("DedupCheckMiddleware: skipping — already reviewed this run");
+            return Ok(EndVerdict::Finish);
         }
 
-        // Guard: only review once per turn
-        if self.already_reviewed_this_turn.swap(true, Ordering::SeqCst) {
-            log::debug!("DedupCheckMiddleware: skipping — already reviewed this turn");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
-        }
-
-        // Get the last context for building BeforeLlmCall state
-        let last_context = self.last_context.lock().await.clone();
-        let Some(context) = last_context else {
-            log::debug!("DedupCheckMiddleware: skipping — no last_context captured");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
-        };
-
-        // Get function_index and turn_diffs from the runtime parameter
-        let Some(runtime) = runtime else {
-            log::debug!("DedupCheckMiddleware: skipping — no runtime provided");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
-        };
-
+        let runtime = cx.runtime();
         let workspace = runtime.workspace_handle.get().cloned();
         let Some(workspace) = workspace else {
             log::debug!(
                 "DedupCheckMiddleware: skipping — workspace index not ready yet \
                 (index is still initializing in the background)"
             );
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
+            return Ok(EndVerdict::Finish);
         };
 
-        // Get and clear turn_diffs
-        let turn_diffs = {
-            let mut diffs = runtime.turn_diffs.lock();
-            let accumulated = diffs.clone();
-            *diffs = DiffPaths::default();
-            accumulated
-        };
+        // What this run changed; the run is reviewed once, on these changes.
+        let turn_diffs = cx.changed_paths().clone();
 
         if turn_diffs.is_empty() {
             log::debug!("DedupCheckMiddleware: skipping — no file changes in this turn");
             tracing::Span::current().record("files_checked", 0usize);
             tracing::Span::current().record("duplicates_found", 0usize);
             tracing::Span::current().record("review_injected", false);
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
+            return Ok(EndVerdict::Finish);
         }
 
         // Record the number of files being checked
@@ -705,96 +659,86 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         tracing::Span::current().record("files_checked", files_checked);
 
         // Check for duplicates
-        let mut warnings = self.check_for_duplicates(&workspace, &turn_diffs).await;
+        let mut warnings = self
+            .check
+            .check_for_duplicates(&workspace, &turn_diffs)
+            .await;
 
         // Filter out moved functions
-        warnings = self.filter_moved_functions(warnings, &turn_diffs);
+        warnings = self.check.filter_moved_functions(warnings, &turn_diffs);
 
         // Record duplicates found
         tracing::Span::current().record("duplicates_found", warnings.len());
 
         // Update the index with new/modified functions
-        self.update_index(&workspace, &turn_diffs).await;
+        self.check.update_index(&workspace, &turn_diffs).await;
 
-        // If duplicates found after filtering, write overflow report and inject compact summary
-        if !warnings.is_empty() {
-            log::info!(
-                "DedupCheckMiddleware: Found {} duplicate code warnings in turn review",
-                warnings.len()
+        if warnings.is_empty() {
+            tracing::Span::current().record("review_injected", false);
+            return Ok(EndVerdict::Finish);
+        }
+
+        // Duplicates found after filtering: write overflow report and queue a compact summary
+        log::info!(
+            "DedupCheckMiddleware: Found {} duplicate code warnings in turn review",
+            warnings.len()
+        );
+
+        // Workspace root for path relativisation
+        let workspace_root: Option<std::path::PathBuf> =
+            workspace.file_index().map(|fi| fi.root.clone());
+
+        // 1. Write the full line-indexed overflow report to a temp file
+        let overflow = DedupCheckMiddleware::write_overflow_report(
+            &warnings,
+            cx.session_id(),
+            workspace_root.as_deref(),
+        );
+        let (overflow_path_opt, offsets) = match overflow {
+            Some((path, offs)) => (Some(path), offs),
+            None => (
+                None,
+                vec![WarningOffset { line: 0, length: 0 }; warnings.len()],
+            ),
+        };
+
+        // 2. Compact warnings for the event payload (no body_text, capped matches)
+        let compacted = DedupCheckMiddleware::compact_warnings(&warnings);
+
+        // 3. Emit event with compacted warnings + overflow path.
+        // Intentionally ephemeral (transport-only) because payload
+        // references temporary overflow files that won't survive restart.
+        if let Some(ref event_sink) = self.check.event_sink {
+            event_sink.emit_ephemeral(
+                cx.session_id(),
+                AgentEventKind::DuplicateCodeDetected {
+                    warnings: compacted,
+                    overflow_path: overflow_path_opt.as_ref().map(|p| p.display().to_string()),
+                },
             );
+        }
 
-            // Workspace root for path relativisation
-            let workspace_root: Option<std::path::PathBuf> =
-                workspace.file_index().map(|fi| fi.root.clone());
-
-            // 1. Write the full line-indexed overflow report to a temp file
-            let overflow = Self::write_overflow_report(
+        // 4. Build the compact summary message for the LLM (~5KB)
+        let summary = if let Some(ref path) = overflow_path_opt {
+            DedupCheckMiddleware::format_compact_summary(
                 &warnings,
-                &context.session_id,
+                &offsets,
+                path,
                 workspace_root.as_deref(),
-            );
-            let (overflow_path_opt, offsets) = match overflow {
-                Some((path, offs)) => (Some(path), offs),
-                None => (
-                    None,
-                    vec![WarningOffset { line: 0, length: 0 }; warnings.len()],
-                ),
-            };
+            )
+        } else {
+            // Fallback: overflow write failed — queue a minimal summary
+            format!(
+                "\n📋 CODE REVIEW: {} potential duplicate(s) found.\n\
+                 ACTION: Review recently written functions for duplication.\n",
+                warnings.len()
+            )
+        };
 
-            // 2. Compact warnings for the event payload (no body_text, capped matches)
-            let compacted = Self::compact_warnings(&warnings);
-
-            // 3. Emit event with compacted warnings + overflow path.
-            // Intentionally ephemeral (transport-only) because payload
-            // references temporary overflow files that won't survive restart.
-            if let Some(ref event_sink) = self.event_sink {
-                event_sink.emit_ephemeral(
-                    context.session_id.as_ref(),
-                    AgentEventKind::DuplicateCodeDetected {
-                        warnings: compacted,
-                        overflow_path: overflow_path_opt.as_ref().map(|p| p.display().to_string()),
-                    },
-                );
-            }
-
-            // 4. Build the compact summary message for the LLM (~5KB)
-            let summary = if let Some(ref path) = overflow_path_opt {
-                Self::format_compact_summary(&warnings, &offsets, path, workspace_root.as_deref())
-            } else {
-                // Fallback: overflow write failed — inject a minimal summary
-                format!(
-                    "\n📋 CODE REVIEW: {} potential duplicate(s) found.\n\
-                     ACTION: Review recently written functions for duplication.\n",
-                    warnings.len()
-                )
-            };
-
-            // 5. Inject the compact summary into a new context
-            let new_context = Arc::new(context.inject_message(summary));
-
-            tracing::Span::current().record("review_injected", true);
-            tracing::Span::current().record("output_state", "BeforeLlmCall");
-            return Ok(ExecutionState::BeforeLlmCall {
-                context: new_context,
-            });
-        }
-
-        tracing::Span::current().record("review_injected", false);
-        tracing::Span::current().record("output_state", "Complete");
-        Ok(state)
-    }
-
-    fn reset(&self) {
-        // Reset review guard and clear accumulated results
-        self.already_reviewed_this_turn
-            .store(false, Ordering::SeqCst);
-        if let Ok(mut pending) = self.pending_results.try_lock() {
-            pending.clear();
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "DedupCheckMiddleware"
+        // 5. Queue the summary and ask for another request
+        cx.queue_notice(NoticeSource::DuplicateCode, summary);
+        tracing::Span::current().record("review_injected", true);
+        Ok(EndVerdict::Continue)
     }
 }
 
@@ -810,7 +754,7 @@ impl MiddlewareFactory for DedupCheckFactory {
         &self,
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> AnyhowResult<Option<Arc<dyn Middleware>>> {
         // Check if explicitly disabled
         if !crate::middleware::enabled_flag(config)? {
             return Ok(None);

@@ -76,7 +76,7 @@ impl ToolTrait for DeleteFileTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidRequest("path is required".to_string()))?;
 
-        let path = context.resolve_path(path_arg)?;
+        let path = context.resolve_path_arg("path", path_arg)?;
 
         if !path.exists() {
             return Err(ToolError::InvalidRequest(format!(

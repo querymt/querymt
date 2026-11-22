@@ -29,11 +29,10 @@
 //! # enabled = false
 //! ```
 
-use crate::agent::core::SessionRuntime;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
-    ExecutionState, MiddlewareDriver, PreparedBatch, PreparedCallVerdict, Result, ToolCall,
-    ToolResult,
+    HookCx, Middleware, PreparedBatch, PreparedCallVerdict, Result, ToolCall, ToolResult, TurnInfo,
+    TurnMiddleware,
 };
 use crate::tools::{FileAccess, ToolRegistry};
 use anyhow::Result as AnyhowResult;
@@ -42,9 +41,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::model::NoticeSource;
 use querymt_agent_services::event_sink::EventSink;
 
 /// How the guard reacts to a flagged batch.
@@ -83,8 +83,6 @@ pub struct ParallelEditGuard {
     /// Where warnings are published for UIs; set by `bind_agent`.
     events: ArcSwapOption<EventSink>,
     mode: ParallelEditMode,
-    /// Guidance waiting to be injected, keyed by session id.
-    pending: Mutex<HashMap<String, String>>,
 }
 
 impl ParallelEditGuard {
@@ -93,7 +91,6 @@ impl ParallelEditGuard {
             registry: ArcSwap::new(registry.into()),
             events: ArcSwapOption::empty(),
             mode,
-            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,18 +101,6 @@ impl ParallelEditGuard {
     /// The registry currently in use (shared, not copied).
     pub fn registry(&self) -> Arc<ToolRegistry> {
         self.registry.load_full()
-    }
-
-    /// Tell UIs about a flagged batch. Never waits for the event journal.
-    fn notify(&self, session_id: &str, message: String) {
-        if let Some(sink) = self.events.load_full() {
-            sink.session_stream(session_id)
-                .emit(AgentEventKind::HookNotice {
-                    event_name: "parallel_edit_guard".to_string(),
-                    message,
-                    is_error: false,
-                });
-        }
     }
 
     /// Distinct written paths of one call, in declaration order.
@@ -221,72 +206,52 @@ impl ParallelEditGuard {
         )
         .with_execution(true, "parallel_edit_guard")
     }
+}
 
-    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl Middleware for ParallelEditGuard {
+    fn name(&self) -> &'static str {
+        "ParallelEditGuard"
     }
 
-    /// Drop a note that was never delivered (cancelled or ended turn).
-    fn discard_pending(&self, state: &ExecutionState) {
-        if let Some(context) = state.context() {
-            self.lock_pending().remove(&*context.session_id);
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(ParallelEditTurn {
+            mode: self.mode,
+            events: self.events.load_full(),
+        })
+    }
+
+    fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {
+        self.registry.store(Arc::clone(registry));
+        self.events.store(Some(Arc::clone(events)));
+    }
+}
+
+/// The review of one run. It keeps no state: a flagged batch queues its
+/// guidance at once, and a run that ends first never delivers it.
+struct ParallelEditTurn {
+    mode: ParallelEditMode,
+    events: Option<Arc<EventSink>>,
+}
+
+impl ParallelEditTurn {
+    /// Tell UIs about a flagged batch. Never waits for the event journal.
+    fn notify(&self, session_id: &str, message: String) {
+        if let Some(sink) = &self.events {
+            sink.session_stream(session_id)
+                .emit(AgentEventKind::HookNotice {
+                    event_name: "parallel_edit_guard".to_string(),
+                    message,
+                    is_error: false,
+                });
         }
     }
 }
 
 #[async_trait]
-impl MiddlewareDriver for ParallelEditGuard {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        // A note left over from a cancelled turn must not leak into this one.
-        self.discard_pending(&state);
-        Ok(state)
-    }
-
-    async fn on_turn_end(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        // Other middleware may turn `Complete` back into `BeforeLlmCall`; only
-        // drop the note when the turn really ends.
-        if matches!(
-            state,
-            ExecutionState::Complete { .. }
-                | ExecutionState::Stopped { .. }
-                | ExecutionState::Cancelled
-        ) {
-            self.discard_pending(&state);
-        }
-        Ok(state)
-    }
-
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { context } => {
-                let note = self.lock_pending().remove(&*context.session_id);
-                match note {
-                    Some(note) => Ok(ExecutionState::BeforeLlmCall {
-                        context: Arc::new(context.inject_message(note)),
-                    }),
-                    None => Ok(ExecutionState::BeforeLlmCall { context }),
-                }
-            }
-            other => Ok(other),
-        }
-    }
-
+impl TurnMiddleware for ParallelEditTurn {
     async fn on_prepared_tool_calls(
-        &self,
+        &mut self,
+        cx: &mut HookCx<'_>,
         batch: &PreparedBatch<'_>,
     ) -> Result<Vec<PreparedCallVerdict>> {
         let mut verdicts: Vec<PreparedCallVerdict> = batch
@@ -299,7 +264,7 @@ impl MiddlewareDriver for ParallelEditGuard {
         // (after normalisation and pre-tool hook updates), so aliased, repaired
         // and hook-redirected targets are judged by where they will write.
         let accesses: Vec<&FileAccess> = batch.calls.iter().map(|c| c.access).collect();
-        let flagged = Self::detect(&accesses);
+        let flagged = ParallelEditGuard::detect(&accesses);
         if flagged.is_empty() {
             return Ok(verdicts);
         }
@@ -307,16 +272,17 @@ impl MiddlewareDriver for ParallelEditGuard {
 
         match self.mode {
             ParallelEditMode::Warn => {
-                let note = Self::warn_note(&flagged, cwd);
                 self.notify(
                     batch.session_id,
                     format!(
                         "Several calls modified the same file in one response: {}. They ran in order; `multiedit` was recommended.",
-                        Self::summary(&flagged, cwd)
+                        ParallelEditGuard::summary(&flagged, cwd)
                     ),
                 );
-                self.lock_pending()
-                    .insert(batch.session_id.to_string(), note);
+                cx.queue_notice(
+                    NoticeSource::ParallelEdit,
+                    ParallelEditGuard::warn_note(&flagged, cwd),
+                );
             }
             ParallelEditMode::Deny => {
                 let flagged_by_path: HashMap<&PathBuf, &FlaggedFile> =
@@ -324,16 +290,17 @@ impl MiddlewareDriver for ParallelEditGuard {
                 let mut claimed: HashSet<&PathBuf> = HashSet::new();
 
                 for (prepared, verdict) in batch.calls.iter().zip(verdicts.iter_mut()) {
-                    let writes: Vec<&PathBuf> = Self::call_writes(prepared.access)
+                    let writes: Vec<&PathBuf> = ParallelEditGuard::call_writes(prepared.access)
                         .into_iter()
                         .filter(|path| flagged_by_path.contains_key(path))
                         .collect();
                     if let Some(conflict) = writes.iter().find(|path| claimed.contains(**path)) {
-                        *verdict = PreparedCallVerdict::Reject(Box::new(Self::deny_result(
-                            prepared.call,
-                            prepared.args,
-                            Self::deny_message(flagged_by_path[*conflict], cwd),
-                        )));
+                        *verdict =
+                            PreparedCallVerdict::Reject(Box::new(ParallelEditGuard::deny_result(
+                                prepared.call,
+                                prepared.args,
+                                ParallelEditGuard::deny_message(flagged_by_path[*conflict], cwd),
+                            )));
                     } else {
                         claimed.extend(writes);
                     }
@@ -343,25 +310,12 @@ impl MiddlewareDriver for ParallelEditGuard {
                     batch.session_id,
                     format!(
                         "Rejected redundant same-file writes in one response: {}. Only the first write per file ran.",
-                        Self::summary(&flagged, cwd)
+                        ParallelEditGuard::summary(&flagged, cwd)
                     ),
                 );
             }
         }
         Ok(verdicts)
-    }
-
-    fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {
-        self.registry.store(Arc::clone(registry));
-        self.events.store(Some(Arc::clone(events)));
-    }
-
-    fn reset(&self) {
-        self.lock_pending().clear();
-    }
-
-    fn name(&self) -> &'static str {
-        "ParallelEditGuard"
     }
 }
 
@@ -377,7 +331,7 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
         &self,
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> AnyhowResult<Option<Arc<dyn Middleware>>> {
         if !crate::middleware::enabled_flag(config)? {
             return Ok(None);
         }
@@ -404,7 +358,8 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{AgentStats, ConversationContext, ToolFunction};
+    use crate::middleware::{ToolFunction, TurnInfo};
+    use crate::test_utils::HookRig;
     use crate::tools::builtins::{EditTool, MultiEditTool, ReadTool, ShellTool};
     use serde_json::json;
     use tempfile::TempDir;
@@ -418,14 +373,32 @@ mod tests {
         registry
     }
 
-    fn context() -> Arc<ConversationContext> {
-        Arc::new(ConversationContext::new(
-            "s1".into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ))
+    /// One run of a guard: its per-run state and the rig its notices go to.
+    struct Run {
+        turn: Box<dyn TurnMiddleware>,
+        rig: HookRig,
+    }
+
+    impl Run {
+        fn new(guard: &ParallelEditGuard) -> Self {
+            Self::new_for(guard)
+        }
+
+        fn new_for(middleware: &(impl Middleware + ?Sized)) -> Self {
+            Self {
+                turn: middleware
+                    .begin_turn(&TurnInfo::new("s1", crate::agent::core::AgentMode::Build)),
+                rig: HookRig::at_step("s1", 0),
+            }
+        }
+
+        async fn review(&mut self, batch: &PreparedBatch<'_>) -> Vec<PreparedCallVerdict> {
+            let mut cx = self.rig.cx();
+            self.turn
+                .on_prepared_tool_calls(&mut cx, batch)
+                .await
+                .unwrap()
+        }
     }
 
     fn call(id: &str, name: &str, args: Value) -> ToolCall {
@@ -479,14 +452,13 @@ mod tests {
                 |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
             )
             .collect();
-        guard
-            .on_prepared_tool_calls(&PreparedBatch {
+        Run::new(guard)
+            .review(&PreparedBatch {
                 session_id,
                 cwd: None,
                 calls: &views,
             })
             .await
-            .unwrap()
     }
 
     async fn review(guard: &ParallelEditGuard, calls: &[ToolCall]) -> Vec<PreparedCallVerdict> {
@@ -574,72 +546,72 @@ mod tests {
         assert!(detect_in(&guard, &calls).await.is_empty());
     }
 
+    /// Declare access for `calls` and review them in `run`, as `review_in` does.
+    async fn review_run(run: &mut Run, calls: &[ToolCall]) -> Vec<PreparedCallVerdict> {
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
+        let args: Vec<Value> = calls.iter().map(effective_args).collect();
+        let accesses = guard
+            .registry()
+            .file_access_batch(
+                calls
+                    .iter()
+                    .zip(&args)
+                    .map(|(call, args)| (call.function.name.clone(), args.clone()))
+                    .collect(),
+                None,
+            )
+            .await;
+        let views: Vec<crate::middleware::PreparedToolCall<'_>> = calls
+            .iter()
+            .zip(&args)
+            .zip(&accesses)
+            .map(
+                |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
+            )
+            .collect();
+        run.review(&PreparedBatch {
+            session_id: "s1",
+            cwd: None,
+            calls: &views,
+        })
+        .await
+    }
+
     #[tokio::test]
-    async fn warn_mode_passes_state_through_and_injects_once_after_results() {
+    async fn warn_mode_runs_every_call_and_queues_one_note() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
+        let mut run = Run::new(&guard);
         let calls = vec![
             edit("1", &root.join("design.md")),
             edit("2", &root.join("design.md")),
         ];
 
-        let (proceed, rejected) = split(&calls, review(&guard, &calls).await);
+        let (proceed, rejected) = split(&calls, review_run(&mut run, &calls).await);
+
         assert_eq!(proceed, ["1", "2"], "warn mode runs every call");
         assert!(rejected.is_empty());
-
-        // The step after the tool results gets the note appended as the last message.
-        let before = ExecutionState::BeforeLlmCall { context: context() };
-        let out = guard.on_step_start(before, None).await.unwrap();
-        let ExecutionState::BeforeLlmCall { context } = out else {
-            panic!("expected BeforeLlmCall");
-        };
-        assert_eq!(context.messages.len(), 1);
-        let text = context.messages.last().unwrap().text();
+        // The note is queued on the run; the loop stores it after the results.
+        assert_eq!(run.rig.pending.len(), 1);
+        assert_eq!(
+            run.rig.pending[0].source,
+            querymt_agent_core::model::NoticeSource::ParallelEdit
+        );
+        let text = run.rig.pending[0].content.clone();
         assert!(text.contains("design.md"), "{text}");
         assert!(text.contains("multiedit"), "{text}");
-
-        // Second request: nothing more is injected.
-        let before = ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        };
-        let ExecutionState::BeforeLlmCall { context: again } =
-            guard.on_step_start(before, None).await.unwrap()
-        else {
-            panic!("expected BeforeLlmCall");
-        };
-        assert_eq!(again.messages.len(), 1);
     }
 
     #[tokio::test]
-    async fn warn_mode_without_conflict_injects_nothing() {
+    async fn warn_mode_without_conflict_queues_nothing() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
+        let mut run = Run::new(&guard);
         let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("b.md"))];
-        review(&guard, &calls).await;
 
-        let before = ExecutionState::BeforeLlmCall { context: context() };
-        let ExecutionState::BeforeLlmCall { context } =
-            guard.on_step_start(before, None).await.unwrap()
-        else {
-            panic!("expected BeforeLlmCall");
-        };
-        assert!(context.messages.is_empty());
-    }
+        review_run(&mut run, &calls).await;
 
-    #[tokio::test]
-    async fn reset_clears_pending_note() {
-        let (_dir, root) = temp_root();
-        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        flag_same_file(&guard, &root).await;
-        guard.reset();
-
-        let before = ExecutionState::BeforeLlmCall { context: context() };
-        let ExecutionState::BeforeLlmCall { context } =
-            guard.on_step_start(before, None).await.unwrap()
-        else {
-            panic!("expected BeforeLlmCall");
-        };
-        assert!(context.messages.is_empty());
+        assert!(run.rig.pending.is_empty());
     }
 
     /// Review a pair whose *raw* arguments and *effective* access disagree.
@@ -662,14 +634,13 @@ mod tests {
                 |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
             )
             .collect();
-        guard
-            .on_prepared_tool_calls(&PreparedBatch {
+        Run::new(guard)
+            .review(&PreparedBatch {
                 session_id: "s1",
                 cwd: None,
                 calls: &views,
             })
             .await
-            .unwrap()
     }
 
     #[tokio::test]
@@ -704,71 +675,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warn_mode_notes_use_the_session_of_the_batch() {
-        let (_dir, root) = temp_root();
-        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
-        review_in(&guard, "other-session", &calls).await;
-
-        // The note is delivered to the batch's session only.
-        assert_eq!(injected_messages(&guard).await, 0);
-        let before = ExecutionState::BeforeLlmCall {
-            context: Arc::new(ConversationContext::new(
-                "other-session".into(),
-                Arc::from([]),
-                Arc::new(AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )),
-        };
-        let ExecutionState::BeforeLlmCall { context } =
-            guard.on_step_start(before, None).await.unwrap()
-        else {
-            panic!("expected BeforeLlmCall");
-        };
-        assert_eq!(context.messages.len(), 1);
-    }
-
-    async fn flag_same_file(guard: &ParallelEditGuard, root: &Path) {
-        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
-        review(guard, &calls).await;
-    }
-
-    async fn injected_messages(guard: &ParallelEditGuard) -> usize {
-        let before = ExecutionState::BeforeLlmCall { context: context() };
-        let ExecutionState::BeforeLlmCall { context } =
-            guard.on_step_start(before, None).await.unwrap()
-        else {
-            panic!("expected BeforeLlmCall");
-        };
-        context.messages.len()
-    }
-
-    #[tokio::test]
-    async fn pending_note_is_dropped_at_turn_start_and_turn_end() {
-        let (_dir, root) = temp_root();
-        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-
-        // Turn start drops a note left by a cancelled turn.
-        flag_same_file(&guard, &root).await;
-        let start = ExecutionState::BeforeLlmCall { context: context() };
-        guard.on_turn_start(start, None).await.unwrap();
-        assert_eq!(injected_messages(&guard).await, 0);
-
-        // Turn end (Complete) drops an undelivered note.
-        flag_same_file(&guard, &root).await;
-        let end = ExecutionState::Complete { context: context() };
-        guard.on_turn_end(end, None).await.unwrap();
-        assert_eq!(injected_messages(&guard).await, 0);
-
-        // A BeforeLlmCall at turn end (another middleware asked to continue) keeps it.
-        flag_same_file(&guard, &root).await;
-        let cont = ExecutionState::BeforeLlmCall { context: context() };
-        guard.on_turn_end(cont, None).await.unwrap();
-        assert_eq!(injected_messages(&guard).await, 1);
-    }
-
-    #[tokio::test]
     async fn bind_agent_replaces_the_registry() {
         let (_dir, root) = temp_root();
         // Starts with no tools: nothing is detected.
@@ -798,7 +704,7 @@ mod tests {
         ));
         let config = (*agent.config)
             .clone()
-            .with_middleware(vec![guard.clone() as Arc<dyn MiddlewareDriver>]);
+            .with_middleware(vec![guard.clone() as Arc<dyn Middleware>]);
         assert!(Arc::ptr_eq(&guard.registry(), &config.tool_registry));
     }
 
@@ -904,13 +810,13 @@ mod tests {
         assert_eq!(ParallelEditMode::parse("block"), None);
     }
 
-    async fn run_factory(config: Value) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
+    async fn run_factory(config: Value) -> AnyhowResult<Option<Arc<dyn Middleware>>> {
         let agent = crate::test_utils::TestAgent::new().await;
         ParallelEditGuardFactory.create(&config, &agent.config)
     }
 
     /// Whether the driver rejects the second same-file edit (deny) or not (warn).
-    async fn denies_second_edit(driver: &Arc<dyn MiddlewareDriver>) -> bool {
+    async fn denies_second_edit(driver: &Arc<dyn Middleware>) -> bool {
         let (_dir, root) = temp_root();
         let calls = [edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
         let args: Vec<Value> = calls.iter().map(effective_args).collect();
@@ -932,14 +838,13 @@ mod tests {
                 |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
             )
             .collect();
-        let verdicts = driver
-            .on_prepared_tool_calls(&PreparedBatch {
+        let verdicts = Run::new_for(&**driver)
+            .review(&PreparedBatch {
                 session_id: "s1",
                 cwd: None,
                 calls: &views,
             })
-            .await
-            .unwrap();
+            .await;
         matches!(verdicts[0], PreparedCallVerdict::Proceed)
             && matches!(verdicts[1], PreparedCallVerdict::Reject(_))
     }

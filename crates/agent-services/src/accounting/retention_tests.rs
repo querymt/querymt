@@ -35,6 +35,8 @@ fn request_end(accounting: Option<crate::accounting::RequestAccounting>) -> Agen
         context_tokens: 0,
         metrics: ExecutionMetrics { steps: 1, turns: 1 },
         accounting,
+        prefix_change: None,
+        idle_secs: None,
     }
 }
 

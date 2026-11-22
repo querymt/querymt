@@ -16,7 +16,7 @@ use crate::delegation::roster::AgentRoster;
 use crate::hooks::Hooks;
 use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware,
-    MiddlewareDriver,
+    Middleware,
 };
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
@@ -51,7 +51,7 @@ pub struct AgentConfigBuilder {
     tool_config: ToolConfig,
     tool_registry: ToolRegistry,
     skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
-    middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    middleware_drivers: Vec<Arc<dyn Middleware>>,
     auth_methods: Vec<AuthMethod>,
     roster: Option<Arc<AgentRoster>>,
     delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
@@ -328,13 +328,13 @@ impl AgentConfigBuilder {
     }
 
     /// Adds a single middleware.
-    pub fn with_middleware<M: MiddlewareDriver + 'static>(mut self, middleware: M) -> Self {
+    pub fn with_middleware<M: Middleware + 'static>(mut self, middleware: M) -> Self {
         self.middleware_drivers.push(Arc::new(middleware));
         self
     }
 
     /// Adds multiple middlewares.
-    pub fn with_middlewares(mut self, middlewares: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+    pub fn with_middlewares(mut self, middlewares: Vec<Arc<dyn Middleware>>) -> Self {
         self.middleware_drivers.extend(middlewares);
         self
     }
@@ -534,6 +534,8 @@ impl AgentConfigBuilder {
 
     /// Sets the full execution policy at once (tool output, pruning, compaction, rate limit).
     pub fn with_execution_policy(mut self, policy: RuntimeExecutionPolicy) -> Self {
+        self.provider
+            .set_cache_ttl_secs(policy.prompt_cache.ttl_secs);
         self.execution_policy = policy;
         self
     }
@@ -625,12 +627,12 @@ impl AgentConfigBuilder {
     }
 
     /// Mutably push a middleware driver (for quorum helper function).
-    pub fn push_middleware(&mut self, driver: Arc<dyn MiddlewareDriver>) {
+    pub fn push_middleware(&mut self, driver: Arc<dyn Middleware>) {
         self.middleware_drivers.push(driver);
     }
 
     /// Clone of the middleware drivers pushed so far.
-    pub fn middleware_snapshot(&self) -> Vec<Arc<dyn MiddlewareDriver>> {
+    pub fn middleware_snapshot(&self) -> Vec<Arc<dyn Middleware>> {
         self.middleware_drivers.clone()
     }
 
@@ -707,6 +709,20 @@ mod tests {
     async fn default_mode_is_build() {
         let (builder, _td) = make_builder().await;
         assert_eq!(builder.default_mode_value(), AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_lifetime_reaches_the_session_provider() {
+        let (builder, _td) = make_builder().await;
+        assert_eq!(builder.provider.cache_ttl_secs(), 0);
+
+        let mut policy = RuntimeExecutionPolicy::default();
+        policy.prompt_cache.ttl_secs = 3600;
+        let builder = builder.with_execution_policy(policy);
+
+        assert_eq!(builder.provider.cache_ttl_secs(), 3600);
+        // Clones of the provider (one per session) see the same setting.
+        assert_eq!(builder.provider.as_ref().clone().cache_ttl_secs(), 3600);
     }
 
     #[tokio::test]
@@ -948,7 +964,7 @@ mod tests {
     async fn with_middlewares_adds_multiple() {
         use crate::middleware::{LimitsConfig, LimitsMiddleware};
         let (builder, _td) = make_builder().await;
-        let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![
+        let drivers: Vec<Arc<dyn Middleware>> = vec![
             Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
             Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
         ];

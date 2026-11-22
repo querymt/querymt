@@ -459,28 +459,48 @@ pub enum VerificationType {
 
 ## Middleware
 
-### MiddlewareDriver
+### Middleware and TurnMiddleware
 
 ```rust
-pub trait MiddlewareDriver: Send + Sync {
-    fn name(&self) -> &str;
-    fn process_request(&self, request: &mut Request) -> Result<()>;
-    fn process_response(&self, response: &mut Response) -> Result<()>;
-    fn process_tool_call(&self, tool_call: &mut ToolCall) -> Result<()>;
-    fn process_tool_result(&self, result: &mut ToolResult) -> Result<()>;
+/// Agent-scoped: configuration and shared services.
+pub trait Middleware: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn begin_turn(&self, turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware>;
+    fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {}
+    fn limits(&self) -> Option<SessionLimits> { None }
+    fn budget_pricing(&self) -> Option<ModelPricing> { None }
 }
+
+/// One per run; all run state lives in `self`.
+#[async_trait]
+pub trait TurnMiddleware: Send {
+    async fn on_turn_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict>;
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict>;
+    async fn on_after_llm(&mut self, cx: &mut HookCx<'_>, reply: &LlmResponse) -> Result<ReplyVerdict>;
+    async fn on_prepared_tool_calls(&mut self, cx: &mut HookCx<'_>, batch: &PreparedBatch<'_>)
+        -> Result<Vec<PreparedCallVerdict>>;
+    async fn on_turn_end(&mut self, cx: &mut HookCx<'_>) -> Result<EndVerdict>;
+    async fn on_stopped(&mut self, cx: &mut HookCx<'_>, stop: &Stop) -> Result<StopVerdict>;
+}
+
+pub enum StepVerdict { Proceed, Stop(Stop) }
+pub enum ReplyVerdict { Proceed, Stop(Stop), Retry }
+pub enum EndVerdict { Finish, Continue, Stop(Stop) }
+pub enum StopVerdict { Pass, Recover }
 ```
+
+See the [Middleware guide](middleware.md) for what each hook may decide and for examples.
 
 ### CompositeDriver
 
 ```rust
 pub struct CompositeDriver {
-    // Chain of middleware drivers
+    // The agent's middleware, in configured order
 }
 
 impl CompositeDriver {
-    pub fn new(drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self;
-    pub fn add(&mut self, driver: Arc<dyn MiddlewareDriver>);
+    pub fn new(middleware: Vec<Arc<dyn Middleware>>) -> Self;
+    pub fn begin_turn(&self, info: &TurnInfo<'_>) -> TurnStack; // the state of one run
 }
 ```
 
@@ -531,7 +551,7 @@ pub struct AgentConfig {
     pub default_mode: Arc<Mutex<AgentMode>>,
     pub tool_config: ToolConfig,
     pub tool_registry: ToolRegistry,
-    pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    pub middleware_drivers: Vec<Arc<dyn Middleware>>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub max_steps: Option<usize>,
     pub snapshot_policy: SnapshotPolicy,

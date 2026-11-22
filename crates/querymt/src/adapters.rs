@@ -1,6 +1,9 @@
 use crate::{
     HTTPLLMProvider, LLMProvider, Tool,
-    chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream, StreamChunk},
+    chat::{
+        ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream, StreamChunk,
+        reject_tool_changes,
+    },
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -32,11 +35,30 @@ macro_rules! phase {
 
 pub struct LLMProviderFromHTTP {
     inner: Box<dyn HTTPLLMProvider>,
+    /// Provider name used in error messages.
+    name: Option<String>,
 }
 
 impl LLMProviderFromHTTP {
     pub fn new(inner: Box<dyn HTTPLLMProvider>) -> Self {
-        Self { inner }
+        Self { inner, name: None }
+    }
+
+    /// Names the provider in the errors this adapter raises.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Fails a request holding a tool-change message when the provider does
+    /// not declare `tool_updates`, so the message is never silently dropped by
+    /// a request builder that does not know it.
+    fn check_tool_changes(&self, call: &ChatCall<'_>) -> Result<(), LLMError> {
+        if self.inner.capabilities().tool_updates {
+            return Ok(());
+        }
+        reject_tool_changes(self.name.as_deref().unwrap_or("unnamed"), call.messages)
     }
 
     /// Ensure the provider's credential is fresh before building a request.
@@ -58,8 +80,13 @@ impl ChatProvider for LLMProviderFromHTTP {
         self.inner.capabilities()
     }
 
+    fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+        self.inner.output_provenance()
+    }
+
     #[cfg_attr(feature = "tracing", instrument(name = "http_adapter.chat", skip_all))]
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        self.check_tool_changes(call)?;
         self.ensure_credential_fresh().await?;
 
         let prepared = self.inner.prepare_chat_request(call, false)?;
@@ -82,6 +109,8 @@ impl ChatProvider for LLMProviderFromHTTP {
                 "Streaming not supported by underlying HTTP provider".into(),
             ));
         }
+
+        self.check_tool_changes(call)?;
 
         phase!(
             "http_adapter.credential_refresh",

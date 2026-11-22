@@ -40,6 +40,9 @@
       ],
       "type": "string"
     },
+    "provider": {
+      "type": "string"
+    },
     "session_id": {
       "type": "string"
     },
@@ -64,6 +67,7 @@
     "transcript_path",
     "cwd",
     "hook_event_name",
+    "provider",
     "model",
     "permission_mode",
     "trigger",

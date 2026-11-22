@@ -169,7 +169,7 @@ Command exit behavior is:
 - other non-zero exits, signals, and timeouts: hook infrastructure errors
 - `system_message`: emitted as a non-error durable notice and never inserted into model context
 
-`additional_context` defaults to an approximate 2500-token limit, configurable per handler with `additional_context_limit`. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every `tool_result` block in the combined result message. `context` contributions exist only in the prepared request and never mutate stored history.
+`additional_context` defaults to an approximate 2500-token limit, configurable per handler with `additional_context_limit`. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every `tool_result` block in the combined result message. `context` contributions exist only in the prepared request and never mutate stored history. They are sent in one trailing user message placed after the last cache breakpoint, so they never change the cached prefix.
 
 ### Subagent change hooks
 
@@ -274,7 +274,11 @@ The `tool_response` input remains available as flattened text. The new `tool_res
 }
 ```
 
-A `context` replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, or changes to existing tool-call identities, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.
+A `context` hook receives the durable history only: the stored messages of the session, including stored notices such as mode reminders and Stop-hook continuation messages. It does not receive the run objective or other hooks' `additional_context`, which are added to the request after the hook runs. `additional_context` from a `context` hook is sent in the trailing request message described above and is not stored; the hook must return it on every request it should apply to.
+
+On a provider that supports tool changes inside the conversation (see [Tools that change during a session](configuration.md#tools-that-change-during-a-session)), the messages a `context` hook receives can include tool-change messages: user messages whose only content is the tool definitions added or redefined and the tool names removed. A replacement must keep every one of them, unchanged and in the same order; a replacement that drops, edits or reorders one is ignored with a notice, because a tool change is stored once and a request without it would keep offering the old tools. Tool baselines are not sent as messages and never appear.
+
+A `context` replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, changes to existing tool-call identities, or changes to tool-change messages, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.
 
 ### permission_request allow
 
@@ -317,6 +321,8 @@ Expected hook output:
   }
 }
 ```
+
+For `pre_compaction` and `post_compaction`, `model` is the model the summary is requested from, and `provider` is the provider that serves it: the session's, unless `[agent.execution.compaction]` selects another (see its `provider` and `model` keys). They are the same pair the request, its cost accounting and its trace span use. When a `pre_compaction` hook supplies the summary no request is made, and both hooks still name the model that would have been asked. `post_compaction` also gets `summary_source`: `model` (the compaction model wrote it) or `hook` (a `pre_compaction` hook supplied it). A compaction whose policy names no usable model (a `provider` without a `model`, built in code: a configuration file is refused when it loads) fails before it starts and runs no hook.
 
 A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in `candidate_summary`; the last valid candidate wins. `pre_compaction.messages` contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.
 
@@ -404,7 +410,7 @@ Expected hook output:
 
 `stop` runs when a turn would normally complete (`stop_reason: "EndTurn"`). It also runs when a reply was cut off by the output-token limit and middleware recovery could not continue it (`stop_reason: "ModelTokenLimit"`), so hooks can keep unattended runs going after a cut-off. Each case has its own continuation counter against the same cap, so token-limit cut-offs do not use up the continuations available for normal end-of-turn stops. Hooks can read `stop_reason` from their input to tell the two apart.
 
-If a `stop` hook returns `"continue": false` (or `"decision": "block"`), QueryMT runs another LLM step for that turn, up to the configured cap (see below). QueryMT injects a clearly labeled runtime control message into the next LLM call, wrapped as a `<system-reminder>` block and marked as generated by the hook runtime rather than by the user.
+If a `stop` hook returns `"continue": false` (or `"decision": "block"`), QueryMT runs another LLM step for that turn, up to the configured cap (see below). QueryMT stores a clearly labeled runtime control message (a `notice` message part with source `stop_hook`) in the session history before the next LLM call, wrapped as a `<system-reminder>` block and marked as generated by the hook runtime rather than by the user. It is stored once, so it is part of the cached prefix of every later request and is visible when the session is reloaded.
 
 To avoid runaway loops, QueryMT allows at most `max_stop_hook_continuations` stop-hook continuations per turn (default `1`). When a hook asks to continue after the cap is reached, the request is ignored, the turn ends, and QueryMT publishes an error-level `hook_notice` (event `stop`) so the early end is visible. Raise the cap for long iterative runs, or set it to `0` to make stop hooks advisory only:
 

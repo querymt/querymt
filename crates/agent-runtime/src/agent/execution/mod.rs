@@ -1,11 +1,11 @@
 //! Core execution logic for the agent
 //!
-//! This module contains the main state machine loop (`execute_cycle_state_machine`)
-//! used by the kameo `SessionActor` via `ctx.spawn()`. The implementation is split
-//! across focused submodules:
+//! This module contains the run loop (`run_turn`, in `stage`) used by the kameo
+//! `SessionActor` via `ctx.spawn()`. The implementation is split across focused
+//! submodules:
 //!
-//! - `state_machine` (this file) — Main execution loop and middleware integration
-//! - `transitions` — State transition functions (BeforeLlmCall, CallLlm, AfterLlm, ProcessingToolCalls)
+//! - `stage` — The loop position (`Stage`) and the function that moves it
+//! - `transitions` — Step functions (before request, model call, after reply, tool calls)
 //! - `tool_calls` — Tool execution, permission checking, and result storage
 //! - `wait` — Event waiting and delegation completion handling
 //! - `llm_retry` — LLM retry logic with rate limit handling
@@ -39,28 +39,32 @@ fn format_stop_hook_continuation_message(
     message
 }
 
-mod llm_retry;
+pub(crate) mod cache_hints;
+mod error;
+pub(crate) use error::TurnError;
+pub(crate) mod llm_retry;
 mod maintenance;
-pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
+pub(crate) mod prefix;
+pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history_with};
 mod progress_sink;
+pub(crate) mod stage;
 mod tool_calls;
+pub(crate) mod tool_history;
 mod transitions;
+pub(crate) mod turn;
+pub use turn::ExecutionOrigin;
 mod wait;
 mod wave_plan;
+pub(crate) use stage::{Stage, Step, resolve_model, resolve_model_once, run_turn, stopping};
 pub(crate) use wait::DelegationRecovery;
 #[cfg(test)]
 pub(crate) use wait::cleanup_timed_out_delegations;
 
 use crate::acp::protocol::StopReason;
-use crate::agent::execution_context::ExecutionContext;
-use crate::agent::utils::u32_from_usize;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::hooks::StopRequest;
-use crate::middleware::ExecutionState;
-use log::{debug, info, trace, warn};
-use querymt::chat::ChatRole;
-use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
-use std::sync::Arc;
-use tracing::{Instrument, info_span, instrument};
+use log::warn;
+use querymt_agent_core::events::{AgentEventKind, StopType};
 
 /// Outcome of a single execution cycle
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,20 +80,6 @@ pub enum CycleOutcome {
     },
 }
 
-/// Allow one automatic compaction between main model requests, preventing non-progress loops.
-fn mark_automatic_compaction(
-    last_compaction_request_count: &mut Option<u32>,
-    llm_request_count: u32,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        *last_compaction_request_count != Some(llm_request_count),
-        "The request still exceeds its context budget after automatic compaction. \
-         Reduce tools or injected context, or use a larger-context model."
-    );
-    *last_compaction_request_count = Some(llm_request_count);
-    Ok(())
-}
-
 /// Warn once per cycle and reason when a configured price cap is only
 /// best-effort because the cycle's budget view is incomplete. Execution
 /// continues against the known subtotal. Independent of context-size
@@ -98,18 +88,19 @@ fn mark_automatic_compaction(
 /// execution errors raised by the recorder.
 fn warn_incomplete_budget(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    env: &TurnEnv,
+    turn: &mut Turn,
     totals: &querymt_agent_services::accounting::ScopeTotals,
 ) {
     let Some(cap) = config.budget_cap_usd() else {
         return;
     };
-    let reasons = exec_ctx.budget_warnings.take_new(totals);
+    let reasons = turn.budget_warnings.take_new(totals);
     if reasons.is_empty() {
         return;
     }
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::HookNotice {
             event_name: "price_limit".to_string(),
             message: querymt_agent_services::accounting::budget_warning_message(
@@ -126,16 +117,17 @@ fn warn_incomplete_budget(
 /// reached, so the turn ends even though the hook wanted more work.
 fn emit_stop_hook_cap_notice(
     config: &crate::agent::agent_config::AgentConfig,
-    exec_ctx: &ExecutionContext,
-    stop_reason: &str,
+    env: &TurnEnv,
+    kind: turn::StopHookKind,
     max: u32,
 ) {
+    let stop_reason: &'static str = kind.into();
     warn!(
         "Session {}: stop hook requested more than {} continuation(s) ({}); ignoring",
-        exec_ctx.session_id, max, stop_reason
+        env.session_id, max, stop_reason
     );
     config.emit_event(
-        &exec_ctx.session_id,
+        &env.session_id,
         AgentEventKind::HookNotice {
             event_name: "stop".to_string(),
             message: format!(
@@ -152,26 +144,26 @@ fn emit_stop_hook_cap_notice(
 /// notices. `stop_reason` tells hooks why the turn is ending.
 async fn run_stop_hook(
     config: &crate::agent::agent_config::AgentConfig,
-    exec_ctx: &ExecutionContext,
-    stop_reason: &str,
+    env: &TurnEnv,
+    kind: turn::StopHookKind,
 ) -> Result<crate::hooks::StopResult, crate::hooks::HookError> {
     let stop_hook = config
         .hooks
         .run_stop(StopRequest {
-            session_id: exec_ctx.session_id.clone(),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: exec_ctx
+            session_id: env.session_id.clone(),
+            turn_id: env.turn_id().to_string(),
+            cwd: env.cwd().map(|path| path.to_path_buf()),
+            model: env
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
-            stop_reason: stop_reason.to_string(),
+            permission_mode: env.permission_mode().to_string(),
+            stop_reason: <&'static str>::from(kind).to_string(),
         })
         .await?;
     for notice in &stop_hook.notices {
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::HookNotice {
                 event_name: notice.event_name.clone(),
                 message: notice.message.clone(),
@@ -182,9 +174,8 @@ async fn run_stop_hook(
     Ok(stop_hook)
 }
 
-fn render_run_objective(exec_ctx: &ExecutionContext) -> String {
-    exec_ctx
-        .run_objective
+fn render_run_objective(turn: &Turn) -> String {
+    turn.run_objective
         .as_ref()
         .map(crate::agent::objective::RunObjective::render)
         .unwrap_or_else(|| "[Run objective unavailable]".to_string())
@@ -196,68 +187,118 @@ fn has_effective_task_completion_tool(tools: &[querymt::chat::Tool]) -> bool {
         .any(|tool| tool.function.name == "complete_task")
 }
 
-fn refresh_objective_fragment(
-    context: &Arc<crate::middleware::ConversationContext>,
-    exec_ctx: &ExecutionContext,
-) -> Arc<crate::middleware::ConversationContext> {
-    Arc::new(context.upsert_fragment(
-        "run_objective",
-        render_run_objective(exec_ctx),
-        crate::middleware::ContextPriority::High,
-    ))
+/// Inputs taken out of the steering inbox and not yet stored, with the
+/// boundary at which they are applied.
+///
+/// Draining and committing are separate so that the tool-call stage can store
+/// the skipped results of a batch before the steering that skipped them.
+pub(crate) struct DrainedSteering {
+    inputs: Vec<crate::agent::turn_control::SteeringInput>,
+    boundary: Option<SteeringBoundary>,
 }
 
-pub(crate) async fn apply_pending_steering(
-    config: &AgentConfig,
-    exec_ctx: &mut ExecutionContext,
-    context: &Arc<crate::middleware::ConversationContext>,
-    boundary: &'static str,
+/// Where in a run waiting steering is applied. The label is what events and
+/// the run objective record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+pub(crate) enum SteeringBoundary {
+    /// Before the next model request is prepared.
+    #[strum(serialize = "before_model_request")]
+    NextRequest,
+    /// Before a batch of tool calls starts.
+    #[strum(serialize = "before_tool_batch")]
+    ToolBatch,
+    /// When the reply ended the run, before the end-of-run checks.
+    #[strum(serialize = "before_completion")]
+    RunEnd,
+}
+
+impl DrainedSteering {
+    pub(crate) fn none() -> Self {
+        Self {
+            inputs: Vec::new(),
+            boundary: None,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+    }
+}
+
+/// Take what is waiting in the run's steering inbox. `closing` also closes the
+/// inbox, so nothing accepted after this is applied to this run.
+pub(crate) async fn drain_steering(
+    env: &TurnEnv,
+    boundary: SteeringBoundary,
     closing: bool,
-) -> Result<Option<Arc<crate::middleware::ConversationContext>>, anyhow::Error> {
-    let Some(inbox) = exec_ctx.steering.clone() else {
-        return Ok(None);
+) -> DrainedSteering {
+    let Some(inbox) = env.steering.clone() else {
+        return DrainedSteering::none();
     };
-    let pending = if closing {
+    let inputs = if closing {
         inbox.begin_closing_and_drain().await
     } else {
         inbox.drain().await
     };
-    if pending.is_empty() {
-        return Ok(None);
+    if !inputs.is_empty() {
+        // Consumption happens off the actor mailbox; publish its new count even
+        // if the next model/tool interval is silent and no phase transition
+        // follows.
+        env.report_runtime_change();
     }
-    // Consumption happens off the actor mailbox; publish its new count even if
-    // the next model/tool interval is silent and no phase transition follows.
-    exec_ctx.report_runtime_change();
+    DrainedSteering {
+        inputs,
+        boundary: Some(boundary),
+    }
+}
 
-    let mut messages = context.messages.to_vec();
-    for input in pending {
-        let blocks = input.blocks;
-        let display = crate::agent::utils::render_prompt_for_display(&blocks);
+/// Store `preceding` and then one user message per drained input, in that
+/// order, and apply what the inputs say to the run (events, intent, objective).
+pub(crate) async fn commit_steering(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+    drained: DrainedSteering,
+    mut preceding: Vec<querymt_agent_core::model::AgentMessage>,
+    what: &'static str,
+) -> Result<(), TurnError> {
+    let DrainedSteering { inputs, boundary } = drained;
+    let boundary: &'static str = boundary.map_or("", <&'static str>::from);
+    let mut applied = Vec::with_capacity(inputs.len());
+    for input in inputs {
         let message_id = uuid::Uuid::new_v4().to_string();
-        let client_prompt_id = input.client_input_id.clone();
         let message = querymt_agent_core::model::AgentMessage {
             id: message_id.clone(),
-            session_id: exec_ctx.session_id.clone(),
+            session_id: env.session_id.clone(),
             role: querymt::chat::ChatRole::User,
             parts: vec![querymt_agent_core::model::MessagePart::Steering {
-                run_id: exec_ctx.turn_id().to_string(),
-                client_input_id: client_prompt_id.clone(),
-                blocks: blocks.clone(),
+                run_id: env.turn_id().to_string(),
+                client_input_id: input.client_input_id.clone(),
+                blocks: input.blocks.clone(),
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
             source_provider: None,
             source_model: None,
         };
-        let chat_message = message
+        message
             .to_chat_message()
             .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
-        exec_ctx.add_message(message).await?;
-        messages.push(chat_message);
+        preceding.push(message);
+        applied.push((message_id, input));
+    }
+    turn.history
+        .commit(&env.session_handle, preceding)
+        .await
+        .map_err(TurnError::history(what))?;
 
+    for (message_id, input) in applied {
+        let blocks = input.blocks;
+        let display = crate::agent::utils::render_prompt_for_display(&blocks);
+        let client_prompt_id = input.client_input_id.clone();
         for block in blocks {
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::UserPromptBlock {
                     message_id: message_id.clone(),
                     client_prompt_id: client_prompt_id.clone(),
@@ -267,7 +308,7 @@ pub(crate) async fn apply_pending_steering(
         }
         config
             .emit_event_persisted(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::PromptReceived {
                     content: display.clone(),
                     message_id: Some(message_id),
@@ -276,21 +317,20 @@ pub(crate) async fn apply_pending_steering(
             .await
             .map_err(|error| anyhow::anyhow!("Failed to persist steering prompt event: {error}"))?;
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::UserMessageStored {
                 content: display.clone(),
             },
         );
 
         if !display.trim().is_empty() {
-            let summary = exec_ctx
+            let summary = turn
                 .state
                 .current_intent
                 .as_ref()
                 .map(|intent| intent.summary.clone())
                 .unwrap_or_else(|| display.clone());
-            exec_ctx
-                .state
+            turn.state
                 .update_intent_projection(
                     summary,
                     None,
@@ -298,10 +338,11 @@ pub(crate) async fn apply_pending_steering(
                     "steering".to_string(),
                     Some(input.input_id.clone()),
                 )
-                .await?;
+                .await
+                .map_err(TurnError::history("Failed to update intent projection"))?;
         }
         if !display.trim().is_empty()
-            && let Some(objective) = exec_ctx.run_objective.as_mut()
+            && let Some(objective) = turn.run_objective.as_mut()
         {
             let revision = objective.amend(crate::agent::objective::ObjectiveDirective {
                 text: display,
@@ -311,9 +352,9 @@ pub(crate) async fn apply_pending_steering(
                 application_boundary: Some(boundary.to_string()),
             });
             config.emit_event(
-                &exec_ctx.session_id,
+                &env.session_id,
                 AgentEventKind::ObjectiveUpdated {
-                    run_id: exec_ctx.turn_id().to_string(),
+                    run_id: env.turn_id().to_string(),
                     revision,
                     source: "steering".to_string(),
                     source_ref: Some(input.input_id.clone()),
@@ -321,9 +362,9 @@ pub(crate) async fn apply_pending_steering(
             );
         }
         config.emit_event(
-            &exec_ctx.session_id,
+            &env.session_id,
             AgentEventKind::SteeringApplied {
-                run_id: exec_ctx.turn_id().to_string(),
+                run_id: env.turn_id().to_string(),
                 input_id: input.input_id,
                 boundary: boundary.to_string(),
                 latency_ms: crate::agent::turn_control::now_ms()
@@ -331,740 +372,171 @@ pub(crate) async fn apply_pending_steering(
             },
         );
     }
-
-    let next = crate::middleware::ConversationContext::new(
-        context.session_id.clone(),
-        Arc::from(messages.into_boxed_slice()),
-        context.stats.clone(),
-        context.provider.clone(),
-        context.model.clone(),
-    )
-    .with_session_mode(context.session_mode)
-    .with_profile(context.profile.clone())
-    .with_last_applied(context.last_applied)
-    .with_request_overrides(context.request_overrides)
-    .with_fragments(context.fragments.clone());
-    Ok(Some(Arc::new(next)))
+    Ok(())
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-//  State machine implementation
-// ══════════════════════════════════════════════════════════════════════════
+/// Drain the steering inbox and store what was drained after the history so
+/// far. Returns whether anything was applied.
+pub(crate) async fn apply_pending_steering(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+    boundary: SteeringBoundary,
+    closing: bool,
+) -> Result<bool, TurnError> {
+    let drained = drain_steering(env, boundary, closing).await;
+    if drained.is_empty() {
+        return Ok(false);
+    }
+    commit_steering(
+        config,
+        env,
+        turn,
+        drained,
+        Vec::new(),
+        "Failed to store steering message",
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Queue the periodic progress review as a `progress_review` notice.
+fn queue_progress_review(turn: &mut Turn) {
+    turn.queue_notice(
+        querymt_agent_core::model::NoticeSource::ProgressReview,
+        crate::agent::objective::PROGRESS_REVIEW_NOTICE.to_string(),
+    );
+}
+
+/// Store all queued notices as one user message (one `Notice` part each)
+/// before the model request.
+///
+/// Runs at the point where steering is applied, after any tool results in the
+/// history, so a notice never sits between a tool call and its result. One
+/// message (instead of one per notice) avoids a run of consecutive user
+/// messages and makes the write all-or-nothing. After a tool batch it still
+/// follows the tool-result user message; providers whose chat template
+/// requires strictly alternating roles must merge adjacent user messages.
+///
+/// Nothing is stored for a request that is never sent: the queue lives on the
+/// run and is dropped with it.
+pub(crate) async fn store_pending_notices(env: &TurnEnv, turn: &mut Turn) -> Result<(), TurnError> {
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
+
+    if turn.pending_notices.is_empty() {
+        return Ok(());
+    }
+    let mut message = AgentMessage::new(env.session_id.clone(), querymt::chat::ChatRole::User);
+    message.parts.extend(
+        turn.pending_notices
+            .iter()
+            .map(|notice| MessagePart::Notice {
+                source: notice.source,
+                content: notice.content.clone(),
+            }),
+    );
+    message
+        .to_chat_message()
+        .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
+    turn.history
+        .commit(&env.session_handle, vec![message])
+        .await
+        .map_err(TurnError::history("Failed to store notices"))?;
+    turn.pending_notices.clear();
+    Ok(())
+}
+
+/// Store the queued notices and prepare the model request.
+///
+/// The context-hook trigger is read before the notices are stored, so a
+/// notice after a tool batch keeps the `after_tool_batch` trigger.
+pub(crate) async fn prepare_model_request(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+) -> Result<Step, TurnError> {
+    // The run objective is request-scoped: sent in the request tail, never
+    // stored. It is still built and amended, and its events are emitted,
+    // whether or not it is sent.
+    let objective = config
+        .execution_policy
+        .run_objective
+        .then(|| render_run_objective(turn));
+    let trigger = transitions::context_hook_trigger(turn.history.as_slice());
+    store_pending_notices(env, turn).await?;
+    transitions::transition_before_llm_call(config, env, turn, trigger, objective.as_deref()).await
+}
 
 use crate::agent::agent_config::AgentConfig;
 
-/// Execute the cycle state machine using an `AgentConfig`.
-///
-/// This is the entry point for the kameo `SessionActor`'s `ctx.spawn()` task.
-/// It reads configuration from `AgentConfig` rather than requiring a full agent instance.
-///
-/// `session_mode` is the per-session `AgentMode` captured at turn start.
-/// It is injected into every `ConversationContext` so middleware can read it.
-#[instrument(
-    name = "agent.execution.turn",
-    skip(config, exec_ctx),
-    fields(
-        session_id = %exec_ctx.session_id,
-        mode = %session_mode,
-        llm_request_count = tracing::field::Empty,
-        completion_guard_available = tracing::field::Empty,
-        completion_guard_continuations = tracing::field::Empty,
-    )
-)]
-pub(crate) async fn execute_cycle_state_machine(
-    config: &AgentConfig,
-    exec_ctx: &mut ExecutionContext,
-    session_mode: crate::agent::core::AgentMode,
-) -> Result<CycleOutcome, anyhow::Error> {
-    debug!(
-        "Starting state machine execution (free fn) for session: {}",
-        exec_ctx.session_id
-    );
+/// The labels that events, hooks and the run objective carry are fixed by
+/// clients and hook scripts; the enums that replaced the string parameters
+/// must print what the literals did.
+#[cfg(test)]
+mod label_tests {
+    use super::turn::{ExecutionOrigin, StopHookKind};
+    use super::{SteeringBoundary, transitions::ContextTrigger};
 
-    let driver = info_span!("agent.execution.driver_create").in_scope(|| config.create_driver());
-
-    debug!(
-        "Session {}: state machine loading history, cancelled={}",
-        exec_ctx.session_id,
-        exec_ctx.cancellation_token.is_cancelled()
-    );
-
-    let messages: Arc<[querymt::chat::ChatMessage]> = async {
-        let started = std::time::Instant::now();
-        let (history, summaries) = exec_ctx
-            .session_handle
-            .history_with_compaction()
-            .await
-            .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
-        exec_ctx.compaction_summaries = summaries;
-        let messages: Arc<[querymt::chat::ChatMessage]> = Arc::from(history.into_boxed_slice());
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let span = tracing::Span::current();
-        span.record("history_ms", elapsed_ms);
-        span.record("message_count", messages.len() as u64);
-        Ok::<_, anyhow::Error>(messages)
+    fn label<'a>(value: impl Into<&'a str>) -> &'a str {
+        value.into()
     }
-    .instrument(info_span!(
-        "agent.execution.history_load",
-        session_id = %exec_ctx.session_id,
-        history_ms = tracing::field::Empty,
-        message_count = tracing::field::Empty
-    ))
-    .await?;
 
-    debug!(
-        "Session {}: history loaded, {} messages",
-        exec_ctx.session_id,
-        messages.len()
-    );
-    let turns = messages
-        .iter()
-        .filter(|msg| matches!(msg.role, ChatRole::User))
-        .filter(|msg| !msg.has_tool_result())
-        .count();
-    let stats = crate::middleware::AgentStats {
-        turns,
-        ..Default::default()
-    };
-    let stats = Arc::new(stats);
-
-    let llm_config = exec_ctx
-        .llm_config()
-        .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
-
-    debug!(
-        "Session {}: llm_config provider={} model={}",
-        exec_ctx.session_id, llm_config.provider, llm_config.model
-    );
-
-    // Builds the provider for the turn on first use, so this is where cold-start cost lands.
-    let profile = exec_ctx
-        .session_handle
-        .profile()
-        .instrument(info_span!("agent.execution.profile"))
-        .await;
-    let initial_context = info_span!("agent.execution.context_init").in_scope(|| {
-        Arc::new(
-            crate::middleware::ConversationContext::new(
-                exec_ctx.session_id.as_str().into(),
-                messages,
-                stats,
-                llm_config.provider.as_str().into(),
-                llm_config.model.as_str().into(),
-            )
-            .with_session_mode(session_mode)
-            .with_profile(profile),
-        )
-    });
-
-    let mut state = ExecutionState::BeforeLlmCall {
-        context: initial_context.clone(),
-    };
-    let mut event_rx = config.event_sink.fanout().subscribe();
-    // Stop-hook continuations this turn, counted per stop reason so token-limit
-    // cut-offs do not use up the budget for normal end-of-turn continuations.
-    let mut stop_hook_continuations = 0u32;
-    let mut token_limit_stop_hook_continuations = 0u32;
-    let mut task_completion_guard_continuations = 0u8;
-    // Times middleware has turned a stop into a continuation this turn.
-    let mut stop_recoveries = 0u8;
-    let mut task_completion_tool_available = false;
-    let mut llm_request_count = 0u32;
-    let mut last_compaction_request_count = None;
-    let mut last_objective_checkpoint_step = 0usize;
-
-    state = driver
-        .run_turn_start_cancellable(state, Some(&exec_ctx.runtime), &exec_ctx.cancellation_token)
-        .instrument(info_span!(
-            "agent.execution.middleware.turn_start",
-            session_id = %exec_ctx.session_id
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-
-    debug!(
-        "Session {}: run_turn_start done, state={}, cancelled={}",
-        exec_ctx.session_id,
-        state.name(),
-        exec_ctx.cancellation_token.is_cancelled()
-    );
-
-    loop {
-        if exec_ctx.cancellation_token.is_cancelled()
-            && !matches!(state, ExecutionState::ProcessingToolCalls { .. })
-        {
-            info!("Session {}: CANCELLED at loop top", exec_ctx.session_id);
-            return Ok(CycleOutcome::Cancelled);
-        }
-
-        let state_name = state.name();
-        trace!(
-            "State machine iteration: {} for session {}",
-            state_name, exec_ctx.session_id
+    #[test]
+    fn wire_labels_are_unchanged() {
+        assert_eq!(
+            [
+                label(SteeringBoundary::NextRequest),
+                label(SteeringBoundary::ToolBatch),
+                label(SteeringBoundary::RunEnd),
+            ],
+            [
+                "before_model_request",
+                "before_tool_batch",
+                "before_completion"
+            ]
         );
-
-        state = match state {
-            ExecutionState::BeforeLlmCall { context } => {
-                // Everything from here to request dispatch is agent overhead, not model time.
-                let step_started = std::time::Instant::now();
-                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Model);
-                let context = wait::reconcile_suspended_delegations(
-                    config,
-                    &context,
-                    exec_ctx,
-                    &mut event_rx,
-                )
-                .await?;
-                let context = apply_pending_steering(
-                    config,
-                    exec_ctx,
-                    &context,
-                    "before_model_request",
-                    false,
-                )
-                .await?
-                .unwrap_or(context);
-                let steps = context.stats.steps;
-                let checkpoint_due = (steps >= 7 && last_objective_checkpoint_step == 0)
-                    || (last_objective_checkpoint_step > 0
-                        && steps.saturating_sub(last_objective_checkpoint_step) >= 4);
-                if checkpoint_due {
-                    last_objective_checkpoint_step = steps;
-                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                        objective.set_progress_review(Some(
-                            crate::agent::objective::ProgressReview {
-                                reason: "periodic_progress_review".to_string(),
-                                step: steps,
-                            },
-                        ));
-                    }
-                    config.emit_event(
-                        &exec_ctx.session_id,
-                        AgentEventKind::ObjectiveCheckpoint {
-                            run_id: exec_ctx.turn_id().to_string(),
-                            reason: "periodic_progress_review".to_string(),
-                            action: "review_progress".to_string(),
-                            objective_revision: exec_ctx.run_objective.as_ref().map(|o| o.revision),
-                            current_task_id: exec_ctx
-                                .state
-                                .active_task
-                                .as_ref()
-                                .map(|t| t.public_id.clone()),
-                            current_task_revision: exec_ctx
-                                .state
-                                .active_task
-                                .as_ref()
-                                .map(|t| t.revision),
-                        },
-                    );
-                } else if last_objective_checkpoint_step > 0
-                    && steps > last_objective_checkpoint_step
-                    && let Some(objective) = exec_ctx.run_objective.as_mut()
-                {
-                    objective.set_progress_review(None);
-                }
-                let context = refresh_objective_fragment(&context, exec_ctx);
-                // Price limits read this cycle's committed accounting, which
-                // includes cache and auxiliary (compaction/summary) attempts
-                // that settled since the last main response.
-                let context = match exec_ctx.cycle_accounting.get() {
-                    Some(cycle) => {
-                        let totals = cycle.cycle_totals();
-                        warn_incomplete_budget(config, exec_ctx, &totals);
-                        let mut stats = (*context.stats).clone();
-                        stats.apply_recorded_costs(&totals);
-                        let mut refreshed = (*context).clone();
-                        refreshed.stats = Arc::new(stats);
-                        Arc::new(refreshed)
-                    }
-                    None => context,
-                };
-                let state = ExecutionState::BeforeLlmCall { context };
-                let state = driver
-                    .run_step_start_cancellable(
-                        state,
-                        Some(&exec_ctx.runtime),
-                        &exec_ctx.cancellation_token,
-                    )
-                    .instrument(info_span!(
-                        "agent.execution.middleware.step_start",
-                        session_id = %exec_ctx.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-
-                match state {
-                    ExecutionState::BeforeLlmCall {
-                        context: ref conv_context,
-                    } => {
-                        let next =
-                            transitions::transition_before_llm_call(config, conv_context, exec_ctx)
-                                .await?;
-                        crate::agent::utils::llm_metrics::step_overhead(
-                            "pre_request",
-                            step_started.elapsed().as_secs_f64(),
-                            crate::agent::utils::genai::provider_name(&conv_context.provider),
-                            &conv_context.model,
-                        );
-                        next
-                    }
-                    other => other,
-                }
-            }
-
-            ExecutionState::CallLlm {
-                ref context,
-                ref request,
-            } => {
-                llm_request_count = llm_request_count.saturating_add(1);
-                task_completion_tool_available = has_effective_task_completion_tool(&request.tools);
-                let span = tracing::Span::current();
-                span.record("llm_request_count", llm_request_count as u64);
-                span.record("completion_guard_available", task_completion_tool_available);
-                transitions::transition_call_llm(config, context, request, exec_ctx).await?
-            }
-
-            ExecutionState::AfterLlm { .. } => {
-                let state = driver
-                    .run_after_llm_cancellable(
-                        state,
-                        Some(&exec_ctx.runtime),
-                        &exec_ctx.cancellation_token,
-                    )
-                    .instrument(info_span!(
-                        "agent.execution.middleware.after_llm",
-                        session_id = %exec_ctx.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                match state {
-                    ExecutionState::AfterLlm {
-                        ref response,
-                        ref context,
-                    } => {
-                        transitions::transition_after_llm(config, response, context, exec_ctx)
-                            .await?
-                    }
-                    other => other,
-                }
-            }
-
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-                context,
-            } => {
-                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Tools);
-                if results.is_empty()
-                    && let Some(steered_context) = apply_pending_steering(
-                        config,
-                        exec_ctx,
-                        &context,
-                        "before_tool_batch",
-                        false,
-                    )
-                    .await?
-                {
-                    let skipped = remaining_calls
-                        .iter()
-                        .map(|call| {
-                            crate::middleware::ToolResult::new(
-                                call.id.clone(),
-                                vec![querymt::chat::ToolResultPart::Text {
-                                    text: "Skipped because new user steering was received"
-                                        .to_string(),
-                                }],
-                                true,
-                                Some(call.function.name.clone()),
-                                Some(call.function.arguments.clone()),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let next = transitions::transition_processing_tool_calls(
-                        config,
-                        &driver,
-                        &Arc::from(Vec::new().into_boxed_slice()),
-                        &Arc::from(skipped.into_boxed_slice()),
-                        &steered_context,
-                        exec_ctx,
-                    )
-                    .await?;
-                    state = next;
-                    continue;
-                }
-                let state = ExecutionState::ProcessingToolCalls {
-                    remaining_calls: remaining_calls.clone(),
-                    results: results.clone(),
-                    context: context.clone(),
-                };
-                // Cancellation must not discard the pending-call state: the
-                // transition below synthesizes and persists matching results.
-                let state = if exec_ctx.cancellation_token.is_cancelled() {
-                    state
-                } else {
-                    let middleware_state = driver
-                        .run_processing_tool_calls_cancellable(
-                            state,
-                            Some(&exec_ctx.runtime),
-                            &exec_ctx.cancellation_token,
-                        )
-                        .instrument(info_span!(
-                            "agent.execution.middleware.processing_tool_calls",
-                            session_id = %exec_ctx.session_id
-                        ))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                    if matches!(middleware_state, ExecutionState::Cancelled)
-                        && exec_ctx.cancellation_token.is_cancelled()
-                    {
-                        ExecutionState::ProcessingToolCalls {
-                            remaining_calls,
-                            results,
-                            context,
-                        }
-                    } else {
-                        middleware_state
-                    }
-                };
-                match state {
-                    ExecutionState::ProcessingToolCalls {
-                        ref remaining_calls,
-                        ref results,
-                        ref context,
-                    } => {
-                        transitions::transition_processing_tool_calls(
-                            config,
-                            &driver,
-                            remaining_calls,
-                            results,
-                            context,
-                            exec_ctx,
-                        )
-                        .await?
-                    }
-                    other => other,
-                }
-            }
-
-            ExecutionState::WaitingForEvent {
-                ref context,
-                ref wait,
-            } => {
-                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Waiting);
-                wait::transition_waiting_for_event(config, wait, context, exec_ctx, &mut event_rx)
-                    .await?
-            }
-
-            ExecutionState::Complete { context } => {
-                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let (history, summaries) = exec_ctx
-                    .session_handle
-                    .history_with_compaction()
-                    .await
-                    .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
-                exec_ctx.compaction_summaries = summaries;
-                let history = Arc::from(history.into_boxed_slice());
-                let fallback_context = Arc::new(
-                    crate::middleware::ConversationContext::new(
-                        context.session_id.clone(),
-                        history,
-                        context.stats.clone(),
-                        context.provider.clone(),
-                        context.model.clone(),
-                    )
-                    .with_session_mode(context.session_mode)
-                    .with_profile(context.profile.clone())
-                    .with_fragments(context.fragments.clone()),
-                );
-                if let Some(context) = apply_pending_steering(
-                    config,
-                    exec_ctx,
-                    &fallback_context,
-                    "before_completion",
-                    true,
-                )
-                .await?
-                {
-                    state = ExecutionState::BeforeLlmCall { context };
-                    continue;
-                }
-                let turn_end_state = driver
-                    .run_turn_end_cancellable(
-                        ExecutionState::Complete {
-                            context: fallback_context,
-                        },
-                        Some(&exec_ctx.runtime),
-                        &exec_ctx.cancellation_token,
-                    )
-                    .instrument(info_span!(
-                        "agent.execution.middleware.turn_end",
-                        session_id = %exec_ctx.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-
-                match turn_end_state {
-                    ExecutionState::BeforeLlmCall { .. } => turn_end_state,
-                    ExecutionState::Complete {
-                        context: completed_context,
-                    } => {
-                        debug!("State machine reached Complete state");
-
-                        let stop_hook = run_stop_hook(config, exec_ctx, "EndTurn").await?;
-                        if stop_hook.should_continue {
-                            let max_stop_hook_continuations =
-                                config.execution_policy.max_stop_hook_continuations;
-                            if stop_hook_continuations >= max_stop_hook_continuations {
-                                emit_stop_hook_cap_notice(
-                                    config,
-                                    exec_ctx,
-                                    "EndTurn",
-                                    max_stop_hook_continuations,
-                                );
-                            } else {
-                                stop_hook_continuations += 1;
-                                let current_context = completed_context.clone();
-                                let message = format_stop_hook_continuation_message(
-                                    stop_hook.stop_reason.or(stop_hook.block_reason),
-                                    &stop_hook.additional_contexts,
-                                );
-                                state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(current_context.inject_message(message)),
-                                };
-                                continue;
-                            }
-                        }
-
-                        if config.execution_policy.task_completion_guard
-                            && task_completion_tool_available
-                            && let Some(task) = exec_ctx.state.active_task.as_ref()
-                            && task.status == crate::session::domain::TaskStatus::Active
-                            && task.kind == crate::session::domain::TaskKind::Finite
-                        {
-                            if task_completion_guard_continuations == 0 {
-                                task_completion_guard_continuations = 1;
-                                tracing::Span::current().record(
-                                    "completion_guard_continuations",
-                                    task_completion_guard_continuations as u64,
-                                );
-                                config.emit_event(
-                                    &exec_ctx.session_id,
-                                    AgentEventKind::TaskCompletionGuardTriggered {
-                                        run_id: exec_ctx.turn_id().to_string(),
-                                        task_id: task.public_id.clone(),
-                                    },
-                                );
-                                state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(completed_context.inject_message(
-                                        "<system-reminder>\nThe current finite task remains active. Continue the work and call complete_task with concrete evidence when it is done, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
-                                    )),
-                                };
-                                continue;
-                            }
-                            config.emit_event(
-                                &exec_ctx.session_id,
-                                AgentEventKind::TaskCompletionGuardExhausted {
-                                    run_id: exec_ctx.turn_id().to_string(),
-                                    task_id: task.public_id.clone(),
-                                },
-                            );
-                        }
-
-                        if config.execution_policy.pruning.enabled
-                            && let Err(e) = maintenance::run_pruning(config, exec_ctx).await
-                        {
-                            warn!("Pruning failed: {}", e);
-                        }
-
-                        return Ok(CycleOutcome::Completed);
-                    }
-                    ExecutionState::Stopped {
-                        ref message,
-                        stop_type,
-                        ..
-                    } => {
-                        info!("Turn-end middleware stopped: {} ({:?})", message, stop_type);
-                        turn_end_state
-                    }
-                    other => other,
-                }
-            }
-
-            ExecutionState::Stopped {
-                ref message,
-                stop_type,
-                ..
-            } => {
-                info!("State machine stopped: {} ({:?})", message, stop_type);
-
-                if stop_type == StopType::ContextThreshold
-                    && config.execution_policy.compaction.auto
-                {
-                    mark_automatic_compaction(
-                        &mut last_compaction_request_count,
-                        llm_request_count,
-                    )?;
-                    info!("Context threshold reached, triggering AI compaction");
-
-                    match maintenance::run_ai_compaction(config, exec_ctx, &state).await {
-                        Ok(new_state) => {
-                            state = new_state;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!("AI compaction failed: {}", e);
-                        }
-                    }
-                }
-
-                // Give middleware the chance to replace the stop with a
-                // continuation. The per-turn guard bounds any recovery loop.
-                if state.context().is_some() {
-                    let max_recoveries = config.execution_policy.max_stop_recoveries;
-                    if stop_recoveries >= max_recoveries {
-                        warn!(
-                            "Session {}: stop recovery limit ({}) reached; publishing stop",
-                            exec_ctx.session_id, max_recoveries
-                        );
-                    } else {
-                        let stopped = std::mem::replace(&mut state, ExecutionState::Cancelled);
-                        let recovered = driver
-                            .run_stopped_cancellable(
-                                stopped,
-                                Some(&exec_ctx.runtime),
-                                &exec_ctx.cancellation_token,
-                            )
-                            .instrument(info_span!(
-                                "agent.execution.middleware.stopped",
-                                session_id = %exec_ctx.session_id
-                            ))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                        match recovered {
-                            ExecutionState::BeforeLlmCall { .. } => {
-                                stop_recoveries += 1;
-                                debug!(
-                                    "Session {}: stop recovered by middleware ({}/{})",
-                                    exec_ctx.session_id, stop_recoveries, max_recoveries
-                                );
-                                state = recovered;
-                                continue;
-                            }
-                            ExecutionState::Cancelled => return Ok(CycleOutcome::Cancelled),
-                            ExecutionState::Stopped { .. } => state = recovered,
-                            other => {
-                                // Not a documented outcome; let the state machine handle it.
-                                state = other;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                // A token-limit stop that middleware could not recover still
-                // gives Stop hooks a say, so unattended loops can carry on.
-                if let ExecutionState::Stopped {
-                    stop_type: StopType::ModelTokenLimit,
-                    context: Some(ref stopped_context),
-                    ..
-                } = state
-                {
-                    let stop_hook = run_stop_hook(config, exec_ctx, "ModelTokenLimit").await?;
-                    if stop_hook.should_continue {
-                        let max = config.execution_policy.max_stop_hook_continuations;
-                        if token_limit_stop_hook_continuations >= max {
-                            emit_stop_hook_cap_notice(config, exec_ctx, "ModelTokenLimit", max);
-                        } else {
-                            token_limit_stop_hook_continuations += 1;
-                            let message = format_stop_hook_continuation_message(
-                                stop_hook.stop_reason.or(stop_hook.block_reason),
-                                &stop_hook.additional_contexts,
-                            );
-                            let next = Arc::new(stopped_context.inject_message(message));
-                            state = ExecutionState::BeforeLlmCall { context: next };
-                            continue;
-                        }
-                    }
-                }
-
-                let ExecutionState::Stopped {
-                    ref message,
-                    stop_type,
-                    ..
-                } = state
-                else {
-                    unreachable!("stop recovery only returns Stopped or diverts above");
-                };
-
-                let metrics = state
-                    .context()
-                    .map(|ctx| ExecutionMetrics {
-                        steps: u32_from_usize(
-                            ctx.stats.steps,
-                            "ctx.stats.steps",
-                            Some(&exec_ctx.session_id),
-                        ),
-                        turns: u32_from_usize(
-                            ctx.stats.turns,
-                            "ctx.stats.turns",
-                            Some(&exec_ctx.session_id),
-                        ),
-                    })
-                    .unwrap_or_default();
-
-                config.emit_event(
-                    &exec_ctx.session_id,
-                    AgentEventKind::MiddlewareStopped {
-                        stop_type,
-                        reason: message.to_string(),
-                        metrics,
-                    },
-                );
-
-                return Ok(CycleOutcome::Stopped {
-                    stop_reason: StopReason::from(stop_type),
-                    stop_type,
-                    reason: message.to_string(),
-                });
-            }
-
-            ExecutionState::Cancelled => {
-                debug!("State machine cancelled");
-                return Ok(CycleOutcome::Cancelled);
-            }
-        };
+        assert_eq!(
+            [
+                label(ContextTrigger::AfterToolBatch),
+                label(ContextTrigger::UserPrompt)
+            ],
+            ["after_tool_batch", "user_prompt"]
+        );
+        assert_eq!(
+            [
+                label(StopHookKind::EndTurn),
+                label(StopHookKind::ModelTokenLimit)
+            ],
+            ["EndTurn", "ModelTokenLimit"]
+        );
+        assert_eq!(
+            [
+                label(&ExecutionOrigin::Interactive),
+                label(&ExecutionOrigin::Scheduled {
+                    schedule_public_id: String::new(),
+                    task_public_id: String::new(),
+                }),
+            ],
+            ["interactive", "scheduled"]
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::SteeringBoundary;
+    use super::turn::Turn;
+    use super::{Stage, Step};
     use super::{
-        apply_pending_steering, format_stop_hook_continuation_message,
-        has_effective_task_completion_tool, mark_automatic_compaction,
+        apply_pending_steering, drain_steering, format_stop_hook_continuation_message,
+        has_effective_task_completion_tool,
     };
     use crate::session::backend::StorageBackend;
+    use querymt::chat::ChatRole;
     use querymt::chat::{FunctionTool, Tool};
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
     use serde_json::json;
     use std::sync::Arc;
-
-    /// Failed admission after compaction must not issue another summarization request.
-    #[test]
-    fn automatic_compaction_requires_model_request_progress() {
-        let mut last_compaction = None;
-        mark_automatic_compaction(&mut last_compaction, 0).unwrap();
-        let error = mark_automatic_compaction(&mut last_compaction, 0).unwrap_err();
-        assert!(error.to_string().contains("after automatic compaction"));
-        assert_eq!(last_compaction, Some(0));
-    }
-
-    /// A later model/tool exchange can legitimately require another compaction in the same turn.
-    #[test]
-    fn automatic_compaction_is_allowed_after_a_new_model_request() {
-        let mut last_compaction = None;
-        mark_automatic_compaction(&mut last_compaction, 0).unwrap();
-        mark_automatic_compaction(&mut last_compaction, 1).unwrap();
-        assert_eq!(last_compaction, Some(1));
-        assert!(mark_automatic_compaction(&mut last_compaction, 1).is_err());
-    }
 
     mod budget_warning_tests {
         use super::super::warn_incomplete_budget;
@@ -1133,7 +605,7 @@ mod tests {
         #[tokio::test]
         async fn repeated_snapshots_publish_one_warning_without_any_context_size() {
             let (fixture, config) = agent(Some(1.0)).await;
-            let exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let mut rx = config.subscribe_events();
             let snapshot = totals(Some(IncompleteReason::MissingRate {
                 category: PricingCategory::CacheRead,
@@ -1141,7 +613,7 @@ mod tests {
             // The warning depends only on cycle accounting, not on any
             // context-size knowledge.
             for _ in 0..5 {
-                warn_incomplete_budget(&config, &exec, &snapshot);
+                warn_incomplete_budget(&config, &exec, &mut turn, &snapshot);
             }
             let sent = notices(&mut rx).await;
             assert_eq!(sent.len(), 1, "{sent:?}");
@@ -1152,11 +624,12 @@ mod tests {
         #[tokio::test]
         async fn a_new_missing_category_warns_again() {
             let (fixture, config) = agent(Some(1.0)).await;
-            let exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let mut rx = config.subscribe_events();
             warn_incomplete_budget(
                 &config,
                 &exec,
+                &mut turn,
                 &totals(Some(IncompleteReason::MissingRate {
                     category: PricingCategory::CacheRead,
                 })),
@@ -1164,6 +637,7 @@ mod tests {
             warn_incomplete_budget(
                 &config,
                 &exec,
+                &mut turn,
                 &totals(Some(IncompleteReason::MissingRate {
                     category: PricingCategory::CacheWrite,
                 })),
@@ -1174,22 +648,23 @@ mod tests {
         #[tokio::test]
         async fn a_normal_in_flight_attempt_does_not_warn() {
             let (fixture, config) = agent(Some(1.0)).await;
-            let exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let mut rx = config.subscribe_events();
             let pending = totals(None);
             assert_eq!(pending.unresolved_attempts, 1);
-            warn_incomplete_budget(&config, &exec, &pending);
+            warn_incomplete_budget(&config, &exec, &mut turn, &pending);
             assert!(notices(&mut rx).await.is_empty());
         }
 
         #[tokio::test]
         async fn no_price_cap_means_no_budget_warning() {
             let (fixture, config) = agent(None).await;
-            let exec = fixture.execution_context().await;
+            let (exec, mut turn) = fixture.turn().await;
             let mut rx = config.subscribe_events();
             warn_incomplete_budget(
                 &config,
                 &exec,
+                &mut turn,
                 &totals(Some(IncompleteReason::PricingUnavailable)),
             );
             assert!(notices(&mut rx).await.is_empty());
@@ -1252,45 +727,35 @@ mod tests {
             )
             .await
             .expect("queue steering");
-        let mut exec_ctx = crate::agent::execution_context::ExecutionContext::new(
-            session_id.clone(),
-            querymt_agent_core::model::TurnId::new(),
+        let (mut env, mut turn) = crate::test_utils::inert_turn_parts(
+            &fixture.config,
+            session_handle,
             runtime,
             runtime_context,
-            session_handle,
-            crate::agent::core::ToolConfig::default(),
         )
-        .with_steering(steering);
+        .await;
+        env.steering = Some(steering);
         let overrides = querymt::chat::GenerationOptions::NONE
             .with_max_tokens(128_000)
             .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
-        let context = Arc::new(
-            crate::middleware::ConversationContext::new(
-                session_id.clone().into(),
-                Arc::from([]),
-                Arc::new(crate::middleware::AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )
-            .with_request_overrides(overrides),
-        );
-        let expected_run_id = exec_ctx.turn_id().to_string();
+        turn.request_overrides = overrides;
+        let expected_run_id = env.turn_id().to_string();
         assert!(!expected_run_id.is_empty());
         let mut live_events = fixture.config.subscribe_events();
 
-        let next = apply_pending_steering(
+        let applied = apply_pending_steering(
             &fixture.config,
-            &mut exec_ctx,
-            &context,
-            "before_model_request",
+            &env,
+            &mut turn,
+            SteeringBoundary::NextRequest,
             false,
         )
         .await
-        .expect("apply steering")
-        .expect("steering changes context");
+        .expect("apply steering");
 
-        assert_eq!(next.messages.len(), 1);
-        assert_eq!(next.request_overrides, overrides);
+        assert!(applied, "steering changes the history");
+        assert_eq!(turn.history.as_slice().len(), 1);
+        assert_eq!(turn.request_overrides, overrides);
         let history = fixture
             .config
             .provider
@@ -1382,12 +847,45 @@ mod tests {
         )));
     }
 
+    /// A stored assistant message that calls `ids`.
+    fn assistant_calling(session_id: &str, ids: &[(&str, &str)]) -> AgentMessage {
+        let mut message = AgentMessage::new(session_id.to_string(), ChatRole::Assistant);
+        message.parts = ids
+            .iter()
+            .map(|(id, path)| {
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: id.to_string(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: json!({ "path": path }).to_string(),
+                    },
+                })
+            })
+            .collect();
+        message
+    }
+
+    /// A stored user message that answers `results`.
+    fn results_for(session_id: &str, results: &[(&str, &str)]) -> AgentMessage {
+        let mut message = AgentMessage::new(session_id.to_string(), ChatRole::User);
+        message.parts = results
+            .iter()
+            .map(|(id, text)| MessagePart::ToolResult {
+                call_id: id.to_string(),
+                content: vec![querymt::chat::ToolResultPart::text(*text)],
+                is_error: false,
+                tool_name: Some("read_file".into()),
+                tool_arguments: None,
+                compacted_at: None,
+            })
+            .collect();
+        message
+    }
+
     #[tokio::test]
     async fn tool_results_stay_ahead_of_steering_in_live_and_reloaded_history() {
-        use querymt::chat::{ChatMessage, ChatRole, ToolResultPart};
-        use querymt_agent_core::model::{AgentMessage, MessagePart};
-
-        let fixture = crate::test_utils::TestAgent::new().await;
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
             querymt_agent_core::model::TurnId::new(),
         ));
@@ -1401,80 +899,461 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut exec_ctx = fixture.execution_context().await.with_steering(steering);
-        let assistant = ChatMessage::assistant()
-            .tool_use("call-1", "read_file", json!({"path": "."}))
-            .build();
-        let mut stored = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::Assistant);
-        stored.parts.push(MessagePart::Output {
-            output: assistant.output().unwrap().clone(),
-        });
-        exec_ctx.add_message(stored).await.unwrap();
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            exec_ctx.session_id.clone().into(),
-            Arc::from(vec![assistant]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
-        let steered = apply_pending_steering(
-            &fixture.config,
-            &mut exec_ctx,
-            &context,
-            "before_tool_batch",
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(steered.messages[1].text(), "change direction");
+        let (mut env, mut turn) = fixture.turn().await;
+        env.steering = Some(steering);
+        let calls = assistant_calling(&env.session_id, &[("call-1", ".")]);
+        turn.history
+            .commit(&env.session_handle, vec![calls])
+            .await
+            .unwrap();
+        let drained = drain_steering(&env, SteeringBoundary::ToolBatch, false).await;
+        assert!(!drained.is_empty());
         let results = Arc::from(vec![crate::middleware::ToolResult::new(
             "call-1".into(),
-            vec![ToolResultPart::text(
+            vec![querymt::chat::ToolResultPart::text(
                 "Skipped because new user steering was received",
             )],
             true,
             Some("read_file".into()),
             Some("{\"path\":\".\"}".into()),
         )]);
+
         let next = super::tool_calls::store_all_tool_results(
             &fixture.config,
             &results,
-            &steered,
-            &mut exec_ctx,
+            &env,
+            &mut turn,
+            drained,
         )
         .await
         .unwrap();
-        let crate::middleware::ExecutionState::BeforeLlmCall { context: live } = next else {
-            panic!("expected another model request");
-        };
-        assert_eq!(live.messages.len(), 3);
-        assert!(live.messages[0].has_tool_use());
-        assert!(live.messages[1].has_tool_result());
-        assert_eq!(live.messages[2].text(), "change direction");
 
-        // Storage retains the real chronology; replay normalizes only in memory.
+        assert!(
+            matches!(next, Stage::BeforeRequest),
+            "expected another model request"
+        );
+        // The run holds the stored order: the call, its results, then the steering.
+        let live = turn.history.as_slice();
+        assert_eq!(live.len(), 3);
+        assert!(matches!(&live[1].parts[0], MessagePart::ToolResult { .. }));
+        assert!(matches!(&live[2].parts[0], MessagePart::Steering { .. }));
         let stored = fixture
             .config
             .provider
             .history_store()
-            .get_history(&exec_ctx.session_id)
+            .get_history(&env.session_id)
             .await
             .unwrap();
-        assert!(matches!(&stored[1].parts[0], MessagePart::Steering { .. }));
         assert!(matches!(
-            &stored[2].parts[0],
+            &stored[1].parts[0],
             MessagePart::ToolResult { .. }
         ));
-        let replay = exec_ctx.session_handle.history().await.unwrap();
-        assert_eq!(replay.len(), 2);
-        assert!(replay[0].has_tool_use());
-        let parts = replay[1].portable_input_parts();
-        assert!(
-            matches!(&parts[0], querymt::chat::ChatInputPart::ToolResult(result)
-            if result.call_id == "call-1" && result.parts[0].as_text().unwrap().starts_with("Skipped"))
+        assert!(matches!(&stored[2].parts[0], MessagePart::Steering { .. }));
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(live).unwrap(),
+            serde_json::to_value(&reloaded).unwrap(),
+            "a reload gives the history the run holds"
         );
-        assert_eq!(replay[1].text(), "change direction");
+    }
+
+    /// A run over a history that holds a call to two tools and their results.
+    async fn notice_fixture() -> (
+        crate::test_utils::TestAgent,
+        crate::agent::execution::turn::TurnEnv,
+        Turn,
+    ) {
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
+        let (env, mut turn) = fixture.turn().await;
+        let calls = assistant_calling(&env.session_id, &[("call-1", "."), ("call-2", "..")]);
+        let results = results_for(&env.session_id, &[("call-1", "one"), ("call-2", "two")]);
+        turn.history
+            .commit(&env.session_handle, vec![calls, results])
+            .await
+            .unwrap();
+        (fixture, env, turn)
+    }
+
+    async fn stored_notices(
+        fixture: &crate::test_utils::TestAgent,
+        session_id: &str,
+    ) -> Vec<(querymt_agent_core::model::NoticeSource, String)> {
+        fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(session_id)
+            .await
+            .expect("load history")
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .filter_map(|part| match part {
+                querymt_agent_core::model::MessagePart::Notice { source, content } => {
+                    Some((source, content))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn progress_review_at_step_seven_is_stored_once_before_the_request() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        let mut last = 0usize;
+        for steps in 1..=10usize {
+            if crate::agent::objective::progress_review_due(steps, last) {
+                last = steps;
+                assert_eq!(steps, 7);
+                super::queue_progress_review(&mut turn);
+            }
+            super::store_pending_notices(&env, &mut turn).await.unwrap();
+        }
+        let stored = stored_notices(&fixture, &env.session_id).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, NoticeSource::ProgressReview);
+    }
+
+    #[test]
+    fn progress_review_with_the_objective_enabled_keeps_it_out_of_the_objective() {
+        // The review is a stored notice; the rendered objective never carries it.
+        let objective = crate::agent::objective::RunObjective::new(
+            querymt_agent_core::model::TurnId::new(),
+            "Implement the fix".into(),
+            "interactive".into(),
+            None,
+            None,
+        );
+        let rendered = objective.render();
+        assert!(!rendered.contains("Progress review"));
+        assert!(
+            crate::agent::objective::PROGRESS_REVIEW_NOTICE.contains("Completion means satisfying")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_is_stable_when_a_notice_is_stored() {
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        let before = serde_json::to_value(turn.history.as_slice()).unwrap();
+        let before_len = turn.history.as_slice().len();
+        super::queue_progress_review(&mut turn);
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        let after = serde_json::to_value(&turn.history.as_slice()[..before_len]).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(turn.history.as_slice().len(), before_len + 1);
+    }
+
+    /// Several queued notices become one stored user message, so roles keep
+    /// alternating and the write is all-or-nothing.
+    #[tokio::test]
+    async fn several_notices_are_stored_as_one_message() {
+        use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        let before_len = turn.history.as_slice().len();
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call".into());
+        turn.queue_notice(NoticeSource::AgentMode, "plan reminder".into());
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        assert_eq!(turn.history.as_slice().len(), before_len + 1);
+        assert_eq!(turn.history.last_mode_notice(), Some("plan reminder"));
+        assert!(turn.pending_notices.is_empty());
+        let history = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&env.session_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 3, "one stored message for both notices");
+        let sources: Vec<_> = history[2]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Notice { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            [NoticeSource::DuplicateToolCall, NoticeSource::AgentMode]
+        );
+    }
+
+    /// A stored notice is not a user turn, so it does not bring `max_turns` closer.
+    #[tokio::test]
+    async fn restored_turns_do_not_count_stored_notices() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        let mut prompt = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        prompt.parts.push(MessagePart::Text {
+            content: "fix the build".into(),
+        });
+        turn.history
+            .commit(&env.session_handle, vec![prompt])
+            .await
+            .unwrap();
+        turn.queue_notice(NoticeSource::ProgressReview, "review".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        assert_eq!(turn.history.user_turns(), 1);
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        let mut loaded = super::turn::History::default();
+        loaded.replace(reloaded);
+        assert_eq!(loaded.user_turns(), 1);
+    }
+
+    fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
+        crate::agent::objective::RunObjective::new(
+            querymt_agent_core::model::TurnId::new(),
+            prompt.into(),
+            "interactive".into(),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_objective_is_off_by_default_and_sent_when_enabled() {
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let (env, mut turn) = fixture.turn().await;
+        turn.run_objective = Some(objective_for("fix the build"));
+        let mut user = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        user.parts.push(MessagePart::Text {
+            content: "go".into(),
+        });
+        turn.history
+            .commit(&env.session_handle, vec![user])
+            .await
+            .unwrap();
+        let request_tail = |state: Step| match state {
+            Step::Continue(Stage::CallModel(request)) => request
+                .messages
+                .last()
+                .map(|message| (request.messages.len(), message.text())),
+            other => panic!("expected a prepared request, got {other:?}"),
+        };
+
+        // Default configuration: nothing is attached to the request.
+        assert!(!fixture.config.execution_policy.run_objective);
+        let off = super::prepare_model_request(&fixture.config, &env, &mut turn)
+            .await
+            .unwrap();
+        let (off_len, _) = request_tail(off).expect("a request");
+        assert_eq!(off_len, 1);
+
+        // Enabled: the rendered objective is attached to the request tail and
+        // the durable messages are untouched.
+        let mut config = (*fixture.config).clone();
+        config.execution_policy.run_objective = true;
+        let on = super::prepare_model_request(&config, &env, &mut turn)
+            .await
+            .unwrap();
+        let (on_len, tail) = request_tail(on).expect("a request");
+        assert_eq!(on_len, 2);
+        assert!(tail.contains("fix the build"));
+        assert_eq!(turn.history.as_slice().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_the_model_once_and_objective_events_fire_without_the_objective() {
+        use querymt_agent_core::events::AgentEventKind;
+
+        let fixture = crate::test_utils::TestAgent::new().await.with_inert_model();
+        let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+            querymt_agent_core::model::TurnId::new(),
+        ));
+        steering
+            .push(
+                "input-1".into(),
+                None,
+                vec![crate::acp::protocol::ContentBlock::Text(
+                    crate::acp::protocol::TextContent::new("change direction"),
+                )],
+            )
+            .await
+            .unwrap();
+        let (mut env, mut turn) = fixture.turn().await;
+        env.steering = Some(steering);
+        turn.run_objective = Some(objective_for("fix the build"));
+        let mut events = fixture.config.subscribe_events();
+
+        let applied = super::apply_pending_steering(
+            &fixture.config,
+            &env,
+            &mut turn,
+            SteeringBoundary::NextRequest,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The steering text is in the stored message, once; the objective is not sent.
+        assert!(applied);
+        let texts: Vec<String> = turn
+            .history
+            .as_slice()
+            .iter()
+            .map(|message| message.to_chat_message().unwrap().text())
+            .collect();
+        assert_eq!(texts, ["change direction"]);
+        // The objective was still amended and its event emitted.
+        assert_eq!(turn.run_objective.as_ref().unwrap().revision, 2);
+        let mut saw_update = false;
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+        {
+            saw_update |= matches!(event.kind(), AgentEventKind::ObjectiveUpdated { .. });
+        }
+        assert!(
+            saw_update,
+            "objective_updated is emitted when the objective is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_warning_kind_has_its_own_source() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call".into());
+        turn.queue_notice(NoticeSource::DuplicateCode, "similar code".into());
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        assert_eq!(
+            stored_notices(&fixture, &env.session_id).await,
+            vec![
+                (NoticeSource::DuplicateToolCall, "same call".to_string()),
+                (NoticeSource::DuplicateCode, "similar code".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_survives_into_the_next_turn() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (_fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::StopHook, "keep going".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        // The next turn builds its first request from stored history.
+        let reloaded = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(reloaded.len(), 3);
+        assert_eq!(reloaded[2].to_chat_message().unwrap().text(), "keep going");
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(turn.history.as_slice()).unwrap(),
+            "same content as the message sent in the previous turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_follows_tool_results() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::DuplicateToolCall, "same call twice".into());
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        let stored = turn.history.as_slice();
+        assert_eq!(stored.len(), 3);
+        assert!(matches!(
+            &stored[1].parts[0],
+            MessagePart::ToolResult { .. }
+        ));
+        assert_eq!(
+            stored[2].to_chat_message().unwrap().text(),
+            "same call twice"
+        );
+        assert!(turn.pending_notices.is_empty());
+        assert_eq!(
+            stored_notices(&fixture, &env.session_id).await,
+            vec![(
+                NoticeSource::DuplicateToolCall,
+                "same call twice".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_is_stored_once() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::TaskCompletion, "finish".into());
+
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+        let first = turn.history.as_slice().len();
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        assert_eq!(turn.history.as_slice().len(), first);
+        assert_eq!(stored_notices(&fixture, &env.session_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notice_for_a_request_that_is_never_sent_is_not_stored() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        // The run is cancelled before the next request: the queued notice is
+        // dropped with the run and nothing reaches storage.
+        turn.queue_notice(NoticeSource::DuplicateCode, "review".into());
+        assert_eq!(turn.pending_notices.len(), 1);
+        assert_eq!(turn.history.as_slice().len(), 2);
+        drop(turn);
+
+        assert!(stored_notices(&fixture, &env.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notice_is_reported_in_loaded_history() {
+        use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+        let (fixture, env, mut turn) = notice_fixture().await;
+        turn.queue_notice(NoticeSource::ParallelEdit, "edit once".into());
+        super::store_pending_notices(&env, &mut turn).await.unwrap();
+
+        let history = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&env.session_id)
+            .await
+            .unwrap();
+        let part = history
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .find(|part| matches!(part, MessagePart::Notice { .. }))
+            .expect("notice part in loaded history");
+        assert_eq!(part.type_name(), "notice");
+        assert_eq!(
+            serde_json::to_value(part).unwrap(),
+            json!({"type": "Notice", "data": {"source": "parallel_edit", "content": "edit once"}})
+        );
     }
 
     #[test]

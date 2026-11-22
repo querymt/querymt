@@ -191,6 +191,21 @@ impl ClaudeModel {
         }
     }
 
+    /// Tool changes inside the conversation (`tool_addition` and
+    /// `tool_removal` blocks) are accepted by Opus 4.8, 5 and 5.5, Sonnet 5.5,
+    /// Haiku 5.5, and the Fable 5 and Mythos 5 families. Sonnet 5, Haiku 4.5
+    /// and every older model reject them (Claude API docs, "Mid-conversation
+    /// system messages and tool changes", and the live endpoint).
+    pub fn supports_tool_updates(&self) -> bool {
+        let minor = self.minor.unwrap_or(0);
+        match self.family {
+            Family::Opus => matches!((self.major, minor), (Some(4), 8) | (Some(5), 0 | 5)),
+            Family::Sonnet | Family::Haiku => (self.major, minor) == (Some(5), 5),
+            Family::Fable | Family::Mythos => self.major == Some(5),
+            Family::Other => false,
+        }
+    }
+
     /// Opus 4.7+, every Claude 5+, Fable and Mythos reject non-default
     /// `temperature`, `top_p` and `top_k`.
     pub fn rejects_sampling_params(&self) -> bool {
@@ -400,6 +415,36 @@ mod tests {
         }
         // Unrecognisable IDs never parse, so they never qualify.
         assert!(parse_claude_model("my-proxy-model").is_none());
+    }
+
+    #[test]
+    fn tool_update_support_by_model() {
+        let cases = [
+            ("claude-opus-4-8", true),
+            ("claude-opus-4-8-20260301", true),
+            ("claude-opus-5", true),
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-sonnet-5-5-20260301", true),
+            ("claude-haiku-5-5", true),
+            ("claude-fable-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-fable-5-2", true),
+            ("claude-mythos-5", true),
+            ("claude-mythos-5-2", true),
+            ("claude-sonnet-5", false),
+            ("claude-haiku-4-5", false),
+            ("claude-haiku-4-5-20251001", false),
+            ("claude-haiku-5", false),
+            ("claude-opus-4-7", false),
+            ("claude-opus-4-5", false),
+            ("claude-sonnet-4-6", false),
+            ("claude-3-7-sonnet-20250219", false),
+            ("claude-mythos-preview", false),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(model(id).supports_tool_updates(), expected, "{id}");
+        }
     }
 
     #[test]

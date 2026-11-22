@@ -89,7 +89,7 @@ impl ToolTrait for WriteFileTool {
             .and_then(Value::as_bool)
             .unwrap_or(true);
 
-        let path = context.resolve_path(path_arg)?;
+        let path = context.resolve_path_arg("path", path_arg)?;
 
         // Mutating phase runs under the checkout mutation gate when the
         // session has one (see `run_under_mutation_gate`).

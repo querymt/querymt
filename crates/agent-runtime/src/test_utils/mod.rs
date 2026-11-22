@@ -7,6 +7,7 @@ pub mod delegation;
 pub mod drivers;
 pub mod fixtures;
 pub mod helpers;
+pub mod hook_rig;
 pub mod mcp_harness;
 pub mod mocks;
 
@@ -14,4 +15,5 @@ pub mod mocks;
 pub use drivers::*;
 pub use fixtures::*;
 pub use helpers::*;
+pub use hook_rig::HookRig;
 pub use mocks::*;

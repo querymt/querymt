@@ -3,7 +3,9 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
-use crate::agent::utils::{genai, render_prompt_for_llm};
+use crate::agent::agent_config::AgentConfig;
+use crate::agent::execution::llm_retry::call_chat_with_retry_if;
+use crate::agent::utils::genai;
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::{FutureExt, StreamExt};
@@ -19,6 +21,7 @@ use querymt_agent_core::model::{AgentMessage, MessagePart};
 use querymt_agent_services::accounting::{AccountingError, DispatchLedger, DispatchMode};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Default compaction prompt used to generate conversation summaries
 ///
@@ -45,6 +48,38 @@ pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
         ),
         None => COMPACTION_PROMPT.to_string(),
     }
+}
+
+/// The active task's identifier, deliverable and acceptance criteria, verbatim,
+/// for appending to a compaction summary.
+///
+/// With the run objective off by default, compaction is the one place that can
+/// lose these. Returns `None` when there is no active task, or it has neither a
+/// deliverable nor acceptance criteria.
+pub(crate) fn active_task_section(task: Option<&crate::session::domain::Task>) -> Option<String> {
+    let task = task.filter(|task| task.status == crate::session::domain::TaskStatus::Active)?;
+    let deliverable = task
+        .expected_deliverable
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let criteria = task
+        .acceptance_criteria
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    if deliverable.is_none() && criteria.is_none() {
+        return None;
+    }
+    let mut lines = vec![format!("Task: {}", task.public_id)];
+    if let Some(deliverable) = deliverable {
+        lines.push(format!("Deliverable: {deliverable}"));
+    }
+    if let Some(criteria) = criteria {
+        lines.push(format!("Acceptance criteria: {criteria}"));
+    }
+    Some(format!(
+        "<active_task note=\"verbatim, still in force after this summary\">\n{}\n</active_task>",
+        lines.join("\n")
+    ))
 }
 
 /// Upper bound on the verbatim user prompts carried across a compaction.
@@ -98,27 +133,6 @@ pub(crate) fn original_task_section(messages: &[AgentMessage]) -> Option<String>
     ))
 }
 
-/// Configuration for retry behavior
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Maximum retry attempts
-    pub max_retries: usize,
-    /// Initial backoff delay in milliseconds
-    pub initial_backoff_ms: u64,
-    /// Multiplier for exponential backoff
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            initial_backoff_ms: 1000,
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
 /// Result of a compaction operation
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
@@ -128,6 +142,31 @@ pub struct CompactionResult {
     pub original_token_count: usize,
     /// Estimated token count of the summary
     pub summary_token_count: usize,
+}
+
+/// Where and how a compaction request is sent and recorded. Shared by every
+/// attempt of one compaction.
+///
+/// The model and the initiating session are not repeated here: they are the
+/// ledger's, so the span, the retry events and the accounting cannot disagree
+/// with each other. That `provider` is the one serving the ledger's model is
+/// the caller's to keep true: build both from one
+/// `SessionHandle::resolve_compaction_model`.
+#[derive(Clone)]
+pub struct CompactionDispatch<'a> {
+    /// The LLM provider used for summary generation.
+    pub provider: Arc<dyn querymt::chat::ChatProvider>,
+    /// Provider errors are retried by `[agent.execution.rate_limit]`, rejected
+    /// summaries by `[agent.execution.compaction.retry]`.
+    pub config: &'a AgentConfig,
+    /// Stops the request in flight (including a stream that has started) and
+    /// the waits between retries.
+    pub cancel: &'a CancellationToken,
+    /// Where every physical attempt is recorded. Required: the initiating
+    /// session, cycle and model are explicit and never inferred from the
+    /// messages. Each retry is a separate attempt, settled before the summary
+    /// is validated so a rejected summary keeps its cost.
+    pub ledger: &'a DispatchLedger,
 }
 
 /// Service for generating AI-powered conversation summaries
@@ -165,49 +204,23 @@ impl SessionCompaction {
     /// # Arguments
     ///
     /// * `messages` - The conversation history to summarize
-    /// * `provider` - The LLM provider to use for summary generation
-    /// * `retry_config` - Configuration for retry behavior
-    /// * `ledger` - Where every physical attempt is recorded. Required: the
-    ///   initiating session/cycle is explicit and never inferred from
-    ///   `messages`. Each retry is a separate attempt, settled before the
-    ///   summary is validated so a rejected summary keeps its cost.
+    /// * `max_prompt_bytes` - Optional cap on the request size
+    /// * `instructions` - Optional user-provided focus (for example from
+    ///   `/compact focus on the API changes`) added to the compaction prompt
+    /// * `dispatch` - Where and how the request is sent and recorded; the
+    ///   model and session come from its ledger
     pub async fn process(
         &self,
         messages: &[AgentMessage],
-        provider: Arc<dyn querymt::chat::ChatProvider>,
-        model: &str,
-        retry_config: &RetryConfig,
         max_prompt_bytes: Option<usize>,
-        ledger: &DispatchLedger,
-    ) -> Result<CompactionResult> {
-        self.process_with_instructions(
-            messages,
-            provider,
-            model,
-            retry_config,
-            max_prompt_bytes,
-            ledger,
-            None,
-        )
-        .await
-    }
-
-    /// Like [`Self::process`], with optional user-provided focus instructions
-    /// (for example from `/compact focus on the API changes`) added to the
-    /// compaction prompt.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn process_with_instructions(
-        &self,
-        messages: &[AgentMessage],
-        provider: Arc<dyn querymt::chat::ChatProvider>,
-        model: &str,
-        retry_config: &RetryConfig,
-        max_prompt_bytes: Option<usize>,
-        ledger: &DispatchLedger,
         instructions: Option<&str>,
+        dispatch: &CompactionDispatch<'_>,
     ) -> Result<CompactionResult> {
         // Estimate original token count
-        let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
+        // The compaction request carries no tool records, so none are counted.
+        let original_token_count =
+            crate::session::pruning::estimate_history_tokens(messages, max_prompt_bytes, false)
+                .map_err(|error| LLMError::GenericError(error.to_string()))?;
 
         // Build the compaction request
         let chat_messages = self.build_compaction_messages_with_instructions(
@@ -217,19 +230,7 @@ impl SessionCompaction {
         )?;
 
         // Call LLM with retry logic
-        let summary = self
-            .call_with_retry(
-                &chat_messages,
-                provider,
-                model,
-                retry_config,
-                messages
-                    .first()
-                    .map(|message| message.session_id.as_str())
-                    .filter(|id| !id.is_empty()),
-                ledger,
-            )
-            .await?;
+        let summary = self.call_with_retry(&chat_messages, dispatch).await?;
 
         // The summary is validated before this point; the verbatim task is
         // appended afterwards so it can never rescue an empty summary.
@@ -262,10 +263,19 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         instructions: Option<&str>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
-        let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
-            .iter()
-            .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
-            .collect::<std::result::Result<_, _>>()?;
+        // The summary needs the conversation, not the tool definitions: the
+        // request carries no tool list, so tool baselines and tool changes are
+        // left out by the projection (`tool_changes: false`), which also keeps
+        // native provider output out (no output target).
+        let mut chat_messages = querymt_agent_core::projection::project_request(
+            messages,
+            &querymt_agent_core::projection::RequestTarget {
+                output: None,
+                max_prompt_bytes,
+                tool_changes: false,
+            },
+        )?
+        .messages;
 
         // Add the compaction prompt as a user message
         chat_messages.push(
@@ -277,7 +287,19 @@ impl SessionCompaction {
         Ok(chat_messages)
     }
 
-    /// Call LLM with exponential backoff retry.
+    /// Send the compaction request and return a valid summary.
+    ///
+    /// Two loops with different owners. The inner one is the shared model
+    /// request retry ([`call_chat_with_retry_if`]): a provider error is retried
+    /// only when `LLMError::is_retryable` (and it is not a request timeout),
+    /// after the wait its class asks for, at most `rate_limit.max_retries`
+    /// requests, and it stops when `cancel` fires. A request in flight is
+    /// stopped by `cancel` too, keeping the usage it had reported.
+    /// A stream that closes before its terminal event is a lost connection
+    /// and is retried like one. The outer one is compaction's own: a reply that is not a usable
+    /// summary (empty, refused, cut off) is retried up to
+    /// `compaction.retry.max_retries` times, after `initial_backoff_ms`
+    /// multiplied by `backoff_multiplier` for each further retry.
     ///
     /// Prefers streaming when the provider supports it.  The streaming path
     /// uses per-chunk timeouts (typically 60 s) instead of a single total
@@ -285,133 +307,120 @@ impl SessionCompaction {
     /// generates the compaction summary.  This avoids the 10 s libp2p default
     /// timeout that caused compaction failures on remote mesh nodes.
     ///
-    /// Mesh timeout errors (remote still processing) are treated as
-    /// **non-retriable** to prevent queuing duplicate inference work on the
-    /// remote GPU.
+    /// Request timeouts (the remote side is probably still working) are never
+    /// retried, to prevent queuing duplicate inference work on the remote GPU.
     #[tracing::instrument(
         name = "agent.compaction.call_llm",
         skip_all,
         fields(
-            otel.name = %format!("chat {model}"),
+            otel.name = %format!("chat {}", dispatch.ledger.operation.model()),
             otel.kind = "client",
             gen_ai.operation.name = "chat",
-            gen_ai.request.model = model,
-            gen_ai.conversation.id = session_id,
-            session.id = session_id,
-            gen_ai.request.stream = provider.capabilities().streaming,
+            gen_ai.request.model = dispatch.ledger.operation.model(),
+            gen_ai.conversation.id = dispatch.ledger.operation.session_id(),
+            session.id = dispatch.ledger.operation.session_id(),
+            gen_ai.request.stream = tracing::field::Empty,
             querymt.compaction = true,
         )
     )]
     async fn call_with_retry(
         &self,
         messages: &[querymt::chat::ChatMessage],
-        provider: Arc<dyn querymt::chat::ChatProvider>,
-        model: &str,
-        retry_config: &RetryConfig,
-        session_id: Option<&str>,
-        ledger: &DispatchLedger,
+        dispatch: &CompactionDispatch<'_>,
     ) -> Result<String> {
+        let CompactionDispatch {
+            provider,
+            config,
+            cancel,
+            ledger,
+        } = dispatch;
         // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
         genai::finish_reason("error");
         let chat_span = tracing::Span::current();
-        let mut timing = genai::StreamTiming::default();
+        // What the provider takes cannot change between attempts: it is read
+        // once, for the span and for every attempt.
+        let streaming = provider.capabilities().streaming;
+        chat_span.record("gen_ai.request.stream", streaming);
+        let retry = &config.execution_policy.compaction.retry;
+        let attempts = genai::RequestAttempts::new(&chat_span);
+        // Shared by every request of this compaction: the first chunk is
+        // logical across retries.
+        let timing = tokio::sync::Mutex::new(genai::StreamTiming::default());
+        let mut backoff_ms = retry.initial_backoff_ms;
         let mut last_error = None;
-        let mut backoff_ms = retry_config.initial_backoff_ms;
 
-        for attempt in 0..=retry_config.max_retries {
-            if attempt > 0 {
+        for summary_attempt in 0..=retry.max_retries {
+            if summary_attempt > 0 {
                 log::debug!(
                     "Compaction retry attempt {} after {}ms",
-                    attempt,
+                    summary_attempt,
                     backoff_ms
                 );
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms as f64 * retry_config.backoff_multiplier) as u64;
-            }
-
-            // Prefer streaming to avoid mesh request-response timeout on long
-            // inference.  The streaming path uses per-chunk timeouts instead of
-            // a single total-request timeout, keeping the connection alive
-            // while the model generates.
-            // The start is durable before the request is sent. Failing to
-            // record is fatal and never retried: no paid call without a ledger.
-            let streaming = provider.capabilities().streaming;
-            let attempt_record = ledger
-                .operation
-                .begin(
-                    if streaming {
-                        DispatchMode::Streaming
-                    } else {
-                        DispatchMode::NonStreaming
-                    },
-                    ledger.basis.clone(),
-                )
-                .await
-                .map_err(accounting_failure)?;
-
-            let raw = if streaming {
-                Self::call_streaming(messages, &provider, &mut timing, &chat_span).await
-            } else {
-                provider
-                    .chat(&ChatCall::new(messages))
-                    .await
-                    .map_err(|error| StreamFailure {
-                        error,
-                        response_started: false,
-                        usage: None,
-                        output: None,
-                    })
-            };
-
-            // Settle before validation: a refused, empty or incomplete summary
-            // still incurred whatever usage it reported.
-            let result = match raw {
-                Ok(output) => {
-                    let validated = Self::summary_from_output(&output);
-                    match &validated {
-                        Ok(_) => attempt_record.settle_output(&output).await,
-                        Err(_) => attempt_record.settle_rejected_output(&output, false).await,
-                    }
-                    .map_err(accounting_failure)?;
-                    validated.inspect(|_| genai::output(&output))
-                }
-                Err(failure) => {
-                    match &failure.output {
-                        Some(output) => attempt_record.settle_rejected_output(output, true).await,
-                        None => {
-                            attempt_record
-                                .settle_error(
-                                    &failure.error,
-                                    failure.response_started,
-                                    failure.usage.clone(),
-                                )
-                                .await
-                        }
-                    }
-                    .map_err(accounting_failure)?;
-                    Err(failure.error)
-                }
-            };
-
-            match result {
-                Ok(text) => return Ok(text),
-                Err(e) => {
-                    log::warn!("Compaction LLM call failed (attempt {})", attempt + 1);
-                    // Mesh timeouts mean the remote is still processing.
-                    // Retrying would just queue more work on an already-busy
-                    // remote GPU — abort immediately.
-                    if is_mesh_timeout_error(&e) {
-                        genai::llm_error(&e);
-                        log::warn!(
-                            "Compaction error is a mesh timeout (remote node likely still \
-                             processing). Aborting retries to avoid queuing duplicate work."
-                        );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
                         return Err(anyhow::anyhow!(
-                            "Compaction failed: mesh timeout (remote still processing): {}",
-                            e
+                            "Compaction cancelled while waiting to retry"
                         ));
                     }
-                    last_error = Some(e);
+                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                }
+                backoff_ms = (backoff_ms as f64 * retry.backoff_multiplier) as u64;
+            }
+
+            // An accounting failure is fatal and never retried. It cannot be
+            // returned as an `LLMError` (the shared retry would classify it),
+            // so the attempt parks it here and ends as a cancelled attempt,
+            // which is not retried and adds no attempt event.
+            let fatal = std::sync::Mutex::new(None);
+            // A request timeout is a failed attempt like any other, but the
+            // remote is probably still working: never resend after one.
+            let sent = call_chat_with_retry_if(
+                config,
+                ledger.operation.session_id(),
+                &attempts,
+                cancel,
+                |error| error.is_retryable() && !is_request_timeout(error),
+                |reply| matches!(reply, Reply::Rejected(_)),
+                || Self::send_once(messages, dispatch, streaming, &timing, &chat_span, &fatal),
+            )
+            .await;
+            if let Some(error) = fatal.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                return Err(error);
+            }
+
+            match sent {
+                Ok(Reply::Summary { text, output }) => {
+                    genai::output(&output);
+                    return Ok(text);
+                }
+                Ok(Reply::Rejected(error)) => {
+                    log::warn!(
+                        "Compaction reply rejected as a summary (attempt {})",
+                        summary_attempt + 1
+                    );
+                    last_error = Some(error);
+                }
+                Err(LLMError::Cancelled) => {
+                    return Err(anyhow::anyhow!("Compaction cancelled"));
+                }
+                Err(error) if is_request_timeout(&error) => {
+                    // The remote is still processing. Retrying would just
+                    // queue more work on an already-busy remote GPU.
+                    genai::llm_error(&error);
+                    log::warn!(
+                        "Compaction error is a request timeout (remote node likely still \
+                         processing). Aborting retries to avoid queuing duplicate work."
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Compaction failed: mesh timeout (remote still processing): {}",
+                        error
+                    ));
+                }
+                Err(error) => {
+                    // Not retryable, or the provider attempts are used up.
+                    genai::llm_error(&error);
+                    return Err(anyhow::anyhow!("Compaction request failed: {:?}", error));
                 }
             }
         }
@@ -421,9 +430,120 @@ impl SessionCompaction {
         }
         Err(anyhow::anyhow!(
             "Compaction failed after {} retries: {:?}",
-            retry_config.max_retries,
+            retry.max_retries,
             last_error
         ))
+    }
+
+    /// One physical request: open its accounting attempt, send it, settle
+    /// it, and say what came back. A reply is `Ok` even when it will be
+    /// rejected as a summary, so the shared retry only ever sees provider
+    /// errors.
+    async fn send_once(
+        messages: &[querymt::chat::ChatMessage],
+        dispatch: &CompactionDispatch<'_>,
+        streaming: bool,
+        timing: &tokio::sync::Mutex<genai::StreamTiming>,
+        chat_span: &tracing::Span,
+        fatal: &std::sync::Mutex<Option<anyhow::Error>>,
+    ) -> std::result::Result<Reply, LLMError> {
+        let CompactionDispatch {
+            provider,
+            cancel,
+            ledger,
+            ..
+        } = dispatch;
+        let park = |error: AccountingError| {
+            *fatal.lock().unwrap_or_else(|e| e.into_inner()) = Some(accounting_failure(error));
+            LLMError::Cancelled
+        };
+
+        // Prefer streaming to avoid mesh request-response timeout on long
+        // inference.  The streaming path uses per-chunk timeouts instead of
+        // a single total-request timeout, keeping the connection alive
+        // while the model generates.
+        // The start is durable before the request is sent. Failing to
+        // record is fatal and never retried: no paid call without a ledger.
+        let attempt_record = ledger
+            .operation
+            .begin(
+                if streaming {
+                    DispatchMode::Streaming
+                } else {
+                    DispatchMode::NonStreaming
+                },
+                ledger.basis.clone(),
+            )
+            .await
+            .map_err(park)?;
+
+        let raw = if streaming {
+            Self::call_streaming(
+                messages,
+                provider,
+                &mut *timing.lock().await,
+                chat_span,
+                cancel,
+            )
+            .await
+        } else {
+            let call = ChatCall::new(messages);
+            match unless_cancelled(cancel, provider.chat(&call)).await {
+                Ok(reply) => reply.map_err(|error| StreamFailure {
+                    error,
+                    response_started: false,
+                    usage: None,
+                    output: None,
+                    sent: true,
+                }),
+                Err(sent) => Err(StreamFailure::cancelled_before_reply(sent)),
+            }
+        };
+
+        // Settle before validation: a refused, empty or incomplete summary
+        // still incurred whatever usage it reported.
+        match raw {
+            Ok(output) => {
+                let validated = Self::summary_from_output(&output);
+                match &validated {
+                    Ok(_) => attempt_record.settle_output(&output).await,
+                    Err(_) => attempt_record.settle_rejected_output(&output, false).await,
+                }
+                .map_err(park)?;
+                Ok(match validated {
+                    Ok(text) => Reply::Summary {
+                        text,
+                        output: Box::new(output),
+                    },
+                    Err(error) => Reply::Rejected(error),
+                })
+            }
+            Err(failure) => {
+                match &failure.output {
+                    Some(output) => attempt_record.settle_rejected_output(output, true).await,
+                    // Cancelled before the request was ever polled: nothing
+                    // was sent, so nothing can have been billed.
+                    None if !failure.sent => attempt_record.settle_cancelled_before_send().await,
+                    None => {
+                        attempt_record
+                            .settle_error(
+                                &failure.error,
+                                failure.response_started,
+                                failure.usage.clone(),
+                            )
+                            .await
+                    }
+                }
+                .map_err(park)?;
+                if failure.output.is_some() {
+                    // The stream finished, with a reply that is cut off or
+                    // invalid: a rejected summary, not a provider error.
+                    Ok(Reply::Rejected(failure.error))
+                } else {
+                    Err(failure.error)
+                }
+            }
+        }
     }
 
     /// Collect legacy or structured output, requiring a successful stream completion.
@@ -435,24 +555,40 @@ impl SessionCompaction {
         provider: &Arc<dyn querymt::chat::ChatProvider>,
         timing: &mut genai::StreamTiming,
         chat_span: &tracing::Span,
+        cancel: &CancellationToken,
     ) -> std::result::Result<ChatOutput, StreamFailure> {
         timing.start();
-        let mut stream = provider
-            .chat_stream(&ChatCall::new(messages))
-            .await
-            .map_err(|error| StreamFailure {
+        let call = ChatCall::new(messages);
+        let mut stream = match unless_cancelled(cancel, provider.chat_stream(&call)).await {
+            Ok(opened) => opened.map_err(|error| StreamFailure {
                 error,
                 response_started: false,
                 usage: None,
                 output: None,
-            })?;
+                sent: true,
+            })?,
+            Err(sent) => return Err(StreamFailure::cancelled_before_reply(sent)),
+        };
         timing.headers_received(chat_span);
         let mut accumulator = ChatStreamAccumulator::new();
         let mut response_started = false;
         let mut terminal_seen = false;
         loop {
             timing.wait_begin();
-            let next = stream.next().await;
+            // Cancelling stops a stream that is quiet or blocked before its
+            // terminal chunk, and keeps the usage it reported so far for the
+            // attempt's settlement.
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    timing.wait_end();
+                    return Err(StreamFailure::cancelled(
+                        response_started,
+                        accumulator.output().usage,
+                    ));
+                }
+                next = stream.next() => next,
+            };
             timing.wait_end();
             let Some(chunk) = next else { break };
             let chunk = match chunk {
@@ -463,6 +599,7 @@ impl SessionCompaction {
                         response_started,
                         usage: accumulator.output().usage,
                         output: None,
+                        sent: true,
                     });
                 }
             };
@@ -474,6 +611,7 @@ impl SessionCompaction {
                     response_started,
                     usage: accumulator.output().usage,
                     output: None,
+                    sent: true,
                 });
             }
             if querymt::chat::chunk_is_terminal(&chunk) {
@@ -483,12 +621,16 @@ impl SessionCompaction {
         }
         if !terminal_seen {
             return Err(StreamFailure {
-                error: LLMError::GenericError(
-                    "Compaction stream ended without a terminal event".into(),
-                ),
+                // A lost connection, as the model stream path classifies it:
+                // retryable, unlike a typed timeout.
+                error: LLMError::Transport {
+                    kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                    message: "Compaction stream ended without a terminal event".into(),
+                },
                 response_started,
                 usage: accumulator.output().usage,
                 output: None,
+                sent: true,
             });
         }
         timing.finish(chat_span);
@@ -523,6 +665,7 @@ impl SessionCompaction {
                     response_started,
                     usage: output.usage.clone(),
                     output: Some(Box::new(output)),
+                    sent: true,
                 })
             }
             ChatStreamFinish::Failed { output, error } => {
@@ -532,6 +675,7 @@ impl SessionCompaction {
                     response_started,
                     usage: output.usage.clone(),
                     output: Some(Box::new(output)),
+                    sent: true,
                 })
             }
         }
@@ -571,44 +715,6 @@ impl SessionCompaction {
             ));
         }
         Ok(())
-    }
-
-    /// Estimate token count for a list of messages
-    pub(crate) fn estimate_messages_tokens(
-        &self,
-        messages: &[AgentMessage],
-        max_prompt_bytes: Option<usize>,
-    ) -> usize {
-        messages
-            .iter()
-            .map(|m| {
-                m.parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
-                        MessagePart::Prompt { blocks } => self
-                            .estimator
-                            .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
-                        MessagePart::ToolResult { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .filter_map(|b| b.as_text())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.estimator.estimate(&text)
-                        }
-                        MessagePart::Reasoning { item, .. } => {
-                            self.estimator.estimate(&item.visible_text())
-                        }
-                        MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
-                        MessagePart::Output { output } => {
-                            self.estimator.estimate(&output.estimate_text())
-                        }
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum()
     }
 
     /// Create a compaction message pair to be stored in history.
@@ -657,6 +763,17 @@ impl SessionCompaction {
     }
 }
 
+/// What one physical request returned, after it was settled.
+enum Reply {
+    /// A usable summary, with the output it came from.
+    Summary {
+        text: String,
+        output: Box<ChatOutput>,
+    },
+    /// A reply that is not a usable summary (empty, refused, cut off).
+    Rejected(LLMError),
+}
+
 /// A failed physical attempt, with what accounting needs to settle it.
 struct StreamFailure {
     error: LLMError,
@@ -667,13 +784,61 @@ struct StreamFailure {
     usage: Option<querymt::Usage>,
     /// Partial canonical output, when the stream reached finalization.
     output: Option<Box<ChatOutput>>,
+    /// False only when the provider request was never polled: nothing was
+    /// sent, so the attempt cannot have been billed.
+    sent: bool,
+}
+
+impl StreamFailure {
+    /// The compaction was cancelled while the request was in flight.
+    fn cancelled(response_started: bool, usage: Option<querymt::Usage>) -> Self {
+        Self {
+            error: LLMError::Cancelled,
+            response_started,
+            usage,
+            output: None,
+            sent: true,
+        }
+    }
+
+    /// The compaction was cancelled before any reply arrived; `sent` says
+    /// whether the provider request had been polled by then.
+    fn cancelled_before_reply(sent: bool) -> Self {
+        Self {
+            sent,
+            ..Self::cancelled(false, None)
+        }
+    }
+}
+
+/// Run `request` unless `cancel` fires first (cancellation wins a tie). On
+/// cancellation, `Err` says whether `request` had been polled: until it is,
+/// a provider request cannot have been sent.
+async fn unless_cancelled<T>(
+    cancel: &CancellationToken,
+    request: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, bool> {
+    let mut polled = false;
+    let outcome = {
+        let mut request = std::pin::pin!(request);
+        let tracked = std::future::poll_fn(|cx| {
+            polled = true;
+            request.as_mut().poll(cx)
+        });
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            reply = tracked => Some(reply),
+        }
+    };
+    outcome.ok_or(polled)
 }
 
 fn accounting_failure(error: AccountingError) -> anyhow::Error {
     anyhow::anyhow!("Compaction accounting failure: {error}")
 }
 
-/// Check if an LLM error indicates a mesh timeout (remote node still processing).
+/// Check if an LLM error is a request timeout (remote node still processing).
 ///
 /// These errors should **not** be retried because the remote GPU is still busy
 /// with the previous request.  Retrying just queues additional inference work,
@@ -683,7 +848,7 @@ fn accounting_failure(error: AccountingError) -> anyhow::Error {
 /// variant which is produced by `MeshChatProvider::chat_with_tools` when
 /// kameo's `RemoteSendError::Timeout` fires, or when a mesh stream's
 /// reconnect grace period expires.
-fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
+fn is_request_timeout(e: &querymt::error::LLMError) -> bool {
     matches!(
         e,
         querymt::error::LLMError::Transport {
@@ -797,7 +962,9 @@ mod tests {
         };
         use tracing::Instrument;
 
-        for session_id in [None, Some("compaction-session"), Some("")] {
+        // The span's session is the ledger's (the initiating session), never
+        // inferred from the history, whatever the history carries.
+        for session_id in [None, Some("history-session"), Some("")] {
             let mut chunks = structured_summary("SECRET_RESPONSE", true);
             if let StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
                 provenance,
@@ -827,7 +994,7 @@ mod tests {
             let provider = ScriptedProvider::new(
                 true,
                 vec![
-                    Attempt::Stream(vec![Err(LLMError::AuthError("SECRET_ERROR".into()))]),
+                    Attempt::Stream(vec![Err(LLMError::HttpError("SECRET_ERROR".into()))]),
                     Attempt::Stream(chunks.into_iter().map(Ok).collect()),
                 ],
             );
@@ -839,11 +1006,14 @@ mod tests {
                 SessionCompaction::new()
                     .process(
                         &history,
-                        provider.clone(),
-                        "model",
-                        &retry_config(1),
                         None,
-                        &test_ledger().await,
+                        None,
+                        &CompactionDispatch {
+                            provider: provider.clone(),
+                            config: &*test_config(1).await,
+                            cancel: &CancellationToken::new(),
+                            ledger: &test_ledger().await,
+                        },
                     )
                     .instrument(tracing::info_span!(
                         "unrelated-parent",
@@ -900,10 +1070,7 @@ mod tests {
             );
             assert_eq!(
                 attr(chat, "gen_ai.conversation.id"),
-                session_id
-                    .filter(|id| !id.is_empty())
-                    .map(Value::from)
-                    .as_ref()
+                Some(&Value::from("compaction-session"))
             );
             assert_eq!(
                 attr(chat, "session.id"),
@@ -971,9 +1138,24 @@ mod tests {
                     Attempt::Stream(chunks)
                 };
                 let provider = ScriptedProvider::new(true, vec![attempt]);
+                // The configuration and ledger (a database each) are built
+                // outside the time limit: it is there to catch a wait on the
+                // pending tail, not a slow test machine.
+                let config = test_config(0).await;
+                let ledger = test_ledger().await;
                 let (result, spans) = capture(tokio::time::timeout(
                     Duration::from_secs(1),
-                    process_script(provider, 0),
+                    SessionCompaction::new().process(
+                        &[],
+                        None,
+                        None,
+                        &CompactionDispatch {
+                            provider,
+                            config: &config,
+                            cancel: &CancellationToken::new(),
+                            ledger: &ledger,
+                        },
+                    ),
                 ))
                 .await;
                 assert_eq!(
@@ -983,13 +1165,16 @@ mod tests {
                         .summary,
                     "SECRET_RESPONSE"
                 );
-                assert_eq!(spans.len(), 1);
+                // The shared retry adds its own helper span; the request is
+                // the `chat` span, and there is exactly one.
+                let chats: Vec<_> = spans.iter().filter(|s| s.name == "chat model").collect();
+                assert_eq!(chats.len(), 1);
                 assert_eq!(
-                    attr(&spans[0], "gen_ai.usage.input_tokens"),
+                    attr(chats[0], "gen_ai.usage.input_tokens"),
                     Some(&Value::I64(37))
                 );
                 assert_eq!(
-                    attr(&spans[0], "gen_ai.usage.output_tokens"),
+                    attr(chats[0], "gen_ai.usage.output_tokens"),
                     Some(&Value::I64(40))
                 );
                 assert_private(&spans);
@@ -1004,7 +1189,9 @@ mod tests {
             assert_private, attr, capture,
         };
         for metadata_first in [false, true] {
-            let error = || LLMError::AuthError("SECRET_ERROR".into());
+            // A retryable error: the shared retry resends after
+            // `transport_wait_secs`, which is 0 here.
+            let error = || LLMError::HttpError("SECRET_ERROR".into());
             let initial = if metadata_first {
                 Attempt::Stream(vec![
                     Ok(StreamChunk::Usage(Default::default())),
@@ -1033,15 +1220,14 @@ mod tests {
             )];
             let (result, spans) = capture(SessionCompaction::new().process(
                 &history,
-                provider.clone(),
-                "model",
-                &RetryConfig {
-                    max_retries: 1,
-                    initial_backoff_ms: 60,
-                    backoff_multiplier: 1.0,
-                },
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: provider.clone(),
+                    config: &*test_config(1).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             ))
             .await;
             assert!(result.is_ok());
@@ -1051,7 +1237,10 @@ mod tests {
                 matches!(attr(chat, "gen_ai.response.time_to_first_chunk"), Some(Value::F64(actual)) if (actual - expected).abs() < 0.03)
             );
             if !metadata_first {
-                assert!(expected >= 0.1);
+                // The provider's delay of 20 ms three times (setup of the
+                // first request, then setup and first chunk of the retry).
+                // The retry itself waits `transport_wait_secs`, 0 here.
+                assert!(expected >= 0.06);
             }
             assert_eq!(
                 chat.attributes
@@ -1085,14 +1274,207 @@ mod tests {
         );
         let (result, spans) = capture(process_script(provider, 0)).await;
         assert!(result.is_err());
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].status, Status::error(""));
-        assert!(attr(&spans[0], "gen_ai.response.time_to_first_chunk").is_none());
+        // The shared retry adds its own helper span; the request is the
+        // `chat` span, and there is exactly one.
+        let chats: Vec<_> = spans.iter().filter(|s| s.name == "chat model").collect();
+        assert_eq!(chats.len(), 1);
+        let chat = chats[0];
+        assert_eq!(chat.status, Status::error(""));
+        assert!(attr(chat, "gen_ai.response.time_to_first_chunk").is_none());
         assert_eq!(
-            attr(&spans[0], "error.type"),
+            attr(chat, "error.type"),
             Some(&Value::from("authentication"))
         );
         assert_private(&spans);
+    }
+
+    /// The `gen_ai.request.attempt` events of a span, as the attempt number
+    /// and the `error.type` each carries.
+    fn attempt_events(span: &opentelemetry_sdk::trace::SpanData) -> Vec<(i64, Option<String>)> {
+        span.events
+            .iter()
+            .filter(|event| event.name == "gen_ai.request.attempt")
+            .map(|event| {
+                let value = |key: &str| {
+                    event
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.key.as_str() == key)
+                        .map(|attribute| attribute.value.clone())
+                };
+                let attempt = match value("gen_ai.request.attempt") {
+                    Some(opentelemetry::Value::I64(attempt)) => attempt,
+                    other => panic!("attempt event without a number: {other:?}"),
+                };
+                (attempt, value("error.type").map(|v| v.to_string()))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compaction_request_retried_once() {
+        use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::SetupError(LLMError::HttpStatus {
+                    status_code: 503,
+                    message: "SECRET_ERROR".into(),
+                    retry_after_secs: Some(0),
+                }),
+                Attempt::Stream(
+                    structured_summary("SECRET_RESPONSE", true)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
+        let config = config_with(|_| {}).await;
+        let (result, spans) = capture(SessionCompaction::new().process(
+            &[MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "SECRET_PROMPT",
+            )],
+            None,
+            None,
+            &CompactionDispatch {
+                provider: provider.clone(),
+                config: &config,
+                cancel: &CancellationToken::new(),
+                ledger: &test_ledger().await,
+            },
+        ))
+        .await;
+
+        assert_eq!(result.unwrap().summary, "SECRET_RESPONSE");
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+        let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+        assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(2)));
+        // One event per attempt that ended: the first failed (an HTTP status
+        // is a provider error, never its message), the second succeeded.
+        assert_eq!(
+            attempt_events(chat),
+            vec![(1, Some("provider_error".to_string())), (2, None)]
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn compaction_request_without_a_retry() {
+        use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
+        let provider = ScriptedProvider::new(
+            true,
+            vec![Attempt::Stream(
+                structured_summary("SECRET_RESPONSE", true)
+                    .into_iter()
+                    .map(Ok)
+                    .collect(),
+            )],
+        );
+        let config = config_with(|_| {}).await;
+        let (result, spans) = capture(SessionCompaction::new().process(
+            &[MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "SECRET_PROMPT",
+            )],
+            None,
+            None,
+            &CompactionDispatch {
+                provider,
+                config: &config,
+                cancel: &CancellationToken::new(),
+                ledger: &test_ledger().await,
+            },
+        ))
+        .await;
+
+        assert!(result.is_ok());
+        let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+        assert_eq!(attr(chat, "gen_ai.request.attempt"), Some(&Value::I64(1)));
+        assert_eq!(attempt_events(chat), vec![(1, None)]);
+        assert_private(&spans);
+    }
+
+    /// A reply rejected as a summary is not a successful attempt: its event
+    /// carries an `error.type`, and the next summary attempt follows.
+    #[tokio::test]
+    async fn rejected_summary_attempt_is_reported_as_rejected_output() {
+        use querymt_agent_services::tools::trace_support::genai_trace::{assert_private, capture};
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::Stream(structured_summary(" ", true).into_iter().map(Ok).collect()),
+                Attempt::Stream(
+                    structured_summary("SECRET_RESPONSE", true)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
+        let config = config_with(|config| {
+            config.execution_policy.compaction.retry.max_retries = 1;
+            config.execution_policy.compaction.retry.initial_backoff_ms = 0;
+        })
+        .await;
+        let (result, spans) = capture(SessionCompaction::new().process(
+            &[MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "SECRET_PROMPT",
+            )],
+            None,
+            None,
+            &CompactionDispatch {
+                provider: provider.clone(),
+                config: &config,
+                cancel: &CancellationToken::new(),
+                ledger: &test_ledger().await,
+            },
+        ))
+        .await;
+
+        assert_eq!(result.unwrap().summary, "SECRET_RESPONSE");
+        let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+        assert_eq!(
+            attempt_events(chat),
+            vec![(1, Some("output_rejected".to_string())), (2, None)]
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_request_is_polled_reports_it_unsent() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polled = AtomicUsize::new(0);
+        let request = std::future::poll_fn(|_| {
+            polled.fetch_add(1, Ordering::Relaxed);
+            std::task::Poll::<()>::Pending
+        });
+        assert_eq!(unless_cancelled(&cancel, request).await, Err(false));
+        assert_eq!(polled.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_the_request_was_polled_reports_it_possibly_sent() {
+        let cancel = CancellationToken::new();
+        let request = std::future::pending::<()>();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+        assert_eq!(unless_cancelled(&cancel, request).await, Err(true));
     }
 
     enum Attempt {
@@ -1114,6 +1496,9 @@ mod tests {
         calls: AtomicUsize,
         delay: Duration,
         clock: Arc<std::sync::Mutex<(Option<std::time::Instant>, Option<f64>)>>,
+        /// When each request reached the provider, on the tokio clock (paused
+        /// in the tests that assert a wait).
+        sent: std::sync::Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl ScriptedProvider {
@@ -1124,11 +1509,13 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 delay: Duration::ZERO,
                 clock: Default::default(),
+                sent: Default::default(),
             })
         }
 
         async fn next(&self) -> Attempt {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.sent.lock().unwrap().push(tokio::time::Instant::now());
             self.attempts
                 .lock()
                 .await
@@ -1195,12 +1582,53 @@ mod tests {
         }
     }
 
-    fn retry_config(max_retries: usize) -> RetryConfig {
-        RetryConfig {
-            max_retries,
-            initial_backoff_ms: 0,
-            backoff_multiplier: 1.0,
+    /// An agent configuration for the compaction under test. The summary
+    /// budget is `max_retries`, no wait is longer than zero seconds and
+    /// there is no jitter, so a test that does not assert a wait does not
+    /// wait. Dereferences to the [`AgentConfig`].
+    struct TestConfig {
+        config: crate::agent::agent_config::AgentConfig,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestConfig {
+        type Target = crate::agent::agent_config::AgentConfig;
+
+        fn deref(&self) -> &Self::Target {
+            &self.config
         }
+    }
+
+    async fn config_with(
+        edit: impl FnOnce(&mut crate::agent::agent_config::AgentConfig),
+    ) -> TestConfig {
+        let (registry, dir) =
+            crate::test_utils::helpers::empty_plugin_registry().expect("plugin registry");
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut config = crate::agent::agent_config_builder::AgentConfigBuilder::new(
+            Arc::new(registry),
+            storage,
+            querymt::LLMParams::new().provider("mock").model("mock"),
+        )
+        .build();
+        let policy = &mut config.execution_policy;
+        policy.rate_limit.jitter_ratio = 0.0;
+        policy.rate_limit.default_wait_secs = 0;
+        policy.rate_limit.transport_wait_secs = 0;
+        policy.compaction.retry.initial_backoff_ms = 0;
+        policy.compaction.retry.backoff_multiplier = 1.0;
+        edit(&mut config);
+        TestConfig { config, _dir: dir }
+    }
+
+    /// A configuration whose rejected-summary budget is `max_retries`.
+    async fn test_config(max_retries: usize) -> TestConfig {
+        config_with(|config| config.execution_policy.compaction.retry.max_retries = max_retries)
+            .await
     }
 
     fn message_item(text: &str) -> ChatOutputItem {
@@ -1273,11 +1701,14 @@ mod tests {
         SessionCompaction::new()
             .process(
                 &[],
-                provider,
-                "model",
-                &retry_config(max_retries),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider,
+                    config: &*test_config(max_retries).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await
     }
@@ -1357,16 +1788,69 @@ mod tests {
         let result = SessionCompaction::new()
             .process(
                 &[],
-                provider.clone(),
-                "model",
-                &retry_config(1),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: provider.clone(),
+                    config: &*test_config(1).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await
             .unwrap();
         assert_eq!(result.summary, "Valid continuation summary");
         assert_eq!(provider.call_count(), 2);
+    }
+
+    fn task_with(
+        status: crate::session::domain::TaskStatus,
+        deliverable: Option<&str>,
+        criteria: Option<&str>,
+    ) -> crate::session::domain::Task {
+        let now = time::OffsetDateTime::now_utc();
+        crate::session::domain::Task {
+            id: 1,
+            public_id: "task-7".into(),
+            session_id: 1,
+            kind: crate::session::domain::TaskKind::Finite,
+            status,
+            expected_deliverable: deliverable.map(str::to_owned),
+            acceptance_criteria: criteria.map(str::to_owned),
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn compaction_with_an_active_task_carries_its_identifier_and_criteria() {
+        use crate::session::domain::TaskStatus;
+        let task = task_with(
+            TaskStatus::Active,
+            Some("a parser fix"),
+            Some("all tests pass"),
+        );
+
+        let section = active_task_section(Some(&task)).expect("task section");
+
+        assert!(section.contains("task-7"));
+        assert!(section.contains("Deliverable: a parser fix"));
+        assert!(section.contains("Acceptance criteria: all tests pass"));
+    }
+
+    #[test]
+    fn compaction_without_an_active_task_has_no_task_section() {
+        use crate::session::domain::TaskStatus;
+        assert!(active_task_section(None).is_none());
+        // Finished, and active-but-empty tasks add nothing either.
+        let done = task_with(TaskStatus::Done, Some("x"), Some("y"));
+        assert!(active_task_section(Some(&done)).is_none());
+        let empty = task_with(TaskStatus::Active, None, None);
+        assert!(active_task_section(Some(&empty)).is_none());
     }
 
     #[tokio::test]
@@ -1394,11 +1878,14 @@ mod tests {
         let result = SessionCompaction::new()
             .process(
                 &messages,
-                provider,
-                "model",
-                &retry_config(0),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider,
+                    config: &*test_config(0).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await
             .unwrap();
@@ -1439,13 +1926,111 @@ mod tests {
             chunks,
             vec![StreamChunk::Text("partial legacy summary".into())],
         ] {
+            // A stream that closes early is a lost connection, which the
+            // shared retry resends: every request of its budget gets the same
+            // answer, and none of them is a summary.
             let provider = ScriptedProvider::new(
                 true,
-                vec![Attempt::Stream(chunks.into_iter().map(Ok).collect())],
+                (0..3)
+                    .map(|_| Attempt::Stream(chunks.iter().cloned().map(Ok).collect()))
+                    .collect(),
             );
-            let error = process_script(provider, 0).await.unwrap_err();
+            let error = process_script(provider.clone(), 0).await.unwrap_err();
             assert!(error.to_string().contains("without a terminal event"));
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
         }
+    }
+
+    #[tokio::test]
+    async fn a_stream_closed_before_its_terminal_event_recovers_on_the_next_request() {
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::Stream(vec![Ok(StreamChunk::Text("partial".into()))]),
+                Attempt::Stream(
+                    structured_summary("Valid continuation summary", true)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
+        assert_eq!(
+            process_script(provider.clone(), 0).await.unwrap().summary,
+            "Valid continuation summary"
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn genai_compaction_timeout_is_a_failed_attempt_and_is_not_retried() {
+        use querymt_agent_services::tools::trace_support::genai_trace::capture;
+        let timeout = || {
+            Attempt::SetupError(LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::Timeout,
+                message: "network timeout".into(),
+            })
+        };
+        let provider = ScriptedProvider::new(true, vec![timeout(), timeout()]);
+        let (result, spans) = capture(process_script(provider.clone(), 0)).await;
+
+        assert!(result.unwrap_err().to_string().contains("timeout"));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        let chat = spans
+            .iter()
+            .find(|span| span.name == "chat model")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no chat span in {:?}",
+                    spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+                )
+            });
+        let events = attempt_events(chat);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].0, 1);
+        assert!(events[0].1.is_some(), "the attempt failed: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_a_stream_that_is_blocked_before_its_terminal_chunk() {
+        let provider = ScriptedProvider::new(
+            true,
+            vec![Attempt::StreamWithPendingTail(vec![Ok(
+                StreamChunk::Usage(Default::default()),
+            )])],
+        );
+        let cancel = CancellationToken::new();
+        let config = test_config(0).await;
+        let ledger = test_ledger().await;
+        // Cancel once the request is in flight, not on a timer: the stream
+        // never ends, so the only way out is the cancellation.
+        let canceller = cancel.clone();
+        let watched = provider.clone();
+        tokio::spawn(async move {
+            while watched.calls.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            canceller.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            SessionCompaction::new().process(
+                &[],
+                None,
+                None,
+                &CompactionDispatch {
+                    provider: provider.clone(),
+                    config: &config,
+                    cancel: &cancel,
+                    ledger: &ledger,
+                },
+            ),
+        )
+        .await
+        .expect("cancelling must not wait for the stream");
+
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1, "no retry");
     }
 
     #[tokio::test]
@@ -1455,7 +2040,10 @@ mod tests {
             vec![
                 Attempt::Stream(vec![
                     Ok(StreamChunk::Text("discard me".into())),
-                    Err(LLMError::GenericError("transport failed".into())),
+                    Err(LLMError::Transport {
+                        kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                        message: "transport failed".into(),
+                    }),
                 ]),
                 Attempt::Stream(
                     structured_summary("Valid continuation summary", true)
@@ -1756,14 +2344,22 @@ mod tests {
             self.service
                 .process(
                     messages,
-                    Arc::new(mock),
-                    "test-model",
-                    &RetryConfig::default(),
                     None,
-                    &test_ledger().await,
+                    None,
+                    &CompactionDispatch {
+                        provider: Arc::new(mock),
+                        config: &*test_config(3).await,
+                        cancel: &CancellationToken::new(),
+                        ledger: &test_ledger().await,
+                    },
                 )
                 .await
         }
+    }
+
+    /// The shared estimate of a stored history.
+    fn estimate_tokens(messages: &[AgentMessage], max_prompt_bytes: Option<usize>) -> usize {
+        crate::session::pruning::estimate_history_tokens(messages, max_prompt_bytes, false).unwrap()
     }
 
     // ========================================================================
@@ -1816,10 +2412,8 @@ mod tests {
             }],
             ..structured.clone()
         };
-
-        let compactor = SessionCompaction::new();
-        let structured_estimate = compactor.estimate_messages_tokens(&[structured], None);
-        let legacy_estimate = compactor.estimate_messages_tokens(&[legacy_equivalent], None);
+        let structured_estimate = estimate_tokens(&[structured], None);
+        let legacy_estimate = estimate_tokens(&[legacy_equivalent], None);
         assert_eq!(
             structured_estimate, legacy_estimate,
             "structured output must be sized like its legacy projection"
@@ -1893,14 +2487,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_retry_config_default() {
-        let config = RetryConfig::default();
-        assert_eq!(config.max_retries, 3);
-        assert_eq!(config.initial_backoff_ms, 1000);
-        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
-    }
-
     // ========================================================================
     // New Unit Tests Using Fixtures
     // ========================================================================
@@ -1924,25 +2510,22 @@ mod tests {
 
     #[test]
     fn test_estimate_messages_tokens_text_parts() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for text messages");
     }
 
     #[test]
     fn test_estimate_messages_tokens_tool_results() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::conversation_with_tools("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for tool results");
     }
 
     #[test]
     fn test_estimate_messages_tokens_mixed_parts() {
-        let fixture = CompactionFixture::new();
         let messages = vec![
             MessageFixture::user_message("1", "s1", "User request"),
             MessageFixture::reasoning_message("2", "s1", "Let me think about this"),
@@ -1950,25 +2533,38 @@ mod tests {
             MessageFixture::assistant_message("4", "s1", "Final response"),
         ];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for all part types");
     }
 
     #[test]
+    fn notice_is_estimated_like_text_of_the_same_content() {
+        let content = "The agent mode changed. ".repeat(20);
+        let text = MessageFixture::user_message("1", "s1", &content);
+        let mut notice = text.clone();
+        notice.parts = vec![MessagePart::Notice {
+            source: querymt_agent_core::model::NoticeSource::AgentMode,
+            content: content.clone(),
+        }];
+
+        let notice_tokens = estimate_tokens(&[notice], None);
+        assert!(notice_tokens > 0);
+        assert_eq!(notice_tokens, estimate_tokens(&[text], None));
+    }
+
+    #[test]
     fn test_estimate_messages_tokens_empty() {
-        let fixture = CompactionFixture::new();
         let messages: Vec<AgentMessage> = vec![];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert_eq!(tokens, 0, "Empty messages should have 0 tokens");
     }
 
     #[test]
     fn test_estimate_messages_tokens_long_conversation() {
-        let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let tokens = estimate_tokens(&messages, None);
         assert!(
             tokens > 500,
             "Long conversation should have significant token count"
@@ -2028,6 +2624,47 @@ mod tests {
                 .text()
                 .contains("conversation")
         );
+    }
+
+    #[test]
+    fn compaction_request_leaves_out_tool_baselines_and_changes() {
+        let fixture = CompactionFixture::new();
+        let mut messages = MessageFixture::simple_conversation("s1");
+        let tool = querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "deploy".into(),
+                description: "Deploy".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        };
+        let record = |part: MessagePart| {
+            let mut message = MessageFixture::user_message("r", "s1", "");
+            message.parts = vec![part];
+            message
+        };
+        messages.insert(
+            1,
+            record(MessagePart::ToolBaseline {
+                tools: vec![tool.clone()],
+                origin: "anthropic/claude-sonnet-5-5".into(),
+            }),
+        );
+        messages.push(record(MessagePart::ToolChange {
+            added: vec![tool],
+            removed: vec!["old".into()],
+        }));
+
+        let chat = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
+
+        assert_eq!(chat.len(), messages.len() - 2 + 1, "records are left out");
+        assert!(!chat.iter().any(|m| m.has_tool_change()));
+        // A provider that rejects tool-change messages accepts the request.
+        querymt::chat::reject_tool_changes("acme", &chat).unwrap();
     }
 
     #[test]
@@ -2108,11 +2745,14 @@ mod tests {
         let result = service
             .process(
                 &[message],
-                provider.clone(),
-                "model",
-                &RetryConfig::default(),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: provider.clone(),
+                    config: &*test_config(3).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await;
 
@@ -2155,7 +2795,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let original_tokens = fixture.service.estimate_messages_tokens(&messages, None);
+        let original_tokens = estimate_tokens(&messages, None);
         let result = fixture
             .process_with_summary(&messages, "short")
             .await
@@ -2180,15 +2820,25 @@ mod tests {
         assert!(!result.summary.is_empty());
     }
 
+    /// A retryable provider failure that the provider answered.
+    fn unavailable() -> LLMError {
+        LLMError::HttpStatus {
+            status_code: 503,
+            message: "service unavailable".into(),
+            retry_after_secs: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_process_retries_on_llm_error() {
         let service = SessionCompaction::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        // Create a mock that fails twice then succeeds
+        // Fails twice with a retryable error, then succeeds: exactly the
+        // three requests `rate_limit.max_retries` (3) allows.
         let mock = MockCompactionProvider::new(vec![
-            Err(LLMError::GenericError("timeout".to_string())),
-            Err(LLMError::GenericError("timeout".to_string())),
+            Err(unavailable()),
+            Err(unavailable()),
             Ok("recovered summary".to_string()),
         ]);
         let mock_arc = Arc::new(mock);
@@ -2196,11 +2846,14 @@ mod tests {
         let result = service
             .process(
                 &messages,
-                mock_arc.clone(),
-                "model",
-                &RetryConfig::default(),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: mock_arc.clone(),
+                    config: &*test_config(3).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await
             .expect("should succeed after retries");
@@ -2214,29 +2867,33 @@ mod tests {
         let service = SessionCompaction::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        // Create a mock that always fails
+        // Create a mock that always fails with a retryable error
         let mock = MockCompactionProvider::new(vec![
-            Err(LLMError::GenericError("error1".to_string())),
-            Err(LLMError::GenericError("error2".to_string())),
-            Err(LLMError::GenericError("error3".to_string())),
-            Err(LLMError::GenericError("error4".to_string())),
+            Err(unavailable()),
+            Err(unavailable()),
+            Err(unavailable()),
+            Err(unavailable()),
         ]);
         let mock_arc = Arc::new(mock);
 
         let result = service
             .process(
                 &messages,
-                mock_arc.clone(),
-                "model",
-                &RetryConfig::default(),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: mock_arc.clone(),
+                    config: &*test_config(3).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await;
 
         assert!(result.is_err(), "should fail after max retries");
-        // Default retry config has max_retries=3, so 4 calls (initial + 3 retries)
-        assert_eq!(mock_arc.call_count(), 4);
+        // The default `rate_limit.max_retries` is 3 requests in total; the
+        // summary budget (`compaction.retry.max_retries`) does not apply.
+        assert_eq!(mock_arc.call_count(), 3);
     }
 
     #[tokio::test]
@@ -2244,31 +2901,38 @@ mod tests {
         let service = SessionCompaction::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let custom_config = RetryConfig {
-            max_retries: 1,
-            initial_backoff_ms: 10,
-            backoff_multiplier: 1.0,
-        };
+        // Provider errors follow `rate_limit.max_retries`; the compaction
+        // budget of 1 does not limit them.
+        let config = config_with(|config| {
+            config.execution_policy.rate_limit.max_retries = 2;
+            config.execution_policy.compaction.retry.max_retries = 1;
+            config.execution_policy.compaction.retry.initial_backoff_ms = 10;
+        })
+        .await;
 
         let mock = MockCompactionProvider::new(vec![
-            Err(LLMError::GenericError("error1".to_string())),
-            Err(LLMError::GenericError("error2".to_string())),
+            Err(unavailable()),
+            Err(unavailable()),
+            Err(unavailable()),
         ]);
         let mock_arc = Arc::new(mock);
 
         let result = service
             .process(
                 &messages,
-                mock_arc.clone(),
-                "model",
-                &custom_config,
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: mock_arc.clone(),
+                    config: &config,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await;
 
         assert!(result.is_err());
-        // With max_retries=1, should have 2 calls (initial + 1 retry)
+        // With rate_limit.max_retries=2, there are 2 requests in total.
         assert_eq!(mock_arc.call_count(), 2);
     }
 
@@ -2345,7 +3009,7 @@ mod tests {
     }
 
     // ========================================================================
-    // is_mesh_timeout_error tests
+    // is_request_timeout tests
     // ========================================================================
 
     #[test]
@@ -2355,7 +3019,7 @@ mod tests {
             message: "network timeout".to_string(),
         };
         assert!(
-            is_mesh_timeout_error(&err),
+            is_request_timeout(&err),
             "network timeout should be detected as mesh timeout"
         );
     }
@@ -2367,7 +3031,7 @@ mod tests {
             message: "Eof { name: \"enum\", expect: Small(1) }".to_string(),
         };
         assert!(
-            is_mesh_timeout_error(&err),
+            is_request_timeout(&err),
             "Eof decode error should be detected as mesh timeout"
         );
     }
@@ -2379,7 +3043,7 @@ mod tests {
             message: "dial failure".to_string(),
         };
         assert!(
-            !is_mesh_timeout_error(&err),
+            !is_request_timeout(&err),
             "dial failure should NOT be classified as mesh timeout"
         );
     }
@@ -2388,7 +3052,7 @@ mod tests {
     fn test_mesh_timeout_generic_error_is_not_timeout() {
         let err = LLMError::GenericError("some other error".to_string());
         assert!(
-            !is_mesh_timeout_error(&err),
+            !is_request_timeout(&err),
             "generic errors should NOT be classified as mesh timeout"
         );
     }
@@ -2400,7 +3064,7 @@ mod tests {
             message: "connection closed".to_string(),
         };
         assert!(
-            !is_mesh_timeout_error(&err),
+            !is_request_timeout(&err),
             "connection closed should NOT be classified as mesh timeout"
         );
     }
@@ -2424,11 +3088,14 @@ mod tests {
         let result = service
             .process(
                 &messages,
-                mock_arc.clone(),
-                "model",
-                &RetryConfig::default(),
                 None,
-                &test_ledger().await,
+                None,
+                &CompactionDispatch {
+                    provider: mock_arc.clone(),
+                    config: &*test_config(3).await,
+                    cancel: &CancellationToken::new(),
+                    ledger: &test_ledger().await,
+                },
             )
             .await;
 
@@ -2518,11 +3185,20 @@ mod tests {
             let result = SessionCompaction::new()
                 .process(
                     &history,
-                    provider,
-                    "model",
-                    &retry_config(retries),
                     None,
-                    &ledger,
+                    None,
+                    &CompactionDispatch {
+                        provider,
+                        // One request per summary attempt: a provider error is not
+                        // retried, so each scripted reply is one accounted attempt.
+                        config: &*config_with(|config| {
+                            config.execution_policy.compaction.retry.max_retries = retries;
+                            config.execution_policy.rate_limit.max_retries = 1;
+                        })
+                        .await,
+                        cancel: &CancellationToken::new(),
+                        ledger: &ledger,
+                    },
                 )
                 .await;
             (result, accounting)
@@ -2648,7 +3324,17 @@ mod tests {
                 "hello",
             )];
             SessionCompaction::new()
-                .process(&history, provider, "model", &retry_config(0), None, &ledger)
+                .process(
+                    &history,
+                    None,
+                    None,
+                    &CompactionDispatch {
+                        provider,
+                        config: &*test_config(0).await,
+                        cancel: &CancellationToken::new(),
+                        ledger: &ledger,
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(accounting.read(|r| r.cycle("cycle-1").priced_attempts), 1);
@@ -2665,7 +3351,17 @@ mod tests {
                 "hello",
             )];
             SessionCompaction::new()
-                .process(&history, provider, "model", &retry_config(0), None, &ledger)
+                .process(
+                    &history,
+                    None,
+                    None,
+                    &CompactionDispatch {
+                        provider,
+                        config: &*test_config(0).await,
+                        cancel: &CancellationToken::new(),
+                        ledger: &ledger,
+                    },
+                )
                 .await
                 .unwrap();
             let t = accounting.read(|r| r.session().clone());
@@ -2726,11 +3422,14 @@ mod tests {
             let result = SessionCompaction::new()
                 .process(
                     &history,
-                    provider.clone(),
-                    "model",
-                    &retry_config(2),
                     None,
-                    &foreign,
+                    None,
+                    &CompactionDispatch {
+                        provider: provider.clone(),
+                        config: &*test_config(2).await,
+                        cancel: &CancellationToken::new(),
+                        ledger: &foreign,
+                    },
                 )
                 .await;
             assert!(result.is_err());
@@ -2740,6 +3439,369 @@ mod tests {
                 "no paid request without a recorded start"
             );
             let _ = UsageDisposition::Final;
+        }
+    }
+
+    /// The retry rules of `session-compaction` (change `unify-model-call-path`):
+    /// provider errors follow `[agent.execution.rate_limit]`, rejected
+    /// summaries follow `[agent.execution.compaction.retry]`. Every test goes
+    /// through `compact`, the one place that knows the signature of
+    /// `process`.
+    mod retry_rules_tests {
+        use super::*;
+        use crate::agent::agent_config::AgentConfig;
+        use querymt::error::{ProviderErrorKind, ProviderFailure, TransportErrorKind};
+        use tokio_util::sync::CancellationToken;
+
+        /// One compaction of a one-message history. The clock is paused after
+        /// the ledger is built, so the waits of the retry rules cost no real
+        /// time and are measured on `ScriptedProvider::sent`.
+        async fn compact(
+            provider: &Arc<ScriptedProvider>,
+            config: &AgentConfig,
+            cancel: &CancellationToken,
+        ) -> Result<CompactionResult> {
+            let ledger = test_ledger().await;
+            tokio::time::pause();
+            compact_with(provider, config, cancel, &ledger).await
+        }
+
+        /// [`compact`] over a ledger the test built, on a clock the test
+        /// has already paused.
+        async fn compact_with(
+            provider: &Arc<ScriptedProvider>,
+            config: &AgentConfig,
+            cancel: &CancellationToken,
+            ledger: &DispatchLedger,
+        ) -> Result<CompactionResult> {
+            let history = [MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "hello",
+            )];
+            SessionCompaction::new()
+                .process(
+                    &history,
+                    None,
+                    None,
+                    &CompactionDispatch {
+                        provider: provider.clone(),
+                        config,
+                        cancel,
+                        ledger,
+                    },
+                )
+                .await
+        }
+
+        fn summary(text: &str) -> Attempt {
+            Attempt::Stream(structured_summary(text, true).into_iter().map(Ok).collect())
+        }
+
+        fn overloaded(retry_after_secs: u64) -> Attempt {
+            Attempt::SetupError(
+                ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "overloaded")
+                    .with_retry_after_secs(Some(retry_after_secs))
+                    .into(),
+            )
+        }
+
+        fn refused() -> Attempt {
+            Attempt::SetupError(LLMError::Transport {
+                kind: TransportErrorKind::ConnectionRefused,
+                message: "connection refused".into(),
+            })
+        }
+
+        /// Time between request `index` and the next one.
+        fn gap(provider: &ScriptedProvider, index: usize) -> Duration {
+            let sent = provider.sent.lock().unwrap();
+            sent[index + 1] - sent[index]
+        }
+
+        fn calls(provider: &ScriptedProvider) -> usize {
+            provider.calls.load(Ordering::Relaxed)
+        }
+
+        #[tokio::test]
+        async fn overloaded_provider_during_compaction() {
+            let config = config_with(|config| {
+                // A fixed backoff that the provider's own delay must override.
+                config.execution_policy.compaction.retry.initial_backoff_ms = 60_000;
+            })
+            .await;
+            let provider =
+                ScriptedProvider::new(true, vec![overloaded(2), summary("a real summary")]);
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert_eq!(result.unwrap().summary, "a real summary");
+            assert_eq!(calls(&provider), 2);
+            let wait = gap(&provider, 0);
+            assert!(
+                wait >= Duration::from_secs(2) && wait < Duration::from_secs(3),
+                "the second request follows the 2 s the provider named, got {wait:?}"
+            );
+        }
+
+        /// The retry events of a compaction belong to the session that
+        /// initiated it (the ledger's), whatever session the history names.
+        #[tokio::test]
+        async fn retry_events_go_to_the_initiating_session_not_the_histories() {
+            use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+            let config = config_with(|_| {}).await;
+            let mut events = config.subscribe_events();
+            let provider = ScriptedProvider::new(true, vec![overloaded(0), summary("a summary")]);
+            let ledger = test_ledger().await;
+            assert_eq!(ledger.operation.session_id(), "compaction-session");
+            tokio::time::pause();
+            let history = [MessageFixture::user_message(
+                "m1",
+                "history-session",
+                "hello",
+            )];
+
+            SessionCompaction::new()
+                .process(
+                    &history,
+                    None,
+                    None,
+                    &CompactionDispatch {
+                        provider: provider.clone(),
+                        config: &config,
+                        cancel: &CancellationToken::new(),
+                        ledger: &ledger,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let mut sessions = Vec::new();
+            while let Ok(envelope) = events.try_recv() {
+                if let EventEnvelope::Durable(event) = envelope
+                    && matches!(
+                        event.kind,
+                        AgentEventKind::LlmRetryWait { .. }
+                            | AgentEventKind::LlmRetryResume { .. }
+                            | AgentEventKind::RateLimited { .. }
+                            | AgentEventKind::RateLimitResume { .. }
+                    )
+                {
+                    sessions.push(event.session_id);
+                }
+            }
+            assert_eq!(
+                sessions,
+                ["compaction-session", "compaction-session"],
+                "one wait and one resume, both on the initiating session"
+            );
+        }
+
+        #[tokio::test]
+        async fn connection_failure_during_compaction() {
+            let config = config_with(|config| {
+                config.execution_policy.rate_limit.transport_wait_secs = 7;
+                config.execution_policy.compaction.retry.initial_backoff_ms = 60_000;
+            })
+            .await;
+            let provider = ScriptedProvider::new(true, vec![refused(), summary("a real summary")]);
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert_eq!(result.unwrap().summary, "a real summary");
+            let wait = gap(&provider, 0);
+            assert!(
+                wait >= Duration::from_secs(7) && wait < Duration::from_secs(8),
+                "the wait is transport_wait_secs, not the compaction backoff, got {wait:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rejected_credential_during_compaction() {
+            let config = config_with(|_| {}).await;
+            let provider = ScriptedProvider::new(
+                true,
+                vec![
+                    Attempt::SetupError(LLMError::AuthError("bad key".into())),
+                    summary("never requested"),
+                ],
+            );
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert!(result.is_err());
+            assert_eq!(
+                calls(&provider),
+                1,
+                "an authentication error is not retried"
+            );
+        }
+
+        #[tokio::test]
+        async fn provider_errors_on_every_compaction_attempt() {
+            let config = config_with(|config| {
+                config.execution_policy.rate_limit.max_retries = 2;
+            })
+            .await;
+            let provider = ScriptedProvider::new(
+                true,
+                vec![overloaded(1), overloaded(1), overloaded(1), overloaded(1)],
+            );
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert!(
+                result.is_err(),
+                "no summary, so nothing replaces the history"
+            );
+            assert_eq!(
+                calls(&provider),
+                2,
+                "rate_limit.max_retries is the number of requests"
+            );
+        }
+
+        #[tokio::test]
+        async fn provider_error_with_the_summary_budget_at_zero() {
+            let config = config_with(|config| {
+                config.execution_policy.compaction.retry.max_retries = 0;
+            })
+            .await;
+            let provider =
+                ScriptedProvider::new(true, vec![overloaded(1), summary("a real summary")]);
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert_eq!(result.unwrap().summary, "a real summary");
+            assert_eq!(calls(&provider), 2);
+        }
+
+        #[tokio::test]
+        async fn timeout_during_compaction() {
+            let config = config_with(|_| {}).await;
+            let provider = ScriptedProvider::new(
+                true,
+                vec![
+                    Attempt::SetupError(LLMError::Transport {
+                        kind: TransportErrorKind::Timeout,
+                        message: "network timeout".into(),
+                    }),
+                    summary("never requested"),
+                ],
+            );
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("timeout"), "names the timeout: {error}");
+            assert_eq!(calls(&provider), 1, "a timeout is not retried");
+        }
+
+        #[tokio::test]
+        async fn empty_summary_is_retried() {
+            let config = config_with(|config| {
+                config.execution_policy.compaction.retry.initial_backoff_ms = 5_000;
+            })
+            .await;
+            let provider =
+                ScriptedProvider::new(true, vec![summary(""), summary("a real summary")]);
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert_eq!(result.unwrap().summary, "a real summary");
+            let wait = gap(&provider, 0);
+            assert!(
+                wait >= Duration::from_secs(5) && wait < Duration::from_secs(6),
+                "the second request follows initial_backoff_ms, got {wait:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn summary_rejected_on_every_attempt() {
+            let config = config_with(|config| {
+                config.execution_policy.compaction.retry.max_retries = 1;
+            })
+            .await;
+            let provider = ScriptedProvider::new(true, vec![summary(""), summary("  ")]);
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert!(result.is_err());
+            assert_eq!(calls(&provider), 2, "max_retries = 1 is two requests");
+        }
+
+        #[tokio::test]
+        async fn each_summary_attempt_has_its_own_provider_retries() {
+            let config = config_with(|config| {
+                config.execution_policy.compaction.retry.max_retries = 1;
+                config.execution_policy.rate_limit.max_retries = 3;
+            })
+            .await;
+            // Attempt 1 is rejected; attempt 2 meets one provider error first.
+            let provider = ScriptedProvider::new(
+                true,
+                vec![summary(""), overloaded(3), summary("a real summary")],
+            );
+
+            let result = compact(&provider, &config, &CancellationToken::new()).await;
+
+            assert_eq!(result.unwrap().summary, "a real summary");
+            assert_eq!(calls(&provider), 3);
+            let wait = gap(&provider, 1);
+            assert!(
+                wait >= Duration::from_secs(3) && wait < Duration::from_secs(4),
+                "the provider error waits as a model request does, got {wait:?}"
+            );
+        }
+
+        /// Cancel `cancel` one second (paused clock) into a compaction whose
+        /// first wait is far longer, and return what the compaction did.
+        async fn compact_cancelled_after_one_second(
+            provider: &Arc<ScriptedProvider>,
+            config: &AgentConfig,
+        ) -> Result<CompactionResult> {
+            let ledger = test_ledger().await;
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let cancel = CancellationToken::new();
+            let (result, ()) =
+                tokio::join!(compact_with(provider, config, &cancel, &ledger), async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    cancel.cancel();
+                });
+            // The wait is abandoned when the token fires, not sat out and
+            // then refused (the 600 s wait would otherwise be on the clock).
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_secs(5),
+                "the compaction stopped waiting at the cancel, not after {waited:?}"
+            );
+            // The test runs two cases, each with its own paused clock.
+            tokio::time::resume();
+            result
+        }
+
+        #[tokio::test]
+        async fn cancelled_while_compaction_waits_to_retry() {
+            // During the wait before a provider-error retry (the provider
+            // names 600 s).
+            let config = config_with(|_| {}).await;
+            let provider = ScriptedProvider::new(true, vec![overloaded(600), summary("never")]);
+            let result = compact_cancelled_after_one_second(&provider, &config).await;
+            let error = result.expect_err("no summary is stored").to_string();
+            assert!(error.contains("cancelled"), "{error}");
+            assert_eq!(calls(&provider), 1, "no further request after the cancel");
+
+            // During the backoff before a rejected-summary retry.
+            let config = config_with(|config| {
+                config.execution_policy.compaction.retry.initial_backoff_ms = 600_000;
+            })
+            .await;
+            let provider = ScriptedProvider::new(true, vec![summary(""), summary("never")]);
+            let result = compact_cancelled_after_one_second(&provider, &config).await;
+            let error = result.expect_err("no summary is stored").to_string();
+            assert!(error.contains("cancelled"), "{error}");
+            assert_eq!(calls(&provider), 1, "no further request after the cancel");
         }
     }
 }

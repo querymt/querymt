@@ -375,6 +375,55 @@ mod tests {
     }
 
     #[test]
+    fn tilde_path_arguments_resolve_against_the_home_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
+
+        let Some(home) = dirs::home_dir() else {
+            let error = context.resolve_path_arg("path", "~/data").unwrap_err();
+            assert!(error.to_string().contains("path"), "{error}");
+            return;
+        };
+        assert_eq!(
+            context.resolve_path("~/.local/share").unwrap(),
+            home.join(".local/share")
+        );
+        assert_eq!(context.resolve_path("~").unwrap(), home);
+        // `resolve_path_arg` gives the same result and names the argument on failure.
+        assert_eq!(
+            context.resolve_path_arg("root", "~/src").unwrap(),
+            home.join("src")
+        );
+    }
+
+    #[test]
+    fn tilde_with_a_user_name_or_inside_a_path_is_resolved_against_the_cwd() {
+        let temp_dir = TempDir::new().unwrap();
+        let cwd = temp_dir.path().to_path_buf();
+        let context = AgentToolContext::basic("test_session".to_string(), Some(cwd.clone()));
+
+        assert_eq!(
+            context.resolve_path("~alice/notes.md").unwrap(),
+            cwd.join("~alice/notes.md")
+        );
+        assert_eq!(
+            context.resolve_path("backup/~old/notes.md").unwrap(),
+            cwd.join("backup/~old/notes.md")
+        );
+    }
+
+    #[test]
+    fn tilde_needs_no_working_directory() {
+        let context = AgentToolContext::basic("test_session".to_string(), None);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(context.resolve_path("~/x").unwrap(), home.join("x"));
+        }
+    }
+
+    #[test]
     fn test_path_resolution_without_cwd() {
         let context = AgentToolContext::basic("test_session".to_string(), None);
 

@@ -153,7 +153,7 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::delegation::AgentInfo;
-use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
+use crate::middleware::{ToolCall, ToolFunction};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -161,7 +161,7 @@ use crate::session::store::{LLMConfig, Session};
 use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
 use anyhow::Result;
 use querymt::LLMParams;
-use querymt::chat::{ChatMessage, ChatRole};
+use querymt::chat::ChatRole;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 use querymt_agent_services::snapshot::backend::SnapshotBackend;
@@ -171,46 +171,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-/// Creates a test conversation context with the given session ID and step count
-pub fn test_context(session_id: &str, steps: usize) -> Arc<ConversationContext> {
-    Arc::new(ConversationContext::new(
-        session_id.into(),
-        Arc::from([]),
-        Arc::new(AgentStats {
-            steps,
-            ..Default::default()
-        }),
-        "mock".into(),
-        "mock-model".into(),
-    ))
-}
-
-/// Creates a test conversation context with the given number of user messages
-/// for testing turn-based middleware
-pub fn test_context_with_user_messages(
-    session_id: &str,
-    user_message_count: usize,
-) -> Arc<ConversationContext> {
-    let messages: Vec<ChatMessage> = (0..user_message_count)
-        .map(|i| {
-            ChatMessage::user()
-                .text(format!("User message {}", i))
-                .build()
-        })
-        .collect();
-
-    Arc::new(ConversationContext::new(
-        session_id.into(),
-        Arc::from(messages.into_boxed_slice()),
-        Arc::new(AgentStats {
-            turns: user_message_count,
-            ..Default::default()
-        }),
-        "mock".into(),
-        "mock-model".into(),
-    ))
-}
 
 /// Creates a mock tool call for middleware/state tests
 pub fn mock_tool_call(id: &str, name: &str, args: &str) -> ToolCall {
@@ -319,6 +279,15 @@ pub fn mock_plugin_registry_in(
     dir: &std::path::Path,
     factory: Arc<TestProviderFactory>,
 ) -> Result<PluginRegistry> {
+    mock_plugin_registry_for(dir, factory)
+}
+
+/// Like [`mock_plugin_registry_in`] for any provider factory that names itself
+/// `mock`.
+pub fn mock_plugin_registry_for(
+    dir: &std::path::Path,
+    factory: Arc<dyn querymt::plugin::LLMProviderFactory>,
+) -> Result<PluginRegistry> {
     let wasm_path = dir.join("mock.wasm");
     std::fs::write(&wasm_path, "")?;
     let config_path = dir.join("providers.toml");
@@ -352,13 +321,15 @@ pub struct UndoTestFixture {
     pub storage: Arc<SqliteStorage>,
     pub(crate) handle: AgentHandle,
     pub backend: GitSnapshotBackend,
+    /// Workspace index handed to every session actor registered afterwards.
+    workspace: Option<querymt_agent_index::WorkspaceHandle>,
 }
 
 impl UndoTestFixture {
     /// Creates a new test fixture with snapshot support enabled.
     pub async fn new() -> Result<Self> {
         let (registry, config_dir) = empty_plugin_registry()?;
-        Self::with_registry(registry, config_dir, None).await
+        Self::with_registry(registry, config_dir, None, Vec::new()).await
     }
 
     /// Creates a fixture whose LLM is `provider`, so prompts run end to end
@@ -368,7 +339,71 @@ impl UndoTestFixture {
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
-        Self::with_registry(registry, config_dir, None).await
+        Self::with_registry(registry, config_dir, None, Vec::new()).await
+    }
+
+    /// Like [`Self::with_provider`], with `middleware` installed on the agent,
+    /// in the given order.
+    pub(crate) async fn with_provider_and_middleware(
+        provider: crate::test_utils::SharedLlmProvider,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
+    ) -> Result<Self> {
+        let (registry, config_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
+        Self::with_registry(registry, config_dir, None, middleware).await
+    }
+
+    /// Index the worktree as it is now.
+    pub(crate) async fn build_workspace_index(
+        &self,
+    ) -> Result<querymt_agent_index::WorkspaceHandle> {
+        use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+        Ok(WorkspaceIndexActor::create(
+            self.worktree.path().to_path_buf(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await?)
+    }
+
+    /// Index the worktree as it is now and give the index to every session
+    /// created afterwards, as a materialized session gets its own.
+    pub(crate) async fn index_workspace(&mut self) -> Result<()> {
+        self.workspace = Some(self.build_workspace_index().await?);
+        Ok(())
+    }
+
+    /// Create a session in the worktree whose runtime has no workspace index
+    /// yet. Setting the returned cell later makes the index ready, as the
+    /// background build of a materialized session does.
+    pub(crate) async fn create_session_with_pending_index(
+        &self,
+    ) -> Result<(
+        String,
+        Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>>,
+    )> {
+        let cwd = self.worktree.path();
+        let session = self
+            .storage
+            .session_store()
+            .create_session(None, Some(cwd.to_path_buf()), None, None)
+            .await?;
+        let cell = self
+            .register_session_actor_with_cwd(&session.public_id, cwd)
+            .await;
+        Ok((session.public_id, cell))
+    }
+
+    /// A fixture whose LLM is built by `factory` (a provider that is not a
+    /// [`SharedLlmProvider`]), with `hooks` and `middleware` installed.
+    pub(crate) async fn with_factory(
+        factory: Arc<dyn querymt::plugin::LLMProviderFactory>,
+        hooks: Option<crate::hooks::Hooks>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
+    ) -> Result<Self> {
+        let config_dir = TempDir::new()?;
+        let registry = mock_plugin_registry_for(config_dir.path(), factory)?;
+        Self::with_registry(registry, config_dir, hooks, middleware).await
     }
 
     /// Like [`Self::with_provider`], with `hooks` installed on the agent.
@@ -378,13 +413,14 @@ impl UndoTestFixture {
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
-        Self::with_registry(registry, config_dir, Some(hooks)).await
+        Self::with_registry(registry, config_dir, Some(hooks), Vec::new()).await
     }
 
     async fn with_registry(
         registry: PluginRegistry,
         config_dir: TempDir,
         hooks: Option<crate::hooks::Hooks>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
     ) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
@@ -404,6 +440,9 @@ impl UndoTestFixture {
         if let Some(hooks) = hooks {
             builder = builder.with_hooks(hooks);
         }
+        if !middleware.is_empty() {
+            builder = builder.with_middlewares(middleware);
+        }
 
         let config = Arc::new(builder.build());
         let handle = AgentHandle::from_config(config);
@@ -415,6 +454,7 @@ impl UndoTestFixture {
             storage,
             handle,
             backend: GitSnapshotBackend::new().with_snapshot_base(snapshot_base_path),
+            workspace: None,
         })
     }
 
@@ -470,21 +510,46 @@ impl UndoTestFixture {
         &self,
         session_id: &str,
         cwd: &std::path::Path,
-    ) {
+    ) -> Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>> {
+        self.register_session_actor_with_mcp(
+            session_id,
+            cwd,
+            crate::agent::core::McpToolState::empty(),
+        )
+        .await
+    }
+
+    /// Like [`Self::register_session_actor_with_cwd`], with the session's MCP
+    /// tool state supplied by the caller, who can change it while a run is going.
+    pub(crate) async fn register_session_actor_with_mcp(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        mcp: Arc<crate::agent::core::McpToolState>,
+    ) -> Arc<tokio::sync::OnceCell<querymt_agent_index::WorkspaceHandle>> {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
         let runtime = crate::agent::core::SessionRuntime::new(
             Some(cwd.to_path_buf()),
             std::collections::HashMap::new(),
-            crate::agent::core::McpToolState::empty(),
+            mcp,
         );
+        if let Some(workspace) = &self.workspace {
+            assert!(
+                runtime.workspace_handle.set(workspace.clone()).is_ok(),
+                "a new runtime has no workspace index"
+            );
+        }
+
+        let workspace_cell = runtime.workspace_handle.clone();
 
         let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);
         let actor_ref = SessionActor::spawn(actor);
 
         let mut registry = self.handle.registry.lock().await;
         registry.insert(session_id.to_string(), actor_ref);
+        workspace_cell
     }
 
     /// Simulate a user message and return its ID
@@ -701,6 +766,15 @@ impl UndoTestFixture {
         SendAgent::prompt(&self.handle, request)
             .await
             .map_err(|e| anyhow::anyhow!("prompt failed: {e:?}"))
+    }
+
+    /// Cancel the active run of `session_id`.
+    pub(crate) async fn cancel(&self, session_id: &str) -> Result<()> {
+        use crate::send_agent::SendAgent;
+        let notification = crate::acp::protocol::CancelNotification::new(session_id.to_owned());
+        SendAgent::cancel(&self.handle, notification)
+            .await
+            .map_err(|e| anyhow::anyhow!("cancel failed: {e:?}"))
     }
 
     /// Like [`Self::prompt`], but also waits until the run this prompt started

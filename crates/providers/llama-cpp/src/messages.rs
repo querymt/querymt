@@ -138,6 +138,8 @@ pub(crate) fn messages_to_json(
                     }
                     _ => {}
                 },
+                // Tool changes are rejected before a request is built.
+                ChatInputPart::ToolChange(_) => {}
                 ChatInputPart::ToolResult(result) => {
                     let output_text = result.text_content();
                     json_messages.push(serde_json::json!({
@@ -232,11 +234,43 @@ pub(crate) fn messages_to_json(
         }
     }
 
+    let json_messages = merge_adjacent_user_messages(json_messages);
     let json = serde_json::to_string(&json_messages).map_err(|e| {
         LLMError::ProviderError(format!("Failed to serialize messages JSON: {}", e))
     })?;
 
     Ok((json, media_count))
+}
+
+/// Join runs of plain user messages into one.
+///
+/// The agent stores harness notices as user messages, so a prompt can be
+/// followed by one. Chat templates that require alternating roles (Gemma,
+/// Mistral and others) reject two user messages in a row. Joining keeps the text
+/// and media markers in order, which is what `extract_media` relies on. Only
+/// messages that are just a role and a string are joined; a `tool` message
+/// between two user messages already separates them.
+fn merge_adjacent_user_messages(messages: Vec<Value>) -> Vec<Value> {
+    fn plain_user_text(message: &Value) -> Option<&str> {
+        let object = message.as_object()?;
+        (object.len() == 2 && message["role"] == "user")
+            .then(|| message["content"].as_str())
+            .flatten()
+    }
+
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(next) = plain_user_text(&message)
+            && let Some(last) = merged.last_mut()
+            && let Some(previous) = plain_user_text(last)
+        {
+            let joined = format!("{previous}\n\n{next}");
+            *last = serde_json::json!({ "role": "user", "content": joined });
+            continue;
+        }
+        merged.push(message);
+    }
+    merged
 }
 
 /// Convert ChatMessages to simple text prompt (fallback for models without templates).
@@ -308,6 +342,9 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     }
                     ChatInputPart::Attachment(_) => {
                         // Unreachable: binary content is rejected before this point.
+                    }
+                    ChatInputPart::ToolChange(_) => {
+                        // Unreachable: tool changes are rejected before this point.
                     }
                 }
             }
@@ -869,13 +906,12 @@ mod tests {
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
         assert_eq!(media_count, 3);
-        // 1 tool message + 3 user marker messages
-        assert_eq!(parsed.len(), 4);
+        // 1 tool message + one user message holding the 3 markers: adjacent user
+        // messages are joined so strict chat templates accept the history.
+        assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["role"], "tool");
-        for entry in &parsed[1..=3] {
-            assert_eq!(entry["role"], "user");
-            assert_eq!(entry["content"], "<M>");
-        }
+        assert_eq!(parsed[1]["role"], "user");
+        assert_eq!(parsed[1]["content"], "<M>\n\n<M>\n\n<M>");
     }
 
     #[test]
@@ -961,5 +997,120 @@ mod tests {
 
         let result = messages_to_text(&cfg, &messages);
         assert!(result.is_err());
+    }
+
+    /// A chat template of the strict kind (Gemma, Mistral): two user or two
+    /// assistant messages in a row are rejected. `tool` messages are their own role.
+    const ALTERNATING_TEMPLATE: &str = r#"
+{%- set ns = namespace(prev='') -%}
+{%- for m in messages -%}
+  {%- if m['role'] in ('user', 'assistant') and m['role'] == ns.prev -%}
+    {{- raise_exception('Conversation roles must alternate user/assistant') -}}
+  {%- endif -%}
+  {%- set ns.prev = m['role'] -%}
+  {{- '<' ~ m['role'] ~ '>' ~ m['content'] ~ '</' ~ m['role'] ~ '>' -}}
+{%- endfor -%}
+"#;
+
+    fn render_alternating(messages_json: &str) -> Result<String, minijinja::Error> {
+        let mut env = minijinja::Environment::new();
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<(), minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        let messages: Value = serde_json::from_str(messages_json).unwrap();
+        env.render_str(
+            ALTERNATING_TEMPLATE,
+            minijinja::value::Serde(serde_json::json!({ "messages": messages })),
+        )
+    }
+
+    #[test]
+    fn prompt_followed_by_a_stored_notice_renders_under_an_alternating_template() {
+        let cfg = test_config();
+        let messages = vec![
+            user_msg(vec![text("fix the build")]),
+            user_msg(vec![text("[plan mode] do not edit files")]),
+        ];
+
+        let (json, _) = messages_to_json(&cfg, &messages, None).unwrap();
+        let rendered = render_alternating(&json).expect("template accepts the history");
+
+        let parsed: Vec<Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1, "adjacent user messages are merged: {json}");
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(
+            parsed[0]["content"],
+            "fix the build\n\n[plan mode] do not edit files"
+        );
+        assert!(rendered.starts_with("<user>fix the build"));
+    }
+
+    #[test]
+    fn tool_result_followed_by_a_stored_notice_renders_under_an_alternating_template() {
+        let cfg = test_config();
+        let messages = vec![
+            user_msg(vec![text("fix the build")]),
+            assistant_msg(vec![Block::ToolUse {
+                id: "call-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "cargo check"}),
+            }]),
+            user_msg(vec![named_tool_result(
+                "call-1",
+                "shell",
+                vec![text("error[E0425]")],
+            )]),
+            user_msg(vec![text("[progress review] seven steps taken")]),
+        ];
+
+        let (json, _) = messages_to_json(&cfg, &messages, None).unwrap();
+        render_alternating(&json).expect("template accepts the history");
+
+        let roles: Vec<String> = serde_json::from_str::<Vec<Value>>(&json)
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "user"]);
+    }
+
+    #[test]
+    fn merged_user_messages_keep_media_markers_in_order() {
+        let cfg = test_config();
+        let messages = vec![
+            user_msg(vec![text("look"), image("image/png", vec![1, 2, 3])]),
+            user_msg(vec![text("[notice] be brief")]),
+        ];
+
+        let (json, media_count) = messages_to_json(&cfg, &messages, Some("<__media__>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(media_count, 1);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0]["content"],
+            "look\n<__media__>\n\n[notice] be brief"
+        );
+    }
+
+    #[test]
+    fn user_messages_around_an_assistant_message_stay_separate() {
+        let cfg = test_config();
+        let messages = vec![
+            user_msg(vec![text("one")]),
+            assistant_msg(vec![text("two")]),
+            user_msg(vec![text("three")]),
+        ];
+
+        let (json, _) = messages_to_json(&cfg, &messages, None).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.len(), 3);
     }
 }

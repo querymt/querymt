@@ -17,14 +17,264 @@
   reloads the model; changing only the scale does not. New exports
   `LoraAdapterConfig`, `LoraScale` and `LoraScaleError`.
 
+- **Providers declare prompt-cache support; new `[agent.execution.prompt_cache]
+  ttl_secs`.** `ChatCapabilities` has a new `prompt_cache` field
+  (`explicit_breakpoints`, `max_ttl_secs`), `Copy` and defaulted, so a plugin that
+  omits it reads as declaring nothing. New exports `PromptCacheCapabilities`.
+  `ttl_secs` (0 to 86400, default 0 for the provider's default) sets the lifetime
+  of the agent's default cache hints, capped at the provider's `max_ttl_secs`.
+  Anthropic declares 3600 and OpenAI Responses, on a model and endpoint with
+  breakpoint support, 1800. A value out of range, not an integer, or an unknown
+  key in the table fails the load naming the key.
+
+- **`ChatProvider::output_provenance` and `HTTPChatProvider::output_provenance`.**
+  A provider can state the `ChatOutputProvenance` (provider, protocol, model,
+  endpoint) it stamps on its output; the default is `None`. `ValidatedLLM`,
+  `ToolEnabledProvider`, `LLMProviderFromHTTP` and `MeshChatProvider` forward
+  it, `RemoteChatProvider` reports `None` (the provider contract carries no
+  provenance), and the OpenAI (Responses mode), xAI (Responses path) and Codex
+  providers implement it. The plugin contract is unchanged, so an Extism
+  provider reports `None`.
+
 ### Behavior changes
 
+- **The replay identity of a stored reply comes from the provider.** The agent
+  used to complete the protocol and endpoint a reply is replayed against from
+  the latest stored reply of the same provider and model. When the provider
+  states its provenance it now uses all of it (provider, protocol, model and
+  endpoint, whatever alias the session configuration gives the provider), so
+  after the configured endpoint changes a reply stamped at the old endpoint is
+  sent in portable form (no encrypted reasoning or signatures). A stored reply
+  with no provenance (stored before provenance existed) is also sent in
+  portable form to such a provider, instead of being matched on provider and
+  model alone (`OutputTarget::fallback_provider_model` is off for a stated
+  identity). Providers that state nothing keep the old completion and the old
+  comparison. OpenAI Responses streams are now stamped with the configured
+  endpoint, like their non-streamed replies; before, a streamed reply carried an
+  empty endpoint and never replayed natively.
+- **A run resolves its model once, before any middleware hook.** When the
+  session's provider cannot be built (after the provider-setup retries) the run
+  fails with the provider-initialization error before any middleware hook runs
+  and before any model request, with the user's prompt already in the history;
+  no pre-turn snapshot is taken for it. Hooks therefore always see the model's
+  real profile. Native `/compact` with a provider that cannot be built still
+  runs the `pre_compaction` hook first: a summary the hook supplies is stored
+  without a provider, and so is a compaction policy that names another working
+  provider. When the summary has to come from the session's own provider, it
+  fails with the provider failure before the `compaction_start` event, instead
+  of an internal error after it (an empty conversation still answers "nothing
+  to compact" without a provider). The
+  `agent.execution.provider_init` span is a child of `agent.prompt.execute`.
+  The tools a run offers are still collected for every request, so an MCP
+  server's `tools/list_changed` still takes effect mid-run.
+- **BREAKING (config semantics, compaction): provider errors during compaction
+  follow `[agent.execution.rate_limit]`.** `[agent.execution.compaction.retry]`
+  (`max_retries`, `initial_backoff_ms`, `backoff_multiplier`) now applies only to
+  a reply the agent rejects as a summary (empty, refused or cut off). A provider
+  error is retried only when it is retryable (an overloaded or rate-limited
+  provider, a 5xx status, a lost connection), after the wait the error calls for
+  (the provider's own delay, `transport_wait_secs` or `default_wait_secs`), for
+  at most `max(1, rate_limit.max_retries)` requests, and the run's cancellation
+  stops the wait. A rejected credential or an invalid request fails the compaction
+  after one request; before, it was retried `compaction.retry.max_retries`
+  times. A request timeout is still not retried. No key is added or removed.
+  A compaction can now send up to `(compaction.retry.max_retries + 1) ×
+  max(1, rate_limit.max_retries)` requests (12 with the defaults, 4 before);
+  each is in the cost accounting. A response stream that closes before its
+  terminal event is a lost connection and is retried like one (it used to count
+  as a rejected summary). A request timeout is recorded as a failed attempt.
+  Cancelling stops a request in flight, also while its stream is open, keeps the
+  usage it had reported, and a summary that finishes after the cancel is not
+  stored. The same retry-wait events as for a model request
+  (`llm_retry_wait`, `rate_limited` and their resume events) are now sent during
+  a compaction. A compaction request span (telemetry) carries
+  `gen_ai.request.attempt` and its events. `querymt-desktop` should confirm that
+  retry notices during a compaction render like those of a model request. The
+  public `compaction::RetryConfig` (re-exported as `CompactionRetryConfig`) is
+  removed. `SessionCompaction::process` and `process_with_instructions` are one
+  method, `process(messages, max_prompt_bytes, instructions, &CompactionDispatch)`;
+  `CompactionDispatch { provider, config, cancel, ledger }` carries the provider,
+  the `&AgentConfig`, the `CancellationToken` and the `DispatchLedger`. The model
+  and the session of a compaction request (and its span) are now the ledger's
+  (`AttemptOperation::model()` / `session_id()`), no longer a `model` argument
+  and the first message's session. Retry-wait events of a compaction are
+  written to that initiating session (an empty or blank history session used to
+  send them to session `""`).
+- **Fix (compaction): `[agent.execution.compaction]` `provider` and `model` now
+  choose where the compaction request goes.** Before, both were only labels:
+  the request always ran on the session's model, while the cost accounting, the
+  pricing and the span named the configured `model`, so a cheaper compaction
+  model was charged at its rates for a request that ran on the session's model.
+  `model` alone is that model on the session's provider (and mesh node);
+  `provider` is resolved like any provider and needs a `model` (the session's
+  model belongs to another provider), otherwise the compaction fails before a
+  request is sent. The session's own settings (system prompt, reasoning effort,
+  local-model options) are not carried over to another model. A configuration
+  that set only `provider` used to be accepted and is now refused when it
+  loads (see the hooks entry below). The worktree handoff summary follows the same policy, and a
+  price-limit refusal of it is reported as such (`summary_failed`, "price limit
+  reached") instead of as a provider failure. `AttemptOperation` gains
+  `model()` / `session_id()`.
+- **BREAKING (hooks, compaction): `pre_compaction` and `post_compaction` name
+  the compaction model.** Their `model` was the session's model even when
+  `[agent.execution.compaction]` sent the request elsewhere; it is now the model
+  the summary is requested from, and both payloads gain `provider`.
+  `post_compaction` also gains `summary_source` (`model` or `hook`). The
+  committed input schemas set `additionalProperties: false`, so a hook that
+  validates its stdin against the old schema rejects the new fields.
+  `compaction.provider` without `compaction.model` is refused when a
+  configuration file loads (`agent`, `planner` and every delegate; a session
+  stored by an earlier version still loads, and its compaction then fails before it starts;
+  it used to be accepted and silently ignored, and
+  afterwards was refused only when a compaction started); a configuration built
+  in code is refused when the compaction starts, before any event or hook.
+- **Fix (worktree handoff): `session/cancel` stops a handoff summary.** The
+  owner's actor is unloaded for a handoff, so the cancel found nothing to stop
+  and the summary kept running with the workspace held exclusively. It now
+  stops the request in flight, or the provider setup that precedes it, and the
+  handoff ends with the new `summary_cancelled` code, ownership unchanged and
+  the workspace released. The
+  summary still has no time bound beyond the retry budgets.
+- **Skipped tool results are stored before the steering that skipped them.**
+  When steering is applied before a tool batch starts, the stored order is now
+  the assistant message with the calls, one message with the skipped results,
+  then the steering message (before, the steering message was stored first and a
+  load moved the results behind it, so the request a run sent differed from the
+  one a reload sends). Sessions stored with the old order still load: the
+  results are moved to directly after their calls, as before.
+- **Token figures of a compaction use the request's estimate.** `compaction_start`
+  and `compaction_end` events, the `context_tokens` that follow a compaction and
+  the delegation summary budget are now the estimate of the request the history
+  projects to (steering, reasoning and compaction summaries included, and the
+  tool list and tool-change definitions when the session's provider takes tool
+  changes as messages), where three different partial estimates were used. The
+  numbers change for histories that hold any of those parts; for one with a
+  4,000-byte tool-change definition the figure grows by about 1,000 tokens.
+- **Duplicate-code review runs in every run that changed files (middleware
+  `dedup_check`).** Before, its "already reviewed" flag was cleared only by
+  `MiddlewareDriver::reset`, which no run called, so after the first review of
+  a process no later run of any session was reviewed; and it continued a run
+  from the last context any session had stored, so with concurrent sessions a
+  continuation could carry another session's conversation. Now the review
+  runs once per run that added or modified files, considers only that run's
+  changes (`SessionRuntime::turn_diffs` is cleared when a run starts and when
+  it ends), and continues with the reviewed session's own conversation. It is
+  still opt-in (`type = "dedup_check"`) and can be turned off with
+  `enabled = false`.
+- **The context-usage warning is stored at most once per run (middleware
+  `context`).** Before, the "already warned" state was reset whenever any
+  session used a different model than the one before it, so concurrent
+  sessions on different models could store a `context_usage` notice on every
+  step, and a session that stayed above the threshold was warned once until
+  the model changed. Now each run stores one notice, at the first request at
+  or above `warn_at_percent`, and the next run warns again.
+- **Scheduled runs record `run_started`.** A run started by a schedule now
+  records a durable `run_started` event with `origin = "scheduled"` after the
+  run lease is acquired and before its other events, with the same `run_id` as
+  its `run_completed`. Before, only interactive and queued runs did. It is one
+  more durable event per scheduled run. Follow-up in `querymt-desktop`:
+  confirm nothing assumes `run_started.origin` is always `interactive` and
+  that a scheduled run renders as a run.
 - **BREAKING (Rust API, llama-cpp):** `qmt_llama_cpp::LlamaCppConfig` has a new
   public field `lora: Vec<LoraAdapterConfig>`. Struct literals must add
   `lora: Vec::new()`, or better `..LlamaCppConfig::new(model)` /
   `..Default::default()`: `LlamaCppConfig` now implements `Default` and has
   `LlamaCppConfig::new(model)`, so later new options won't break callers again.
   Config files are unaffected.
+- **BREAKING (model requests, prompt caching):** the model request is now an
+  append-only prefix of stored history plus one trailing request message.
+  - The run objective is no longer sent with every request by default. Set
+    `[agent.execution] run_objective = true` to restore it (new key, default
+    `false`). When on, it is sent in the trailing message, so it no longer
+    changes the cached prefix.
+  - Reminders (agent mode, output limit, progress review, Stop-hook and
+    task-completion messages, duplicate-call and duplicate-code guidance,
+    parallel-edit and context-usage warnings, background-command notices) are
+    stored once as `notice` message parts instead of being added to every
+    model call. A mode reminder is stored when the mode changes, with a leave
+    notice when the session moves to a mode without one.
+  - Context hooks now receive durable history only (no run objective and no
+    other hooks' `additional_context`). Their `additional_context` is sent in
+    the trailing request message and is not stored.
+  - Rollback: a session that holds a `notice` part cannot be loaded by a build
+    from before this change (unknown message part kind).
+- **BREAKING (provider plugins, prompt caching):** the agent now adds default
+  system cache hints from the provider's declaration, not from a list of provider
+  names. A provider plugin built before this change declares nothing and gets no
+  default system hints until it is rebuilt against this version. `qmt-codex`
+  declares nothing either: its backend rejects explicit breakpoints and the
+  adapter dropped every hint, so no request changes. `qmt-openai` Responses now
+  sends a 30-minute lifetime for any cache hint asking for 1800 seconds or less
+  (it failed for anything but 1800) and still fails for longer.
+- **Retries after transport failures wait 10 seconds, not 60.** A model request
+  that fails without an answer from the provider (connection refused or reset,
+  DNS failure, timeout, a stream that breaks or cannot be decoded) is retried
+  after `[agent.execution.rate_limit] transport_wait_secs` (new key, 0 to 300,
+  default 10; then doubled by `backoff_multiplier`). Failures the provider
+  answered keep the provider's own retry delay, or `default_wait_secs` (60) when
+  it gave none. Set `transport_wait_secs = 60` for the old behaviour. Rollback:
+  after a revert the new key is an unknown key in `[agent.execution.rate_limit]`
+  and fails the load until removed.
+- **Higher starting output cap at high reasoning effort.** With no `max_tokens`
+  configured and reasoning effort `high` or `max`, requests start at
+  `min(64000, model output limit)` instead of `min(32000, ...)`; the ceiling for
+  escalation is unchanged. An unknown output limit stays at 32,000 and an
+  explicit `max_tokens` still wins.
+- **Path arguments expand a leading `~`.** Every built-in tool argument that
+  names a file or directory (`path`, `file_path`, `root`, `paths`, and `workdir`
+  of `shell`) treats `~` and `~/...` as the home directory of the user running
+  the agent. Before, the path was taken relative to the working directory, so
+  `~/x` named a directory called `~`. `~name/...` and a `~` that is not first are
+  unchanged. Approval prompts and file-conflict detection use the expanded path;
+  the arguments stored in the assistant message are not rewritten. If no home
+  directory is known the call fails with an error naming the argument. New
+  `ToolContext::resolve_path_arg(arg, value)` (default method; `resolve_path`
+  calls it with `path`); `resolve_target` in the built-in helpers takes the
+  argument name and returns a `Result`.
+- **Fewer exported spans by default (telemetry).** Actor message dispatch spans
+  (`kameo`, about 60% of exported spans) are no longer exported unless
+  `QMT_TELEMETRY_LEVEL` names `kameo` (for example `info,kameo=info`), and
+  eleven per-step bookkeeping spans (`middleware.driver`, `middleware.phase`,
+  the `agent.execution.middleware.*` spans, `agent.tool.side_effects`,
+  `agent.request.cache_breakpoints`, `model_inventory.get_snapshot`,
+  `function_index.remove_file`) are exported only at `debug`. Model request and
+  tool call spans are unchanged.
+- **Model request spans report their attempts (telemetry).** The `chat {model}`
+  span carries `gen_ai.request.attempt` (attempts started) and one event of that
+  name per attempt that ended, with `error.type` on failed attempts. Error
+  messages are not exported. `otelite retries` lists a request
+  retried this way with its final attempt number (checked against a local
+  otelite).
+- **llama-cpp:** adjacent plain user messages are joined (with a blank line)
+  before the chat template is applied, because the agent now stores notices as
+  user messages and strict templates (Gemma, Mistral) reject two user messages
+  in a row. Media markers keep their order; a message with several nested tool
+  result images now yields one user message holding all markers.
+- **Request attribution:** `llm_request_end` events carry `prefix_change`
+  (`first_request`, `model`, `tools`, `system`, `history` or `none`) and
+  `idle_secs`, and the model request span carries `qmt.cache.prefix_change` and
+  `qmt.cache.idle_secs`.
+- **Tool order:** the tool list sent to the model is sorted by name, and
+  `ToolRegistry` keeps its tools in name order too, so the tool prefix is
+  byte-stable between requests.
+- **Tool changes inside the conversation (Anthropic):** a tool that appears,
+  disappears or changes mid-session (an MCP server connecting, `tools/list_changed`,
+  a changed `skill` description) no longer rewrites the prompt cache on models
+  that accept in-conversation tool changes (Opus 4.8, 5 and 5.5, Sonnet 5.5,
+  Haiku 5.5, Fable 5 and Mythos 5 families). The agent stores the offered tools
+  as a `tool_baseline` message part (before the first request, after a
+  compaction and after a model change; never sent as a message) and later
+  differences as `tool_change` parts, sent as `tool_addition` / `tool_removal`
+  entries with the `inline-tools-2026-09-15` beta header. The request keeps the
+  baseline's tool list and records `prefix_change = "none"`. Other providers are
+  unchanged. New `querymt` API: `ChatCapabilities::tool_updates` (default
+  `false`, so older provider plugins keep working), `ChatInputPart::ToolChange`,
+  `ToolChange`, `ChatMessage::from_tool_change`, `reject_tool_changes`, and
+  `LLMProviderFromHTTP::with_name`. Rollback: a session holding a `tool_baseline`
+  or `tool_change` part cannot be loaded by a build from before this change
+  (unknown message part kind), like `notice` above.
+- **Compaction:** the summary is followed by the session's active task, so a
+  compacted session keeps its task commitment.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /
@@ -283,8 +533,159 @@
   the file (`mmap_size = 268435456`), with or without migrations. Older binaries
   can still open a migrated database.
 
+
+### Breaking
+
+- **BREAKING: the middleware trait is replaced by `Middleware` and
+  `TurnMiddleware`** (`querymt_agent::middleware`). A middleware is now an
+  agent-scoped `Middleware` (configuration and shared services) that creates one
+  `TurnMiddleware` per run; all state of a run lives in that instance, so it
+  cannot leak into another session or the next run (before, per-run state kept
+  in a shared driver was cleared by `reset`, which no run called). Hooks take a
+  `HookCx` (reads of the run, `queue_notice`, `set_request_overrides`) and
+  return a verdict that names only what the stage allows (`StepVerdict`,
+  `ReplyVerdict`, `EndVerdict`, `StopVerdict`) instead of any `ExecutionState`.
+  Before and after, a middleware that stops a run at its sixth request:
+
+  ```rust
+  // Before
+  struct Budget;
+  #[async_trait]
+  impl MiddlewareDriver for Budget {
+      async fn on_step_start(&self, state: ExecutionState, _rt: Option<&Arc<SessionRuntime>>)
+          -> Result<ExecutionState> {
+          match state {
+              ExecutionState::BeforeLlmCall { context } if context.stats.steps >= 5 =>
+                  Ok(ExecutionState::Stopped {
+                      message: "budget used".into(),
+                      stop_type: StopType::Other,
+                      context: Some(context),
+                  }),
+              other => Ok(other),
+          }
+      }
+      fn reset(&self) {}
+      fn name(&self) -> &'static str { "budget" }
+  }
+
+  // After
+  struct Budget;
+  impl Middleware for Budget {
+      fn name(&self) -> &'static str { "budget" }
+      fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> { Box::new(BudgetTurn) }
+  }
+  struct BudgetTurn;
+  #[async_trait]
+  impl TurnMiddleware for BudgetTurn {
+      async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+          if cx.stats().steps >= 5 {
+              return Ok(StepVerdict::Stop(Stop::new(StopType::Other, "budget used")));
+          }
+          Ok(StepVerdict::Proceed)
+      }
+  }
+  ```
+
+  Removed from the trait: `reset` (a run gets new instances), the
+  `on_processing_tool_calls` hook (only test code implemented it), the
+  `Option<&Arc<SessionRuntime>>` parameter (use `HookCx::runtime`), a hook's
+  freedom to return any `ExecutionState` (a middleware can no longer complete or
+  cancel a run), and `get_limits` (now `Middleware::limits`). `on_turn_start`
+  remains and returns a `StepVerdict`. `CompositeDriver::run_*` and `reset` are
+  gone; `CompositeDriver::begin_turn` returns the run's `TurnStack`.
+  `MiddlewareFactory::create`, `AgentBuilder::middleware`,
+  `AgentConfigBuilder::with_middleware(s)` and `AgentConfig::middleware_drivers`
+  take `Arc<dyn Middleware>` / `impl Middleware`. See the
+  [middleware guide](docs/docs/agent/middleware.md).
+- **BREAKING: five unused middleware types are removed:**
+  `DelegationGuardMiddleware`, `DuplicateToolCallMiddleware`,
+  `MaxStepsMiddleware`, `TurnLimitMiddleware` and `PriceLimitMiddleware`. None
+  was built by any preset, assembly or configuration entry. Use
+  `LimitsMiddleware` for the three limit types
+  (`LimitsConfig::default().max_steps(n)`, `.max_turns(n)`,
+  `LimitsConfig::with_manual_pricing(input, output).max_price_usd(cap)`); the
+  other two have no replacement. `StopType::DelegationBlocked`,
+  `NoticeSource::DuplicateToolCall` and `Delegation::retry_count` stay.
+- **`SessionRuntime::turn_diffs` is removed.** The files a run changed are held
+  by the run itself and reach middleware through `HookCx::changed_paths`.
+- **BREAKING (Rust API): the run no longer holds its history as provider
+  messages.** `HookCx::history()` returns `&[AgentMessage]`, the messages as the
+  session stores them (a notice with its source, a tool baseline, a steering
+  message), not the `&[ChatMessage]` a provider is sent. `ConversationContext`
+  is removed, and the `ExecutionState` variants no longer carry a `context`: the
+  history, statistics, queued notices and request overrides of a run belong to
+  the run and reach a hook through `HookCx` (`history`, `stats`,
+  `pending_notices`, `last_applied`, `request_overrides`).
+  `SessionHandle::add_message` is `pub(crate)`, and `SessionHandle::history`
+  and `SessionHandle::project_history` are removed: the run is the only writer
+  of its history, and a model or compaction request is projected from the stored
+  messages in one place. Public `SessionRuntime` fields `turn_snapshot` and
+  `pre_turn_snapshot_task` are removed with `turn_diffs`.
+- **BREAKING (Rust API): the removed public `SessionRuntime` fields.**
+  `SessionRuntime::turn_snapshot`, `pre_turn_snapshot_task` and `turn_diffs` no
+  longer exist: they were state of one run kept on the session. The pre-turn
+  snapshot and the changed paths belong to the run, and a reader fails to
+  compile instead of reading a value of another run.
+- **BREAKING (Rust API): `BudgetWarnings::take_new` takes `&mut self`**
+  (`querymt_agent_services::accounting::BudgetWarnings`). It held a mutex only
+  because the run shared it; the run now owns it.
+- **BREAKING (Rust API): `ExecutionState` is removed** from
+  `querymt_agent::middleware`. It was the loop's position, and middleware stopped
+  using it when hooks got typed verdicts; the loop's position is now internal.
+  `ExecutionOrigin` is exported from `querymt_agent_runtime::agent::execution`
+  (the module `execution_context` is gone), and a run's failure is the internal
+  `TurnError`, which keeps its source (a provider error, or the name and source
+  of a failed middleware) where the loop used to wrap it in a string.
+- **A scheduled run executes like an interactive one.** Both start through one
+  `SessionActor::start_run`, and the run reports its phase through a `watch`
+  channel, so a burst of phase changes publishes the latest phase instead of
+  every step. Events and their order are unchanged. A provider that cannot be
+  built now fails the run before the first middleware hook and before the model
+  is asked, the provider is built once per run, and a middleware error names the
+  middleware.
+  A failed write of the stored conversation keeps the store's error as its
+  source; the messages that were already prefixed (`Failed to store assistant
+  message: ...`, `... wait message: ...`, `... tool results: ...`) are unchanged,
+  and the writes that reported the store's bare error (queued notices, steering,
+  tool baseline and change records, intent projection) now carry the same kind of
+  prefix.
+- **A run that panics fails instead of leaving its session stuck.** The panic
+  is caught where the run is started and becomes the run's failure: the client
+  gets an `Internal` error (`run panicked: ...`), an `Error` event is emitted,
+  a scheduled run emits `ScheduledExecutionFailed`, and the run is closed as
+  `failed`, so the run lease is released or handed to the next queued prompt.
+  Before, the session kept a run that never ended: later prompts queued behind
+  it for good and the client was told `prompt execution dropped`. The workspace
+  changes a panicking run made are still recorded for undo, and steering the
+  run had accepted but not applied gets a `SteeringDiscarded` event
+  (`run_failed`) instead of none; a run that fails by an error ends the same
+  way.
+
 ### Fixed
 
+- **A failed scheduled run is attributed to its own cycle.** The scheduler now
+  names the run it fires, and the run's terminal events (including a failure
+  and the cycle timeout) carry that id. Before, every failure was reported
+  without a run id and the scheduler remembered it per schedule, so after a
+  schedule's first failure its later failures were dropped as duplicates (the
+  schedule was never re-armed with backoff or marked failed), and the late
+  failure of a cycle that had timed out could end the cycle that followed it.
+  A terminal event of an earlier cycle is now ignored while a later one is in
+  flight, and failures that name no run (startup recovery, the reconciliation
+  sweep) are each applied.
+
+- **`shell` returns when its command exits.** A command that leaves a background
+  process holding its output (for example `server & echo started`) no longer
+  keeps the call open until that process ends: the call waits at most one second
+  for the remaining output after the command exits. The leftover process keeps
+  running, and output it writes afterwards is not part of the result. The result
+  format and its truncation are unchanged.
+- **Every started tool call gets one end event.** When a run was cancelled, a
+  running tool call could be dropped without a `tool_call_end` event, depending
+  on whether the cancel signal or the tool's own cancellation was observed first.
+  Such a call now always ends with an error event reporting the cancellation. A
+  call that was running when the agent process died is closed as interrupted when
+  the run is reconciled on the next load.
 - **Faster prompt records, and corrupt non-prompt parts no longer fail loads.**
   Structured user prompt records (remote and local session loads, older-history
   pages, peer prompt requests and history replay for clients without snapshot
@@ -381,6 +782,23 @@
 
 ### Breaking
 
+- **`SessionHandle::chat`, `SessionHandle::submit_request` and
+  `SessionHandle::convert_chat_to_agent` removed** from
+  `querymt_agent_runtime::session`. `chat` sent the stored history as it was
+  and skipped the agent's per-request tool handling, so it failed on any session
+  with stored tool lists or tool changes; the other two had no other caller.
+  Send prompts with `AgentSession::chat`, `Agent::chat` or ACP
+  `session/prompt`.
+- **`querymt_agent::middleware::PreparedModelRequest` has a new public field
+  `offered_tools`**; struct literals must add it. It holds the tools the model
+  can call in the request. `tools` is the request's tool list, which on a
+  provider that takes tool changes as messages is the list stored when the
+  session started on that model: tools added or removed since are not in it.
+  Middleware that asks "can the model call X" must read `offered_tools`.
+- **`querymt_agent::middleware::ConversationContext` can no longer be built
+  with a struct literal outside its crate**: it has a crate-private field (the
+  tool baseline in effect). Use `ConversationContext::new` and the `with_*`
+  methods.
 - **`qmt_llama_cpp::LlamaCppConfig` has a new public field
   `grammar_backend: Option<GrammarBackend>`**; struct literals must add it
   (`None` keeps the default). `qmt_llama_cpp::GrammarBackend` is a new exported

@@ -391,6 +391,7 @@ readable messages may be reworded; codes do not change.
 | `owner_transferred` | the session handed its workspace off and is read-only; the current owner is in `ownerSessionId` |
 | `not_owner`, `workspace_not_ready`, `owner_not_local` | handoff refused: the target does not own a ready, locally hosted workspace (nothing is created) |
 | `summary_failed` | handoff with `summary` failed before the transfer; ownership is unchanged |
+| `summary_cancelled` | the summary was cancelled (`session/cancel` for the owner session) before the transfer; ownership is unchanged and the workspace is released |
 | `handoff_incomplete` | ownership moved but the successor is not runnable yet; run `recover` with its `session_id` |
 | `removal_refused` | removal refused for a reason without a more specific code (for example externally owned content) |
 | `operation_refused` | another lifecycle operation was refused in the current state |
@@ -662,7 +663,14 @@ owner and the successor never runs unowned.
 **Summary.** Clean by default. With `summary`, the compaction summarizer runs
 over the previous conversation *before anything is created* and the result
 seeds the successor as its initial context (`summary_seeded: true`). A
-summarizer failure returns `summary_failed` with ownership unchanged.
+summarizer failure returns `summary_failed` with ownership unchanged. The
+summary is sent where `[agent.execution.compaction]` says (the owner's own
+provider and model when it says nothing). The owner's actor is already
+unloaded, so a `session/cancel` for the owner session is routed to the summary
+instead: it stops a request in flight, ends the handoff with `summary_cancelled`
+and releases the workspace. While the summary runs, the workspace is held
+exclusively, so a prompt to the owner or to a session sharing the checkout is
+refused until it ends.
 
 ### Read-only previous owners
 

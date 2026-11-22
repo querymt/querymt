@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -20,16 +20,16 @@ use crate::acp::protocol::{ContentBlock, ImageContent, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
+use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, StopOnBeforeLlmCall,
-    TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
-    mock_session,
+    Act, MockChatResponse, MockLlmProvider, MockSessionStore, ScriptedMiddleware,
+    SharedLlmProvider, TestProviderFactory, mock_llm_config, mock_plugin_registry,
+    mock_querymt_tool_call, mock_session,
 };
 use crate::tools::{Tool as AgentTool, ToolContext, ToolError, ToolExecutionClass, ToolRegistry};
 use querymt_agent_core::events::AgentEventKind;
@@ -39,10 +39,15 @@ use querymt_agent_core::events::AgentEventKind;
 struct TestHarness {
     config: Arc<AgentConfig>,
     session_id: String,
-    exec_ctx: ExecutionContext,
+    env: TurnEnv,
+    turn: Turn,
+    /// The config `env`'s tool set and accounting were built from.
+    env_config: Arc<AgentConfig>,
     provider: Arc<Mutex<MockLlmProvider>>,
     stored_messages: Arc<StdMutex<Vec<querymt_agent_core::model::AgentMessage>>>,
     history_writes: Arc<AtomicUsize>,
+    /// While set, the store rejects the write of an assistant message.
+    fail_assistant_writes: Arc<AtomicBool>,
     _temp_dir: TempDir,
 }
 
@@ -55,6 +60,14 @@ impl TestHarness {
     }
 
     async fn new_with_tools(
+        history: Vec<querymt_agent_core::model::AgentMessage>,
+        delegation_sender: Option<oneshot::Sender<String>>,
+        tools: Vec<Tool>,
+    ) -> Self {
+        Self::assemble(history, delegation_sender, tools).await
+    }
+
+    async fn assemble(
         history: Vec<querymt_agent_core::model::AgentMessage>,
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
@@ -117,9 +130,18 @@ impl TestHarness {
         let history_writes = Arc::new(AtomicUsize::new(0));
         let stored_messages_for_mock = stored_messages.clone();
         let history_writes_for_mock = history_writes.clone();
+        let fail_assistant_writes = Arc::new(AtomicBool::new(false));
+        let fail_for_mock = fail_assistant_writes.clone();
         store
             .expect_add_message()
             .returning(move |_, message| {
+                if fail_for_mock.load(Ordering::SeqCst)
+                    && message.role == querymt::chat::ChatRole::Assistant
+                {
+                    return Err(crate::session::error::SessionError::Other(
+                        "disk full".into(),
+                    ));
+                }
                 stored_messages_for_mock.lock().unwrap().push(message);
                 history_writes_for_mock.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -207,34 +229,57 @@ impl TestHarness {
             crate::agent::core::McpToolState::empty(),
         );
 
-        let exec_ctx = ExecutionContext::new(
-            session_id.clone(),
-            querymt_agent_core::model::TurnId::new(),
-            session_runtime,
-            runtime_context,
-            context,
-            crate::agent::core::ToolConfig::default(),
-        );
+        let (env, turn) =
+            crate::test_utils::turn_parts(&config, context, session_runtime, runtime_context).await;
 
         Self {
+            env_config: config.clone(),
             config,
             session_id,
-            exec_ctx,
+            env,
+            turn,
             provider,
             stored_messages,
             history_writes,
+            fail_assistant_writes,
             _temp_dir: temp_dir,
         }
     }
 
+    /// Rebuild what `env` derives from the config (tool set, accounting) when
+    /// a test replaced the config after the harness was built.
+    async fn refresh_env(&mut self) {
+        if Arc::ptr_eq(&self.env_config, &self.config) {
+            return;
+        }
+        self.env.tool_set =
+            TurnEnv::build_tool_set(&self.config, &self.env.runtime, &self.env.tool_config);
+        self.env.cycle_accounting = querymt_agent_services::accounting::CycleAccounting::begin(
+            self.config
+                .event_sink
+                .session_accounting(&self.env.session_id)
+                .await
+                .expect("session accounting"),
+        );
+        self.env_config = self.config.clone();
+    }
+
     async fn run(&mut self) -> CycleOutcome {
-        crate::agent::execution::execute_cycle_state_machine(
+        self.run_result().await.expect("state machine")
+    }
+
+    async fn run_result(&mut self) -> Result<CycleOutcome, crate::agent::execution::TurnError> {
+        self.refresh_env().await;
+        self.turn.history = crate::agent::execution::turn::History::load(&self.env.session_handle)
+            .await
+            .expect("history loads");
+        crate::agent::execution::run_turn(
             &self.config,
-            &mut self.exec_ctx,
+            &self.env,
+            &mut self.turn,
             crate::agent::core::AgentMode::Build,
         )
         .await
-        .expect("state machine")
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
@@ -263,7 +308,7 @@ impl TestHarness {
             builder = builder.with_hooks(hooks);
         }
         self.config = Arc::new(builder.build());
-        self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
+        self.env.tool_config.policy = ToolPolicy::BuiltInOnly;
     }
 
     fn enable_task_completion_guard(&mut self, enabled: bool) {
@@ -284,7 +329,7 @@ impl TestHarness {
     /// Rebuild the config with one extra middleware and a stop-recovery limit.
     fn install_stop_recovery(
         &mut self,
-        middleware: impl crate::middleware::MiddlewareDriver + 'static,
+        middleware: impl crate::middleware::Middleware + 'static,
         max_stop_recoveries: u8,
     ) {
         let mut policy = self.config.execution_policy.clone();
@@ -304,7 +349,7 @@ impl TestHarness {
 
     fn set_task(&mut self, status: TaskStatus, kind: TaskKind) {
         let now = OffsetDateTime::now_utc();
-        self.exec_ctx.state.active_task = Some(Task {
+        self.turn.state.active_task = Some(Task {
             id: 1,
             public_id: "task-1".to_string(),
             session_id: 1,
@@ -567,64 +612,26 @@ fn provider_tool(name: &str) -> Tool {
 
 /// Stops at step start (for the first `stop_steps` steps) with a model token
 /// limit, and recovers every stop it is offered.
-struct StopThenRecover {
-    stop_steps: usize,
-    steps: AtomicUsize,
-    recoveries_offered: AtomicUsize,
-}
-
-impl StopThenRecover {
-    fn new(stop_steps: usize) -> Self {
-        Self {
-            stop_steps,
-            steps: AtomicUsize::new(0),
-            recoveries_offered: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl crate::middleware::MiddlewareDriver for StopThenRecover {
-    async fn on_step_start(
-        &self,
-        state: crate::middleware::ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        let step = self.steps.fetch_add(1, Ordering::SeqCst);
-        match state {
-            crate::middleware::ExecutionState::BeforeLlmCall { context }
-                if step < self.stop_steps =>
-            {
-                Ok(crate::middleware::ExecutionState::Stopped {
-                    message: "cut off".into(),
-                    stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
-                    context: Some(context),
-                })
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn on_stopped(
-        &self,
-        state: crate::middleware::ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.recoveries_offered.fetch_add(1, Ordering::SeqCst);
-        match state {
-            crate::middleware::ExecutionState::Stopped {
-                context: Some(context),
-                ..
-            } => Ok(crate::middleware::ExecutionState::BeforeLlmCall { context }),
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "StopThenRecover"
-    }
+fn stop_then_recover(stop_steps: usize) -> ScriptedMiddleware {
+    use crate::middleware::{StepVerdict, Stop, StopVerdict};
+    let stop = || {
+        Act::Say(StepVerdict::Stop(Stop::new(
+            querymt_agent_core::events::StopType::ModelTokenLimit,
+            "cut off",
+        )))
+    };
+    // The last act repeats: the steps after the last stop proceed.
+    let steps: Vec<_> = if stop_steps == usize::MAX {
+        vec![stop()]
+    } else {
+        (0..stop_steps)
+            .map(|_| stop())
+            .chain([Act::Say(StepVerdict::Proceed)])
+            .collect()
+    };
+    ScriptedMiddleware::default()
+        .step_start(steps)
+        .stopped([Act::Say(StopVerdict::Recover)])
 }
 
 /// Count `MiddlewareStopped` events currently buffered on `events`.
@@ -646,8 +653,8 @@ async fn drain_middleware_stopped(
 #[tokio::test]
 async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
     let mut harness = TestHarness::new(vec![], None).await;
-    let middleware = Arc::new(StopThenRecover::new(1));
-    harness.install_stop_recovery(SharedDriver(middleware.clone()), 5);
+    let middleware = stop_then_recover(1);
+    harness.install_stop_recovery(middleware.clone(), 5);
     harness
         .provider_mut()
         .await
@@ -665,7 +672,7 @@ async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
-    assert_eq!(middleware.recoveries_offered.load(Ordering::SeqCst), 1);
+    assert_eq!(middleware.count("stopped"), 1);
     assert_eq!(
         drain_middleware_stopped(&mut events).await,
         0,
@@ -677,8 +684,8 @@ async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
 async fn recovery_guard_publishes_the_stop_after_the_limit() {
     let mut harness = TestHarness::new(vec![], None).await;
     // Stops on every step and recovers every time it is asked.
-    let middleware = Arc::new(StopThenRecover::new(usize::MAX));
-    harness.install_stop_recovery(SharedDriver(middleware.clone()), 2);
+    let middleware = stop_then_recover(usize::MAX);
+    harness.install_stop_recovery(middleware.clone(), 2);
     let mut events = harness.config.subscribe_events();
 
     let outcome = harness.run().await;
@@ -694,12 +701,12 @@ async fn recovery_guard_publishes_the_stop_after_the_limit() {
         "{outcome:?}"
     );
     assert_eq!(
-        middleware.recoveries_offered.load(Ordering::SeqCst),
+        middleware.count("stopped"),
         2,
         "middleware is consulted at most max_stop_recoveries times"
     );
     assert_eq!(
-        middleware.steps.load(Ordering::SeqCst),
+        middleware.count("step_start"),
         3,
         "the initial attempt plus one per recovery"
     );
@@ -709,7 +716,7 @@ async fn recovery_guard_publishes_the_stop_after_the_limit() {
 #[tokio::test]
 async fn stop_without_a_recovering_middleware_is_published_immediately() {
     let mut harness = TestHarness::new(vec![], None).await;
-    harness.install_stop_recovery(StopOnBeforeLlmCall, 5);
+    harness.install_stop_recovery(stop_at_every_step(), 5);
     let mut events = harness.config.subscribe_events();
 
     let outcome = harness.run().await;
@@ -718,36 +725,13 @@ async fn stop_without_a_recovering_middleware_is_published_immediately() {
     assert_eq!(drain_middleware_stopped(&mut events).await, 1);
 }
 
-/// Lets a test keep a handle on a middleware installed by value.
-struct SharedDriver<T>(Arc<T>);
-
-#[async_trait]
-impl<T: crate::middleware::MiddlewareDriver> crate::middleware::MiddlewareDriver
-    for SharedDriver<T>
-{
-    async fn on_step_start(
-        &self,
-        state: crate::middleware::ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.0.on_step_start(state, runtime).await
-    }
-
-    async fn on_stopped(
-        &self,
-        state: crate::middleware::ExecutionState,
-        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
-        self.0.on_stopped(state, runtime).await
-    }
-
-    fn reset(&self) {
-        self.0.reset();
-    }
-
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
+/// Stops before every model request and recovers nothing.
+fn stop_at_every_step() -> ScriptedMiddleware {
+    use crate::middleware::{StepVerdict, Stop};
+    ScriptedMiddleware::default().step_start([Act::Say(StepVerdict::Stop(Stop::new(
+        querymt_agent_core::events::StopType::Other,
+        "stopped",
+    )))])
 }
 
 async fn run_completion_guard_case(
@@ -873,7 +857,7 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
         )
         .with_tool_policy(ToolPolicy::ProviderOnly)
         .with_execution_policy(policy)
-        .with_middleware(StopThenRecover::new(1))
+        .with_middleware(stop_then_recover(1))
         .with_hooks(hooks)
         .build(),
     );
@@ -885,6 +869,89 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
         .times(1);
 
     assert_eq!(harness.run().await, CycleOutcome::Completed);
+}
+
+/// "Prefix is stable after a reload": a Stop-hook continuation is sent to the
+/// model, so a session loaded from storage must contain it at the same place.
+/// Storage is what a reload reads, so the continuation has to be stored.
+#[tokio::test]
+async fn durable_prefix_is_stable_after_a_reload() {
+    use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let output = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "keep going"}
+    });
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{
+                "type": "command",
+                "command": format!("cat >/dev/null; printf '%s' '{output}'"),
+                "timeout_sec": 5
+            }]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(harness.config.execution_policy.clone())
+        .with_hooks(hooks)
+        .build(),
+    );
+    let sent: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sent_for_mock = sent.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(move |messages, _| {
+            sent_for_mock
+                .lock()
+                .unwrap()
+                .push(messages.iter().map(|message| message.text()).collect());
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(2);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    // The second request carried the continuation message.
+    let sent = sent.lock().unwrap().clone();
+    let continuation = sent[1]
+        .iter()
+        .find(|text| text.contains("budget remains"))
+        .expect("second request carries the Stop-hook continuation")
+        .clone();
+
+    // A reload reads storage: the continuation must be there, as a notice.
+    let stored_notice = harness
+        .stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            MessagePart::Notice {
+                source: NoticeSource::StopHook,
+                content,
+            } => Some(content.clone()),
+            _ => None,
+        });
+    assert_eq!(
+        stored_notice.as_deref(),
+        Some(continuation.as_str()),
+        "the continuation sent to the model is not in stored history"
+    );
 }
 
 #[tokio::test]
@@ -981,26 +1048,87 @@ async fn invalid_steering_conversion_does_not_persist_history() {
         )
         .await
         .expect("direct inbox insertion bypasses admission validation");
-    harness.exec_ctx = harness.exec_ctx.with_steering(inbox);
-    let context = Arc::new(crate::middleware::ConversationContext::new(
-        Arc::from(harness.session_id.as_str()),
-        Arc::from([]),
-        Arc::new(crate::middleware::AgentStats::default()),
-        Arc::from("mock"),
-        Arc::from("mock-model"),
-    ));
-
+    harness.env.steering = Some(inbox);
     let result = crate::agent::execution::apply_pending_steering(
         &harness.config,
-        &mut harness.exec_ctx,
-        &context,
-        "test",
+        &harness.env,
+        &mut harness.turn,
+        crate::agent::execution::SteeringBoundary::NextRequest,
         false,
     )
     .await;
 
     assert!(result.is_err());
     assert_eq!(harness.history_writes.load(Ordering::SeqCst), 0);
+}
+
+/// run-history-consistency / Storing an assistant reply fails.
+#[tokio::test]
+async fn storing_an_assistant_reply_fails() {
+    let mut user = querymt_agent_core::model::AgentMessage::new(
+        "sess-test".into(),
+        querymt::chat::ChatRole::User,
+    );
+    user.parts
+        .push(querymt_agent_core::model::MessagePart::Text {
+            content: "go".into(),
+        });
+    let mut harness = TestHarness::new(vec![user], None).await;
+    harness.fail_assistant_writes.store(true, Ordering::SeqCst);
+    // The reply calls a tool: were it kept, a second request would follow.
+    let calls = vec![mock_querymt_tool_call("call-a", "unknown_tool", "{}")];
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .returning(move |_| Ok(MockChatResponse::with_tools("", calls.clone()).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    harness.turn.history =
+        crate::agent::execution::turn::History::load(&harness.env.session_handle)
+            .await
+            .unwrap();
+    let result = crate::agent::execution::run_turn(
+        &harness.config,
+        &harness.env,
+        &mut harness.turn,
+        crate::agent::core::AgentMode::Build,
+    )
+    .await;
+
+    let error = result.expect_err("the run fails with the store's error");
+    // The text is what it always was; the store's error is the typed source.
+    assert_eq!(
+        error.to_string(),
+        "Failed to store assistant message: disk full"
+    );
+    match &error {
+        crate::agent::execution::TurnError::History { what, source } => {
+            assert_eq!(*what, "Failed to store assistant message");
+            assert!(
+                matches!(source, crate::session::error::SessionError::Other(message) if message == "disk full"),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected a history error, got {other:?}"),
+    }
+    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.llm_error().is_none());
+    // One request was sent; the unstored reply is not in what a next one would carry.
+    assert!(
+        harness
+            .turn
+            .history
+            .as_slice()
+            .iter()
+            .all(|message| { message.role != querymt::chat::ChatRole::Assistant })
+    );
 }
 
 #[tokio::test]
@@ -1603,6 +1731,106 @@ async fn test_single_tool_call_cycle() {
     assert_eq!(outcome, CycleOutcome::Completed);
 }
 
+/// Per-step bookkeeping spans that are exported only at debug level.
+const BOOKKEEPING_SPANS: [&str; 7] = [
+    "middleware.driver",
+    "agent.execution.middleware.turn_start",
+    "agent.execution.middleware.step_start",
+    "agent.execution.middleware.after_llm",
+    "agent.execution.middleware.turn_end",
+    "agent.tool.side_effects",
+    "agent.request.cache_breakpoints",
+];
+
+/// Run one turn with a tool call and a final answer and return the spans
+/// exported at info level (`info_level`) or at every level.
+async fn spans_of_a_tool_turn(info_level: bool) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    use querymt_agent_services::tools::trace_support::genai_trace::{capture, capture_info};
+
+    let mut harness = TestHarness::new(vec![], None).await;
+    // A middleware that changes nothing, so the driver spans have a driver to name.
+    harness.install_stop_recovery(ScriptedMiddleware::default(), 5);
+    let tool_call = mock_querymt_tool_call("call-1", "remote_tool", "{}");
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|_| Ok(MockChatResponse::text_only("done").into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok(vec![ToolResultPart::text("tool output")]))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+    let turn = harness.run();
+    let (outcome, spans) = if info_level {
+        capture_info(turn).await
+    } else {
+        capture(turn).await
+    };
+    assert_eq!(outcome, CycleOutcome::Completed);
+    spans
+}
+
+/// Default telemetry level (info): the per-step bookkeeping spans are not
+/// exported, the work spans are.
+#[tokio::test]
+async fn default_level_omits_bookkeeping_spans_and_keeps_work_spans() {
+    use querymt_agent_services::tools::trace_support::genai_trace::attr;
+
+    let spans = spans_of_a_tool_turn(true).await;
+    let names: Vec<&str> = spans.iter().map(|span| span.name.as_ref()).collect();
+    for name in BOOKKEEPING_SPANS {
+        assert!(!names.contains(&name), "{name} exported at info: {names:?}");
+    }
+    let operation = |wanted: &str| {
+        spans.iter().any(|span| {
+            attr(span, "gen_ai.operation.name")
+                == Some(&opentelemetry::Value::from(wanted.to_string()))
+        })
+    };
+    assert!(
+        names.contains(&"agent.tool.invoke"),
+        "agent.tool.invoke span missing: {names:?}"
+    );
+    assert!(operation("chat"), "model request span missing: {names:?}");
+    assert!(
+        operation("execute_tool"),
+        "execute_tool span missing: {names:?}"
+    );
+}
+
+/// Debug level: the same turn exports the bookkeeping spans again.
+#[tokio::test]
+async fn debug_level_exports_bookkeeping_spans() {
+    let spans = spans_of_a_tool_turn(false).await;
+    let names: Vec<&str> = spans.iter().map(|span| span.name.as_ref()).collect();
+    for name in [
+        "middleware.driver",
+        "agent.tool.side_effects",
+        "agent.request.cache_breakpoints",
+        "agent.execution.middleware.step_start",
+    ] {
+        assert!(names.contains(&name), "{name} missing at debug: {names:?}");
+    }
+}
+
 /// Same-turn tool loop must keep encrypted reasoning on the second request.
 ///
 /// `store=false` Responses continuation needs `encrypted_content` on the
@@ -1755,7 +1983,7 @@ async fn test_cancel_before_llm_call() {
         .return_const(None)
         .times(0..);
 
-    harness.exec_ctx.cancellation_token.cancel();
+    harness.env.cancellation_token.cancel();
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Cancelled);
@@ -1777,9 +2005,14 @@ async fn test_llm_error_returns_err() {
         .return_const(None)
         .times(0..);
 
-    let result = crate::agent::execution::execute_cycle_state_machine(
+    harness.turn.history =
+        crate::agent::execution::turn::History::load(&harness.env.session_handle)
+            .await
+            .unwrap();
+    let result = crate::agent::execution::run_turn(
         &harness.config,
-        &mut harness.exec_ctx,
+        &harness.env,
+        &mut harness.turn,
         crate::agent::core::AgentMode::Build,
     )
     .await;
@@ -1798,7 +2031,7 @@ async fn test_middleware_stops_execution() {
             harness.config.event_sink.journal().clone(),
         )
         .with_tool_policy(ToolPolicy::ProviderOnly)
-        .with_middleware(StopOnBeforeLlmCall)
+        .with_middleware(stop_at_every_step())
         .build(),
     );
     harness
@@ -1820,6 +2053,227 @@ async fn test_middleware_stops_execution() {
         ),
         "{outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn stop_at_run_start_sends_no_model_request() {
+    use crate::middleware::{StepVerdict, Stop};
+    let stopper = ScriptedMiddleware::default().turn_start([Act::Say(StepVerdict::Stop(
+        Stop::new(querymt_agent_core::events::StopType::Other, "at start"),
+    ))]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(stopper.clone(), 5);
+    // No `expect_chat`: a model request would fail the run.
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert!(
+        matches!(
+            &outcome,
+            CycleOutcome::Stopped { reason, .. } if reason == "at start"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stopper.count("turn_start"), 1);
+    assert_eq!(
+        stopper.count("step_start"),
+        0,
+        "the run ended before its first step"
+    );
+}
+
+#[tokio::test]
+async fn middleware_error_keeps_its_source() {
+    use crate::agent::execution::TurnError;
+    use crate::middleware::{MiddlewareError, StepVerdict};
+    let failing = ScriptedMiddleware::default().step_start([Act::<StepVerdict>::Fail]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(failing.clone(), 5);
+    // No `expect_chat`: the run fails before a model request.
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let error = harness
+        .run_result()
+        .await
+        .expect_err("a failing hook fails the run");
+
+    match &error {
+        TurnError::Middleware { name, source } => {
+            assert_eq!(*name, "ScriptedMiddleware");
+            assert!(
+                matches!(source, MiddlewareError::ExecutionError(message) if message == "test error"),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected a middleware error, got {other:?}"),
+    }
+    // The source is reachable through the standard chain, not only in the text.
+    let source = std::error::Error::source(&error).expect("the error has a source");
+    assert!(source.downcast_ref::<MiddlewareError>().is_some());
+    assert!(error.llm_error().is_none());
+}
+
+/// The model is resolved before the run's environment exists, so a run that
+/// starts cancelled never builds a provider and ends as cancelled. (The
+/// scenarios of a provider that cannot be built, is built after a failure,
+/// or is waited for are driven through the session actor, which resolves the
+/// model: `provider_resolution_tests.rs`.)
+#[tokio::test]
+async fn resolve_model_for_a_cancelled_run_is_cancelled() {
+    let harness = TestHarness::new(vec![], None).await;
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
+
+    let model = crate::agent::execution::resolve_model(
+        &harness.config,
+        &harness.env.session_handle,
+        &cancelled,
+    )
+    .await
+    .expect("a cancelled run is not an error");
+
+    assert!(model.is_none(), "no model is resolved for a cancelled run");
+}
+
+/// Provider setup is its own span, not an attempt of a request, and it
+/// happens once per run.
+#[tokio::test]
+async fn resolve_model_is_traced_as_provider_init_and_is_not_a_chat_retry() {
+    use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
+
+    let harness = TestHarness::new(vec![], None).await;
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let (model, spans) = capture(crate::agent::execution::resolve_model(
+        &harness.config,
+        &harness.env.session_handle,
+        &token,
+    ))
+    .await;
+
+    assert!(model.expect("resolves").is_some());
+    let operations: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "agent.llm.call_with_retry")
+        .map(|span| attr(span, "operation").cloned())
+        .collect();
+    assert_eq!(
+        operations,
+        vec![Some(opentelemetry::Value::from("provider_init"))],
+        "one setup retry wrapper and no chat attempt"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.name == "agent.execution.provider_init"),
+        "provider init span"
+    );
+}
+
+#[tokio::test]
+async fn continuation_at_the_end_of_a_run_sends_another_request() {
+    use crate::middleware::EndVerdict;
+    let continuer = ScriptedMiddleware::default().turn_end([
+        Act::Notice("one more check", EndVerdict::Continue),
+        Act::Say(EndVerdict::Finish),
+    ]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(continuer.clone(), 5);
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .returning(move |messages| {
+            recorded.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|message| message.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(2);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let seen = seen.lock().unwrap();
+    assert!(!seen[0].contains("one more check"));
+    assert!(
+        seen[1].contains("one more check"),
+        "the notice is sent with the continuation"
+    );
+}
+
+#[tokio::test]
+async fn notices_queued_before_a_stop_are_stored_when_the_stop_is_recovered() {
+    use crate::middleware::{StepVerdict, Stop, StopVerdict};
+    let queues = ScriptedMiddleware::default()
+        .step_start([Act::Notice("kept across the stop", StepVerdict::Proceed)]);
+    let stops_once = ScriptedMiddleware::default()
+        .step_start([
+            Act::Say(StepVerdict::Stop(Stop::new(
+                querymt_agent_core::events::StopType::ModelTokenLimit,
+                "cut off",
+            ))),
+            Act::Say(StepVerdict::Proceed),
+        ])
+        .stopped([Act::Say(StopVerdict::Recover)]);
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(queues, 5);
+    harness.config = {
+        let mut config = (*harness.config).clone();
+        config.middleware_drivers.push(Arc::new(stops_once));
+        Arc::new(config)
+    };
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .returning(move |messages| {
+            recorded.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|message| message.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert!(seen.lock().unwrap()[0].contains("kept across the stop"));
 }
 
 #[tokio::test]
@@ -2525,8 +2979,8 @@ mod repository_delivery {
                 builder = builder.with_hooks(hooks);
             }
             self.config = Arc::new(builder.build());
-            self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
-            self.exec_ctx.runtime = crate::agent::core::SessionRuntime::new(
+            self.env.tool_config.policy = ToolPolicy::BuiltInOnly;
+            self.env.runtime = crate::agent::core::SessionRuntime::new(
                 Some(kb.repo.path().to_path_buf()),
                 HashMap::new(),
                 crate::agent::core::McpToolState::empty(),
@@ -2772,7 +3226,10 @@ mod repository_delivery {
         );
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             "the scheduler dispatches queued tasks to workers",
             &[],
         )
@@ -2814,7 +3271,10 @@ mod repository_delivery {
         );
         let oriented = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -2875,7 +3335,10 @@ mod repository_delivery {
         harness.with_repository_delivery(kb, &settings(false, true), Vec::new());
         crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -2937,16 +3400,22 @@ mod repository_delivery {
         // persisted history is unchanged, so the next turn delivers it again.
         let a = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
         .await;
         assert_eq!(a.len(), 1);
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None;
+        harness.turn.delivery_budget = None;
         let b = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             PROMPT,
             &[],
         )
@@ -3158,7 +3627,7 @@ mod repository_delivery {
             &settings(true, true),
             vec![Arc::new(crate::tools::builtins::IndexTool::new())],
         );
-        let tools_before = harness.exec_ctx.tool_config.clone();
+        let tools_before = harness.env.tool_config.clone();
         let calls = vec![mock_querymt_tool_call(
             "call-1",
             "index",
@@ -3176,7 +3645,7 @@ mod repository_delivery {
         assert_eq!(out.contexts[0].0, INDEX_CONTEXT_HANDLER_ID);
 
         // Permissions, allow/deny lists and the system prompt are unchanged.
-        let after = &harness.exec_ctx.tool_config;
+        let after = &harness.env.tool_config;
         assert_eq!(after.allow, tools_before.allow);
         assert_eq!(after.deny, tools_before.deny);
         assert!(!crate::knowledge::repository::policy::RETRIEVAL_POLICY.contains(hostile));
@@ -3228,7 +3697,7 @@ mod repository_delivery {
             vec![Arc::new(crate::tools::builtins::IndexTool::new())],
         );
         harness
-            .exec_ctx
+            .env
             .tool_config
             .deny
             .insert(crate::config::ToolRef::builtin("index"));
@@ -3284,7 +3753,10 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3297,17 +3769,20 @@ mod repository_delivery {
         // The feature registers the retrieval tool, so the card may name it.
         assert!(cards[0].content.contains("repo_knowledge_get id="));
 
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None; // new turn
+        harness.turn.delivery_budget = None; // new turn
         // When session policy denies the tool, citations stay but no
         // unavailable call is suggested.
         harness
-            .exec_ctx
+            .env
             .tool_config
             .deny
             .insert(crate::config::ToolRef::builtin("repo_knowledge_get"));
         let denied = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3315,14 +3790,17 @@ mod repository_delivery {
         assert_eq!(denied.len(), 1);
         assert!(!denied[0].content.contains("repo_knowledge_get"));
         assert!(denied[0].content.contains("docs/arch.md"));
-        harness.exec_ctx.tool_config.deny = crate::config::ToolSet::new();
+        harness.env.tool_config.deny = crate::config::ToolSet::new();
 
-        *harness.exec_ctx.delivery_budget.lock().unwrap() = None; // new turn
+        harness.turn.delivery_budget = None; // new turn
         // A card already present (e.g. from a command-hook wrapper) is not
         // delivered again.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             prompt,
             &cards,
         )
@@ -3334,7 +3812,10 @@ mod repository_delivery {
         assert!(
             crate::agent::repository_delivery::orientation_contexts(
                 &harness.config,
-                &harness.exec_ctx,
+                &harness.env.session_id,
+                harness.env.cwd(),
+                &harness.env.tool_config,
+                &mut harness.turn,
                 prompt,
                 &[],
             )
@@ -3355,7 +3836,10 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             prompt,
             &[],
         )
@@ -3381,7 +3865,10 @@ mod repository_delivery {
         // Same turn, same card again: matched and suppressed, not delivered.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.exec_ctx,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
+            &mut harness.turn,
             prompt,
             &[],
         )

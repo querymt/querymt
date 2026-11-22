@@ -1,8 +1,8 @@
 //! Agent mode middleware - injects mode-specific reminders based on the current agent mode
 //!
-//! This middleware reads the agent's current mode (Build, Plan, Review) and injects
-//! an appropriate reminder message before each LLM call. In Build mode (default),
-//! no reminder is injected.
+//! This middleware reads the agent's current mode (Build, Plan, Review) and queues
+//! a stored `agent_mode` notice when the mode's reminder is not already the most
+//! recent one in history. In Build mode (default), no reminder is stored.
 //!
 //! # Example (programmatic)
 //!
@@ -32,21 +32,22 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{ExecutionState, MiddlewareDriver, Result};
+use super::{HookCx, Middleware, Result, StepVerdict, TurnInfo, TurnMiddleware};
 use crate::agent::core::AgentMode;
 use crate::middleware::factory::MiddlewareFactory;
-use log::trace;
+use querymt_agent_core::model::NoticeSource;
 use serde::Deserialize;
 
 /// Middleware that injects mode-specific reminder messages based on the current agent mode.
 ///
 /// Stores a map of `AgentMode` → reminder string. When the agent is in a mode that
-/// has a reminder, it is injected as a user message before the LLM call.
+/// has a reminder, it is stored once as a notice when the mode changes.
 /// Build mode typically has no reminder (full read/write).
 ///
-/// Mode is read from `ConversationContext.session_mode` (per-session).
+/// The mode is the session's, read through `HookCx::mode`.
+#[derive(Clone)]
 pub struct AgentModeMiddleware {
-    reminders: HashMap<AgentMode, String>,
+    reminders: Arc<HashMap<AgentMode, String>>,
 }
 
 impl AgentModeMiddleware {
@@ -54,58 +55,66 @@ impl AgentModeMiddleware {
     pub fn new(plan_reminder: String) -> Self {
         let mut reminders = HashMap::new();
         reminders.insert(AgentMode::Plan, plan_reminder);
-        Self { reminders }
+        Self::with_reminders(reminders)
     }
 
     /// Create with explicit per-mode reminders.
-    /// Mode is read from `ConversationContext.session_mode`.
     pub fn with_reminders(reminders: HashMap<AgentMode, String>) -> Self {
-        Self { reminders }
+        Self {
+            reminders: Arc::new(reminders),
+        }
     }
 }
 
-#[async_trait]
-impl MiddlewareDriver for AgentModeMiddleware {
-    async fn on_turn_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        Ok(state)
+/// The notice to store before the next request, if any.
+///
+/// Compares the session mode with the most recent `agent_mode` notice in
+/// the effective history (stored or queued): a reminder is stored when the
+/// mode has one and the last notice is missing or another mode's; a leave
+/// notice is stored when the mode has none and the last notice is a
+/// reminder. Any stored mode notice other than the leave notice counts as a
+/// reminder, so one written under an earlier reminder text is still left.
+/// Checked per request, not per switch, so switches without a request store
+/// nothing and a reminder lost to compaction is stored again.
+fn notice_for(reminders: &HashMap<AgentMode, String>, cx: &HookCx<'_>) -> Option<String> {
+    let last = cx.last_mode_notice();
+    match reminders.get(&cx.mode()) {
+        Some(reminder) => (last != Some(reminder.as_str())).then(|| reminder.clone()),
+        None => last
+            .filter(|last| *last != LEAVE_NOTICE)
+            .map(|_| LEAVE_NOTICE.to_string()),
     }
+}
 
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => {
-                let new_context = if let Some(reminder) = self.reminders.get(&context.session_mode)
-                {
-                    trace!("AgentModeMiddleware: refreshing reminder fragment");
-                    context.upsert_fragment(
-                        "agent_mode",
-                        reminder.clone(),
-                        crate::middleware::ContextPriority::High,
-                    )
-                } else {
-                    context.remove_fragment("agent_mode")
-                };
-                Ok(ExecutionState::BeforeLlmCall {
-                    context: Arc::new(new_context),
-                })
-            }
-            other => Ok(other),
-        }
-    }
+/// Stored when the session leaves a mode that had a reminder.
+const LEAVE_NOTICE: &str =
+    "The agent mode changed. The instructions from the earlier mode reminder no longer apply.";
 
-    fn reset(&self) {
-        // No state to reset
-    }
-
+impl Middleware for AgentModeMiddleware {
     fn name(&self) -> &'static str {
         "AgentModeMiddleware"
+    }
+
+    fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
+        Box::new(AgentModeTurn {
+            reminders: Arc::clone(&self.reminders),
+        })
+    }
+}
+
+/// The mode check of one run. It keeps no state of its own: what the last
+/// notice was is read from the history.
+struct AgentModeTurn {
+    reminders: Arc<HashMap<AgentMode, String>>,
+}
+
+#[async_trait]
+impl TurnMiddleware for AgentModeTurn {
+    async fn on_step_start(&mut self, cx: &mut HookCx<'_>) -> Result<StepVerdict> {
+        if let Some(content) = notice_for(&self.reminders, cx) {
+            cx.queue_notice(NoticeSource::AgentMode, content);
+        }
+        Ok(StepVerdict::Proceed)
     }
 }
 
@@ -174,7 +183,7 @@ impl MiddlewareFactory for AgentModeFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config.clone())?;
 
         // Build reminders map
@@ -218,7 +227,7 @@ impl MiddlewareFactory for PlanModeCompatFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
+    ) -> anyhow::Result<Option<Arc<dyn Middleware>>> {
         // Parse the old plan_mode config format
         #[derive(Debug, Deserialize)]
         struct LegacyConfig {
@@ -258,7 +267,182 @@ impl MiddlewareFactory for PlanModeCompatFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::PendingNotice;
     use crate::middleware::factory::MIDDLEWARE_REGISTRY;
+    use crate::test_utils::HookRig;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
+
+    fn middleware() -> AgentModeMiddleware {
+        let mut reminders = HashMap::new();
+        reminders.insert(AgentMode::Plan, "plan reminder".to_string());
+        reminders.insert(AgentMode::Review, "review reminder".to_string());
+        AgentModeMiddleware::with_reminders(reminders)
+    }
+
+    /// What a request starts from: the session's mode and the mode notice
+    /// the stored history holds.
+    #[derive(Clone)]
+    struct Context {
+        mode: AgentMode,
+        stored: Option<String>,
+    }
+
+    impl Context {
+        fn last_mode_notice(&self) -> Option<&str> {
+            self.stored.as_deref()
+        }
+    }
+
+    fn context(mode: AgentMode, stored: Option<&str>) -> Context {
+        Context {
+            mode,
+            stored: stored.map(str::to_string),
+        }
+    }
+
+    /// What the middleware handed on for one request.
+    struct Stepped {
+        pending_notices: Vec<PendingNotice>,
+        last_mode_notice: Option<String>,
+    }
+
+    /// Run the middleware for one request.
+    async fn step(middleware: &AgentModeMiddleware, context: Context) -> Stepped {
+        let mut stack = HookRig::stack_of(middleware.clone());
+        let mut rig = HookRig::new();
+        rig.mode = context.mode;
+        if let Some(content) = &context.stored {
+            let mut message = AgentMessage::new("s".into(), querymt::chat::ChatRole::User);
+            message.parts.push(MessagePart::Notice {
+                source: NoticeSource::AgentMode,
+                content: content.clone(),
+            });
+            rig.set_history(vec![message]);
+        }
+        let _ = rig.step_start(&mut stack).await.unwrap();
+        Stepped {
+            last_mode_notice: rig.cx().last_mode_notice().map(str::to_string),
+            pending_notices: rig.pending,
+        }
+    }
+
+    fn queued(stepped: &Stepped) -> Vec<(NoticeSource, &str)> {
+        stepped
+            .pending_notices
+            .iter()
+            .map(|notice| (notice.source, notice.content.as_str()))
+            .collect()
+    }
+
+    /// Mimics the loop storing queued notices: the last one becomes the stored notice.
+    fn stored(stepped: &Stepped, mode: AgentMode) -> Context {
+        self::context(mode, stepped.last_mode_notice.as_deref())
+    }
+
+    #[tokio::test]
+    async fn reminder_is_stored_once_for_a_plan_mode_run() {
+        let m = middleware();
+        let mut ctx = context(AgentMode::Plan, None);
+        let mut stored_count = 0;
+        for _ in 0..5 {
+            let next = step(&m, ctx.clone()).await;
+            stored_count += next.pending_notices.len();
+            if !next.pending_notices.is_empty() {
+                assert_eq!(
+                    queued(&next),
+                    vec![(NoticeSource::AgentMode, "plan reminder")]
+                );
+            }
+            ctx = stored(&next, AgentMode::Plan);
+        }
+        assert_eq!(stored_count, 1);
+    }
+
+    #[tokio::test]
+    async fn switch_from_plan_to_review_stores_the_review_reminder_without_a_leave_notice() {
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Review, Some("plan reminder"))).await;
+        assert_eq!(
+            queued(&next),
+            vec![(NoticeSource::AgentMode, "review reminder")]
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_without_a_request_stores_nothing() {
+        // Build -> plan -> review -> build with no request in between: the
+        // middleware only runs at a request, and the session is in build mode.
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Build, None)).await;
+        assert!(next.pending_notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reminder_is_restored_after_compaction() {
+        // Compaction removed the stored reminder: no stored mode notice remains.
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Plan, None)).await;
+        assert_eq!(
+            queued(&next),
+            vec![(NoticeSource::AgentMode, "plan reminder")]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_session_stores_no_mode_notice() {
+        let m = middleware();
+        let mut ctx = context(AgentMode::Build, None);
+        for _ in 0..3 {
+            let next = step(&m, ctx.clone()).await;
+            assert!(next.pending_notices.is_empty());
+            ctx = stored(&next, AgentMode::Build);
+        }
+        assert_eq!(ctx.last_mode_notice(), None);
+    }
+
+    #[tokio::test]
+    async fn returning_to_plan_mode_stores_the_reminder_again() {
+        let m = middleware();
+        let left = step(&m, context(AgentMode::Build, Some("plan reminder"))).await;
+        let leave = queued(&left)[0].1.to_string();
+        let back = step(&m, stored(&left, AgentMode::Plan)).await;
+        assert_eq!(
+            queued(&back),
+            vec![(NoticeSource::AgentMode, "plan reminder")]
+        );
+        assert_ne!(leave, "plan reminder");
+    }
+
+    #[tokio::test]
+    async fn leaving_plan_mode_stores_a_leave_notice_after_the_earlier_reminder() {
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Build, Some("plan reminder"))).await;
+        let notices = queued(&next);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, NoticeSource::AgentMode);
+        assert_eq!(notices[0].1, LEAVE_NOTICE);
+    }
+
+    #[tokio::test]
+    async fn leaving_a_mode_whose_reminder_text_changed_stores_a_leave_notice() {
+        // The stored reminder was written under an earlier configuration.
+        let m = middleware();
+        let next = step(&m, context(AgentMode::Build, Some("old plan reminder"))).await;
+        assert_eq!(queued(&next), vec![(NoticeSource::AgentMode, LEAVE_NOTICE)]);
+    }
+
+    #[tokio::test]
+    async fn leave_notice_is_stored_once() {
+        let m = middleware();
+        let mut ctx = context(AgentMode::Build, Some("plan reminder"));
+        let mut count = 0;
+        for _ in 0..4 {
+            let next = step(&m, ctx.clone()).await;
+            count += next.pending_notices.len();
+            ctx = stored(&next, AgentMode::Build);
+        }
+        assert_eq!(count, 1);
+    }
 
     #[test]
     fn test_agent_mode_factory_registered() {

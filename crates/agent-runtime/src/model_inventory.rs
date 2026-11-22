@@ -491,6 +491,7 @@ impl ModelInventory {
     /// Returns whatever data is available, even if stale.
     #[tracing::instrument(
         name = "model_inventory.get_snapshot",
+        level = "debug",
         skip(self),
         fields(
             model_count = tracing::field::Empty,
@@ -1484,6 +1485,53 @@ mod tests {
         assert_eq!(result.catalogs.len(), peers.len());
         assert_eq!(peak.load(Ordering::Relaxed), 2);
         assert!(!result.incomplete);
+    }
+
+    /// `get_snapshot` is read on a timer by some clients, so its span is a
+    /// debug-level one: not exported at the default (info) level.
+    #[tokio::test]
+    async fn get_snapshot_span_is_exported_only_at_debug_level() {
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            attr, capture, capture_info,
+        };
+
+        let inventory = ModelInventory::new(make_test_config().await);
+        inventory
+            .inner
+            .local_snapshot
+            .store(Arc::new(vec![ModelEntry {
+                id: "local".into(),
+                label: "local".into(),
+                source: "catalog".into(),
+                provider: "test".into(),
+                model: "local".into(),
+                node_id: None,
+                node_label: None,
+                family: None,
+                quant: None,
+            }]));
+
+        let (_, info_spans) = capture_info(inventory.get_snapshot()).await;
+        assert!(
+            info_spans
+                .iter()
+                .all(|span| span.name != "model_inventory.get_snapshot"),
+            "exported at info: {:?}",
+            info_spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let ((models, _), debug_spans) = capture(inventory.get_snapshot()).await;
+        assert_eq!(models.len(), 1);
+        let span = debug_spans
+            .iter()
+            .find(|span| span.name == "model_inventory.get_snapshot")
+            .expect("exported at debug");
+        // The exporter keeps the values as recorded; compare their text.
+        let text = |key: &str| attr(span, key).map(|value| value.to_string());
+        assert_eq!(text("model_count").as_deref(), Some("1"));
+        assert_eq!(text("cache_hit").as_deref(), Some("true"));
+        assert_eq!(text("refresh_in_progress").as_deref(), Some("false"));
+        assert!(attr(span, "stale").is_some());
     }
 
     #[cfg(feature = "remote")]

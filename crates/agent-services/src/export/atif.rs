@@ -734,6 +734,8 @@ mod tests {
                     context_tokens: 100,
                     metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             },
         ];
@@ -934,6 +936,8 @@ mod tests {
                     context_tokens: 150,
                     metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             },
         ];
@@ -1014,6 +1018,8 @@ mod tests {
                         complete,
                         reasons: vec![],
                     }),
+                    prefix_change: None,
+                    idle_secs: None,
                 },
             ),
         ]

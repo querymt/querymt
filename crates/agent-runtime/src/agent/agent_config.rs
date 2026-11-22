@@ -4,7 +4,7 @@
 //! It holds all shared/immutable state that session actors need. It is NOT
 //! an actor — it has no lifecycle or message processing needs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_swap::ArcSwap;
@@ -18,7 +18,7 @@ use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
 use crate::delegation::roster::AgentRoster;
 use crate::hooks::Hooks;
-use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::middleware::{CompositeDriver, Middleware};
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
@@ -85,7 +85,7 @@ pub struct AgentConfig {
     /// `skill` tool from it (see `ToolSet`); the tool is deliberately absent
     /// from `tool_registry`.
     pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
-    pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    pub middleware_drivers: Vec<Arc<dyn Middleware>>,
     pub auth_methods: Vec<AuthMethod>,
 
     // ── MCP servers (from TOML config, applied to every session) ────────
@@ -148,7 +148,7 @@ impl AgentConfig {
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
     #[doc(hidden)]
-    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn Middleware>>) -> Self {
         for driver in &drivers {
             driver.bind_agent(&self.tool_registry, &self.event_sink);
         }
@@ -160,7 +160,7 @@ impl AgentConfig {
     pub fn create_driver(&self) -> CompositeDriver {
         use crate::middleware::{LimitsConfig, LimitsMiddleware};
 
-        let mut drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
+        let mut drivers: Vec<Arc<dyn Middleware>> = Vec::new();
 
         // Add LimitsMiddleware if configured
         if let Some(max_steps) = self.max_steps {
@@ -188,13 +188,13 @@ impl AgentConfig {
     /// Enforced before every paid attempt, best effort.
     pub fn budget_cap_usd(&self) -> Option<f64> {
         self.create_driver()
-            .get_limits()
+            .limits()
             .and_then(|limits| limits.max_cost_usd)
     }
 
     /// Returns the session limits from configured middleware.
     pub fn get_session_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
-        self.create_driver().get_limits()
+        self.create_driver().limits()
     }
 
     /// Builds delegation metadata for ACP `AgentCapabilities._meta` field.
@@ -384,67 +384,61 @@ impl AgentConfig {
         tool_config_override: Option<&crate::agent::core::ToolConfig>,
         tool_set: &crate::tools::ToolSet,
     ) -> Vec<querymt::chat::Tool> {
-        let mut tools = Vec::new();
         let config = tool_config_override.unwrap_or(&self.tool_config);
+        let with_builtin = matches!(
+            config.policy,
+            ToolPolicy::BuiltInOnly | ToolPolicy::BuiltInAndProvider
+        );
+        let with_provider = matches!(
+            config.policy,
+            ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider
+        );
 
-        match config.policy {
-            ToolPolicy::BuiltInOnly => {
-                tools.extend(tool_set.definitions());
-            }
-            ToolPolicy::ProviderOnly => {
-                if let Some(provider_tools) = provider.tools() {
-                    tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
-                }
-            }
-            ToolPolicy::BuiltInAndProvider => {
-                tools.extend(tool_set.definitions());
-                if let Some(provider_tools) = provider.tools() {
-                    tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
-                }
+        // One entry per tool name, ordered by name (bytes). The first source to
+        // claim a name wins, in the order a call is resolved at dispatch
+        // (built-in, MCP, provider), so the definition offered to the model is
+        // the tool that runs. A claimed-but-disallowed tool stays `None`: it
+        // still shadows the later sources, which dispatch would never reach.
+        let mut offered: BTreeMap<String, Option<querymt::chat::Tool>> = BTreeMap::new();
+        let mut offer = |tool: querymt::chat::Tool, allowed: bool| {
+            offered
+                .entry(tool.function.name.clone())
+                .or_insert_with(|| allowed.then_some(tool));
+        };
+
+        // Built-in tools are matched by bare name.
+        if with_builtin {
+            for tool in tool_set.definitions() {
+                let allowed = config.allows(ToolRef::builtin(&tool.function.name));
+                offer(tool, allowed);
             }
         }
 
-        // Collect MCP tools (always when a runtime is present, regardless of
-        // policy, because the policy was already chosen with MCP in mind in
-        // builder_from_config).
-        //
-        // Load a single consistent snapshot — tools and defs are guaranteed to
-        // be from the same generation (no multi-lock tearing).
-        let mcp_snapshot =
-            if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
-                (runtime, config.policy)
-            {
-                Some(runtime.mcp_tool_state.load())
-            } else {
-                None
-            };
-
-        let mcp_tool_defs: Vec<querymt::chat::Tool> = mcp_snapshot
-            .as_ref()
-            .map(|s| s.tool_defs.clone())
-            .unwrap_or_default();
-
-        // Built-in / provider tools are matched by bare name.
-        let mut filtered: Vec<querymt::chat::Tool> = tools
-            .into_iter()
-            .filter(|tool| config.allows(ToolRef::builtin(&tool.function.name)))
-            .collect();
-
-        // MCP tools are matched with their serving server.
-        if let Some(ref snap) = mcp_snapshot {
-            for tool_def in mcp_tool_defs {
-                let name = &tool_def.function.name;
-                let tool = match snap.tools.get(name) {
+        // MCP tools (when a runtime is present and the policy includes them;
+        // the policy was already chosen with MCP in mind in
+        // builder_from_config) are matched with their serving server. One
+        // snapshot is loaded, so tools and defs are from the same generation.
+        if let (Some(runtime), true) = (runtime, with_provider) {
+            let snapshot = runtime.mcp_tool_state.load();
+            for tool in &snapshot.tool_defs {
+                let name = &tool.function.name;
+                let target = match snapshot.tools.get(name) {
                     Some(adapter) => ToolRef::mcp(adapter.server_name(), name),
                     None => ToolRef::builtin(name),
                 };
-                if config.allows(tool) {
-                    filtered.push(tool_def);
-                }
+                offer(tool.clone(), config.allows(target));
             }
         }
 
-        filtered
+        // Provider tools are matched by bare name.
+        if with_provider && let Some(provider_tools) = provider.tools() {
+            for tool in provider_tools.iter().cloned::<querymt::chat::Tool>() {
+                let allowed = config.allows(ToolRef::builtin(&tool.function.name));
+                offer(tool, allowed);
+            }
+        }
+
+        offered.into_values().flatten().collect()
     }
 
     pub fn execution_config_snapshot(&self) -> SessionExecutionConfig {
@@ -482,6 +476,149 @@ mod tests {
         let config =
             Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm).build());
         (config, temp_dir)
+    }
+
+    fn chat_tool(name: &str, description: &str) -> querymt::chat::Tool {
+        querymt::chat::Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    /// The tool list `config` offers for one request, with `provider_tools`
+    /// declared by the provider.
+    fn offered_tools(
+        config: &AgentConfig,
+        runtime: &crate::agent::core::SessionRuntime,
+        provider_tools: Vec<querymt::chat::Tool>,
+    ) -> Vec<querymt::chat::Tool> {
+        let provider: Arc<dyn querymt::LLMProvider> =
+            Arc::new(crate::test_utils::SharedLlmProvider::new(
+                crate::test_utils::MockLlmProvider::new(),
+                provider_tools,
+            ));
+        let tool_set = crate::tools::ToolSet::new(
+            Arc::clone(&config.tool_registry),
+            crate::tools::ToolRegistry::new(),
+        );
+        config.collect_tools(provider, Some(runtime), None, &tool_set)
+    }
+
+    fn names_of(tools: &[querymt::chat::Tool]) -> Vec<&str> {
+        tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect()
+    }
+
+    fn description_of<'a>(tools: &'a [querymt::chat::Tool], name: &str) -> &'a str {
+        let mut matching = tools.iter().filter(|tool| tool.function.name == name);
+        let tool = matching.next().expect("tool is offered");
+        assert!(matching.next().is_none(), "`{name}` is offered once");
+        &tool.function.description
+    }
+
+    /// "MCP server refresh keeps the order": a real `replace_server` refresh
+    /// that reports the same tools in another order (it re-appends that
+    /// server's tools) leaves the offered list, byte for byte, unchanged.
+    #[tokio::test]
+    async fn request_tool_list_is_ordered_by_name_and_survives_an_mcp_refresh() {
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness};
+
+        let (config, _td) = make_config().await;
+        let harness = McpHarness::start(HarnessOptions::default()).await;
+        let state = crate::agent::core::McpToolState::empty();
+        let runtime = crate::agent::core::SessionRuntime::new(None, HashMap::new(), state.clone());
+        let provider_tools = || {
+            vec![
+                chat_tool("zeta_provider", ""),
+                chat_tool("alpha_provider", ""),
+            ]
+        };
+        let mut adapters: Vec<_> = harness.adapters.values().cloned().collect();
+        let server_name = adapters[0].server_name().to_string();
+
+        state.replace_server(&server_name, Some(adapters.clone()), None);
+        let before = offered_tools(&config, &runtime, provider_tools());
+        let before_names = names_of(&before);
+        let mut sorted = before_names.clone();
+        sorted.sort_unstable();
+        assert_eq!(before_names, sorted, "ordered by name");
+        assert!(before_names.contains(&"echo"), "MCP tools are offered");
+        assert!(
+            before_names.contains(&"shell"),
+            "built-in tools are offered"
+        );
+
+        adapters.reverse();
+        state.replace_server(&server_name, Some(adapters), None);
+        let after = offered_tools(&config, &runtime, provider_tools());
+
+        assert_eq!(
+            serde_json::to_vec(&after).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+    }
+
+    /// A name is offered once, and the definition offered is the one a call
+    /// resolves to at dispatch: built-in, then MCP, then provider.
+    #[tokio::test]
+    async fn request_tool_list_offers_each_name_once_in_dispatch_precedence() {
+        let (config, _td) = make_config().await;
+        let builtin = config
+            .tool_registry
+            .definition("shell")
+            .expect("shell is built in")
+            .function
+            .description;
+        let state = crate::agent::core::McpToolState::new(
+            HashMap::new(),
+            vec![
+                chat_tool("shell", "mcp shell"),
+                chat_tool("clash", "mcp clash"),
+            ],
+        );
+        let runtime = crate::agent::core::SessionRuntime::new(None, HashMap::new(), state);
+
+        let tools = offered_tools(
+            &config,
+            &runtime,
+            vec![
+                chat_tool("shell", "provider shell"),
+                chat_tool("clash", "provider clash"),
+                chat_tool("only_provider", "provider"),
+            ],
+        );
+
+        assert_eq!(description_of(&tools, "shell"), builtin);
+        assert_eq!(description_of(&tools, "clash"), "mcp clash");
+        assert_eq!(description_of(&tools, "only_provider"), "provider");
+    }
+
+    /// A denied tool is not replaced by a lower-precedence tool of the same
+    /// name: dispatch would never reach it.
+    #[tokio::test]
+    async fn denied_tool_does_not_let_a_same_named_provider_tool_through() {
+        let (registry, _td) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock-model");
+        let config = AgentConfigBuilder::new(Arc::new(registry), storage, llm)
+            .with_denied_tools(["shell".parse().unwrap()])
+            .build();
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+
+        let tools = offered_tools(&config, &runtime, vec![chat_tool("shell", "provider")]);
+
+        assert!(!names_of(&tools).contains(&"shell"));
     }
 
     #[tokio::test]
