@@ -350,3 +350,91 @@ async fn index_fails_the_lookup() {
         "a stopped owner fails immediately, not at the deadline"
     );
 }
+
+#[tokio::test]
+async fn busy_index_costs_one_deadline_per_call() {
+    // More files than one directory-search batch, so a per-batch deadline would show.
+    let fx = Fixture::new();
+    for i in 0..300 {
+        fx.write(&format!("gen_{i:03}.rs"), "pub fn unrelated() {}\n");
+    }
+    let context = fx
+        .plain()
+        .with_workspace_index(Some(CodeCacheClient::unresponsive(fx.root())));
+    let args = json!({
+        "paths": ["."],
+        "symbols": ["greet"],
+        "root": fx.root(),
+        "max_results": 1000
+    });
+
+    let started = Instant::now();
+    let output = text(
+        FindSymbolReferencesTool::new()
+            .call(args.clone(), &context)
+            .await
+            .expect("find_symbol_references"),
+    );
+    let elapsed = started.elapsed();
+    let direct = text(
+        FindSymbolReferencesTool::new()
+            .call(args, &fx.plain())
+            .await
+            .expect("find_symbol_references"),
+    );
+
+    assert_eq!(output, direct);
+    assert!(
+        elapsed < CODE_INDEX_LOOKUP_DEADLINE * 2,
+        "the index is skipped after the first timeout, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn reference_search_limit_applies_across_paths() {
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.root().join("sub")).expect("sub");
+    fx.write(
+        "sub/more.rs",
+        "pub fn greet_again() {}\npub fn call() { greet_again(); }\n",
+    );
+    let call = |max_results: u64| {
+        let context = fx.plain();
+        let root = fx.root().to_path_buf();
+        async move {
+            text(
+                FindSymbolReferencesTool::new()
+                    .call(
+                        json!({
+                            "paths": ["lib.rs", "sub"],
+                            "symbols": ["greet"],
+                            "root": root,
+                            "max_results": max_results
+                        }),
+                        &context,
+                    )
+                    .await
+                    .expect("find_symbol_references"),
+            )
+        }
+    };
+
+    let all = call(100).await;
+    assert_eq!(
+        all.lines().filter(|l| l.starts_with("  ")).count(),
+        3,
+        "{all}"
+    );
+    assert!(!all.contains("Results capped"));
+
+    // `lib.rs` has one `greet` match, half of the limit; the directory after it must still
+    // be searched, and the third match is reported as capped.
+    let capped = call(2).await;
+    let match_lines = capped.lines().filter(|l| l.starts_with("  ")).count();
+    assert_eq!(match_lines, 2, "{capped}");
+    assert!(
+        capped.contains("sub/more.rs"),
+        "directory searched: {capped}"
+    );
+    assert!(capped.contains("Results capped"), "{capped}");
+}

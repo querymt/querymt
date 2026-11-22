@@ -43,7 +43,10 @@
   `index`, `get_symbol`, `get_function`, `replace_symbol` and
   `find_symbol_references` reuse results for unchanged files with identical
   output. A locked or unusable cache directory falls back to memory with a
-  warning. Deleting the directory is safe.
+  warning; only damaged contents are deleted. Caches of workspaces not opened
+  for 30 days (such as removed worktrees) are deleted, the cache directory is
+  private to the user on Unix, and a change to the extractors or parser
+  grammars discards old results. Deleting the directory is safe.
 
 ### Behavior changes
 
@@ -293,9 +296,12 @@
   `FunctionIndex::from_entries` / `set_file_entries`,
   `outline_index::{index_symbols, check_file_size}` and the `code_cache`
   types. In `querymt-agent-services`, `ToolContext::workspace_index()` (default
-  `None`) and `AgentToolContext::with_workspace_index` are added.
+  `None`), `AgentToolContext::with_workspace_index` and the builtin-tool
+  helper `SymbolResolver` are added.
   `find_symbol_references` now lists files in walk order instead of an
-  arbitrary order.
+  arbitrary order, applies `max_results` to the total across all `paths`
+  (a directory after an earlier path is no longer skipped), and shows the
+  "Results capped" note when results were capped (it was never shown).
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /

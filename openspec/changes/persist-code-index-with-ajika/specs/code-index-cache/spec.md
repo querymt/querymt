@@ -96,6 +96,12 @@ The tool call SHALL NOT fail because of the index.
 - **WHEN** `get_function` is called on a file outside the index's workspace root
 - **THEN** the call succeeds with the directly parsed result and the index statistics are unchanged
 
+#### Scenario: A busy index costs one deadline per call
+
+- **GIVEN** a workspace index that does not reply to lookups
+- **WHEN** `find_symbol_references` searches a directory with more files than one lookup batch
+- **THEN** the call returns the directly parsed result after waiting for the index at most once
+
 #### Scenario: Index does not answer in time
 
 - **GIVEN** a workspace index that does not reply to lookups
@@ -107,6 +113,16 @@ The tool call SHALL NOT fail because of the index.
 - **GIVEN** a workspace index whose cache owner has stopped
 - **WHEN** `find_symbol_references` is called
 - **THEN** the call returns the directly parsed result without an error
+
+### Requirement: Paths that cannot be keyed do not disable the cache
+
+A source file whose path cannot be represented as a cache key (a non-UTF-8 path component) SHALL be indexed directly, and SHALL NOT prevent other files from being indexed through the cache.
+
+#### Scenario: Non-UTF-8 file name
+
+- **GIVEN** a workspace with valid source files and one source file whose name is not valid UTF-8
+- **WHEN** the workspace index is built, shut down and started again with no file changed
+- **THEN** the odd file's functions are indexed, and the second start reports zero parsed files and one reused result per other file
 
 ### Requirement: Unparseable files do not fail indexing
 
@@ -143,9 +159,20 @@ If a workspace's cache directory is locked by another process, or cannot be crea
 - **WHEN** a workspace index starts for that root
 - **THEN** the index starts, parses every file, answers correctly, and a later restart with unchanged files reports zero parsed files
 
+#### Scenario: Recreated index in the same process keeps the disk cache
+
+- **GIVEN** a workspace index whose cache client is still held (for example by a session) after the index manager dropped the index
+- **WHEN** a new workspace index starts for the same root in the same process
+- **THEN** the new index uses the same on-disk cache rather than falling back to memory, and parses no file whose result is stored
+
+#### Scenario: Transient open failure keeps the cache
+
+- **WHEN** a cache directory cannot be opened for a reason other than damaged contents (for example an I/O or permission error)
+- **THEN** the index keeps its results in memory for that process and the directory is not deleted
+
 ### Requirement: Format or version changes discard the cache
 
-Stored results SHALL be reused only by the same `querymt-agent-index` package version and cache schema version that wrote them. Otherwise, the whole cache for that workspace SHALL be discarded on open and rebuilt, never migrated.
+Stored results SHALL be reused only by the same `querymt-agent-index` package version, cache schema version and extractor build (extractor sources and parser dependency versions) that wrote them. Otherwise, the whole cache for that workspace SHALL be discarded on open and rebuilt, never migrated.
 
 #### Scenario: Schema version change rebuilds the cache
 
@@ -156,6 +183,12 @@ Stored results SHALL be reused only by the same `querymt-agent-index` package ve
 ### Requirement: Cache size is bounded
 
 By default, a workspace cache SHALL hold at most 256 MiB of stored results and at most 200,000 entries. Results not used for 30 days SHALL be evicted. Eviction SHALL only cause recomputation, never wrong or missing answers.
+
+#### Scenario: Caches of roots that are not opened again are removed
+
+- **GIVEN** a cache directory for a root (for example a removed worktree) that no process holds and that was last used longer ago than the idle limit
+- **WHEN** a workspace index opens a cache under the same base directory
+- **THEN** that stale directory is removed, while directories that are held by another process or were used within the idle limit are kept
 
 #### Scenario: Idle results are evicted and recomputed
 

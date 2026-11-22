@@ -126,3 +126,15 @@ Scenario references use `code-index-cache / <Scenario name>`. Test names are the
   - `cargo check -p querymt-agent-knowledge`: ok. `QMT_UI_DIST=<minimal fixture outside target/> cargo t-agent --no-run`: built. `PYO3_PYTHON=/opt/homebrew/bin/python3.14 cargo check -p querymt-agent-py`: ok. `cargo check -p querymt-mobile-ffi`: ok. The zbus/systemd features only take effect on Linux, so they remain unverified on macOS.
 - [x] 6.3 Run `cargo hakari verify` and `openspec validate persist-code-index-with-ajika --strict`. Both must pass.
   - `cargo hakari verify`: "querymt-workspace-hack works correctly". `openspec validate persist-code-index-with-ajika --strict`: valid. Re-run after the last code change, together with `cargo t-index` (143 passed, 1 skipped), `cargo cl-index` (clean) and `cargo fmt --check` for index, services, runtime and core (clean).
+
+## 7. Review follow-ups
+
+- [x] 7.1 Share on-disk cache owners per directory through a process-wide registry, and let a new owner wait for the previous one to release the directory; make the workspace actor's change forwarder hold a `WeakActorRef` (design D1). Tests: `recreated_index_shares_the_live_owner`, `dropping_every_client_releases_the_directory_for_the_next_owner`; `cache_directory_held_by_another_owner` now holds the directory with a separate database, as another process would.
+- [x] 7.2 Sweep stale sibling cache directories (unlocked, unused for `max_idle`), touch the lock file on open and close, create the cache base with mode `0700` (design D9). Tests: `stale_directories_are_swept` (also pins Ajika's `owner.lock` name), `cache_base_is_private`.
+- [x] 7.3 One `SymbolResolver` per tool call that stops asking the index after the first timeout or error; `find_symbol_references` parses unanswered files lazily, applies `max_results` to the total across paths, and reports capped results (design D6). Tests: `busy_index_costs_one_deadline_per_call`, `reference_search_limit_applies_across_paths`.
+- [x] 7.4 Index files whose path cannot be keyed directly instead of failing the whole cache operation (design D2). Test: `non_utf8_file_name_does_not_disable_the_cache` (Linux only; macOS file systems reject such names).
+- [x] 7.5 Fold an extractor/parser fingerprint from `build.rs` into the epoch (design D5).
+- [x] 7.6 Remove the equal-text comparison that could never match; one `text: Option<String>` input so each file is read once; count reuse only for successful operations; keep `SymbolError::Io` distinct; lock-free statistics; survive panics in an operation (design D1, D2, D6, D7). Test: `parser_panic_does_not_stop_the_owner`.
+- [x] 7.7 Delete the cache directory only for `InvalidCache`; other open errors fall back to memory (design D5).
+- [x] 7.8 Reuse the entries (with TypeScript fingerprints) computed in an operation instead of recomputing fingerprints (design D8).
+- [x] 7.9 Drop `IndexError::CodeCache` (cache errors never surface); `CodeCacheError::Operation` keeps the Ajika error as its source; add `CodeCacheError::ParsePool`; the test-only receiver no longer changes `CodeCacheClient`'s shape.

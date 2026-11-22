@@ -2,7 +2,6 @@
 
 use super::fingerprint::{rust_structural_fingerprint, structural_simhash_from_tree};
 use super::types::{FunctionIndexConfig, IndexedFunctionEntry};
-use crate::error::IndexError;
 use ignore::WalkBuilder;
 use similarity_core::{
     AstFingerprint, extract_functions, generic_tree_sitter_parser::GenericTreeSitterParser,
@@ -27,8 +26,8 @@ static PARSE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 ///
 /// # Errors
 ///
-/// Returns [`IndexError::ThreadPool`] if the pool threads cannot be spawned.
-pub(crate) fn parse_pool() -> Result<&'static rayon::ThreadPool, IndexError> {
+/// Returns the build error if the pool threads cannot be spawned.
+pub(crate) fn parse_pool() -> Result<&'static rayon::ThreadPool, rayon::ThreadPoolBuildError> {
     if let Some(pool) = PARSE_POOL.get() {
         return Ok(pool);
     }

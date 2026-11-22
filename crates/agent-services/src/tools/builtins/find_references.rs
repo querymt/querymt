@@ -14,9 +14,7 @@ use crate::tools::{
 };
 use querymt_agent_index::symbol_index::SymbolIndex;
 
-use super::helpers::{
-    parse_paths, resolve_root, resolve_symbols, resolve_symbols_batch, resolve_target,
-};
+use super::helpers::{SymbolResolver, parse_paths, resolve_root, resolve_target};
 
 /// Files read and resolved per workspace-index lookup during a directory search.
 const DIR_SEARCH_BATCH: usize = 256;
@@ -126,32 +124,40 @@ impl Tool for FindSymbolReferencesTool {
             .unwrap_or(200) as usize;
 
         let mut matches: Vec<RefMatch> = Vec::new();
+        // Collect one match beyond `max_results`, which tells whether the results were capped.
+        // The limit applies to the total across all search paths.
+        let limit = max_results.saturating_add(1);
+        let mut resolver = SymbolResolver::new(context);
+        // Every path is validated, even ones the search stops before reaching.
+        let targets = search_paths
+            .iter()
+            .map(|search_path| resolve_target("paths", search_path, &root))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        for search_path in &search_paths {
-            let resolved = resolve_target("paths", search_path, &root)?;
+        for resolved in targets {
+            if matches.len() >= limit {
+                break;
+            }
             if resolved.is_file() {
                 self.search_file(
-                    context,
+                    &mut resolver,
                     &resolved,
                     &symbols,
                     find_type,
-                    max_results - matches.len(),
+                    limit,
                     &mut matches,
                 )
                 .await;
             } else if resolved.is_dir() {
                 self.search_dir(
-                    context,
+                    &mut resolver,
                     &resolved,
                     &symbols,
                     find_type,
-                    max_results - matches.len(),
+                    limit,
                     &mut matches,
                 )
                 .await;
-            }
-            if matches.len() >= max_results {
-                break;
             }
         }
 
@@ -164,16 +170,17 @@ impl Tool for FindSymbolReferencesTool {
 }
 
 impl FindSymbolReferencesTool {
+    /// Search one file, adding matches until `matches` holds `limit` entries in total.
     async fn search_file(
         &self,
-        context: &dyn ToolContext,
+        resolver: &mut SymbolResolver,
         path: &Path,
         symbols: &[String],
         find_type: &str,
-        remaining: usize,
+        limit: usize,
         matches: &mut Vec<RefMatch>,
     ) {
-        if remaining == 0 {
+        if matches.len() >= limit {
             return;
         }
         let content = match tokio::fs::read_to_string(path).await {
@@ -181,7 +188,7 @@ impl FindSymbolReferencesTool {
             Err(_) => return,
         };
 
-        let symbol_index = match resolve_symbols(context, path, &content).await {
+        let symbol_index = match resolver.resolve(path, &content).await {
             Ok(idx) => idx,
             Err(_) => return,
         };
@@ -192,20 +199,23 @@ impl FindSymbolReferencesTool {
             &symbol_index,
             symbols,
             find_type,
-            remaining,
+            limit,
             matches,
         );
     }
 
-    /// Read up to [`DIR_SEARCH_BATCH`] files, resolve all their symbols with one index
-    /// lookup, then scan them in the order given, stopping once `max_results` is reached.
+    /// Read up to [`DIR_SEARCH_BATCH`] files, ask the workspace index about all of them with
+    /// one lookup, then scan them in the order given until `matches` holds `limit` entries.
+    ///
+    /// Files the index did not answer are parsed directly, and only when they are scanned, so
+    /// a search that fills up early does not parse the rest of the batch.
     async fn search_batch(
         &self,
-        context: &dyn ToolContext,
+        resolver: &mut SymbolResolver,
         paths: &[PathBuf],
         symbols: &[String],
         find_type: &str,
-        max_results: usize,
+        limit: usize,
         matches: &mut Vec<RefMatch>,
     ) {
         let mut readable: Vec<(&PathBuf, String)> = Vec::with_capacity(paths.len());
@@ -218,12 +228,14 @@ impl FindSymbolReferencesTool {
             .iter()
             .map(|(path, content)| (path.as_path(), content.as_str()))
             .collect();
-        let resolved = resolve_symbols_batch(context, &files).await;
+        let cached = resolver.from_index(&files).await;
 
-        for ((path, content), symbol_index) in readable.iter().zip(resolved) {
-            if matches.len() >= max_results {
+        for ((path, content), cached) in readable.iter().zip(cached) {
+            if matches.len() >= limit {
                 break;
             }
+            let symbol_index =
+                cached.unwrap_or_else(|| SymbolIndex::from_source_for_path(path, content));
             let Ok(symbol_index) = symbol_index else {
                 continue;
             };
@@ -233,19 +245,20 @@ impl FindSymbolReferencesTool {
                 &symbol_index,
                 symbols,
                 find_type,
-                max_results - matches.len(),
+                limit,
                 matches,
             );
         }
     }
 
+    /// Search a directory in walk order until `matches` holds `limit` entries in total.
     async fn search_dir(
         &self,
-        context: &dyn ToolContext,
+        resolver: &mut SymbolResolver,
         dir: &Path,
         symbols: &[String],
         find_type: &str,
-        max_results: usize,
+        limit: usize,
         matches: &mut Vec<RefMatch>,
     ) {
         let types = TypesBuilder::new()
@@ -272,25 +285,26 @@ impl FindSymbolReferencesTool {
             .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
             .map(|entry| entry.into_path());
 
-        while matches.len() < max_results {
+        while matches.len() < limit {
             let batch: Vec<PathBuf> = files.by_ref().take(DIR_SEARCH_BATCH).collect();
             if batch.is_empty() {
                 break;
             }
-            self.search_batch(context, &batch, symbols, find_type, max_results, matches)
+            self.search_batch(resolver, &batch, symbols, find_type, limit, matches)
                 .await;
         }
     }
 }
 
-/// Collect definition and reference matches of `symbols` in one file's text.
+/// Collect definition and reference matches of `symbols` in one file's text, until
+/// `matches` holds `limit` entries in total.
 fn scan_file(
     path: &Path,
     content: &str,
     symbol_index: &SymbolIndex,
     symbols: &[String],
     find_type: &str,
-    remaining: usize,
+    limit: usize,
     matches: &mut Vec<RefMatch>,
 ) {
     {
@@ -304,7 +318,7 @@ fn scan_file(
             // Definitions via SymbolIndex
             if find_type == "definition" || find_type == "both" {
                 for def in &defs {
-                    if matches.len() >= remaining {
+                    if matches.len() >= limit {
                         return;
                     }
                     let line_idx = def.start_line.saturating_sub(1);
@@ -322,7 +336,7 @@ fn scan_file(
             // References via text matching
             if find_type == "reference" || find_type == "both" {
                 for (i, line) in content.lines().enumerate() {
-                    if matches.len() >= remaining {
+                    if matches.len() >= limit {
                         return;
                     }
                     if line.contains(symbol_name.as_str()) {
@@ -365,10 +379,15 @@ fn parse_symbols(args: &Value) -> Result<Vec<String>, ToolError> {
 fn format_matches(matches: &[RefMatch], root: &Path, truncated: bool) -> String {
     // Group by file in first-seen (walk) order so the output is deterministic.
     let mut by_file: Vec<(&PathBuf, Vec<&RefMatch>)> = Vec::new();
+    let mut positions: std::collections::HashMap<&PathBuf, usize> =
+        std::collections::HashMap::new();
     for m in matches {
-        match by_file.iter_mut().find(|(path, _)| **path == m.path) {
-            Some((_, group)) => group.push(m),
-            None => by_file.push((&m.path, vec![m])),
+        match positions.get(&m.path) {
+            Some(&position) => by_file[position].1.push(m),
+            None => {
+                positions.insert(&m.path, by_file.len());
+                by_file.push((&m.path, vec![m]));
+            }
         }
     }
 

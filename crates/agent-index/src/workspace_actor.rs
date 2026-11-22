@@ -9,11 +9,12 @@ use super::error::IndexError;
 use super::file_index::{FileChangeSet, FileIndex, FileIndexConfig, FileIndexWatcher};
 use super::function_index::{
     FunctionIndex, FunctionIndexConfig, IndexedFunctionEntry, SimilarFunctionMatch,
-    collect_source_files, get_language_category,
+    collect_source_files, get_language_category, index_file_entries,
 };
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
 use kameo::message::{Context, Message};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::instrument;
@@ -139,12 +140,18 @@ impl Actor for WorkspaceIndexActor {
     /// `tokio::spawn` background task in the old `WorkspaceIndex`.
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let mut changes_rx = args.file_watcher.subscribe_changes();
-        let actor_ref_clone = actor_ref.clone();
+        // A weak reference: the forwarder must not keep the actor (and with it the file
+        // watcher and the code cache owner) alive once every handle has been dropped.
+        let weak_ref = actor_ref.downgrade();
         tokio::spawn(async move {
             while let Ok(change_set) = changes_rx.recv().await {
-                if change_set.has_source_changes()
-                    && let Err(e) = actor_ref_clone.tell(ApplyChanges { change_set }).await
-                {
+                if !change_set.has_source_changes() {
+                    continue;
+                }
+                let Some(actor_ref) = weak_ref.upgrade() else {
+                    break;
+                };
+                if let Err(e) = actor_ref.tell(ApplyChanges { change_set }).await {
                     log::debug!("WorkspaceIndexActor: failed to send ApplyChanges: {:?}", e);
                 }
             }
@@ -171,19 +178,39 @@ async fn build_function_index(
 ) -> Result<FunctionIndex, IndexError> {
     let walk_root = root.to_path_buf();
     let paths = tokio::task::spawn_blocking(move || collect_source_files(&walk_root)).await?;
-    match code_cache.index_all(&paths).await {
-        Ok(entries) => Ok(FunctionIndex::from_entries(
-            root,
-            config.clone(),
-            entries.into_iter().collect(),
-        )),
+    // A path the cache cannot key (a non-UTF-8 component) is indexed directly, so one such
+    // file never disables the cache for the whole workspace.
+    let (cached, direct): (Vec<PathBuf>, Vec<PathBuf>) = paths
+        .into_iter()
+        .partition(|path| code_cache.key_for(path).is_some());
+    let mut entries: HashMap<PathBuf, Vec<IndexedFunctionEntry>> = match code_cache
+        .index_all(&cached)
+        .await
+    {
+        Ok(entries) => entries.into_iter().collect(),
         Err(error) => {
             log::warn!(
                 "WorkspaceIndexActor: code cache failed for {root:?} ({error}); building directly"
             );
-            FunctionIndex::build(root, config.clone()).await
+            return FunctionIndex::build(root, config.clone()).await;
         }
+    };
+    if !direct.is_empty() {
+        let direct_config = config.clone();
+        let direct_entries = tokio::task::spawn_blocking(move || {
+            direct
+                .into_iter()
+                .filter_map(|path| {
+                    let source = std::fs::read_to_string(&path).ok()?;
+                    let file_entries = index_file_entries(&path, &source, &direct_config);
+                    Some((path, file_entries))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await?;
+        entries.extend(direct_entries);
     }
+    Ok(FunctionIndex::from_entries(root, config.clone(), entries))
 }
 
 impl WorkspaceIndexActor {
@@ -235,6 +262,20 @@ impl WorkspaceIndexActor {
         for (path, _) in &unsupported {
             self.function_index.remove_file(path);
         }
+        // Paths the cache cannot key (outside the root or not UTF-8) are indexed directly.
+        let (changed, direct): (Vec<_>, Vec<_>) = changed
+            .into_iter()
+            .partition(|(path, _)| self.code_cache.key_for(path).is_some());
+        let (removed, removed_direct): (Vec<_>, Vec<_>) = removed
+            .into_iter()
+            .partition(|path| self.code_cache.key_for(path).is_some());
+        for path in &removed_direct {
+            self.function_index.remove_file(path);
+        }
+        for (path, source) in &direct {
+            let entries = index_file_entries(path, source, &self.function_config);
+            self.function_index.set_file_entries(path, entries);
+        }
         if changed.is_empty() && removed.is_empty() {
             return;
         }
@@ -256,7 +297,8 @@ impl WorkspaceIndexActor {
                     self.function_index.remove_file(path);
                 }
                 for (path, source) in &changed {
-                    self.function_index.update_file(path, source);
+                    let entries = index_file_entries(path, source, &self.function_config);
+                    self.function_index.set_file_entries(path, entries);
                 }
             }
         }
@@ -649,5 +691,33 @@ mod tests {
         assert!(found.iter().all(|(path, _)| path != &a));
         assert_eq!(found.len(), 2, "the other files still match");
         assert_eq!(stats(&handle).await.indexed_file_count, 2);
+    }
+
+    /// A file name that is not UTF-8 cannot be a cache key; it is indexed directly while every
+    /// other file still goes through the cache. (macOS file systems reject such names.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_file_name_does_not_disable_the_cache() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let fx = Fixture::new(&three_files());
+        let odd = fx.root.join(OsStr::from_bytes(b"odd\xff.rs"));
+        std::fs::write(&odd, function_source("odd")).expect("write odd file");
+
+        let first = fx.open().await;
+        assert_eq!(stats(&first).await.parsed_files, 3, "cached files only");
+        assert!(
+            duplicates(&first, &fx.root)
+                .await
+                .contains(&(odd.clone(), "odd".to_owned()))
+        );
+        close(&first).await;
+
+        let second = fx.open().await;
+        let started = stats(&second).await;
+        assert_eq!(started.parsed_files, 0);
+        assert_eq!(started.reused_files, 3);
+        assert_eq!(started.indexed_file_count, 4);
     }
 }

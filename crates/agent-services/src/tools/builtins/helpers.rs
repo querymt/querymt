@@ -12,76 +12,97 @@ pub const CODE_INDEX_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Resolve the symbols of one file from the text the tool read.
 ///
-/// Equivalent to [`resolve_symbols_batch`] with a single file.
+/// For tools that resolve several files in one call, use one [`SymbolResolver`] instead, so
+/// an index that times out is only waited for once.
 pub async fn resolve_symbols(
     context: &dyn ToolContext,
     path: &Path,
     text: &str,
 ) -> Result<SymbolIndex, SymbolError> {
-    let files = [(path, text)];
-    resolve_symbols_batch(context, &files)
-        .await
-        .pop()
-        .unwrap_or_else(|| SymbolIndex::from_source_for_path(path, text))
+    SymbolResolver::new(context).resolve(path, text).await
 }
 
-/// Resolve the symbols of several files, in order, from the texts the tool read.
+/// Resolves symbols for one tool call, through the session's workspace index when it is
+/// ready.
 ///
-/// When the session's workspace index is ready, files inside its root are answered by one
-/// cache lookup (one parse per changed file, none for unchanged ones). The result always
-/// equals `SymbolIndex::from_source_for_path` on the same text: with no index, for files
-/// outside the root, on timeout ([`CODE_INDEX_LOOKUP_DEADLINE`]) or on any cache error the
-/// file is parsed directly, so the index can never fail a tool call.
-pub async fn resolve_symbols_batch(
-    context: &dyn ToolContext,
-    files: &[(&Path, &str)],
-) -> Vec<Result<SymbolIndex, SymbolError>> {
-    let mut results: Vec<Option<Result<SymbolIndex, SymbolError>>> =
-        files.iter().map(|_| None).collect();
+/// Files inside the index's root are answered by cache lookups (one parse per changed file,
+/// none for unchanged ones). Every result equals `SymbolIndex::from_source_for_path` on the
+/// same text: with no index, for files outside the root, on timeout
+/// ([`CODE_INDEX_LOOKUP_DEADLINE`]) or on any cache error the file is parsed directly, so the
+/// index can never fail a tool call.
+///
+/// After the first timeout or error the resolver stops asking the index for the rest of the
+/// call, so a busy index (for example during a rebuild) costs one deadline per call, not one
+/// per file or batch.
+pub struct SymbolResolver {
+    index: Option<querymt_agent_index::CodeCacheClient>,
+}
 
-    if let Some(client) = context.workspace_index() {
+impl SymbolResolver {
+    pub fn new(context: &dyn ToolContext) -> Self {
+        Self {
+            index: context.workspace_index(),
+        }
+    }
+
+    /// Resolve one file from the text the tool read.
+    pub async fn resolve(&mut self, path: &Path, text: &str) -> Result<SymbolIndex, SymbolError> {
+        match self.from_index(&[(path, text)]).await.pop().flatten() {
+            Some(answer) => answer,
+            None => SymbolIndex::from_source_for_path(path, text),
+        }
+    }
+
+    /// Ask the index about several files with one lookup. Entries are `None` where the index
+    /// did not answer; the caller parses those directly with
+    /// `SymbolIndex::from_source_for_path`, which lets it parse only the files it needs.
+    pub async fn from_index(
+        &mut self,
+        files: &[(&Path, &str)],
+    ) -> Vec<Option<Result<SymbolIndex, SymbolError>>> {
+        let mut results: Vec<Option<Result<SymbolIndex, SymbolError>>> =
+            files.iter().map(|_| None).collect();
+        let Some(client) = self.index.as_ref() else {
+            return results;
+        };
         let indexed: Vec<usize> = files
             .iter()
             .enumerate()
             .filter(|(_, (path, _))| client.key_for(path).is_some())
             .map(|(position, _)| position)
             .collect();
-        if !indexed.is_empty() {
-            let request: Vec<(PathBuf, Arc<str>)> = indexed
-                .iter()
-                .map(|&position| {
-                    let (path, text) = files[position];
-                    (path.to_path_buf(), Arc::from(text))
-                })
-                .collect();
-            match tokio::time::timeout(CODE_INDEX_LOOKUP_DEADLINE, client.symbols(request)).await {
-                Ok(Ok(answers)) if answers.len() == indexed.len() => {
-                    for (position, answer) in indexed.into_iter().zip(answers) {
-                        results[position] = Some(answer);
-                    }
-                }
-                Ok(Ok(answers)) => log::warn!(
-                    "workspace index returned {} answers for {} files; parsing directly",
-                    answers.len(),
-                    indexed.len()
-                ),
-                Ok(Err(error)) => {
-                    log::debug!("workspace index lookup failed ({error}); parsing directly");
-                }
-                Err(_) => log::debug!(
-                    "workspace index did not answer within {CODE_INDEX_LOOKUP_DEADLINE:?}; parsing directly"
-                ),
-            }
+        if indexed.is_empty() {
+            return results;
         }
+        let request: Vec<(PathBuf, Arc<str>)> = indexed
+            .iter()
+            .map(|&position| {
+                let (path, text) = files[position];
+                (path.to_path_buf(), Arc::from(text))
+            })
+            .collect();
+        match tokio::time::timeout(CODE_INDEX_LOOKUP_DEADLINE, client.symbols(request)).await {
+            Ok(Ok(answers)) if answers.len() == indexed.len() => {
+                for (position, answer) in indexed.into_iter().zip(answers) {
+                    results[position] = Some(answer);
+                }
+                return results;
+            }
+            Ok(Ok(answers)) => log::warn!(
+                "workspace index returned {} answers for {} files; parsing directly",
+                answers.len(),
+                indexed.len()
+            ),
+            Ok(Err(error)) => {
+                log::debug!("workspace index lookup failed ({error}); parsing directly");
+            }
+            Err(_) => log::debug!(
+                "workspace index did not answer within {CODE_INDEX_LOOKUP_DEADLINE:?}; parsing directly"
+            ),
+        }
+        self.index = None;
+        results
     }
-
-    files
-        .iter()
-        .zip(results)
-        .map(|((path, text), cached)| {
-            cached.unwrap_or_else(|| SymbolIndex::from_source_for_path(path, text))
-        })
-        .collect()
 }
 
 /// Resolve the workspace root from args, falling back to the context cwd.

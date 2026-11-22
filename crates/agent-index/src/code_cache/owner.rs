@@ -1,22 +1,34 @@
 //! The cache owner thread and its client (design D1, D6, D7).
 //!
-//! Ajika is synchronous and needs `&mut Database`, so one dedicated thread per workspace owns
-//! the database and serves commands from a channel. Replies travel back over `tokio` oneshot
-//! channels, so async callers never block a runtime worker.
+//! Ajika is synchronous and needs `&mut Database`, so one dedicated thread per cache directory
+//! owns the database and serves commands from a channel. Replies travel back over `tokio`
+//! oneshot channels, so async callers never block a runtime worker.
+//!
+//! Owners of on-disk caches are shared through a process-wide registry: a workspace index
+//! that is recreated for a root (for example after the manager pruned an idle index while a
+//! session still held the old handle) reuses the live owner instead of opening the directory
+//! a second time, which would fail on the directory lock and fall back to memory.
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak, mpsc};
+use std::time::Duration;
 
 use ajika::Database;
 use rayon::prelude::*;
 use tokio::sync::oneshot;
 
 use super::queries::{CacheServices, Db, IndexSettings, SourceFile, functions_for, symbols_for};
-use super::storage::{CacheStorageKind, CodeIndexCacheOptions, open_database};
+use super::storage::{CacheStorageKind, CodeIndexCacheOptions, open_database, touch};
 use super::values::{FunctionsResult, SymbolsResult};
 use crate::function_index::{FunctionIndexConfig, IndexedFunctionEntry, parse_pool};
 use crate::symbol_index::{SymbolError, SymbolIndex};
+
+/// How long a new owner waits for the previous owner of the same directory to release it.
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
 
 /// Failure talking to the cache owner.
 #[derive(Debug, thiserror::Error)]
@@ -30,10 +42,15 @@ pub enum CodeCacheError {
     OutsideRoot(PathBuf),
     /// The cache operation failed.
     #[error("code cache operation failed: {0}")]
-    Operation(String),
+    Operation(#[source] ajika::Error),
+    /// The parse thread pool could not be created.
+    #[error("failed to build the parse thread pool: {0}")]
+    ParsePool(#[source] rayon::ThreadPoolBuildError),
 }
 
-/// Cumulative counts since the cache started (design D7).
+/// Cumulative counts since the cache owner started (design D7).
+///
+/// Every workspace index sharing one owner sees the same counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeCacheStats {
     /// Per-file extractions that ran.
@@ -73,8 +90,9 @@ enum Command {
         files: Vec<Change>,
         reply: oneshot::Sender<Result<Vec<Result<SymbolIndex, SymbolError>>, CodeCacheError>>,
     },
-    Stats {
-        reply: oneshot::Sender<CodeCacheStats>,
+    /// Waits until the database is open, then replies.
+    Ready {
+        reply: oneshot::Sender<()>,
     },
     Collect {
         reply: oneshot::Sender<Result<usize, CodeCacheError>>,
@@ -91,6 +109,13 @@ struct Roots {
 }
 
 impl Roots {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            canonical: root.canonicalize().ok().filter(|c| c != root),
+        }
+    }
+
     fn key(&self, path: &Path) -> Option<String> {
         let relative = path.strip_prefix(&self.root).ok().or_else(|| {
             self.canonical
@@ -121,16 +146,82 @@ impl Roots {
     }
 }
 
+/// State shared between an owner thread and its clients.
+#[derive(Default)]
+struct OwnerState {
+    parsed: AtomicU64,
+    reused: AtomicU64,
+    /// Set once the database is open.
+    storage: OnceLock<CacheStorageKind>,
+    /// Set once the owner was asked to stop or has stopped; such an owner is never shared.
+    stopped: AtomicBool,
+}
+
+impl OwnerState {
+    fn snapshot(&self) -> Option<CodeCacheStats> {
+        Some(CodeCacheStats {
+            parsed_files: self.parsed.load(Ordering::Acquire),
+            reused_files: self.reused.load(Ordering::Acquire),
+            storage: *self.storage.get()?,
+        })
+    }
+}
+
+/// Signalled when an owner thread has dropped its database (and released its directory).
+#[derive(Default)]
+struct Released {
+    done: Mutex<bool>,
+    signal: Condvar,
+}
+
+impl Released {
+    fn notify(&self) {
+        *self.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.signal.notify_all();
+    }
+
+    fn is_done(&self) -> bool {
+        *self.done.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        let (done, _) = self
+            .signal
+            .wait_timeout_while(done, timeout, |done| !*done)
+            .unwrap_or_else(PoisonError::into_inner);
+        *done
+    }
+}
+
+/// One owner thread, held by every client of it. The thread exits when the last link drops.
+struct OwnerLink {
+    tx: mpsc::Sender<Command>,
+    state: Arc<OwnerState>,
+    /// Test clients keep their command receiver here so it lives as long as the client.
+    _keepalive: Option<Box<dyn Any + Send + Sync>>,
+}
+
+/// Registry entry for an on-disk cache directory.
+struct Slot {
+    link: Weak<OwnerLink>,
+    settings: (u32, usize),
+    released: Arc<Released>,
+}
+
+fn registry() -> &'static Mutex<HashMap<PathBuf, Slot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
+    REGISTRY.get_or_init(Mutex::default)
+}
+
 /// Clonable handle to a workspace's cache owner thread.
 ///
-/// The thread exits, after a final retention pass, when the last clone is dropped or after
-/// [`CodeCacheClient::shutdown`].
+/// The thread exits, after a final retention pass, when the last client of it is dropped or
+/// after [`CodeCacheClient::shutdown`].
 #[derive(Clone)]
 pub struct CodeCacheClient {
-    tx: mpsc::Sender<Command>,
+    link: Arc<OwnerLink>,
     roots: Arc<Roots>,
-    #[cfg(any(test, feature = "test-support"))]
-    _keepalive: Option<Arc<std::sync::Mutex<mpsc::Receiver<Command>>>>,
 }
 
 impl std::fmt::Debug for CodeCacheClient {
@@ -141,9 +232,42 @@ impl std::fmt::Debug for CodeCacheClient {
     }
 }
 
+fn start_owner(
+    root: &Path,
+    options: CodeIndexCacheOptions,
+    function_config: FunctionIndexConfig,
+    previous: Option<Arc<Released>>,
+    released: Arc<Released>,
+) -> std::io::Result<Arc<OwnerLink>> {
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(OwnerState::default());
+    let thread_state = Arc::clone(&state);
+    let thread_root = root.to_path_buf();
+    std::thread::Builder::new()
+        .name("qmt-code-cache".to_owned())
+        .spawn(move || {
+            if let Some(previous) = previous
+                && !previous.wait(RELEASE_WAIT)
+            {
+                log::debug!("code cache: previous owner of {thread_root:?} is still closing");
+            }
+            owner_main(&thread_root, &options, &function_config, &rx, &thread_state);
+            thread_state.stopped.store(true, Ordering::Release);
+            released.notify();
+        })?;
+    Ok(Arc::new(OwnerLink {
+        tx,
+        state,
+        _keepalive: None,
+    }))
+}
+
 impl CodeCacheClient {
-    /// Start the owner thread for `root`. The database is opened on that thread, so this
-    /// returns immediately; commands queue until it is ready.
+    /// Get a client for `root`'s cache.
+    ///
+    /// When a live owner already serves the same cache directory with the same settings, the
+    /// client shares it. Otherwise a new owner thread starts; the database is opened on that
+    /// thread, so this returns immediately and commands queue until it is ready.
     ///
     /// # Errors
     ///
@@ -153,24 +277,57 @@ impl CodeCacheClient {
         options: CodeIndexCacheOptions,
         function_config: FunctionIndexConfig,
     ) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
-        let roots = Arc::new(Roots {
-            root: root.to_path_buf(),
-            canonical: root.canonicalize().ok().filter(|c| c != root),
-        });
-        let thread_root = root.to_path_buf();
-        std::thread::Builder::new()
-            .name("qmt-code-cache".to_owned())
-            .spawn(move || owner_main(&thread_root, &options, &function_config, &rx))?;
-        Ok(Self {
-            tx,
-            roots,
-            #[cfg(any(test, feature = "test-support"))]
-            _keepalive: None,
-        })
+        let roots = Arc::new(Roots::new(root));
+        let Some(directory) = options.cache_directory(root) else {
+            let link = start_owner(root, options, function_config, None, Arc::default())?;
+            return Ok(Self { link, roots });
+        };
+
+        let settings = (
+            function_config.min_function_lines,
+            function_config.max_file_bytes,
+        );
+        let mut slots = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        // Drop entries whose owner is gone and has released its directory.
+        slots.retain(|_, slot| slot.link.strong_count() > 0 || !slot.released.is_done());
+
+        let previous = match slots.get(&directory) {
+            Some(slot) => match slot.link.upgrade() {
+                Some(link) if !link.state.stopped.load(Ordering::Acquire) => {
+                    if slot.settings == settings {
+                        return Ok(Self { link, roots });
+                    }
+                    // A live owner with other settings holds the directory: this owner falls
+                    // back to memory and does not replace the registered one.
+                    let link = start_owner(root, options, function_config, None, Arc::default())?;
+                    return Ok(Self { link, roots });
+                }
+                _ => Some(Arc::clone(&slot.released)),
+            },
+            None => None,
+        };
+
+        let released = Arc::new(Released::default());
+        let link = start_owner(
+            root,
+            options,
+            function_config,
+            previous,
+            Arc::clone(&released),
+        )?;
+        slots.insert(
+            directory,
+            Slot {
+                link: Arc::downgrade(&link),
+                settings,
+                released,
+            },
+        );
+        Ok(Self { link, roots })
     }
 
-    /// Root-relative key of `path`, or `None` when it lies outside the workspace root.
+    /// Root-relative key of `path`, or `None` when it lies outside the workspace root or
+    /// cannot be keyed (a non-UTF-8 path component).
     #[must_use]
     pub fn key_for(&self, path: &Path) -> Option<String> {
         self.roots.key(path)
@@ -181,7 +338,8 @@ impl CodeCacheClient {
         build: impl FnOnce(oneshot::Sender<T>) -> Command,
     ) -> Result<T, CodeCacheError> {
         let (reply, response) = oneshot::channel();
-        self.tx
+        self.link
+            .tx
             .send(build(reply))
             .map_err(|_| CodeCacheError::Stopped)?;
         response.await.map_err(|_| CodeCacheError::Stopped)
@@ -192,7 +350,8 @@ impl CodeCacheClient {
     ///
     /// # Errors
     ///
-    /// Fails if a path is outside the root, the owner stopped, or the operation failed.
+    /// Fails if a path cannot be keyed (see [`Self::key_for`]), the owner stopped, or the
+    /// operation failed.
     pub async fn index_all(&self, paths: &[PathBuf]) -> Result<FileEntries, CodeCacheError> {
         let files = paths
             .iter()
@@ -207,7 +366,7 @@ impl CodeCacheClient {
     ///
     /// # Errors
     ///
-    /// Fails if a path is outside the root, the owner stopped, or the operation failed.
+    /// Fails if a path cannot be keyed, the owner stopped, or the operation failed.
     pub async fn apply(
         &self,
         changed: Vec<(PathBuf, Arc<str>)>,
@@ -240,7 +399,7 @@ impl CodeCacheClient {
     ///
     /// # Errors
     ///
-    /// Fails if a path is outside the root, the owner stopped, or the operation failed.
+    /// Fails if a path cannot be keyed, the owner stopped, or the operation failed.
     pub async fn symbols(
         &self,
         files: Vec<(PathBuf, Arc<str>)>,
@@ -260,11 +419,18 @@ impl CodeCacheClient {
 
     /// Cumulative parse/reuse counts.
     ///
+    /// Once the database is open this reads shared counters and never waits behind a running
+    /// operation; before that, it waits until the owner has opened its database.
+    ///
     /// # Errors
     ///
-    /// Fails if the owner stopped.
+    /// Fails if the owner stopped before opening its database.
     pub async fn stats(&self) -> Result<CodeCacheStats, CodeCacheError> {
-        self.request(|reply| Command::Stats { reply }).await
+        if let Some(stats) = self.link.state.snapshot() {
+            return Ok(stats);
+        }
+        self.request(|reply| Command::Ready { reply }).await?;
+        self.link.state.snapshot().ok_or(CodeCacheError::Stopped)
     }
 
     /// Apply retention limits now; returns the number of evicted records.
@@ -277,8 +443,11 @@ impl CodeCacheClient {
     }
 
     /// Stop the owner after a final retention pass and wait until it has released the cache
-    /// directory. Later calls on any clone fail with [`CodeCacheError::Stopped`].
+    /// directory. Later calls on any client sharing this owner fail with
+    /// [`CodeCacheError::Stopped`], so those clients fall back to direct parsing; a client
+    /// spawned afterwards starts a new owner.
     pub async fn shutdown(&self) {
+        self.link.state.stopped.store(true, Ordering::Release);
         // A stopped owner has nothing left to release.
         let _ = self.request(|reply| Command::Stop { reply }).await;
     }
@@ -286,49 +455,38 @@ impl CodeCacheClient {
 
 #[cfg(any(test, feature = "test-support"))]
 impl CodeCacheClient {
-    fn detached(root: &Path) -> (Self, mpsc::Receiver<Command>) {
-        let (tx, rx) = mpsc::channel();
-        let roots = Arc::new(Roots {
-            root: root.to_path_buf(),
-            canonical: root.canonicalize().ok().filter(|c| c != root),
-        });
-        (
-            Self {
+    fn detached(root: &Path, keep_receiver: bool) -> Self {
+        let (tx, rx) = mpsc::channel::<Command>();
+        let keepalive: Option<Box<dyn Any + Send + Sync>> =
+            keep_receiver.then(|| Box::new(Mutex::new(rx)) as Box<dyn Any + Send + Sync>);
+        Self {
+            link: Arc::new(OwnerLink {
                 tx,
-                roots,
-                _keepalive: None,
-            },
-            rx,
-        )
+                state: Arc::default(),
+                _keepalive: keepalive,
+            }),
+            roots: Arc::new(Roots::new(root)),
+        }
     }
 
     /// A client that accepts commands but never replies (holds the receiver).
     #[must_use]
     pub fn unresponsive(root: &Path) -> Self {
-        let (mut client, rx) = Self::detached(root);
-        client._keepalive = Some(Arc::new(std::sync::Mutex::new(rx)));
-        client
+        Self::detached(root, true)
     }
 
     /// A client whose owner is gone: every call fails with [`CodeCacheError::Stopped`].
     #[must_use]
     pub fn disconnected(root: &Path) -> Self {
-        let (client, rx) = Self::detached(root);
-        drop(rx);
-        client
+        Self::detached(root, false)
     }
 }
 
 struct Owner {
     db: Database<CacheServices>,
-    storage: CacheStorageKind,
-    parsed: u64,
-    reused: u64,
+    directory: Option<PathBuf>,
+    state: Arc<OwnerState>,
     executions_seen: u64,
-}
-
-fn operation_error(error: &ajika::Error) -> CodeCacheError {
-    CodeCacheError::Operation(error.to_string())
 }
 
 fn owner_main(
@@ -336,13 +494,13 @@ fn owner_main(
     options: &CodeIndexCacheOptions,
     function_config: &FunctionIndexConfig,
     rx: &mpsc::Receiver<Command>,
+    state: &Arc<OwnerState>,
 ) {
-    let (db, storage) = open_database(root, options);
+    let (db, storage, directory) = open_database(root, options);
     let mut owner = Owner {
         db,
-        storage,
-        parsed: 0,
-        reused: 0,
+        directory,
+        state: Arc::clone(state),
         executions_seen: 0,
     };
     let settings = IndexSettings::at(());
@@ -354,12 +512,38 @@ fn owner_main(
         log::error!("code cache: cannot install index settings for {root:?}: {error}");
         return;
     }
+    let _ = state.storage.set(storage);
 
     while let Ok(command) = rx.recv() {
+        // A panic inside an operation (for example in a parser) only loses that command:
+        // its reply is dropped, so the caller falls back to direct parsing. Ajika resets its
+        // operation state after a panic, so the owner keeps serving later commands.
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| owner.handle(command)));
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(reply)) => {
+                owner.finish(root);
+                // Dropping the database releases the directory before the caller resumes.
+                drop(owner);
+                let _ = reply.send(());
+                return;
+            }
+            Err(_) => log::warn!(
+                "code cache: an operation for {root:?} panicked; the caller parses directly"
+            ),
+        }
+    }
+    owner.finish(root);
+}
+
+impl Owner {
+    /// Serve one command. Returns the reply channel of `Stop`, which the caller answers once
+    /// the database is released.
+    fn handle(&mut self, command: Command) -> Option<oneshot::Sender<()>> {
         match command {
             Command::IndexAll { files, reply } => {
                 if !reply.is_closed() {
-                    let _ = reply.send(owner.index_all(&files));
+                    let _ = reply.send(self.index_all(&files));
                 }
             }
             Command::Apply {
@@ -367,71 +551,56 @@ fn owner_main(
                 removed,
                 reply,
             } => {
-                let _ = reply.send(owner.apply(&changed, &removed));
+                let _ = reply.send(self.apply(&changed, &removed));
             }
             Command::Symbols { files, reply } => {
                 // A lookup whose caller already timed out is not worth running.
                 if !reply.is_closed() {
-                    let _ = reply.send(owner.symbols(&files));
+                    let _ = reply.send(self.symbols(&files));
                 }
             }
-            Command::Stats { reply } => {
-                let _ = reply.send(owner.stats());
+            Command::Ready { reply } => {
+                let _ = reply.send(());
             }
             Command::Collect { reply } => {
-                let _ = reply.send(owner.db.collect().map_err(|e| operation_error(&e)));
+                let _ = reply.send(self.db.collect().map_err(CodeCacheError::Operation));
             }
-            Command::Stop { reply } => {
-                owner.finish(root);
-                drop(owner);
-                let _ = reply.send(());
-                return;
-            }
+            Command::Stop { reply } => return Some(reply),
         }
+        None
     }
-    owner.finish(root);
-}
 
-impl Owner {
     fn finish(&mut self, root: &Path) {
+        log::debug!("code cache: closing the cache of {root:?}");
         if let Err(error) = self.db.collect() {
-            log::warn!("code cache: final collection for {root:?} failed: {error}");
+            log::warn!("code cache: final collection failed: {error}");
+        }
+        if let Some(directory) = &self.directory {
+            touch(directory);
         }
     }
 
-    fn stats(&self) -> CodeCacheStats {
-        CodeCacheStats {
-            parsed_files: self.parsed,
-            reused_files: self.reused,
-            storage: self.storage,
-        }
-    }
-
-    /// Install texts the host already has, unless the captured text is equal (design D6).
+    /// Install texts the host already has.
+    ///
+    /// Text is forgotten after every operation (design D6), so there is no captured value to
+    /// compare with; Ajika keeps the stored result valid when the new text equals the text
+    /// behind it, so an unchanged file is still answered without parsing.
     fn install(&mut self, installed: &[(&str, &Arc<str>)]) -> ajika::Result<()> {
-        let stale: Vec<_> = installed
-            .iter()
-            .filter(|(key, text)| {
-                self.db
-                    .inputs()
-                    .peek(SourceFile::TEXT, &(*key).to_owned())
-                    .is_none_or(|captured| captured.as_str() != &***text)
-            })
-            .collect();
-        if stale.is_empty() {
+        if installed.is_empty() {
             return Ok(());
         }
         self.db.update_inputs(|update| {
-            for (key, text) in stale {
-                let file = SourceFile::at((*key).to_owned());
-                file.set_text(update, text.to_string())?;
-                file.set_readable(update, true)?;
+            for (key, text) in installed {
+                SourceFile::at((*key).to_owned()).set_text(update, Some(text.to_string()))?;
             }
             Ok(())
         })
     }
 
     fn forget(&mut self, keys: &[&str]) {
+        if keys.is_empty() {
+            return;
+        }
         let result = self.db.update_inputs(|update| {
             for key in keys {
                 SourceFile::at((*key).to_owned()).forget_all(update);
@@ -444,7 +613,8 @@ impl Owner {
     }
 
     /// One Ajika operation: install, run, release the text of every file touched, and update
-    /// the statistics from the real execution count.
+    /// the statistics from the real execution count. Text is released even if the operation
+    /// panics.
     fn run_batch<R>(
         &mut self,
         installed: &[(&str, &Arc<str>)],
@@ -452,23 +622,37 @@ impl Owner {
         requested: usize,
         work: impl FnOnce(&Db<'_>) -> ajika::Result<R>,
     ) -> Result<R, CodeCacheError> {
-        let result = self.install(installed).and_then(|()| self.db.run(work));
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.install(installed).and_then(|()| self.db.run(work))
+        }));
         let executions = self.db.services().executions();
         let ran = executions.saturating_sub(self.executions_seen);
         self.executions_seen = executions;
-        self.parsed += ran;
-        self.reused += u64::try_from(requested)
-            .unwrap_or(u64::MAX)
-            .saturating_sub(ran);
+        self.state.parsed.fetch_add(ran, Ordering::AcqRel);
+        if matches!(outcome, Ok(Ok(_))) {
+            let requested = u64::try_from(requested).unwrap_or(u64::MAX);
+            self.state
+                .reused
+                .fetch_add(requested.saturating_sub(ran), Ordering::AcqRel);
+        }
         self.forget(touched);
-        result.map_err(|error| operation_error(&error))
+        match outcome {
+            Ok(result) => result.map_err(CodeCacheError::Operation),
+            Err(panic) => {
+                // Entries of an abandoned operation must not leak into the next one.
+                self.db.services().take_fresh_functions();
+                panic::resume_unwind(panic)
+            }
+        }
     }
 
     fn index_all(&mut self, files: &[FileRef]) -> Result<FileEntries, CodeCacheError> {
         let keys: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
         let touched: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let results = self.run_batch(&[], &touched, keys.len(), |db| functions_for(db, &keys))?;
-        function_entries(files, &results)
+        let results = self.run_batch(&[], &touched, keys.len(), |db| functions_for(db, &keys));
+        let fresh = self.db.services().take_fresh_functions();
+        let files: Vec<&FileRef> = files.iter().collect();
+        function_entries(&files, &results?, fresh)
     }
 
     fn apply(
@@ -489,9 +673,10 @@ impl Owner {
         let touched: Vec<&str> = keys.iter().map(String::as_str).collect();
         let results = self.run_batch(&installed, &touched, keys.len(), |db| {
             functions_for(db, &keys)
-        })?;
+        });
+        let fresh = self.db.services().take_fresh_functions();
         let files: Vec<&FileRef> = changed.iter().map(|c| &c.file).collect();
-        function_entries_ref(&files, &results)
+        function_entries(&files, &results?, fresh)
     }
 
     fn symbols(
@@ -514,25 +699,38 @@ impl Owner {
     }
 }
 
+/// Public entries for each file, in order.
+///
+/// Files computed in this operation use the entries their query just produced, which still
+/// carry their TypeScript fingerprints. Reused files are rebuilt from the stored mirror,
+/// recomputing those fingerprints, on the large-stack pool.
 fn function_entries(
-    files: &[FileRef],
-    results: &[Arc<FunctionsResult>],
-) -> Result<FileEntries, CodeCacheError> {
-    let refs: Vec<&FileRef> = files.iter().collect();
-    function_entries_ref(&refs, results)
-}
-
-/// Rebuild public entries (recomputing TypeScript fingerprints) on the large-stack pool.
-fn function_entries_ref(
     files: &[&FileRef],
     results: &[Arc<FunctionsResult>],
+    mut fresh: HashMap<String, Vec<IndexedFunctionEntry>>,
 ) -> Result<FileEntries, CodeCacheError> {
-    let pool = parse_pool().map_err(|e| CodeCacheError::Operation(e.to_string()))?;
-    Ok(pool.install(|| {
-        files
-            .par_iter()
-            .zip(results.par_iter())
-            .map(|(file, result)| (file.path.clone(), result.to_entries(&file.path)))
-            .collect()
-    }))
+    let mut entries: Vec<Option<Vec<IndexedFunctionEntry>>> = files
+        .iter()
+        .map(|file| {
+            fresh.remove(&file.key).map(|mut list| {
+                for entry in &mut list {
+                    entry.file_path.clone_from(&file.path);
+                }
+                list
+            })
+        })
+        .collect();
+    let pool = parse_pool().map_err(CodeCacheError::ParsePool)?;
+    pool.install(|| {
+        entries
+            .par_iter_mut()
+            .zip(files.par_iter().zip(results.par_iter()))
+            .filter(|(entry, _)| entry.is_none())
+            .for_each(|(entry, (file, result))| *entry = Some(result.to_entries(&file.path)));
+    });
+    Ok(files
+        .iter()
+        .zip(entries)
+        .map(|(file, list)| (file.path.clone(), list.unwrap_or_default()))
+        .collect())
 }

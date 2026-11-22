@@ -1,7 +1,8 @@
 //! Storage selection, epoch, retention and the open/fallback policy (design D5).
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ajika::{Database, DatabaseOptions, ErrorKind, Inputs, PersistenceErrorKind, Retention};
 use querymt_agent_core::hash::RapidHash;
@@ -13,6 +14,11 @@ use super::queries::{CacheServices, WorkspaceRoot};
 /// Bump this whenever extractor output or the persisted mirrors change; a different value
 /// makes every existing cache be discarded on open.
 pub const CODE_CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Hash of the extractor sources and the resolved parser dependency versions, computed by
+/// `build.rs`. Part of the epoch, so a grammar or extractor change never serves old results
+/// even when the package version stays the same (nightlies, local builds).
+const EXTRACTOR_FINGERPRINT: &str = env!("QMT_CODE_INDEX_FINGERPRINT");
 
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 200_000;
@@ -91,11 +97,15 @@ impl CodeIndexCacheOptions {
         Some(base.join(format!("{:016x}", hash.as_u64())))
     }
 
+    /// The cache epoch: package version, schema version and the build fingerprint of the
+    /// extractor sources and parser dependencies (see `build.rs`). Any difference discards
+    /// the cache on open, so stored results always come from the extractors in this binary.
     fn epoch(&self) -> String {
         format!(
-            "qmt-code-index/{}/{}",
+            "qmt-code-index/{}/{}/{}",
             env!("CARGO_PKG_VERSION"),
-            self.schema_version
+            self.schema_version,
+            EXTRACTOR_FINGERPRINT
         )
     }
 
@@ -126,11 +136,11 @@ fn inputs(root: &Path) -> Inputs {
     Inputs::with_state(WorkspaceRoot(root.to_path_buf()))
 }
 
-fn is_in_use(error: &ajika::Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::Persistence(persistence) if persistence.kind() == PersistenceErrorKind::InUse
-    )
+fn persistence_kind(error: &ajika::Error) -> Option<PersistenceErrorKind> {
+    match error.kind() {
+        ErrorKind::Persistence(persistence) => Some(persistence.kind()),
+        _ => None,
+    }
 }
 
 fn open_memory(root: &Path, options: &CodeIndexCacheOptions) -> Database<CacheServices> {
@@ -141,26 +151,143 @@ fn open_memory(root: &Path, options: &CodeIndexCacheOptions) -> Database<CacheSe
     )
 }
 
+/// Lock file Ajika 0.2.1 (`ajika_storage`) holds for as long as an owner has the directory
+/// open. The sweep below uses it to detect directories that are in use; Ajika is pinned, so
+/// this name is checked by `stale_directories_are_swept` on every upgrade.
+const OWNER_LOCK: &str = "owner.lock";
+
+/// Create the cache base directory readable only by the current user: stored results
+/// include function bodies and configuration values.
+fn create_private_base(base: &Path) -> std::io::Result<()> {
+    if let Some(parent) = base.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        match fs::DirBuilder::new().mode(0o700).create(base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(base)?;
+    Ok(())
+}
+
+/// Record that the cache in `directory` was just used, for the stale-directory sweep.
+///
+/// Ajika never writes its lock file, so its modification time is ours to keep.
+pub(crate) fn touch(directory: &Path) {
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .open(directory.join(OWNER_LOCK))
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(error) = result {
+        log::debug!("code cache: cannot record use of {directory:?}: {error}");
+    }
+}
+
+/// When the cache in `directory` was last opened or closed.
+fn last_used(directory: &Path) -> Option<SystemTime> {
+    fs::metadata(directory.join(OWNER_LOCK))
+        .or_else(|_| fs::metadata(directory))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn is_cache_directory_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.len() == 16 && name.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Remove sibling caches under `base` that nobody holds and that were last used longer than
+/// `max_idle` ago, such as caches of deleted worktrees. Retention inside a cache only runs
+/// while its root is open, so without this sweep such directories would never be reclaimed.
+///
+/// Returns the number of removed directories.
+pub(crate) fn sweep_stale(base: &Path, keep: &Path, max_idle: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(base) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !is_cache_directory_name(&entry.file_name()) || !path.is_dir() {
+            continue;
+        }
+        let idle = last_used(&path)
+            .and_then(|used| now.duration_since(used).ok())
+            .unwrap_or_default();
+        if idle < max_idle {
+            continue;
+        }
+        // Only remove a directory no owner (in any process) holds.
+        let lock = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(OWNER_LOCK))
+        {
+            Ok(lock) => match lock.try_lock() {
+                Ok(()) => Some(lock),
+                Err(_) => continue,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        // Unix can remove a directory while its lock is held, which closes the window in
+        // which another owner could open it; Windows cannot delete an open file.
+        #[cfg(windows)]
+        drop(lock);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                log::info!("code cache: removed {path:?}, unused for {idle:?}");
+            }
+            Err(error) => log::debug!("code cache: cannot remove stale {path:?}: {error}"),
+        }
+        #[cfg(not(windows))]
+        drop(lock);
+    }
+    removed
+}
+
 /// Open the database for `root`, falling back to memory when the directory cannot be used.
 ///
-/// A held directory (`InUse`) falls back to memory directly. Any other open error discards
-/// the directory and retries once, then falls back to memory. Every fallback logs a warning.
+/// - A held directory (`InUse`) falls back to memory directly.
+/// - Contents Ajika reports as invalid are discarded and opened again once. (Ajika already
+///   resets damaged contents itself; this covers what it cannot repair.)
+/// - Any other error (I/O, permissions, a full disk) falls back to memory without deleting
+///   anything, so a transient failure never wipes a valid cache.
+///
+/// Every fallback logs a warning. Returns the directory when the database is on disk.
 pub(crate) fn open_database(
     root: &Path,
     options: &CodeIndexCacheOptions,
-) -> (Database<CacheServices>, CacheStorageKind) {
+) -> (Database<CacheServices>, CacheStorageKind, Option<PathBuf>) {
     let Some(directory) = options.cache_directory(root) else {
         if options.storage != CodeIndexStorage::Memory {
             log::warn!("code cache: no platform cache directory, keeping the index in memory");
         }
-        return (open_memory(root, options), CacheStorageKind::Memory);
+        return (open_memory(root, options), CacheStorageKind::Memory, None);
+    };
+    let memory = |reason: String| {
+        log::warn!("code cache: {reason}, using memory for {root:?}");
+        (open_memory(root, options), CacheStorageKind::Memory, None)
     };
 
+    if let Some(base) = directory.parent()
+        && let Err(error) = create_private_base(base)
+    {
+        return memory(format!("cannot create {base:?} ({error})"));
+    }
+
     let epoch = options.epoch();
-    let try_open = || -> ajika::Result<Database<CacheServices>> {
-        if let Some(parent) = directory.parent() {
-            std::fs::create_dir_all(parent).map_err(ajika::Error::application)?;
-        }
+    let try_open = || {
         Database::open(
             &directory,
             &epoch,
@@ -170,33 +297,33 @@ pub(crate) fn open_database(
         )
     };
 
-    match try_open() {
-        Ok(database) => return (database, CacheStorageKind::Disk),
-        Err(error) if is_in_use(&error) => {
-            log::warn!(
-                "code cache: {directory:?} is held by another owner, using memory for {root:?}"
-            );
-            return (open_memory(root, options), CacheStorageKind::Memory);
-        }
-        Err(error) => {
-            log::warn!(
-                "code cache: cannot open {directory:?} ({error}); discarding it and retrying once"
-            );
-        }
-    }
+    let database = match try_open() {
+        Ok(database) => database,
+        Err(error) => match persistence_kind(&error) {
+            Some(PersistenceErrorKind::InUse) => {
+                return memory(format!("{directory:?} is held by another owner"));
+            }
+            Some(PersistenceErrorKind::InvalidCache) => {
+                log::warn!(
+                    "code cache: {directory:?} is invalid ({error}); discarding it and retrying once"
+                );
+                if let Err(error) = fs::remove_dir_all(&directory)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return memory(format!("cannot remove {directory:?} ({error})"));
+                }
+                match try_open() {
+                    Ok(database) => database,
+                    Err(error) => return memory(format!("cannot reopen {directory:?} ({error})")),
+                }
+            }
+            _ => return memory(format!("cannot open {directory:?} ({error})")),
+        },
+    };
 
-    if let Err(error) = std::fs::remove_dir_all(&directory)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        log::warn!("code cache: cannot remove {directory:?}: {error}");
+    touch(&directory);
+    if let Some(base) = directory.parent() {
+        sweep_stale(base, &directory, options.max_idle);
     }
-    match try_open() {
-        Ok(database) => (database, CacheStorageKind::Disk),
-        Err(error) => {
-            log::warn!(
-                "code cache: cannot reopen {directory:?} ({error}), using memory for {root:?}"
-            );
-            (open_memory(root, options), CacheStorageKind::Memory)
-        }
-    }
+    (database, CacheStorageKind::Disk, Some(directory))
 }

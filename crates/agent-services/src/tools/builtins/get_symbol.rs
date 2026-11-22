@@ -14,7 +14,7 @@ use crate::tools::{
 };
 use querymt_agent_index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 
-use super::helpers::{resolve_root, resolve_symbols, resolve_target};
+use super::helpers::{SymbolResolver, resolve_root, resolve_target};
 
 pub struct GetSymbolTool;
 
@@ -142,6 +142,7 @@ impl Tool for GetSymbolTool {
 
         let requests = parse_requests(&args)?;
         let mut file_results: Vec<(String, Vec<String>)> = Vec::new();
+        let mut resolver = SymbolResolver::new(context);
 
         for req in &requests {
             let target = resolve_target("path", &req.path, &root)?;
@@ -153,7 +154,7 @@ impl Tool for GetSymbolTool {
                     continue;
                 }
             };
-            let symbol_index = match resolve_symbols(context, &target, &content).await {
+            let symbol_index = match resolver.resolve(&target, &content).await {
                 Ok(idx) => idx,
                 Err(e) => {
                     let err = format!("{}\n- Failed to index file: {e}", target.display());

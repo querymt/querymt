@@ -181,6 +181,8 @@ pub(crate) enum SymbolsResult {
     UnsupportedExtension(String),
     UnsupportedLanguage(String),
     ParseFailed(String),
+    /// An I/O failure reported by the extractor.
+    Io(String),
     /// The file could not be read as UTF-8 text.
     Unreadable,
 }
@@ -202,9 +204,8 @@ impl SymbolsResult {
         match error {
             SymbolError::UnsupportedExtension(ext) => Self::UnsupportedExtension(ext),
             SymbolError::UnsupportedLanguage(language) => Self::UnsupportedLanguage(language),
-            SymbolError::ParseError(message) | SymbolError::Io(message) => {
-                Self::ParseFailed(message)
-            }
+            SymbolError::ParseError(message) => Self::ParseFailed(message),
+            SymbolError::Io(message) => Self::Io(message),
         }
     }
 
@@ -223,6 +224,7 @@ impl SymbolsResult {
                 Err(SymbolError::UnsupportedLanguage(language.clone()))
             }
             Self::ParseFailed(message) => Err(SymbolError::ParseError(message.clone())),
+            Self::Io(message) => Err(SymbolError::Io(message.clone())),
             Self::Unreadable => Err(SymbolError::Io(
                 "stream did not contain valid UTF-8".to_owned(),
             )),

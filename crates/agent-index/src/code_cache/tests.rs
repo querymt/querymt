@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use super::storage::{open_database, sweep_stale};
 use super::{CacheStorageKind, CodeCacheClient, CodeIndexCacheOptions};
 use crate::function_index::FunctionIndexConfig;
 
@@ -217,12 +218,10 @@ async fn cache_directory_held_by_another_owner() {
     ]);
     let paths = ["a.rs", "b.rs"].map(|n| ws.path(n));
 
-    let holder = ws.start(ws.options());
-    holder.index_all(&paths).await.expect("holder index");
-    assert_eq!(
-        holder.stats().await.expect("stats").storage,
-        CacheStorageKind::Disk
-    );
+    // Another process holds the directory. (Owners in this process are shared instead, see
+    // `recreated_index_shares_the_live_owner`.)
+    let (_holder, storage, _) = open_database(&ws.root, &ws.options());
+    assert_eq!(storage, CacheStorageKind::Disk);
 
     let second = ws.start(ws.options());
     let entries = second.index_all(&paths).await.expect("second index");
@@ -346,4 +345,150 @@ async fn idle_results_are_evicted_and_recomputed() {
         after[0].as_ref().expect("symbols").symbols,
         before[0].as_ref().expect("symbols").symbols
     );
+}
+
+#[tokio::test]
+async fn recreated_index_shares_the_live_owner() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let paths = [ws.path("a.rs")];
+
+    let first = ws.start(ws.options());
+    first.index_all(&paths).await.expect("first index");
+
+    // A second index for the same root while the first client is alive (for example after the
+    // manager pruned the index but a session still holds the old handle) shares the owner and
+    // keeps using the disk cache instead of falling back to memory.
+    let second = ws.start(ws.options());
+    second.index_all(&paths).await.expect("second index");
+    let stats = second.stats().await.expect("stats");
+    assert_eq!(stats.storage, CacheStorageKind::Disk);
+    assert_eq!(stats.parsed_files, 1, "shared owner: parsed once");
+    assert_eq!(stats.reused_files, 1);
+    assert_eq!(first.stats().await.expect("stats"), stats);
+}
+
+#[tokio::test]
+async fn dropping_every_client_releases_the_directory_for_the_next_owner() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let paths = [ws.path("a.rs")];
+
+    let first = ws.start(ws.options());
+    first.index_all(&paths).await.expect("first index");
+    let clone = first.clone();
+    drop(first);
+    drop(clone);
+
+    // No shutdown: the next owner waits for the old one to release the directory.
+    let next = ws.start(ws.options());
+    next.index_all(&paths).await.expect("next index");
+    let stats = next.stats().await.expect("stats");
+    assert_eq!(stats.storage, CacheStorageKind::Disk);
+    assert_eq!(
+        stats.parsed_files, 0,
+        "results persisted by the dropped owner"
+    );
+}
+
+fn age(directory: &Path, idle: Duration) {
+    let lock = directory.join("owner.lock");
+    if !lock.exists() {
+        fs::write(&lock, b"").expect("lock file");
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&lock)
+        .expect("open lock");
+    file.set_modified(std::time::SystemTime::now() - idle)
+        .expect("age lock");
+}
+
+#[tokio::test]
+async fn stale_directories_are_swept() {
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let options = ws.options();
+    let idle = options.max_idle + Duration::from_secs(60);
+
+    // A cache written by a real owner, then left unused (for example a removed worktree).
+    let other_root = ws._dir.path().join("worktree");
+    fs::create_dir_all(&other_root).expect("worktree");
+    fs::write(other_root.join("a.rs"), function_source("beta")).expect("write");
+    let other =
+        CodeCacheClient::spawn(&other_root, options.clone(), FunctionIndexConfig::default())
+            .expect("spawn");
+    other
+        .index_all(&[other_root.join("a.rs")])
+        .await
+        .expect("index");
+    other.shutdown().await;
+    let stale = options.cache_directory(&other_root).expect("dir");
+    assert!(
+        stale.join("owner.lock").is_file(),
+        "Ajika's lock file name is pinned"
+    );
+    age(&stale, idle);
+
+    // An equally old cache that another process still holds is kept.
+    let held = ws.base.join("00000000000000aa");
+    fs::create_dir_all(&held).expect("held");
+    age(&held, idle);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(held.join("owner.lock"))
+        .expect("open");
+    lock.lock().expect("hold lock");
+
+    // A recently used cache and a directory that is not a cache are kept.
+    let recent = ws.base.join("00000000000000bb");
+    fs::create_dir_all(&recent).expect("recent");
+    fs::write(recent.join("owner.lock"), b"").expect("lock");
+    let unrelated = ws.base.join("not-a-cache");
+    fs::create_dir_all(&unrelated).expect("unrelated");
+
+    let client = ws.start(options.clone());
+    client.index_all(&[ws.path("a.rs")]).await.expect("index");
+
+    assert!(!stale.exists(), "stale cache removed");
+    assert!(held.exists(), "held cache kept");
+    assert!(recent.exists(), "recent cache kept");
+    assert!(unrelated.exists(), "unrelated directory kept");
+    let own = options.cache_directory(&ws.root).expect("own");
+    assert!(own.exists(), "own cache kept");
+    assert_eq!(sweep_stale(&ws.base, &own, options.max_idle), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cache_base_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = Workspace::new(&[("a.rs", &function_source("alpha"))]);
+    let client = ws.start(ws.options());
+    client.index_all(&[ws.path("a.rs")]).await.expect("index");
+    let mode = fs::metadata(&ws.base).expect("base").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+#[tokio::test]
+async fn parser_panic_does_not_stop_the_owner() {
+    let ws = Workspace::new(&[
+        ("a.rs", &function_source("alpha")),
+        (super::queries::PANIC_FOR_TEST, &function_source("boom")),
+    ]);
+    let client = ws.start(CodeIndexCacheOptions::memory());
+    let panicked = client
+        .index_all(&[ws.path("a.rs"), ws.path(super::queries::PANIC_FOR_TEST)])
+        .await;
+    assert!(
+        matches!(panicked, Err(super::CodeCacheError::Stopped)),
+        "the panicking request is dropped: {panicked:?}"
+    );
+
+    // The owner keeps serving, and the text of the abandoned operation was released.
+    let entries = client.index_all(&[ws.path("a.rs")]).await.expect("index");
+    assert_eq!(names_of(&entries, &ws.path("a.rs")), ["alpha"]);
+    let symbols = client
+        .symbols(vec![(ws.path("a.rs"), Arc::from(function_source("alpha")))])
+        .await
+        .expect("lookup");
+    assert!(symbols[0].is_ok());
 }

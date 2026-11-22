@@ -69,9 +69,13 @@ Ajika constraints (0.2.1; book chapters "Keeping results across restarts", "Acqu
   - `IndexAll { files }`: initial build and `Rebuild`.
   - `Apply { changed: Vec<(rel, Arc<str>)>, removed }`: watcher change sets.
   - `Symbols { files: Vec<(rel, Arc<str>)> }`: tool lookups, batched.
-  - `Stats`.
+  - `Ready`: waits until the database is open (statistics are read from shared counters, D7).
+  - `Stop`: final `collect`, then release the directory.
   - `Collect`: retention; used by tests and on shutdown.
 - The thread exits when the last client drops. Before exiting it calls `collect`.
+- **Shared owners.** On-disk owners are registered process-wide by cache directory (with a weak reference). `CodeCacheClient::spawn` for a directory that a live, unstopped owner with the same settings already serves returns a client of that owner. A recreated workspace index (the manager prunes idle indexes while sessions still hold their handles) therefore keeps using the disk cache instead of hitting the directory lock and falling back to memory. A new owner for a directory whose previous owner is closing waits up to 10 s for it to release the directory. Statistics are per owner, so indexes sharing an owner share counts.
+- **Lifetime.** The workspace actor's change forwarder holds a `WeakActorRef`, so the actor, its file watcher and its cache client drop once every handle is gone.
+- **Panics.** A panic inside a command (for example in a parser) is caught on the owner thread: that command's reply is dropped, so its caller falls back to direct parsing, the text it installed is released, and the owner keeps serving. Ajika resets its operation state after a panic for exactly this use.
 
 **Why.** Ajika is synchronous and needs `&mut Database`. A kameo actor would block a tokio worker during long runs, and `spawn_blocking` cannot hold `&mut` across calls. One thread per workspace serialises indexing and lookups, which the spec allows. A lookup queued behind a cold build is covered by the tool deadline (D6).
 
@@ -84,7 +88,7 @@ Ajika constraints (0.2.1; book chapters "Keeping results across restarts", "Acqu
 
 ```rust
 #[ajika::input(key = String)]               // workspace-relative path, '/' separators
-struct SourceFile { #[input(arc, initialize = read_source)] text: String, readable: bool }
+struct SourceFile { #[input(arc, initialize = read_source)] text: Option<String> }  // None: not UTF-8 text
 
 #[ajika::input(key = ())]
 struct IndexSettings { min_function_lines: u32, max_file_bytes: u64 }
@@ -101,9 +105,10 @@ struct IndexSettings { min_function_lines: u32, max_file_bytes: u64 }
 - **Keys.**
   - Keys are relative paths, so moving a workspace keeps its keys and the cache directory (D5) keeps roots apart.
   - A file outside the root never reaches the cache; the tool falls back to direct parsing.
+  - A path with a non-UTF-8 component cannot be a key. The workspace index indexes such files directly and sends every other file to the cache, so one odd file name never disables the cache.
   - The language comes from the key's extension, so it needs no input.
 - **Settings are an input.** `FunctionIndexConfig.min_function_lines` and `max_file_bytes` change answers, so they are inputs, not services.
-- **Errors as data.** `SymbolsResult` is `Ok(symbols) | Unsupported | ParseFailed(String)`. `FunctionsResult` is `Vec<entry>`, empty for skipped, oversized, unsupported or failed files. Non-UTF-8 and unreadable files are captured as an empty-text marker (`text = ""`, plus a `readable: bool` field). As a result:
+- **Errors as data.** `SymbolsResult` is `Ok(symbols) | Unsupported | ParseFailed(String)`. `FunctionsResult` is `Vec<entry>`, empty for skipped, oversized, unsupported or failed files. Non-UTF-8 and unreadable files are captured as `text = None` (`SymbolsResult::Unreadable`). One input read gives both readability and text, so they can never disagree and each file is read once. As a result:
   - only cancellation or storage errors fail an operation;
   - a broken file is a stored result like any other (spec: *One broken file among valid files*);
   - catching a child error inside `all_functions` is not needed. The book says that would not save the operation anyway.
@@ -146,16 +151,18 @@ pub struct CodeIndexCacheOptions { storage: CodeIndexStorage, max_bytes: u64, ma
 - `WorkspaceIndexManagerConfig` gains `cache: CodeIndexCacheOptions`, with `Default` set to the spec's limits.
 - `Directory(base)` resolves the same way as `Default`, as `<base>/<hash>`, so tests can use a temp dir.
 - **Location.** `Default` uses `dirs::cache_dir()/querymt/code-index/<{:016x} of RapidHash(canonical root)>`. This matches `GitSnapshotBackend::snapshot_dir` in `crates/agent-services/src/snapshot/git/mod.rs`. If there is no platform cache dir (some mobile targets), the cache uses memory.
-- **Epoch.** `format!("qmt-code-index/{}/{}", env!("CARGO_PKG_VERSION"), schema_version)`. `CODE_CACHE_SCHEMA_VERSION` starts at 1 and must be bumped with extractor changes.
+- **Epoch.** `format!("qmt-code-index/{}/{}/{}", env!("CARGO_PKG_VERSION"), schema_version, QMT_CODE_INDEX_FINGERPRINT)`. `CODE_CACHE_SCHEMA_VERSION` starts at 1.
+  - `QMT_CODE_INDEX_FINGERPRINT` is computed by `crates/agent-index/build.rs`: an FNV-1a hash of the extractor sources (`symbol_index/`, `function_index/`, `outline_index/common.rs`, `code_cache/values.rs`, `code_cache/queries.rs`) and of the lockfile entries (name, version, source) of the parser crates (`tree-sitter*`, `similarity-*`, `oxc*`, `syn`) and the encoding crates (`ajika`, `wincode`, `rapidhash`). A grammar bump, a `cargo update` of the `similarity` git branch, or an extractor edit between releases (nightlies) therefore discards old caches without a manual bump. Builds without a lockfile hash the sources only.
   - The package version is included because extractor semantics are not otherwise versioned. A release rebuilds every cache once, which is cheap compared to serving stale symbols.
   - Tests set `schema_version` to exercise *Schema version change rebuilds the cache*.
 - **Retention.** `Retention { max_entries, max_bytes, max_idle }` with the spec's 200,000 entries, 256 MiB and 30 days. `max_physical_bytes` is 512 MiB, so physical files are reclaimed close to the logical budget.
 - **Checkpoints.** The default: written before `run` returns. This keeps a crash from losing a build.
 - **Open failure:**
   1. If `Database::open` returns a lock or busy error, use `Database::memory`, log a warning and continue.
-  2. On any other open error, remove the directory, retry once, then fall back to memory.
+  2. If Ajika reports the contents invalid (`PersistenceErrorKind::InvalidCache`, damage it could not reset itself), remove the directory, retry once, then fall back to memory.
+  3. On any other error (I/O, permissions, a full disk), fall back to memory without deleting anything, so a transient failure never wipes a valid cache.
 
-  Pinned in task 1.2 against 0.2.1: a second `Database::open` on a held directory returns `ErrorKind::Persistence(e)` with `e.kind() == PersistenceErrorKind::InUse`. Only `InUse` selects the memory fallback without removing the directory; every other open error takes step 2.
+  Pinned in task 1.2 against 0.2.1: a second `Database::open` on a held directory returns `ErrorKind::Persistence(e)` with `e.kind() == PersistenceErrorKind::InUse`. Only `InvalidCache` removes the directory.
 
 ```mermaid
 flowchart TD
@@ -164,7 +171,8 @@ flowchart TD
     B -- yes --> C[Database::open dir, epoch]
     C -- ok --> D[disk database]
     C -- locked --> M
-    C -- other error --> E[remove dir, open again]
+    C -- invalid cache --> E[remove dir, open again]
+    C -- other error --> M
     E -- ok --> D
     E -- error --> M
 ```
@@ -179,7 +187,9 @@ One `run` is one natural unit of work:
 | Watcher change set | one `Apply` |
 | Tool call | one `Symbols` per batch |
 
-`find_symbol_references` on a directory batches 256 files per request. It keeps walk order and the existing `max_results` truncation, so output is identical. The owner thread never keeps an operation open between commands, which follows the book's guidance on peak memory.
+`find_symbol_references` on a directory batches 256 files per request and keeps walk order. Files the index does not answer are parsed directly only when they are scanned, so a search that reaches `max_results` early parses no more than before. The `max_results` limit applies to the total across all search paths, and one extra match is collected so the "Results capped" note appears when results were capped.
+
+Tools resolve through one `SymbolResolver` per call. After the first timeout or error it stops asking the index for the rest of the call, so a busy index (for example during a rebuild) costs one 2 s deadline per call, not one per file or batch. The owner thread never keeps an operation open between commands, which follows the book's guidance on peak memory.
 
 **RAM.** After each `run` the host forgets the text of every file it installed in that operation (`forget(SourceFile::TEXT, path)`). File text is not held between operations. A later validation re-acquires it through `read_source`, and equal text validates without executing.
 
@@ -210,7 +220,7 @@ sequenceDiagram
 
 **Why tools supply text.** The spec requires symbols for the text the tool read. Supplying it closes the window where the watcher has not yet reported an edit.
 
-**Before setting text, the owner compares it with the captured value.** This means equal text never creates a new input revision. Task 1.2 verified that Ajika already tolerates identical sets: an equal `set_text` leaves `executed == 0` and `validated == 0`, so it preserves validity. The comparison is kept regardless, because it also avoids a needless input write per lookup.
+**The owner sets the supplied text without comparing it first.** Text is forgotten after every operation, so there is never a captured value to compare with. Task 1.2 verified that this is safe: setting text equal to the text behind a stored result leaves `executed == 0` and `validated == 0`, so the result stays valid and the lookup is answered without parsing.
 
 Plumbing:
 
@@ -224,11 +234,14 @@ Plumbing:
 `file_symbols` and `file_functions` increment a shared `AtomicU64` in the untracked services (`db.services()`) each time their body runs. Counting real executions is the use the book explicitly allows for services. After each `run`, the owner computes:
 
 - `parsed_files += executions this run`;
-- `reused_files += requested per-file results − executions`.
+- `reused_files += requested per-file results − executions`, only when the operation succeeded.
 
-`WorkspaceIndexStats` gains both fields, filled from the `Stats` command.
+The counters live in atomics shared by the owner and its clients, updated before each reply is sent. `CodeCacheClient::stats` reads them without a round trip once the database is open, so `GetStats` never waits behind a running build. `WorkspaceIndexStats` gains both fields.
 
 ### D8. Function index assembly
+
+(TypeScript fingerprints: `file_functions` hands the entries it just computed, fingerprints included, to the host through an untracked services side output. The host uses them for files computed in that operation and recomputes fingerprints from the stored mirror (D4) only for reused files.)
+
 
 `WorkspaceIndexActor::create` and `Rebuild`:
 
@@ -243,6 +256,12 @@ Plumbing:
 3. Replace or remove the per-file entries in the in-memory index (`FunctionIndex::set_file_entries` / `remove_file`).
 
 `update_file` and `remove_file` (`UpdateFile`, `RemoveFile`) go through the same path. `FunctionIndex::build` / `build_sync` remain for direct users and tests, but `build_sync`'s per-language bodies are folded into one `index_file_entries(path, source, config)`. The query and the eager build therefore share one extraction function.
+
+### D9. Reclaiming caches of roots that never return
+
+Retention only runs inside an open owner, so caches of roots that are never opened again (removed worktrees) would never be collected. Each disk owner, after opening, therefore sweeps its sibling directories under the cache base. A sibling is removed when its name is a 16-hex-digit cache name, it was last used longer than `max_idle` ago, and its Ajika lock file (`owner.lock`) can be locked, which means no process holds it. "Last used" is the lock file's modification time; Ajika never writes that file, so the owner touches it on open and on close. On Unix the directory is removed while the lock is held.
+
+The cache base (`querymt/code-index`) is created with mode `0700` on Unix, because stored results include function bodies and configuration values.
 
 ## Risks / Trade-offs
 
