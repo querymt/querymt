@@ -1,7 +1,8 @@
 //! SQLite implementation of the querymt agent storage contracts.
 //!
-//! This is the agent storage package that talks to `rusqlite`. With
-//! `mesh-access`, it also provides a separate mesh policy store.
+//! Depends only on `querymt-agent-core` (design D1). This is the one agent
+//! package, besides `querymt-agent-knowledge`'s own cache file, that talks to
+//! `rusqlite`.
 
 pub mod backend;
 #[cfg(test)]
@@ -10,8 +11,6 @@ pub mod error;
 pub mod knowledge;
 #[cfg(test)]
 mod location_tests;
-#[cfg(feature = "mesh-access")]
-pub mod mesh_access;
 pub mod repo_dotagents_automation;
 pub mod repo_dotagents_tasks;
 pub mod repo_schedule;

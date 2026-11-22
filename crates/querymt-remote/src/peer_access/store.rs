@@ -8,7 +8,7 @@ use super::{InvalidPeerGrant, PeerGrant, PeerGrantKey};
 use crate::NodeId;
 
 /// Last committed policy and the revision to supply to the next owner write.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerGrantState {
     /// The nil revision represents an absent row, not a persisted edit.
     pub revision: Uuid,

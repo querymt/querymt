@@ -41,6 +41,8 @@ pub enum PeerGrant {
     Custom {
         sessions: bool,
         filesystem: bool,
+        #[serde(default)]
+        shell: bool,
         providers: Vec<ProviderGrant>,
     },
 }
@@ -67,6 +69,8 @@ pub enum ModelSelection {
 pub enum InvalidPeerGrant {
     #[error("filesystem access requires session access")]
     FilesystemRequiresSessions,
+    #[error("shell access requires filesystem access")]
+    ShellRequiresFilesystem,
     #[error("provider IDs must be nonempty and unique")]
     InvalidProviders,
     #[error("a model selection must contain nonempty, unique IDs")]
@@ -80,6 +84,7 @@ impl PeerGrant {
         let Self::Custom {
             sessions,
             filesystem,
+            shell,
             providers,
         } = self
         else {
@@ -87,6 +92,9 @@ impl PeerGrant {
         };
         if *filesystem && !sessions {
             return Err(InvalidPeerGrant::FilesystemRequiresSessions);
+        }
+        if *shell && !filesystem {
+            return Err(InvalidPeerGrant::ShellRequiresFilesystem);
         }
         let mut ids = HashSet::with_capacity(providers.len());
         for provider in providers {
@@ -127,8 +135,9 @@ impl PeerGrant {
     }
 
     /// Whether the peer may invoke the unsandboxed shell, subject to host tool policy.
-    pub fn allows_shell(&self) -> bool {
+    pub fn allows_shell(&self, protocol: SharingProtocol) -> bool {
         matches!(self, Self::Full)
+            || self.allows_filesystem(protocol) && matches!(self, Self::Custom { shell: true, .. })
     }
 
     /// Check a resolved host provider/model pair. This does not check available quota.
@@ -166,26 +175,35 @@ mod tests {
             assert!(!grant.allows_filesystem(protocol));
             assert!(!grant.allows_model(protocol, "example", "model-1"));
         }
-        assert!(!grant.allows_shell());
+        assert!(!grant.allows_shell(SharingProtocol::V1));
     }
 
     #[test]
     fn peer_access_validates_restricted_capability_combinations() {
-        let custom = |sessions, filesystem| PeerGrant::Custom {
+        let custom = |sessions, filesystem, shell| PeerGrant::Custom {
             sessions,
             filesystem,
+            shell,
             providers: vec![],
         };
         assert_eq!(
-            custom(false, true).validate(),
+            custom(false, true, true).validate(),
             Err(InvalidPeerGrant::FilesystemRequiresSessions)
         );
-        let grant = custom(true, false);
-        assert!(grant.allows_sessions(SharingProtocol::V1));
-        assert!(!grant.allows_filesystem(SharingProtocol::V1));
-        assert!(!grant.allows_shell());
-        let invalid = json!({"mode": "custom", "sessions": true, "filesystem": true, "providers": [], "shell": true});
-        assert!(serde_json::from_value::<PeerGrant>(invalid).is_err());
+        assert_eq!(
+            custom(true, false, true).validate(),
+            Err(InvalidPeerGrant::ShellRequiresFilesystem)
+        );
+        let json = json!({"mode": "custom", "sessions": true, "filesystem": true, "providers": []});
+        let grant: PeerGrant = serde_json::from_value(json).unwrap();
+        assert_eq!(grant, custom(true, true, false));
+        assert_eq!(serde_json::to_value(&grant).unwrap()["shell"], false);
+        assert!(!grant.allows_shell(SharingProtocol::V1));
+        let grant = custom(true, true, true);
+        grant.validate().unwrap();
+        assert!(grant.allows_shell(SharingProtocol::V1));
+        assert!(!grant.allows_shell(SharingProtocol::Legacy));
+        assert!(PeerGrant::Full.allows_shell(SharingProtocol::Legacy));
     }
 
     #[test]
@@ -193,6 +211,7 @@ mod tests {
         let grant = PeerGrant::Custom {
             sessions: false,
             filesystem: false,
+            shell: false,
             providers: vec![
                 ProviderGrant {
                     provider_id: "selected".into(),

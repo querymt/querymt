@@ -101,13 +101,11 @@ done
 features=""
 if hit agent; then features="$(qualify querymt-agent "$AGENT_FEATURES")"; fi
 if hit runtime; then features+="${features:+,}$(qualify querymt-agent-runtime "$RUNTIME_FEATURES")"; fi
-if hit sqlite; then features+="${features:+,}querymt-agent-sqlite/mesh-access"; fi
 feature_flag=""
 if [[ -n $features ]]; then feature_flag="--features $features"; fi
 
 clippy='[]'
 add() { clippy="$(jq -c --arg n "$1" --arg f "$2" '. + [{name: $n, flags: $f}]' <<<"$clippy")"; }
-if hit sqlite; then lower_args+=" --features querymt-agent-sqlite/mesh-access"; fi
 if [[ -n $lower_args ]]; then add lower "${lower_args# }"; fi
 if hit runtime; then add runtime "-p querymt-agent-runtime --features $RUNTIME_FEATURES"; fi
 if hit agent; then add agent "-p querymt-agent --features $AGENT_FEATURES"; fi
