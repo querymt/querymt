@@ -1,4 +1,6 @@
 
+
+
 <!doctype html>
 <html lang="en" class="no-js">
   <head>
@@ -12,6 +14,7 @@
       
       
       
+      
         <link rel="prev" href="../configuration/">
       
       
@@ -22,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.1.2">
+      <meta name="generator" content="zensical-0.1.3">
     
     
       
@@ -33,12 +36,13 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.ebb7f775.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e2cf241e.min.css">
       
         
           
         
         <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.b60ce83d.min.css">
+      
       
       
 
@@ -2330,7 +2334,7 @@
 <li>other non-zero exits, signals, and timeouts: hook infrastructure errors</li>
 <li><code>system_message</code>: emitted as a non-error durable notice and never inserted into model context</li>
 </ul>
-<p><code>additional_context</code> defaults to an approximate 2500-token limit, configurable per handler with <code>additional_context_limit</code>. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every <code>tool_result</code> block in the combined result message. <code>context</code> contributions exist only in the prepared request and never mutate stored history.</p>
+<p><code>additional_context</code> defaults to an approximate 2500-token limit, configurable per handler with <code>additional_context_limit</code>. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every <code>tool_result</code> block in the combined result message. <code>context</code> contributions exist only in the prepared request and never mutate stored history. They are sent in one trailing user message placed after the last cache breakpoint, so they never change the cached prefix.</p>
 <h3 id="subagent-change-hooks">Subagent change hooks</h3>
 <p><code>subagent_added</code> and <code>subagent_removed</code> run after a subagent is added to or removed from a running agent, by any path (the Rust or Python API, <code>querymt/agents/add</code>, <code>querymt/agents/remove</code>). A profile's own <code>[agent.hooks]</code> run for changes to that profile's runtime. They are observe-only and are not tied to a session: there is no <code>session_id</code>, and a failure, timeout, block request or invalid reply is logged and never undoes the change. <code>mcp_tool</code> handlers are rejected for these events. The only accepted output field is <code>system_message</code>.</p>
 <p>Input fields: <code>hook_event_name</code>, <code>subagent_id</code>, <code>name</code>, <code>description</code>, <code>capabilities</code>, <code>origin</code> (<code>config</code>, <code>protocol</code> or <code>runtime</code>), <code>location</code> (<code>local</code> or <code>remote</code>), <code>generation</code>, <code>profile_id</code> (or <code>null</code>) and <code>cwd</code>.</p>
@@ -2450,7 +2454,9 @@ the raw versus effective argument rules.</p>
 <a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<p>A <code>context</code> replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, or changes to existing tool-call identities, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.</p>
+<p>A <code>context</code> hook receives the durable history only: the stored messages of the session, including stored notices such as mode reminders and Stop-hook continuation messages. It does not receive the run objective or other hooks' <code>additional_context</code>, which are added to the request after the hook runs. <code>additional_context</code> from a <code>context</code> hook is sent in the trailing request message described above and is not stored; the hook must return it on every request it should apply to.</p>
+<p>On a provider that supports tool changes inside the conversation (see <a href="../configuration/#tools-that-change-during-a-session">Tools that change during a session</a>), the messages a <code>context</code> hook receives can include tool-change messages: user messages whose only content is the tool definitions added or redefined and the tool names removed. A replacement must keep every one of them, unchanged and in the same order; a replacement that drops, edits or reorders one is ignored with a notice, because a tool change is stored once and a request without it would keep offering the old tools. Tool baselines are not sent as messages and never appear.</p>
+<p>A <code>context</code> replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, changes to existing tool-call identities, or changes to tool-change messages, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.</p>
 <h3 id="permission_request-allow">permission_request allow</h3>
 <p>Example script for <code>crates/agent/examples/hooks/approve-safe-shell.sh</code>:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1"> 1</a></span>
@@ -2505,6 +2511,7 @@ the raw versus effective argument rules.</p>
 <a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p>For <code>pre_compaction</code> and <code>post_compaction</code>, <code>model</code> is the model the summary is requested from, and <code>provider</code> is the provider that serves it: the session's, unless <code>[agent.execution.compaction]</code> selects another (see its <code>provider</code> and <code>model</code> keys). They are the same pair the request, its cost accounting and its trace span use. When a <code>pre_compaction</code> hook supplies the summary no request is made, and both hooks still name the model that would have been asked. <code>post_compaction</code> also gets <code>summary_source</code>: <code>model</code> (the compaction model wrote it) or <code>hook</code> (a <code>pre_compaction</code> hook supplied it). A compaction whose policy names no usable model (a <code>provider</code> without a <code>model</code>, built in code: a configuration file is refused when it loads) fails before it starts and runs no hook.</p>
 <p>A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in <code>candidate_summary</code>; the last valid candidate wins. <code>pre_compaction.messages</code> contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.</p>
 <p>Command hooks are the portable lifecycle mechanism. MCP-backed handlers are intended for automatic retrieval, sanitation, and policy calls against connected services; ordinary MCP tools remain separately registered and model-visible. Compiled middleware remains the right choice for in-process state-machine behavior.</p>
 <h3 id="pre_compaction-block">pre_compaction block</h3>
@@ -2608,7 +2615,7 @@ the raw versus effective argument rules.</p>
 </code></pre></div></td></tr></table></div>
 <h2 id="stop-hook-behavior">Stop Hook Behavior</h2>
 <p><code>stop</code> runs when a turn would normally complete (<code>stop_reason: "EndTurn"</code>). It also runs when a reply was cut off by the output-token limit and middleware recovery could not continue it (<code>stop_reason: "ModelTokenLimit"</code>), so hooks can keep unattended runs going after a cut-off. Each case has its own continuation counter against the same cap, so token-limit cut-offs do not use up the continuations available for normal end-of-turn stops. Hooks can read <code>stop_reason</code> from their input to tell the two apart.</p>
-<p>If a <code>stop</code> hook returns <code>"continue": false</code> (or <code>"decision": "block"</code>), QueryMT runs another LLM step for that turn, up to the configured cap (see below). QueryMT injects a clearly labeled runtime control message into the next LLM call, wrapped as a <code>&lt;system-reminder&gt;</code> block and marked as generated by the hook runtime rather than by the user.</p>
+<p>If a <code>stop</code> hook returns <code>"continue": false</code> (or <code>"decision": "block"</code>), QueryMT runs another LLM step for that turn, up to the configured cap (see below). QueryMT stores a clearly labeled runtime control message (a <code>notice</code> message part with source <code>stop_hook</code>) in the session history before the next LLM call, wrapped as a <code>&lt;system-reminder&gt;</code> block and marked as generated by the hook runtime rather than by the user. It is stored once, so it is part of the cached prefix of every later request and is visible when the session is reloaded.</p>
 <p>To avoid runaway loops, QueryMT allows at most <code>max_stop_hook_continuations</code> stop-hook continuations per turn (default <code>1</code>). When a hook asks to continue after the cap is reached, the request is ignored, the turn ends, and QueryMT publishes an error-level <code>hook_notice</code> (event <code>stop</code>) so the early end is visible. Raise the cap for long iterative runs, or set it to <code>0</code> to make stop hooks advisory only:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
 <span class="normal"><a href="#__codelineno-17-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[agent.execution]</span>
@@ -2787,7 +2794,8 @@ the raw versus effective argument rules.</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.719e0d91.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.3cb411a8.min.js"></script>
+      <script src="../../assets/javascripts/bundle.9e76c64c.min.js"></script>
+      
       
     
   </body>

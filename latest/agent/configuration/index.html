@@ -1,4 +1,6 @@
 
+
+
 <!doctype html>
 <html lang="en" class="no-js">
   <head>
@@ -12,6 +14,7 @@
       
       
       
+      
         <link rel="prev" href="../">
       
       
@@ -22,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.1.2">
+      <meta name="generator" content="zensical-0.1.3">
     
     
       
@@ -33,12 +36,13 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.ebb7f775.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e2cf241e.min.css">
       
         
           
         
         <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.b60ce83d.min.css">
+      
       
       
 
@@ -1541,6 +1545,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#tools-that-change-during-a-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Tools that change during a session
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2737,50 +2752,126 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <span class="normal"><a href="#__codelineno-5-40">40</a></span>
 <span class="normal"><a href="#__codelineno-5-41">41</a></span>
 <span class="normal"><a href="#__codelineno-5-42">42</a></span>
-<span class="normal"><a href="#__codelineno-5-43">43</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
+<span class="normal"><a href="#__codelineno-5-43">43</a></span>
+<span class="normal"><a href="#__codelineno-5-44">44</a></span>
+<span class="normal"><a href="#__codelineno-5-45">45</a></span>
+<span class="normal"><a href="#__codelineno-5-46">46</a></span>
+<span class="normal"><a href="#__codelineno-5-47">47</a></span>
+<span class="normal"><a href="#__codelineno-5-48">48</a></span>
+<span class="normal"><a href="#__codelineno-5-49">49</a></span>
+<span class="normal"><a href="#__codelineno-5-50">50</a></span>
+<span class="normal"><a href="#__codelineno-5-51">51</a></span>
+<span class="normal"><a href="#__codelineno-5-52">52</a></span>
+<span class="normal"><a href="#__codelineno-5-53">53</a></span>
+<span class="normal"><a href="#__codelineno-5-54">54</a></span>
+<span class="normal"><a href="#__codelineno-5-55">55</a></span>
+<span class="normal"><a href="#__codelineno-5-56">56</a></span>
+<span class="normal"><a href="#__codelineno-5-57">57</a></span>
+<span class="normal"><a href="#__codelineno-5-58">58</a></span>
+<span class="normal"><a href="#__codelineno-5-59">59</a></span>
+<span class="normal"><a href="#__codelineno-5-60">60</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">max_stop_hook_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="w">   </span><span class="c1"># Stop-hook continuations allowed per turn (0 = advisory only)</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a>
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="c1"># Tool output truncation (Layer 1)</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="k">[agent.execution.tool_output]</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="n">max_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2000</span><span class="w">          </span><span class="c1"># Maximum lines before truncation</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="n">max_bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">51200</span><span class="w">         </span><span class="c1"># Maximum bytes before truncation (50 KB)</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="n">overflow_storage</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"temp_dir"</span><span class="w">  </span><span class="c1"># discard | temp_dir | data_dir</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a>
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="c1"># Pruning (Layer 2) - runs after every turn</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="k">[agent.execution.pruning]</span>
-<a id="__codelineno-5-12" name="__codelineno-5-12"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">            </span><span class="c1"># Enable/disable pruning</span>
-<a id="__codelineno-5-13" name="__codelineno-5-13"></a><span class="n">protect_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">40000</span><span class="w">    </span><span class="c1"># Tokens of recent output to protect</span>
-<a id="__codelineno-5-14" name="__codelineno-5-14"></a><span class="n">minimum_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">20000</span><span class="w">    </span><span class="c1"># Minimum tokens to clear before pruning</span>
-<a id="__codelineno-5-15" name="__codelineno-5-15"></a><span class="n">protected_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"skill"</span><span class="p">]</span><span class="w">  </span><span class="c1"># Tools never to prune</span>
-<a id="__codelineno-5-16" name="__codelineno-5-16"></a>
-<a id="__codelineno-5-17" name="__codelineno-5-17"></a><span class="c1"># AI Compaction (Layer 3) - runs on context overflow</span>
-<a id="__codelineno-5-18" name="__codelineno-5-18"></a><span class="k">[agent.execution.compaction]</span>
-<a id="__codelineno-5-19" name="__codelineno-5-19"></a><span class="n">auto</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">               </span><span class="c1"># Enable automatic compaction</span>
-<a id="__codelineno-5-20" name="__codelineno-5-20"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="w">    </span><span class="c1"># Optional: different provider for compaction</span>
-<a id="__codelineno-5-21" name="__codelineno-5-21"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-haiku"</span><span class="w">    </span><span class="c1"># Optional: cheaper model for compaction</span>
-<a id="__codelineno-5-22" name="__codelineno-5-22"></a>
-<a id="__codelineno-5-23" name="__codelineno-5-23"></a><span class="k">[agent.execution.compaction.retry]</span>
-<a id="__codelineno-5-24" name="__codelineno-5-24"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-5-25" name="__codelineno-5-25"></a><span class="n">initial_backoff_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1000</span>
-<a id="__codelineno-5-26" name="__codelineno-5-26"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
-<a id="__codelineno-5-27" name="__codelineno-5-27"></a>
-<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="c1"># Compaction is a paid request. Every attempt (including a retry after a</span>
-<a id="__codelineno-5-29" name="__codelineno-5-29"></a><span class="c1"># rejected or empty summary) is recorded in the session's cost accounting</span>
-<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="c1"># under the "compaction" purpose, charged to the cycle that triggered it.</span>
-<a id="__codelineno-5-31" name="__codelineno-5-31"></a><span class="c1"># See "Cost accounting" in api_reference.md.</span>
-<a id="__codelineno-5-32" name="__codelineno-5-32"></a>
-<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
-<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
-<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="c1"># max_snapshots = 100     # Optional: keep at most this many snapshots (&gt;= 1)</span>
-<a id="__codelineno-5-37" name="__codelineno-5-37"></a><span class="c1"># max_age_days = 30       # Optional: prune snapshots older than this (&gt;= 1)</span>
-<a id="__codelineno-5-38" name="__codelineno-5-38"></a>
-<a id="__codelineno-5-39" name="__codelineno-5-39"></a><span class="c1"># Rate limit retry configuration</span>
-<a id="__codelineno-5-40" name="__codelineno-5-40"></a><span class="k">[agent.execution.rate_limit]</span>
-<a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-5-42" name="__codelineno-5-42"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
-<a id="__codelineno-5-43" name="__codelineno-5-43"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="n">run_objective</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">             </span><span class="c1"># Send the rendered run objective with each model request</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="c1"># Tool output truncation (Layer 1)</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="k">[agent.execution.tool_output]</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="n">max_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2000</span><span class="w">          </span><span class="c1"># Maximum lines before truncation</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="n">max_bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">51200</span><span class="w">         </span><span class="c1"># Maximum bytes before truncation (50 KB)</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="n">overflow_storage</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"temp_dir"</span><span class="w">  </span><span class="c1"># discard | temp_dir | data_dir</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a>
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="c1"># Pruning (Layer 2) - runs after every turn</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12"></a><span class="k">[agent.execution.pruning]</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">            </span><span class="c1"># Enable/disable pruning</span>
+<a id="__codelineno-5-14" name="__codelineno-5-14"></a><span class="n">protect_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">40000</span><span class="w">    </span><span class="c1"># Tokens of recent output to protect</span>
+<a id="__codelineno-5-15" name="__codelineno-5-15"></a><span class="n">minimum_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">20000</span><span class="w">    </span><span class="c1"># Minimum tokens to clear before pruning</span>
+<a id="__codelineno-5-16" name="__codelineno-5-16"></a><span class="n">protected_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"skill"</span><span class="p">]</span><span class="w">  </span><span class="c1"># Tools never to prune</span>
+<a id="__codelineno-5-17" name="__codelineno-5-17"></a>
+<a id="__codelineno-5-18" name="__codelineno-5-18"></a><span class="c1"># AI Compaction (Layer 3) - runs on context overflow</span>
+<a id="__codelineno-5-19" name="__codelineno-5-19"></a><span class="k">[agent.execution.compaction]</span>
+<a id="__codelineno-5-20" name="__codelineno-5-20"></a><span class="n">auto</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">               </span><span class="c1"># Enable automatic compaction</span>
+<a id="__codelineno-5-21" name="__codelineno-5-21"></a><span class="c1"># The compaction request is sent to this provider and model, and is recorded and</span>
+<a id="__codelineno-5-22" name="__codelineno-5-22"></a><span class="c1"># priced for them. Unset keys are the session's: `model` alone is that model on</span>
+<a id="__codelineno-5-23" name="__codelineno-5-23"></a><span class="c1"># the session's provider (and mesh node); `provider` needs a `model`, because</span>
+<a id="__codelineno-5-24" name="__codelineno-5-24"></a><span class="c1"># the session's model belongs to another provider (a `provider` without a</span>
+<a id="__codelineno-5-25" name="__codelineno-5-25"></a><span class="c1"># `model` is refused when the configuration loads). A target built separately</span>
+<a id="__codelineno-5-26" name="__codelineno-5-26"></a><span class="c1"># from the session's does not carry the session's own settings (system prompt,</span>
+<a id="__codelineno-5-27" name="__codelineno-5-27"></a><span class="c1"># reasoning effort, local-model options); a target that names the session's own</span>
+<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="c1"># provider and model reuses the session's provider, so its settings apply.</span>
+<a id="__codelineno-5-29" name="__codelineno-5-29"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="w">    </span><span class="c1"># Optional: different provider for compaction</span>
+<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-haiku"</span><span class="w">    </span><span class="c1"># Optional: cheaper model for compaction</span>
+<a id="__codelineno-5-31" name="__codelineno-5-31"></a>
+<a id="__codelineno-5-32" name="__codelineno-5-32"></a><span class="c1"># Governs summaries the agent rejects (empty, refused or cut off): the number of</span>
+<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="c1"># retries, the wait before the first one and its multiplier. It does not govern</span>
+<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="c1"># provider errors; those use [agent.execution.rate_limit] below.</span>
+<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="k">[agent.execution.compaction.retry]</span>
+<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-5-37" name="__codelineno-5-37"></a><span class="n">initial_backoff_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1000</span>
+<a id="__codelineno-5-38" name="__codelineno-5-38"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-39" name="__codelineno-5-39"></a>
+<a id="__codelineno-5-40" name="__codelineno-5-40"></a><span class="c1"># Compaction is a paid request. Every attempt (including a retry after a</span>
+<a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="c1"># rejected or empty summary, or after a provider error) is recorded in the</span>
+<a id="__codelineno-5-42" name="__codelineno-5-42"></a><span class="c1"># session's cost accounting under the "compaction" purpose, charged to the</span>
+<a id="__codelineno-5-43" name="__codelineno-5-43"></a><span class="c1"># cycle that triggered it. See "Cost accounting" in api_reference.md.</span>
+<a id="__codelineno-5-44" name="__codelineno-5-44"></a>
+<a id="__codelineno-5-45" name="__codelineno-5-45"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
+<a id="__codelineno-5-46" name="__codelineno-5-46"></a><span class="k">[agent.execution.snapshot]</span>
+<a id="__codelineno-5-47" name="__codelineno-5-47"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
+<a id="__codelineno-5-48" name="__codelineno-5-48"></a><span class="c1"># max_snapshots = 100     # Optional: keep at most this many snapshots (&gt;= 1)</span>
+<a id="__codelineno-5-49" name="__codelineno-5-49"></a><span class="c1"># max_age_days = 30       # Optional: prune snapshots older than this (&gt;= 1)</span>
+<a id="__codelineno-5-50" name="__codelineno-5-50"></a>
+<a id="__codelineno-5-51" name="__codelineno-5-51"></a><span class="c1"># Rate limit retry configuration</span>
+<a id="__codelineno-5-52" name="__codelineno-5-52"></a><span class="k">[agent.execution.rate_limit]</span>
+<a id="__codelineno-5-53" name="__codelineno-5-53"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-5-54" name="__codelineno-5-54"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
+<a id="__codelineno-5-55" name="__codelineno-5-55"></a><span class="n">transport_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="w">  </span><span class="c1"># 0..=300; base wait after a failure the provider never answered</span>
+<a id="__codelineno-5-56" name="__codelineno-5-56"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-57" name="__codelineno-5-57"></a>
+<a id="__codelineno-5-58" name="__codelineno-5-58"></a><span class="c1"># Prompt cache</span>
+<a id="__codelineno-5-59" name="__codelineno-5-59"></a><span class="k">[agent.execution.prompt_cache]</span>
+<a id="__codelineno-5-60" name="__codelineno-5-60"></a><span class="n">ttl_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w">              </span><span class="c1"># 0..=86400; 0 keeps the provider's default cache lifetime</span>
 </code></pre></div></td></tr></table></div>
+<p><code>default_wait_secs</code> is the base wait before retrying a failure the provider
+answered (overloaded, rate limited, a 5xx status) when it supplied no delay of
+its own. A delay the provider does supply (<code>Retry-After</code>, <code>retry-after-ms</code>,
+<code>x-ratelimit-reset-requests</code>, or a delay named in the error message) is used
+instead, capped at <code>max_wait_secs</code>.</p>
+<p><code>transport_wait_secs</code> is the base wait for failures where no answer arrived:
+connection refused or reset, DNS failure, a timeout, or a response stream that
+broke or could not be decoded. These carry no delay hint and are usually brief,
+so they do not wait the 60 seconds. With the defaults the retries wait about 10
+seconds and then about 20 (<code>backoff_multiplier</code>), and the attempts are counted
+against <code>max_retries</code> together with the other failures. <code>0</code> retries at once. A
+value outside <code>0..=300</code>, or one that is not an integer, fails the load with an
+error naming <code>transport_wait_secs</code>.</p>
+<p>The compaction request follows the same rules as a model request when the
+provider fails. A provider error is retried only if it can succeed on a second
+try (an overloaded or rate-limited provider, a 5xx status, a lost connection),
+after the wait described above, for at most <code>max(1, rate_limit.max_retries)</code>
+requests in total (a <code>max_retries</code> of <code>0</code> still sends the first request), and clients receive the same retry notices as for a model request. A
+rejected credential or an invalid request fails the compaction after that one
+request. A request that times out is not retried, because the remote side may
+still be working on it, and a cancelled run stops waiting to retry.
+<code>[agent.execution.compaction.retry]</code> applies only to a reply that is not a usable
+summary (empty, refused or cut off), and each of those attempts has its own
+provider retries. In the worst case, where retryable provider errors and
+rejected summaries alternate, one compaction sends
+<code>(compaction.retry.max_retries + 1) × max(1, rate_limit.max_retries)</code> requests: 12 with
+the defaults (it was 4). Every request is recorded in the cost accounting. If you
+set <code>compaction.retry.max_retries = 0</code> to make compaction fail fast, a provider
+error is now still retried, by <code>rate_limit</code>.</p>
+<p><code>ttl_secs</code> is the cache lifetime that the agent's default cache hints (the
+first and last system section and the last two messages) request. It is capped
+at the longest lifetime the provider offers (3600 for Anthropic, 1800 for OpenAI
+Responses), and the provider rounds it up to one it supports (Anthropic: up to
+300 gives 5 minutes, more gives 1 hour; OpenAI Responses: 30 minutes). <code>0</code>, the
+default, requests no lifetime, so the provider's own default applies. A provider
+that offers no choice of lifetime ignores the setting. Hints you set yourself
+with <code>cache = { ephemeral = { ttl_seconds = ... } }</code> keep their own lifetime.
+Anthropic bills a 1-hour cache write at twice the input price against 1.25 times
+for 5 minutes, so a longer lifetime pays off only when you often pause for 5 to
+60 minutes. Use <code>qmt.cache.prefix_change</code> and <code>qmt.cache.idle_secs</code> to see how
+often that happens. A value outside <code>0..=86400</code>, one that is not an integer, or
+an unknown key in the table fails the load with an error naming the key.</p>
 <h4 id="snapshot-scope-and-retention">Snapshot scope and retention</h4>
 <p>Every file inside the snapshot scope is captured, whatever its size. The scope
 is decided by path:</p>
@@ -3170,6 +3261,39 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
 <a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="c1"># Mix with built-in tools</span>
 <a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem.*"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
+<h3 id="tools-that-change-during-a-session">Tools that change during a session</h3>
+<p>An MCP server can add, remove or redefine tools while a session runs (a
+<code>tools/list_changed</code> notification), and the offered tools can change in other
+ways, for example when a skill changes the <code>skill</code> tool's description. Editing
+the tool list at the head of a request invalidates the provider's prompt cache
+for the whole conversation, so the agent avoids that where the provider allows
+it:</p>
+<ul>
+<li>A provider that can change tools inside the conversation declares
+  <code>tool_updates</code> in its chat capabilities. Today that is Anthropic, for the
+  models that accept it: Opus 4.8, 5 and 5.5, Sonnet 5.5, Haiku 5.5 and the
+  Fable 5 and Mythos 5 families. Sonnet 5, Haiku 4.5 and older models do not.
+  A provider plugin built before the declaration existed is treated as not
+  declaring it.</li>
+<li>For such a provider the agent stores the offered tools in the session history
+  as a baseline before the first request, after a compaction and after a model
+  change. The baseline is the request's tool list and is never sent as a
+  message. When the tools offered now differ from the baseline plus the changes
+  stored after it, the agent stores one change (the definitions added or
+  redefined, and the names removed) after the tool results and sends it as a
+  message in the conversation. The tool list at the head of the request stays
+  the same, so the cached prefix is still read and the request records
+  <code>prefix_change = "none"</code>.</li>
+<li>Every other provider gets the tools offered now as the request's tool list, as
+  before, and nothing is stored. A change then costs one cache rewrite and the
+  request records <code>prefix_change = "tools"</code>. Baselines and changes stored under
+  an earlier model stay in the history and are left out of requests to such a
+  provider.</li>
+</ul>
+<p>Tools are always sent ordered by name, so a restart or an MCP refresh that
+reports the same tools does not change the request. Tool changes follow the
+tool results of the step they were found in and are never placed between a tool
+call and its result.</p>
 <h2 id="middleware-configuration">Middleware Configuration</h2>
 <p>Middleware extends agent behavior through a pluggable stack. Building an agent (root agent or delegate) fails when an entry has an unknown <code>type</code> or invalid configuration; an entry turned off by its own config (for example <code>enabled = false</code>) is skipped. The initial session mode is the <code>mode</code> key on <code>[agent]</code> and <code>[[delegates]]</code>, not a middleware setting:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1"> 1</a></span>
@@ -4130,7 +4254,8 @@ stays in place, and the placeholder is never executed.</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.719e0d91.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.3cb411a8.min.js"></script>
+      <script src="../../assets/javascripts/bundle.9e76c64c.min.js"></script>
+      
       
     
   </body>

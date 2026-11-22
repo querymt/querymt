@@ -1,4 +1,6 @@
 
+
+
 <!doctype html>
 <html lang="en" class="no-js">
   <head>
@@ -12,6 +14,7 @@
       
       
       
+      
         <link rel="prev" href="../">
       
       
@@ -22,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.1.2">
+      <meta name="generator" content="zensical-0.1.3">
     
     
       
@@ -33,12 +36,13 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.ebb7f775.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e2cf241e.min.css">
       
         
           
         
         <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.b60ce83d.min.css">
+      
       
       
 
@@ -2068,8 +2072,13 @@ legacy strings and string arrays remain supported. For example, in an agent conf
 <a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>In the agent runtime, plain system strings and <code>{ file = "..." }</code> entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses, but only on
-the <strong>first and last</strong> section (a single section gets one hint). Sections in between
+default cache hints for every provider that declares explicit cache breakpoints in its
+chat capabilities (<code>prompt_cache.explicit_breakpoints</code>: Anthropic, and OpenAI Responses
+on a model and endpoint that support them), but only on
+the <strong>first and last</strong> section (a single section gets one hint). A provider or plugin
+that declares nothing gets no default system hints; the decision never depends on the
+provider's name. <code>[agent.execution.prompt_cache] ttl_secs</code> sets the lifetime these
+hints request (see the agent configuration reference). Sections in between
 are still cached, because the last section's prefix covers them; they just have no
 reuse boundary of their own. To keep a boundary on a middle section, give it an
 explicit <code>cache</code> hint. Explicit hints/TTLs (including <code>cache = null</code>) and native
@@ -2080,12 +2089,13 @@ defaults are agent policy.</p>
 the provider keeps the most useful ones and drops the rest with a warning; see
 <a href="../available-providers/#prompt-cache-breakpoints">Prompt cache breakpoints</a>.</p>
 <p>Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
-unsupported translation remains disabled, so annotations do not guarantee reuse.</p>
+unsupported translation remains disabled and Codex declares no breakpoints, so it
+gets no default hints.</p>
 <p>Programmatic callers can pass <code>querymt::params::SystemPrompt::with_cache(text, hint)</code>
 to <code>.system(...)</code>. File references are resolved by the agent, not provider plugins.
 Providers translate hints; unsupported endpoints may skip them. Responses supports
-only a 1,800-second (<code>30m</code>) request-wide minimum lifetime: applied hints must agree
-with the provider's configured TTL. Omit <code>ttl_seconds</code> for the provider default.
+only a 1,800-second (<code>30m</code>) request-wide lifetime: a hint asking for 1,800 seconds or
+less is sent as <code>30m</code>, and a hint asking for more fails the request. Omit <code>ttl_seconds</code> for the provider default.
 A lifetime is not a deletion deadline, and cache hits are not guaranteed.</p>
 <p>On supported OpenAI Responses models, hints become explicit prefix breakpoints;
 request-wide mode remains configurable with <code>extra_body.prompt_cache_options</code>.
@@ -2334,7 +2344,8 @@ Offline request-shape and verdict tests run without OAuth or inference:</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.719e0d91.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.3cb411a8.min.js"></script>
+      <script src="../../assets/javascripts/bundle.9e76c64c.min.js"></script>
+      
       
     
   </body>

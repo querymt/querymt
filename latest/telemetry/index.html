@@ -1,4 +1,6 @@
 
+
+
 <!doctype html>
 <html lang="en" class="no-js">
   <head>
@@ -12,6 +14,7 @@
       
       
       
+      
         <link rel="prev" href="../architecture/">
       
       
@@ -22,7 +25,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.1.2">
+      <meta name="generator" content="zensical-0.1.3">
     
     
       
@@ -33,12 +36,13 @@
       
         
       
-      <link rel="stylesheet" href="../assets/stylesheets/modern/main.ebb7f775.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/modern/main.e2cf241e.min.css">
       
         
           
         
         <link rel="stylesheet" href="../assets/stylesheets/modern/palette.b60ce83d.min.css">
+      
       
       
 
@@ -593,6 +597,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#request-attempts" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Request attempts
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#what-metadata-is-attached-to-spans" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -710,6 +725,34 @@
       </span>
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Adjusting verbosity">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#spans-that-need-debug-level" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Spans that need debug level
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#actor-dispatch-spans" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Actor dispatch spans
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
         
@@ -2003,8 +2046,8 @@ produces a tree of child spans describing every step that was executed.</p>
 <td>Building the middleware driver for the turn</td>
 </tr>
 <tr>
-<td><code>agent.execution.profile</code></td>
-<td>Resolving the turn's model profile (builds the provider on first use)</td>
+<td><code>agent.execution.provider_init</code></td>
+<td>Resolving the run's model (provider and its profile) after the prompt is stored and before the run starts; a child of <code>agent.prompt.execute</code>, not of <code>agent.execution.turn</code> (builds the provider on first use)</td>
 </tr>
 <tr>
 <td><code>agent.execution.context_init</code></td>
@@ -2028,7 +2071,7 @@ produces a tree of child spans describing every step that was executed.</p>
 </tr>
 <tr>
 <td><code>agent.request.cache_breakpoints</code></td>
-<td>Applying cache hints to the request messages</td>
+<td>Applying cache hints to the request messages (debug level)</td>
 </tr>
 <tr>
 <td><code>agent.accounting.open</code></td>
@@ -2052,7 +2095,7 @@ produces a tree of child spans describing every step that was executed.</p>
 </tr>
 <tr>
 <td><code>agent.execution.middleware.*</code></td>
-<td>Middleware phases (<code>turn_start</code>, <code>step_start</code>, <code>after_llm</code>, <code>processing_tool_calls</code>)</td>
+<td>Middleware stages (<code>turn_start</code>, <code>step_start</code>, <code>after_llm</code>, <code>turn_end</code>, <code>stopped</code>; debug level)</td>
 </tr>
 </tbody>
 </table>
@@ -2083,7 +2126,7 @@ produces a tree of child spans describing every step that was executed.</p>
 </tr>
 <tr>
 <td><code>agent.tool.side_effects</code></td>
-<td>Processing tool side-effects</td>
+<td>Processing tool side-effects (debug level)</td>
 </tr>
 <tr>
 <td><code>agent.tool.snapshot.*</code></td>
@@ -2259,12 +2302,8 @@ these operations (<code>operation</code>: <code>start</code>, <code>callback</co
 </thead>
 <tbody>
 <tr>
-<td><code>middleware.phase</code></td>
-<td>Running a middleware phase</td>
-</tr>
-<tr>
 <td><code>middleware.driver</code></td>
-<td>Middleware driver orchestration</td>
+<td>One middleware's hook call, with its <code>name</code> and <code>phase</code> (debug level)</td>
 </tr>
 <tr>
 <td><code>middleware.dedup_check.analyze</code></td>
@@ -2312,6 +2351,25 @@ these operations (<code>operation</code>: <code>start</code>, <code>callback</co
 <p>Metadata includes known providers, models, request settings, response IDs,
 finish reasons, token usage, errors, and tool status. Input totals include cache
 read/write tokens; output totals include reasoning tokens, with breakdowns when available.</p>
+<h4 id="request-attempts">Request attempts</h4>
+<p>A <code>chat {model}</code> span covers every attempt of one model request. It carries the
+integer attribute <code>gen_ai.request.attempt</code> (the number of attempts started) and
+one <code>gen_ai.request.attempt</code> event per attempt that ended, in order, with the
+same attribute on the event. Retries after provider errors, transport failures
+and streams that broke all count. The event of a failed attempt also carries
+<code>error.type</code>; the error message is not exported. A cancelled attempt adds no
+event, and a reply requested again at a higher output cap is a new request with
+its own span. Provider setup retries (<code>agent.llm.call_with_retry</code> with
+<code>operation = provider_init</code>) are not attempts of a request.</p>
+<p>A compaction request is a <code>chat {model}</code> span too and carries the same
+attribute and events. Its attempts are the requests of one compaction: a retry
+after a provider error and a request for a new summary after a rejected one both
+count, so <code>gen_ai.request.attempt</code> is the number of the last request sent. A
+request that timed out is not retried; its event does not carry <code>error.type</code>
+(the timeout is recorded as the span's error).</p>
+<p>A compaction span names the model the request ran on (<code>[agent.execution.compaction]</code>
+<code>model</code>, else the session's) and the session that started the compaction, never a
+session read from the history. Its retry-wait events are written to that session.</p>
 <p>When available, <code>gen_ai.conversation.id</code> and its <code>session.id</code> alias identify the
 current session. Delegates use their own session ID.
 <code>gen_ai.agent.id</code> identifies the configured agent, not the session, and is
@@ -2560,21 +2618,38 @@ Collector, etc.) will work.</p>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="c1"># Include debug-level spans and logs (more verbose)</span>
 <a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
 </code></pre></div></td></tr></table></div>
+<h4 id="spans-that-need-debug-level">Spans that need debug level</h4>
+<p>Per-step bookkeeping spans are only exported at <code>debug</code> or more verbose, so a
+default trace describes work (model requests, tool calls) and not internals:
+<code>middleware.driver</code>, <code>agent.execution.middleware.turn_start</code>,
+<code>.step_start</code>, <code>.after_llm</code>, <code>.turn_end</code>, <code>.stopped</code>,
+<code>agent.tool.side_effects</code>, <code>agent.request.cache_breakpoints</code>,
+<code>model_inventory.get_snapshot</code> and <code>function_index.remove_file</code>. Model request,
+<code>execute_tool</code> and <code>agent.tool.invoke</code> spans are unchanged.</p>
+<h4 id="actor-dispatch-spans">Actor dispatch spans</h4>
+<p>The actor framework (<code>kameo</code>) creates a span for every message an actor handles.
+There are very many, most under a millisecond, so unless <code>QMT_TELEMETRY_LEVEL</code>
+names the <code>kameo</code> target, <code>kameo</code> is limited to <code>warn</code> (like <code>iroh</code>). Spans
+created while a message is handled are still exported. To export the dispatch
+spans again:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>info,kameo<span class="o">=</span>info
+</code></pre></div></td></tr></table></div>
+<p>A stricter global level such as <code>warn</code> or <code>error</code> already applies to both.</p>
 <p>The console filter (<code>RUST_LOG</code>) is independent — you can keep the console
 quiet while still exporting detailed telemetry, or vice versa:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
-<span class="normal"><a href="#__codelineno-5-2">2</a></span>
-<span class="normal"><a href="#__codelineno-5-3">3</a></span>
-<span class="normal"><a href="#__codelineno-5-4">4</a></span>
-<span class="normal"><a href="#__codelineno-5-5">5</a></span>
-<span class="normal"><a href="#__codelineno-5-6">6</a></span>
-<span class="normal"><a href="#__codelineno-5-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Verbose console, minimal telemetry</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>debug
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>error
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a>
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="c1"># Quiet console, detailed telemetry</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>error
-<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span>
+<span class="normal"><a href="#__codelineno-6-4">4</a></span>
+<span class="normal"><a href="#__codelineno-6-5">5</a></span>
+<span class="normal"><a href="#__codelineno-6-6">6</a></span>
+<span class="normal"><a href="#__codelineno-6-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="c1"># Verbose console, minimal telemetry</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>debug
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>error
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="c1"># Quiet console, detailed telemetry</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>error
+<a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
 </code></pre></div></td></tr></table></div>
 
 
@@ -2702,7 +2777,8 @@ quiet while still exporting detailed telemetry, or vice versa:</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../assets/javascripts/workers/search.719e0d91.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.3cb411a8.min.js"></script>
+      <script src="../assets/javascripts/bundle.9e76c64c.min.js"></script>
+      
       
     
   </body>
