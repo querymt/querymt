@@ -45,9 +45,7 @@ pub(crate) use error::TurnError;
 pub(crate) mod llm_retry;
 mod maintenance;
 pub(crate) mod prefix;
-pub(crate) use maintenance::{
-    CompactionOutcome, TRIGGER_MANUAL, compact_history, compact_history_with,
-};
+pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history_with};
 mod progress_sink;
 pub(crate) mod stage;
 mod tool_calls;
