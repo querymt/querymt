@@ -825,6 +825,7 @@ impl QmtApp {
         let p = *palette(cx);
         // Pinned then open, in their tab order (see `sidebar_shown`).
         let open = self.sidebar_shown(cx).open;
+        let rail_len = open.len();
         let waiting = self.store.read(cx).sessions_waiting();
         let current_tab = self
             .store
@@ -964,12 +965,20 @@ impl QmtApp {
                                     )
                                 });
                                 let s2 = s.clone();
-                                self.tab_row(tile, list, ix, &s, sidebar::TabLook::Tile, 6., &p, cx)
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.open_summary(&s2, cx)
-                                        }),
-                                    )
+                                self.tab_row(
+                                    tile,
+                                    list,
+                                    ix,
+                                    rail_len,
+                                    &s,
+                                    sidebar::TabLook::Tile,
+                                    6.,
+                                    &p,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)),
+                                )
                             })),
                     )
                     .child(separator())
@@ -1129,6 +1138,7 @@ impl QmtApp {
                     row,
                     crate::store::sidebar::SideList::Pinned,
                     ix,
+                    pinned.len(),
                     s,
                     sidebar::TabLook::Pinned,
                     1.,
@@ -1210,6 +1220,7 @@ impl QmtApp {
                     row,
                     crate::store::sidebar::SideList::Open,
                     ix,
+                    open.len(),
                     s,
                     sidebar::TabLook::Open {
                         workspace: workspace_name(&s.cwd).into(),

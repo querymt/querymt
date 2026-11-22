@@ -239,12 +239,14 @@ impl QmtApp {
     /// Make `row` a tab of `list`: draggable within it, a drop target
     /// showing where the dragged row would land, and a right-click menu.
     /// `gap`: space between this list's rows; the drop line sits in it.
+    /// `len`: rows in the list, so the line at either end stays inside it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn tab_row(
         &self,
         row: Stateful<Div>,
         list: SideList,
         ix: usize,
+        len: usize,
         s: &SessionSummary,
         look: TabLook,
         gap: f32,
@@ -329,7 +331,12 @@ impl QmtApp {
                     cx.notify();
                 }),
             )
-            .when_some(marker, |el, after| el.child(drop_line(after, gap, p)))
+            .when_some(marker, |el, after| {
+                // At the ends the gap may be the scroll edge, which would
+                // clip the line: it goes just inside the row instead.
+                let end = if after { ix + 1 == len } else { ix == 0 };
+                el.child(drop_line(after, if end { None } else { Some(gap) }, p))
+            })
     }
 
     /// The right-click menu of a sidebar session (the actions of the
@@ -502,12 +509,14 @@ impl QmtApp {
 }
 
 /// Where the dragged row will go: a line in the gap between two rows, with
-/// a ring at its start (browser tab strips).
-fn drop_line(after: bool, gap: f32, p: &Palette) -> Div {
+/// a ring at its start (browser tab strips). Without a `gap`, along the
+/// row's own edge.
+fn drop_line(after: bool, gap: Option<f32>, p: &Palette) -> Div {
     const H: f32 = 8.;
-    let edge = px(-(gap / 2.) - H / 2.);
+    let edge = px(gap.map_or(0., |gap| -(gap / 2.) - H / 2.));
     let color = p.muted;
     h_flex()
+        .debug_selector(|| "tab-drop-line".into())
         .absolute()
         .left_0()
         .right_0()
@@ -791,6 +800,41 @@ mod ui_tests {
             render(handle, cx);
         }
         assert!(shown_ids(&app, cx).len() > super::OPEN_PAGE);
+    }
+
+    #[gpui_kit::test]
+    fn the_line_above_the_first_row_is_not_clipped(cx: &mut TestAppContext) {
+        let (handle, app, _rpc, _requests) = app(3, cx);
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        let from = vcx.debug_bounds("tab-test-agent/s3").unwrap().center();
+        let s1 = vcx.debug_bounds("tab-test-agent/s1").unwrap();
+        let s2 = vcx.debug_bounds("tab-test-agent/s2").unwrap();
+        vcx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        vcx.simulate_mouse_move(
+            point(from.x, from.y - px(10.)),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        let to = point(s1.center().x, s1.center().y - px(4.));
+        vcx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        app.read_with(cx, |app, _| {
+            let t = app.side.drop_target.as_ref().expect("drop line");
+            assert!(t.key.ends_with("/s1") && !t.after);
+        });
+        // The list scrolls from s1's top: the line stays inside the row.
+        render(handle, cx);
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        let line = vcx.debug_bounds("tab-drop-line").expect("line shown");
+        assert!(line.top() >= s1.top() && line.bottom() <= s1.bottom());
+
+        // Between rows it sits in the gap, as before.
+        let to = point(s2.center().x, s2.center().y - px(4.));
+        vcx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        render(handle, cx);
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        let line = vcx.debug_bounds("tab-drop-line").expect("line shown");
+        assert!(line.top() < s2.top() && line.bottom() > s1.bottom());
+        vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
     }
 
     #[gpui_kit::test]
