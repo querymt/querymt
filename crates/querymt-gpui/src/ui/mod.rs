@@ -824,8 +824,10 @@ impl QmtApp {
     fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
         // Pinned then open, in their tab order (see `sidebar_shown`).
-        let open = self.sidebar_shown(cx).open;
+        let shown = self.sidebar_shown(cx);
+        let open = shown.open;
         let rail_len = open.len();
+        let open_more = rail_len < shown.pinned_total + shown.open_total;
         let waiting = self.store.read(cx).sessions_waiting();
         let current_tab = self
             .store
@@ -904,6 +906,11 @@ impl QmtApp {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
+                            // Pages in as it is scrolled, like the expanded list.
+                            .track_scroll(&self.side.scroll)
+                            .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| {
+                                this.sidebar_near_bottom(cx)
+                            }))
                             .w_full()
                             .items_center()
                             .gap_1p5()
@@ -979,7 +986,14 @@ impl QmtApp {
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)),
                                 )
-                            })),
+                            }))
+                            .when(open_more, |el| {
+                                el.child(div().flex_none().py_2().child(kit::spinner(
+                                    "rail-more-open",
+                                    12.,
+                                    p.dim,
+                                )))
+                            }),
                     )
                     .child(separator())
                     .child(self.nav_item(

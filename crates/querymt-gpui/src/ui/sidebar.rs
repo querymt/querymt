@@ -18,8 +18,6 @@ use crate::theme::{Palette, palette};
 pub(super) const OPEN_PAGE: usize = 20;
 /// Pinned sessions shown at first and added per "Show more pinned".
 pub(super) const PINNED_PAGE: usize = 5;
-/// Sessions on the collapsed rail.
-pub(super) const RAIL_SESSIONS: usize = 10;
 /// How close to the bottom the open list loads its next page.
 const LOAD_MARGIN: f32 = 120.;
 
@@ -198,7 +196,8 @@ impl QmtApp {
     }
 
     /// The sidebar's sessions as shown: expanded, pinned then open within
-    /// their limits; collapsed, the rail's first few of both.
+    /// their limits; collapsed, all pinned then the same open rows, in one
+    /// list (the rail has no "Show more pinned").
     pub(super) fn sidebar_shown(&self, cx: &App) -> Shown {
         let store = self.store.read(cx);
         let current = self.current_tab(cx);
@@ -206,11 +205,12 @@ impl QmtApp {
         let open = store.sidebar_sessions(SideList::Open);
         let (pinned_total, open_total) = (pinned.len(), open.len());
         if store.prefs.sidebar_collapsed {
-            let all: Vec<&SessionSummary> = pinned.into_iter().chain(open).collect();
+            let mut rail: Vec<SessionSummary> = pinned.into_iter().cloned().collect();
+            rail.extend(take_keeping(open, self.side.open_limit, current.as_deref()));
             return Shown {
                 pinned: Vec::new(),
                 pinned_total,
-                open: take_keeping(all, RAIL_SESSIONS, current.as_deref()),
+                open: rail,
                 open_total,
             };
         }
@@ -222,8 +222,8 @@ impl QmtApp {
         }
     }
 
-    /// Show the next page of open sessions once the list is scrolled near
-    /// its end (desktop `loadNearBottom`).
+    /// Show the next page of open sessions once the list (expanded or the
+    /// rail) is scrolled near its end (desktop `loadNearBottom`).
     pub(super) fn sidebar_near_bottom(&mut self, cx: &mut Context<Self>) {
         let (offset, max) = (self.side.scroll.offset(), self.side.scroll.max_offset());
         if max.y + offset.y > px(LOAD_MARGIN) {
@@ -835,6 +835,28 @@ mod ui_tests {
         let line = vcx.debug_bounds("tab-drop-line").expect("line shown");
         assert!(line.top() < s2.top() && line.bottom() > s1.bottom());
         vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    }
+
+    #[gpui_kit::test]
+    fn the_collapsed_rail_lists_and_grows_like_the_sidebar(cx: &mut TestAppContext) {
+        let (handle, app, _rpc, _requests) = app(50, cx);
+        let store = app.read_with(cx, |app, _| app.store.clone());
+        cx.update(|cx| store.update(cx, |s, _| s.prefs.sidebar_collapsed = true));
+        render(handle, cx);
+        assert_eq!(shown_ids(&app, cx).len(), super::OPEN_PAGE);
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        // The page's last tile (`OPEN_PAGE` is 20), not the old ten.
+        assert!(vcx.debug_bounds("tab-test-agent/s20").is_some());
+        let tile = vcx.debug_bounds("tab-test-agent/s1").unwrap().center();
+        for _ in 0..3 {
+            vcx.simulate_event(ScrollEvent {
+                position: tile,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-5000.))),
+                ..Default::default()
+            });
+            render(handle, cx);
+        }
+        assert!(shown_ids(&app, cx).len() > super::OPEN_PAGE);
     }
 
     #[gpui_kit::test]
