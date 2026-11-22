@@ -282,6 +282,29 @@ impl AgentsStore {
         }
     }
 
+    /// Where `key` sits in `list`: `(index, rows)`, or `None` when not there.
+    pub fn sidebar_place(&self, list: SideList, key: &str) -> Option<(usize, usize)> {
+        let shown = self.sidebar_sessions(list);
+        let ix = shown.iter().position(|s| tab_key(s) == key)?;
+        Some((ix, shown.len()))
+    }
+
+    /// Move `key` to the top of `list`, or to its bottom with `!top`.
+    pub fn move_sidebar_session_to_end(
+        &mut self,
+        list: SideList,
+        key: &str,
+        top: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = self.sidebar_sessions(list);
+        let edge = if top { shown.first() } else { shown.last() };
+        let Some(target) = edge.map(|s| tab_key(s)) else {
+            return;
+        };
+        self.move_sidebar_session(list, key, &target, !top, cx);
+    }
+
     /// Root sessions (`agent/session`) with a permission or question waiting.
     /// A delegate's request marks the session it belongs to, when known.
     pub fn sessions_waiting(&self) -> HashSet<String> {
