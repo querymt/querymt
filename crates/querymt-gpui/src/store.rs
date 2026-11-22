@@ -2822,6 +2822,16 @@ impl AgentsStore {
                 .map(|t| t.label),
             connected: true,
         });
+        // A chosen peer profile may have been removed on the peer since it
+        // was listed: check right before creating (desktop `launchSession`).
+        let profile_check = target
+            .clone()
+            .zip(self.launch.remote_profile.clone())
+            .filter(|_| {
+                self.runtime
+                    .get(agent_id)
+                    .is_some_and(|rt| rt.supports_method("querymt/profiles"))
+            });
         let image_mode = self.prefs.image_send_mode;
         let mode = self.prefs.mode().to_string();
         let reasoning = self.prefs.reasoning().to_string();
@@ -2838,6 +2848,16 @@ impl AgentsStore {
         let agent_id = agent_id.to_string();
         self._launch_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<String, String> = async {
+                if let Some((node, profile)) = profile_check {
+                    let listed = launch::request_peer_profiles(&rpc, &node).await;
+                    let _ = this.update(cx, |s, cx| {
+                        s.store_peer_profiles(&agent_id, &node, &listed);
+                        cx.notify();
+                    });
+                    if !listed?.iter().any(|p| p.id == profile) {
+                        return Err(launch::MISSING_PEER_PROFILE.to_string());
+                    }
+                }
                 let created = rpc.request(method, params).await?;
                 let session_id = created
                     .get("sessionId")
