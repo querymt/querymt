@@ -11,6 +11,8 @@ use async_channel::Sender;
 use futures::channel::oneshot;
 use serde_json::{Value, json};
 
+use crate::rpc_log::WireLog;
+
 pub enum Incoming {
     Notification {
         method: String,
@@ -58,6 +60,8 @@ pub struct RpcClient {
     outgoing: Sender<String>,
     next_id: Cell<u64>,
     pending: RefCell<HashMap<u64, Pending>>,
+    /// Records the traffic for the debug events viewer (Developer mode).
+    wire: RefCell<Option<Rc<WireLog>>>,
 }
 
 impl RpcClient {
@@ -66,7 +70,18 @@ impl RpcClient {
             outgoing,
             next_id: Cell::new(1),
             pending: RefCell::new(HashMap::new()),
+            wire: RefCell::new(None),
         })
+    }
+
+    /// Record every message of this connection in `wire`.
+    pub fn set_wire_log(&self, wire: Rc<WireLog>) {
+        *self.wire.borrow_mut() = Some(wire);
+    }
+
+    /// The recorder, when one is set and recording.
+    fn recording(&self) -> Option<Rc<WireLog>> {
+        self.wire.borrow().clone().filter(|w| w.enabled())
     }
 
     pub fn request(
@@ -99,8 +114,11 @@ impl RpcClient {
         );
         self.pending.borrow_mut().insert(id, (tx, span.clone()));
         let text =
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": &params }).to_string();
         span.record("rpc.request_bytes", text.len());
+        if let Some(wire) = self.recording() {
+            wire.sent_request(id, method, &params, &text);
+        }
         let outgoing = self.outgoing.clone();
         let request = async move {
             outgoing
@@ -115,18 +133,26 @@ impl RpcClient {
 
     /// Fire-and-forget JSON-RPC notification.
     pub fn notify(&self, method: &str, params: Value) {
-        let text = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
+        let text = json!({ "jsonrpc": "2.0", "method": method, "params": &params }).to_string();
+        if let Some(wire) = self.recording() {
+            wire.sent_notification(method, &params, &text);
+        }
         let _ = self.outgoing.try_send(text);
     }
 
     pub fn respond(&self, id: Value, result: Result<Value, (i64, String)>) {
+        let error = result.as_ref().err().map(|(_, m)| m.clone());
         let message = match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": &id, "result": result }),
             Err((code, message)) => {
-                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+                json!({ "jsonrpc": "2.0", "id": &id, "error": { "code": code, "message": message } })
             }
         };
-        let _ = self.outgoing.try_send(message.to_string());
+        let text = message.to_string();
+        if let Some(wire) = self.recording() {
+            wire.sent_response(&id, error.as_deref(), &text);
+        }
+        let _ = self.outgoing.try_send(text);
     }
 
     /// Route one inbound line: resolves responses, returns notifications and requests.
@@ -138,6 +164,9 @@ impl RpcClient {
         let parse_started = crate::util::now_ms();
         let message: Value = serde_json::from_str(text).ok()?;
         let parse_ms = crate::util::now_ms() - parse_started;
+        if let Some(wire) = self.recording() {
+            wire.received(&message, text);
+        }
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             return Some(match message.get("id") {

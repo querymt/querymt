@@ -464,6 +464,7 @@ impl QmtApp {
             let (id, config) = (c.id.clone(), c.clone());
             let host_managed = c.host_managed;
             let auto_on = c.auto_start;
+            let developer = self.store.read(cx).prefs.developer_mode;
             kit::icon_button(
                 kit::keyed("agent-menu", c.id.clone()),
                 IconName::Ellipsis,
@@ -477,6 +478,7 @@ impl QmtApp {
                 let (i1, i3, i4) = (id.clone(), id.clone(), id.clone());
                 let (a5, i5) = (store_h.clone(), id.clone());
                 let (a6, i6) = (app.clone(), id.clone());
+                let (a7, i7) = (app.clone(), id.clone());
                 let config = config.clone();
                 menu.item(
                     PopupMenuItem::new("Details")
@@ -495,6 +497,17 @@ impl QmtApp {
                             let _ = a6.update(cx, |this, cx| this.open_agent_logs(&i6, window, cx));
                         }),
                 )
+                .when(developer, |m| {
+                    m.item(
+                        PopupMenuItem::new("Debug events…")
+                            .icon(Icon::new(IconName::Bug))
+                            .on_click(move |_, window, cx| {
+                                let _ = a7.update(cx, |this, cx| {
+                                    this.open_debug_events(&i7, None, window, cx)
+                                });
+                            }),
+                    )
+                })
                 .when(live, |m| {
                     m.item(
                         PopupMenuItem::new(if websocket { "Reconnect" } else { "Restart" })
@@ -1312,6 +1325,8 @@ impl QmtApp {
                             ));
                         }
                         let open_id = c.id.clone();
+                        let events_id = c.id.clone();
+                        let developer = self.store.read(cx).prefs.developer_mode;
                         h_flex()
                             .gap_3()
                             .child(
@@ -1346,6 +1361,17 @@ impl QmtApp {
                                         this.open_agent_logs(&open_id, window, cx)
                                     })),
                             )
+                            .when(developer, |el| {
+                                el.child(
+                                    kit::flat_btn("details-open-events", true, true, p)
+                                        .debug_selector(|| "details-open-events".into())
+                                        .child(kit::icon(IconName::Bug, 14., p.text))
+                                        .child("Debug events…")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_debug_events(&events_id, None, window, cx)
+                                        })),
+                                )
+                            })
                     })
                     .map(|el| self.smooth_scroll.region("agent-details", el)),
             );

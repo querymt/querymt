@@ -4318,14 +4318,16 @@ impl QmtApp {
             cx.notify();
         }));
         let menu_panel = self.session_menu_open.then(|| {
-            let (can_create_worktree, can_handoff_worktree) = {
+            let (can_create_worktree, can_handoff_worktree, developer) = {
                 let store = self.store.read(cx);
                 let busy = store.worktree_pending();
                 (
                     !busy && store.can_create_worktree(),
                     !busy && store.can_handoff_worktree(),
+                    store.prefs.developer_mode,
                 )
             };
+            let (debug_agent, debug_session) = (agent_id.clone(), session_id.clone());
             let (pinned, resolved, archived) = summary
                 .map(|s| (s.pinned, s.resolved, s.archived))
                 .unwrap_or_default();
@@ -4476,6 +4478,21 @@ impl QmtApp {
                         cx.write_to_clipboard(ClipboardItem::new_string(sid.clone()));
                         this.flash_copied(COPIED_MENU_ID.into(), cx);
                     }))
+                })
+                // Developer mode: the session's protocol traffic, full size.
+                .when(developer, |el| {
+                    el.child(div().my_1().child(kit::divider(p))).child(
+                        item("m-debug-events", IconName::Bug, "Debug events…".into())
+                            .debug_selector(|| "m-debug-events".into())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_debug_events(
+                                    &debug_agent,
+                                    Some(debug_session.clone()),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
                 })
         });
 

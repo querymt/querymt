@@ -1227,6 +1227,8 @@ pub struct AgentRuntime {
     /// Names of actions in flight (e.g. `invite`, `key:xai`).
     pub pending: std::collections::HashSet<String>,
     pub log: agent_log::AgentLog,
+    /// JSON-RPC traffic across reconnects (debug events, Developer mode).
+    pub wire: Rc<crate::rpc_log::WireLog>,
     pub pid: Option<u32>,
     pub connected_at: Option<f64>,
     pub busy: bool,
@@ -2560,7 +2562,9 @@ impl AgentsStore {
             return;
         };
         let config_id = config.id.clone();
+        let developer = self.prefs.developer_mode;
         let rt = self.runtime.entry(id.to_string()).or_default();
+        rt.wire.set_enabled(developer);
         if let Some(rpc) = rt.rpc.take() {
             rpc.close();
         }
@@ -2633,6 +2637,7 @@ impl AgentsStore {
             let ok = this
                 .update(cx, |s, _| {
                     let Some(rt) = s.live(&id, generation) else { return false };
+                    rpc.set_wire_log(rt.wire.clone());
                     rt.rpc = Some(rpc.clone());
                     rt.pid = conn.pid;
                     rt.tasks.push(reader);
