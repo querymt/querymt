@@ -669,6 +669,7 @@ pub trait AcpSessionHooks: Send + Sync {
 }
 
 pub const QMT_NOTIFICATION_MESH_NODES_CHANGED: &str = "querymt/mesh/nodesChanged";
+pub const QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED: &str = "querymt/mesh/peerAccessChanged";
 pub const QMT_NOTIFICATION_MESH_JOINED: &str = "querymt/mesh/joined";
 pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
 pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";

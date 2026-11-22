@@ -2434,6 +2434,25 @@ impl SessionStore for SqliteStorage {
         repo.create_delegation(delegation).await
     }
 
+    async fn create_delegation_with_origin(
+        &self,
+        delegation: Delegation,
+        origin: querymt_agent_core::session::domain_schedule::ScheduleOrigin,
+    ) -> SessionResult<Delegation> {
+        SqliteDelegationRepository::new(self.conn.clone())
+            .create_with_origin(delegation, origin)
+            .await
+    }
+
+    async fn delegation_origin(
+        &self,
+        delegation_id: &str,
+    ) -> SessionResult<querymt_agent_core::session::domain_schedule::ScheduleOrigin> {
+        SqliteDelegationRepository::new(self.conn.clone())
+            .origin(delegation_id)
+            .await
+    }
+
     async fn get_delegation(&self, delegation_id: &str) -> SessionResult<Option<Delegation>> {
         let repo = SqliteDelegationRepository::new(self.conn.clone());
         repo.get_delegation(delegation_id).await

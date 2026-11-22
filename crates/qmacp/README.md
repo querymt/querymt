@@ -58,6 +58,33 @@ Configure: `set-mode` (`build|plan|review`), `set-model`, `set-effort` (`auto|lo
 
 Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `cancel`, `runtime`
 
+### Mesh access
+
+`mesh nodes` lists discoverable nodes; the other `mesh` commands require the
+server to advertise mesh access v1. Copy the peer ID from the node listing and
+the revision from `outgoing.revision`. Use the revision returned by each
+successful write for the next write.
+
+ACP is unauthenticated. When the mesh access store is configured, every ACP
+connection can read and change mesh sharing policy. Deployments may run ACP
+behind a proxy if needed. Built-in ACP authentication is planned separately.
+
+```sh
+qmacp --quiet mesh nodes
+qmacp --quiet mesh get "$PEER_ID"
+qmacp --quiet mesh set-quota "$PEER_ID" --expected-revision "$REV" \
+  --provider "$PROVIDER_ID" --model "$MODEL_ID" --mtok 2.5 --window daily --operation reconfigure
+qmacp --quiet mesh set "$PEER_ID" --expected-revision "$REV" --grant '{"mode":"none"}'
+qmacp --quiet mesh reset-quota "$PEER_ID" --expected-revision "$REV" --provider "$PROVIDER_ID"
+qmacp --quiet mesh watch "$PEER_ID" --timeout 30
+```
+
+A Full grant requires `--allow-host-shell`; it includes the unsandboxed shell.
+`mesh watch` waits for one hint, not a state snapshot. Run `mesh get` after the
+hint. On a conflict or uncertain write, refresh and review before retrying.
+
+### Session workflows
+
 `prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. Auto delivery and idle waits require the updated backend observation metadata; unknown/unavailable status is not usable.
 
 Prompt/follow/watch wait for self-session idle, including queued turns, not for

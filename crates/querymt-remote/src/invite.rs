@@ -529,12 +529,15 @@ impl InviteStore {
         keypair: &libp2p::identity::Keypair,
         mesh_name: Option<&str>,
     ) -> Result<MembershipToken, InviteError> {
-        let (permissions, expires_at) = {
+        let (scope, permissions, expires_at) = {
             let record = self
                 .records
                 .get_mut(invite_id)
                 .ok_or_else(|| InviteError::NotFound(invite_id.to_string()))?;
 
+            if record.grant.mesh_name.as_deref() != mesh_name {
+                return Err(InviteError::InvalidToken("invite scope mismatch".into()));
+            }
             match record.status {
                 InviteStatus::Revoked => return Err(InviteError::InviteRevoked),
                 InviteStatus::Consumed => return Err(InviteError::InviteConsumed),
@@ -558,13 +561,19 @@ impl InviteStore {
                 }
             }
             record.used_by.push(joiner_peer_id.to_string());
-            (record.grant.permissions.clone(), record.grant.expires_at)
+            (
+                mesh_id_for(
+                    &record.grant.inviter_peer_id,
+                    record.grant.mesh_name.as_deref(),
+                ),
+                record.grant.permissions.clone(),
+                record.grant.expires_at,
+            )
         };
         self.save_records()?;
 
-        let mid = mesh_id_for(&keypair.public().to_peer_id().to_string(), mesh_name);
         MembershipToken::issue(
-            mid,
+            scope,
             joiner_peer_id,
             keypair,
             invite_id.to_string(),
@@ -945,6 +954,10 @@ mod tests {
             )
             .unwrap();
 
+        assert!(matches!(
+            store.admit_peer(&signed.grant.invite_id, "joiner-1", &keypair, Some("other")),
+            Err(InviteError::InvalidToken(_))
+        ));
         let token = store
             .admit_peer(
                 &signed.grant.invite_id,

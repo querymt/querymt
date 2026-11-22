@@ -109,6 +109,18 @@ pub trait MiddlewareDriver: Send + Sync {
     /// Returns a human-readable name for this driver
     fn name(&self) -> &'static str;
 
+    /// Configured context size for models with no published window, if this driver provides one.
+    #[cfg(feature = "remote")]
+    fn fallback_context_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether this driver can run without filesystem, tool, or auxiliary
+    /// provider authority. Unclassified drivers are not run for Custom peers.
+    fn supports_restricted_mesh(&self) -> bool {
+        false
+    }
+
     /// Returns session limits if this middleware enforces any.
     /// Default implementation returns None.
     fn get_limits(&self) -> Option<SessionLimits> {

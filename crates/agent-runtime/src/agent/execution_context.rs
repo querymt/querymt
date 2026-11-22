@@ -3,6 +3,8 @@
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::objective::RunObjective;
+use crate::agent::session_actor::TurnAuthority;
+use crate::error::AgentError;
 use crate::knowledge::KnowledgeStore;
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
@@ -75,6 +77,9 @@ pub(crate) struct ExecutionContext {
 
     /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
     pub execution_origin: ExecutionOrigin,
+    turn_authority: TurnAuthority,
+    restricted_mesh_turn: bool,
+    confined_mesh_read: bool,
 
     /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
@@ -141,6 +146,9 @@ impl ExecutionContext {
             cancellation_token: CancellationToken::new(),
             tool_config,
             execution_origin: ExecutionOrigin::Interactive,
+            turn_authority: TurnAuthority::Local,
+            restricted_mesh_turn: false,
+            confined_mesh_read: false,
             knowledge_store: None,
             repository_knowledge: None,
             delivery_budget: std::sync::Mutex::new(None),
@@ -189,6 +197,48 @@ impl ExecutionContext {
     pub fn with_execution_origin(mut self, origin: ExecutionOrigin) -> Self {
         self.execution_origin = origin;
         self
+    }
+
+    pub(crate) fn with_turn_authority(mut self, authority: TurnAuthority) -> Self {
+        self.turn_authority = authority;
+        self
+    }
+
+    pub(crate) async fn require_turn_authority(&self) -> Result<(), AgentError> {
+        #[cfg(feature = "remote")]
+        if let TurnAuthority::Peer(peer) = &self.turn_authority {
+            let binding = self
+                .session_handle
+                .llm_config()
+                .map(|config| (config.provider.as_str(), config.model.as_str()));
+            return peer.grant_for(binding).await.map(|_| ());
+        }
+        self.turn_authority.check().await
+    }
+
+    pub(crate) fn turn_authority(&self) -> &TurnAuthority {
+        &self.turn_authority
+    }
+
+    pub(crate) fn with_restricted_mesh_turn(mut self, restricted: bool, filesystem: bool) -> Self {
+        self.restricted_mesh_turn = restricted;
+        self.confined_mesh_read =
+            restricted && filesystem && cfg!(all(feature = "remote", target_os = "linux"));
+        self
+    }
+
+    pub(crate) fn restricted_mesh_turn(&self) -> bool {
+        self.restricted_mesh_turn
+    }
+
+    pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
+        if self.restricted_mesh_turn() {
+            return name == "delegate" || self.confined_mesh_read && name == "read_tool";
+        }
+        // The delegation orchestrator and routing tools can outlive this turn.
+        // Until they preserve its origin, do not let them borrow host authority.
+        matches!(self.turn_authority, TurnAuthority::Local)
+            || !matches!(name, "route_delegation_to_peer" | "use_remote_provider")
     }
 
     /// Set the knowledge store for this context.

@@ -218,7 +218,7 @@ impl LocalAgentHandle {
                     &read.events,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                 )
-                .await,
+                .await?,
             ),
             None => None,
         };
@@ -274,6 +274,9 @@ impl LocalAgentHandle {
             let fetched = tokio::time::timeout_at(deadline, sync.ensure_covered(start, end)).await;
             match fetched {
                 Ok(Ok(())) => {}
+                Ok(Err(crate::error::AgentError::MeshAccessDenied)) => {
+                    return Err(crate::error::AgentError::MeshAccessDenied.into());
+                }
                 Ok(Err(error)) => {
                     if self.history_epoch_of(session_id, source).await? != epoch {
                         return Err(history_changed(session_id));
@@ -307,6 +310,12 @@ impl LocalAgentHandle {
             )
             .await
             .map_err(|error| error.to_acp_error())?;
+        tokio::time::timeout(
+            super::model_registry::remote_transfer_budget(),
+            connected.session_ref.check_history_access(),
+        )
+        .await
+        .map_err(|_| transfer_failed(session_id, "history authorization timed out".into()))??;
         Ok(crate::agent::remote::event_backfill::RemoteSync::new(
             self.config.event_sink.clone(),
             connected.session_ref,
@@ -344,6 +353,9 @@ impl LocalAgentHandle {
         };
         match tokio::time::timeout_at(deadline, work).await {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(crate::error::AgentError::MeshAccessDenied)) => {
+                Err(crate::error::AgentError::MeshAccessDenied.into())
+            }
             Ok(Err(error)) => Err(transfer_failed(session_id, error.to_string())),
             Err(_) => Err(transfer_failed(
                 session_id,

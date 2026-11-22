@@ -52,7 +52,7 @@ async fn remote_create_keeps_explicit_owner_profile_and_rejects_invalid_selectio
     let viewer = RealStorageHandleFixture::new().await;
     viewer.handle.set_mesh(mesh.clone());
     let (owner, _dir) = owner_profiles_fixture("alpha").await;
-    let (node_id, _) = register_remote_node(mesh, &owner, "profile-probe", true).await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "profile-probe").await;
     let created = ext_method_json(
         &viewer.handle,
         "querymt/remote/createSession",
@@ -145,7 +145,7 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
     let (owner, _dir) = owner_profiles_fixture("alpha").await;
     let profiles = owner.handle.profiles().unwrap();
     let runtime = profiles.runtime_for_profile("cdr").await.unwrap();
-    let (node_id, _) = register_remote_node(mesh, &owner, "binding-failure", true).await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "binding-failure").await;
     owner
         .storage
         .conn_for_test()
@@ -251,7 +251,7 @@ async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load
     let viewer = RealStorageHandleFixture::new().await;
     viewer.handle.set_mesh(mesh.clone());
     let (owner, _dir) = owner_profiles_fixture("cdr").await;
-    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-child", true).await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-child").await;
     let parent = owner
         .handle
         .new_session(NewSessionRequest::new(std::path::PathBuf::new()))
@@ -372,7 +372,7 @@ async fn remote_delegate_controls_reach_owner_and_preserve_revision_errors() {
     );
     let (owner, _dir) = owner_profiles_fixture("cdr").await;
     owner.handle.set_mesh(mesh.clone());
-    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-probe", true).await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-probe").await;
     let created = ext_method_json(
         &viewer.handle,
         "querymt/remote/createSession",
@@ -500,15 +500,8 @@ async fn register_remote_node(
     mesh: &crate::agent::remote::mesh::MeshHandle,
     remote: &RealStorageHandleFixture,
     node_name: &str,
-    use_mesh_peer: bool,
 ) -> (String, kameo::actor::ActorRef<RemoteNodeManager>) {
-    let peer_id = if use_mesh_peer {
-        *mesh.peer_id()
-    } else {
-        libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-    };
+    let peer_id = *mesh.peer_id();
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),
@@ -523,9 +516,6 @@ async fn register_remote_node(
     let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
     mesh.register_actor(node_manager_ref.clone(), per_peer_name)
         .await;
-    mesh.inject_known_peer_for_test(peer_id);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     (node_id, node_manager_ref)
 }
 
@@ -537,8 +527,7 @@ async fn test_querymt_remote_sessions_returns_shared_shape() {
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, node_manager_ref) =
-        register_remote_node(mesh, &remote, "peer-remote", false).await;
+    let (node_id, node_manager_ref) = register_remote_node(mesh, &remote, "peer-remote").await;
 
     node_manager_ref
         .ask(crate::agent::remote::CreateRemoteSession {
@@ -567,7 +556,7 @@ async fn test_querymt_remote_sessions_returns_shared_shape() {
 async fn remote_owner_lifecycle_updates_and_filters_before_paging() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let remote = RealStorageHandleFixture::new().await;
-    let (_node_id, manager) = register_remote_node(mesh, &remote, "lifecycle-owner", false).await;
+    let (_node_id, manager) = register_remote_node(mesh, &remote, "lifecycle-owner").await;
     let store = remote.handle.config.provider.history_store();
     for index in 0..25 {
         store
@@ -670,7 +659,7 @@ async fn lifecycle_query_remote_owner_scopes_relationships_and_live_metadata() {
     let local = RealStorageHandleFixture::new().await;
     local.handle.set_mesh(mesh.clone());
     let owner = RealStorageHandleFixture::new().await;
-    let (node_id, manager) = register_remote_node(mesh, &owner, "scoped-owner", false).await;
+    let (node_id, manager) = register_remote_node(mesh, &owner, "scoped-owner").await;
     let root = manager
         .ask(crate::agent::remote::CreateRemoteSession {
             cwd: Some("/remote/work".into()),
@@ -882,7 +871,7 @@ async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
     let local = RealStorageHandleFixture::new().await;
     local.handle.set_mesh(mesh.clone());
     let owner = RealStorageHandleFixture::new().await;
-    let (node_id, _manager) = register_remote_node(mesh, &owner, "lifecycle-owner", false).await;
+    let (node_id, _manager) = register_remote_node(mesh, &owner, "lifecycle-owner").await;
     let owner_store = owner.handle.config.provider.history_store();
 
     let owner_session = owner_store
@@ -1051,7 +1040,7 @@ async fn acp_remote_lifecycle_filter_uses_owner_before_page_and_includes_metadat
     let f = RealStorageHandleFixture::new().await;
     f.handle.set_mesh(mesh.clone());
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, manager) = register_remote_node(mesh, &remote, "filtered-owner", false).await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "filtered-owner").await;
     let store = remote.handle.config.provider.history_store();
     for index in 0..30 {
         store
@@ -1155,7 +1144,7 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         )
         .build(),
     ));
-    let (node_id, node_manager) = register_remote_node(mesh, &remote, "owner", true).await;
+    let (node_id, node_manager) = register_remote_node(mesh, &remote, "owner").await;
     let profile_dir = tempfile::tempdir().unwrap();
     write_profile(
         profile_dir.path(),
@@ -1475,7 +1464,7 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         },
     ));
     restarted.handle.set_profiles(restarted_profiles.clone());
-    let (_, restarted_manager) = register_remote_node(mesh, &restarted, "owner", true).await;
+    let (_, restarted_manager) = register_remote_node(mesh, &restarted, "owner").await;
     for lifecycle in [false, true] {
         if lifecycle {
             restarted_manager
@@ -1624,7 +1613,7 @@ async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
     let f = RealStorageHandleFixture::new().await;
     f.handle.set_mesh(mesh.clone());
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, manager) = register_remote_node(mesh, &remote, "listing-owner", false).await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "listing-owner").await;
     let store = remote.handle.config.provider.history_store();
     for index in 0..25 {
         store
@@ -1732,7 +1721,7 @@ async fn test_acp_remote_cursor_restarts_when_peer_switches_between_bookmarks_an
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let f = RealStorageHandleFixture::new().await;
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, manager) = register_remote_node(mesh, &remote, "transition-owner", false).await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "transition-owner").await;
     let store = remote.handle.config.provider.history_store();
     for _ in 0..25 {
         store
@@ -1836,8 +1825,7 @@ async fn test_querymt_remote_create_session_without_attach_returns_structured_re
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, _node_manager_ref) =
-        register_remote_node(mesh, &remote, "peer-create", false).await;
+    let (node_id, _node_manager_ref) = register_remote_node(mesh, &remote, "peer-create").await;
 
     let created = ext_method_json(
         &f.handle,
@@ -2013,6 +2001,23 @@ async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
         .unwrap();
     assert_eq!(snapshot["history"]["stale"], true);
     assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn confirmed_denial_cannot_fall_back_to_cached_history() {
+    let (viewer, _) = viewer_with_synced_history("rs-denied", "node-z", 4).await;
+    let error = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            "rs-denied",
+            Some(crate::session::history_window::LoadWindow::default()),
+            Err(crate::error::AgentError::MeshAccessDenied),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("confirmed denial must not return a cached snapshot");
+    assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
 }
 
 #[cfg(feature = "remote")]

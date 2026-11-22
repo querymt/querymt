@@ -61,12 +61,12 @@
 mod agent;
 mod config;
 mod dotagents_runtime;
+pub mod mesh;
 mod profiles;
 mod utils;
 mod worktrees;
 
-/// The session, mesh and callback parts of the API live in the runtime crate.
-pub use querymt_agent_runtime::api::{mesh, sessions};
+pub use querymt_agent_runtime::api::sessions;
 
 // Re-export public API types
 pub use crate::delegation::roster::{
@@ -74,6 +74,7 @@ pub use crate::delegation::roster::{
 };
 pub use agent::{Agent, AgentBuilder, AgentInfra, SubagentInfo};
 pub use config::DelegateConfigBuilder;
+pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use querymt_agent_runtime::api::AgentSession;
 pub use querymt_agent_runtime::api::sessions::AcpSessionListError;
@@ -84,7 +85,6 @@ pub use querymt_agent_runtime::api::sessions::{
     SessionLifecycleFilter, SessionLifecyclePatch, SessionListMode, SessionListPage,
     SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
-pub use querymt_agent_runtime::api::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use worktrees::{AgentWorktrees, SessionOptions};
 
 #[cfg(test)]

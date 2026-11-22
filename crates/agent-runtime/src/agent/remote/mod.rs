@@ -56,7 +56,7 @@ pub(crate) mod provider_host_backend;
 pub mod remote_setup;
 
 #[cfg(feature = "remote")]
-mod remote_actor_impl;
+pub(crate) mod remote_actor_impl;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

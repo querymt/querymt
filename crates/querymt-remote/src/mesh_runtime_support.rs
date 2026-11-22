@@ -23,6 +23,11 @@ pub(crate) enum SwarmCommand {
     LeaveIrohScope {
         mesh_id: String,
     },
+    Sharing {
+        peer: PeerId,
+        request: crate::mesh_ingress::SharingRequest,
+        tx: crate::mesh_ingress::ResponseSender,
+    },
     Shutdown {
         completion: Option<tokio::sync::oneshot::Sender<()>>,
     },

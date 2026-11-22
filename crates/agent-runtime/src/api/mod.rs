@@ -9,7 +9,7 @@ pub mod sessions;
 pub use callbacks::{
     DelegationCallback, ErrorCallback, MessageCallback, ToolCallCallback, ToolCompleteCallback,
 };
-pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
+pub use mesh::{AgentMesh, MeshJoinOutcome, MeshSpec};
 pub use session::AgentSession;
 pub use sessions::{
     AcpSessionListError, AgentLoadedSession, AgentSessions, ArchiveFilter, ListSessionsOptions,
