@@ -1064,6 +1064,32 @@ fn identicon_cells(seed: &str) -> Vec<(f32, f32, Hsla)> {
 
 /// Deterministic hexagon glyph for a session id.
 /// Deterministic hexagon glyph for a session id.
+/// Bring a virtual list from items `old` to `new` (one signature per item:
+/// a changed signature may mean a changed height). Unchanged items keep
+/// their measurements, so the list keeps its scroll position.
+pub fn sync_list_state(state: &ListState, old: &[u64], new: &[u64]) {
+    if state.item_count() != old.len() {
+        state.reset(new.len());
+    } else if old.len() == new.len() {
+        for (ix, (a, b)) in old.iter().zip(new).enumerate() {
+            if a != b {
+                state.remeasure_items(ix..ix + 1);
+            }
+        }
+    } else {
+        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let max_suffix = old.len().min(new.len()) - prefix;
+        let suffix = old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .take(max_suffix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        state.splice(prefix..old.len() - suffix, new.len() - prefix - suffix);
+    }
+}
+
 pub fn identicon(seed: &str, size: f32) -> impl IntoElement {
     let paths = identicon_paths(seed, size);
     canvas(
