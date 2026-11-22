@@ -1110,11 +1110,9 @@ impl QmtApp {
                 let key = crate::store::sidebar::tab_key(s);
                 let current = current_tab.as_deref() == Some(key.as_str());
                 let group = SharedString::from(format!("pinned-session-title-{}", s.id));
-                let background = if current {
-                    p.bg.blend(p.accent_dim)
-                } else {
-                    p.bg
-                };
+                // The current row gets the rail's quiet neutral fill, not the
+                // accent tint.
+                let background = if current { p.bg.blend(p.card) } else { p.bg };
                 let row = h_flex()
                     .id(kit::keyed("pinned-session", s.id.clone()))
                     .group(group.clone())
@@ -1123,7 +1121,7 @@ impl QmtApp {
                     .h(px(28.))
                     .rounded(px(8.))
                     .text_color(if current { p.text } else { p.muted })
-                    .when(current, |el| el.bg(p.accent_dim))
+                    .when(current, |el| el.bg(background))
                     .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
                     .cursor_pointer()
                     .child(kit::identicon(&s.id, 14.))
@@ -1172,11 +1170,8 @@ impl QmtApp {
                 let current = current_tab.as_deref() == Some(key.as_str());
                 let s2 = s.clone();
                 let group = SharedString::from(format!("open-session-title-{}", s.id));
-                let background = if current {
-                    p.bg.blend(p.accent_dim)
-                } else {
-                    p.bg
-                };
+                // Same quiet fill as the rail's current tile.
+                let background = if current { p.bg.blend(p.card) } else { p.bg };
                 let row = v_flex()
                     .id(kit::keyed("open-session", s.id.clone()))
                     .group(group.clone())
@@ -1185,7 +1180,7 @@ impl QmtApp {
                     .py_1p5()
                     .gap_0p5()
                     .rounded(px(8.))
-                    .when(current, |el| el.bg(p.accent_dim))
+                    .when(current, |el| el.bg(background))
                     .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
                     .child(
                         h_flex()
