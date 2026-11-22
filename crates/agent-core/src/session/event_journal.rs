@@ -212,21 +212,42 @@ pub trait EventJournal: Send + Sync {
     ) -> SessionResult<Vec<DurableEvent>>;
 
     /// Delete the event at `from_seq` and all subsequent events for a session.
-    /// Used by undo cleanup to prune the event journal when the user commits
-    /// a new prompt after an undo so that the reverted turns do not reappear
-    /// on page reload.
-    ///
-    /// Accounting is exempt: `llm_attempt_started` / `llm_attempt_settled`
-    /// records, and legacy `llm_request_end` records that carry no
-    /// `accounting` detail (evidence of generation with no accounting basis),
-    /// are never deleted, so rewinding cannot erase incurred spend. Retained
-    /// records are not renumbered. Deleting the whole session is separate.
-    ///
-    /// Returns the number of deleted rows.
+    /// Equivalent to [`Self::delete_session_events_range`] without an upper
+    /// bound; see there for what is exempt from deletion.
     async fn delete_session_events_from(
         &self,
         session_id: &str,
         from_seq: i64,
+    ) -> SessionResult<usize> {
+        self.delete_session_events_range(session_id, from_seq, None)
+            .await
+    }
+
+    /// Delete the events of a session with `stream_seq >= from_seq` and, when
+    /// `before_seq` is `Some`, `stream_seq < before_seq`. Used by undo cleanup
+    /// to prune the event journal when the user commits a new prompt after an
+    /// undo so that the reverted turns do not reappear on page reload. The
+    /// upper bound keeps events the new run has already written (its
+    /// `run_started`, queued-input markers) out of the deletion.
+    ///
+    /// Exempt, never deleted:
+    /// * accounting: `llm_attempt_started` / `llm_attempt_settled` records, and
+    ///   legacy `llm_request_end` records that carry no `accounting` detail
+    ///   (evidence of generation with no accounting basis), so rewinding cannot
+    ///   erase incurred spend;
+    /// * run lifecycle: `run_started` / `run_completed`, so every run keeps
+    ///   both ends and no run is left looking open (or closed without a start)
+    ///   by a delete that begins in the middle of it.
+    ///
+    /// Retained records are not renumbered. Deleting the whole session is
+    /// separate.
+    ///
+    /// Returns the number of deleted rows.
+    async fn delete_session_events_range(
+        &self,
+        session_id: &str,
+        from_seq: i64,
+        before_seq: Option<i64>,
     ) -> SessionResult<usize>;
 
     /// Owner-side history epoch: a counter bumped whenever

@@ -276,13 +276,14 @@ impl crate::session::projection::EventJournal for AnnouncementRejectingJournal {
     ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
         self.0.load_global_stream(after_seq, limit).await
     }
-    async fn delete_session_events_from(
+    async fn delete_session_events_range(
         &self,
         session_id: &str,
         from_seq: i64,
+        before_seq: Option<i64>,
     ) -> crate::session::error::SessionResult<usize> {
         self.0
-            .delete_session_events_from(session_id, from_seq)
+            .delete_session_events_range(session_id, from_seq, before_seq)
             .await
     }
     async fn append_durable_from_source(

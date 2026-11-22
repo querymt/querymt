@@ -5,7 +5,7 @@
 //! made after a specific message. Redo restores the pre-undo state.
 
 use log::{debug, warn};
-use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::events::{AgentEventKind, EventOrigin};
 use querymt_agent_core::model::{MessagePart, TurnId};
 use querymt_agent_services::snapshot::SnapshotId;
 use std::path::PathBuf;
@@ -753,6 +753,12 @@ fn is_copied_fork_message(
 /// so they do not reappear after a page reload.  The frontier message itself
 /// AND everything after it are removed — the frontier is the user prompt that
 /// started the undone turn, so it must also be purged from history.
+///
+/// `current_run_id` is the run that is about to execute the new prompt. Its
+/// `run_started` (and anything it emitted before this cleanup) is already in
+/// the journal, so the journal prune stops right before it: only events of
+/// the undone turns are removed. Run lifecycle events are never pruned (see
+/// `EventJournal::delete_session_events_range`).
 #[instrument(
     name = "undo.cleanup",
     skip(provider, event_journal),
@@ -766,6 +772,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
     provider: &crate::session::provider::SessionProvider,
     event_journal: &dyn crate::session::projection::EventJournal,
     session_id: &str,
+    current_run_id: Option<&str>,
 ) -> Result<(), UndoError> {
     let revert_state = provider
         .history_store()
@@ -833,10 +840,22 @@ pub(crate) async fn cleanup_revert_on_prompt(
             }
             None
         });
+        // The new run's own start marks where the undone range ends. When it
+        // is not (yet) journaled there is nothing of the new run to protect.
+        let run_start_seq = current_run_id.and_then(|run_id| {
+            events.iter().find_map(|e| match &e.kind {
+                AgentEventKind::RunStarted { run_id: rid, .. }
+                    if rid == run_id && e.origin == EventOrigin::Local =>
+                {
+                    Some(e.stream_seq)
+                }
+                _ => None,
+            })
+        });
 
-        if let Some(seq) = frontier_seq {
+        if let Some(seq) = frontier_seq.filter(|seq| run_start_seq.is_none_or(|end| *seq < end)) {
             match event_journal
-                .delete_session_events_from(session_id, seq)
+                .delete_session_events_range(session_id, seq, run_start_seq)
                 .await
             {
                 Ok(n) => {

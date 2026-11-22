@@ -725,10 +725,11 @@ mod tests {
             {
                 unimplemented!()
             }
-            async fn delete_session_events_from(
+            async fn delete_session_events_range(
                 &self,
                 _: &str,
                 _: i64,
+                _: Option<i64>,
             ) -> crate::session::error::SessionResult<usize> {
                 unimplemented!()
             }
