@@ -2767,7 +2767,9 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <span class="normal"><a href="#__codelineno-5-55">55</a></span>
 <span class="normal"><a href="#__codelineno-5-56">56</a></span>
 <span class="normal"><a href="#__codelineno-5-57">57</a></span>
-<span class="normal"><a href="#__codelineno-5-58">58</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
+<span class="normal"><a href="#__codelineno-5-58">58</a></span>
+<span class="normal"><a href="#__codelineno-5-59">59</a></span>
+<span class="normal"><a href="#__codelineno-5-60">60</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">max_stop_hook_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="w">   </span><span class="c1"># Stop-hook continuations allowed per turn (0 = advisory only)</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="n">run_objective</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">             </span><span class="c1"># Send the rendered run objective with each model request</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a>
@@ -2791,40 +2793,42 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <a id="__codelineno-5-22" name="__codelineno-5-22"></a><span class="c1"># priced for them. Unset keys are the session's: `model` alone is that model on</span>
 <a id="__codelineno-5-23" name="__codelineno-5-23"></a><span class="c1"># the session's provider (and mesh node); `provider` needs a `model`, because</span>
 <a id="__codelineno-5-24" name="__codelineno-5-24"></a><span class="c1"># the session's model belongs to another provider (a `provider` without a</span>
-<a id="__codelineno-5-25" name="__codelineno-5-25"></a><span class="c1"># `model` is refused when the configuration loads). The session's own settings</span>
-<a id="__codelineno-5-26" name="__codelineno-5-26"></a><span class="c1"># (system prompt, reasoning effort, local-model options) are not carried over.</span>
-<a id="__codelineno-5-27" name="__codelineno-5-27"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="w">    </span><span class="c1"># Optional: different provider for compaction</span>
-<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-haiku"</span><span class="w">    </span><span class="c1"># Optional: cheaper model for compaction</span>
-<a id="__codelineno-5-29" name="__codelineno-5-29"></a>
-<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="c1"># Governs summaries the agent rejects (empty, refused or cut off): the number of</span>
-<a id="__codelineno-5-31" name="__codelineno-5-31"></a><span class="c1"># retries, the wait before the first one and its multiplier. It does not govern</span>
-<a id="__codelineno-5-32" name="__codelineno-5-32"></a><span class="c1"># provider errors; those use [agent.execution.rate_limit] below.</span>
-<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="k">[agent.execution.compaction.retry]</span>
-<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="n">initial_backoff_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1000</span>
-<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
-<a id="__codelineno-5-37" name="__codelineno-5-37"></a>
-<a id="__codelineno-5-38" name="__codelineno-5-38"></a><span class="c1"># Compaction is a paid request. Every attempt (including a retry after a</span>
-<a id="__codelineno-5-39" name="__codelineno-5-39"></a><span class="c1"># rejected or empty summary, or after a provider error) is recorded in the</span>
-<a id="__codelineno-5-40" name="__codelineno-5-40"></a><span class="c1"># session's cost accounting under the "compaction" purpose, charged to the</span>
-<a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="c1"># cycle that triggered it. See "Cost accounting" in api_reference.md.</span>
-<a id="__codelineno-5-42" name="__codelineno-5-42"></a>
-<a id="__codelineno-5-43" name="__codelineno-5-43"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
-<a id="__codelineno-5-44" name="__codelineno-5-44"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-5-45" name="__codelineno-5-45"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
-<a id="__codelineno-5-46" name="__codelineno-5-46"></a><span class="c1"># max_snapshots = 100     # Optional: keep at most this many snapshots (&gt;= 1)</span>
-<a id="__codelineno-5-47" name="__codelineno-5-47"></a><span class="c1"># max_age_days = 30       # Optional: prune snapshots older than this (&gt;= 1)</span>
-<a id="__codelineno-5-48" name="__codelineno-5-48"></a>
-<a id="__codelineno-5-49" name="__codelineno-5-49"></a><span class="c1"># Rate limit retry configuration</span>
-<a id="__codelineno-5-50" name="__codelineno-5-50"></a><span class="k">[agent.execution.rate_limit]</span>
-<a id="__codelineno-5-51" name="__codelineno-5-51"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-5-52" name="__codelineno-5-52"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
-<a id="__codelineno-5-53" name="__codelineno-5-53"></a><span class="n">transport_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="w">  </span><span class="c1"># 0..=300; base wait after a failure the provider never answered</span>
-<a id="__codelineno-5-54" name="__codelineno-5-54"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
-<a id="__codelineno-5-55" name="__codelineno-5-55"></a>
-<a id="__codelineno-5-56" name="__codelineno-5-56"></a><span class="c1"># Prompt cache</span>
-<a id="__codelineno-5-57" name="__codelineno-5-57"></a><span class="k">[agent.execution.prompt_cache]</span>
-<a id="__codelineno-5-58" name="__codelineno-5-58"></a><span class="n">ttl_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w">              </span><span class="c1"># 0..=86400; 0 keeps the provider's default cache lifetime</span>
+<a id="__codelineno-5-25" name="__codelineno-5-25"></a><span class="c1"># `model` is refused when the configuration loads). A target built separately</span>
+<a id="__codelineno-5-26" name="__codelineno-5-26"></a><span class="c1"># from the session's does not carry the session's own settings (system prompt,</span>
+<a id="__codelineno-5-27" name="__codelineno-5-27"></a><span class="c1"># reasoning effort, local-model options); a target that names the session's own</span>
+<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="c1"># provider and model reuses the session's provider, so its settings apply.</span>
+<a id="__codelineno-5-29" name="__codelineno-5-29"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="w">    </span><span class="c1"># Optional: different provider for compaction</span>
+<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-haiku"</span><span class="w">    </span><span class="c1"># Optional: cheaper model for compaction</span>
+<a id="__codelineno-5-31" name="__codelineno-5-31"></a>
+<a id="__codelineno-5-32" name="__codelineno-5-32"></a><span class="c1"># Governs summaries the agent rejects (empty, refused or cut off): the number of</span>
+<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="c1"># retries, the wait before the first one and its multiplier. It does not govern</span>
+<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="c1"># provider errors; those use [agent.execution.rate_limit] below.</span>
+<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="k">[agent.execution.compaction.retry]</span>
+<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-5-37" name="__codelineno-5-37"></a><span class="n">initial_backoff_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1000</span>
+<a id="__codelineno-5-38" name="__codelineno-5-38"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-39" name="__codelineno-5-39"></a>
+<a id="__codelineno-5-40" name="__codelineno-5-40"></a><span class="c1"># Compaction is a paid request. Every attempt (including a retry after a</span>
+<a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="c1"># rejected or empty summary, or after a provider error) is recorded in the</span>
+<a id="__codelineno-5-42" name="__codelineno-5-42"></a><span class="c1"># session's cost accounting under the "compaction" purpose, charged to the</span>
+<a id="__codelineno-5-43" name="__codelineno-5-43"></a><span class="c1"># cycle that triggered it. See "Cost accounting" in api_reference.md.</span>
+<a id="__codelineno-5-44" name="__codelineno-5-44"></a>
+<a id="__codelineno-5-45" name="__codelineno-5-45"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
+<a id="__codelineno-5-46" name="__codelineno-5-46"></a><span class="k">[agent.execution.snapshot]</span>
+<a id="__codelineno-5-47" name="__codelineno-5-47"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
+<a id="__codelineno-5-48" name="__codelineno-5-48"></a><span class="c1"># max_snapshots = 100     # Optional: keep at most this many snapshots (&gt;= 1)</span>
+<a id="__codelineno-5-49" name="__codelineno-5-49"></a><span class="c1"># max_age_days = 30       # Optional: prune snapshots older than this (&gt;= 1)</span>
+<a id="__codelineno-5-50" name="__codelineno-5-50"></a>
+<a id="__codelineno-5-51" name="__codelineno-5-51"></a><span class="c1"># Rate limit retry configuration</span>
+<a id="__codelineno-5-52" name="__codelineno-5-52"></a><span class="k">[agent.execution.rate_limit]</span>
+<a id="__codelineno-5-53" name="__codelineno-5-53"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-5-54" name="__codelineno-5-54"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
+<a id="__codelineno-5-55" name="__codelineno-5-55"></a><span class="n">transport_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="w">  </span><span class="c1"># 0..=300; base wait after a failure the provider never answered</span>
+<a id="__codelineno-5-56" name="__codelineno-5-56"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-57" name="__codelineno-5-57"></a>
+<a id="__codelineno-5-58" name="__codelineno-5-58"></a><span class="c1"># Prompt cache</span>
+<a id="__codelineno-5-59" name="__codelineno-5-59"></a><span class="k">[agent.execution.prompt_cache]</span>
+<a id="__codelineno-5-60" name="__codelineno-5-60"></a><span class="n">ttl_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w">              </span><span class="c1"># 0..=86400; 0 keeps the provider's default cache lifetime</span>
 </code></pre></div></td></tr></table></div>
 <p><code>default_wait_secs</code> is the base wait before retrying a failure the provider
 answered (overloaded, rate limited, a 5xx status) when it supplied no delay of
@@ -2842,8 +2846,8 @@ error naming <code>transport_wait_secs</code>.</p>
 <p>The compaction request follows the same rules as a model request when the
 provider fails. A provider error is retried only if it can succeed on a second
 try (an overloaded or rate-limited provider, a 5xx status, a lost connection),
-after the wait described above, for at most <code>rate_limit.max_retries</code> requests in
-total, and clients receive the same retry notices as for a model request. A
+after the wait described above, for at most <code>max(1, rate_limit.max_retries)</code>
+requests in total (a <code>max_retries</code> of <code>0</code> still sends the first request), and clients receive the same retry notices as for a model request. A
 rejected credential or an invalid request fails the compaction after that one
 request. A request that times out is not retried, because the remote side may
 still be working on it, and a cancelled run stops waiting to retry.
@@ -2851,7 +2855,7 @@ still be working on it, and a cancelled run stops waiting to retry.
 summary (empty, refused or cut off), and each of those attempts has its own
 provider retries. In the worst case, where retryable provider errors and
 rejected summaries alternate, one compaction sends
-<code>(compaction.retry.max_retries + 1) × rate_limit.max_retries</code> requests: 12 with
+<code>(compaction.retry.max_retries + 1) × max(1, rate_limit.max_retries)</code> requests: 12 with
 the defaults (it was 4). Every request is recorded in the cost accounting. If you
 set <code>compaction.retry.max_retries = 0</code> to make compaction fail fast, a provider
 error is now still retried, by <code>rate_limit</code>.</p>
