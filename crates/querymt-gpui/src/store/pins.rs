@@ -86,7 +86,7 @@ impl AgentsStore {
                 rt.pins_refresh_scheduled = false;
                 match listed {
                     Ok(listed) => apply_pins(rt, listed),
-                    Err(err) => rt.log(format!("Could not refresh pinned sessions: {err}")),
+                    Err(err) => rt.log_warn(format!("Could not refresh pinned sessions: {err}")),
                 }
                 cx.notify();
             });

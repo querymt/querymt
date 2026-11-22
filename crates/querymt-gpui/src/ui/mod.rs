@@ -10,6 +10,7 @@ mod fork;
 mod inbox;
 mod keys;
 mod kit;
+mod log_view;
 mod md;
 mod mesh;
 mod preview;
@@ -335,6 +336,8 @@ pub struct QmtApp {
     dismissed: kit::Dismissed,
     /// Start composer's workspace field, editing `cwd`.
     workspace: Entity<workspace_select::WorkspaceField>,
+    /// Full-size log viewer (agent logs).
+    log_view: log_view::LogView,
     _subs: Vec<Subscription>,
 }
 
@@ -464,6 +467,8 @@ impl QmtApp {
         let workspaces =
             workspaces::WorkspacesPage::new(store.clone(), smooth_scroll.clone(), window, cx);
         subs.push(workspaces.subscribe(window, cx));
+        let (log_view, log_sub) = log_view::LogView::new(window, cx);
+        subs.push(log_sub);
         let mut this = Self {
             store,
             page,
@@ -551,6 +556,7 @@ impl QmtApp {
             profile_menu_bounds: Default::default(),
             dismissed: kit::Dismissed::default(),
             workspace,
+            log_view,
             _subs: subs,
         };
         this.watch_first_run(cx);
@@ -615,6 +621,9 @@ impl QmtApp {
     /// Close the top-most overlay. Returns whether one was open.
     fn close_topmost(&mut self) -> bool {
         if self.preview.take().is_some() || std::mem::take(&mut self.palette_open) {
+            return true;
+        }
+        if self.close_log_view() {
             return true;
         }
         if std::mem::take(&mut self.options_open) || std::mem::take(&mut self.model_open) {
@@ -1336,6 +1345,7 @@ impl Render for QmtApp {
         let overlay = self
             .render_preview(radii, window, cx)
             .or_else(|| self.render_palette(radii, cx))
+            .or_else(|| self.render_log_view(radii, window, cx))
             .or_else(|| {
                 (self.page == Page::Session)
                     .then(|| self.render_delegate_dialog(radii, cx))
