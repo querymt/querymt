@@ -1019,6 +1019,7 @@ impl QmtApp {
         let error = rt.action_error.clone();
         let maintenance = rt.maintenance.clone();
         let failed = rt.failed_plugins.clone();
+        let plugin_progress = rt.plugin_progress.clone();
         let model_count = rt.models.len();
         let (can_set_key, can_clear_key, can_set_method) = (
             rt.supports_method("querymt/auth/setApiToken"),
@@ -1557,6 +1558,7 @@ impl QmtApp {
                         }))
                     });
                 let update = flat_btn("maint-update", !updating_plugins, false, p)
+                    .debug_selector(|| "maint-update".into())
                     .when(updating_plugins, |el| {
                         el.child(kit::spinner("maint-update-spin", 14., p.muted))
                     })
@@ -1574,6 +1576,53 @@ impl QmtApp {
                     "{model_count} available {} for the selected agent.",
                     if model_count == 1 { "model" } else { "models" }
                 );
+                // Desktop `provider-maintenance-progress`.
+                let progress_box = plugin_progress.clone().map(|pr| {
+                    v_flex()
+                        .id("maint-progress")
+                        .debug_selector(|| "maint-progress".into())
+                        .mx(px(14.4))
+                        .my(px(11.2))
+                        .px_3()
+                        .py_2()
+                        .gap(px(6.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(subtle_border)
+                        .bg(subtle_surface)
+                        .text_size(px(12.))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .text_color(p.text)
+                                        .child(pr.plugin.clone()),
+                                )
+                                .child(div().text_color(p.muted).child(pr.status())),
+                        )
+                        .when_some(pr.percent, |el, pct| {
+                            el.child(
+                                div()
+                                    .h(px(4.))
+                                    .w_full()
+                                    .rounded_full()
+                                    .bg(subtle_border)
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(pct as f32 / 100.))
+                                            .rounded_full()
+                                            .bg(p.accent),
+                                    ),
+                            )
+                        })
+                        .when_some(pr.message.clone(), |el, msg| {
+                            el.child(div().text_color(p.muted).child(msg))
+                        })
+                });
                 let failed_open = self.failed_plugins_open;
                 let failed_box =
                     (!failed.is_empty()).then(|| {
@@ -1648,6 +1697,7 @@ impl QmtApp {
                         false,
                         p,
                     ))
+                    .children(progress_box)
                     .when_some(maintenance.clone(), |el, (msg, is_err)| {
                         let color = if is_err { p.danger } else { p.success };
                         el.child(
@@ -2009,5 +2059,98 @@ fn provider_summary(pr: &ProviderAuth) -> String {
             (Some(m), Some(v)) if m == "env_var" => format!("Set {v} to connect"),
             _ => "Authentication required".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SettingsTab;
+    use crate::ui::{Page, QmtApp};
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use serde_json::{Value, json};
+
+    #[gpui_kit::test]
+    fn plugin_update_shows_progress_then_the_outcome(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let mut store = crate::store::automations::schedule_ui_fixture();
+        let (rpc, requests) = store.rpc_for_test("test-agent");
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        let store = cx.update(|cx| app.read(cx).store.clone());
+        let render = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Settings, cx);
+                app.settings_tab = SettingsTab::Providers;
+                app.maintenance_open = true;
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("maint-progress").is_none());
+        let update = vcx.debug_bounds("maint-update").expect("Update button");
+        vcx.simulate_click(update.center(), gpui_kit::Modifiers::none());
+        let progress = |cx: &mut gpui_kit::TestAppContext| {
+            store.read_with(cx, |s, _| {
+                s.runtime("test-agent").unwrap().plugin_progress.clone()
+            })
+        };
+        // Until the agent reports a step, the update shows as starting.
+        assert_eq!(progress(cx).unwrap().plugin, "Preparing update");
+        render(cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("maint-progress").is_some());
+
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.notify_for_test(
+                    "test-agent",
+                    "_querymt/pluginUpdateStatus",
+                    json!({ "plugin_name": "openai", "image_reference": "ghcr.io/o",
+                            "phase": "downloading", "bytes_downloaded": 5, "percent": 50.0 }),
+                    cx,
+                )
+            })
+        });
+        assert_eq!(progress(cx).unwrap().status(), "downloading · 50%");
+        render(cx);
+
+        // Opening Settings asks for the sign-in status first.
+        let sent: Vec<Value> = std::iter::from_fn(|| requests.try_recv().ok())
+            .map(|r| serde_json::from_str(&r).unwrap())
+            .collect();
+        let request = sent
+            .iter()
+            .find(|r| r["method"] == "_querymt/updatePlugins")
+            .expect("update sent");
+        rpc.handle(
+            &json!({ "id": request["id"], "result": { "results": [
+                { "plugin_name": "openai", "success": true },
+                { "plugin_name": "xai", "success": true }
+            ] } })
+            .to_string(),
+        );
+        cx.run_until_parked();
+        store.read_with(cx, |s, _| {
+            let rt = s.runtime("test-agent").unwrap();
+            assert_eq!(rt.plugin_progress, None);
+            assert_eq!(rt.maintenance, Some(("Updated 2 plugins.".into(), false)));
+        });
+        render(cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("maint-progress").is_none());
     }
 }
