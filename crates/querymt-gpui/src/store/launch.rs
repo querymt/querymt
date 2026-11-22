@@ -142,6 +142,25 @@ pub fn remote_session_params(node: &str, cwd: &str, profile: Option<&str>) -> Va
     params
 }
 
+/// List `node`'s profiles through the agent (`_querymt/profiles` with
+/// `node_id`); the owner must confirm it answered for that peer.
+pub fn request_peer_profiles(
+    rpc: &crate::rpc::RpcClient,
+    node: &str,
+) -> impl std::future::Future<Output = Result<Vec<Profile>, String>> + 'static {
+    let node = node.to_owned();
+    let request = rpc.request("_querymt/profiles", json!({ "node_id": node }));
+    async move {
+        request.await.and_then(|v| {
+            if v.get("node_id").and_then(Value::as_str) == Some(node.as_str()) {
+                Ok(super::parse_profiles(&v))
+            } else {
+                Err("The agent did not confirm the peer's profiles. Update both agents.".into())
+            }
+        })
+    }
+}
+
 /// Where the created session runs, when the agent moved it (a worktree).
 pub fn session_cwd(created: &Value) -> Option<String> {
     created
@@ -259,38 +278,48 @@ impl AgentsStore {
         entry.loading = true;
         entry.error = None;
         let (agent_id, node) = (agent_id.to_owned(), node.to_owned());
-        let request = rpc.request("_querymt/profiles", json!({ "node_id": node }));
+        let request = request_peer_profiles(&rpc, &node);
         cx.spawn(async move |this, cx| {
-            let result = request.await.and_then(|v| {
-                // The owner must confirm it answered for this peer.
-                if v.get("node_id").and_then(Value::as_str) == Some(node.as_str()) {
-                    Ok(super::parse_profiles(&v))
-                } else {
-                    Err("The agent did not confirm the peer's profiles. Update both agents.".into())
-                }
-            });
+            let result = request.await;
             let _ = this.update(cx, |s, cx| {
-                if let Some(entry) = s
-                    .runtime
-                    .get_mut(&agent_id)
-                    .and_then(|rt| rt.peer_profiles.get_mut(&node))
-                {
-                    entry.loading = false;
-                    match result {
-                        Ok(profiles) => {
-                            entry.profiles = profiles;
-                            entry.error = None;
-                        }
-                        Err(error) => {
-                            entry.profiles.clear();
-                            entry.error = Some(error);
-                        }
-                    }
-                }
+                s.store_peer_profiles(&agent_id, &node, &result);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Record a fresh profile list (or its error) for `node`.
+    pub(super) fn store_peer_profiles(
+        &mut self,
+        agent_id: &str,
+        node: &str,
+        result: &Result<Vec<Profile>, String>,
+    ) {
+        let Some(rt) = self.runtime.get_mut(agent_id) else {
+            return;
+        };
+        let entry = rt.peer_profiles.entry(node.to_owned()).or_default();
+        entry.loading = false;
+        match result {
+            Ok(profiles) => {
+                entry.profiles = profiles.clone();
+                entry.error = None;
+            }
+            Err(error) => {
+                entry.profiles.clear();
+                entry.error = Some(error.clone());
+            }
+        }
+    }
+
+    /// What the placeholder says while the next session is being created
+    /// (desktop `showLaunchProgress`).
+    pub fn launch_progress_label(&self) -> String {
+        match &self.launch.creating_on {
+            Some(peer) => format!("Creating session on {peer}…"),
+            None => "Creating session…".into(),
+        }
     }
 }
 
@@ -446,6 +475,23 @@ mod tests {
             s.runtime.get_mut("test-agent").unwrap().worktrees = None;
         });
         assert!(plain["params"].get("_meta").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn placeholder_names_the_peer_while_creating(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| super::peer_fixture());
+        let _requests = cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                let (_, requests) = s.rpc_for_test("test-agent");
+                s.launch.target = Some("thor-id".into());
+                s.launch("test-agent", "/w".into(), "hi".into(), Vec::new(), cx);
+                assert_eq!(s.launch_progress_label(), "Creating session on thor…");
+                s.launch.creating_on = None;
+                assert_eq!(s.launch_progress_label(), "Creating session…");
+                requests
+            })
+        });
     }
 
     #[test]

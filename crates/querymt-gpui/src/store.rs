@@ -1658,6 +1658,8 @@ pub struct LaunchState {
     pub worktree: launch::WorktreeMode,
     /// Profile on the target peer; `None`: the peer's active profile.
     pub remote_profile: Option<String>,
+    /// Peer the session being created runs on, for the placeholder.
+    pub creating_on: Option<String>,
 }
 
 pub struct AgentsStore {
@@ -2826,6 +2828,9 @@ impl AgentsStore {
         self.launch.busy = true;
         self.launch.error = None;
         self.launch.last_started = None;
+        self.launch.creating_on = remote
+            .as_ref()
+            .map(|r| r.label.clone().unwrap_or_else(|| r.node_id.clone()));
         self.session = None;
         self.set_cwd(cwd.clone());
         cx.notify();
@@ -2961,6 +2966,7 @@ impl AgentsStore {
             .await;
             let _ = this.update(cx, |s, cx| {
                 s.launch.busy = false;
+                s.launch.creating_on = None;
                 match result {
                     Ok(id) => s.launch.last_started = Some(id),
                     Err(err) => s.launch.error = Some(err),
