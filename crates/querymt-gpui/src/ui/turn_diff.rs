@@ -15,7 +15,7 @@ use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::session_view::{CHAT_MAX, TOOL_LINE_H, diff_rows, hunk_marker};
+use super::session_view::{CHAT_MAX, ReadingQuip, TOOL_LINE_H, diff_rows, hunk_marker};
 use super::{QmtApp, kit};
 use crate::session::TurnDiffFile;
 use crate::theme::{Palette, palette};
@@ -575,24 +575,28 @@ impl QmtApp {
                                 .children(rows),
                         )
                         .when(hidden > 0, |el| {
-                            el.child(
-                                h_flex()
-                                    .id(SharedString::from(format!("turn-diff-more-{key}")))
-                                    .justify_center()
-                                    .py_1p5()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(p.accent)
-                                    .hover(|s| s.underline())
-                                    .child(format!(
-                                        "Show {hidden} more {}",
-                                        if hidden == 1 { "line" } else { "lines" }
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.turn_diff.expanded.insert(key.clone());
-                                        cx.notify();
-                                    })),
-                            )
+                            // Same row as the transcript's "Show N more lines".
+                            let quip_key = format!("turn-diff-more-{key}");
+                            let hover = p.card_hover.opacity(0.55);
+                            let row = h_flex()
+                                .id(SharedString::from(format!("turn-diff-more-{key}")))
+                                .gap_1p5()
+                                .px_3()
+                                .py_1()
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(hover))
+                                .text_xs()
+                                .text_color(p.dim)
+                                .child(kit::icon(IconName::ChevronsDown, 12., p.dim))
+                                .child(format!(
+                                    "Show {hidden} more {}",
+                                    if hidden == 1 { "line" } else { "lines" }
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.turn_diff.expanded.insert(key.clone());
+                                    cx.notify();
+                                }));
+                            el.child(ReadingQuip::new(quip_key, row, p.dim))
                         })
                         .into_any_element()
                 })
@@ -765,6 +769,74 @@ mod tests {
         let close = vcx.debug_bounds("turn-diff-close").unwrap();
         vcx.simulate_click(close.center(), gpui_kit::Modifiers::none());
         cx.update(|cx| assert!(h.app.read(cx).turn_diff.open.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn hovering_show_more_asks_if_anyone_reads_this(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{Modifiers, point, px};
+        let h = harness(cx);
+        let long: String = (0..450).map(|i| format!("line {i}\n")).collect();
+        cx.update_window(h.handle, |_, window, cx| {
+            h.app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                app.store.update(cx, |s, _| {
+                    let view = s.session.as_mut().unwrap();
+                    view.apply(
+                        &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
+                        "content": { "type": "text", "text": "big" } }),
+                    );
+                    view.apply(&crate::session::undo_tests::edit("t9", "big.rs", "", &long));
+                });
+                app.toggle_turn_diff(6, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(h.handle, cx);
+        let laid_out = vcx
+            .debug_bounds("turn-diff-more-t9:big.rs-row")
+            .expect("show more row");
+        // The row ends a 400-line change: scroll it into view first.
+        let app = h.app.clone();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, _| {
+                let top = app.turn_diff.scroll.bounds().top();
+                app.turn_diff
+                    .scroll
+                    .set_offset(point(px(0.), top + px(200.) - laid_out.top()));
+            });
+            window.render_frame(cx);
+        });
+        let row = vcx
+            .debug_bounds("turn-diff-more-t9:big.rs-row")
+            .expect("show more row");
+        assert!(
+            row.top() > px(0.) && row.bottom() < vcx.update(|w, _| w.viewport_size().height),
+            "row on screen: {row:?}"
+        );
+        assert!(
+            vcx.debug_bounds("reading-quip").is_none(),
+            "hidden until hovered"
+        );
+        let settle = |vcx: &mut gpui_kit::VisualTestContext| {
+            // The fade runs on the wall clock.
+            std::thread::sleep(std::time::Duration::from_millis(320));
+            vcx.update(|window, cx| window.render_frame(cx));
+            vcx.run_until_parked();
+        };
+        vcx.simulate_mouse_move(row.center(), None, Modifiers::none());
+        settle(&mut vcx);
+        assert!(
+            vcx.debug_bounds("reading-quip").is_some(),
+            "fades in on hover"
+        );
+        vcx.simulate_mouse_move(point(px(5.), px(5.)), None, Modifiers::none());
+        settle(&mut vcx);
+        assert!(
+            vcx.debug_bounds("reading-quip").is_none(),
+            "fades out on leave"
+        );
     }
 
     #[gpui_kit::test]

@@ -1167,37 +1167,97 @@ fn more_lines(key: &str, total: usize, max: usize, rc: &RenderCtx) -> Option<Any
     let open = rc.expanded.contains(&more);
     let hover = p.card_hover.opacity(0.55);
     let weak = rc.weak.clone();
-    Some(
-        h_flex()
-            .id(SharedString::from(format!("more-{key}")))
-            .gap_1p5()
-            .px_3()
-            .py_1()
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .text_xs()
-            .text_color(p.dim)
-            .child(kit::icon(
-                if open {
-                    IconName::ChevronsUp
-                } else {
-                    IconName::ChevronsDown
-                },
-                12.,
-                p.dim,
-            ))
-            .child(if open {
-                "Show fewer lines".to_string()
+    let row = h_flex()
+        .id(SharedString::from(format!("more-{key}")))
+        .gap_1p5()
+        .px_3()
+        .py_1()
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .text_xs()
+        .text_color(p.dim)
+        .child(kit::icon(
+            if open {
+                IconName::ChevronsUp
             } else {
-                let hidden = total - max;
-                format!(
-                    "Show {hidden} more {}",
-                    if hidden == 1 { "line" } else { "lines" }
+                IconName::ChevronsDown
+            },
+            12.,
+            p.dim,
+        ))
+        .child(if open {
+            "Show fewer lines".to_string()
+        } else {
+            let hidden = total - max;
+            format!(
+                "Show {hidden} more {}",
+                if hidden == 1 { "line" } else { "lines" }
+            )
+        })
+        .on_click(move |_, _, cx| toggle_expanded(&weak, more.clone(), cx));
+    Some(if open {
+        row.into_any_element()
+    } else {
+        ReadingQuip::new(format!("more-{key}"), row, p.dim).into_any_element()
+    })
+}
+
+/// Fade of the [`ReadingQuip`]: slower than hover chrome, so it drifts in.
+const QUIP_FADE_IN_MS: f64 = 260.;
+const QUIP_FADE_OUT_MS: f64 = 200.;
+
+/// A "Show N more lines" row that, while hovered, fades in a small quip on
+/// its right asking whether anyone still reads all that code.
+#[derive(IntoElement)]
+pub(super) struct ReadingQuip {
+    key: String,
+    row: Stateful<Div>,
+    color: Hsla,
+}
+
+impl ReadingQuip {
+    pub(super) fn new(key: impl Into<String>, row: Stateful<Div>, color: Hsla) -> Self {
+        Self {
+            key: key.into(),
+            row,
+            color,
+        }
+    }
+}
+
+impl RenderOnce for ReadingQuip {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let fade = window.use_keyed_state(
+            SharedString::from(format!("{}-quip", self.key)),
+            cx,
+            |_, _| kit::Fade::default(),
+        );
+        let opacity = kit::fade_opacity_ms(&fade, QUIP_FADE_IN_MS, QUIP_FADE_OUT_MS, window, cx);
+        let weak = fade.downgrade();
+        let key = self.key.clone();
+        self.row
+            .debug_selector(move || format!("{key}-row"))
+            .on_hover(move |hovered, _, cx| {
+                let reduce = cx.reduce_motion();
+                let _ = weak.update(cx, |f, cx| {
+                    if f.show(*hovered, crate::util::now_ms(), reduce) {
+                        cx.notify();
+                    }
+                });
+            })
+            .child(div().flex_1())
+            .when(opacity > 0., |el| {
+                el.child(
+                    div()
+                        .debug_selector(|| "reading-quip".into())
+                        .flex_none()
+                        .italic()
+                        .text_color(self.color)
+                        .opacity(opacity)
+                        .child("Are you going to read this?"),
                 )
             })
-            .on_click(move |_, _, cx| toggle_expanded(&weak, more.clone(), cx))
-            .into_any_element(),
-    )
+    }
 }
 
 /// A text block cut at `max` lines, with its "Show N more lines".

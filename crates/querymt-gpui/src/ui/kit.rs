@@ -129,10 +129,15 @@ impl Fade {
     /// Eased opacity at `now` (ms) and whether the fade is still running.
     /// With reduced motion the opacity snaps to the target.
     pub fn value(&self, now: f64, reduce_motion: bool) -> (f32, bool) {
+        self.value_ms(now, reduce_motion, FADE_IN_MS, FADE_OUT_MS)
+    }
+
+    /// [`Fade::value`] with its own fade-in / fade-out durations (ms).
+    pub fn value_ms(&self, now: f64, reduce_motion: bool, in_ms: f64, out_ms: f64) -> (f32, bool) {
         let (target, ms) = if self.shown {
-            (1., FADE_IN_MS)
+            (1., in_ms)
         } else {
-            (0., FADE_OUT_MS)
+            (0., out_ms)
         };
         if reduce_motion {
             return (target, false);
@@ -158,9 +163,20 @@ impl Fade {
 /// Current opacity of the [`Fade`] state `fade`, asking for the next frame
 /// while it runs (so only animating elements redraw).
 pub fn fade_opacity(fade: &Entity<Fade>, window: &mut Window, cx: &App) -> f32 {
-    let (opacity, running) = fade
-        .read(cx)
-        .value(crate::util::now_ms(), cx.reduce_motion());
+    fade_opacity_ms(fade, FADE_IN_MS, FADE_OUT_MS, window, cx)
+}
+
+/// [`fade_opacity`] with its own durations (ms).
+pub fn fade_opacity_ms(
+    fade: &Entity<Fade>,
+    in_ms: f64,
+    out_ms: f64,
+    window: &mut Window,
+    cx: &App,
+) -> f32 {
+    let (opacity, running) =
+        fade.read(cx)
+            .value_ms(crate::util::now_ms(), cx.reduce_motion(), in_ms, out_ms);
     if running {
         window.request_animation_frame();
     }
