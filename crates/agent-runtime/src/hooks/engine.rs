@@ -2114,33 +2114,8 @@ mod token_estimate_tests {
     use super::{ContextHookRequest, Hooks, HooksConfig, estimate_chat_tokens};
     use querymt::chat::{
         ChatInputPart, ChatMessage, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
-        FinishReason, MediaKind, MediaPart, MediaSource, ToolResult,
+        MediaKind, MediaPart, MediaSource, ToolResult,
     };
-
-    #[test]
-    fn structured_output_is_estimated_once() {
-        let output = ChatOutput::from_projections(
-            None,
-            Some("a sufficiently long assistant response".into()),
-            None,
-            None,
-            Some(FinishReason::Stop),
-        );
-        let message = ChatMessage::from_assistant_output(output);
-        let expected = "a sufficiently long assistant response".len().div_ceil(4) + 4;
-
-        assert_eq!(estimate_chat_tokens(&[message]), expected);
-    }
-
-    #[test]
-    fn canonical_input_parts_are_estimated_directly() {
-        let message = ChatMessage::user()
-            .text("a sufficiently long user prompt")
-            .build();
-        let expected = "a sufficiently long user prompt".len().div_ceil(4) + 4;
-
-        assert_eq!(estimate_chat_tokens(&[message]), expected);
-    }
 
     fn image(source: MediaSource) -> MediaPart {
         MediaPart::new(MediaKind::Image, Some("image/png".parse().unwrap()), source).unwrap()
@@ -2210,56 +2185,6 @@ mod token_estimate_tests {
         assert_eq!(
             estimate_chat_tokens(&[ChatMessage::from_assistant_output(output)]),
             2 * 2_048 + 4
-        );
-    }
-
-    #[test]
-    fn output_estimate_counts_visible_content_not_transport_metadata() {
-        let mut output = ChatOutput::from_projections(
-            Some("thinking".into()),
-            Some("text".into()),
-            Some(vec![querymt::ToolCall {
-                id: "call".into(),
-                call_type: "function".into(),
-                function: querymt::FunctionCall {
-                    name: "read".into(),
-                    arguments: "{}".into(),
-                },
-            }]),
-            None,
-            Some(FinishReason::Stop),
-        );
-        let expected = 2 + 1 + 1 + 1 + 4;
-        assert_eq!(
-            estimate_chat_tokens(&[ChatMessage::from_assistant_output(output.clone())]),
-            expected
-        );
-        output.extensions.insert(
-            "raw_response".into(),
-            serde_json::json!("x".repeat(100_000)),
-        );
-        output.response_id = Some("x".repeat(100_000));
-        for item in &mut output.items {
-            if let ChatOutputItem::Reasoning(reasoning) = item {
-                reasoning.encrypted_content = Some("x".repeat(100_000));
-            }
-        }
-        assert_eq!(
-            estimate_chat_tokens(&[ChatMessage::from_assistant_output(output)]),
-            expected
-        );
-    }
-
-    #[test]
-    fn large_text_still_exceeds_a_context_window() {
-        assert!(
-            estimate_chat_tokens(&[ChatMessage::user().text("x".repeat(400_004)).build()])
-                > 100_000
-        );
-        assert_eq!(estimate_chat_tokens(&[]), 0);
-        assert_eq!(
-            estimate_chat_tokens(&[ChatMessage::user().text("x").build()]),
-            5
         );
     }
 

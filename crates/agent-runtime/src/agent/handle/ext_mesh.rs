@@ -311,7 +311,8 @@ mod access {
             let deadline = Duration::from_secs(5);
             let dir = tempfile::tempdir().unwrap();
             let store = Arc::new(querymt_remote::MeshAccessStore::new(
-                querymt_remote::MeshStateStore::shared(&dir.path().join("mesh_state.json")).unwrap(),
+                querymt_remote::MeshStateStore::shared(&dir.path().join("mesh_state.json"))
+                    .unwrap(),
             ));
             let host = libp2p::PeerId::random();
             let peer = libp2p::PeerId::random();

@@ -688,3 +688,360 @@ fn transport(kind: TransportErrorKind, message: &str) -> LLMError {
         message: message.to_owned(),
     }
 }
+
+#[cfg(all(test, feature = "kameo-mesh"))]
+mod tests {
+    use super::*;
+    use crate::{
+        AttachStreamConsumer, CancelProviderStreamRequest, GetProviderStreamStatus,
+        ProviderBuildRequest, ProviderHostActor, RegisterRequest, RemoteProviderBackend,
+        RenewProviderStreamLease,
+    };
+    use async_trait::async_trait;
+    use kameo::actor::{ActorRef, Spawn};
+    use querymt::LLMProvider;
+    use querymt::chat::{ChatOutput, ChatProvider, FinishReason};
+    use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use querymt::embedding::EmbeddingProvider;
+    use tokio::sync::mpsc;
+
+    struct FixtureProvider(Mutex<Option<ChatStream>>);
+
+    #[async_trait]
+    impl ChatProvider for FixtureProvider {
+        async fn chat(&self, _: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            panic!("fixture expects a streaming call")
+        }
+
+        async fn chat_stream(&self, _: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+            Ok(self.0.lock().take().expect("fixture expects one stream"))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for FixtureProvider {
+        async fn complete(&self, _: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            panic!("fixture expects a streaming call")
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for FixtureProvider {
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            panic!("fixture expects a streaming call")
+        }
+    }
+
+    impl LLMProvider for FixtureProvider {}
+
+    struct FixtureBackend(Option<Arc<FixtureProvider>>);
+
+    #[async_trait]
+    impl RemoteProviderBackend for FixtureBackend {
+        type Error = RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            _: ProviderBuildRequest,
+        ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
+            match &self.0 {
+                Some(provider) => Ok(provider.clone()),
+                None => Err(RemoteProviderHostError::Internal(
+                    "no such fixture provider".into(),
+                )),
+            }
+        }
+    }
+
+    struct Fixture {
+        host: ActorRef<ProviderHostActor>,
+        router: ActorRef<ProviderStreamRouterActor>,
+        request: StreamRequest,
+        consumer: mpsc::UnboundedReceiver<StreamRelayMessage>,
+    }
+
+    impl Fixture {
+        async fn new(stream: Option<ChatStream>) -> Self {
+            super::super::tests::init_local_actor_swarm();
+            let router =
+                ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+            let request_id = "request".to_owned();
+            router
+                .ask(RegisterRequest {
+                    request_id: request_id.clone(),
+                })
+                .await
+                .unwrap();
+            let (tx, consumer) = mpsc::unbounded_channel();
+            router
+                .ask(AttachStreamConsumer {
+                    request_id: request_id.clone(),
+                    consumer_tx: tx,
+                })
+                .await
+                .unwrap();
+            let request = ProviderStreamRequest {
+                provider: "fixture".into(),
+                model: "fixture-model".into(),
+                messages: Vec::new(),
+                tools: None,
+                session_id: "session".into(),
+                request_id,
+                stream_router_ref: router.into_remote_ref().await,
+                reconnect_grace_secs: 1,
+                heartbeat_interval_secs: 1,
+                lease_ttl_secs: 60,
+                params: None,
+                item_aware_contract_version: None,
+                options: None,
+            };
+            let backend = FixtureBackend(
+                stream.map(|stream| Arc::new(FixtureProvider(Mutex::new(Some(stream))))),
+            );
+            let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(backend)));
+            Self {
+                host,
+                router,
+                request,
+                consumer,
+            }
+        }
+
+        async fn start(&self) {
+            self.host
+                .ask(self.request.clone())
+                .await
+                .expect("stream accepted");
+        }
+
+        async fn next(&mut self) -> StreamRelayMessage {
+            time::timeout(Duration::from_secs(5), self.consumer.recv())
+                .await
+                .expect("relay must deliver before the router gap timeout")
+                .expect("consumer closed before the expected frame")
+        }
+
+        async fn status(&self) -> Option<ProviderStreamStatus> {
+            self.host
+                .ask(GetProviderStreamStatus {
+                    session_id: self.request.session_id.clone(),
+                    request_id: Some(self.request.request_id.clone()),
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn assert_unregistered(&self) {
+            time::timeout(Duration::from_secs(2), async {
+                while self.status().await.is_some() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("finished stream must unregister");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_numbers_stream_messages_contiguously_from_zero() {
+        let upstream = (0..MAX_BATCH_SIZE)
+            .map(|i| Ok(StreamChunk::Text(i.to_string())))
+            .chain([Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            })]);
+        let mut fixture = Fixture::new(Some(Box::pin(futures_util::stream::iter(upstream)))).await;
+        fixture.start().await;
+
+        let StreamRelayMessage::ChunkBatch(chunks) = fixture.next().await else {
+            panic!("expected data batch before the terminal");
+        };
+        assert_eq!(chunks.len(), MAX_BATCH_SIZE);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(matches!(chunk, StreamChunk::Text(text) if text == &i.to_string()));
+        }
+        assert!(matches!(
+            fixture.next().await,
+            StreamRelayMessage::Chunk(StreamChunk::Done {
+                finish_reason: FinishReason::Stop
+            })
+        ));
+        fixture.assert_unregistered().await;
+    }
+
+    #[tokio::test]
+    async fn host_setup_failure_reaches_consumer_as_sequenced_provider_error() {
+        let mut fixture = Fixture::new(None).await;
+        fixture.start().await;
+
+        let StreamRelayMessage::ProviderError { error } = fixture.next().await else {
+            panic!("expected a provider setup error");
+        };
+        assert!(
+            LLMError::from_payload(error)
+                .to_string()
+                .contains("no such fixture provider")
+        );
+        fixture.assert_unregistered().await;
+    }
+
+    #[tokio::test]
+    async fn upstream_error_flushes_pending_data_before_the_typed_terminal() {
+        let upstream = futures_util::stream::iter([
+            Ok(StreamChunk::Text("partial answer".into())),
+            Err(LLMError::RateLimited {
+                message: "fixture limit".into(),
+                retry_after_secs: Some(7),
+            }),
+        ]);
+        let mut fixture = Fixture::new(Some(Box::pin(upstream))).await;
+        fixture.start().await;
+
+        assert!(
+            matches!(fixture.next().await, StreamRelayMessage::Chunk(StreamChunk::Text(text)) if text == "partial answer")
+        );
+        let StreamRelayMessage::ProviderError { error } = fixture.next().await else {
+            panic!("expected an upstream error after the partial answer");
+        };
+        assert!(
+            matches!(LLMError::from_payload(error), LLMError::RateLimited { message, retry_after_secs: Some(7) } if message == "fixture limit")
+        );
+        fixture.assert_unregistered().await;
+    }
+
+    #[tokio::test]
+    async fn live_stream_reports_progress_and_honors_scoped_controls() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let upstream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let mut fixture = Fixture::new(Some(Box::pin(upstream))).await;
+        fixture.start().await;
+        let duplicate = fixture.host.ask(fixture.request.clone()).await.unwrap_err();
+        assert!(duplicate.to_string().contains("chat_stream"));
+
+        assert!(matches!(
+            fixture.next().await,
+            StreamRelayMessage::Heartbeat {
+                phase: ProviderStreamPhase::WaitingFirstChunk,
+                chunk_count: 0,
+                ..
+            }
+        ));
+        let before = fixture.status().await.unwrap();
+        assert_eq!(before.phase, ProviderStreamPhase::WaitingFirstChunk);
+        assert!(before.receiver_connected);
+        for (ttl, expected) in [(u64::MAX, false), (120, true)] {
+            let renewed = fixture
+                .host
+                .ask(RenewProviderStreamLease {
+                    session_id: fixture.request.session_id.clone(),
+                    request_id: fixture.request.request_id.clone(),
+                    lease_ttl_secs: ttl,
+                })
+                .await
+                .unwrap();
+            assert_eq!(renewed, expected);
+        }
+        assert!(fixture.status().await.unwrap().lease_expires_in_ms > before.lease_expires_in_ms);
+
+        tx.send(Ok(StreamChunk::Text("first".into()))).unwrap();
+        assert!(
+            matches!(fixture.next().await, StreamRelayMessage::Chunk(StreamChunk::Text(text)) if text == "first")
+        );
+        let status = fixture.status().await.unwrap();
+        assert_eq!(status.phase, ProviderStreamPhase::Streaming);
+        assert_eq!(status.chunk_count, 1);
+        for (session_id, request_id, expected) in [
+            ("other-session", None, 0),
+            ("session", Some("other-request"), 0),
+            ("session", None, 1),
+        ] {
+            let cancelled = fixture
+                .host
+                .ask(CancelProviderStreamRequest {
+                    session_id: session_id.into(),
+                    request_id: request_id.map(str::to_owned),
+                    reason: Some("fixture stopped".into()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(cancelled, expected);
+        }
+        let StreamRelayMessage::TransportFailed { error } = fixture.next().await else {
+            panic!("expected cancellation to reach the stream consumer");
+        };
+        assert!(matches!(
+            LLMError::from_payload(error),
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+        fixture.assert_unregistered().await;
+        assert!(tx.is_closed(), "cancellation must drop the upstream reader");
+    }
+
+    #[tokio::test]
+    async fn expired_lease_interrupts_a_silent_upstream() {
+        let mut fixture = Fixture::new(Some(Box::pin(futures_util::stream::pending()))).await;
+        fixture.request.lease_ttl_secs = 1;
+        fixture.request.heartbeat_interval_secs = 60;
+        fixture.start().await;
+        let StreamRelayMessage::TransportFailed { error } = fixture.next().await else {
+            panic!("expected lease expiry to reach the stream consumer");
+        };
+        assert!(matches!(
+            LLMError::from_payload(error),
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+        fixture.assert_unregistered().await;
+    }
+
+    #[tokio::test]
+    async fn relay_expires_grace_when_the_receiver_stays_disconnected() {
+        let fixture = Fixture::new(None).await;
+        fixture.router.kill();
+        fixture.router.wait_for_shutdown().await;
+        let streams = LiveStreams::default();
+        let relay = Relay::new(
+            streams.clone(),
+            &fixture.request,
+            Owner::Local,
+            CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        let mut delivery = Delivery::default();
+        let error = time::timeout(
+            Duration::from_secs(5),
+            relay.deliver(
+                &mut delivery,
+                StreamRelayMessage::Chunk(StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+                true,
+            ),
+        )
+        .await
+        .expect("delivery must stop after reconnect grace")
+        .unwrap_err();
+        assert!(matches!(
+            LLMError::from_payload(error.to_payload()),
+            LLMError::Transport {
+                kind: TransportErrorKind::Timeout,
+                ..
+            }
+        ));
+        let status = relay.active.status();
+        assert_eq!(status.phase, ProviderStreamPhase::GraceExpired);
+        assert!(!status.receiver_connected);
+        assert_eq!(
+            delivery.queue.front_cloned().unwrap().0,
+            Some(0),
+            "failed frame remains available for replay"
+        );
+        drop(relay);
+        assert!(streams.lock().is_empty());
+    }
+}

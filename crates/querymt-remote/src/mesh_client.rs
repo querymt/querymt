@@ -622,3 +622,150 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
     tracing::Span::current().record("found", false);
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_host_actor::tests::{RecordingBackend, init_local_actor_swarm};
+    use crate::{MeshTransportKind, MeshTransportMode, RouteTable, StaticCatalogBackend};
+    use querymt::chat::GenerationOptions;
+    use tokio::sync::broadcast;
+
+    fn mesh_fixture() -> (MeshHandle, Arc<RouteTable>) {
+        init_local_actor_swarm();
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let routes = Arc::new(RouteTable::new(Duration::from_secs(60)));
+        let mesh = MeshHandle::new(
+            keypair.public().to_peer_id(),
+            broadcast::channel(8).0,
+            routes.clone(),
+            "routing-fixture".into(),
+            Default::default(),
+            keypair,
+            None,
+            None,
+            MeshTransportMode::Lan,
+            mpsc::unbounded_channel().0,
+            Duration::from_secs(5),
+        );
+        (mesh, routes)
+    }
+
+    #[tokio::test]
+    async fn catalog_discovery_prefers_the_best_matching_route_without_a_node_manager() {
+        let (mesh, routes) = mesh_fixture();
+        let scope = MeshScopeId::lan_default();
+        let preferred = PeerId::random();
+        let fallback = PeerId::random();
+        let mismatched = PeerId::random();
+        let mut catalogs = Vec::new();
+        for (peer, claimed_peer, priority) in [
+            (preferred, preferred, 20),
+            (fallback, fallback, 10),
+            (mismatched, preferred, 30),
+        ] {
+            routes.upsert_addrs(
+                peer,
+                MeshTransportKind::Lan,
+                scope.clone(),
+                [libp2p::Multiaddr::empty()],
+                priority,
+            );
+            let catalog = ProviderCatalogActor::spawn(ProviderCatalogActor::new(Arc::new(
+                StaticCatalogBackend::provider_model(
+                    claimed_peer.to_string(),
+                    None,
+                    "fixture",
+                    "demo",
+                ),
+            )));
+            mesh.register_actor(catalog.clone(), scoped_provider_catalog(&scope, &peer))
+                .await;
+            catalogs.push(catalog);
+        }
+
+        assert_eq!(
+            find_provider_on_mesh(&mesh, "fixture").await,
+            Some(NodeId::from_peer_id(preferred))
+        );
+        assert!(
+            find_provider_on_mesh(&mesh, "never-advertised")
+                .await
+                .is_none()
+        );
+        drop(catalogs);
+    }
+
+    #[tokio::test]
+    async fn mesh_chat_uses_the_targets_scope_and_forwards_generation_options() {
+        let (mesh, routes) = mesh_fixture();
+        let target = NodeId::from_peer_id(PeerId::random());
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "fixture-mesh".into(),
+        };
+        routes.upsert_addrs(
+            *target.as_peer_id(),
+            MeshTransportKind::Iroh,
+            scope.clone(),
+            [libp2p::Multiaddr::empty()],
+            20,
+        );
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: seen.clone(),
+        })));
+        let locator = scoped_provider_host(&scope, &target.to_string());
+        mesh.register_actor(host.clone(), &locator).await;
+
+        let provider = MeshChatProvider::from_node_id(&mesh, &target, "fixture", "demo")
+            .with_stream_controls(7, 33);
+        assert!(provider.capabilities().streaming);
+        let options = GenerationOptions::NONE.with_max_tokens(123);
+        provider
+            .chat(&ChatCall::new(&[]).options(options))
+            .await
+            .expect("chat routed to the scoped fixture host");
+        assert_eq!(seen.lock().as_slice(), &[options]);
+        let core = provider.inner.core();
+        assert_eq!(core.config().heartbeat_interval_secs, 7);
+        assert_eq!(core.config().lease_ttl_secs, 33);
+        assert!(
+            !provider.capabilities().streaming,
+            "the negotiated host only supports chat"
+        );
+        assert_eq!(provider.output_provenance(), None);
+        assert!(
+            provider
+                .get_remote_stream_status("missing-session", None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            core.transport()
+                .lookup_provider_host(&locator)
+                .await
+                .unwrap()
+                .id(),
+            host.id()
+        );
+        core.transport()
+            .invalidate_cached_provider_host(&locator)
+            .await;
+        assert!(
+            !KameoMeshClientTransport::provider_host_cache()
+                .read()
+                .await
+                .contains_key(&locator)
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_provider_host_error_names_the_lan_locator() {
+        let (mesh, _) = mesh_fixture();
+        let provider = MeshChatProvider::new(&mesh, "unregistered-fixture-host", "fixture", "demo");
+        let error = provider.chat(&ChatCall::new(&[])).await.unwrap_err();
+        assert!(
+            matches!(error, LLMError::ProviderError(message) if message.contains("scope::lan::default::provider_host::peer::unregistered-fixture-host"))
+        );
+    }
+}

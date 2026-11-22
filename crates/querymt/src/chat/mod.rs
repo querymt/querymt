@@ -1624,6 +1624,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn estimates_canonical_text_once_with_overhead_per_message() {
+        let messages = [
+            ChatMessage::user().text("\u{e9}\u{e9}\u{e9}").build(),
+            ChatOutput::from_projections(None, Some("answer".into()), None, None, None).into(),
+            ChatMessage::user().build(),
+        ];
+        assert_eq!(
+            estimate_chat_tokens(&messages, |_| unreachable!()),
+            2 + 2 + 3 * 4
+        );
+        assert_eq!(estimate_chat_tokens(&[], |_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn large_text_still_exceeds_a_context_window() {
+        let message = ChatMessage::user().text("x".repeat(400_004)).build();
+        assert_eq!(
+            estimate_chat_tokens(&[message], |_| unreachable!()),
+            100_005
+        );
+    }
+
+    #[test]
+    fn output_estimate_counts_visible_content_not_transport_metadata() {
+        let mut output = ChatOutput::from_projections(
+            Some("thinking".into()),
+            Some("text".into()),
+            Some(vec![ToolCall {
+                id: "call-identifier-is-not-counted".into(),
+                call_type: "function".into(),
+                function: crate::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            None,
+            Some(FinishReason::Stop),
+        );
+        let estimate =
+            |output: ChatOutput| estimate_chat_tokens(&[output.into()], |_| unreachable!());
+        let expected = 2 + 1 + 1 + 1 + 4;
+        assert_eq!(estimate(output.clone()), expected);
+
+        let opaque = serde_json::json!({"unrecognized": "x".repeat(1000)});
+        output
+            .extensions
+            .insert("raw_response".into(), opaque.clone());
+        output.response_id = Some("response-id-not-in-prompt".into());
+        for item in &mut output.items {
+            match item {
+                ChatOutputItem::Reasoning(reasoning) => {
+                    reasoning.encrypted_content = Some("encrypted-reasoning".into());
+                    reasoning.summary.push(ChatReasoningPart {
+                        text: "summary".into(),
+                        extensions: Default::default(),
+                    });
+                }
+                ChatOutputItem::Message(message) => message.parts.extend([
+                    ChatMessagePart::Refusal {
+                        refusal: "can't".into(),
+                        extensions: Default::default(),
+                    },
+                    ChatMessagePart::Opaque(ChatOpaquePart {
+                        original_type: "future_part".into(),
+                        payload: opaque.clone(),
+                    }),
+                ]),
+                _ => {}
+            }
+        }
+        output.items.push(ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "future_item".into(),
+            payload: opaque,
+        }));
+        assert_eq!(estimate(output), expected + 2 + 2);
+    }
+
+    #[test]
+    fn estimates_media_in_input_output_and_tool_results_via_the_callback() {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            Some("image/png".parse().unwrap()),
+            MediaSource::Inline {
+                data: vec![1, 2, 3],
+            },
+        )
+        .unwrap();
+        let messages = [
+            ChatMessage::from_user_parts(vec![ChatInputPart::attachment(media.clone())]),
+            ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(
+                ToolResult::new("ignored-call-id")
+                    .with_name("fetch")
+                    .with_text("preview")
+                    .with_attachment(media.clone()),
+            )]),
+            ChatMessage::assistant().attachment(media.clone()).build(),
+        ];
+        let calls = std::cell::Cell::new(0);
+        let estimate = estimate_chat_tokens(&messages, |part| {
+            assert_eq!(part, &media);
+            calls.set(calls.get() + 1);
+            7
+        });
+        assert_eq!(calls.get(), 3);
+        assert_eq!(estimate, 3 * 7 + 2 + 2 + 3 * 4);
+        assert_eq!(estimate_chat_tokens(&messages, |_| usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn tool_change_estimate_includes_definitions_and_removed_names() {
+        let tool = sample_tool("search");
+        let definition = serde_json::to_string(&tool).unwrap();
+        let message = ChatMessage::from_tool_change(ToolChange {
+            added: vec![tool],
+            removed: vec!["read".into(), "write".into()],
+        });
+        assert_eq!(
+            estimate_chat_tokens(&[message], |_| unreachable!()),
+            definition.len().div_ceil(4) + 1 + 2 + 4
+        );
+    }
+
+    #[test]
     fn generation_options_default_is_empty() {
         assert!(GenerationOptions::default().is_empty());
         assert_eq!(GenerationOptions::default(), GenerationOptions::NONE);

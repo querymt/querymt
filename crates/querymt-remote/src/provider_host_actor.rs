@@ -546,7 +546,7 @@ remote_provider_msg_impl!(
 );
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ProviderStreamPhase;
     use async_trait::async_trait;
@@ -563,6 +563,41 @@ mod tests {
     use querymt::error::LLMError;
 
     use crate::{ProviderBuildRequest, RemoteProviderBackend};
+
+    #[cfg(feature = "kameo-mesh")]
+    pub(crate) fn init_local_actor_swarm() {
+        use futures_util::StreamExt;
+        use libp2p::{PeerId, Transport, core::muxing::StreamMuxerBox};
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        // Nextest isolates tests that bootstrap their own global Kameo registry.
+        // These provider fixtures can share one local-only driver under libtest.
+        static SWARM: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        SWARM.get_or_init(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let peer = PeerId::random();
+            let behaviour = kameo::remote::Behaviour::new(
+                peer,
+                crate::mesh_runtime::messaging_config(Duration::from_secs(3)),
+            );
+            behaviour.init_global();
+            let transport =
+                libp2p::core::transport::dummy::DummyTransport::<(PeerId, StreamMuxerBox)>::new();
+            let mut swarm = libp2p::Swarm::new(
+                transport.boxed(),
+                behaviour,
+                peer,
+                libp2p::swarm::Config::with_tokio_executor(),
+            );
+            runtime.spawn(async move { while swarm.next().await.is_some() {} });
+            runtime
+        });
+    }
 
     /// Provider that records the per-request options it receives.
     #[derive(Default)]
@@ -598,8 +633,8 @@ mod tests {
 
     impl LLMProvider for RecordingProvider {}
 
-    struct RecordingBackend {
-        seen: Arc<Mutex<Vec<GenerationOptions>>>,
+    pub(crate) struct RecordingBackend {
+        pub(crate) seen: Arc<Mutex<Vec<GenerationOptions>>>,
     }
 
     #[async_trait]
