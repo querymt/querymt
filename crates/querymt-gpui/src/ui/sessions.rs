@@ -321,29 +321,14 @@ impl Default for SessionList {
 impl SessionList {
     /// Replace the entries, invalidating only the ones whose height may have
     /// changed so the list keeps its measurements and scroll position.
+    /// Replace the entries, invalidating only the ones whose height may have
+    /// changed so the list keeps its measurements and scroll position.
     fn sync(&mut self, entries: Vec<Entry>, rc: RowCtx, global: u64) {
         let sigs: Vec<u64> = entries.iter().map(Entry::sig).collect();
-        if self.global != Some(global) || self.state.item_count() != self.sigs.len() {
+        if self.global != Some(global) {
             self.state.reset(sigs.len());
-        } else if self.sigs.len() == sigs.len() {
-            for (ix, (old, new)) in self.sigs.iter().zip(&sigs).enumerate() {
-                if old != new {
-                    self.state.remeasure_items(ix..ix + 1);
-                }
-            }
         } else {
-            let old = &self.sigs;
-            let prefix = old.iter().zip(&sigs).take_while(|(a, b)| a == b).count();
-            let max_suffix = old.len().min(sigs.len()) - prefix;
-            let suffix = old
-                .iter()
-                .rev()
-                .zip(sigs.iter().rev())
-                .take(max_suffix)
-                .take_while(|(a, b)| a == b)
-                .count();
-            self.state
-                .splice(prefix..old.len() - suffix, sigs.len() - prefix - suffix);
+            kit::sync_list_state(&self.state, &self.sigs, &sigs);
         }
         self.global = Some(global);
         self.sigs = sigs;

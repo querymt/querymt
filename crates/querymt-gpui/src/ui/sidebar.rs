@@ -3,8 +3,12 @@
 //! click menu with what can be done to a session, a dot on sessions waiting
 //! for the user, and the open list growing as it is scrolled.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -12,14 +16,19 @@ use super::{Page, QmtApp, kit};
 use crate::store::SessionSummary;
 use crate::store::sidebar::{SideList, tab_key};
 use crate::theme::{Palette, palette};
+use crate::util::{short_time, workspace_name};
 
 /// Open sessions shown at first and added per page as the list is scrolled
 /// (desktop `SESSION_PAGE_SIZE`).
 pub(super) const OPEN_PAGE: usize = 20;
 /// Pinned sessions shown at first and added per "Show more pinned".
 pub(super) const PINNED_PAGE: usize = 5;
-/// How close to the bottom the open list loads its next page.
-const LOAD_MARGIN: f32 = 120.;
+/// Rows from the end of the list at which the next page of open sessions
+/// loads.
+const LOAD_MARGIN: usize = 3;
+/// Space between rows of the expanded list, and between tiles of the rail.
+const ROW_GAP: f32 = 1.;
+const TILE_GAP: f32 = 6.;
 
 const COPIED_SIDE_PATH: &str = "side-menu-path";
 const COPIED_SIDE_ID: &str = "side-menu-id";
@@ -64,7 +73,10 @@ pub(super) struct SideMenu {
 pub(super) struct SideUi {
     pub(super) open_limit: usize,
     pub(super) pinned_limit: usize,
-    pub(super) scroll: ScrollHandle,
+    /// The expanded sidebar's session list.
+    full: VirtualSide,
+    /// The collapsed rail's tiles.
+    rail: VirtualSide,
     pub(super) drop_target: Option<DropTarget>,
     pub(super) menu: Option<SideMenu>,
 }
@@ -74,11 +86,106 @@ impl Default for SideUi {
         Self {
             open_limit: OPEN_PAGE,
             pinned_limit: PINNED_PAGE,
-            scroll: ScrollHandle::new(),
+            full: VirtualSide::default(),
+            rail: VirtualSide::default(),
             drop_target: None,
             menu: None,
         }
     }
+}
+
+/// One entry of a virtual sidebar list. Session entries index into
+/// [`SideRows`].
+#[derive(Clone, Copy, PartialEq)]
+enum SideItem {
+    /// No open sessions: why.
+    Empty(&'static str),
+    PinnedSection,
+    Pinned(usize),
+    /// "Show more pinned", with how many are hidden.
+    MorePinned(usize),
+    OpenHeader,
+    Open(usize),
+    /// The rail's tile of `open[ix]` (pinned first there).
+    Tile(usize),
+    /// More open sessions load as the list is scrolled to here.
+    More,
+}
+
+/// What the rows of one frame are drawn from.
+struct SideRows {
+    p: Palette,
+    pinned: Vec<SessionSummary>,
+    open: Vec<SessionSummary>,
+    open_total: usize,
+    waiting: HashSet<String>,
+    /// `agent/session` of the session open in the transcript.
+    current: Option<String>,
+    show_pinned: bool,
+    catalog_loading: bool,
+}
+
+/// A virtualized sidebar list: only the rows in view are built and laid
+/// out. Building every loaded row each frame made a long, scrolled list
+/// take ~190 ms a frame with 1,500 sessions.
+struct VirtualSide {
+    state: ListState,
+    items: Rc<Vec<SideItem>>,
+    sigs: Vec<u64>,
+    rows: Option<Rc<SideRows>>,
+    /// The scroll handler (loading the next page) is installed.
+    hooked: bool,
+}
+
+impl Default for VirtualSide {
+    fn default() -> Self {
+        Self {
+            state: ListState::new(0, ListAlignment::Top, px(400.)),
+            items: Rc::default(),
+            sigs: Vec::new(),
+            rows: None,
+            hooked: false,
+        }
+    }
+}
+
+impl VirtualSide {
+    fn sync(&mut self, items: Vec<SideItem>, rows: SideRows) {
+        // Rows have fixed heights: an item's identity is its signature.
+        let sigs: Vec<u64> = items
+            .iter()
+            .map(|item| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                match *item {
+                    SideItem::Empty(text) => (0u8, text).hash(&mut h),
+                    SideItem::PinnedSection => 1u8.hash(&mut h),
+                    SideItem::Pinned(ix) => (2u8, tab_key(&rows.pinned[ix])).hash(&mut h),
+                    SideItem::MorePinned(n) => (3u8, n).hash(&mut h),
+                    SideItem::OpenHeader => 4u8.hash(&mut h),
+                    SideItem::Open(ix) => (5u8, tab_key(&rows.open[ix])).hash(&mut h),
+                    SideItem::Tile(ix) => (6u8, tab_key(&rows.open[ix])).hash(&mut h),
+                    SideItem::More => 7u8.hash(&mut h),
+                }
+                h.finish()
+            })
+            .collect();
+        kit::sync_list_state(&self.state, &self.sigs, &sigs);
+        self.sigs = sigs;
+        self.items = Rc::new(items);
+        self.rows = Some(Rc::new(rows));
+    }
+}
+
+/// A quiet group label of the sidebar: small caps in the dim tone.
+pub(super) fn section(text: &'static str, p: &Palette) -> Div {
+    div()
+        .px_2()
+        .pt_3()
+        .pb_1()
+        .text_size(px(11.))
+        .font_medium()
+        .text_color(p.dim)
+        .child(text.to_uppercase())
 }
 
 /// A row being dragged, and its picture under the pointer.
@@ -226,18 +333,441 @@ impl QmtApp {
         }
     }
 
-    /// Show the next page of open sessions once the list (expanded or the
-    /// rail) is scrolled near its end (desktop `loadNearBottom`).
-    pub(super) fn sidebar_near_bottom(&mut self, cx: &mut Context<Self>) {
-        let (offset, max) = (self.side.scroll.offset(), self.side.scroll.max_offset());
-        if max.y + offset.y > px(LOAD_MARGIN) {
-            return;
-        }
+    /// Show the next page of open sessions: the list (expanded or the rail)
+    /// was scrolled near its end (desktop `loadNearBottom`).
+    fn sidebar_grow(&mut self, cx: &mut Context<Self>) {
         let total = self.store.read(cx).sidebar_sessions(SideList::Open).len();
         if self.side.open_limit < total {
             self.side.open_limit += OPEN_PAGE;
             cx.notify();
         }
+    }
+
+    /// The virtual list of the expanded sidebar (`rail` false) or of the
+    /// collapsed rail. Without pinned sessions the expanded list's "Open
+    /// sessions" header is not part of it: see [`Self::open_header`].
+    pub(super) fn side_list(
+        &mut self,
+        rail: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Shown {
+            pinned,
+            pinned_total,
+            open,
+            open_total,
+        } = self.sidebar_shown(cx);
+        let store = self.store.read(cx);
+        let show_pinned = store.prefs.show_pinned_sidebar;
+        let empty_text = {
+            let any_connecting = store.configs.iter().any(|c| {
+                store.state(&c.id) == crate::store::ConnState::Connecting
+                    || store
+                        .runtime(&c.id)
+                        .is_some_and(|r| r.is_connected() && !r.sessions_loaded)
+            });
+            if any_connecting {
+                "Loading sessions…"
+            } else if store.connected_ids().is_empty() {
+                "Connect an agent to see sessions."
+            } else {
+                "No open sessions."
+            }
+        };
+        let rows = SideRows {
+            p: *palette(cx),
+            open_total,
+            waiting: store.sessions_waiting(),
+            current: self.current_tab(cx),
+            show_pinned,
+            catalog_loading: self.catalog_loading(cx),
+            pinned,
+            open,
+        };
+        let mut items = Vec::new();
+        let more = if rail {
+            items.extend((0..rows.open.len()).map(SideItem::Tile));
+            rows.open.len() < pinned_total + open_total
+        } else {
+            if rows.open.is_empty() {
+                items.push(SideItem::Empty(empty_text));
+            }
+            if show_pinned && !rows.pinned.is_empty() {
+                items.push(SideItem::PinnedSection);
+                items.extend((0..rows.pinned.len()).map(SideItem::Pinned));
+                let hidden = pinned_total.saturating_sub(rows.pinned.len());
+                if hidden > 0 {
+                    items.push(SideItem::MorePinned(hidden));
+                }
+                items.push(SideItem::OpenHeader);
+            }
+            items.extend((0..rows.open.len()).map(SideItem::Open));
+            rows.open.len() < open_total
+        };
+        if more {
+            items.push(SideItem::More);
+        }
+        let side = if rail {
+            &mut self.side.rail
+        } else {
+            &mut self.side.full
+        };
+        side.sync(items, rows);
+        if !side.hooked {
+            side.hooked = true;
+            let weak = cx.entity().downgrade();
+            side.state.set_scroll_handler(move |ev, _, cx| {
+                if ev.visible_range.end + LOAD_MARGIN >= ev.count {
+                    let _ = weak.update(cx, |this, cx| this.sidebar_grow(cx));
+                }
+            });
+        }
+        // A list that doesn't fill its space can't be scrolled, so the
+        // handler never fires: load on while its end is in view.
+        let count = side.state.item_count();
+        if more && count > 0 && side.state.item_is_below_viewport(count - 1) == Some(false) {
+            cx.on_next_frame(window, |this, _, cx| this.sidebar_grow(cx));
+        }
+        let render = cx.processor(move |this: &mut Self, ix: usize, _, cx| {
+            this.render_side_item(rail, ix, cx)
+        });
+        list(side.state.clone(), move |ix, window, cx| {
+            render(ix, window, cx)
+        })
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .into_any_element()
+    }
+
+    /// Of the expanded list as last synced: whether it shows the pinned
+    /// group (and so its own \"Open sessions\" header), and the open total.
+    pub(super) fn side_header_info(&self) -> (bool, usize) {
+        let full = &self.side.full;
+        let pinned = full.items.contains(&SideItem::PinnedSection);
+        (pinned, full.rows.as_ref().map_or(0, |r| r.open_total))
+    }
+
+    /// Older catalog pages are still arriving after the first was shown.
+    pub(super) fn catalog_loading(&self, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        store.configs.iter().any(|c| {
+            store
+                .runtime(&c.id)
+                .is_some_and(|r| r.is_connected() && r.catalog_loading)
+        })
+    }
+
+    /// "Open sessions" doubles as a link to the full list; the count on the
+    /// right tells how many there are.
+    pub(super) fn open_header(
+        &self,
+        catalog_loading: bool,
+        open_total: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let p = *p;
+        h_flex()
+            .id("sidebar-open-header")
+            .cursor_pointer()
+            .child(section("Open sessions", &p).flex_1())
+            .when(catalog_loading, |el| {
+                el.child(
+                    div()
+                        .id("sidebar-catalog-loading")
+                        .pt_3()
+                        .pb_1()
+                        .pr_1()
+                        .child(kit::spinner("sidebar-catalog-spinner", 11., p.dim))
+                        .tooltip(|window, cx| {
+                            kit::wrap_tip("Loading older sessions…").build(window, cx)
+                        }),
+                )
+            })
+            .when(open_total > 0, |el| {
+                el.child(
+                    div()
+                        .pt_3()
+                        .pb_1()
+                        .pr_2()
+                        .text_size(px(11.))
+                        .text_color(p.dim)
+                        .child(open_total.to_string()),
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.go(Page::Sessions, cx)))
+    }
+
+    /// Item `ix` of the expanded list or of the rail, as last synced.
+    fn render_side_item(&mut self, rail: bool, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let side = if rail {
+            &self.side.rail
+        } else {
+            &self.side.full
+        };
+        let (Some(item), Some(rows)) = (side.items.get(ix).copied(), side.rows.clone()) else {
+            return div().into_any_element();
+        };
+        let p = rows.p;
+        let gap = if rail { TILE_GAP } else { ROW_GAP };
+        let body = match item {
+            SideItem::Empty(text) => div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(p.dim)
+                .child(text)
+                .into_any_element(),
+            SideItem::PinnedSection => section("Pinned", &p).into_any_element(),
+            SideItem::Pinned(i) => self.pinned_row(i, &rows, cx).into_any_element(),
+            SideItem::MorePinned(hidden) => div()
+                .id("sidebar-more-pinned")
+                .px_2()
+                .py_1()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_xs()
+                .text_color(p.dim)
+                .hover(move |s| s.bg(p.card_hover).text_color(p.muted))
+                .child(format!("Show more pinned ({hidden})"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.side.pinned_limit += PINNED_PAGE;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            SideItem::OpenHeader => self
+                .open_header(rows.catalog_loading, rows.open_total, &p, cx)
+                .into_any_element(),
+            SideItem::Open(i) => self.open_row(i, &rows, cx).into_any_element(),
+            SideItem::Tile(i) => self.rail_tile(i, &rows, cx).into_any_element(),
+            SideItem::More => h_flex()
+                .justify_center()
+                .py_2()
+                .child(kit::spinner(
+                    if rail {
+                        "rail-more-open"
+                    } else {
+                        "sidebar-more-open"
+                    },
+                    12.,
+                    p.dim,
+                ))
+                .into_any_element(),
+        };
+        // The gap is the row's own bottom padding: list rows can't have one
+        // between them.
+        div()
+            .w_full()
+            .pb(px(gap))
+            .when(rail, |el| el.flex().justify_center())
+            .child(body)
+            .into_any_element()
+    }
+
+    fn pinned_row(&self, ix: usize, rows: &SideRows, cx: &mut Context<Self>) -> Stateful<Div> {
+        let p = rows.p;
+        let s = &rows.pinned[ix];
+        let hover_bg = p.card_hover;
+        let key = tab_key(s);
+        let current = rows.current.as_deref() == Some(key.as_str());
+        let group = SharedString::from(format!("pinned-session-title-{}", s.id));
+        // The current row gets the rail's quiet neutral fill, not the
+        // accent tint.
+        let background = if current { p.bg.blend(p.card) } else { p.bg };
+        let row = h_flex()
+            .id(kit::keyed("pinned-session", s.id.clone()))
+            .group(group.clone())
+            .gap_2()
+            .px_2()
+            .h(px(28.))
+            .rounded(px(8.))
+            .text_color(if current { p.text } else { p.muted })
+            .when(current, |el| el.bg(background))
+            .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
+            .cursor_pointer()
+            .child(kit::identicon(&s.id, 14.))
+            .child(kit::fading_title(
+                s.display_title(),
+                group,
+                background,
+                if current {
+                    background
+                } else {
+                    p.bg.blend(hover_bg)
+                },
+            ))
+            .when(rows.waiting.contains(&key), |el| {
+                el.child(waiting_dot(&s.id, &p))
+            })
+            .when(s.running(), |el| {
+                el.child(kit::spinner(
+                    kit::keyed("pin-spin", s.id.clone()),
+                    12.,
+                    p.success,
+                ))
+            });
+        let s2 = s.clone();
+        self.tab_row(
+            row,
+            SideList::Pinned,
+            ix,
+            rows.pinned.len(),
+            s,
+            TabLook::Pinned,
+            ROW_GAP,
+            &p,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
+    }
+
+    fn open_row(&self, ix: usize, rows: &SideRows, cx: &mut Context<Self>) -> Stateful<Div> {
+        let p = rows.p;
+        let s = &rows.open[ix];
+        let hover_bg = p.card_hover;
+        let key = tab_key(s);
+        let current = rows.current.as_deref() == Some(key.as_str());
+        let group = SharedString::from(format!("open-session-title-{}", s.id));
+        // Same quiet fill as the rail's current tile.
+        let background = if current { p.bg.blend(p.card) } else { p.bg };
+        let row = v_flex()
+            .id(kit::keyed("open-session", s.id.clone()))
+            .group(group.clone())
+            .cursor_pointer()
+            .px_2()
+            .py_1p5()
+            .gap_0p5()
+            .rounded(px(8.))
+            .when(current, |el| el.bg(background))
+            .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        kit::fading_title(
+                            s.display_title(),
+                            group,
+                            background,
+                            if current {
+                                background
+                            } else {
+                                p.bg.blend(hover_bg)
+                            },
+                        )
+                        .text_color(if current { p.text } else { p.muted })
+                        .when(current, |el| el.font_medium()),
+                    )
+                    .when(rows.waiting.contains(&key), |el| {
+                        el.child(waiting_dot(&s.id, &p))
+                    })
+                    .when(s.running(), |el| {
+                        el.child(kit::spinner(
+                            kit::keyed("sb-spin", s.id.clone()),
+                            13.,
+                            p.success,
+                        ))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(p.dim)
+                    .child(kit::identicon(&s.id, 14.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(workspace_name(&s.cwd)),
+                    )
+                    .child(div().flex_none().child(short_time(&s.updated_at))),
+            );
+        let s2 = s.clone();
+        self.tab_row(
+            row,
+            SideList::Open,
+            ix,
+            rows.open.len(),
+            s,
+            TabLook::Open {
+                workspace: workspace_name(&s.cwd).into(),
+                time: short_time(&s.updated_at).into(),
+            },
+            ROW_GAP,
+            &p,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
+    }
+
+    fn rail_tile(&self, ix: usize, rows: &SideRows, cx: &mut Context<Self>) -> Stateful<Div> {
+        let p = rows.p;
+        let s = &rows.open[ix];
+        let key = tab_key(s);
+        let current = rows.current.as_deref() == Some(key.as_str());
+        let is_waiting = rows.waiting.contains(&key);
+        let title = format!(
+            "{}\n{}{}",
+            s.display_title(),
+            workspace_name(&s.cwd),
+            if is_waiting { "\nWaiting for you" } else { "" }
+        );
+        let list = if s.pinned && rows.show_pinned {
+            SideList::Pinned
+        } else {
+            SideList::Open
+        };
+        let tile = kit::rail_button(
+            SharedString::from(format!("rail-session-{}-{}", s.agent_id, s.id)),
+            current,
+            &p,
+        )
+        .tooltip(move |window, cx| kit::wrap_tip(title.clone()).build(window, cx))
+        .child(kit::identicon(&s.id, 30.))
+        .when(s.running(), |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top(px(-1.))
+                    .right(px(-1.))
+                    .p_0p5()
+                    .rounded_full()
+                    .bg(p.bg)
+                    .child(kit::spinner(
+                        kit::keyed("rail-spin", s.id.clone()),
+                        10.,
+                        p.success,
+                    )),
+            )
+        })
+        .when(is_waiting, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .bottom(px(1.))
+                    .right(px(1.))
+                    .p(px(1.5))
+                    .rounded_full()
+                    .bg(p.bg)
+                    .child(waiting_dot(&s.id, &p)),
+            )
+        });
+        let s2 = s.clone();
+        self.tab_row(
+            tile,
+            list,
+            ix,
+            rows.open.len(),
+            s,
+            TabLook::Tile,
+            TILE_GAP,
+            &p,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
     }
 
     /// Make `row` a tab of `list`: draggable within it, a drop target
@@ -1049,7 +1579,19 @@ mod ui_tests {
             });
             render(handle, cx);
         }
-        assert!(shown_ids(&app, cx).len() > super::OPEN_PAGE);
+        let shown = shown_ids(&app, cx).len();
+        assert!(shown > super::OPEN_PAGE);
+        // Virtual: of the rows loaded, only those in view are built. The
+        // first ones scrolled away; the last is on screen.
+        let mut vcx = VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("tab-test-agent/s1").is_none());
+        let built = (1..=shown)
+            .filter(|i| {
+                let id: &'static str = Box::leak(format!("tab-test-agent/s{i}").into_boxed_str());
+                vcx.debug_bounds(id).is_some()
+            })
+            .count();
+        assert!(built > 0 && built < shown, "{built} of {shown} rows built");
     }
 
     #[gpui_kit::test]
@@ -1095,8 +1637,10 @@ mod ui_tests {
         render(handle, cx);
         assert_eq!(shown_ids(&app, cx).len(), super::OPEN_PAGE);
         let mut vcx = VisualTestContext::from_window(handle, cx);
-        // The page's last tile (`OPEN_PAGE` is 20), not the old ten.
-        assert!(vcx.debug_bounds("tab-test-agent/s20").is_some());
+        // The whole page is listed (not the old ten), but only the tiles in
+        // view are built: the page's last one (`OPEN_PAGE` is 20) is below.
+        assert!(vcx.debug_bounds("tab-test-agent/s1").is_some());
+        assert!(vcx.debug_bounds("tab-test-agent/s20").is_none());
         let tile = vcx.debug_bounds("tab-test-agent/s1").unwrap().center();
         for _ in 0..3 {
             vcx.simulate_event(ScrollEvent {
@@ -1107,6 +1651,35 @@ mod ui_tests {
             render(handle, cx);
         }
         assert!(shown_ids(&app, cx).len() > super::OPEN_PAGE);
+    }
+
+    /// Frame cost with a large catalog, the sidebar in each state.
+    /// `cargo test --release -- --ignored sidebar_frame_cost --nocapture`.
+    #[gpui_kit::test]
+    #[ignore]
+    fn sidebar_frame_cost(cx: &mut TestAppContext) {
+        let (handle, app, _rpc, _requests) = app(1500, cx);
+        let time = |label: &str, cx: &mut TestAppContext| {
+            render(handle, cx);
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                cx.update_window(handle, |_, window, cx| {
+                    window.refresh();
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000. / 20.;
+            eprintln!("{label}: {ms:.2} ms/frame");
+        };
+        time("expanded, first page", cx);
+        app.update(cx, |app, _| app.side.open_limit = 1500);
+        time("expanded, scrolled to the end", cx);
+        let store = app.read_with(cx, |app, _| app.store.clone());
+        cx.update(|cx| store.update(cx, |s, _| s.prefs.sidebar_collapsed = true));
+        time("rail, scrolled to the end", cx);
+        app.update(cx, |app, _| app.side.open_limit = super::OPEN_PAGE);
+        time("rail, first page", cx);
     }
 
     #[gpui_kit::test]
