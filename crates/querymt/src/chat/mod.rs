@@ -999,6 +999,18 @@ pub trait ChatProvider: Send + Sync {
     fn capabilities(&self) -> ChatCapabilities {
         ChatCapabilities::NONE
     }
+
+    /// The provenance this provider stamps on the output it produces now, with
+    /// the protocol and endpoint of its current configuration: the identity a
+    /// stored reply must carry to be replayed to this provider in its native
+    /// form.
+    ///
+    /// `None` (the default) means the provider does not say: it stamps no
+    /// provenance, or it cannot report it (a plugin or a remote peer). A caller
+    /// then falls back to what it can infer from stored output.
+    fn output_provenance(&self) -> Option<ChatOutputProvenance> {
+        None
+    }
 }
 
 /// Whether a stream chunk is a semantic terminal.

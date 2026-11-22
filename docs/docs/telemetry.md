@@ -43,7 +43,7 @@ produces a tree of child spans describing every step that was executed.
 | `agent.execution.turn` | A single execution turn |
 | `agent.execution.history_load` | Loading session history |
 | `agent.execution.driver_create` | Building the middleware driver for the turn |
-| `agent.execution.provider_init` | Resolving the run's provider before its first hook (builds it on first use) |
+| `agent.execution.provider_init` | Resolving the run's model (provider and its profile) after the prompt is stored and before the run starts; a child of `agent.prompt.execute`, not of `agent.execution.turn` (builds the provider on first use) |
 | `agent.execution.context_init` | Building the initial conversation context |
 | `agent.provider.build` | Cold provider build for the turn (once per turn; later steps reuse it) |
 | `agent.llm.call_with_retry` | Retry wrapper; `operation` is `provider_init` or `chat` |
@@ -165,6 +165,17 @@ and streams that broke all count. The event of a failed attempt also carries
 event, and a reply requested again at a higher output cap is a new request with
 its own span. Provider setup retries (`agent.llm.call_with_retry` with
 `operation = provider_init`) are not attempts of a request.
+
+A compaction request is a `chat {model}` span too and carries the same
+attribute and events. Its attempts are the requests of one compaction: a retry
+after a provider error and a request for a new summary after a rejected one both
+count, so `gen_ai.request.attempt` is the number of the last request sent. A
+request that timed out is not retried; its event does not carry `error.type`
+(the timeout is recorded as the span's error).
+
+A compaction span names the model the request ran on (`[agent.execution.compaction]`
+`model`, else the session's) and the session that started the compaction, never a
+session read from the history. Its retry-wait events are written to that session.
 
 When available, `gen_ai.conversation.id` and its `session.id` alias identify the
 current session. Delegates use their own session ID.

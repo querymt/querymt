@@ -123,6 +123,7 @@ impl LocalAgentHandle {
             profiles,
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             delegation_service: parking_lot::Mutex::new(None),
+            admin_cancels: Default::default(),
             shutdown_done: AtomicBool::new(false),
         }
     }

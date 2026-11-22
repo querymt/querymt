@@ -192,6 +192,16 @@ impl AttemptOperation {
         &self.identity.operation_id
     }
 
+    /// The session that initiated this operation (the cycle's session).
+    pub fn session_id(&self) -> &str {
+        &self.identity.session_id
+    }
+
+    /// The model every attempt of this operation is recorded against.
+    pub fn model(&self) -> &str {
+        &self.identity.model
+    }
+
     /// Request-end accounting detail for this operation's attempts so far.
     pub fn request_accounting(&self) -> super::RequestAccounting {
         let totals = self.totals();

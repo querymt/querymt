@@ -70,6 +70,8 @@ mod history_consistency_tests;
 #[cfg(test)]
 mod local_session_concurrency_tests;
 #[cfg(test)]
+mod provider_resolution_tests;
+#[cfg(test)]
 mod registry_lock_tests;
 #[cfg(test)]
 mod undo_integration_tests;

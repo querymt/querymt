@@ -421,7 +421,8 @@ pub trait OwnerHost: Send + Sync {
 pub trait HandoffHost: OwnerHost {
     /// Summarize `previous`'s conversation with the compaction summarizer.
     /// `None` when there is no history to summarize. Any failure is
-    /// `summary_failed` and aborts the handoff before anything is created.
+    /// `summary_failed`, and a cancel of the owner session `summary_cancelled`;
+    /// either aborts the handoff before anything is created.
     async fn summarize(&self, previous: &str) -> Result<Option<String>, WorktreeOpError>;
 
     /// Seed `successor` (still behind its startup barrier) with `summary` as

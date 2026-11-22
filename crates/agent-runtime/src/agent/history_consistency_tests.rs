@@ -40,6 +40,8 @@ type Hook = Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> +
 #[derive(Clone)]
 struct Seen {
     messages: Vec<ChatMessage>,
+    /// The names of the tools the request offered.
+    tools: Vec<String>,
 }
 
 struct Inner {
@@ -53,6 +55,10 @@ struct Inner {
     reload: OnceLock<(Arc<SessionProvider>, String)>,
     /// A hook to run while answering request number `.0`.
     before_reply: OnceLock<(usize, Hook)>,
+    /// What the provider says it stamps on its output (`None`: it does not
+    /// say). Read when a run resolves its model, so a change applies from the
+    /// next run.
+    provenance: Mutex<Option<querymt::chat::ChatOutputProvenance>>,
 }
 
 /// A provider that answers from a script and checks every request against a
@@ -73,7 +79,25 @@ impl ScriptedProvider {
             divergences: Mutex::default(),
             reload: OnceLock::new(),
             before_reply: OnceLock::new(),
+            provenance: Mutex::new(None),
         }))
+    }
+
+    /// A provider that states the provenance it stamps, as OpenAI, xAI and
+    /// Codex do.
+    fn stating(self, endpoint: &str) -> Self {
+        self.state_endpoint(endpoint);
+        self
+    }
+
+    /// Point the provider at another endpoint: its next run's model states it.
+    fn state_endpoint(&self, endpoint: &str) {
+        *self.0.provenance.lock().unwrap() = Some(querymt::chat::ChatOutputProvenance {
+            provider: "mock".into(),
+            protocol: "responses".into(),
+            model: "mock-model".into(),
+            endpoint: endpoint.into(),
+        });
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -94,7 +118,10 @@ impl ScriptedProvider {
             .get_effective_agent_history()
             .await
             .expect("history loads");
-        let target = handle.output_target(&stored);
+        // A later run resolves its model first and takes the identity from it.
+        // A later run resolves its model first and takes the identity from it.
+        let model = handle.resolve_model().await.expect("model resolves");
+        let target = handle.output_target(&model, &stored);
         let projected = project_request(
             &stored,
             &RequestTarget {
@@ -166,11 +193,24 @@ impl querymt::chat::ChatProvider for ScriptedProvider {
         ChatCapabilities::NONE.with_tool_updates(self.0.tool_updates)
     }
 
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        self.0.provenance.lock().unwrap().clone()
+    }
+
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let index = {
             let mut seen = self.0.seen.lock().unwrap();
             seen.push(Seen {
                 messages: call.messages.to_vec(),
+                tools: call
+                    .tools
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .map(|tool| tool.function.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
             seen.len() - 1
         };
@@ -583,6 +623,69 @@ async fn request_after_a_reply_with_provider_reasoning_matches_a_reload() {
     reasoning_run(true).await;
 }
 
+/// The endpoint the scripted reply with reasoning is stamped with.
+const STAMPED_ENDPOINT: &str = "https://mock.invalid/v1/responses";
+
+/// A provider that states its provenance gets its reasoning back natively when
+/// the stated identity is the one the reply was stamped with, and the identity
+/// comes from the provider, not from the stored reply.
+#[tokio::test]
+async fn request_after_a_reply_from_a_provider_that_states_its_provenance_matches_a_reload() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call_with_reasoning(0, true),
+        _ => done(10),
+    })
+    .stating(STAMPED_ENDPOINT);
+    let run = Run::new(provider, Setup::default()).await;
+
+    run.prompt("run 0").await;
+
+    let second = run.provider.seen().remove(1);
+    assert!(
+        text_of(&second.messages).contains("enc-1"),
+        "the second request carries the native reasoning: {}",
+        text_of(&second.messages)
+    );
+    run.assert_matches_a_reload(2);
+}
+
+/// Spec `run-history-consistency`: the configured endpoint changes between two
+/// requests of one session. The earlier reply was stamped at the old endpoint,
+/// so it goes to the new one in portable form, even though the session's
+/// latest stored reply of this provider and model carries the old endpoint (the
+/// fallback for providers that do not state their identity would trust it).
+#[tokio::test]
+async fn reply_stamped_at_another_endpoint_is_sent_in_portable_form() {
+    let provider = ScriptedProvider::new(false, |index| match index {
+        0 => write_call_with_reasoning(0, true),
+        1 => done(10),
+        _ => done(20),
+    })
+    .stating(STAMPED_ENDPOINT);
+    let run = Run::new(provider, Setup::default()).await;
+    run.prompt("run 0").await;
+    assert!(
+        text_of(&run.provider.seen()[1].messages).contains("enc-1"),
+        "at the endpoint it came from, the reply is native"
+    );
+
+    run.provider
+        .state_endpoint("https://other.invalid/v1/responses");
+    run.prompt("run 1").await;
+
+    let third = run.provider.seen().remove(2);
+    let sent = text_of(&third.messages);
+    assert!(
+        !sent.contains("enc-1") && !sent.contains("sig-1"),
+        "the earlier reply is portable at another endpoint: {sent}"
+    );
+    assert!(
+        sent.contains("weighing the options"),
+        "the visible reasoning is kept: {sent}"
+    );
+    run.assert_matches_a_reload(3);
+}
+
 /// Output from before provenance was recorded replays by provider and model,
 /// which a load can match. Guards the part that works today.
 #[tokio::test]
@@ -635,6 +738,66 @@ async fn request_after_a_stored_tool_change_matches_a_reload() {
         text_of(&second.messages)
     );
     run.assert_matches_a_reload(2);
+}
+
+/// Spec `provider-resolution`, "MCP tools change between two requests of one
+/// run": the model of a run is fixed, the tools it offers are not. A provider
+/// without tool-change messages is sent the whole list every time.
+#[tokio::test]
+async fn mcp_tools_change_between_two_requests_of_one_run() {
+    fn mcp_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: name.into(),
+                description: name.into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+    let mcp = McpToolState::new(Default::default(), vec![mcp_tool("alpha")]);
+    // An MCP server adds a tool while the first reply is being produced.
+    let appearing = mcp.clone();
+    let provider = ScriptedProvider::new(false, move |index| match index {
+        0 => {
+            appearing.rcu(|snapshot| {
+                let mut next = snapshot.clone();
+                next.tool_defs.push(mcp_tool("beta"));
+                next
+            });
+            write_call(0, 10)
+        }
+        _ => done(10),
+    });
+    let run = Run::new(
+        provider,
+        Setup {
+            mcp: Some(mcp),
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    run.prompt("run 0").await;
+
+    let seen = run.provider.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[0].tools.contains(&"alpha".to_string()),
+        "{:?}",
+        seen[0].tools
+    );
+    assert!(
+        !seen[0].tools.contains(&"beta".to_string()),
+        "{:?}",
+        seen[0].tools
+    );
+    assert!(
+        seen[1].tools.contains(&"beta".to_string()),
+        "the second request offers the new tool: {:?}",
+        seen[1].tools
+    );
 }
 
 #[tokio::test]

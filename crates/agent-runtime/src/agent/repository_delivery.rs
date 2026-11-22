@@ -51,11 +51,9 @@ const GET_TOOL: &str = "repo_knowledge_get";
 /// Whether cards may name `repo_knowledge_get`: the tool is registered for
 /// this agent and allowed by the session's tool policy. Otherwise cards keep
 /// navigable relative citations without suggesting an unavailable call.
-fn fetch_available(config: &AgentConfig, env: &TurnEnv) -> bool {
+fn fetch_available(config: &AgentConfig, tool_config: &crate::agent::core::ToolConfig) -> bool {
     config.tool_registry.find(GET_TOOL).is_some()
-        && env
-            .tool_config
-            .allows(crate::config::ToolRef::builtin(GET_TOOL))
+        && tool_config.allows(crate::config::ToolRef::builtin(GET_TOOL))
 }
 
 /// Whether the stable retrieval policy applies: repository knowledge is
@@ -134,6 +132,12 @@ fn append_policy_once(system: &mut Vec<querymt::params::SystemPrompt>) -> bool {
 /// compactions so far. Nothing here depends on a diagnostics cache, so losing
 /// one never causes reinjection. A history failure leaves the state as it was.
 pub(crate) async fn restore_state(config: &AgentConfig, env: &TurnEnv, turn: &mut Turn) {
+    restore_state_of(config, &env.session_id, turn).await;
+}
+
+/// [`restore_state`] for a caller that has the session's id and no
+/// [`TurnEnv`] yet.
+async fn restore_state_of(config: &AgentConfig, session_id: &str, turn: &mut Turn) {
     use querymt_agent_core::model::MessagePart;
     let Some(registry) = config.repository_knowledge() else {
         return;
@@ -151,11 +155,8 @@ pub(crate) async fn restore_state(config: &AgentConfig, env: &TurnEnv, turn: &mu
     {
         return;
     }
-    let Ok(Ok(history)) = tokio::time::timeout(
-        DELIVERY_TIMEOUT,
-        turn.state.store.get_history(&env.session_id),
-    )
-    .await
+    let Ok(Ok(history)) =
+        tokio::time::timeout(DELIVERY_TIMEOUT, turn.state.store.get_history(session_id)).await
     else {
         return;
     };
@@ -243,9 +244,15 @@ fn orientation_deadline(
 }
 
 /// Orientation cards for an accepted prompt, when the host enabled that stage.
+///
+/// It runs before the user's prompt is stored, and so before the run's model
+/// is resolved and its [`TurnEnv`] exists: it takes the three things it reads
+/// of the run (the session, its working directory and its tool policy).
 pub(crate) async fn orientation_contexts(
     config: &AgentConfig,
-    env: &TurnEnv,
+    session_id: &str,
+    cwd: Option<&std::path::Path>,
+    tool_config: &crate::agent::core::ToolConfig,
     turn: &mut Turn,
     prompt: &str,
     existing: &[HookContextContribution],
@@ -257,20 +264,19 @@ pub(crate) async fn orientation_contexts(
         return Vec::new();
     }
     let max_cards = registry.settings().delivery.effective_max_cards();
-    restore_state(config, env, turn).await;
+    restore_state_of(config, session_id, turn).await;
     // First task of the session: nothing from the user is stored yet. A
     // history failure reads as "not first", the conservative answer.
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
-    let history =
-        tokio::time::timeout_at(deadline, turn.state.store.get_history(&env.session_id)).await;
+    let history = tokio::time::timeout_at(deadline, turn.state.store.get_history(session_id)).await;
     let first_task = match history {
         Ok(Ok(history)) => !history
             .iter()
             .any(|message| message.role == querymt::chat::ChatRole::User),
         _ => false,
     };
-    let fetch = fetch_available(config, env);
-    let cwd = env.cwd().map(|path| path.to_path_buf());
+    let fetch = fetch_available(config, tool_config);
+    let cwd = cwd.map(|path| path.to_path_buf());
     let prompt = prompt.to_string();
     let existing = existing.to_vec();
     let started = Instant::now();
@@ -359,7 +365,7 @@ pub(crate) async fn index_contexts(
         return Vec::new();
     }
     let max_cards = registry.settings().delivery.effective_max_cards();
-    let fetch = fetch_available(config, env);
+    let fetch = fetch_available(config, &env.tool_config);
     let cwd = env.cwd().map(|path| path.to_path_buf());
     let owned = OwnedCall {
         tool_name: call.tool_name.to_string(),
@@ -507,7 +513,7 @@ pub(crate) async fn post_compaction_contexts(
     let orientation = settings.orientation_active();
     let index = settings.index_context_active();
     let max_cards = settings.delivery.effective_max_cards();
-    let fetch = fetch_available(config, env);
+    let fetch = fetch_available(config, &env.tool_config);
     let cwd = env.cwd().map(|path| path.to_path_buf());
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
     let until = deadline.into_std();

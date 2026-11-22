@@ -166,6 +166,10 @@ impl Default for RetryConfig {
 }
 
 /// Configuration for AI compaction (Layer 3) - runs on context overflow
+///
+/// Deserializing is lenient: sessions store their policy, and one saved before
+/// `provider` needed a `model` must still load. A configuration file is
+/// checked with [`CompactionConfig::validate`] when it is loaded.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
@@ -173,10 +177,13 @@ pub struct CompactionConfig {
     #[serde(default = "default_true")]
     pub auto: bool,
 
-    /// Optional: different provider for compaction (cheaper model)
+    /// Optional: different provider for compaction. Needs `model`, because the
+    /// session's model belongs to another provider.
     pub provider: Option<String>,
 
-    /// Optional: different model for compaction (cheaper model)
+    /// Optional: different model for compaction (cheaper model), on the
+    /// session's provider unless `provider` is set. The request, its cost
+    /// accounting and its pricing all use it.
     pub model: Option<String>,
 
     /// Retry configuration for compaction LLM calls
@@ -191,6 +198,22 @@ impl Default for CompactionConfig {
             provider: None,
             model: None,
             retry: RetryConfig::default(),
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// A compaction `provider` needs a `model`: the session's model belongs to
+    /// another provider. Checked when a configuration file loads, and by the
+    /// runtime for a policy that never went through a file (built in code, or
+    /// stored with a session by an earlier version).
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.provider, &self.model) {
+            (Some(provider), None) => Err(format!(
+                "compaction.provider = \"{provider}\" needs a compaction model \
+                 (compaction.model): the session's model belongs to another provider"
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -965,5 +988,37 @@ mod tests {
             .unwrap_or_else(|e| panic!("jitter_ratio={ratio} should be valid: {e}"));
             assert!((cfg.jitter_ratio - ratio).abs() < f64::EPSILON);
         }
+    }
+    #[test]
+    fn compaction_provider_without_a_model_is_invalid_but_still_deserializes() {
+        // A session stored before the rule must still load.
+        let stored: CompactionConfig =
+            serde_json::from_value(json!({"provider": "anthropic"})).unwrap();
+        let error = stored.validate().unwrap_err();
+        assert!(error.contains("needs a compaction model"), "{error}");
+        assert!(error.contains("anthropic"), "{error}");
+    }
+
+    #[test]
+    fn compaction_provider_with_a_model_and_the_other_shapes_are_valid() {
+        let both: CompactionConfig =
+            serde_json::from_value(json!({"provider": "anthropic", "model": "haiku"})).unwrap();
+        assert_eq!(both.provider.as_deref(), Some("anthropic"));
+        assert_eq!(both.model.as_deref(), Some("haiku"));
+        assert!(both.validate().is_ok());
+
+        let model_only: CompactionConfig =
+            serde_json::from_value(json!({"model": "haiku"})).unwrap();
+        assert!(model_only.provider.is_none());
+        assert!(model_only.validate().is_ok());
+
+        let defaults: CompactionConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(defaults.auto);
+        assert!(defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn compaction_config_still_rejects_unknown_keys() {
+        assert!(serde_json::from_value::<CompactionConfig>(json!({"modle": "x"})).is_err());
     }
 }

@@ -125,6 +125,10 @@ impl ChatProvider for ToolEnabledProvider {
         self.inner.capabilities()
     }
 
+    fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+        self.inner.output_provenance()
+    }
+
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.inner.chat(&self.with_default_tools(call)).await
     }
@@ -212,6 +216,44 @@ mod tests {
                 .with_streaming(true)
                 .with_options(GenerationOptionSupport::ALL)
         }
+
+        fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+            Some(recorder_provenance())
+        }
+    }
+
+    fn recorder_provenance() -> crate::chat::ChatOutputProvenance {
+        crate::chat::ChatOutputProvenance {
+            provider: "recorder".into(),
+            protocol: "responses".into(),
+            model: "recorder-model".into(),
+            endpoint: "https://recorder.invalid/v1/responses".into(),
+        }
+    }
+
+    fn bare_recorder() -> Recorder {
+        Recorder {
+            seen: Seen::default(),
+            replies: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn tool_enabled_provider_forwards_output_provenance() {
+        let provider = ToolEnabledProvider::new(Box::new(bare_recorder()), HashMap::new());
+        assert_eq!(provider.output_provenance(), Some(recorder_provenance()));
+    }
+
+    #[test]
+    fn validated_llm_forwards_output_provenance() {
+        let provider = ValidatedLLM::new(Box::new(bare_recorder()), Box::new(|_| Ok(())), 1);
+        assert_eq!(provider.output_provenance(), Some(recorder_provenance()));
+    }
+
+    #[test]
+    fn the_decorator_chain_forwards_output_provenance_to_its_base() {
+        let provider = decorated(&Seen::default());
+        assert_eq!(provider.output_provenance(), Some(recorder_provenance()));
     }
 
     #[async_trait]

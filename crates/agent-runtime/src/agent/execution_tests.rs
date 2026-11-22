@@ -64,19 +64,13 @@ impl TestHarness {
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
     ) -> Self {
-        Self::assemble(history, delegation_sender, tools, false).await
-    }
-
-    /// A harness whose session's provider cannot be built.
-    async fn with_unbuildable_provider() -> Self {
-        Self::assemble(vec![], None, Vec::new(), true).await
+        Self::assemble(history, delegation_sender, tools).await
     }
 
     async fn assemble(
         history: Vec<querymt_agent_core::model::AgentMessage>,
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
-        unbuildable_provider: bool,
     ) -> Self {
         let session_id = "sess-test".to_string();
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
@@ -87,17 +81,7 @@ impl TestHarness {
         let factory = Arc::new(TestProviderFactory::new(shared_provider));
 
         // Use shared helper to create mock plugin registry
-        let (registry, temp_dir) = if unbuildable_provider {
-            let dir = TempDir::new().expect("temp dir");
-            let registry = crate::test_utils::mock_plugin_registry_for(
-                dir.path(),
-                Arc::new(crate::test_utils::UnbuildableProviderFactory),
-            )
-            .expect("mock registry");
-            (registry, dir)
-        } else {
-            mock_plugin_registry(factory).expect("mock registry")
-        };
+        let (registry, temp_dir) = mock_plugin_registry(factory).expect("mock registry");
         let registry = Arc::new(registry);
 
         let mut store = MockSessionStore::new();
@@ -2140,109 +2124,61 @@ async fn middleware_error_keeps_its_source() {
     assert!(error.llm_error().is_none());
 }
 
-/// A provider that cannot be built fails the run at its start: before any
-/// hook, with the provider's error kept as the source.
+/// The model is resolved before the run's environment exists, so a run that
+/// starts cancelled never builds a provider and ends as cancelled. (The
+/// scenarios of a provider that cannot be built, is built after a failure,
+/// or is waited for are driven through the session actor, which resolves the
+/// model: `provider_resolution_tests.rs`.)
 #[tokio::test]
-async fn provider_failure_at_run_start_runs_no_hook_and_sends_no_request() {
-    use crate::agent::execution::TurnError;
-    let watching = ScriptedMiddleware::default();
-    let mut harness = TestHarness::with_unbuildable_provider().await;
-    harness.install_stop_recovery(watching.clone(), 5);
+async fn resolve_model_for_a_cancelled_run_is_cancelled() {
+    let harness = TestHarness::new(vec![], None).await;
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
 
-    let error = harness
-        .run_result()
-        .await
-        .expect_err("a provider that cannot be built fails the run");
+    let model = crate::agent::execution::resolve_model(
+        &harness.config,
+        &harness.env.session_handle,
+        &cancelled,
+    )
+    .await
+    .expect("a cancelled run is not an error");
 
-    match &error {
-        TurnError::Provider {
-            operation,
-            provider,
-            model,
-            source,
-        } => {
-            assert_eq!(*operation, "provider initialization");
-            assert_eq!((provider.as_str(), model.as_str()), ("mock", "mock-model"));
-            assert!(matches!(source, LLMError::InvalidRequest(_)), "{source:?}");
-        }
-        other => panic!("expected a provider error, got {other:?}"),
-    }
-    assert!(error.llm_error().is_some());
-    assert!(
-        watching.calls().is_empty(),
-        "no hook runs before the provider exists: {:?}",
-        watching.calls()
-    );
-}
-
-/// The provider is resolved before the first hook, once: a run cancelled
-/// before it starts ends as cancelled without a hook or a request.
-#[tokio::test]
-async fn cancel_during_provider_init_runs_no_hook() {
-    let watching = ScriptedMiddleware::default();
-    let mut harness = TestHarness::new(vec![], None).await;
-    harness.install_stop_recovery(watching.clone(), 5);
-    // No `expect_chat`: a request would fail the test.
-    harness.env.cancellation_token.cancel();
-
-    let outcome = harness.run().await;
-
-    assert_eq!(outcome, CycleOutcome::Cancelled);
-    assert!(watching.calls().is_empty(), "{:?}", watching.calls());
+    assert!(model.is_none(), "no model is resolved for a cancelled run");
 }
 
 /// Provider setup is its own span, not an attempt of a request, and it
-/// happens once per run, before the first hook.
+/// happens once per run.
 #[tokio::test]
-async fn provider_init_is_traced_once_and_is_not_a_chat_retry() {
+async fn resolve_model_is_traced_as_provider_init_and_is_not_a_chat_retry() {
     use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
 
-    let mut harness = TestHarness::new(vec![], None).await;
-    harness
-        .provider_mut()
-        .await
-        .expect_chat()
-        .times(1)
-        .returning(|_| Ok(MockChatResponse::text_only("done").into()));
-    harness
-        .provider_mut()
-        .await
-        .expect_tools()
-        .return_const(None)
-        .times(0..);
+    let harness = TestHarness::new(vec![], None).await;
+    let token = tokio_util::sync::CancellationToken::new();
 
-    let (outcome, spans) = capture(harness.run()).await;
+    let (model, spans) = capture(crate::agent::execution::resolve_model(
+        &harness.config,
+        &harness.env.session_handle,
+        &token,
+    ))
+    .await;
 
-    assert_eq!(outcome, CycleOutcome::Completed);
-    let retries: Vec<_> = spans
+    assert!(model.expect("resolves").is_some());
+    let operations: Vec<_> = spans
         .iter()
         .filter(|span| span.name == "agent.llm.call_with_retry")
-        .collect();
-    let operations: Vec<_> = retries
-        .iter()
         .map(|span| attr(span, "operation").cloned())
         .collect();
     assert_eq!(
-        operations
-            .iter()
-            .filter(|operation| **operation == Some(opentelemetry::Value::from("provider_init")))
-            .count(),
-        1,
-        "{operations:?}"
+        operations,
+        vec![Some(opentelemetry::Value::from("provider_init"))],
+        "one setup retry wrapper and no chat attempt"
     );
-    let init = spans
-        .iter()
-        .find(|span| span.name == "agent.execution.provider_init")
-        .expect("provider init span");
-    let first_hook = spans
-        .iter()
-        .find(|span| span.name == "agent.execution.middleware.turn_start");
-    if let Some(hook) = first_hook {
-        assert!(
-            init.end_time <= hook.start_time,
-            "init precedes the first hook"
-        );
-    }
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.name == "agent.execution.provider_init"),
+        "provider init span"
+    );
 }
 
 #[tokio::test]
@@ -3290,7 +3226,9 @@ mod repository_delivery {
         );
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             "the scheduler dispatches queued tasks to workers",
             &[],
@@ -3333,7 +3271,9 @@ mod repository_delivery {
         );
         let oriented = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             PROMPT,
             &[],
@@ -3395,7 +3335,9 @@ mod repository_delivery {
         harness.with_repository_delivery(kb, &settings(false, true), Vec::new());
         crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             PROMPT,
             &[],
@@ -3458,7 +3400,9 @@ mod repository_delivery {
         // persisted history is unchanged, so the next turn delivers it again.
         let a = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             PROMPT,
             &[],
@@ -3468,7 +3412,9 @@ mod repository_delivery {
         harness.turn.delivery_budget = None;
         let b = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             PROMPT,
             &[],
@@ -3807,7 +3753,9 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             prompt,
             &[],
@@ -3831,7 +3779,9 @@ mod repository_delivery {
             .insert(crate::config::ToolRef::builtin("repo_knowledge_get"));
         let denied = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             prompt,
             &[],
@@ -3847,7 +3797,9 @@ mod repository_delivery {
         // delivered again.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             prompt,
             &cards,
@@ -3860,7 +3812,9 @@ mod repository_delivery {
         assert!(
             crate::agent::repository_delivery::orientation_contexts(
                 &harness.config,
-                &harness.env,
+                &harness.env.session_id,
+                harness.env.cwd(),
+                &harness.env.tool_config,
                 &mut harness.turn,
                 prompt,
                 &[],
@@ -3882,7 +3836,9 @@ mod repository_delivery {
 
         let cards = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             prompt,
             &[],
@@ -3909,7 +3865,9 @@ mod repository_delivery {
         // Same turn, same card again: matched and suppressed, not delivered.
         let again = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
-            &harness.env,
+            &harness.env.session_id,
+            harness.env.cwd(),
+            &harness.env.tool_config,
             &mut harness.turn,
             prompt,
             &[],

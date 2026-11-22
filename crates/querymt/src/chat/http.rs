@@ -1,5 +1,5 @@
 use crate::{
-    chat::{ChatCall, ChatCapabilities, ChatOutput, StreamChunk},
+    chat::{ChatCall, ChatCapabilities, ChatOutput, ChatOutputProvenance, StreamChunk},
     error::{LLMError, classify_status_only},
 };
 use http::{Request, Response};
@@ -92,5 +92,11 @@ pub trait HTTPChatProvider: Send + Sync {
     /// What this provider supports. Defaults to nothing.
     fn capabilities(&self) -> ChatCapabilities {
         ChatCapabilities::NONE
+    }
+
+    /// The provenance this provider stamps on the output it produces, as
+    /// [`ChatProvider::output_provenance`]. Defaults to `None`.
+    fn output_provenance(&self) -> Option<ChatOutputProvenance> {
+        None
     }
 }

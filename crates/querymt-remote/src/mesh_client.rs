@@ -417,6 +417,10 @@ impl ChatProvider for MeshChatProvider {
         self.inner.capabilities()
     }
 
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        self.inner.output_provenance()
+    }
+
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.inner.chat(call).await
     }

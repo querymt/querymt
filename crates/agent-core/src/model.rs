@@ -528,9 +528,19 @@ pub struct OutputTarget {
     pub protocol: String,
     pub model: String,
     pub endpoint: String,
-    /// Whether output that carries no provenance may still replay native state.
-    /// True only when the caller could not resolve protocol/endpoint identity
-    /// and explicitly accepts the legacy provider/model-only comparison.
+    /// Whether output that carries no provenance may still replay native state
+    /// when only its provider and model (the message's recorded origin) match
+    /// this target.
+    ///
+    /// That comparison is a guess: such output predates provenance, so its
+    /// protocol and endpoint were never recorded. `true` (the default of
+    /// [`OutputTarget::new`]) accepts the guess, and is for a caller that
+    /// could not resolve this target's protocol and endpoint itself. `false`
+    /// is for a caller that knows the target's full identity (a provider that
+    /// states its provenance): then output without provenance is replayed in
+    /// portable form, and only output stamped with exactly this identity
+    /// replays natively. Output that carries provenance is never affected by
+    /// this flag.
     pub fallback_provider_model: bool,
 }
 

@@ -198,14 +198,27 @@ pub(crate) async fn turn_parts(
     );
     let tool_config = crate::agent::core::ToolConfig::default();
     let tool_set = TurnEnv::build_tool_set(config, &runtime, &tool_config);
+    // A run resolves its model before its environment exists, as the session
+    // actor does. A fixture without a registered provider has none to
+    // resolve: it gets an inert one that declares nothing and answers no
+    // request (mockall panics on an unexpected call), for the tests that use
+    // the environment for something else.
+    let model = match session_handle.resolve_model().await {
+        Ok(model) => model,
+        Err(_) => crate::session::provider::ResolvedModel {
+            provider: Arc::new(crate::test_utils::MockLlmProvider::new()),
+            profile: Arc::new(crate::middleware::ModelProfile::default()),
+            provenance: None,
+        },
+    };
     let env = TurnEnv {
         session_id,
         turn_id: querymt_agent_core::model::TurnId::new(),
         runtime,
         session_handle,
+        model,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tool_config,
-        execution_origin: crate::agent::execution::ExecutionOrigin::Interactive,
         knowledge_store: None,
         repository_knowledge: None,
         event_sink: None,
@@ -216,22 +229,10 @@ pub(crate) async fn turn_parts(
         cycle_accounting,
         tool_set,
     };
-    let mut turn = Turn::new(state);
-    // A run reads the profile of its model once, as `run_turn` does.
-    turn.profile = env.session_handle.profile().await;
-    (env, turn)
+    (env, Turn::new(state))
 }
 
 impl TurnEnv {
-    /// The provider the run would resolve before its first hook. A fixture
-    /// whose provider cannot be built fails here, in the test that needs it.
-    pub(crate) async fn provider_for_test(&self) -> std::sync::Arc<dyn querymt::LLMProvider> {
-        self.session_handle
-            .provider()
-            .await
-            .expect("the fixture's provider can be built")
-    }
-
     /// This env with its tool set built from `config`, for tests that run a
     /// step under a config other than the one the fixture was created with.
     pub(crate) fn tools_from(mut self, config: &crate::agent::agent_config::AgentConfig) -> Self {

@@ -516,6 +516,9 @@ impl LocalAgentHandle {
         previous: &str,
     ) -> Result<Option<String>, WorktreeOpError> {
         let failed = |message: String| WorktreeOpError::rejected("summary_failed", message);
+        // The owner's actor is already unloaded, so `session/cancel` finds no
+        // actor to stop: it reaches this step through the registration.
+        let cancel = self.admin_cancels.begin(previous);
         let handle = self
             .config
             .provider
@@ -529,20 +532,25 @@ impl LocalAgentHandle {
         if messages.is_empty() {
             return Ok(None);
         }
-        let llm_provider = handle
-            .provider()
-            .await
-            .map_err(|err| failed(format!("no LLM provider for summary: {err}")))?;
-        let policy = &self.config.execution_policy.compaction;
-        let model = match (&policy.model, handle.llm_config()) {
-            (Some(model), _) => model.clone(),
-            (None, Some(config)) => config.model.clone(),
-            (None, None) => return Err(failed("session has no LLM config".into())),
-        };
-        let retry = crate::session::compaction::RetryConfig {
-            max_retries: policy.retry.max_retries,
-            initial_backoff_ms: policy.retry.initial_backoff_ms,
-            backoff_multiplier: policy.retry.backoff_multiplier,
+        // The summary is sent where `[agent.execution.compaction]` says (the
+        // previous session's provider and model when it says nothing), like
+        // any other compaction.
+        // Building a provider can wait (a retry, a credential refresh, a mesh
+        // lookup) while the workspace is held exclusively, so the cancel
+        // reaches this step too. Nothing has been created yet, and the
+        // accounting and stream below are not set up, so there is nothing to
+        // release.
+        let target = tokio::select! {
+            biased;
+            () = cancel.token().cancelled() => {
+                return Err(WorktreeOpError::rejected(
+                    "summary_cancelled",
+                    "the handoff summary was cancelled; ownership is unchanged",
+                ));
+            }
+            target = handle.resolve_compaction_model(&self.config.execution_policy.compaction) => {
+                target.map_err(|err| failed(format!("no LLM provider for summary: {err}")))?
+            }
         };
         // The handoff summary is a paid request outside any prompt: charge it
         // to a maintenance cycle of the previous session.
@@ -560,35 +568,61 @@ impl LocalAgentHandle {
                 cycle.session_accounting().clone(),
             ),
         );
-        let provider_name = handle
-            .llm_config()
-            .map(|config| config.provider.clone())
-            .unwrap_or_default();
         let ledger = querymt_agent_services::accounting::DispatchLedger {
             operation: Arc::new(
                 querymt_agent_services::accounting::AttemptOperation::new(
                     recorder,
                     &cycle,
                     querymt_agent_services::accounting::AttemptPurpose::Compaction,
-                    provider_name,
-                    model.clone(),
+                    target.provider_name.as_str(),
+                    target.model.as_str(),
                 )
                 .with_budget_pricing(self.config.budget_pricing())
                 .with_budget_cap(self.config.budget_cap_usd()),
             ),
-            basis: handle.billing_basis_for_model(&model),
+            basis: target.basis.clone(),
         };
-        let result = self
+        let dispatch = crate::session::compaction::CompactionDispatch {
+            provider: target.provider.clone(),
+            config: &self.config,
+            // Stops the waits between retries; the race below stops a request
+            // in flight.
+            cancel: cancel.token(),
+            ledger: &ledger,
+        };
+        let request = self
             .config
             .compaction
-            .process(&messages, llm_provider, &model, &retry, None, &ledger)
-            .await
-            .map_err(|err| failed(err.to_string()))
-            .and_then(|result| {
-                crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
-                    .map(|()| result.summary)
-                    .map_err(|err| failed(err.to_string()))
-            });
+            .process(&messages, None, None, &dispatch);
+        // A cancelled summary drops the request: its attempt in flight is
+        // settled as cancelled and nothing has been created yet.
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.token().cancelled() => None,
+            result = request => Some(result),
+        };
+        let result = match outcome {
+            Some(result) if !cancel.token().is_cancelled() => result
+                .map_err(|err| match ledger.operation.budget_refusal() {
+                    // Nothing was sent: say so, instead of blaming the provider.
+                    Some((cap, spent)) => failed(format!(
+                        "summary not requested: price limit reached: ${spent:.4} >= ${cap:.2}"
+                    )),
+                    None => failed(err.to_string()),
+                })
+                .and_then(|result| {
+                    crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
+                        .map(|()| result.summary)
+                        .map_err(|err| failed(err.to_string()))
+                }),
+            // Cancelled, including a cancel that arrived as the summary
+            // finished: the handoff has created nothing, so nothing is left
+            // behind.
+            _ => Err(WorktreeOpError::rejected(
+                "summary_cancelled",
+                "the handoff summary was cancelled; ownership is unchanged",
+            )),
+        };
         // The previous owner was unloaded by quiesce, so no actor retires the
         // stream and accounting set up above. Release them now so no later
         // failure leaks them; a successful announcement reopens the stream.
@@ -761,6 +795,14 @@ impl LocalAgentHandle {
             .unwrap_or(false);
         self.announce_handoff(previous, workspace_id, successor, seeded)
             .await;
+    }
+
+    /// Cancels the administration step running for `session_id` without a
+    /// session actor (a handoff summary), on the runtime that hosts it.
+    /// Returns whether there was one.
+    pub(super) async fn cancel_admin_operation(&self, session_id: &str) -> bool {
+        let hosted = self.hosting_handle(session_id).await.ok().flatten();
+        self.runtime_of(&hosted).admin_cancels.cancel(session_id)
     }
 
     fn worktree_ops(&self) -> Result<WorktreeOps, WorktreeOpError> {

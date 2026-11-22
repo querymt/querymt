@@ -303,6 +303,10 @@ pub struct PreCompactionRequest {
     pub session_id: String,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
+    /// The provider the summary is requested from (the session's unless
+    /// `[agent.execution.compaction]` selects another).
+    pub provider: String,
+    /// The model the summary is requested from.
     pub model: String,
     pub permission_mode: String,
     pub trigger: String,
@@ -320,14 +324,40 @@ pub struct PreCompactionResult {
     pub notices: Vec<HookNotice>,
 }
 
+/// Where a compaction summary came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarySource {
+    /// The compaction model wrote it.
+    Model,
+    /// A `pre_compaction` hook supplied it; no model request was made.
+    Hook,
+}
+
+impl SummarySource {
+    /// The value hooks see in `summary_source`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Hook => "hook",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostCompactionRequest {
     pub session_id: String,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
+    /// The provider the summary was requested from, or would have been when a
+    /// `pre_compaction` hook supplied it.
+    pub provider: String,
+    /// The model the summary was requested from, or would have been when a
+    /// `pre_compaction` hook supplied it.
     pub model: String,
     pub permission_mode: String,
     pub trigger: String,
+    /// Where the summary came from.
+    pub summary_source: SummarySource,
     pub summary: String,
     pub original_token_count: u32,
     pub summary_token_count: u32,
@@ -1247,6 +1277,7 @@ impl Hooks {
             transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::PreCompaction.label().to_string(),
+            provider: request.provider,
             model: request.model,
             permission_mode: request.permission_mode,
             trigger: request.trigger,
@@ -1318,9 +1349,11 @@ impl Hooks {
             transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::PostCompaction.label().to_string(),
+            provider: request.provider,
             model: request.model,
             permission_mode: request.permission_mode,
             trigger: request.trigger,
+            summary_source: request.summary_source.label().to_string(),
             summary: request.summary,
             original_token_count: request.original_token_count,
             summary_token_count: request.summary_token_count,

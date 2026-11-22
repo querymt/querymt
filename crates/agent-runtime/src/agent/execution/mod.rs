@@ -42,10 +42,12 @@ fn format_stop_hook_continuation_message(
 pub(crate) mod cache_hints;
 mod error;
 pub(crate) use error::TurnError;
-mod llm_retry;
+pub(crate) mod llm_retry;
 mod maintenance;
 pub(crate) mod prefix;
-pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
+pub(crate) use maintenance::{
+    CompactionOutcome, TRIGGER_MANUAL, compact_history, compact_history_with,
+};
 mod progress_sink;
 pub(crate) mod stage;
 mod tool_calls;
@@ -55,7 +57,7 @@ pub(crate) mod turn;
 pub use turn::ExecutionOrigin;
 mod wait;
 mod wave_plan;
-pub(crate) use stage::{Stage, Step, run_turn, stopping};
+pub(crate) use stage::{Stage, Step, resolve_model, resolve_model_once, run_turn, stopping};
 pub(crate) use wait::DelegationRecovery;
 #[cfg(test)]
 pub(crate) use wait::cleanup_timed_out_delegations;
@@ -454,7 +456,6 @@ pub(crate) async fn prepare_model_request(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    provider: &std::sync::Arc<dyn querymt::LLMProvider>,
 ) -> Result<Step, TurnError> {
     // The run objective is request-scoped: sent in the request tail, never
     // stored. It is still built and amended, and its events are emitted,
@@ -465,15 +466,7 @@ pub(crate) async fn prepare_model_request(
         .then(|| render_run_objective(turn));
     let trigger = transitions::context_hook_trigger(turn.history.as_slice());
     store_pending_notices(env, turn).await?;
-    transitions::transition_before_llm_call(
-        config,
-        env,
-        turn,
-        provider,
-        trigger,
-        objective.as_deref(),
-    )
-    .await
+    transitions::transition_before_llm_call(config, env, turn, trigger, objective.as_deref()).await
 }
 
 use crate::agent::agent_config::AgentConfig;
@@ -1162,8 +1155,7 @@ mod tests {
 
         // Default configuration: nothing is attached to the request.
         assert!(!fixture.config.execution_policy.run_objective);
-        let provider = env.provider_for_test().await;
-        let off = super::prepare_model_request(&fixture.config, &env, &mut turn, &provider)
+        let off = super::prepare_model_request(&fixture.config, &env, &mut turn)
             .await
             .unwrap();
         let (off_len, _) = request_tail(off).expect("a request");
@@ -1173,7 +1165,7 @@ mod tests {
         // the durable messages are untouched.
         let mut config = (*fixture.config).clone();
         config.execution_policy.run_objective = true;
-        let on = super::prepare_model_request(&config, &env, &mut turn, &provider)
+        let on = super::prepare_model_request(&config, &env, &mut turn)
             .await
             .unwrap();
         let (on_len, tail) = request_tail(on).expect("a request");

@@ -15,8 +15,9 @@ stays responsive to cancel and mode changes while a turn runs.
 
 ## Stages and steps
 
-`run_turn` resolves the run's provider once (`provider_init` retry), runs the first middleware
-hook, then moves a `Stage` until a step returns the run's `CycleOutcome`. A `Stage` is a loop
+The run's model (its provider and the facts about it) is resolved once before `run_turn` is
+called (`execution::resolve_model`, `provider_init` retry, see "Run state"); `run_turn` runs the
+first middleware hook, then moves a `Stage` until a step returns the run's `CycleOutcome`. A `Stage` is a loop
 position that owns the data its step consumes (`stage.rs`): `BeforeRequest`,
 `CallModel(request)`, `AfterReply(reply)`, `ToolCalls { calls, results }`, `Waiting(wait)`,
 `Ending` and `Stopping(stop)`. `Stage::advance` takes the stage by value and returns a
@@ -85,14 +86,28 @@ Source: `crates/agent-runtime/src/agent/session_actor.rs`, `crates/agent-runtime
 
 The state of a run is split by mutability in `crates/agent-runtime/src/agent/execution/turn.rs`:
 
-- `TurnEnv` is everything fixed when the run starts: session id, run id, the turn-pinned
-  `SessionHandle`, tool configuration, cancellation token, steering inbox, cycle
-  accounting and the run's `ToolSet`. It is built with a struct literal in
-  `execute_prompt_inner` (`session_actor.rs`), so a missing field is a compile error,
-  and step functions take it as `&TurnEnv`, including the concurrent tool wave.
+- `TurnEnv` is everything fixed for the run: session id, run id, the turn-pinned
+  `SessionHandle`, the resolved model (`ResolvedModel`: the provider and its profile of
+  capabilities, output caps and configured effort), tool configuration, cancellation token,
+  steering inbox, cycle accounting and the run's `ToolSet`. It is built once the model is
+  resolved, with one struct literal in `execute_prompt_inner` (`session_actor.rs`), so a
+  missing field is a compile error and a `TurnEnv` always has a model; step functions take
+  it as `&TurnEnv`, including the concurrent tool wave. For a prompt the model is resolved
+  after the prompt is stored (a provider failure leaves the prompt in the history, takes no
+  pre-turn snapshot and runs no middleware hook), so the steps before that (the
+  `UserPromptSubmit` hook, which runs before the model is resolved, repository-knowledge
+  orientation, storing the prompt) use the session's handle and locals, not a `TurnEnv`.
+  Native `/compact` resolves the model once, without a retry, but a provider that cannot be
+  built does not end it yet: the env then holds `ResolvedModel::unavailable`, and
+  `compact_history_with` runs the `pre_compaction` hook first. A summary from the hook is
+  stored without any provider, and so is a compaction policy that names another working
+  provider; only a summary that has to come from the session's own provider fails with the
+  provider-initialization error, before `CompactionStart`. What the run offers the model is not part of the
+  model: the tools are collected for every request from the live MCP snapshot, so an MCP
+  server's `tools/list_changed` takes effect between two requests of one run.
 - `Turn` is everything that changes while the run executes: the `RuntimeContext`
   (active task, intent), the run objective, the `History`, the statistics, the queued
-  notices, the request overrides, the model profile, delegations suspended by
+  notices, the request overrides, delegations suspended by
   steering, the repository-knowledge delivery budget, budget warnings, the pre-turn
   snapshot (`PreTurnSnapshot`: `None`, `Pending(task)`, `Ready(snapshot)`) and
   `TurnBudgets`, the counters that bound the run (Stop-hook continuations per reason,
@@ -100,12 +115,10 @@ The state of a run is split by mutability in `crates/agent-runtime/src/agent/exe
   progress-review positions). It has one owner, the loop, and is borrowed `&mut` by the
   steps that change it. It holds no lock, atomic or cell, so a new run starts from
   `Turn::new` and nothing run-scoped is reachable from another session or a later run.
-- The provider is neither: it never changes, and it is not known when `TurnEnv` is built (that
-  happens before the prompt is stored, and a provider failure must not move ahead of storing
-  it or into the `/compact` path). `run_turn` resolves it once, before the first hook, under the
-  `provider_init` retry, and holds it in `Run` (`stage.rs`); `prepare_model_request` and
-  `transition_call_llm` take it as a parameter. `unify-model-call-path` can move it to
-  `TurnEnv`.
+- The model is not run state: it never changes. It is `TurnEnv::model`, resolved by
+  `execution::resolve_model` (`stage.rs`) under the `provider_init` retry, cancellable while
+  it waits; `Run` holds only the middleware stack and the event receiver. Capabilities are
+  read from `env.model.profile` at every place in the run loop, never from the provider.
 - `SessionRuntime` keeps only session-scoped caches and grants (session grants, MCP tool
   state, accounting, cache prefix) behind short synchronous locks.
 
@@ -143,12 +156,16 @@ check all use it). A model request, a compaction request and every token estimat
 through the projection, so what a reload would send is what the run sends. Cache hints are
 put on the messages as they are sent (`cache_hints.rs`), after any context hook.
 
-The identity native replay is checked against is `SessionHandle::output_target`: the session
-store records no endpoint, so it is completed from the latest stored output of the same
-provider and model. It is a gate, not proof of the endpoint configured now: the provider is
-the authority and re-checks every output's provenance against its own configuration (OpenAI,
-xAI and Codex), degrading what does not match to the portable form. Taking the identity from
-the provider itself needs the run's resolved model (`unify-model-call-path`).
+The identity native replay is checked against is `SessionHandle::output_target(&env.model, …)`.
+The session store records no protocol or endpoint, so it comes from the provider:
+`ChatProvider::output_provenance` is what the provider stamps on its output for the
+configuration it was built with (OpenAI in Responses mode, xAI on its Responses path and
+Codex state it), read once into `ResolvedModel::provenance`. A reply stamped at another
+endpoint is therefore sent in portable form. A provider that states nothing (Extism plugins,
+remote and mesh providers, OpenAI in Chat Completions mode) falls back to completing the
+identity from the latest stored output of the same provider and model, which is a gate and
+not proof of the endpoint configured now; the provider re-checks every output's provenance
+against its own configuration where it can.
 
 Skipped results of a batch that steering interrupted are committed before the steering that
 skipped them (`commit_steering` with the results as `preceding`), so the stored order is the
@@ -219,6 +236,23 @@ After a turn, `crates/agent-runtime/src/agent/execution/maintenance.rs` runs pru
 the context threshold is reached. Automatic compaction is allowed once between two main
 model requests; a second attempt without progress fails with an explicit message instead
 of looping. Post-compaction hooks may add context for the new window.
+
+The compaction request goes where `[execution.compaction]` `provider` / `model` say, resolved by
+`SessionHandle::resolve_compaction_model` (`session/provider.rs`): neither set is the session's own provider;
+`model` alone is that model on the session's provider and node; `provider` needs a `model` (refused when the
+configuration loads, and by `compaction_target` for a configuration built in code). It is resolved in two steps:
+`compaction_target` names the pair (no provider is built; `compact_history` runs it before the hooks so
+`pre_compaction` / `post_compaction` carry the compaction `provider` and `model`, and a policy with a `provider`
+but no `model` is refused before `CompactionStart`; a policy that names neither is valid and uses the session's
+model), then `build_compaction_model` builds the provider and its billing basis, only when no `pre_compaction`
+hook supplied the summary. The run's cancellation stops that build (the compaction then ends with a cancelled
+`CompactionFailed`), a request in flight and the stream it reads, and a summary that finishes after a cancel is
+not stored. The same pair gives the ledger its provider, model and
+billing basis, so the request, its accounting attempts and its span name one model. The worktree handoff summary
+(`summarize_in_runtime`) resolves it the same way and runs no compaction hooks. It registers with
+`LocalAgentHandle::admin_cancels` (`handle/admin_cancel.rs`) for the owner session, because the owner's actor is
+unloaded and `session/cancel` finds none: `cancel` stops the step (token plus a `select!` against provider
+resolution and against the request) and the handoff ends with `summary_cancelled`.
 
 Related: [sessions.md](../../agent-services/knowledge/sessions.md) for the stored history and the compaction layers,
 [tools.md](../../agent-services/knowledge/tools.md) for scheduling inputs, [repository-knowledge.md](../../agent-knowledge/knowledge/repository-knowledge.md)

@@ -134,18 +134,27 @@ protected_tools = ["skill"]  # Tools never to prune
 # AI Compaction (Layer 3) - runs on context overflow
 [agent.execution.compaction]
 auto = true               # Enable automatic compaction
+# The compaction request is sent to this provider and model, and is recorded and
+# priced for them. Unset keys are the session's: `model` alone is that model on
+# the session's provider (and mesh node); `provider` needs a `model`, because
+# the session's model belongs to another provider (a `provider` without a
+# `model` is refused when the configuration loads). The session's own settings
+# (system prompt, reasoning effort, local-model options) are not carried over.
 provider = "anthropic"    # Optional: different provider for compaction
 model = "claude-haiku"    # Optional: cheaper model for compaction
 
+# Governs summaries the agent rejects (empty, refused or cut off): the number of
+# retries, the wait before the first one and its multiplier. It does not govern
+# provider errors; those use [agent.execution.rate_limit] below.
 [agent.execution.compaction.retry]
 max_retries = 3
 initial_backoff_ms = 1000
 backoff_multiplier = 2.0
 
 # Compaction is a paid request. Every attempt (including a retry after a
-# rejected or empty summary) is recorded in the session's cost accounting
-# under the "compaction" purpose, charged to the cycle that triggered it.
-# See "Cost accounting" in api_reference.md.
+# rejected or empty summary, or after a provider error) is recorded in the
+# session's cost accounting under the "compaction" purpose, charged to the
+# cycle that triggered it. See "Cost accounting" in api_reference.md.
 
 # Snapshot backend (undo/redo support)
 [agent.execution.snapshot]
@@ -179,6 +188,23 @@ seconds and then about 20 (`backoff_multiplier`), and the attempts are counted
 against `max_retries` together with the other failures. `0` retries at once. A
 value outside `0..=300`, or one that is not an integer, fails the load with an
 error naming `transport_wait_secs`.
+
+The compaction request follows the same rules as a model request when the
+provider fails. A provider error is retried only if it can succeed on a second
+try (an overloaded or rate-limited provider, a 5xx status, a lost connection),
+after the wait described above, for at most `rate_limit.max_retries` requests in
+total, and clients receive the same retry notices as for a model request. A
+rejected credential or an invalid request fails the compaction after that one
+request. A request that times out is not retried, because the remote side may
+still be working on it, and a cancelled run stops waiting to retry.
+`[agent.execution.compaction.retry]` applies only to a reply that is not a usable
+summary (empty, refused or cut off), and each of those attempts has its own
+provider retries. In the worst case, where retryable provider errors and
+rejected summaries alternate, one compaction sends
+`(compaction.retry.max_retries + 1) × rate_limit.max_retries` requests: 12 with
+the defaults (it was 4). Every request is recorded in the cost accounting. If you
+set `compaction.retry.max_retries = 0` to make compaction fail fast, a provider
+error is now still retried, by `rate_limit`.
 
 `ttl_secs` is the cache lifetime that the agent's default cache hints (the
 first and last system section and the last two messages) request. It is capped

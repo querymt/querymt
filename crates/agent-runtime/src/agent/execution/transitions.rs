@@ -83,10 +83,11 @@ pub(super) enum ContextTrigger {
 /// if the tool set has changed. `trigger` is the context-hook trigger, from
 /// [`context_hook_trigger`] over the history before notices were stored.
 /// `objective` is the request-scoped run objective, sent in the request tail.
-/// `provider` is the run's provider, resolved once before its first hook.
+/// The provider and its capabilities are the run's model (`env.model`),
+/// resolved once before the run's environment was built.
 #[instrument(
     name = "agent.transition.before_llm_call",
-    skip(config, env, turn, provider, trigger, objective),
+    skip(config, env, turn, trigger, objective),
     fields(
         session_id = %env.session_id,
         provider = %env.provider_name(),
@@ -98,7 +99,6 @@ pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    provider: &Arc<dyn querymt::LLMProvider>,
     trigger: ContextTrigger,
     objective: Option<&str>,
 ) -> Result<Step, TurnError> {
@@ -118,7 +118,7 @@ pub(super) async fn transition_before_llm_call(
         tool_count = tracing::field::Empty,
         tools_bytes = tracing::field::Empty
     );
-    let capabilities = provider.capabilities();
+    let capabilities = env.model.profile.capabilities;
     let tool_updates = capabilities.tool_updates;
     // Default message hints request the configured lifetime, capped at what
     // the provider offers; the provider rounds it to one it supports.
@@ -130,7 +130,7 @@ pub(super) async fn transition_before_llm_call(
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
         let tools = config.collect_tools(
-            Arc::clone(provider),
+            Arc::clone(&env.model.provider),
             Some(env.runtime.as_ref()),
             Some(&env.tool_config),
             env.tool_set(),
@@ -175,7 +175,9 @@ pub(super) async fn transition_before_llm_call(
         &tools,
     )
     .await?;
-    let target = env.session_handle.output_target(turn.history.as_slice());
+    let target = env
+        .session_handle
+        .output_target(&env.model, turn.history.as_slice());
     let projected = querymt_agent_core::projection::project_request(
         turn.history.as_slice(),
         &querymt_agent_core::projection::RequestTarget {
@@ -367,11 +369,23 @@ pub(super) fn contextualize_llm_error(
     operation: &'static str,
     env: &TurnEnv,
 ) -> TurnError {
+    provider_error(error, operation, env.provider_name(), env.model_name())
+}
+
+/// A provider failure of `operation` for `provider` and `model`, recorded on
+/// the current span. [`contextualize_llm_error`] for callers that have no
+/// [`TurnEnv`] yet (resolving the model).
+pub(super) fn provider_error(
+    error: LLMError,
+    operation: &'static str,
+    provider: &str,
+    model: &str,
+) -> TurnError {
     genai::llm_error(&error);
     TurnError::Provider {
         operation,
-        provider: env.provider_name().to_string(),
-        model: env.model_name().to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
         source: error,
     }
 }
@@ -794,7 +808,7 @@ fn gate_function_calls_for_execution(
 /// tracks usage/costs, and emits LlmRequestStart/End events.
 #[instrument(
     name = "agent.transition.call_llm",
-    skip(config, request, env, turn, provider),
+    skip(config, request, env, turn),
     fields(
         otel.name = %format!("chat {}", env.model_name()),
         otel.kind = "client",
@@ -818,7 +832,6 @@ pub(super) async fn transition_call_llm(
     request: &PreparedModelRequest,
     env: &TurnEnv,
     turn: &mut Turn,
-    provider: &Arc<dyn querymt::LLMProvider>,
 ) -> Result<Step, TurnError> {
     // A single expected generation; early cancellation/drop retains an abnormal finish
     // without marking the span as an error. Successful canonical output replaces it.
@@ -850,7 +863,8 @@ pub(super) async fn transition_call_llm(
 
     // Overrides last for exactly this request. Options the provider does not
     // honour are dropped (and logged); `applied` records what was really sent.
-    let options = turn
+    let options = env
+        .model
         .profile
         .capabilities
         .options
@@ -873,7 +887,7 @@ pub(super) async fn transition_call_llm(
     );
 
     let session_handle = &env.session_handle;
-    let provider = Arc::clone(provider);
+    let provider = Arc::clone(&env.model.provider);
     let messages_with_cache = request_messages;
     // Recorded on every exit path (success, error, cancel) when dropped.
     let chat_timer = crate::agent::utils::llm_metrics::ChatTimer::start(
@@ -936,7 +950,7 @@ pub(super) async fn transition_call_llm(
         }
     } else {
         session_handle.record_generation_settings(&chat_span, options);
-        if provider.capabilities().streaming {
+        if env.model.profile.capabilities.streaming {
             tracing::Span::current().record("gen_ai.request.stream", true);
             // === STREAMING PATH (all capable providers) ===
             let message_id = Uuid::new_v4().to_string();
@@ -2489,12 +2503,10 @@ pub(super) async fn transition_before_llm_call_in_test(
     turn: &mut Turn,
 ) -> Result<Step, TurnError> {
     let trigger = context_hook_trigger(turn.history.as_slice());
-    let provider = env.provider_for_test().await;
-    transition_before_llm_call(config, env, turn, &provider, trigger, None).await
+    transition_before_llm_call(config, env, turn, trigger, None).await
 }
 
-/// [`transition_call_llm`] with the provider the session's handle resolves,
-/// as the run does before its first hook.
+/// [`transition_call_llm`] over the model the fixture's environment holds.
 #[cfg(test)]
 pub(super) async fn call_llm_in_test(
     config: &AgentConfig,
@@ -2502,8 +2514,7 @@ pub(super) async fn call_llm_in_test(
     env: &TurnEnv,
     turn: &mut Turn,
 ) -> Result<Step, TurnError> {
-    let provider = env.provider_for_test().await;
-    transition_call_llm(config, request, env, turn, &provider).await
+    transition_call_llm(config, request, env, turn).await
 }
 
 #[cfg(test)]
@@ -3817,9 +3828,9 @@ mod tests {
             };
             assert_eq!(request.options, overrides);
             assert_eq!(
-                turn.profile.capabilities,
-                exec.session_handle.provider().await.unwrap().capabilities(),
-                "successful initialization must replace a stale or empty profile"
+                exec.model.profile.capabilities,
+                exec.model.provider.capabilities(),
+                "the profile holds what the resolved provider declares"
             );
         }
 
@@ -3998,11 +4009,9 @@ mod tests {
         ) -> Vec<ChatMessage> {
             hold(turn, &exec.session_id, &messages);
             let trigger = context_hook_trigger(turn.history.as_slice());
-            let provider = exec.provider_for_test().await;
-            let state =
-                transition_before_llm_call(config, exec, turn, &provider, trigger, objective)
-                    .await
-                    .expect("before llm call");
+            let state = transition_before_llm_call(config, exec, turn, trigger, objective)
+                .await
+                .expect("before llm call");
             let Step::Continue(Stage::CallModel(request)) = state else {
                 panic!("expected CallLlm, got {state:?}");
             };
@@ -4177,12 +4186,10 @@ mod tests {
             turn.queue_notice(NoticeSource::DuplicateToolCall, "same".into());
 
             let (_, spans) = capture(async {
-                let provider = exec.provider_for_test().await;
                 let _ = crate::agent::execution::prepare_model_request(
                     &fixture.config,
                     &exec,
                     &mut turn,
-                    &provider,
                 )
                 .await
                 .expect("prepare request");
@@ -4433,9 +4440,9 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let (exec, mut turn) = fixture.turn().await;
+            let (mut exec, mut turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
-            turn.profile = profile_with(querymt::chat::GenerationOptionSupport::ALL, None);
+            exec.model.profile = profile_with(querymt::chat::GenerationOptionSupport::ALL, None);
             turn.request_overrides = overrides;
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
@@ -4512,7 +4519,7 @@ mod tests {
             factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
             let (exec, _turn) = fixture.turn().await;
 
-            let profile = exec.session_handle.profile().await;
+            let profile = exec.model.profile.clone();
 
             // The binding's explicit max_tokens is its own ceiling.
             assert_eq!(
@@ -4538,7 +4545,7 @@ mod tests {
             let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             let (before, _turn) = fixture.turn().await;
-            let old = before.session_handle.profile().await;
+            let old = before.model.profile.clone();
             assert!(old.capabilities.options.max_tokens);
 
             // A switch rebinds the session to another model: the next turn builds a
@@ -4548,7 +4555,7 @@ mod tests {
             factory.binding.lock().unwrap()["max_tokens"] = serde_json::json!(999);
             fixture.config.provider.clear_provider_cache().await;
             let (after, _turn) = fixture.turn().await;
-            let new = after.session_handle.profile().await;
+            let new = after.model.profile.clone();
 
             assert!(!Arc::ptr_eq(&old, &new));
             assert_eq!(
@@ -4571,9 +4578,9 @@ mod tests {
             .await;
             let support = querymt::chat::GenerationOptionSupport::ALL;
             *factory.provider.support.lock().unwrap() = support;
-            let (exec, mut turn) = fixture.turn().await;
+            let (mut exec, mut turn) = fixture.turn().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
-            turn.profile = profile_with(support, None);
+            exec.model.profile = profile_with(support, None);
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
             let plain_request = Arc::new(prepared.clone());
@@ -4644,12 +4651,12 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let (exec, mut turn) = fixture.turn().await;
+            let (mut exec, mut turn) = fixture.turn().await;
             let mut stack =
                 HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
-            turn.profile = profile_with(
+            exec.model.profile = profile_with(
                 querymt::chat::GenerationOptionSupport::ALL,
                 Some(querymt_agent_services::model_heuristics::OutputCaps {
                     initial: 32_000,
@@ -4752,14 +4759,14 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let (exec, mut turn) = fixture.turn().await;
+            let (mut exec, mut turn) = fixture.turn().await;
             let mut middleware =
                 HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let instruction_marker = "cut off by the output-token limit";
 
             // Request 1: initial cap, thinking only, cut off -> escalate.
-            turn.profile = profile_with(
+            exec.model.profile = profile_with(
                 querymt::chat::GenerationOptionSupport::ALL,
                 Some(querymt_agent_services::model_heuristics::OutputCaps {
                     initial: 32_000,
@@ -4976,11 +4983,11 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let (exec, mut turn) = fixture.turn().await;
+            let (mut exec, mut turn) = fixture.turn().await;
             let mut middleware =
                 HookRig::stack_of(crate::middleware::OutputLimitRecoveryMiddleware::default());
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
-            turn.profile = profile_with(
+            exec.model.profile = profile_with(
                 querymt::chat::GenerationOptionSupport::ALL,
                 Some(querymt_agent_services::model_heuristics::OutputCaps {
                     initial: 32_000,

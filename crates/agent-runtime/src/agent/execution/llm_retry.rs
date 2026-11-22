@@ -34,7 +34,15 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, LLMError>>,
 {
-    call_with_retry_mode(config, session_id, cancel_token, None, call_fn).await
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        None,
+        LLMError::is_retryable,
+        call_fn,
+    )
+    .await
 }
 
 /// [`call_with_retry`] for the model request itself (`operation` is `chat`):
@@ -46,7 +54,7 @@ where
     skip(config, attempts, cancel_token, call_fn),
     fields(session_id = %session_id, operation = "chat", attempt = tracing::field::Empty, retrying = tracing::field::Empty)
 )]
-pub(super) async fn call_chat_with_retry<T, F, Fut>(
+pub(crate) async fn call_chat_with_retry<T, F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     attempts: &RequestAttempts,
@@ -57,7 +65,48 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, LLMError>>,
 {
-    call_with_retry_mode(config, session_id, cancel_token, Some(attempts), call_fn).await
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        Some(attempts),
+        LLMError::is_retryable,
+        call_fn,
+    )
+    .await
+}
+
+/// [`call_chat_with_retry`] with its own decision on which errors are worth
+/// another request. The attempt is reported on the span as failed either way;
+/// `retryable` only decides whether another one follows. For a caller that
+/// must not resend after an error `LLMError::is_retryable` accepts (a request
+/// timeout: the remote is probably still working).
+#[instrument(
+    name = "agent.llm.call_with_retry",
+    skip(config, attempts, cancel_token, retryable, call_fn),
+    fields(session_id = %session_id, operation = "chat", attempt = tracing::field::Empty, retrying = tracing::field::Empty)
+)]
+pub(crate) async fn call_chat_with_retry_if<T, F, Fut>(
+    config: &AgentConfig,
+    session_id: &str,
+    attempts: &RequestAttempts,
+    cancel_token: &CancellationToken,
+    retryable: impl Fn(&LLMError) -> bool,
+    call_fn: F,
+) -> Result<T, LLMError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LLMError>>,
+{
+    call_with_retry_mode(
+        config,
+        session_id,
+        cancel_token,
+        Some(attempts),
+        retryable,
+        call_fn,
+    )
+    .await
 }
 
 async fn call_with_retry_mode<T, F, Fut>(
@@ -65,6 +114,7 @@ async fn call_with_retry_mode<T, F, Fut>(
     session_id: &str,
     cancel_token: &CancellationToken,
     attempts: Option<&RequestAttempts>,
+    retryable: impl Fn(&LLMError) -> bool,
     mut call_fn: F,
 ) -> Result<T, LLMError>
 where
@@ -97,7 +147,7 @@ where
                 if let Some(attempts) = attempts {
                     attempts.failed(&error);
                 }
-                if !error.is_retryable() || attempt >= max_attempts {
+                if !retryable(&error) || attempt >= max_attempts {
                     return Err(error);
                 }
 

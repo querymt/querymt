@@ -47,6 +47,13 @@ mod mesh_provider_tests {
         }
     }
 
+    #[tokio::test]
+    async fn mesh_chat_provider_reports_no_output_provenance() {
+        let mesh = get_test_mesh().await;
+        let provider = MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3");
+        assert_eq!(provider.output_provenance(), None);
+    }
+
     // ── B.2 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]

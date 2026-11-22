@@ -169,6 +169,72 @@ fn set_key_resolver_forwards_to_inner_provider() {
     assert_eq!(forwarded.current(), "resolver-token");
 }
 
+/// An HTTP provider that states the provenance it stamps on its output.
+struct StampingHttpProvider;
+
+fn stamped_provenance() -> crate::chat::ChatOutputProvenance {
+    crate::chat::ChatOutputProvenance {
+        provider: "stamping".into(),
+        protocol: "responses".into(),
+        model: "stamping-model".into(),
+        endpoint: "https://stamping.invalid/v1/responses".into(),
+    }
+}
+
+impl HTTPChatProvider for StampingHttpProvider {
+    fn prepare_chat_request(
+        &self,
+        _call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+
+    fn parse_chat(
+        &self,
+        _resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+
+    fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+        Some(stamped_provenance())
+    }
+}
+
+impl HTTPCompletionProvider for StampingHttpProvider {
+    fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+}
+
+impl HTTPEmbeddingProvider for StampingHttpProvider {
+    fn embed_request(&self, _inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+
+    fn parse_embed(&self, _resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented("unused in test".into()))
+    }
+}
+
+impl HTTPLLMProvider for StampingHttpProvider {}
+
+#[test]
+fn http_adapter_forwards_output_provenance() {
+    let adapter = LLMProviderFromHTTP::new(Box::new(StampingHttpProvider));
+    assert_eq!(adapter.output_provenance(), Some(stamped_provenance()));
+
+    // A provider that does not say reports nothing, rather than a default tuple.
+    let silent = LLMProviderFromHTTP::new(Box::new(DummyHttpProvider { resolver: None }));
+    assert_eq!(silent.output_provenance(), None);
+}
+
 #[tokio::test]
 async fn ensure_credential_fresh_resolves_before_request_building() {
     let resolver = Arc::new(CountingResolver::new());

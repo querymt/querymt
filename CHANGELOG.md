@@ -27,8 +27,114 @@
   breakpoint support, 1800. A value out of range, not an integer, or an unknown
   key in the table fails the load naming the key.
 
+- **`ChatProvider::output_provenance` and `HTTPChatProvider::output_provenance`.**
+  A provider can state the `ChatOutputProvenance` (provider, protocol, model,
+  endpoint) it stamps on its output; the default is `None`. `ValidatedLLM`,
+  `ToolEnabledProvider`, `LLMProviderFromHTTP` and `MeshChatProvider` forward
+  it, `RemoteChatProvider` reports `None` (the provider contract carries no
+  provenance), and the OpenAI (Responses mode), xAI (Responses path) and Codex
+  providers implement it. The plugin contract is unchanged, so an Extism
+  provider reports `None`.
+
 ### Behavior changes
 
+- **The replay identity of a stored reply comes from the provider.** The agent
+  used to complete the protocol and endpoint a reply is replayed against from
+  the latest stored reply of the same provider and model. When the provider
+  states its provenance it now uses all of it (provider, protocol, model and
+  endpoint, whatever alias the session configuration gives the provider), so
+  after the configured endpoint changes a reply stamped at the old endpoint is
+  sent in portable form (no encrypted reasoning or signatures). A stored reply
+  with no provenance (stored before provenance existed) is also sent in
+  portable form to such a provider, instead of being matched on provider and
+  model alone (`OutputTarget::fallback_provider_model` is off for a stated
+  identity). Providers that state nothing keep the old completion and the old
+  comparison. OpenAI Responses streams are now stamped with the configured
+  endpoint, like their non-streamed replies; before, a streamed reply carried an
+  empty endpoint and never replayed natively.
+- **A run resolves its model once, before any middleware hook.** When the
+  session's provider cannot be built (after the provider-setup retries) the run
+  fails with the provider-initialization error before any middleware hook runs
+  and before any model request, with the user's prompt already in the history;
+  no pre-turn snapshot is taken for it. Hooks therefore always see the model's
+  real profile. Native `/compact` with a provider that cannot be built still
+  runs the `pre_compaction` hook first: a summary the hook supplies is stored
+  without a provider, and so is a compaction policy that names another working
+  provider. When the summary has to come from the session's own provider, it
+  fails with the provider failure before the `compaction_start` event, instead
+  of an internal error after it (an empty conversation still answers "nothing
+  to compact" without a provider). The
+  `agent.execution.provider_init` span is a child of `agent.prompt.execute`.
+  The tools a run offers are still collected for every request, so an MCP
+  server's `tools/list_changed` still takes effect mid-run.
+- **BREAKING (config semantics, compaction): provider errors during compaction
+  follow `[agent.execution.rate_limit]`.** `[agent.execution.compaction.retry]`
+  (`max_retries`, `initial_backoff_ms`, `backoff_multiplier`) now applies only to
+  a reply the agent rejects as a summary (empty, refused or cut off). A provider
+  error is retried only when it is retryable (an overloaded or rate-limited
+  provider, a 5xx status, a lost connection), after the wait the error calls for
+  (the provider's own delay, `transport_wait_secs` or `default_wait_secs`), for
+  at most `max(1, rate_limit.max_retries)` requests, and the run's cancellation
+  stops the wait. A rejected credential or an invalid request fails the compaction
+  after one request; before, it was retried `compaction.retry.max_retries`
+  times. A request timeout is still not retried. No key is added or removed.
+  A compaction can now send up to `(compaction.retry.max_retries + 1) ×
+  max(1, rate_limit.max_retries)` requests (12 with the defaults, 4 before);
+  each is in the cost accounting. A response stream that closes before its
+  terminal event is a lost connection and is retried like one (it used to count
+  as a rejected summary). A request timeout is recorded as a failed attempt.
+  Cancelling stops a request in flight, also while its stream is open, keeps the
+  usage it had reported, and a summary that finishes after the cancel is not
+  stored. The same retry-wait events as for a model request
+  (`llm_retry_wait`, `rate_limited` and their resume events) are now sent during
+  a compaction. A compaction request span (telemetry) carries
+  `gen_ai.request.attempt` and its events. `querymt-desktop` should confirm that
+  retry notices during a compaction render like those of a model request. The
+  public `compaction::RetryConfig` (re-exported as `CompactionRetryConfig`) is
+  removed. `SessionCompaction::process` and `process_with_instructions` are one
+  method, `process(messages, max_prompt_bytes, instructions, &CompactionDispatch)`;
+  `CompactionDispatch { provider, config, cancel, ledger }` carries the provider,
+  the `&AgentConfig`, the `CancellationToken` and the `DispatchLedger`. The model
+  and the session of a compaction request (and its span) are now the ledger's
+  (`AttemptOperation::model()` / `session_id()`), no longer a `model` argument
+  and the first message's session. Retry-wait events of a compaction are
+  written to that initiating session (an empty or blank history session used to
+  send them to session `""`).
+- **Fix (compaction): `[agent.execution.compaction]` `provider` and `model` now
+  choose where the compaction request goes.** Before, both were only labels:
+  the request always ran on the session's model, while the cost accounting, the
+  pricing and the span named the configured `model`, so a cheaper compaction
+  model was charged at its rates for a request that ran on the session's model.
+  `model` alone is that model on the session's provider (and mesh node);
+  `provider` is resolved like any provider and needs a `model` (the session's
+  model belongs to another provider), otherwise the compaction fails before a
+  request is sent. The session's own settings (system prompt, reasoning effort,
+  local-model options) are not carried over to another model. A configuration
+  that set only `provider` used to be accepted and is now refused when it
+  loads (see the hooks entry below). The worktree handoff summary follows the same policy, and a
+  price-limit refusal of it is reported as such (`summary_failed`, "price limit
+  reached") instead of as a provider failure. `AttemptOperation` gains
+  `model()` / `session_id()`.
+- **BREAKING (hooks, compaction): `pre_compaction` and `post_compaction` name
+  the compaction model.** Their `model` was the session's model even when
+  `[agent.execution.compaction]` sent the request elsewhere; it is now the model
+  the summary is requested from, and both payloads gain `provider`.
+  `post_compaction` also gains `summary_source` (`model` or `hook`). The
+  committed input schemas set `additionalProperties: false`, so a hook that
+  validates its stdin against the old schema rejects the new fields.
+  `compaction.provider` without `compaction.model` is refused when a
+  configuration file loads (`agent`, `planner` and every delegate; a session
+  stored by an earlier version still loads, and its compaction then fails before it starts;
+  it used to be accepted and silently ignored, and
+  afterwards was refused only when a compaction started); a configuration built
+  in code is refused when the compaction starts, before any event or hook.
+- **Fix (worktree handoff): `session/cancel` stops a handoff summary.** The
+  owner's actor is unloaded for a handoff, so the cancel found nothing to stop
+  and the summary kept running with the workspace held exclusively. It now
+  stops the request in flight, or the provider setup that precedes it, and the
+  handoff ends with the new `summary_cancelled` code, ownership unchanged and
+  the workspace released. The
+  summary still has no time bound beyond the retry budgets.
 - **Skipped tool results are stored before the steering that skipped them.**
   When steering is applied before a tool batch starts, the stored order is now
   the assistant message with the calls, one message with the skipped results,

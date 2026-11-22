@@ -20,7 +20,7 @@ pub use engine::{
     PostToolUseRequest, PostToolUseResult, PreCompactionRequest, PreCompactionResult,
     PreDelegationRequest, PreDelegationResult, PreToolUseRequest, PreToolUseResult,
     SessionEndRequest, SessionEndResult, SessionStartRequest, SessionStartResult, StopRequest,
-    StopResult, SubagentChangeRequest, SubagentChangeResult, UpdatedDelegation,
+    StopResult, SubagentChangeRequest, SubagentChangeResult, SummarySource, UpdatedDelegation,
     UserPromptSubmitRequest, UserPromptSubmitResult,
 };
 pub use error::{HookConfigError, HookError};

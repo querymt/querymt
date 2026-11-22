@@ -828,6 +828,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_chat_provider_reports_no_output_provenance() {
+        use querymt::chat::ChatProvider as _;
+        let (_transport, core) = core_with_contract(ProviderContractInfo {
+            item_aware_chat_version: Some(querymt::chat::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE.with_streaming(true),
+            generation: Default::default(),
+        });
+        let provider = crate::RemoteChatProvider::new(core);
+        // Before and after the handshake: the contract carries capabilities,
+        // not provenance, so the peer's output identity is not known here.
+        assert_eq!(provider.output_provenance(), None);
+        provider.core().negotiate_contract().await.unwrap();
+        assert!(provider.capabilities().streaming);
+        assert_eq!(provider.output_provenance(), None);
+    }
+
+    #[tokio::test]
     async fn missing_protocol_version_fails_with_upgrade_guidance() {
         let (_transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,

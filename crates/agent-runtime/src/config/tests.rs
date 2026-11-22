@@ -1886,6 +1886,43 @@ auth = { type = "oauth" }
     assert!(format!("{err:#}").contains("bad-sock"), "{err:#}");
 }
 
+/// A compaction `provider` without a `model` is refused when the file loads,
+/// naming where it is; with a model, or with only a model, it loads.
+#[tokio::test]
+async fn load_config_refuses_a_compaction_provider_without_a_model() {
+    let single = |compaction: &str| {
+        format!(
+            "[agent]\nprovider = \"test\"\nmodel = \"m\"\ntools = []\n\n\
+             [agent.execution.compaction]\n{compaction}\n"
+        )
+    };
+    let err = load_config(ConfigSource::Toml(single("provider = \"other\"")))
+        .await
+        .expect_err("a provider needs a model");
+    let text = format!("{err:#}");
+    assert!(text.contains("agent.execution.compaction"), "{text}");
+    assert!(text.contains("needs a compaction model"), "{text}");
+
+    for ok in [
+        "provider = \"other\"\nmodel = \"cheap\"",
+        "model = \"cheap\"",
+        "auto = true",
+    ] {
+        load_config(ConfigSource::Toml(single(ok)))
+            .await
+            .unwrap_or_else(|error| panic!("`{ok}` must load: {error:#}"));
+    }
+
+    let multi = "[agent]\nprovider = \"test\"\nmodel = \"m\"\ntools = []\n\n\
+                 [[delegates]]\nid = \"d\"\nprovider = \"test\"\nmodel = \"m\"\n\
+                 description = \"d\"\ntools = []\n\n\
+                 [delegates.execution.compaction]\nprovider = \"other\"\n";
+    let err = load_config(ConfigSource::Toml(multi.to_string()))
+        .await
+        .expect_err("a delegate's provider needs a model too");
+    assert!(format!("{err:#}").contains("delegate 'd'"), "{err:#}");
+}
+
 /// The trading examples load from their real paths (prompt files resolve),
 /// split read and order scopes between the two profiles, and the desk starts
 /// disarmed in plan mode with its guard hooks wired.

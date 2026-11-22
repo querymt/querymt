@@ -846,6 +846,109 @@ impl Clone for SessionProvider {
     }
 }
 
+/// The provider a run talks to and the facts about its model. Resolved once
+/// per run by [`SessionHandle::resolve_model`] and fixed for the run; what the
+/// run offers the model (its tools) is not part of it.
+#[derive(Clone)]
+pub(crate) struct ResolvedModel {
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    /// Capabilities, output caps and configured effort.
+    pub(crate) profile: Arc<ModelProfile>,
+    /// The provenance the provider stamps on its output, read once when the
+    /// model is resolved; `None` when it does not say (see
+    /// [`SessionHandle::output_target`]).
+    pub(crate) provenance: Option<querymt::chat::ChatOutputProvenance>,
+}
+
+impl ResolvedModel {
+    /// A stand-in for a session whose provider could not be built, for the
+    /// one run that can still make progress without it: native `/compact`
+    /// (see `compact_history_with`). It has no capabilities and no
+    /// provenance, and its provider fails every call with `reason`; nothing
+    /// that sends a model request may be given one.
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            provider: Arc::new(UnavailableProvider {
+                reason: reason.into(),
+            }),
+            profile: Arc::new(ModelProfile::default()),
+            provenance: None,
+        }
+    }
+}
+
+/// The provider of [`ResolvedModel::unavailable`]: every call fails.
+struct UnavailableProvider {
+    reason: String,
+}
+
+impl UnavailableProvider {
+    fn error(&self) -> LLMError {
+        LLMError::ProviderError(format!("provider unavailable: {}", self.reason))
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::chat::ChatProvider for UnavailableProvider {
+    async fn chat(
+        &self,
+        _call: &querymt::chat::ChatCall<'_>,
+    ) -> Result<querymt::chat::ChatOutput, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::completion::CompletionProvider for UnavailableProvider {
+    async fn complete(
+        &self,
+        _req: &querymt::completion::CompletionRequest,
+    ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl querymt::embedding::EmbeddingProvider for UnavailableProvider {
+    async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(self.error())
+    }
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for UnavailableProvider {}
+
+/// The provider and model a compaction request is sent to, by name; see
+/// [`SessionHandle::compaction_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionTarget {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// The target's provider is the session's.
+    is_session_provider: bool,
+    /// The target is the session's own provider and model.
+    is_session_model: bool,
+}
+
+impl CompactionTarget {
+    /// The request goes to the provider the session itself talks to, so
+    /// building it is the session's own provider build (and fails when that
+    /// does).
+    pub(crate) fn is_session_model(&self) -> bool {
+        self.is_session_model
+    }
+}
+
+/// Where one compaction request is sent and how it is billed; see
+/// [`SessionHandle::build_compaction_model`].
+pub(crate) struct CompactionModel {
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    /// The provider's name, as the accounting attempts record it.
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) basis: BillingBasis,
+}
+
 pub(crate) struct ProviderSnapshot {
     provider: Arc<dyn LLMProvider>,
     settings: crate::agent::utils::genai::GenerationSettings,
@@ -1001,24 +1104,26 @@ impl SessionHandle {
     /// The identity native replay is checked against for this session's model
     /// (`None` when no model is pinned: nothing native replays).
     ///
-    /// The session store records no protocol or endpoint for a model, while a
-    /// provider stamps its output with both. So that a reply replays to the
-    /// provider that produced it, the identity is completed from the latest
-    /// stored output of the same provider and model in `history`.
+    /// A provider stamps its output with a protocol and an endpoint, which the
+    /// session store does not record. The identity comes from the resolved
+    /// model: the provenance the provider states for the configuration it was
+    /// built with, so a reply stamped at another endpoint is sent in portable
+    /// form.
     ///
-    /// This gate does not prove the endpoint is the one configured now: the
-    /// provider that is sent the messages is the authority on that and checks
-    /// every output's provenance against its own configuration (OpenAI, xAI and
-    /// Codex do), degrading what does not match to the portable form. Taking
-    /// the identity from the provider itself is planned with the run's resolved
-    /// model (`unify-model-call-path`).
+    /// A provider that states nothing (an Extism plugin, a mesh provider, an
+    /// OpenAI provider in Chat Completions mode) falls back to completing the
+    /// identity from the latest stored output of the same provider and model in
+    /// `history`. That fallback does not prove the endpoint is the one
+    /// configured now; the provider that is sent the messages re-checks every
+    /// output's provenance against its own configuration where it can.
     pub(crate) fn output_target(
         &self,
+        model: &ResolvedModel,
         history: &[AgentMessage],
     ) -> Option<querymt_agent_core::model::OutputTarget> {
         self.llm_config
             .as_ref()
-            .map(|llm| complete_output_target(llm, history))
+            .map(|llm| complete_output_target(llm, model.provenance.as_ref(), history))
     }
 
     /// Get the session execution config captured at handle creation time (turn-pinned).
@@ -1026,7 +1131,16 @@ impl SessionHandle {
         self.execution_config.as_ref()
     }
 
+    /// The provider this turn talks to, built on first use.
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
+        self.snapshot()
+            .await
+            .map(|built| Arc::clone(&built.provider))
+    }
+
+    /// The provider with what was resolved alongside it, built on first use
+    /// and shared by every clone of the handle. A failed build is not cached.
+    async fn snapshot(&self) -> SessionResult<&ProviderSnapshot> {
         self.cached_llm_provider
             .get_or_try_init(|| async {
                 let config = self.llm_config.as_ref().ok_or_else(|| {
@@ -1053,26 +1167,123 @@ impl SessionHandle {
                 .await
             })
             .await
-            .map(|built| Arc::clone(&built.provider))
     }
 
-    /// The facts about this turn's model: output caps, what the provider
-    /// honours per request, configured effort and pricing.
+    /// The provider this turn talks to and the facts about its model (output
+    /// caps, what the provider honours per request, configured effort), both
+    /// read from the same build.
     ///
-    /// Builds (and caches) the provider if needed. When the provider cannot be
-    /// built the profile is empty (no caps, no per-request options); the real
-    /// request surfaces the error. A model switch builds a new handle and so a
-    /// new profile.
-    pub(crate) async fn profile(&self) -> Arc<ModelProfile> {
-        let Ok(provider) = self.provider().await else {
-            return Arc::new(ModelProfile::default());
-        };
-        let built = self.cached_llm_provider.get();
-        Arc::new(ModelProfile {
-            caps: built.and_then(|built| built.output_caps),
-            capabilities: provider.capabilities(),
-            reasoning_effort: built.and_then(|built| built.reasoning_effort),
+    /// Builds (and caches) the provider if needed and returns the error when
+    /// that fails: there is no empty profile to fall back on. A model switch
+    /// builds a new handle and so a new model.
+    pub(crate) async fn resolve_model(&self) -> SessionResult<ResolvedModel> {
+        let built = self.snapshot().await?;
+        Ok(ResolvedModel {
+            provider: Arc::clone(&built.provider),
+            provenance: built.provider.output_provenance(),
+            profile: Arc::new(ModelProfile {
+                caps: built.output_caps,
+                capabilities: built.provider.capabilities(),
+                reasoning_effort: built.reasoning_effort,
+            }),
         })
+    }
+
+    /// The provider and model one compaction request is sent to, by name.
+    ///
+    /// `[agent.execution.compaction]` `provider` and `model` select them; what
+    /// is left unset is the session's. Nothing is built, so this is what the
+    /// compaction hooks are told before any provider exists.
+    ///
+    /// - Neither differs from the session's: the session's own pair.
+    /// - Only the model differs: that model on the session's provider.
+    /// - The provider is set: it needs a `model`, because the session's model
+    ///   belongs to another provider. Loading a configuration file already
+    ///   refuses that; this covers a configuration built in code.
+    pub(crate) fn compaction_target(
+        &self,
+        policy: &crate::config::CompactionConfig,
+    ) -> SessionResult<CompactionTarget> {
+        policy.validate().map_err(SessionError::InvalidOperation)?;
+        let session = self.llm_config.as_ref().ok_or_else(|| {
+            SessionError::InvalidOperation("Session has no LLM config".to_string())
+        })?;
+        let provider = policy.provider.as_deref().unwrap_or(&session.provider);
+        let provider_changed = provider != session.provider;
+        let model = policy.model.as_deref().unwrap_or(&session.model);
+        Ok(CompactionTarget {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            is_session_provider: !provider_changed,
+            is_session_model: !provider_changed && model == session.model,
+        })
+    }
+
+    /// Builds the provider for a [`CompactionTarget`], with what it is priced
+    /// for. The same pair is what the request runs on and what its accounting
+    /// attempts and span name, so the three cannot disagree.
+    ///
+    /// The session's own provider is reused when the target is the session's
+    /// own pair. Another model is built with
+    /// [`SessionProvider::selection_params`], so the session's own settings
+    /// (system prompt, effort, a local model's context size) do not leak into
+    /// a request for it. A model on the session's provider keeps the session's
+    /// mesh node. Another provider drops the session's pinned node and is
+    /// resolved like any provider: locally first, then on the mesh when mesh
+    /// fallback is enabled and the provider is not available locally.
+    pub(crate) async fn build_compaction_model(
+        &self,
+        target: &CompactionTarget,
+    ) -> SessionResult<CompactionModel> {
+        let (provider_name, model) = (target.provider.as_str(), target.model.as_str());
+        if target.is_session_model {
+            return Ok(CompactionModel {
+                provider: self.provider().await?,
+                provider_name: target.provider.clone(),
+                model: target.model.clone(),
+                basis: self.billing_basis_for_model(model),
+            });
+        }
+
+        let (_, _, params) = crate::session::store::extract_llm_config_values(
+            &self.provider.selection_params(provider_name, model),
+        )?;
+        let request = ProviderRequest::new(provider_name, model)
+            .with_params(params.as_ref())
+            .with_session_id(&self.session.public_id);
+        #[cfg(feature = "remote")]
+        let request = request.with_provider_node_id(if target.is_session_provider {
+            self.provider_node_id.as_deref()
+        } else {
+            None
+        });
+        let span = tracing::info_span!(
+            "agent.provider.build",
+            provider = %provider_name,
+            model = %model,
+            compaction = true,
+            auth.source = tracing::field::Empty,
+        );
+        let built =
+            tracing::Instrument::instrument(self.provider.build_provider_snapshot(request), span)
+                .await?;
+        let oauth_backed = built.provider.key_resolver().is_some();
+        Ok(CompactionModel {
+            basis: resolve_billing_basis(provider_name, model, oauth_backed),
+            provider: built.provider,
+            provider_name: target.provider.clone(),
+            model: target.model.clone(),
+        })
+    }
+
+    /// [`Self::compaction_target`] and [`Self::build_compaction_model`] in one
+    /// step, for a caller that runs no hook between them.
+    pub(crate) async fn resolve_compaction_model(
+        &self,
+        policy: &crate::config::CompactionConfig,
+    ) -> SessionResult<CompactionModel> {
+        self.build_compaction_model(&self.compaction_target(policy)?)
+            .await
     }
 
     /// Record the request settings on the chat span: the configured values
@@ -1379,14 +1590,37 @@ pub(crate) fn record_auth_source(source: AuthSource) {
     tracing::Span::current().record("auth.source", source.as_str());
 }
 
-/// The replay identity of `llm`, with the protocol and endpoint the store does
-/// not record taken from the latest output of the same provider and model in
-/// `history` (see [`SessionHandle::output_target`]).
+/// The replay identity of `llm`.
+///
+/// When the provider states its provenance (`provenance`), that is the
+/// identity, all four fields of it: provider, protocol, model and endpoint are
+/// exactly what it stamps on its own output, whatever name the session
+/// configuration gives the provider (a logical alias) or the model. Without a
+/// stated identity, the session's provider and model are used and the
+/// protocol and endpoint, which the store does not record, are taken from the
+/// latest output of the same provider and model in `history` (see
+/// [`SessionHandle::output_target`]).
 fn complete_output_target(
     llm: &LLMConfig,
+    provenance: Option<&querymt::chat::ChatOutputProvenance>,
     history: &[AgentMessage],
 ) -> querymt_agent_core::model::OutputTarget {
     use querymt_agent_core::model::{MessagePart, OutputTarget};
+    if let Some(stated) = provenance {
+        let mut target = OutputTarget::new(stated.provider.clone(), stated.model.clone())
+            .with_protocol(stated.protocol.clone())
+            .with_endpoint(stated.endpoint.clone());
+        // `fallback_provider_model` lets stored output that carries no
+        // provenance replay natively when only its provider and model match
+        // the target. That is a guess about an origin nobody recorded. A
+        // provider that states its full identity is the case where the guess
+        // is not needed and not safe: output without provenance may come from
+        // any endpoint, so it is replayed in portable form (no encrypted
+        // reasoning or signatures), and only output stamped with exactly this
+        // identity replays natively.
+        target.fallback_provider_model = false;
+        return target;
+    }
     let mut target = OutputTarget::new(llm.provider.clone(), llm.model.clone());
     target.protocol = llm.protocol.clone();
     target.endpoint = llm.endpoint.clone();
@@ -1583,18 +1817,95 @@ pub mod tests {
             reply("p", "other", "https://b"),
             reply("q", "m", "https://c"),
         ];
-        let target = complete_output_target(&llm, &history);
+        let target = complete_output_target(&llm, None, &history);
         assert_eq!(target.endpoint, "https://a");
         assert_eq!(target.protocol, "responses");
 
         // Without a reply of its own the identity stays incomplete, which
         // never authorizes native replay.
-        assert_eq!(complete_output_target(&llm, &[]).endpoint, "");
+        assert_eq!(complete_output_target(&llm, None, &[]).endpoint, "");
         assert_eq!(
-            complete_output_target(&llm, &history[1..]).endpoint,
+            complete_output_target(&llm, None, &history[1..]).endpoint,
             "",
             "replies of other models do not complete it"
         );
+
+        // What the provider states is the identity; the stored replies, which
+        // may come from another endpoint, do not complete it.
+        let stated = ChatOutputProvenance {
+            provider: "p".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            endpoint: "https://now".into(),
+        };
+        let target = complete_output_target(&llm, Some(&stated), &history);
+        assert_eq!(target.endpoint, "https://now");
+        assert_eq!(target.protocol, "chat");
+        assert_eq!(target.provider, "p");
+        assert_eq!(target.model, "m");
+        assert_eq!(
+            complete_output_target(&llm, Some(&stated), &[]).endpoint,
+            "https://now",
+            "a stated identity needs no history"
+        );
+        assert!(
+            !target.fallback_provider_model,
+            "a stated identity never replays output of unknown origin natively"
+        );
+        assert!(
+            complete_output_target(&llm, None, &history).fallback_provider_model,
+            "without a stated identity the legacy comparison stays available"
+        );
+
+        // The session may name the provider by an alias; the stated identity,
+        // which is what the output is stamped with, is used as it is.
+        let aliased = LLMConfig {
+            provider: "work-openai".into(),
+            model: "alias-of-m".into(),
+            ..llm.clone()
+        };
+        let target = complete_output_target(&aliased, Some(&stated), &[]);
+        assert_eq!(target.provider, "p");
+        assert_eq!(target.model, "m");
+
+        // Output stamped with exactly that identity replays natively (its
+        // reasoning signature is kept); the same output after the endpoint
+        // moved, and output without provenance even from the same provider
+        // and model, are portable.
+        let replays = |provenance: Option<ChatOutputProvenance>| {
+            use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart};
+            let mut message = AgentMessage::new("s".into(), ChatRole::Assistant);
+            message.source_provider = Some("p".into());
+            message.source_model = Some("m".into());
+            message.parts.push(MessagePart::Output {
+                output: ChatOutput {
+                    provenance,
+                    items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                        id: None,
+                        summary: vec![ChatReasoningPart::text("visible")],
+                        content: Vec::new(),
+                        encrypted_content: None,
+                        signature: Some("sig".into()),
+                        status: None,
+                        extensions: Default::default(),
+                    })],
+                    ..ChatOutput::default()
+                },
+            });
+            let chat = message
+                .to_chat_message_with_output_target(Some(&target), None)
+                .unwrap();
+            chat.output().and_then(|output| output.signature()) == Some("sig".to_string())
+        };
+        let at = |endpoint: &str| {
+            Some(ChatOutputProvenance {
+                endpoint: endpoint.into(),
+                ..stated.clone()
+            })
+        };
+        assert!(replays(at("https://now")));
+        assert!(!replays(at("https://before")));
+        assert!(!replays(None));
     }
 
     #[cfg(feature = "remote")]

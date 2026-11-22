@@ -80,6 +80,10 @@ impl ChatProvider for LLMProviderFromHTTP {
         self.inner.capabilities()
     }
 
+    fn output_provenance(&self) -> Option<crate::chat::ChatOutputProvenance> {
+        self.inner.output_provenance()
+    }
+
     #[cfg_attr(feature = "tracing", instrument(name = "http_adapter.chat", skip_all))]
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.check_tool_changes(call)?;

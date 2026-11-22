@@ -20,9 +20,9 @@ use crate::agent::turn_control::{RunPhase, RunSignal, SteeringInbox};
 use crate::knowledge::KnowledgeStore;
 use crate::knowledge::repository::RepositoryKnowledgeRegistry;
 use crate::knowledge::repository::budget::DeliveryBudget;
-use crate::middleware::{AgentStats, HookCx, HookInputs, ModelProfile, PendingNotice};
+use crate::middleware::{AgentStats, HookCx, HookInputs, PendingNotice};
 use crate::session::error::SessionResult;
-use crate::session::provider::SessionHandle;
+use crate::session::provider::{ResolvedModel, SessionHandle};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::{AgentToolContext, ToolRegistry, ToolSet};
@@ -65,9 +65,15 @@ impl ExecutionOrigin {
 
 /// What a run reads and never changes.
 ///
-/// Built with a struct literal at its one production site
-/// (`session_actor.rs` `execute_prompt_inner`), so a missing field is a
-/// compile error and cannot fall back to a silent default.
+/// It is built once the run's model is resolved (`execution::resolve_model`),
+/// so a `TurnEnv` always has one: there is no state that means "not resolved
+/// yet". It is built through one constructor (`session_actor.rs`), so a
+/// missing field is a compile error and cannot fall back to a silent default.
+///
+/// What is fixed for the run: the model, the session's `llm_config`, the tool
+/// configuration and the mode. What is not: `runtime` is a handle to live
+/// session state, so the MCP tools a run offers can change between two of its
+/// requests (they are collected for every request, never kept here).
 pub(crate) struct TurnEnv {
     /// The session ID for this execution.
     pub session_id: String,
@@ -79,14 +85,15 @@ pub(crate) struct TurnEnv {
     /// Turn-pinned session handle: avoids repeated DB lookups for
     /// session/config.
     pub session_handle: SessionHandle,
+    /// The provider the run talks to and the facts about its model
+    /// (capabilities, output caps, configured effort), resolved once.
+    pub model: ResolvedModel,
     /// Cancelled when the session receives a cancel signal. Propagated into
     /// tool contexts so tools can abort long-running work cooperatively.
     pub cancellation_token: CancellationToken,
     /// Per-session tool configuration captured at the start of the turn, so
     /// `SetAllowedTools`, `SetDeniedTools` and `SetToolPolicy` are honoured.
     pub tool_config: ToolConfig,
-    /// Interactive (user/delegation) or scheduled.
-    pub execution_origin: ExecutionOrigin,
     /// Optional knowledge store, propagated into tool contexts.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
     /// Lazy per-checkout repository knowledge; `None` unless host-enabled.
@@ -259,8 +266,6 @@ pub(crate) struct Turn {
     pub request_overrides: GenerationOptions,
     /// Options the most recent model request was sent with.
     pub last_applied: GenerationOptions,
-    /// Facts about the session's model.
-    pub profile: Arc<ModelProfile>,
     /// Delegations left running when steering interrupts a wait.
     pub suspended_delegations: HashSet<String>,
     /// Retains a supplementary terminal read across bounded BeforeModel
@@ -292,7 +297,7 @@ impl Turn {
             runtime: &env.runtime,
             history: &self.history,
             stats: &self.stats,
-            profile: &self.profile,
+            profile: &env.model.profile,
             last_applied: self.last_applied,
             request_overrides: &mut self.request_overrides,
             pending_notices: &mut self.pending_notices,
@@ -316,7 +321,6 @@ impl Turn {
             pending_notices: Vec::new(),
             request_overrides: GenerationOptions::NONE,
             last_applied: GenerationOptions::NONE,
-            profile: Arc::new(ModelProfile::default()),
             suspended_delegations: HashSet::new(),
             suspended_recovery: None,
             delivery_budget: None,

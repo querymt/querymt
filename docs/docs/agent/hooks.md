@@ -322,6 +322,8 @@ Expected hook output:
 }
 ```
 
+For `pre_compaction` and `post_compaction`, `model` is the model the summary is requested from, and `provider` is the provider that serves it: the session's, unless `[agent.execution.compaction]` selects another (see its `provider` and `model` keys). They are the same pair the request, its cost accounting and its trace span use. When a `pre_compaction` hook supplies the summary no request is made, and both hooks still name the model that would have been asked. `post_compaction` also gets `summary_source`: `model` (the compaction model wrote it) or `hook` (a `pre_compaction` hook supplied it). A compaction whose policy names no usable model (a `provider` without a `model`, built in code: a configuration file is refused when it loads) fails before it starts and runs no hook.
+
 A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in `candidate_summary`; the last valid candidate wins. `pre_compaction.messages` contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.
 
 Command hooks are the portable lifecycle mechanism. MCP-backed handlers are intended for automatic retrieval, sanitation, and policy calls against connected services; ordinary MCP tools remain separately registered and model-visible. Compiled middleware remains the right choice for in-process state-machine behavior.

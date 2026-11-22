@@ -18,8 +18,8 @@ pub use task_service::TaskService;
 // Compaction system (3-layer)
 pub mod compaction;
 pub use compaction::{
-    CompactionResult, RetryConfig as CompactionRetryConfig, SessionCompaction,
-    filter_to_effective_history, get_last_compaction, has_compaction,
+    CompactionDispatch, CompactionResult, SessionCompaction, filter_to_effective_history,
+    get_last_compaction, has_compaction,
 };
 pub use pruning::{
     PrunableToolResult, PruneAnalysis, PruneConfig, SimpleTokenEstimator, TokenEstimator,

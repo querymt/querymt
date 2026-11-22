@@ -38,10 +38,20 @@
       ],
       "type": "string"
     },
+    "provider": {
+      "type": "string"
+    },
     "session_id": {
       "type": "string"
     },
     "summary": {
+      "type": "string"
+    },
+    "summary_source": {
+      "enum": [
+        "model",
+        "hook"
+      ],
       "type": "string"
     },
     "summary_token_count": {
@@ -65,9 +75,11 @@
     "transcript_path",
     "cwd",
     "hook_event_name",
+    "provider",
     "model",
     "permission_mode",
     "trigger",
+    "summary_source",
     "summary",
     "original_token_count",
     "summary_token_count",

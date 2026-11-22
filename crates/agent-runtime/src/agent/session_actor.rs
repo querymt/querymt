@@ -20,6 +20,7 @@ use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for_display};
 use crate::error::AgentError;
 use crate::hooks::HookNotice;
+use crate::session::provider::ResolvedModel;
 use crate::session::run_lease::{RunLease, RunLeaseRoot};
 use querymt_agent_core::events::{AgentEventKind, RunOutcome, SessionLimits};
 use querymt_agent_core::model::{
@@ -3059,26 +3060,31 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let cycle_accounting =
         querymt_agent_services::accounting::CycleAccounting::begin(session_accounting);
 
-    // The run's read-only inputs, built with a struct literal so that a missing
-    // field is a compile error. The cancellation token propagates into
-    // individual tool calls for cooperative cancellation; the knowledge store
-    // lets knowledge tools reach it.
+    // The run's read-only inputs, built into a `TurnEnv` once the run's model
+    // is resolved. For a prompt that is after the prompt is stored, so a
+    // provider failure leaves the prompt in the history; for native `/compact`
+    // it is before the compaction starts. The closure is the one place the
+    // struct literal is written, so a missing field is a compile error, and it
+    // runs once, on the path that gets a model. The cancellation token
+    // propagates into individual tool calls for cooperative cancellation; the
+    // knowledge store lets knowledge tools reach it.
     let tool_set = TurnEnv::build_tool_set(&config, &runtime, &tool_config);
-    let env = TurnEnv {
+    let workspace_query_bridge = editor_bridge_for_workspace(
+        runtime.managed_checkout.get().copied().unwrap_or(false),
+        config.workspace_query_bridge_for_session(&session_id),
+    );
+    let make_env = |model: ResolvedModel| TurnEnv {
         session_id: session_id.clone(),
         turn_id,
         runtime: runtime.clone(),
-        session_handle,
+        session_handle: session_handle.clone(),
+        model,
         cancellation_token: cancel_token.clone(),
-        tool_config,
-        execution_origin,
+        tool_config: tool_config.clone(),
         knowledge_store: config.knowledge_store(),
         repository_knowledge: config.repository_knowledge(),
         event_sink: Some(config.event_sink.clone()),
-        workspace_query_bridge: editor_bridge_for_workspace(
-            runtime.managed_checkout.get().copied().unwrap_or(false),
-            config.workspace_query_bridge_for_session(&session_id),
-        ),
+        workspace_query_bridge,
         turn_mode: mode,
         steering: Some(steering),
         phase_reporter: Some(phase_reporter),
@@ -3093,7 +3099,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
     // The run reads the stored history once, here. From now on it is the only
     // writer of its session's conversation, so it holds what the store holds.
-    turn.history = match crate::agent::execution::turn::History::load(&env.session_handle).await {
+    turn.history = match crate::agent::execution::turn::History::load(&session_handle).await {
         Ok(history) => history,
         Err(error) => {
             config.emit_event(
@@ -3115,16 +3121,34 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     {
         log::info!("Session {}: manual compaction requested", session_id);
         let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
-        // The estimates of a compaction depend on what the model takes.
-        turn.profile = env.session_handle.profile().await;
-        let outcome = crate::agent::execution::compact_history(
-            &config,
-            &env,
-            &mut turn,
-            crate::agent::execution::TRIGGER_MANUAL,
-            instructions,
-        )
-        .await;
+        // The model is resolved first, without a retry (its capabilities size
+        // the estimate), but a provider that cannot be built does not end the
+        // command yet: the `pre_compaction` hook runs before anything needs the
+        // session's provider and may supply the summary, and the compaction
+        // policy may send the request to another provider. The failure is
+        // reported once the summary has to come from the provider that failed.
+        // An empty conversation needs no model: there is nothing to compact.
+        let outcome: Result<crate::agent::execution::CompactionOutcome, TurnError> =
+            if turn.history.as_slice().is_empty() {
+                Ok(crate::agent::execution::CompactionOutcome::NothingToCompact)
+            } else {
+                let (model, unresolved) =
+                    match crate::agent::execution::resolve_model_once(&session_handle).await {
+                        Ok(model) => (model, None),
+                        Err(error) => (ResolvedModel::unavailable(error.to_string()), Some(error)),
+                    };
+                let env = make_env(model);
+                crate::agent::execution::compact_history_with(
+                    &config,
+                    &env,
+                    &mut turn,
+                    crate::agent::execution::TRIGGER_MANUAL,
+                    instructions,
+                    unresolved,
+                )
+                .await
+                .map_err(TurnError::from)
+            };
         return match outcome {
             Ok(crate::agent::execution::CompactionOutcome::Completed { .. }) => Ok(
                 PromptRun::finished(PromptResponse::new(StopReason::EndTurn)),
@@ -3164,7 +3188,6 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                 )))
             }
             Err(error) => {
-                let error = TurnError::from(error);
                 let message = error.to_string();
                 config.emit_event(
                     &session_id,
@@ -3172,8 +3195,10 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                         message: message.clone(),
                     },
                 );
-                Err(provider_failure_from_execution_error(&error, &env)
-                    .unwrap_or(AgentError::Internal(message)))
+                Err(
+                    provider_failure_from_execution_error(&error, session_handle.llm_config())
+                        .unwrap_or(AgentError::Internal(message)),
+                )
             }
         };
     }
@@ -3213,12 +3238,12 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
             session_id: session_id.clone(),
             turn_id: run_id.to_string(),
-            cwd: env.cwd().map(|p| p.to_path_buf()),
-            model: env
+            cwd: runtime.cwd.as_deref().map(|p| p.to_path_buf()),
+            model: session_handle
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
-            permission_mode: env.permission_mode().to_string(),
+            permission_mode: crate::hooks::permission_mode_label(mode).to_string(),
             prompt: user_text.clone(),
         })
         .await
@@ -3243,7 +3268,9 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let mut context_contributions = hook_result.context_contributions;
     let orientation = crate::agent::repository_delivery::orientation_contexts(
         &config,
-        &env,
+        &session_id,
+        runtime.cwd.as_deref(),
+        &tool_config,
         &mut turn,
         &user_text,
         &context_contributions,
@@ -3275,11 +3302,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         source_model: None,
     };
 
-    if let Err(e) = turn
-        .history
-        .commit(&env.session_handle, vec![agent_msg])
-        .await
-    {
+    if let Err(e) = turn.history.commit(&session_handle, vec![agent_msg]).await {
         config.emit_event(
             &session_id,
             AgentEventKind::Error {
@@ -3330,14 +3353,14 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         intent_started.elapsed().as_millis() as u64,
     );
 
-    let origin_label = match &env.execution_origin {
+    let origin_label = match &execution_origin {
         ExecutionOrigin::Interactive => "interactive".to_string(),
         ExecutionOrigin::Scheduled {
             schedule_public_id,
             task_public_id,
         } => format!("scheduled:{schedule_public_id}:{task_public_id}"),
     };
-    let objective_task = match &env.execution_origin {
+    let objective_task = match &execution_origin {
         ExecutionOrigin::Scheduled { .. } => scheduled_task.as_ref(),
         ExecutionOrigin::Interactive => turn.state.active_task.as_ref(),
     };
@@ -3360,6 +3383,36 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     turn.run_objective = Some(objective);
 
     config.emit_event(&session_id, AgentEventKind::TurnStarted);
+
+    // The run's model is resolved after the prompt is stored and before its
+    // environment exists (and before any hook of the run). A provider that
+    // cannot be built fails the run here with the prompt in the history, and
+    // no pre-turn snapshot has been taken for it.
+    let model =
+        match crate::agent::execution::resolve_model(&config, &session_handle, &cancel_token).await
+        {
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                return Ok(PromptRun::finished(PromptResponse::new(
+                    StopReason::Cancelled,
+                )));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::Error {
+                        message: message.clone(),
+                    },
+                );
+                return Err(provider_failure_from_execution_error(
+                    &error,
+                    session_handle.llm_config(),
+                )
+                .unwrap_or(AgentError::Internal(message)));
+            }
+        };
+    let env = make_env(model);
 
     debug!(
         "Session {}: user_message_stored, starting pre-turn snapshot",
@@ -3565,15 +3618,17 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                     message: message.clone(),
                 },
             );
-            Err(provider_failure_from_execution_error(&e, &env)
+            Err(provider_failure_from_execution_error(&e, env.llm_config())
                 .unwrap_or(AgentError::Internal(message)))
         }
     }
 }
 
-fn provider_failure_from_execution_error(error: &TurnError, env: &TurnEnv) -> Option<AgentError> {
+fn provider_failure_from_execution_error(
+    error: &TurnError,
+    llm_config: Option<&LLMConfig>,
+) -> Option<AgentError> {
     let llm_error = error.llm_error()?;
-    let llm_config = env.llm_config();
 
     Some(AgentError::ProviderFailure {
         message: error.to_string(),
@@ -5713,15 +5768,13 @@ mod tests {
     #[tokio::test]
     async fn invalid_scheduled_task_does_not_write_history_or_intent() {
         let fixture = ActorFixture::new().await;
-        let (mut env, turn) = fixture.turn("test-session").await;
-        env.execution_origin = ExecutionOrigin::Scheduled {
+        let (_env, turn) = fixture.turn("test-session").await;
+        let origin = ExecutionOrigin::Scheduled {
             schedule_public_id: "schedule-1".to_string(),
             task_public_id: "missing-task".to_string(),
         };
 
-        let result =
-            validate_execution_task(&*turn.state.store, &env.execution_origin, "test-session")
-                .await;
+        let result = validate_execution_task(&*turn.state.store, &origin, "test-session").await;
 
         assert!(result.is_err());
         assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
@@ -5883,8 +5936,8 @@ mod tests {
         );
         let error = TurnError::Other(anyhow::Error::new(llm_error).context("execute cycle failed"));
 
-        let provider_failure =
-            provider_failure_from_execution_error(&error, &env).expect("recover provider failure");
+        let provider_failure = provider_failure_from_execution_error(&error, env.llm_config())
+            .expect("recover provider failure");
 
         match provider_failure {
             AgentError::ProviderFailure {
@@ -5933,8 +5986,8 @@ mod tests {
             source: llm_error,
         };
 
-        let provider_failure =
-            provider_failure_from_execution_error(&error, &env).expect("provider failure");
+        let provider_failure = provider_failure_from_execution_error(&error, env.llm_config())
+            .expect("provider failure");
 
         match provider_failure {
             AgentError::ProviderFailure {
@@ -5973,7 +6026,7 @@ mod tests {
             anyhow::anyhow!("storage unavailable").context("execute cycle failed"),
         );
 
-        assert!(provider_failure_from_execution_error(&error, &env).is_none());
+        assert!(provider_failure_from_execution_error(&error, env.llm_config()).is_none());
     }
 
     // ── Actor message handler tests ──────────────────────────────────────────

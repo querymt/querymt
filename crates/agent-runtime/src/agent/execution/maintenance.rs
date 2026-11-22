@@ -8,9 +8,10 @@ use crate::agent::execution::Stage;
 use crate::agent::execution::TurnError;
 use crate::agent::execution::turn::{Turn, TurnEnv};
 use crate::agent::utils::u32_from_usize;
-use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
+use crate::hooks::{PostCompactionRequest, PreCompactionRequest, SummarySource};
 use crate::middleware::Stop;
 use crate::session::compaction::SessionCompaction;
+use crate::session::provider::CompactionModel;
 use log::{debug, info, warn};
 use querymt_agent_core::events::{AgentEventKind, StopType};
 use querymt_agent_core::model::MessagePart;
@@ -25,13 +26,33 @@ async fn emit_compaction_failure(
     compaction_id: &str,
     error: &anyhow::Error,
 ) {
+    emit_compaction_ended_unsuccessfully(config, session_id, compaction_id, error, false).await;
+}
+
+/// [`emit_compaction_failure`] for a compaction the run's cancellation ended.
+async fn emit_compaction_cancelled(
+    config: &AgentConfig,
+    session_id: &str,
+    compaction_id: &str,
+    error: &anyhow::Error,
+) {
+    emit_compaction_ended_unsuccessfully(config, session_id, compaction_id, error, true).await;
+}
+
+async fn emit_compaction_ended_unsuccessfully(
+    config: &AgentConfig,
+    session_id: &str,
+    compaction_id: &str,
+    error: &anyhow::Error,
+    cancelled: bool,
+) {
     emit_compaction_event(
         config,
         session_id,
         AgentEventKind::CompactionFailed {
             compaction_id: compaction_id.to_string(),
             reason: format!("{error:#}"),
-            cancelled: false,
+            cancelled,
         },
     )
     .await;
@@ -46,13 +67,13 @@ async fn emit_compaction_event(config: &AgentConfig, session_id: &str, kind: Age
 
 /// The accounting ledger for one compaction operation.
 ///
-/// Uses the cycle the compaction was initiated from. The billing basis is the
-/// session provider's (that provider handles the request), priced for the
-/// compaction model actually used.
+/// Uses the cycle the compaction was initiated from. The provider, model and
+/// billing basis are those the request is sent to (`target`), which
+/// `[agent.execution.compaction]` may have moved off the session's.
 fn compaction_ledger(
     config: &AgentConfig,
     env: &TurnEnv,
-    model: &str,
+    target: &CompactionModel,
 ) -> querymt_agent_services::accounting::DispatchLedger {
     let cycle = &env.cycle_accounting;
     let recorder = Arc::new(
@@ -61,23 +82,19 @@ fn compaction_ledger(
             cycle.session_accounting().clone(),
         ),
     );
-    let provider = env
-        .llm_config()
-        .map(|c| c.provider.clone())
-        .unwrap_or_default();
     querymt_agent_services::accounting::DispatchLedger {
         operation: Arc::new(
             querymt_agent_services::accounting::AttemptOperation::new(
                 recorder,
                 cycle,
                 querymt_agent_services::accounting::AttemptPurpose::Compaction,
-                provider,
-                model,
+                target.provider_name.as_str(),
+                target.model.as_str(),
             )
             .with_budget_pricing(config.budget_pricing())
             .with_budget_cap(config.budget_cap_usd()),
         ),
-        basis: env.session_handle.billing_basis_for_model(model),
+        basis: target.basis.clone(),
     }
 }
 
@@ -142,6 +159,7 @@ const TRIGGER_CONTEXT_THRESHOLD: &str = "context_threshold";
 pub(crate) const TRIGGER_MANUAL: &str = "manual";
 
 /// How a compaction attempt ended without an error.
+#[derive(Debug)]
 pub(crate) enum CompactionOutcome {
     /// A summary boundary was stored and the run's history is the new
     /// effective history. Carries its estimated token count.
@@ -207,6 +225,27 @@ pub(crate) async fn compact_history(
     trigger: &str,
     instructions: Option<&str>,
 ) -> Result<CompactionOutcome, anyhow::Error> {
+    compact_history_with(config, env, turn, trigger, instructions, None).await
+}
+
+/// [`compact_history`] for a run whose session provider could not be built.
+///
+/// Native `/compact` is the one run that can make progress without its main
+/// model: a `pre_compaction` hook may supply the summary, and the policy may
+/// send the request to a different, working provider. So the hook runs
+/// first, and `main_model_error` (the provider-initialization failure, with
+/// `env` holding [`crate::session::provider::ResolvedModel::unavailable`])
+/// ends the compaction only when the summary has to come from the session's
+/// own provider. It does so before `CompactionStart`, with the provider
+/// failure itself, as when the model is resolved up front.
+pub(crate) async fn compact_history_with(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    turn: &mut Turn,
+    trigger: &str,
+    instructions: Option<&str>,
+    main_model_error: Option<TurnError>,
+) -> Result<CompactionOutcome, anyhow::Error> {
     let session_id = &env.session_id;
     // The run's history is the stored one: nothing else writes it.
     let messages = turn.history.as_slice().to_vec();
@@ -215,16 +254,20 @@ pub(crate) async fn compact_history(
     }
 
     let prompt_limit = env.execution_config().and_then(|cfg| cfg.max_prompt_bytes);
-    let tool_changes = turn.profile.capabilities.tool_updates;
+    let tool_changes = env.model.profile.capabilities.tool_updates;
     let token_estimate =
         crate::session::pruning::estimate_history_tokens(&messages, prompt_limit, tool_changes)
             .map_err(|e| anyhow::anyhow!("Invalid prompt content in history: {e}"))?;
 
     let turn_id = env.turn_id().to_string();
-    let model_name = env
-        .llm_config()
-        .map(|cfg| cfg.model.clone())
-        .unwrap_or_default();
+    // Where the summary is requested from, by name: what the compaction hooks
+    // are told, and what is built (only when no hook supplies the summary)
+    // for the request. A policy that cannot name one is refused before the
+    // compaction starts.
+    let target = env
+        .session_handle
+        .compaction_target(&config.execution_policy.compaction)
+        .map_err(|error| anyhow::anyhow!("Compaction target unavailable: {error}"))?;
     let token_estimate_u32 = u32_from_usize(token_estimate, "token_estimate", Some(session_id));
     let message_count = u32_from_usize(messages.len(), "messages.len", Some(session_id));
 
@@ -234,7 +277,8 @@ pub(crate) async fn compact_history(
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             cwd: env.cwd().map(|path| path.to_path_buf()),
-            model: model_name.clone(),
+            provider: target.provider.clone(),
+            model: target.model.clone(),
             permission_mode: env.permission_mode().to_string(),
             trigger: trigger.to_string(),
             token_estimate: token_estimate_u32,
@@ -269,6 +313,15 @@ pub(crate) async fn compact_history(
         return Ok(CompactionOutcome::Blocked { message: reason });
     }
 
+    // No hook summary and no model to ask: the session's own provider is the
+    // one that failed to build, so say so now, before the compaction starts.
+    if let Some(error) = main_model_error
+        && pre_hook.custom_summary.is_none()
+        && target.is_session_model()
+    {
+        return Err(anyhow::Error::from(error));
+    }
+
     // The compaction identity is fixed before the start event so every
     // related update shares one session-unique ID.
     let compaction_id = uuid::Uuid::now_v7().to_string();
@@ -283,17 +336,11 @@ pub(crate) async fn compact_history(
     )
     .await;
 
-    let llm_config = env
-        .llm_config()
-        .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
-
-    let model = config
-        .execution_policy
-        .compaction
-        .model
-        .as_ref()
-        .unwrap_or(&llm_config.model);
-
+    let summary_source = if pre_hook.custom_summary.is_some() {
+        SummarySource::Hook
+    } else {
+        SummarySource::Model
+    };
     let mut result = if let Some(summary) = pre_hook.custom_summary {
         crate::session::compaction::CompactionResult {
             summary_token_count: summary.len() / 4,
@@ -301,36 +348,43 @@ pub(crate) async fn compact_history(
             original_token_count: token_estimate,
         }
     } else {
-        let llm_provider = match env
-            .session_handle
-            .provider()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))
-        {
-            Ok(provider) => provider,
+        // A provider that cannot be built ends the started compaction like
+        // any other failure. Building another provider can wait (credential
+        // refresh, a mesh lookup), so the run's cancellation stops it: no
+        // request is sent, and the started compaction still gets its
+        // terminal event.
+        let built = tokio::select! {
+            biased;
+            () = env.cancellation_token.cancelled() => {
+                let error = anyhow::anyhow!("Compaction cancelled while preparing its provider");
+                emit_compaction_cancelled(config, session_id, &compaction_id, &error).await;
+                return Err(error);
+            }
+            built = env.session_handle.build_compaction_model(&target) => built,
+        };
+        let built = match built {
+            Ok(built) => built,
             Err(error) => {
+                let error = anyhow::anyhow!("Compaction provider unavailable: {error}");
                 emit_compaction_failure(config, session_id, &compaction_id, &error).await;
                 return Err(error);
             }
         };
         // Compaction is a paid request: its attempts are recorded against the
         // initiating cycle and session, never inferred from message history.
-        let ledger = compaction_ledger(config, env, model);
-        let retry_config = crate::session::compaction::RetryConfig {
-            max_retries: config.execution_policy.compaction.retry.max_retries,
-            initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
-            backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
-        };
+        let ledger = compaction_ledger(config, env, &built);
         match config
             .compaction
-            .process_with_instructions(
+            .process(
                 &messages,
-                llm_provider,
-                model,
-                &retry_config,
                 env.execution_config().and_then(|cfg| cfg.max_prompt_bytes),
-                &ledger,
                 instructions,
+                &crate::session::compaction::CompactionDispatch {
+                    provider: built.provider.clone(),
+                    config,
+                    cancel: &env.cancellation_token,
+                    ledger: &ledger,
+                },
             )
             .await
         {
@@ -350,11 +404,23 @@ pub(crate) async fn compact_history(
                     });
                 }
                 let error = anyhow::anyhow!("Compaction failed: {}", error);
-                emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+                if env.cancellation_token.is_cancelled() {
+                    emit_compaction_cancelled(config, session_id, &compaction_id, &error).await;
+                } else {
+                    emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+                }
                 return Err(error);
             }
         }
     };
+
+    // A cancel that arrived as the summary finished must not store a boundary:
+    // the user asked for the compaction to stop.
+    if env.cancellation_token.is_cancelled() {
+        let error = anyhow::anyhow!("Compaction cancelled");
+        emit_compaction_cancelled(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
 
     // A hook-provided summary must be usable on its own, not rescued by post-hook notes.
     if let Err(error) = SessionCompaction::validate_summary(&result.summary) {
@@ -382,9 +448,11 @@ pub(crate) async fn compact_history(
             session_id: session_id.clone(),
             turn_id,
             cwd: env.cwd().map(|path| path.to_path_buf()),
-            model: model_name,
+            provider: target.provider.clone(),
+            model: target.model.clone(),
             permission_mode: env.permission_mode().to_string(),
             trigger: trigger.to_string(),
+            summary_source,
             summary: result.summary.clone(),
             original_token_count: u32_from_usize(
                 result.original_token_count,
@@ -595,11 +663,26 @@ mod tests {
         } else {
             mock.expect_chat().times(0);
         }
+        fixture_with_mock(hooks, mock).await
+    }
+
+    async fn fixture_with_mock(
+        hooks: Hooks,
+        mock: MockLlmProvider,
+    ) -> (AgentConfig, TurnEnv, Turn, tempfile::TempDir) {
         let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
             mock,
             vec![],
         )));
         let (registry, tempdir) = mock_plugin_registry(factory).unwrap();
+        fixture_with_registry(hooks, registry, tempdir).await
+    }
+
+    async fn fixture_with_registry(
+        hooks: Hooks,
+        registry: querymt::plugin::host::PluginRegistry,
+        tempdir: tempfile::TempDir,
+    ) -> (AgentConfig, TurnEnv, Turn, tempfile::TempDir) {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let mut config = AgentConfigBuilder::new(
             Arc::new(registry),
@@ -744,6 +827,83 @@ mod tests {
         assert!(!cancelled);
         assert_compaction_journal_matches(&config, &env.session_id, &compaction_events).await;
         assert!(!crate::session::compaction::has_compaction(&after));
+    }
+
+    /// `session-compaction / Retry wait during compaction is reported`: a
+    /// provider error during the compaction request is retried through the
+    /// shared retry, so clients see the wait and resume events of a model
+    /// request that waits, and nothing else is added to the lifecycle.
+    #[tokio::test]
+    async fn retry_wait_during_compaction_is_reported() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat().times(2).returning(move |_| {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(querymt::error::LLMError::HttpStatus {
+                    status_code: 503,
+                    message: "unavailable".into(),
+                    // The provider names no wait: the test does not sleep.
+                    retry_after_secs: Some(0),
+                })
+            } else {
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("A usable summary".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            }
+        });
+        let (config, env, mut turn, _tempdir) = fixture_with_mock(Hooks::disabled(), mock).await;
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+
+        let outcome = compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+            .await
+            .expect("the retry succeeds");
+
+        assert!(matches!(outcome, CompactionOutcome::Completed { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let mut retry_events = Vec::new();
+        loop {
+            match events.try_recv() {
+                Ok(EventEnvelope::Durable(event)) => {
+                    if matches!(
+                        event.kind,
+                        AgentEventKind::LlmRetryWait { .. }
+                            | AgentEventKind::LlmRetryResume { .. }
+                            | AgentEventKind::RateLimited { .. }
+                            | AgentEventKind::RateLimitResume { .. }
+                    ) {
+                        retry_events.push(event.kind);
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("failed to receive event: {error}"),
+            }
+        }
+        let [
+            AgentEventKind::LlmRetryWait {
+                attempt: wait_attempt,
+                max_attempts,
+                wait_secs,
+                ..
+            },
+            AgentEventKind::LlmRetryResume {
+                attempt: resume_attempt,
+            },
+        ] = retry_events.as_slice()
+        else {
+            panic!("expected one wait and one resume event, got {retry_events:?}");
+        };
+        assert_eq!((*wait_attempt, *resume_attempt), (1, 2));
+        assert_eq!(*max_attempts, 3, "rate_limit.max_retries is the budget");
+        assert_eq!(*wait_secs, 0);
     }
 
     #[tokio::test]
@@ -900,6 +1060,85 @@ mod tests {
         );
     }
 
+    fn main_provider_failure() -> TurnError {
+        TurnError::Provider {
+            operation: "provider initialization",
+            provider: "mock".into(),
+            model: "mock".into(),
+            source: querymt::error::LLMError::InvalidRequest("cannot build".into()),
+        }
+    }
+
+    /// Native `/compact` with a session provider that cannot be built: the
+    /// `pre_compaction` hook runs first, and a summary it supplies is stored
+    /// without any provider (the mock expects no request).
+    #[tokio::test]
+    async fn hook_summary_is_stored_when_the_session_provider_cannot_be_built() {
+        let (config, mut env, mut turn, _tempdir) =
+            fixture(custom_summary_hooks("Summary from the hook", None), None).await;
+        env.model = crate::session::provider::ResolvedModel::unavailable("cannot build");
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+
+        let outcome = compact_history_with(
+            &config,
+            &env,
+            &mut turn,
+            TRIGGER_MANUAL,
+            None,
+            Some(main_provider_failure()),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, CompactionOutcome::Completed { .. }));
+        let effective = env
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_string(&effective)
+                .unwrap()
+                .contains("Summary from the hook")
+        );
+    }
+
+    /// Without a hook summary the request would go to the session's own
+    /// provider, the one that failed: the provider failure is the error,
+    /// before the compaction starts.
+    #[tokio::test]
+    async fn provider_failure_is_reported_before_the_compaction_starts() {
+        let (config, mut env, mut turn, _tempdir) = fixture(Hooks::disabled(), None).await;
+        env.model = crate::session::provider::ResolvedModel::unavailable("cannot build");
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+
+        let error = compact_history_with(
+            &config,
+            &env,
+            &mut turn,
+            TRIGGER_MANUAL,
+            None,
+            Some(main_provider_failure()),
+        )
+        .await
+        .unwrap_err();
+
+        let error = TurnError::from(error);
+        assert!(
+            matches!(
+                error.llm_error(),
+                Some(querymt::error::LLMError::InvalidRequest(_))
+            ),
+            "the provider failure survives: {error}"
+        );
+        assert!(take_compaction_events(&mut events).is_empty());
+    }
+
     #[tokio::test]
     async fn valid_custom_summary_is_stored_and_emitted_as_success() {
         let (config, env, mut turn, _tempdir) = fixture(
@@ -1031,7 +1270,7 @@ mod tests {
     /// run-history-consistency / Compaction figure equals the request estimate.
     #[tokio::test]
     async fn compaction_figure_equals_the_request_estimate() {
-        let (config, env, mut turn) = {
+        let (config, mut env, mut turn) = {
             let (config, env, turn, _tempdir) =
                 fixture(custom_summary_hooks("Summary", None), None).await;
             std::mem::forget(_tempdir);
@@ -1085,7 +1324,9 @@ mod tests {
         }
         let expected = request_estimate(&env).await;
         // A provider that takes tool changes is sent the definitions.
-        Arc::make_mut(&mut turn.profile).capabilities.tool_updates = true;
+        Arc::make_mut(&mut env.model.profile)
+            .capabilities
+            .tool_updates = true;
 
         let figure = compaction_start_figure(&config, &env, &mut turn).await;
 
@@ -1126,7 +1367,7 @@ mod tests {
         for message in [text, baseline] {
             env.session_handle.add_message(message).await.unwrap();
         }
-        assert!(!turn.profile.capabilities.tool_updates);
+        assert!(!env.model.profile.capabilities.tool_updates);
 
         let figure = compaction_start_figure(&config, &env, &mut turn).await;
 
@@ -1385,6 +1626,395 @@ mod tests {
             let t = totals(&env).await;
             assert_eq!(t.priced_attempts, 0);
             assert_eq!(t.unresolved_attempts, 0);
+        }
+    }
+
+    /// `[agent.execution.compaction]` `provider` / `model` choose where the
+    /// compaction request is sent; what the request runs on, what its
+    /// accounting attempts name and what it is priced for are one and the same.
+    mod compaction_target_tests {
+        use super::*;
+        use querymt::LLMProvider;
+        use querymt::error::LLMError;
+        use querymt::plugin::LLMProviderFactory;
+        use querymt_agent_core::events::AgentEventKind;
+
+        /// A provider named `mock` that answers `summary from <model>` for the
+        /// model it was built for, and records each model it is built for.
+        struct ModelEchoFactory {
+            built: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl LLMProviderFactory for ModelEchoFactory {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            fn config_schema(&self) -> String {
+                r#"{"type":"object","properties":{"model":{"type":"string"}}}"#.to_string()
+            }
+
+            fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+                let model = serde_json::from_str::<serde_json::Value>(cfg)
+                    .ok()
+                    .and_then(|value| value["model"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                self.built.lock().unwrap().push(model.clone());
+                let mut mock = MockLlmProvider::new();
+                mock.expect_chat().returning(move |_| {
+                    Ok(crate::test_utils::MockChatResponse::text_only(&format!(
+                        "summary from {model}"
+                    ))
+                    .into())
+                });
+                Ok(Box::new(SharedLlmProvider::new(mock, vec![])))
+            }
+
+            fn list_models<'a>(
+                &'a self,
+                _cfg: &str,
+            ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+                Box::pin(async { Ok(vec!["mock".to_string()]) })
+            }
+        }
+
+        /// A session bound to model `mock`, whose compaction policy is `edit`.
+        async fn fixture_with_policy(
+            edit: impl FnOnce(&mut crate::config::CompactionConfig),
+        ) -> (
+            AgentConfig,
+            TurnEnv,
+            Turn,
+            tempfile::TempDir,
+            Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            fixture_with_policy_and_hooks(Hooks::disabled(), edit).await
+        }
+
+        async fn fixture_with_policy_and_hooks(
+            hooks: Hooks,
+            edit: impl FnOnce(&mut crate::config::CompactionConfig),
+        ) -> (
+            AgentConfig,
+            TurnEnv,
+            Turn,
+            tempfile::TempDir,
+            Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            let built = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let dir = tempfile::TempDir::new().unwrap();
+            // Two providers, `mock` (the session's) and `other`, served by the
+            // same echo factory.
+            let wasm = dir.path().join("mock.wasm");
+            std::fs::write(&wasm, "").unwrap();
+            let wasm = format!("{:?}", wasm.display().to_string());
+            let config_path = dir.path().join("providers.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[[providers]]\nname = \"mock\"\npath = {wasm}\n\n\
+                     [[providers]]\nname = \"other\"\npath = {wasm}\n"
+                ),
+            )
+            .unwrap();
+            let mut registry =
+                querymt::plugin::host::PluginRegistry::from_path(&config_path).unwrap();
+            registry.register_loader(Box::new(crate::test_utils::mocks::TestPluginLoader {
+                factory: Arc::new(ModelEchoFactory {
+                    built: built.clone(),
+                }),
+            }));
+            let (mut config, env, mut turn, dir) =
+                fixture_with_registry(hooks, registry, dir).await;
+            // The session's own provider is built by the run before it compacts.
+            env.session_handle.provider().await.unwrap();
+            edit(&mut config.execution_policy.compaction);
+            turn.history = super::super::super::turn::History::load(&env.session_handle)
+                .await
+                .unwrap();
+            (config, env, turn, dir, built)
+        }
+
+        /// Model and provider of every attempt of the session's journal.
+        async fn attempts(config: &AgentConfig, session_id: &str) -> Vec<(String, String)> {
+            config
+                .event_sink
+                .journal()
+                .load_session_stream(session_id, None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    AgentEventKind::LlmAttemptStarted { start } => {
+                        Some((start.provider, start.model))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn stored_summary_mentions(env: &TurnEnv, text: &str) -> bool {
+            let history = env.session_handle.get_agent_history().await.unwrap();
+            serde_json::to_string(&history).unwrap().contains(text)
+        }
+
+        #[tokio::test]
+        async fn without_a_policy_the_request_runs_on_the_session_model() {
+            let (config, env, mut turn, _dir, built) = fixture_with_policy(|_| {}).await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            assert_eq!(*built.lock().unwrap(), ["mock"], "no second provider");
+            assert!(stored_summary_mentions(&env, "summary from mock").await);
+            assert_eq!(
+                attempts(&config, &env.session_id).await,
+                [("mock".to_string(), "mock".to_string())]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_compaction_model_is_what_the_request_runs_on_and_is_recorded() {
+            let (config, env, mut turn, _dir, built) =
+                fixture_with_policy(|policy| policy.model = Some("cheap".into())).await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            assert_eq!(*built.lock().unwrap(), ["mock", "cheap"]);
+            assert!(
+                stored_summary_mentions(&env, "summary from cheap").await,
+                "the cheaper model answered"
+            );
+            assert!(!stored_summary_mentions(&env, "summary from mock").await);
+            assert_eq!(
+                attempts(&config, &env.session_id).await,
+                [("mock".to_string(), "cheap".to_string())],
+                "the attempt names the model that ran"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_compaction_provider_and_model_are_resolved_and_recorded_together() {
+            let (config, env, mut turn, _dir, built) = fixture_with_policy(|policy| {
+                policy.provider = Some("other".into());
+                policy.model = Some("cheap".into());
+            })
+            .await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            assert_eq!(*built.lock().unwrap(), ["mock", "cheap"]);
+            assert!(stored_summary_mentions(&env, "summary from cheap").await);
+            assert_eq!(
+                attempts(&config, &env.session_id).await,
+                [("other".to_string(), "cheap".to_string())],
+                "the attempt names the provider and model that ran"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_session_model_is_unchanged_after_a_compaction_model_ran() {
+            let (config, env, mut turn, _dir, _built) =
+                fixture_with_policy(|policy| policy.model = Some("cheap".into())).await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            assert_eq!(env.model_name(), "mock");
+            let again = env.session_handle.provider().await.unwrap();
+            assert!(Arc::ptr_eq(&again, &env.model.provider));
+        }
+
+        /// A policy built in code (a file is refused when it loads) that
+        /// names a provider without a model is refused before the compaction
+        /// starts: no event, no hook, no provider, no request.
+        #[tokio::test]
+        async fn a_compaction_provider_needs_a_model() {
+            let (dir_hooks, hooks) = recording_hooks(None);
+            let (config, env, mut turn, _dir, built) =
+                fixture_with_policy_and_hooks(hooks, |policy| {
+                    policy.provider = Some("other".into())
+                })
+                .await;
+            let mut events = config.subscribe_events();
+
+            let error = compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .expect_err("the session's model belongs to another provider");
+
+            let text = format!("{error:#}");
+            assert!(text.contains("needs a compaction model"), "{text}");
+            assert_eq!(*built.lock().unwrap(), ["mock"], "nothing was built");
+            assert!(attempts(&config, &env.session_id).await.is_empty());
+            assert!(
+                take_compaction_events(&mut events).is_empty(),
+                "a compaction that never started has no lifecycle"
+            );
+            assert!(!dir_hooks.path().join("pre.json").exists(), "no hook ran");
+        }
+
+        #[tokio::test]
+        async fn a_compaction_provider_with_the_sessions_own_name_still_needs_a_model() {
+            let (config, env, mut turn, _dir, built) =
+                fixture_with_policy(|policy| policy.provider = Some("mock".into())).await;
+
+            let error = compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .expect_err("the configuration file would be refused as well");
+
+            assert!(format!("{error:#}").contains("needs a compaction model"));
+            assert_eq!(*built.lock().unwrap(), ["mock"]);
+        }
+
+        /// Hooks that record their stdin under a temporary directory.
+        /// `custom_summary` makes the pre-compaction hook supply the summary.
+        fn recording_hooks(custom_summary: Option<&str>) -> (tempfile::TempDir, Hooks) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().display();
+            let pre_output = match custom_summary {
+                Some(summary) => serde_json::json!({"hook_specific_output": {
+                    "hook_event_name": "pre_compaction", "compaction": {"summary": summary}
+                }})
+                .to_string(),
+                None => "{}".to_string(),
+            };
+            let group = |file: &str, output: &str| {
+                vec![MatcherGroupConfig {
+                    matcher: None,
+                    hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                        command: format!("cat > '{path}/{file}'; printf '%s' '{output}'"),
+                        timeout_sec: Some(5),
+                        ..HookCommandConfig::default()
+                    })],
+                }]
+            };
+            let hooks = Hooks::new(HooksConfig {
+                enabled: true,
+                pre_compaction: group("pre.json", &pre_output),
+                post_compaction: group("post.json", "{}"),
+                ..HooksConfig::default()
+            })
+            .unwrap();
+            (dir, hooks)
+        }
+
+        /// What the two compaction hooks were told: `(provider, model)` of
+        /// each, and the post hook's `summary_source`.
+        fn hook_payloads(dir: &tempfile::TempDir) -> [serde_json::Value; 2] {
+            ["pre.json", "post.json"].map(|file| {
+                let text = std::fs::read_to_string(dir.path().join(file))
+                    .unwrap_or_else(|error| panic!("{file} was not written: {error}"));
+                serde_json::from_str(&text).unwrap()
+            })
+        }
+
+        #[tokio::test]
+        async fn the_hooks_name_the_session_model_without_a_policy() {
+            let (hook_dir, hooks) = recording_hooks(None);
+            let (config, env, mut turn, _dir, _built) =
+                fixture_with_policy_and_hooks(hooks, |_| {}).await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            let [pre, post] = hook_payloads(&hook_dir);
+            for payload in [&pre, &post] {
+                assert_eq!(payload["provider"], "mock");
+                assert_eq!(payload["model"], "mock");
+            }
+            assert_eq!(post["summary_source"], "model");
+        }
+
+        #[tokio::test]
+        async fn the_hooks_name_the_compaction_model() {
+            let (hook_dir, hooks) = recording_hooks(None);
+            let (config, env, mut turn, _dir, _built) =
+                fixture_with_policy_and_hooks(hooks, |policy| policy.model = Some("cheap".into()))
+                    .await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            let [pre, post] = hook_payloads(&hook_dir);
+            for payload in [&pre, &post] {
+                assert_eq!(payload["provider"], "mock", "the session's provider");
+                assert_eq!(payload["model"], "cheap");
+            }
+            assert_eq!(post["summary_source"], "model");
+        }
+
+        #[tokio::test]
+        async fn the_hooks_name_the_compaction_provider_and_model() {
+            let (hook_dir, hooks) = recording_hooks(None);
+            let (config, env, mut turn, _dir, _built) =
+                fixture_with_policy_and_hooks(hooks, |policy| {
+                    policy.provider = Some("other".into());
+                    policy.model = Some("cheap".into());
+                })
+                .await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            let [pre, post] = hook_payloads(&hook_dir);
+            for payload in [&pre, &post] {
+                assert_eq!(payload["provider"], "other");
+                assert_eq!(payload["model"], "cheap");
+            }
+        }
+
+        /// A pre-compaction hook that supplies the summary means no request:
+        /// no provider is built for the compaction model, and the post hook
+        /// still names the model that would have been asked.
+        #[tokio::test]
+        async fn a_hook_summary_builds_no_provider_and_is_marked_as_the_hooks() {
+            let (hook_dir, hooks) = recording_hooks(Some("A summary the hook wrote"));
+            let (config, env, mut turn, _dir, built) =
+                fixture_with_policy_and_hooks(hooks, |policy| policy.model = Some("cheap".into()))
+                    .await;
+
+            compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .unwrap();
+
+            assert_eq!(*built.lock().unwrap(), ["mock"], "no model was built");
+            assert!(attempts(&config, &env.session_id).await.is_empty());
+            let [pre, post] = hook_payloads(&hook_dir);
+            assert_eq!(pre["model"], "cheap");
+            assert_eq!(post["model"], "cheap");
+            assert_eq!(post["summary_source"], "hook");
+            assert!(stored_summary_mentions(&env, "A summary the hook wrote").await);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_compaction_provider_fails_the_compaction_without_a_request() {
+            let (config, env, mut turn, _dir, built) = fixture_with_policy(|policy| {
+                policy.provider = Some("not-a-provider".into());
+                policy.model = Some("m".into());
+            })
+            .await;
+
+            let error = compact_history(&config, &env, &mut turn, TRIGGER_MANUAL, None)
+                .await
+                .expect_err("no such provider");
+
+            assert!(
+                format!("{error:#}").contains("Compaction provider unavailable"),
+                "{error:#}"
+            );
+            assert_eq!(*built.lock().unwrap(), ["mock"]);
+            assert!(attempts(&config, &env.session_id).await.is_empty());
+            let after = env.session_handle.get_agent_history().await.unwrap();
+            assert!(!crate::session::compaction::has_compaction(&after));
         }
     }
 

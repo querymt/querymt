@@ -22,12 +22,12 @@ use crate::middleware::{
     EndVerdict, Folded, LlmResponse, PreparedModelRequest, ReplyVerdict, StepVerdict, Stop,
     StopVerdict, ToolCall, ToolResult, TurnInfo, TurnStack, WaitCondition,
 };
+use crate::session::provider::{ResolvedModel, SessionHandle};
 use log::{debug, info, warn};
-use querymt::LLMProvider;
 use querymt_agent_core::events::{AgentEventKind, EventEnvelope, ExecutionMetrics, StopType};
 use std::ops::ControlFlow;
-use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug_span, info_span, instrument};
 
 /// A position in the loop, with the data its step consumes.
@@ -80,23 +80,20 @@ pub(crate) fn after_step(folded: Folded<StepVerdict>) -> Step {
     }
 }
 
-/// What a run holds besides its environment and its state: the provider the
-/// run resolved, the middleware of the run and the agent's event stream (read
-/// while waiting for delegations).
-///
-/// The provider is not run *state*: it never changes, and it is resolved
-/// before the first hook, so every stage can rely on it without an `Option`.
-/// `unify-model-call-path` moves it to [`TurnEnv`].
+/// What a run holds besides its environment and its state: the middleware of
+/// the run and the agent's event stream (read while waiting for delegations).
+/// The model the run talks to is not here: it is resolved before the run's
+/// environment exists and lives in [`TurnEnv::model`].
 pub(crate) struct Run<'a> {
     config: &'a AgentConfig,
-    provider: Arc<dyn LLMProvider>,
     stack: TurnStack,
     events: broadcast::Receiver<EventEnvelope>,
 }
 
 /// Run the loop to its outcome.
 ///
-/// This is the entry point of the session actor's execution task.
+/// This is the entry point of the session actor's execution task: the run's
+/// model is already resolved (`resolve_model`) and is part of `env`.
 /// `session_mode` is the `AgentMode` captured at turn start; middleware reads
 /// it through its hook context.
 #[instrument(
@@ -124,12 +121,12 @@ pub(crate) async fn run_turn(
             .begin_turn(&TurnInfo::new(&env.session_id, session_mode))
     });
     let events = config.event_sink.fanout().subscribe();
-    let Some(provider) = resolve_provider(config, env, turn).await? else {
-        return Ok(CycleOutcome::Cancelled);
+    turn.stats = crate::middleware::AgentStats {
+        turns: turn.history.user_turns(),
+        ..Default::default()
     };
     let mut run = Run {
         config,
-        provider,
         stack,
         events,
     };
@@ -146,62 +143,76 @@ pub(crate) async fn run_turn(
     }
 }
 
-/// Set up the run's statistics and resolve its provider, before any hook:
-/// a provider that cannot be built never reaches the middleware or the model.
-/// This is where the cold-start cost lands. `None` means the run was
-/// cancelled while the provider was being built.
-async fn resolve_provider(
+/// Resolve the model a run talks to: its provider and the facts about it,
+/// under the `provider_init` retry, cancellable while it waits. This is where
+/// the cold-start cost of a provider lands, and the one place a run resolves
+/// a model: the result is a field of [`TurnEnv`] and every step reads it.
+///
+/// It takes the session handle and not a [`TurnEnv`], because the environment
+/// needs the model to exist. `Ok(None)` means the run was cancelled while the
+/// provider was being built; any other failure is a provider-initialization
+/// error.
+pub(crate) async fn resolve_model(
     config: &AgentConfig,
-    env: &TurnEnv,
-    turn: &mut Turn,
-) -> Result<Option<Arc<dyn LLMProvider>>, TurnError> {
-    turn.stats = crate::middleware::AgentStats {
-        turns: turn.history.user_turns(),
-        ..Default::default()
-    };
-
-    let llm_config = env
+    session_handle: &SessionHandle,
+    cancel: &CancellationToken,
+) -> Result<Option<ResolvedModel>, TurnError> {
+    let session_id = &session_handle.session().public_id;
+    let llm_config = session_handle
         .llm_config()
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
     debug!(
         "Session {}: llm_config provider={} model={}",
-        env.session_id, llm_config.provider, llm_config.model
+        session_id, llm_config.provider, llm_config.model
     );
 
-    let resolved = super::llm_retry::call_with_retry(
-        config,
-        &env.session_id,
-        "provider_init",
-        &env.cancellation_token,
-        || {
-            let session_handle = env.session_handle.clone();
-            let cancel = env.cancellation_token.clone();
+    let resolved =
+        super::llm_retry::call_with_retry(config, session_id, "provider_init", cancel, || {
+            let session_handle = session_handle.clone();
+            let cancel = cancel.clone();
             async move {
                 tokio::select! {
-                    result = session_handle.provider() => {
+                    result = session_handle.resolve_model() => {
                         result.map_err(querymt::error::LLMError::from)
                     }
                     _ = cancel.cancelled() => Err(querymt::error::LLMError::Cancelled),
                 }
             }
-        },
-    )
-    .instrument(info_span!("agent.execution.provider_init"))
-    .await;
-    let provider = match resolved {
-        Ok(provider) => provider,
-        Err(querymt::error::LLMError::Cancelled) => return Ok(None),
-        Err(error) => {
-            return Err(transitions::contextualize_llm_error(
-                error,
-                "provider initialization",
-                env,
-            ));
-        }
-    };
-    // The estimates of a request depend on what the model takes.
-    turn.profile = env.session_handle.profile().await;
-    Ok(Some(provider))
+        })
+        .instrument(info_span!("agent.execution.provider_init"))
+        .await;
+    match resolved {
+        Ok(model) => Ok(Some(model)),
+        Err(querymt::error::LLMError::Cancelled) => Ok(None),
+        Err(error) => Err(transitions::provider_error(
+            error,
+            "provider initialization",
+            &llm_config.provider,
+            &llm_config.model,
+        )),
+    }
+}
+
+/// [`resolve_model`] without a retry, for native `/compact`: a failure to build
+/// the provider is the provider-initialization error at once. It has no
+/// cancellation token to race either, as the command runs to completion. The
+/// caller decides when the failure ends the command (see
+/// `compact_history_with`): a `pre_compaction` hook may still supply the
+/// summary.
+pub(crate) async fn resolve_model_once(
+    session_handle: &SessionHandle,
+) -> Result<ResolvedModel, TurnError> {
+    let llm_config = session_handle
+        .llm_config()
+        .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
+    session_handle.resolve_model().await.map_err(|error| {
+        transitions::provider_error(
+            querymt::error::LLMError::from(error),
+            "provider initialization",
+            &llm_config.provider,
+            &llm_config.model,
+        )
+    })
 }
 
 impl Stage {
@@ -241,7 +252,7 @@ impl Stage {
 }
 
 impl Run<'_> {
-    /// The first middleware hook, after setup (`resolve_provider`).
+    /// The first middleware hook.
     async fn first(&mut self, env: &TurnEnv, turn: &mut Turn) -> Result<Step, TurnError> {
         // The run's history was loaded when the run was set up (`History::load`)
         // and holds the prompt of this run.
@@ -321,7 +332,7 @@ impl Run<'_> {
             Folded::Decided(StepVerdict::Proceed) => {
                 // Middleware queued its notices during step start; store
                 // them now, after any tool results and before the request.
-                let next = prepare_model_request(config, env, turn, &self.provider).await?;
+                let next = prepare_model_request(config, env, turn).await?;
                 crate::agent::utils::llm_metrics::step_overhead(
                     "pre_request",
                     step_started.elapsed().as_secs_f64(),
@@ -349,7 +360,7 @@ impl Run<'_> {
             "completion_guard_available",
             turn.budgets.task_completion_tool_available(),
         );
-        transitions::transition_call_llm(self.config, request, env, turn, &self.provider).await
+        transitions::transition_call_llm(self.config, request, env, turn).await
     }
 
     async fn after_reply(

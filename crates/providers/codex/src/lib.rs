@@ -190,6 +190,18 @@ impl HTTPChatProvider for Codex {
             .with_prompt_cache(PromptCacheCapabilities::NONE)
             .with_streaming(true)
     }
+
+    /// Codex stamps every reply with `codex_provenance()` and replays output
+    /// natively only when it carries exactly this identity (`api.rs`).
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        let stamped = codex_provenance();
+        Some(querymt::chat::ChatOutputProvenance {
+            provider: stamped.name.to_string(),
+            protocol: stamped.protocol.to_string(),
+            model: self.model.clone(),
+            endpoint: stamped.endpoint,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -375,6 +387,28 @@ mod capability_tests {
         let caps = HTTPChatProvider::capabilities(&provider);
         assert!(caps.streaming);
         assert_eq!(caps.prompt_cache, PromptCacheCapabilities::NONE);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::{Codex, HTTPChatProvider, codex_provenance};
+
+    #[test]
+    fn codex_states_the_provenance_it_stamps_on_its_output() {
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("Codex stamps provenance on every reply");
+        // The same identity the response and stream stamping use.
+        let stamped = codex_provenance();
+        assert_eq!(stated.provider, stamped.name);
+        assert_eq!(stated.protocol, stamped.protocol);
+        assert_eq!(stated.endpoint, stamped.endpoint);
+        assert_eq!(stated.model, "gpt-5.6");
     }
 }
 

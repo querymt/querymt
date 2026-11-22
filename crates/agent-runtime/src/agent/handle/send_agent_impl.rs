@@ -46,6 +46,11 @@ impl SendAgent for LocalAgentHandle {
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
+        // A step that runs without the session's actor (a handoff summary)
+        // has none to cancel: stop it here. A session never has both.
+        if self.cancel_admin_operation(&session_id).await {
+            return Ok(());
+        }
         #[cfg(feature = "remote")]
         {
             match self

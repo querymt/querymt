@@ -63,7 +63,7 @@ Every hook has a default that passes, so a middleware implements only the hooks 
 
 | Hook | Runs | Verdict | Meaning |
 |---|---|---|---|
-| `on_turn_start` | once, before the first step | `StepVerdict`: `Proceed`, `Stop(Stop)` | `Stop` ends the run before any model request |
+| `on_turn_start` | once, before the first step | `StepVerdict`: `Proceed`, `Stop(Stop)` | `Stop` ends the run before any model request. The run's model is already resolved, so `cx.profile()` is the model's real profile; a run whose provider cannot be built fails before this hook and no hook runs |
 | `on_step_start` | before every model request | `StepVerdict` | as above |
 | `on_after_llm` | after a reply, before it is stored | `ReplyVerdict`: `Proceed`, `Stop(Stop)`, `Retry` | `Retry` discards the reply, counts its usage and sends the request again |
 | `on_prepared_tool_calls` | before a batch of tool calls is scheduled | one `PreparedCallVerdict` per call | `Reject(result)` replaces the call with its final result |

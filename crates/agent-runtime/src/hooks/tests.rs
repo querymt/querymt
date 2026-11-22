@@ -982,6 +982,7 @@ async fn pre_compaction_accepts_custom_summary() {
             session_id: "s".into(),
             turn_id: "t".into(),
             cwd: None,
+            provider: "p".into(),
             model: "m".into(),
             permission_mode: "default".into(),
             trigger: "context_threshold".into(),

@@ -242,6 +242,20 @@ impl HTTPChatProvider for Xai {
     fn capabilities(&self) -> ChatCapabilities {
         ChatCapabilities::NONE.with_streaming(true)
     }
+
+    /// The Responses path stamps its output with this identity (the stream
+    /// parser and `parse_chat` use `Xai::responses_endpoint`, and replayed
+    /// output is checked against the same values). The Chat Completions path
+    /// carries no provenance.
+    fn output_provenance(&self) -> Option<querymt::chat::ChatOutputProvenance> {
+        self.should_use_responses_api()
+            .then(|| querymt::chat::ChatOutputProvenance {
+                provider: "xai".to_string(),
+                protocol: "responses".to_string(),
+                model: self.model.clone(),
+                endpoint: Xai::responses_endpoint(),
+            })
+    }
 }
 
 impl HTTPEmbeddingProvider for Xai {
@@ -1252,6 +1266,26 @@ mod tests {
         req.headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn responses_endpoint_states_the_provenance_it_stamps_on_its_output() {
+        let provider = test_xai("key");
+        assert!(provider.should_use_responses_api());
+        let stated = HTTPChatProvider::output_provenance(&provider)
+            .expect("the Responses path stamps provenance");
+        assert_eq!(stated.provider, "xai");
+        assert_eq!(stated.protocol, "responses");
+        assert_eq!(stated.model, "grok-test");
+        assert_eq!(stated.endpoint, Xai::responses_endpoint());
+    }
+
+    #[test]
+    fn chat_completions_path_states_no_provenance() {
+        let mut provider = test_xai("key");
+        provider.base_url = Url::parse("https://llm.example.test/v1/").unwrap();
+        assert!(!provider.should_use_responses_api());
+        assert_eq!(HTTPChatProvider::output_provenance(&provider), None);
     }
 
     #[test]

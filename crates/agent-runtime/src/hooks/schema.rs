@@ -598,6 +598,7 @@ pub struct PreCompactionCommandInput {
     pub cwd: String,
     #[schemars(schema_with = "pre_compaction_hook_event_name_schema")]
     pub hook_event_name: String,
+    pub provider: String,
     pub model: String,
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
@@ -618,10 +619,13 @@ pub struct PostCompactionCommandInput {
     pub cwd: String,
     #[schemars(schema_with = "post_compaction_hook_event_name_schema")]
     pub hook_event_name: String,
+    pub provider: String,
     pub model: String,
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
     pub trigger: String,
+    #[schemars(schema_with = "summary_source_schema")]
+    pub summary_source: String,
     pub summary: String,
     pub original_token_count: u32,
     pub summary_token_count: u32,
@@ -1015,6 +1019,10 @@ fn delegation_lifecycle_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Sc
 
 fn permission_mode_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_enum_schema(&["default", "plan", "accept_edits"])
+}
+
+fn summary_source_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_enum_schema(&["model", "hook"])
 }
 
 fn string_const_schema(value: &str) -> Schema {
