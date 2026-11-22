@@ -161,6 +161,10 @@ pub fn request_peer_profiles(
     }
 }
 
+/// Shown when the peer profile chosen for a launch is gone from the peer.
+pub const MISSING_PEER_PROFILE: &str =
+    "Selected profile is not available on the session owner. Choose an owner profile.";
+
 /// Where the created session runs, when the agent moved it (a worktree).
 pub fn session_cwd(created: &Value) -> Option<String> {
     created
@@ -492,6 +496,55 @@ mod tests {
                 requests
             })
         });
+    }
+
+    #[gpui_kit::test]
+    fn launch_checks_the_peer_profile_still_exists(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| super::peer_fixture());
+        let (rpc, requests) = cx.update(|cx| store.update(cx, |s, _| s.rpc_for_test("test-agent")));
+        let launch = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update(|cx| {
+                store.update(cx, |s, cx| {
+                    s.launch.target = Some("thor-id".into());
+                    s.launch.remote_profile = Some("coder".into());
+                    s.launch("test-agent", "/w".into(), "hi".into(), Vec::new(), cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        let next = || -> Value { serde_json::from_str(&requests.try_recv().unwrap()).unwrap() };
+        let reply = |request: &Value, profiles: Value| {
+            rpc.handle(
+                &json!({ "id": request["id"], "result": { "node_id": "thor-id", "profiles": profiles } })
+                    .to_string(),
+            );
+        };
+
+        // The peer dropped the profile: no session is created.
+        launch(cx);
+        let check = next();
+        assert_eq!(check["method"], "_querymt/profiles");
+        assert_eq!(check["params"]["node_id"], "thor-id");
+        reply(&check, json!([{ "id": "reviewer" }]));
+        cx.run_until_parked();
+        assert!(requests.try_recv().is_err());
+        store.read_with(cx, |s, _| {
+            assert!(!s.launch.busy);
+            assert_eq!(s.launch.error.as_deref(), Some(super::MISSING_PEER_PROFILE));
+            // The Start options see the fresh list.
+            let listed = &s.peer_profiles("test-agent", "thor-id").unwrap().profiles;
+            assert_eq!(listed[0].id, "reviewer");
+        });
+
+        // Still there: the session is created with it.
+        launch(cx);
+        let check = next();
+        reply(&check, json!([{ "id": "coder" }]));
+        cx.run_until_parked();
+        let create = next();
+        assert_eq!(create["method"], "_querymt/remote/createSession");
+        assert_eq!(create["params"]["profile_id"], "coder");
     }
 
     #[test]
