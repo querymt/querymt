@@ -340,6 +340,8 @@ struct RenderCtx {
     md: md::Kept,
     /// The agent returns complete tool content a load shortened.
     tool_content: bool,
+    /// Developer mode: message metadata, `exit 0` of shell calls.
+    developer: bool,
 }
 
 impl RenderCtx {
@@ -422,6 +424,7 @@ impl RenderCtx {
     fn hash_globals(&self, h: &mut DefaultHasher) {
         (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(h);
         self.tool_content.hash(h);
+        self.developer.hash(h);
     }
 
     /// Signature of one transcript row: it changes exactly when the row's
@@ -2205,7 +2208,8 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
     } else {
         kit::icon(IconName::Check, 13., p.success).into_any_element()
     };
-    let exit = call.exit_code().filter(|c| *c != 0);
+    // A clean exit is noise except to developers (desktop `terminalExitCode`).
+    let exit = call.exit_code().filter(|c| *c != 0 || rc.developer);
     let (adds, dels) = call.stats;
     let (id, weak) = (call.id.clone(), rc.weak.clone());
     let attached = open && expandable && attaches_to_header(call);
@@ -2295,7 +2299,11 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
             )
         })
         .when_some(exit, |el, code| {
-            el.child(kit::tone_chip(format!("exit {code}"), p.danger))
+            el.child(if code == 0 {
+                kit::chip("exit 0", p)
+            } else {
+                kit::tone_chip(format!("exit {code}"), p.danger)
+            })
         })
         // The delegate's name lives only here (desktop session pill); once the
         // child session is known, the pill opens it.
@@ -3059,8 +3067,9 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             let (key, weak, text2) = (item.key.clone(), rc.weak.clone(), text.clone());
             // Front matter (often from automated messages) stays out of the
             // bubble; a toggle beside Copy shows it as YAML.
+            // The toggle is a developer tool (desktop `SessionTurn`).
             let (front, body) = match crate::util::split_front_matter(text) {
-                Some((front, body)) => (Some(front), body),
+                Some((front, body)) => (rc.developer.then_some(front), body),
                 None => (None, text.as_str()),
             };
             let fm_key = front_matter_key(&item.key);
@@ -5058,6 +5067,7 @@ impl QmtApp {
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
             md: self.transcript.md.clone(),
             tool_content: store.supports_tool_content(),
+            developer: store.prefs.developer_mode,
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {

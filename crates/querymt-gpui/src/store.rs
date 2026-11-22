@@ -6,6 +6,7 @@
 
 pub(crate) mod automations;
 pub(crate) mod delegates;
+mod devtools;
 pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod mcp_notice;
@@ -1440,6 +1441,9 @@ pub struct Prefs {
     /// Recent model keys per (agent, profile, delegate).
     #[serde(default)]
     pub recent_delegate_models: HashMap<String, Vec<String>>,
+    /// Developer-only tools: protocol debug events, message metadata.
+    #[serde(default)]
+    pub developer_mode: bool,
 }
 
 impl Prefs {
