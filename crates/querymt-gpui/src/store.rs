@@ -8,6 +8,7 @@ pub(crate) mod automations;
 pub(crate) mod delegates;
 pub(crate) mod fork;
 pub(crate) mod launch;
+mod pins;
 pub(crate) mod setup;
 pub(crate) mod worktree;
 
@@ -1182,6 +1183,8 @@ pub struct AgentRuntime {
     /// Consecutive automatic reconnect attempts since the last success.
     reconnect_attempt: u32,
     refresh_scheduled: bool,
+    /// A pinned-list refresh after `pinsChanged` is pending.
+    pins_refresh_scheduled: bool,
     /// Session id -> resume authority for re-attaching its pending questions
     /// after a reconnect (`querymt/elicitation/recoveryAuthority`).
     resume_authorities: HashMap<String, String>,
@@ -4426,6 +4429,8 @@ impl AgentsStore {
                     || method.ends_with("session/update")
                 {
                     self.schedule_sessions_refresh(id, Duration::from_millis(1200), cx);
+                } else if method.trim_start_matches('_') == "querymt/session/pinsChanged" {
+                    self.on_pins_changed(id, &params, cx);
                 } else if method.trim_start_matches('_') == "querymt/schedules/changed" {
                     if self
                         .live(id, generation)
