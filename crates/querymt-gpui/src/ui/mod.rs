@@ -4,6 +4,7 @@ mod agents;
 mod automations;
 mod chrome;
 mod code;
+mod connectors;
 mod delegates;
 mod fork;
 mod inbox;

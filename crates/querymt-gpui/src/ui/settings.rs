@@ -19,10 +19,11 @@ pub enum SettingsTab {
     Appearance,
     Keybindings,
     Providers,
+    Connectors,
     Profiles,
 }
 
-const TABS: [(SettingsTab, IconName, &str, &str); 5] = [
+const TABS: [(SettingsTab, IconName, &str, &str); 6] = [
     (
         SettingsTab::General,
         IconName::SlidersHorizontal,
@@ -52,6 +53,12 @@ const TABS: [(SettingsTab, IconName, &str, &str); 5] = [
         IconName::KeyRound,
         "Providers",
         "Authentication for models and services.",
+    ),
+    (
+        SettingsTab::Connectors,
+        IconName::Plug,
+        "Connectors",
+        "Sign in to OAuth-protected connectors. Tools become available in sessions started after signing in.",
     ),
 ];
 
@@ -358,10 +365,13 @@ impl QmtApp {
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *palette(cx);
         let tab = self.settings_tab;
+        // Desktop: only agents with MCP servers to sign in to get the tab.
+        let connectors = self.has_connectors(cx) || tab == SettingsTab::Connectors;
 
         let nav = v_flex().w(px(220.)).flex_none().gap_0p5().children(
             TABS.iter()
                 .filter(|t| HAS_PROFILE_TEMPLATES || t.0 != SettingsTab::Profiles)
+                .filter(|t| connectors || t.0 != SettingsTab::Connectors)
                 .map(|(t, icon, label, desc)| {
                     let t = *t;
                     let active = t == tab;
@@ -404,6 +414,7 @@ impl QmtApp {
             SettingsTab::Appearance => self.settings_appearance(&p, cx).into_any_element(),
             SettingsTab::Keybindings => self.settings_keys(&p, cx).into_any_element(),
             SettingsTab::Providers => self.settings_providers(false, &p, cx).into_any_element(),
+            SettingsTab::Connectors => self.settings_connectors(&p, cx),
             SettingsTab::Profiles => self.settings_profiles(&p, cx).into_any_element(),
         };
         let (title, desc) = TABS
@@ -457,31 +468,38 @@ impl QmtApp {
                                         ),
                                     )
                                 })
-                                .when(tab == SettingsTab::Providers, |el| {
-                                    let store = self.store.read(cx);
-                                    let agent = store.primary_agent();
-                                    let loading = agent
-                                        .as_ref()
-                                        .is_some_and(|a| store.is_pending(a, "extras"));
-                                    el.child(
-                                        kit::loading_icon_button(
-                                            "prov-refresh",
-                                            IconName::RefreshCw,
-                                            "Refresh providers",
-                                            loading,
-                                            32.,
+                                .when(
+                                    matches!(tab, SettingsTab::Providers | SettingsTab::Connectors),
+                                    |el| {
+                                        let store = self.store.read(cx);
+                                        let agent = store.primary_agent();
+                                        let loading = agent
+                                            .as_ref()
+                                            .is_some_and(|a| store.is_pending(a, "extras"));
+                                        el.child(
+                                            kit::loading_icon_button(
+                                                "prov-refresh",
+                                                IconName::RefreshCw,
+                                                if tab == SettingsTab::Connectors {
+                                                    "Refresh connectors"
+                                                } else {
+                                                    "Refresh providers"
+                                                },
+                                                loading,
+                                                32.,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    if let Some(a) = agent.clone() {
+                                                        this.store.update(cx, |s, cx| {
+                                                            s.refresh_extras(&a, cx)
+                                                        });
+                                                    }
+                                                }),
+                                            ),
                                         )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                if let Some(a) = agent.clone() {
-                                                    this.store.update(cx, |s, cx| {
-                                                        s.refresh_extras(&a, cx)
-                                                    });
-                                                }
-                                            }),
-                                        ),
-                                    )
-                                }),
+                                    },
+                                ),
                         )
                         .child(body),
                 )
