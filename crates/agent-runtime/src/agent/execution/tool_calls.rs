@@ -2471,7 +2471,6 @@ mod genai_trace_tests {
         ] {
             // The turn's tool set is cached per context: one context per mode.
             let (mut exec, turn) = fixture.turn().await;
-            let mut exec = exec.tools_from(&config);
             let mut registry = ToolRegistry::new();
             if mode == "custom" {
                 registry.add(Arc::new(CustomShell));
@@ -2495,6 +2494,9 @@ mod genai_trace_tests {
                 })).unwrap()).unwrap());
             }
             let config = builder.build();
+            // Built last: the tool set reflects both the registry in `config`
+            // and the deny list set on `exec.tool_config` above.
+            let exec = exec.tools_from(&config);
             let command = match mode {
                 "symlink" => symlink.to_str().unwrap(),
                 "script" => script.to_str().unwrap(),
