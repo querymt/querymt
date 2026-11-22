@@ -27,6 +27,65 @@ pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
     })
 }
 
+/// Estimate prepared messages with a four-byte text heuristic and caller-supplied media costs.
+/// This is neither a token count nor an upper bound.
+#[doc(hidden)]
+pub fn estimate_chat_tokens(
+    messages: &[ChatMessage],
+    estimate_media: impl Fn(&MediaPart) -> usize,
+) -> usize {
+    let text_tokens = |text: &str| text.len().div_ceil(4);
+    messages.iter().fold(0usize, |total, message| {
+        let content_tokens = match message.output() {
+            Some(output) => output.items.iter().fold(0usize, |total, item| {
+                let tokens = match item {
+                    ChatOutputItem::Message(message) => {
+                        message.parts.iter().fold(0usize, |total, part| {
+                            total.saturating_add(match part {
+                                ChatMessagePart::Text { text, .. } => text_tokens(text),
+                                ChatMessagePart::Refusal { refusal, .. } => text_tokens(refusal),
+                                ChatMessagePart::Media(media) => estimate_media(media),
+                                ChatMessagePart::Opaque(_) => 0,
+                            })
+                        })
+                    }
+                    ChatOutputItem::Reasoning(reasoning) => reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .fold(0usize, |total, part| {
+                            total.saturating_add(text_tokens(&part.text))
+                        }),
+                    ChatOutputItem::FunctionCall(call) => {
+                        text_tokens(&call.name).saturating_add(text_tokens(&call.arguments))
+                    }
+                    ChatOutputItem::Opaque(_) => 0,
+                };
+                total.saturating_add(tokens)
+            }),
+            None => message.input().map_or(0, |parts| {
+                parts.iter().fold(0usize, |total, part| {
+                    total.saturating_add(match part {
+                        ChatInputPart::Text { text } => text_tokens(text),
+                        ChatInputPart::Attachment(media) => estimate_media(media),
+                        ChatInputPart::ToolResult(result) => result.parts.iter().fold(
+                            result.name.as_deref().map_or(0, text_tokens),
+                            |total, part| {
+                                total.saturating_add(match part {
+                                    ToolResultPart::Text { text } => text_tokens(text),
+                                    ToolResultPart::Attachment(media) => estimate_media(media),
+                                })
+                            },
+                        ),
+                    })
+                })
+            }),
+        };
+        // Roles, message boundaries and tool-result framing.
+        total.saturating_add(content_tokens).saturating_add(4)
+    })
+}
+
 pub use output::{
     ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatMessagePayload,
     ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,

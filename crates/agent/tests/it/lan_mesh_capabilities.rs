@@ -179,7 +179,10 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
             provider_id: "fixture".into(),
             model_id: "offline".into(),
             request_id: uuid::Uuid::now_v7(),
-            bound_tokens: Some(20),
+            estimate: querymt_remote::peer_access::quota::QuotaEstimate {
+                reserved_tokens: 20,
+                prompt_tokens: 5,
+            },
             now: time::OffsetDateTime::now_utc().unix_timestamp(),
         })
         .await

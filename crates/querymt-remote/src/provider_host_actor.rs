@@ -339,8 +339,8 @@ impl Message<GuardedStreamStart> for ProviderHostActor {
                 _ = admission.cancelled() => return Err(RemoteProviderHostError::Internal("stream admission cancelled".into())),
                 result = async {
                     let call = streams::call(&msg);
-                    let provider = policy.prepare(&peer, request, &call, id, true).await?;
-                    let reservation = provider.reserve(&call, true).await.map_err(policy_error)?;
+                    let provider = policy.prepare(&peer, request, &call, id).await?;
+                    let reservation = provider.reserve(&call).await.map_err(policy_error)?;
                     Ok::<_, RemoteProviderHostError>((provider, reservation))
                 } => result?,
             };

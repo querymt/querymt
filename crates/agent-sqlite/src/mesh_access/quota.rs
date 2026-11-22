@@ -235,22 +235,32 @@ fn status(
         next_reset_at: None,
     };
     if let Some(period) = period {
-        let (known, estimated, unknown, reserved) = conn.query_row(
-            "SELECT COALESCE(SUM(r.known),0), COALESCE(SUM(r.estimated),0), COALESCE(MAX(r.unknown),0),
-               COALESCE(SUM(CASE WHEN a.state IN ('reserved','dispatched') THEN r.reserved END),0)
+        let mut stmt = conn.prepare(
+            "SELECT r.known, r.estimated, r.unknown,
+               COALESCE(CASE WHEN a.state IN ('reserved','dispatched') THEN r.reserved END,0)
              FROM quota_reservations r JOIN quota_attempts a ON a.id=r.attempt_id WHERE r.period_id=?1",
-            [period.id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?, row.get::<_, i64>(3)?)),
         ).map_err(backend)?;
-        status.known_tokens = known;
-        status.estimated_tokens = estimated;
-        status.has_unknown_usage = unknown;
+        let mut rows = stmt.query([period.id]).map_err(backend)?;
+        let mut reserved = 0_i64;
+        // Overshoot can put a period's totals beyond i64 even when each entry fits.
+        // Saturate status totals, keeping exact integer arithmetic for admission.
+        while let Some(row) = rows.next().map_err(backend)? {
+            status.known_tokens = status
+                .known_tokens
+                .saturating_add(row.get(0).map_err(backend)?);
+            status.estimated_tokens = status
+                .estimated_tokens
+                .saturating_add(row.get(1).map_err(backend)?);
+            status.has_unknown_usage |= row.get::<_, bool>(2).map_err(backend)?;
+            reserved = reserved.saturating_add(row.get(3).map_err(backend)?);
+        }
         status.limit = period.limit;
         if let QuotaLimit::Finite { tokens, .. } = period.limit {
             status.reserved_tokens = reserved;
             status.available_tokens = Some(
                 tokens
-                    .saturating_sub(known)
-                    .saturating_sub(estimated)
+                    .saturating_sub(status.known_tokens)
+                    .saturating_sub(status.estimated_tokens)
                     .saturating_sub(reserved)
                     .max(0),
             );
@@ -278,21 +288,24 @@ fn settle_attempt(
     conn: &Connection,
     id: &str,
     usage: AttemptUsage,
+    unknown_usage_charge: UnknownUsageCharge,
 ) -> Result<QuotaSettlement, QuotaError> {
-    let state = conn
+    let attempt = conn
         .query_row(
-            "SELECT state FROM quota_attempts WHERE id=?1",
+            "SELECT state, prompt_tokens FROM quota_attempts WHERE id=?1",
             [id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
         .optional()
         .map_err(backend)?;
-    match state.as_deref() {
-        Some("settled" | "released") => return Ok(QuotaSettlement::AlreadyFinal),
-        Some("dispatched") => {}
+    let Some((state, prompt_tokens)) = attempt else {
+        return Err(QuotaError::InvalidAttempt);
+    };
+    match state.as_str() {
+        "settled" | "released" => return Ok(QuotaSettlement::AlreadyFinal),
+        "dispatched" => {}
         _ => return Err(QuotaError::InvalidAttempt),
     }
-    let mut outcome = QuotaSettlement::Recorded;
     match usage {
         AttemptUsage::Observed(actual) if actual < 0 => return Err(QuotaError::InvalidTokens),
         AttemptUsage::Observed(actual) => {
@@ -301,22 +314,19 @@ fn settle_attempt(
                 params![id, actual],
             )
             .map_err(backend)?;
-            let faulty = conn.execute(
-                "INSERT INTO quota_binding_faults (host_id, provider_id, model_id)
-                 SELECT a.host_id,a.provider_id,a.model_id FROM quota_attempts a WHERE a.id=?1
-                 AND EXISTS(SELECT 1 FROM quota_reservations WHERE attempt_id=?1 AND reserved<?2)
-                 ON CONFLICT(host_id,provider_id,model_id) DO UPDATE SET model_id=excluded.model_id",
-                params![id, actual],
-            ).map_err(backend)?;
-            if faulty != 0 {
-                outcome = QuotaSettlement::BoundExceeded;
-            }
         }
         AttemptUsage::Unknown => {
+            let estimated = match unknown_usage_charge {
+                UnknownUsageCharge::Reserved => None,
+                UnknownUsageCharge::EstimatedPrompt => prompt_tokens,
+            };
             conn.execute(
-                "UPDATE quota_reservations SET estimated=COALESCE(reserved,0), unknown=reserved IS NULL WHERE attempt_id=?1",
-                [id],
-            ).map_err(backend)?;
+                "UPDATE quota_reservations SET
+                    estimated=CASE WHEN reserved IS NULL THEN 0 ELSE COALESCE(?2,reserved) END,
+                    unknown=reserved IS NULL WHERE attempt_id=?1",
+                params![id, estimated],
+            )
+            .map_err(backend)?;
         }
     }
     conn.execute(
@@ -324,7 +334,7 @@ fn settle_attempt(
         [id],
     )
     .map_err(backend)?;
-    Ok(outcome)
+    Ok(QuotaSettlement::Recorded)
 }
 
 #[cfg(test)]
@@ -404,7 +414,6 @@ impl QuotaStore for SqliteMeshAccess {
             limit.validate()?;
         }
         let (key, scope) = (key.clone(), scope.clone());
-        let changes = self.changes.clone();
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let grant = load_grant(&tx, &key)?;
@@ -419,14 +428,13 @@ impl QuotaStore for SqliteMeshAccess {
             let current = current_period(&tx, id)?
                 .map(|period| roll_forward(&tx, id, period, now))
                 .transpose()?;
-            let mut exhausted = None;
             match edit {
                 QuotaEdit::Update(limit) => {
                     let Some(period) = current else {
                         return Err(QuotaError::ReconfigureRequired);
                     };
                     let (
-                        QuotaLimit::Finite { window, tokens: previous },
+                        QuotaLimit::Finite { window, .. },
                         QuotaLimit::Finite {
                             window: proposed,
                             tokens,
@@ -447,26 +455,6 @@ impl QuotaStore for SqliteMeshAccess {
                         params![period.id, tokens],
                     )
                     .map_err(backend)?;
-                    // Only the edit can trigger cancellation, not subsequent reservations.
-                    if tokens < previous && grant.grant != PeerGrant::Full {
-                        let balance = status(&tx, scope.clone(), Some(Period { limit, ..period }))?;
-                        if balance.available_tokens == Some(0) {
-                            exhausted = Some(LimitingQuota {
-                                scope: scope.clone(),
-                                available_tokens: 0,
-                                next_reset_at: balance.next_reset_at,
-                            });
-                            // Prevent the reserve/dispatch race from sending an upstream call
-                            // after this edit, even before the live watcher wakes up.
-                            tx.execute(
-                                "UPDATE quota_attempts SET state='released' WHERE state='reserved'
-                                 AND host_id=?1 AND peer_id=?2 AND provider_id=?3
-                                 AND (?4 IS NULL OR model_id=?4)
-                                 AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=quota_attempts.id)",
-                                params![key.host.to_string(), key.peer.to_string(), scope.provider_id, scope.model_id],
-                            ).map_err(backend)?;
-                        }
-                    }
                 }
                 QuotaEdit::Reset | QuotaEdit::Reconfigure(_) => {
                     let clock = current.map_or(now, |period| now.max(period.started_at));
@@ -496,9 +484,6 @@ impl QuotaStore for SqliteMeshAccess {
             }
             let revision = save_grant(&tx, &key, &grant.grant)?;
             tx.commit().map_err(backend)?;
-            if let Some(limit) = exhausted {
-                let _ = changes.send(PolicyChange { key, effect: PolicyEffect::Exhausted(limit) });
-            }
             Ok(revision)
         })
         .await
@@ -506,9 +491,6 @@ impl QuotaStore for SqliteMeshAccess {
 
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
         utc_date(attempt.now)?;
-        if attempt.bound_tokens.is_some_and(|tokens| tokens <= 0) {
-            return Err(QuotaError::InvalidTokens);
-        }
         let provider = QuotaScope {
             provider_id: attempt.provider_id.clone(),
             model_id: None,
@@ -537,12 +519,8 @@ impl QuotaStore for SqliteMeshAccess {
             let id = ReservationId(Uuid::now_v7());
             let mut periods = Vec::with_capacity(2);
             let mut limiting = Vec::new();
-            let mut unsupported = None;
+            let mut prompt_tokens = None;
             if grant.grant != PeerGrant::Full {
-                let faulty: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM quota_binding_faults WHERE host_id=?1 AND provider_id=?2 AND model_id=?3)",
-                    params![host, attempt.provider_id, attempt.model_id], |row| row.get(0),
-                ).map_err(backend)?;
                 for scope in [provider, model] {
                     let scope_id = scope_id(&tx, &attempt.peer, &scope, true)?.ok_or(QuotaError::InvalidScope)?;
                     let period = if let Some(period) = current_period(&tx, scope_id)? {
@@ -550,41 +528,37 @@ impl QuotaStore for SqliteMeshAccess {
                     } else {
                         open_period(&tx, scope_id, QuotaLimit::Unlimited, attempt.now, None)?
                     };
-                    let mut reservation = None;
-                    if let QuotaLimit::Finite { .. } = period.limit {
-                        match attempt.bound_tokens {
-                            Some(bound) if !faulty => {
-                                let status = status(&tx, scope, Some(period))?;
-                                let available = status.available_tokens.ok_or(QuotaError::InvalidScope)?;
-                                if bound > available {
-                                    limiting.push(LimitingQuota { scope: status.scope, available_tokens: available, next_reset_at: status.next_reset_at });
-                                } else {
-                                    reservation = Some(bound);
-                                }
-                            }
-                            _ => { unsupported.get_or_insert(scope); }
+                    let reservation = if let QuotaLimit::Finite { .. } = period.limit {
+                        let status = status(&tx, scope, Some(period))?;
+                        let available = status.available_tokens.ok_or(QuotaError::InvalidScope)?;
+                        if available <= 0 {
+                            limiting.push(LimitingQuota { scope: status.scope, available_tokens: available, next_reset_at: status.next_reset_at });
                         }
-                    }
+                        prompt_tokens = Some(attempt.estimate.prompt_tokens);
+                        Some(attempt.estimate.reserved_tokens)
+                    } else {
+                        None
+                    };
                     periods.push((period.id, reservation));
                 }
             }
             // Persist any observed rollover but never write part of a reservation.
-            if let Some(scope) = unsupported {
-                tx.commit().map_err(backend)?;
-                return Err(QuotaError::Unsupported(scope));
-            }
+            // TODO: Add a let-it-finish vs cut-off toggle. For now, exhaustion only denies new admissions.
             if !limiting.is_empty() {
                 tx.commit().map_err(backend)?;
                 return Err(QuotaError::Exhausted(limiting));
             }
+            if prompt_tokens.is_some_and(|prompt| prompt < 0 || attempt.estimate.reserved_tokens <= 0) {
+                return Err(QuotaError::InvalidTokens);
+            }
             let id_text = id.0.to_string();
             tx.execute(
-                "INSERT INTO quota_attempts (id,host_id,peer_id,provider_id,model_id,request_id,state)
-                 VALUES (?1,?2,?3,?4,?5,?6,'reserved')",
-                params![id_text, host, peer, attempt.provider_id, attempt.model_id, replay_id],
+                "INSERT INTO quota_attempts (id,host_id,peer_id,provider_id,model_id,request_id,state,prompt_tokens)
+                 VALUES (?1,?2,?3,?4,?5,?6,'reserved',?7)",
+                params![id_text, host, peer, attempt.provider_id, attempt.model_id, replay_id, prompt_tokens],
             ).map_err(backend)?;
-            for (period, bound) in periods {
-                tx.execute("INSERT INTO quota_reservations (attempt_id,period_id,reserved) VALUES (?1,?2,?3)", params![id_text, period, bound]).map_err(backend)?;
+            for (period, reserved) in periods {
+                tx.execute("INSERT INTO quota_reservations (attempt_id,period_id,reserved) VALUES (?1,?2,?3)", params![id_text, period, reserved]).map_err(backend)?;
             }
             tx.commit().map_err(backend)?;
             Ok(id)
@@ -595,36 +569,55 @@ impl QuotaStore for SqliteMeshAccess {
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let id = attempt.0.to_string();
-            let (host, peer, provider, model, custom): (String, String, String, String, bool) = tx.query_row(
-                "SELECT host_id, peer_id, provider_id, model_id,
+            let (host, peer, provider, model, custom): (String, String, String, String, bool) = tx
+                .query_row(
+                    "SELECT host_id, peer_id, provider_id, model_id,
                      EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id)
                  FROM quota_attempts a WHERE id=?1 AND state='reserved'",
-                [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            ).optional().map_err(backend)?.ok_or(QuotaError::InvalidAttempt)?;
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(backend)?
+                .ok_or(QuotaError::InvalidAttempt)?;
             let key = PeerGrantKey {
-                host: NodeId::parse(&host).map_err(|error| backend(std::io::Error::other(error)))?,
-                peer: NodeId::parse(&peer).map_err(|error| backend(std::io::Error::other(error)))?,
+                host: NodeId::parse(&host)
+                    .map_err(|error| backend(std::io::Error::other(error)))?,
+                peer: NodeId::parse(&peer)
+                    .map_err(|error| backend(std::io::Error::other(error)))?,
             };
             let grant = load_grant(&tx, &key)?.grant;
             // An attempt admitted as Full has no reservations and cannot start
             // under a subsequent Custom grant. Custom attempts are always V1.
-            if !grant.allows_model(querymt_remote::peer_access::SharingProtocol::V1, &provider, &model)
-                || (!custom && grant != PeerGrant::Full)
+            if !grant.allows_model(
+                querymt_remote::peer_access::SharingProtocol::V1,
+                &provider,
+                &model,
+            ) || (!custom && grant != PeerGrant::Full)
             {
                 return Err(QuotaError::InvalidAttempt);
             }
-            let changed = tx.execute(
-                "UPDATE quota_attempts AS a SET state='dispatched' WHERE id=?1 AND state='reserved'
-                 AND NOT (EXISTS(SELECT 1 FROM quota_binding_faults f WHERE f.host_id=a.host_id AND f.provider_id=a.provider_id AND f.model_id=a.model_id)
-                      AND EXISTS(SELECT 1 FROM quota_reservations r WHERE r.attempt_id=a.id AND r.reserved IS NOT NULL))",
-                [&id],
-            ).map_err(backend)?;
+            let changed = tx
+                .execute(
+                    "UPDATE quota_attempts SET state='dispatched' WHERE id=?1 AND state='reserved'",
+                    [&id],
+                )
+                .map_err(backend)?;
             if changed != 1 {
                 return Err(QuotaError::InvalidAttempt);
             }
             tx.commit().map_err(backend)?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     async fn release_unused(&self, attempt: ReservationId) -> Result<(), QuotaError> {
@@ -647,10 +640,11 @@ impl QuotaStore for SqliteMeshAccess {
         usage: AttemptUsage,
     ) -> Result<QuotaSettlement, QuotaError> {
         let changes = self.usage_changes.clone();
+        let charge = self.unknown_usage_charge;
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             let id = attempt.0.to_string();
-            let result = settle_attempt(&tx, &id, usage)?;
+            let result = settle_attempt(&tx, &id, usage, charge)?;
             let peer = if result != QuotaSettlement::AlreadyFinal && changes.receiver_count() != 0 {
                 tx.query_row(
                     "SELECT a.host_id, a.peer_id FROM quota_attempts a WHERE a.id=?1
@@ -676,6 +670,7 @@ impl QuotaStore for SqliteMeshAccess {
 
     async fn reconcile_startup(&self, host: &NodeId) -> Result<(), QuotaError> {
         let host = host.to_string();
+        let charge = self.unknown_usage_charge;
         self.with_conn(move |conn| {
             let tx = begin(conn)?;
             tx.execute(
@@ -696,7 +691,7 @@ impl QuotaStore for SqliteMeshAccess {
                     .map_err(backend)?
             };
             for attempt in dispatched {
-                settle_attempt(&tx, &attempt, AttemptUsage::Unknown)?;
+                settle_attempt(&tx, &attempt, AttemptUsage::Unknown, charge)?;
             }
             let scopes = {
                 let mut stmt = tx

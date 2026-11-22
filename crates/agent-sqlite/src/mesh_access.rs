@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use querymt_remote::NodeId;
+use querymt_remote::peer_access::quota::UnknownUsageCharge;
 use querymt_remote::peer_access::{
     GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
     PolicyEffect,
@@ -15,7 +16,7 @@ use uuid::Uuid;
 
 // Distinguish the standalone store from existing user SQLite databases.
 const APPLICATION_ID: i64 = 0x514d_5441;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const GRANT_SCHEMA_V1: &str = "CREATE TABLE peer_grants (
     host_id TEXT NOT NULL, peer_id TEXT NOT NULL, revision TEXT NOT NULL,
     grant_json TEXT NOT NULL, PRIMARY KEY (host_id, peer_id)
@@ -30,6 +31,7 @@ pub struct SqliteMeshAccess {
     lease: Option<Arc<std::fs::File>>,
     changes: tokio::sync::broadcast::Sender<PolicyChange>,
     usage_changes: tokio::sync::broadcast::Sender<PeerGrantKey>,
+    unknown_usage_charge: UnknownUsageCharge,
 }
 
 impl SqliteMeshAccess {
@@ -44,6 +46,7 @@ impl SqliteMeshAccess {
             lease: None,
             changes: tokio::sync::broadcast::channel(64).0,
             usage_changes: tokio::sync::broadcast::channel(64).0,
+            unknown_usage_charge: UnknownUsageCharge::default(),
         })
     }
 
@@ -64,10 +67,18 @@ impl SqliteMeshAccess {
                 lease: Some(Arc::new(lease)),
                 changes: tokio::sync::broadcast::channel(64).0,
                 usage_changes: tokio::sync::broadcast::channel(64).0,
+                unknown_usage_charge: UnknownUsageCharge::default(),
             })
         })
         .await
         .map_err(backend)?
+    }
+
+    /// Select how missing usage is charged in both live settlement and startup reconciliation.
+    /// Set this before reconciling or sharing the store with request handlers.
+    pub fn with_unknown_usage_charge(mut self, charge: UnknownUsageCharge) -> Self {
+        self.unknown_usage_charge = charge;
+        self
     }
 
     async fn with_conn<T: Send + 'static, E: From<GrantStoreError> + Send + 'static>(
@@ -99,7 +110,7 @@ fn open_store(path: PathBuf) -> Result<Connection, GrantStoreError> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(backend)?;
     match (app, version) {
-        (APPLICATION_ID, 1 | SCHEMA_VERSION) => {}
+        (APPLICATION_ID, 1..=SCHEMA_VERSION) => {}
         (0, 0) => {
             let populated: bool = tx
                 .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |row| {
@@ -124,6 +135,10 @@ fn open_store(path: PathBuf) -> Result<Connection, GrantStoreError> {
     }
     if version < 2 {
         tx.execute_batch(include_str!("mesh_access/quota_v2.sql"))
+            .map_err(backend)?;
+    }
+    if version < 3 {
+        tx.execute_batch(include_str!("mesh_access/quota_v3.sql"))
             .map_err(backend)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(backend)?;

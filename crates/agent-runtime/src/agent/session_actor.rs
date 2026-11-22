@@ -399,7 +399,6 @@ impl PeerTurn {
     }
 
     pub(crate) async fn revoked(&self, binding: Option<(&str, &str)>) -> AgentError {
-        use querymt_remote::peer_access::quota::QuotaError;
         let changes = self
             .changes
             .lock()
@@ -410,19 +409,6 @@ impl PeerTurn {
             &self.key,
             changes,
             |grant| self.check_grant(grant, binding),
-            |limit| {
-                let (provider, model) = binding?;
-                limit.scope.covers(provider, model).then(|| {
-                    let error = QuotaError::Exhausted(vec![limit.clone()]).into_provider_error();
-                    AgentError::ProviderFailure {
-                        message: error.to_string(),
-                        provider: Some(provider.to_owned()),
-                        model: Some(model.to_owned()),
-                        retryable: false,
-                        error: Box::new(error.to_payload()),
-                    }
-                })
-            },
             || AgentError::MeshAccessDenied,
         )
         .await
@@ -3550,7 +3536,7 @@ async fn execute_prompt_inner(
 
     #[cfg(feature = "remote")]
     let session_handle = if let Some((peer, grant)) = peer_grant {
-        session_handle.for_mesh_turn(peer, &grant)?
+        session_handle.for_mesh_turn(peer, &grant, config.fallback_context_tokens())?
     } else {
         session_handle
     };

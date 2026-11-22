@@ -205,23 +205,19 @@ impl From<AgentError> for AcpError {
                         error_type.as_deref(),
                     )
             {
-                use querymt_remote::peer_access::quota::QuotaDenialDetails;
-                let mut data = serde_json::json!({"code": code, "category": "provider", "kind": kind, "provider": provider, "model": model, "retryable": false});
-                match details {
-                    QuotaDenialDetails::Limits { limits } => {
-                        data["limits"] = serde_json::Value::Array(limits.into_iter().map(|limit| {
-                            let mut value = serde_json::json!({"scope": limit.scope, "available_tokens": limit.available_tokens.to_string()});
-                            if let Some(reset) = limit.next_reset_at
-                                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
-                                .and_then(|date| date.format(&time::format_description::well_known::Rfc3339).ok())
-                            {
-                                value["next_reset_at"] = serde_json::json!(reset);
-                            }
-                            value
-                        }).collect());
+                let querymt_remote::peer_access::quota::QuotaDenialDetails::Limits { limits } =
+                    details;
+                let limits: Vec<_> = limits.into_iter().map(|limit| {
+                    let mut value = serde_json::json!({"scope": limit.scope, "available_tokens": limit.available_tokens.to_string()});
+                    if let Some(reset) = limit.next_reset_at
+                        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                        .and_then(|date| date.format(&time::format_description::well_known::Rfc3339).ok())
+                    {
+                        value["next_reset_at"] = serde_json::json!(reset);
                     }
-                    QuotaDenialDetails::Scope { scope } => data["scope"] = serde_json::json!(scope),
-                }
+                    value
+                }).collect();
+                let data = serde_json::json!({"code": code, "category": "provider", "kind": kind, "provider": provider, "model": model, "retryable": false, "limits": limits});
                 return AcpError::new(-32000, provider_message.unwrap_or_else(|| message.clone()))
                     .data(data);
             }
@@ -611,39 +607,27 @@ mod tests {
             available_tokens: 9007199254740993,
             next_reset_at: Some(1_709_164_800),
         }]);
-        for (error, code, key, expected) in [
-            (
-                exhausted,
-                "mesh_quota_exhausted",
-                "limits",
-                serde_json::json!([{
-                    "scope": scope, "available_tokens": "9007199254740993", "next_reset_at": "2024-02-29T00:00:00Z",
-                }]),
-            ),
-            (
-                QuotaError::Unsupported(scope.clone()),
-                "mesh_quota_unsupported",
-                "scope",
-                serde_json::json!(scope),
-            ),
-        ] {
-            let payload = error.into_provider_error().to_payload();
-            let wire = serde_json::to_vec(&payload).unwrap();
-            let payload =
-                querymt::error::LLMError::from_payload(serde_json::from_slice(&wire).unwrap())
-                    .to_payload();
-            let acp = AcpError::from(AgentError::ProviderFailure {
-                message: "provider dispatch refused".into(),
-                provider: Some("fixture".into()),
-                model: Some("model".into()),
-                retryable: false,
-                error: Box::new(payload),
-            });
-            assert_eq!(acp.code, ErrorCode::new(-32000));
-            let data = acp.data.unwrap();
-            assert_eq!(data["code"], code);
-            assert_eq!(data[key], expected);
-        }
+        let payload = exhausted.into_provider_error().to_payload();
+        let wire = serde_json::to_vec(&payload).unwrap();
+        let payload =
+            querymt::error::LLMError::from_payload(serde_json::from_slice(&wire).unwrap())
+                .to_payload();
+        let acp = AcpError::from(AgentError::ProviderFailure {
+            message: "provider dispatch refused".into(),
+            provider: Some("fixture".into()),
+            model: Some("model".into()),
+            retryable: false,
+            error: Box::new(payload),
+        });
+        assert_eq!(acp.code, ErrorCode::new(-32000));
+        let data = acp.data.unwrap();
+        assert_eq!(data["code"], "mesh_quota_exhausted");
+        assert_eq!(
+            data["limits"],
+            serde_json::json!([{
+                "scope": scope, "available_tokens": "9007199254740993", "next_reset_at": "2024-02-29T00:00:00Z",
+            }])
+        );
     }
 
     #[test]

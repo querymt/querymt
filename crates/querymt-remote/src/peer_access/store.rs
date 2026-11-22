@@ -37,7 +37,6 @@ pub struct PolicyChange {
 #[derive(Debug, Clone)]
 pub enum PolicyEffect {
     Grant(PeerGrant),
-    Exhausted(super::quota::LimitingQuota),
 }
 
 /// Durable owner policy reads and compare-and-swap edits.
@@ -54,7 +53,7 @@ pub trait GrantStore: Send + Sync {
         grant: PeerGrant,
     ) -> Result<PeerGrantState, GrantStoreError>;
 
-    /// Subscribe to committed permission changes and cap reductions that exhausted a scope.
+    /// Subscribe to committed permission changes.
     /// Stores with out-of-process writers should return `None` unless they observe those writers.
     fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PolicyChange>> {
         None
@@ -71,7 +70,6 @@ pub async fn wait_for_policy_loss<E>(
     key: &PeerGrantKey,
     mut changes: Option<tokio::sync::broadcast::Receiver<PolicyChange>>,
     check: impl Fn(&PeerGrant) -> Result<(), E>,
-    exhausted: impl Fn(&super::quota::LimitingQuota) -> Option<E>,
     unavailable: impl Fn() -> E,
 ) -> E {
     use tokio::sync::broadcast::error::RecvError;
@@ -97,14 +95,6 @@ pub async fn wait_for_policy_loss<E>(
                             return error;
                         }
                         break;
-                    }
-                    Ok(PolicyChange {
-                        effect: PolicyEffect::Exhausted(limit),
-                        ..
-                    }) => {
-                        if let Some(error) = exhausted(&limit) {
-                            return error;
-                        }
                     }
                     Err(RecvError::Lagged(_)) => break,
                     Err(RecvError::Closed) => return unavailable(),

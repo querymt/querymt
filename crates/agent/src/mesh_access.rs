@@ -147,7 +147,10 @@ mod tests {
                 provider_id: "fixture".into(),
                 model_id: "model".into(),
                 request_id: Uuid::now_v7(),
-                bound_tokens: Some(40),
+                estimate: querymt_remote::peer_access::quota::QuotaEstimate {
+                    reserved_tokens: 40,
+                    prompt_tokens: 10,
+                },
                 now,
             })
             .await

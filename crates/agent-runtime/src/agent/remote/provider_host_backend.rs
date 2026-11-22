@@ -1,11 +1,11 @@
 use crate::agent::agent_config::AgentConfig;
-use crate::session::provider::ProviderRequest;
+use crate::session::provider::{ProviderQuotaInputs, ProviderRequest};
 use async_trait::async_trait;
 use querymt::LLMProvider;
 use querymt::chat::ChatCall;
 #[cfg(any(test, feature = "test-support"))]
 use querymt_remote::ProviderHostActor;
-use querymt_remote::peer_access::quota::QuotaStore;
+use querymt_remote::peer_access::quota::{QuotaEstimate, QuotaStore};
 use querymt_remote::{
     ProviderBuildRequest, RemoteProviderBackend, RemoteProviderHostError,
     params_for_remote_provider,
@@ -51,8 +51,7 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
         &self,
         request: ProviderBuildRequest,
         call: &ChatCall<'_>,
-        streaming: bool,
-    ) -> Result<(Arc<dyn LLMProvider>, Option<i64>), Self::Error> {
+    ) -> Result<(Arc<dyn LLMProvider>, QuotaEstimate), Self::Error> {
         let snapshot = self
             .config
             .provider
@@ -62,8 +61,10 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
             )
             .await
             .map_err(|error| host_error("prepare_chat", None, error))?;
-        let bound = text_stream_bound(snapshot.mesh_text_stream_limit, call, streaming);
-        Ok((snapshot.provider, bound))
+        let estimate = snapshot
+            .quota_inputs(self.config.fallback_context_tokens())
+            .estimate(&request.provider_name, &request.model, call);
+        Ok((snapshot.provider, estimate))
     }
 
     async fn contract_info(
@@ -112,61 +113,22 @@ pub fn provider_backend_from_config(
     Arc::new(AgentConfigProviderBackend { config })
 }
 
-pub(crate) fn qualified_text_stream_limit(schema: &str, resolved_config: &str) -> Option<i64> {
-    if !has_text_stream_bound(schema) {
-        return None;
-    }
-    let config: serde_json::Value = serde_json::from_str(resolved_config).ok()?;
-    let limit = i32::try_from(config["n_ctx"].as_u64()?).ok()?;
-    (limit > 0 && config["speculative"].is_null()).then_some(i64::from(limit))
-}
-
-pub(crate) fn has_text_stream_bound(schema: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(schema).is_ok_and(|schema| {
-        schema["x-querymt-chat-token-bound"] == "llama-cpp-text-stream-n-ctx-v2"
-    })
-}
-
-fn text_stream_bound(limit: Option<i64>, call: &ChatCall<'_>, streaming: bool) -> Option<i64> {
-    use querymt::chat::{ChatInputPart, ToolResultPart};
-    // The native checker runs after template rendering, so tool definitions and
-    // text tool results are included in the enforced prompt length.
-    if !streaming
-        || call.messages.iter().any(|message| {
-            message
-                .portable_input_parts()
-                .iter()
-                .any(|part| match part {
-                    ChatInputPart::Text { .. } => false,
-                    ChatInputPart::Attachment(_) => true,
-                    ChatInputPart::ToolResult(result) => result
-                        .parts
-                        .iter()
-                        .any(|part| matches!(part, ToolResultPart::Attachment(_))),
-                })
-        })
-    {
-        return None;
-    }
-    limit
-}
-
 /// Wraps a single pinned host binding, never the shared provider cache.
 pub(crate) fn hosted_provider(
     inner: Arc<dyn LLMProvider>,
     peer: &crate::agent::session_actor::PeerTurn,
     store: Arc<dyn QuotaStore>,
-    provider: String,
-    model: String,
-    text_stream_limit: Option<i64>,
+    binding: (String, String),
+    quota_inputs: ProviderQuotaInputs,
 ) -> querymt_remote::MeteredProvider {
+    let (provider, model) = binding.clone();
     querymt_remote::MeteredProvider::hosted(
         inner,
         store,
         peer.key.clone(),
         peer.protocol,
-        (provider, model),
-        move |call, streaming| text_stream_bound(text_stream_limit, call, streaming),
+        binding,
+        move |call| quota_inputs.estimate(&provider, &model, call),
     )
 }
 
@@ -178,11 +140,10 @@ pub fn provider_host_from_config(config: Arc<AgentConfig>) -> ProviderHostActor 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::session_actor::PeerTurn, test_utils::MockLlmProvider};
+    use crate::agent::session_actor::PeerTurn;
     use futures_util::StreamExt;
-    use querymt::chat::{ChatOutput, ChatProvider, ChatStream};
+    use querymt::chat::{ChatOutput, ChatProvider, ChatStream, FinishReason, StreamChunk};
     use querymt::error::LLMError;
-    use querymt_remote::peer_access::quota::{AttemptUsage, QuotaAttempt, ReservedAttempt};
     use querymt_remote::{
         NodeId,
         peer_access::{
@@ -191,40 +152,6 @@ mod tests {
         },
     };
     use uuid::Uuid;
-
-    #[test]
-    fn finite_support_requires_a_qualified_binding_and_streaming_text() {
-        let schema = r#"{"x-querymt-chat-token-bound":"llama-cpp-text-stream-n-ctx-v2"}"#;
-        assert_eq!(qualified_text_stream_limit("{}", r#"{"n_ctx":4096}"#), None);
-        assert_eq!(
-            qualified_text_stream_limit(schema, r#"{"n_ctx":4096,"speculative":{}}"#),
-            None
-        );
-        assert_eq!(
-            qualified_text_stream_limit(schema, r#"{"n_ctx":2147483648}"#),
-            None
-        );
-        let limit = qualified_text_stream_limit(schema, r#"{"n_ctx":4096}"#);
-        assert_eq!(limit, Some(4096));
-        assert_eq!(
-            text_stream_bound(limit, &ChatCall::new(&[]), true),
-            Some(4096)
-        );
-        assert_eq!(text_stream_bound(limit, &ChatCall::new(&[]), false), None);
-        let tools = [querymt::chat::Tool {
-            tool_type: "function".into(),
-            function: querymt::chat::FunctionTool {
-                name: "fixture".into(),
-                description: "Inert fixture".into(),
-                parameters: serde_json::json!({"type": "object"}),
-                strict: None,
-            },
-        }];
-        assert_eq!(
-            text_stream_bound(limit, &ChatCall::new(&[]).tools(&tools), true),
-            Some(4096)
-        );
-    }
 
     async fn scope_status(
         store: &dyn QuotaStore,
@@ -273,9 +200,7 @@ mod tests {
                     filesystem: false,
                     providers: vec![ProviderGrant {
                         provider_id: "fixture".into(),
-                        models: ModelSelection::Selected {
-                            model_ids: vec!["model".into()],
-                        },
+                        models: ModelSelection::All,
                     }],
                 },
             )
@@ -302,53 +227,243 @@ mod tests {
         (dir, store, key, scope, revision, now)
     }
 
-    #[tokio::test]
-    async fn session_inference_and_direct_inference_share_an_allowance() {
-        let (_dir, store, key, scope, _, now) = finite_quota_fixture(16).await;
-        let direct = ReservedAttempt::reserve(
-            store.clone(),
-            QuotaAttempt {
-                peer: key.clone(),
-                protocol: SharingProtocol::V1,
-                provider_id: "fixture".into(),
-                model_id: "model".into(),
-                request_id: Uuid::new_v4(),
-                bound_tokens: Some(10),
-                now,
-            },
-        )
-        .await
-        .unwrap()
-        .begin()
-        .await
-        .unwrap();
-        direct.settle(AttemptUsage::Observed(7)).await.unwrap();
+    struct HttpFixture {
+        url: String,
+    }
 
+    impl querymt::plugin::LLMProviderFactory for HttpFixture {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn config_schema(&self) -> String {
+            r#"{"type":"object","properties":{"model":{},"max_tokens":{}}}"#.into()
+        }
+
+        fn from_config(&self, _: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+            Ok(Box::new(Self {
+                url: self.url.clone(),
+            }))
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+            Box::pin(async { Ok(vec!["known".into(), "missing".into()]) })
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for HttpFixture {
+        async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            let body = serde_json::to_vec(&call.options)?;
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()?
+                .post(&self.url)
+                .header("content-type", "application/json")
+                .timeout(std::time::Duration::from_secs(5))
+                .body(body)
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(serde_json::from_slice(&response.bytes().await?)?)
+        }
+    }
+
+    #[async_trait]
+    impl querymt::completion::CompletionProvider for HttpFixture {
+        async fn complete(
+            &self,
+            _: &querymt::completion::CompletionRequest,
+        ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+            unreachable!("chat-only fixture")
+        }
+    }
+
+    #[async_trait]
+    impl querymt::embedding::EmbeddingProvider for HttpFixture {
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            unreachable!("chat-only fixture")
+        }
+    }
+
+    impl LLMProvider for HttpFixture {}
+
+    #[tokio::test]
+    async fn finite_http_chat_reserves_with_known_and_missing_model_metadata() {
+        use crate::agent::agent_config_builder::AgentConfigBuilder;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use axum::{Json, Router, routing::post};
+        use querymt::chat::{ChatMessage, GenerationOptions};
+        use querymt::plugin::host::PluginRegistry;
+
+        // Configure the on-disk models.dev lookup in a dedicated process; changing
+        // the environment in this test process would race unrelated tests.
+        const CHILD: &str = "QMT_RUNTIME_QUOTA_HTTP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("models.dev.json"),
+                r#"{"providers":{"fixture":{"models":{"known":{"limit":{"context":64}}}}}}"#,
+            )
+            .unwrap();
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg(format!(
+                    "{module}::finite_http_chat_reserves_with_known_and_missing_model_metadata"
+                ))
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("QMT_PROVIDER_CACHE_DIR", dir.path())
+                .kill_on_drop(true);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let (reservations, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let (_dir, store, key, scope, mut revision, now) = finite_quota_fixture(5).await;
+        let server = tokio::spawn({
+            let (store, key, scope) = (store.clone(), key.clone(), scope.clone());
+            async move {
+                let router = Router::new().route(
+                    "/chat",
+                    post(move |Json(options): Json<GenerationOptions>| {
+                        let (store, key, scope, reservations) = (
+                            store.clone(),
+                            key.clone(),
+                            scope.clone(),
+                            reservations.clone(),
+                        );
+                        async move {
+                            let status = scope_status(store.as_ref(), &key, &scope, now).await;
+                            reservations
+                                .send((options.max_tokens, status.reserved_tokens))
+                                .unwrap();
+                            Json(ChatOutput::from_projections(
+                                None,
+                                Some("hello".into()),
+                                None,
+                                Some(querymt::Usage {
+                                    input_tokens: 125,
+                                    output_tokens: 37,
+                                    ..Default::default()
+                                }),
+                                Some(FinishReason::Stop),
+                            ))
+                        }
+                    }),
+                );
+                axum::serve(listener, router).await.unwrap();
+            }
+        });
+
+        let registry = Arc::new(PluginRegistry::empty());
+        registry.register_static(Arc::new(HttpFixture { url }));
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let peer = PeerTurn::test_peer(
             key.clone(),
             store.grant(&key).await.unwrap().grant,
             store.clone(),
         );
-        // No mock methods are configured: touching the provider would fail the test.
-        let provider = hosted_provider(
-            Arc::new(MockLlmProvider::new()),
-            &peer,
-            store.clone(),
-            "fixture".into(),
-            "model".into(),
-            Some(10),
-        );
-        let error = provider
-            .chat_stream(&ChatCall::new(&[]))
-            .await
-            .err()
-            .expect("direct spend leaves fewer than ten tokens");
-        assert!(
-            matches!(error, LLMError::ProviderResponseError(failure) if failure.code() == Some("mesh_quota_exhausted"))
-        );
-        let after = scope_status(store.as_ref(), &key, &scope, now).await;
-        assert_eq!(after.known_tokens, 7);
-        assert_eq!(after.reserved_tokens, 0);
+        let messages = [ChatMessage::user().text("Count this prompt").build()];
+        let call = ChatCall::new(&messages).options(GenerationOptions::NONE.with_max_tokens(100));
+
+        for (model, fallback, expected_ceiling) in [
+            ("known", Some(17), Some(64)),
+            ("missing", Some(17), Some(17)),
+            ("missing", None, None),
+        ] {
+            let builder = AgentConfigBuilder::new(
+                registry.clone(),
+                storage.clone(),
+                querymt::LLMParams::new(),
+            );
+            let builder = if let Some(fallback) = fallback {
+                builder.with_context_management(
+                    crate::middleware::ContextConfig::with_manual_limit(3)
+                        .fallback_max_tokens(fallback),
+                )
+            } else {
+                builder
+            };
+            let config = Arc::new(builder.build());
+            assert_eq!(config.fallback_context_tokens(), fallback);
+            let backend = provider_backend_from_config(config.clone());
+            let params = serde_json::json!({"max_tokens": 8});
+            let request = ProviderBuildRequest {
+                provider_name: "fixture".into(),
+                model: model.into(),
+                params: Some(params.clone()),
+            };
+            let (_, direct) = backend.prepare_chat(request.clone(), &call).await.unwrap();
+            assert!(direct.prompt_tokens > 0);
+            assert_eq!(
+                direct.reserved_tokens,
+                expected_ceiling.unwrap_or(direct.prompt_tokens + 100)
+            );
+            if fallback.is_none() {
+                let (_, default_cap) = backend
+                    .prepare_chat(request, &ChatCall::new(&messages))
+                    .await
+                    .unwrap();
+                assert_eq!(default_cap.reserved_tokens, default_cap.prompt_tokens + 8);
+            }
+
+            let snapshot = config
+                .provider
+                .build_local_provider_snapshot(
+                    ProviderRequest::new("fixture", model).with_params(Some(&params)),
+                )
+                .await
+                .unwrap();
+            let inputs = snapshot.quota_inputs(config.fallback_context_tokens());
+            let hosted = hosted_provider(
+                snapshot.provider,
+                &peer,
+                store.clone(),
+                ("fixture".into(), model.into()),
+                inputs,
+            );
+            let output = hosted.chat(&call).await.unwrap();
+            assert_eq!(output.text().as_deref(), Some("hello"));
+            assert_eq!(output.finish_reason, Some(FinishReason::Stop));
+            assert_eq!(
+                seen.try_recv().unwrap(),
+                (Some(100), direct.reserved_tokens)
+            );
+            let status = scope_status(store.as_ref(), &key, &scope, now).await;
+            assert_eq!(
+                (
+                    status.known_tokens,
+                    status.estimated_tokens,
+                    status.reserved_tokens
+                ),
+                (162, 0, 0)
+            );
+            assert!(matches!(hosted.chat(&call).await,
+                Err(LLMError::ProviderResponseError(error)) if error.code() == Some("mesh_quota_exhausted")));
+            assert!(seen.try_recv().is_err());
+            revision = store
+                .edit_quota(&key, revision, &scope, QuotaEdit::Reset, now)
+                .await
+                .unwrap();
+        }
+        server.abort();
     }
 
     struct ScriptedStream(std::sync::Mutex<Option<Result<ChatStream, LLMError>>>);
@@ -386,36 +501,61 @@ mod tests {
     fn hosted_stream(
         stream: Result<ChatStream, LLMError>,
         key: &PeerGrantKey,
-        _revision: Uuid,
         store: Arc<dyn QuotaStore>,
     ) -> querymt_remote::MeteredProvider {
-        hosted_provider(
+        querymt_remote::MeteredProvider::hosted(
             Arc::new(ScriptedStream(std::sync::Mutex::new(Some(stream)))),
-            &PeerTurn::test_peer(key.clone(), PeerGrant::Full, store.clone()),
             store,
-            "fixture".into(),
-            "model".into(),
-            Some(10),
+            key.clone(),
+            SharingProtocol::V1,
+            ("fixture".into(), "model".into()),
+            |_| QuotaEstimate {
+                reserved_tokens: 10,
+                prompt_tokens: 2,
+            },
         )
+    }
+
+    fn terminal_stream(input_tokens: u32, output_tokens: u32) -> ChatStream {
+        Box::pin(futures_util::stream::iter([
+            Ok(StreamChunk::Usage(querymt::Usage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            })),
+            Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            }),
+        ]))
+    }
+
+    async fn assert_done(stream: &mut ChatStream) {
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("terminal chunk");
+        assert!(matches!(
+            terminal,
+            Some(Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop
+            }))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    async fn assert_exhausted(provider: &querymt_remote::MeteredProvider) {
+        assert!(matches!(provider.chat_stream(&ChatCall::new(&[])).await,
+            Err(LLMError::ProviderResponseError(failure)) if failure.code() == Some("mesh_quota_exhausted")));
     }
 
     #[tokio::test]
     async fn hosted_stream_settles_usage_only_after_terminal_chunk() {
-        use querymt::chat::{FinishReason, StreamChunk};
-
-        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let (_dir, store, key, scope, _, now) = finite_quota_fixture(16).await;
         let usage = querymt::Usage {
             input_tokens: 4,
             output_tokens: 3,
             ..Default::default()
         };
-        let upstream = futures_util::stream::iter([
-            Ok(StreamChunk::Usage(usage.clone())),
-            Ok(StreamChunk::Done {
-                finish_reason: FinishReason::Stop,
-            }),
-        ]);
-        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
+        let provider = hosted_stream(Ok(terminal_stream(4, 3)), &key, store.clone());
         let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
 
         assert!(
@@ -447,10 +587,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_stream_charges_bound_when_upstream_does_not_report_terminal_usage() {
-        use querymt::chat::StreamChunk;
-
-        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(32).await;
+    async fn hosted_stream_charges_estimate_when_upstream_does_not_report_terminal_usage() {
+        let (_dir, store, key, scope, _, now) = finite_quota_fixture(32).await;
         let provider_error = || LLMError::NotImplemented("fixture upstream error".into());
         let partial_usage = || {
             Ok(StreamChunk::Usage(querymt::Usage {
@@ -461,7 +599,6 @@ mod tests {
         let eof = hosted_stream(
             Ok(Box::pin(futures_util::stream::iter([partial_usage()]))),
             &key,
-            revision,
             store.clone(),
         );
         let mut stream = eof.chat_stream(&ChatCall::new(&[])).await.unwrap();
@@ -486,7 +623,6 @@ mod tests {
                 Err(provider_error()),
             ]))),
             &key,
-            revision,
             store.clone(),
         );
         let mut stream = midstream.chat_stream(&ChatCall::new(&[])).await.unwrap();
@@ -507,7 +643,7 @@ mod tests {
             (0, 20, 0)
         );
 
-        let startup = hosted_stream(Err(provider_error()), &key, revision, store.clone());
+        let startup = hosted_stream(Err(provider_error()), &key, store.clone());
         assert!(
             matches!(startup.chat_stream(&ChatCall::new(&[])).await, Err(LLMError::NotImplemented(message)) if message == "fixture upstream error")
         );
@@ -523,53 +659,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_stream_rejects_completion_and_suspends_a_faulty_binding() {
-        use querymt::chat::{FinishReason, StreamChunk};
-
-        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(40).await;
-        let upstream = futures_util::stream::iter([
-            Ok(StreamChunk::Usage(querymt::Usage {
-                input_tokens: 12,
-                output_tokens: 3,
-                ..Default::default()
-            })),
-            Ok(StreamChunk::Done {
-                finish_reason: FinishReason::Stop,
-            }),
-        ]);
-        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
-        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+    async fn hosted_overshoot_delivers_terminal_and_only_blocks_new_attempts_until_raised() {
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let call = ChatCall::new(&[]);
+        let first = hosted_stream(Ok(terminal_stream(12, 6)), &key, store.clone());
+        let held = hosted_stream(Ok(terminal_stream(4, 3)), &key, store.clone());
+        let next = hosted_stream(Ok(terminal_stream(1, 1)), &key, store.clone());
+        let mut first = first.chat_stream(&call).await.unwrap();
+        // Six tokens remain, so the second estimate of ten can still be reserved.
+        let mut held = held.chat_stream(&call).await.unwrap();
         assert!(matches!(
-            stream.next().await,
+            first.next().await,
             Some(Ok(StreamChunk::Usage(_)))
         ));
-        assert!(
-            matches!(stream.next().await, Some(Err(LLMError::ProviderResponseError(error)))
-            if error.code() == Some("mesh_quota_bound_exceeded"))
-        );
+        assert_done(&mut first).await;
         let charged = scope_status(store.as_ref(), &key, &scope, now).await;
-        assert_eq!(charged.known_tokens, 15);
-        assert_eq!(charged.reserved_tokens, 0);
-        assert_eq!(charged.available_tokens, Some(25));
-        // The remaining balance can fit the advertised bound, but it is no
-        // longer trustworthy. A second upstream invocation would panic.
-        assert!(matches!(provider.chat_stream(&ChatCall::new(&[])).await,
-            Err(LLMError::ProviderResponseError(error)) if error.code() == Some("mesh_quota_unsupported")));
+        assert_eq!((charged.known_tokens, charged.reserved_tokens), (18, 10));
+        assert_exhausted(&next).await;
+
+        assert!(matches!(held.next().await, Some(Ok(StreamChunk::Usage(_)))));
+        assert_done(&mut held).await;
+        let settled = scope_status(store.as_ref(), &key, &scope, now).await;
+        assert_eq!((settled.known_tokens, settled.reserved_tokens), (25, 0));
+        assert_exhausted(&next).await;
+
+        store
+            .edit_quota(
+                &key,
+                revision,
+                &scope,
+                QuotaEdit::Update(QuotaLimit::Finite {
+                    tokens: 26,
+                    window: QuotaWindow::Manual,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        let mut next = next.chat_stream(&call).await.unwrap();
+        assert!(matches!(next.next().await, Some(Ok(StreamChunk::Usage(_)))));
+        assert_done(&mut next).await;
         assert_eq!(
-            scope_status(store.as_ref(), &key, &scope, now).await,
-            charged
+            scope_status(store.as_ref(), &key, &scope, now)
+                .await
+                .known_tokens,
+            27
         );
     }
 
     #[tokio::test]
-    async fn hosted_stream_drop_cancels_upstream_and_charges_bound() {
-        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+    async fn hosted_stream_drop_cancels_upstream_and_charges_estimate() {
+        let (_dir, store, key, scope, _, now) = finite_quota_fixture(16).await;
         let (upstream, dropped) = tokio::sync::oneshot::channel::<()>();
         let stream = futures_util::stream::once(async move {
             let _upstream = upstream;
             std::future::pending().await
         });
-        let provider = hosted_stream(Ok(Box::pin(stream)), &key, revision, store.clone());
+        let provider = hosted_stream(Ok(Box::pin(stream)), &key, store.clone());
         let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
         assert!(futures_util::poll!(stream.next()).is_pending());
         assert_eq!(
@@ -598,58 +744,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_stream_survives_cap_edits_with_capacity_and_stops_on_exhaustion() {
-        use std::time::Duration;
-
-        let (_dir, store, key, scope, mut revision, now) = finite_quota_fixture(16).await;
-        let provider = hosted_stream(
-            Ok(Box::pin(futures_util::stream::pending())),
-            &key,
-            revision,
-            store.clone(),
-        );
-        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+    async fn held_stream_survives_lowered_cap_and_reset_readmits_new_work() {
+        let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
+        let call = ChatCall::new(&[]);
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let upstream = futures_util::stream::once(async {
+            wait.await.unwrap();
+            Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            })
+        });
+        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, store.clone());
+        let next = hosted_stream(Ok(terminal_stream(1, 1)), &key, store.clone());
+        let mut stream = provider.chat_stream(&call).await.unwrap();
         let mut pending = stream.next();
         assert!(futures_util::poll!(&mut pending).is_pending());
-        for tokens in [25, 11, 10] {
-            revision = store
-                .edit_quota(
-                    &key,
-                    revision,
-                    &scope,
-                    QuotaEdit::Update(QuotaLimit::Finite {
-                        tokens,
-                        window: QuotaWindow::Manual,
-                    }),
-                    now,
-                )
+        let revision = store
+            .edit_quota(
+                &key,
+                revision,
+                &scope,
+                QuotaEdit::Update(QuotaLimit::Finite {
+                    tokens: 5,
+                    window: QuotaWindow::Manual,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        assert_exhausted(&next).await;
+
+        finish.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), pending)
                 .await
-                .unwrap();
-            if tokens > 10 {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(75), &mut pending)
-                        .await
-                        .is_err()
-                );
-            }
-        }
-        assert!(
-            matches!(tokio::time::timeout(Duration::from_secs(3), pending).await.unwrap(),
-            Some(Err(LLMError::ProviderResponseError(failure))) if failure.code() == Some("mesh_quota_exhausted"))
-        );
+                .unwrap(),
+            Some(Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop
+            }))
+        ));
         let status = scope_status(store.as_ref(), &key, &scope, now).await;
         assert_eq!((status.reserved_tokens, status.estimated_tokens), (0, 10));
+        assert_exhausted(&next).await;
+
+        store
+            .edit_quota(&key, revision, &scope, QuotaEdit::Reset, now)
+            .await
+            .unwrap();
+        let mut next = next.chat_stream(&call).await.unwrap();
+        assert!(matches!(next.next().await, Some(Ok(StreamChunk::Usage(_)))));
+        assert_done(&mut next).await;
+        let status = scope_status(store.as_ref(), &key, &scope, now).await;
+        assert_eq!((status.known_tokens, status.estimated_tokens), (2, 0));
     }
 
     #[tokio::test]
-    async fn hosted_stream_revocation_wakes_a_pending_read_and_charges_bound() {
-        use querymt::chat::StreamChunk;
+    async fn hosted_stream_revocation_wakes_a_pending_read_and_charges_estimate() {
         use std::time::Duration;
 
         let (_dir, store, key, scope, revision, now) = finite_quota_fixture(16).await;
         let upstream = futures_util::stream::iter([Ok(StreamChunk::Text("fixture".into()))])
             .chain(futures_util::stream::pending());
-        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, revision, store.clone());
+        let provider = hosted_stream(Ok(Box::pin(upstream)), &key, store.clone());
         let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
         assert!(
             matches!(stream.next().await, Some(Ok(StreamChunk::Text(text))) if text == "fixture")

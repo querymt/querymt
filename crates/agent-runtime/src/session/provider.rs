@@ -639,11 +639,7 @@ impl SessionProvider {
         let builder_config = resolved_cfg.builder_config;
         let pruned_config_str = resolved_cfg.pruned_config_str;
         #[cfg(feature = "remote")]
-        let mesh_text_stream_limit =
-            crate::agent::remote::provider_host_backend::qualified_text_stream_limit(
-                &factory.config_schema(),
-                &pruned_config_str,
-            );
+        let llama_cpp_n_ctx = llama_cpp_context_limit(factory.name(), &pruned_config_str);
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -702,7 +698,7 @@ impl SessionProvider {
                     output_caps,
                     reasoning_effort,
                     #[cfg(feature = "remote")]
-                    mesh_text_stream_limit,
+                    llama_cpp_n_ctx,
                 });
             }
 
@@ -725,7 +721,7 @@ impl SessionProvider {
                     output_caps,
                     reasoning_effort,
                     #[cfg(feature = "remote")]
-                    mesh_text_stream_limit,
+                    llama_cpp_n_ctx,
                 });
             }
 
@@ -741,7 +737,7 @@ impl SessionProvider {
                 output_caps,
                 reasoning_effort,
                 #[cfg(feature = "remote")]
-                mesh_text_stream_limit,
+                llama_cpp_n_ctx,
             });
         }
 
@@ -752,7 +748,7 @@ impl SessionProvider {
             output_caps,
             reasoning_effort,
             #[cfg(feature = "remote")]
-            mesh_text_stream_limit,
+            llama_cpp_n_ctx,
         })
     }
 }
@@ -778,7 +774,7 @@ impl Clone for SessionProvider {
 pub(crate) struct ProviderSnapshot {
     pub(crate) provider: Arc<dyn LLMProvider>,
     #[cfg(feature = "remote")]
-    pub(crate) mesh_text_stream_limit: Option<i64>,
+    llama_cpp_n_ctx: Option<u64>,
     settings: crate::agent::utils::genai::GenerationSettings,
     /// Output caps resolved with the provider; `None` when unknown.
     output_caps: Option<OutputCaps>,
@@ -786,7 +782,54 @@ pub(crate) struct ProviderSnapshot {
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 }
 
+#[cfg(feature = "remote")]
+fn llama_cpp_context_limit(factory_name: &str, resolved_config: &str) -> Option<u64> {
+    // The logical provider ID can be an alias. Only the native factory's
+    // resolved n_ctx is relevant; a context middleware override is not.
+    if !matches!(factory_name, "llama_cpp" | "llama.cpp") {
+        return None;
+    }
+    let config: serde_json::Value = serde_json::from_str(resolved_config).ok()?;
+    config.get("n_ctx")?.as_u64().filter(|&limit| limit > 0)
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderQuotaInputs {
+    initial_max_tokens: Option<u32>,
+    llama_cpp_n_ctx: Option<u64>,
+    context_fallback: Option<usize>,
+}
+
+#[cfg(feature = "remote")]
+impl ProviderQuotaInputs {
+    pub(crate) fn estimate(
+        self,
+        provider: &str,
+        model: &str,
+        call: &ChatCall<'_>,
+    ) -> querymt_remote::peer_access::quota::QuotaEstimate {
+        querymt_remote::peer_access::quota::QuotaEstimate::for_chat(
+            provider,
+            model,
+            call,
+            self.initial_max_tokens,
+            self.llama_cpp_n_ctx,
+            self.context_fallback,
+        )
+    }
+}
+
 impl ProviderSnapshot {
+    #[cfg(feature = "remote")]
+    pub(crate) fn quota_inputs(&self, context_fallback: Option<usize>) -> ProviderQuotaInputs {
+        ProviderQuotaInputs {
+            initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+            llama_cpp_n_ctx: self.llama_cpp_n_ctx,
+            context_fallback,
+        }
+    }
+
     #[cfg(feature = "remote")]
     async fn remote(provider: querymt_remote::MeshChatProvider) -> SessionResult<Self> {
         let info = provider.negotiate_contract().await?;
@@ -807,7 +850,7 @@ impl ProviderSnapshot {
                 .zip(info.generation.output_ceiling)
                 .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
             reasoning_effort: info.generation.reasoning_effort,
-            mesh_text_stream_limit: None,
+            llama_cpp_n_ctx: None,
         }
     }
 
@@ -855,7 +898,7 @@ pub struct SessionHandle {
     /// every step). A failed init is not cached, so retries still rebuild.
     cached_llm_provider: Arc<tokio::sync::OnceCell<ProviderSnapshot>>,
     #[cfg(feature = "remote")]
-    mesh_turn: Option<Arc<crate::agent::session_actor::PeerTurn>>,
+    mesh_turn: Option<(Arc<crate::agent::session_actor::PeerTurn>, Option<usize>)>,
 }
 
 impl Clone for SessionHandle {
@@ -920,6 +963,7 @@ impl SessionHandle {
         mut self,
         peer: &Arc<crate::agent::session_actor::PeerTurn>,
         grant: &querymt_remote::peer_access::PeerGrant,
+        context_fallback: Option<usize>,
     ) -> Result<Self, crate::error::AgentError> {
         use crate::error::AgentError;
         let config = self
@@ -935,7 +979,7 @@ impl SessionHandle {
         }
         // Never reuse an unguarded provider or route a peer's spend onward.
         self.cached_llm_provider = Arc::new(tokio::sync::OnceCell::new());
-        self.mesh_turn = Some(peer.clone());
+        self.mesh_turn = Some((peer.clone(), context_fallback));
         Ok(self)
     }
 
@@ -1005,7 +1049,7 @@ impl SessionHandle {
                 )
                 .await?;
                 #[cfg(feature = "remote")]
-                if let Some(peer) = &self.mesh_turn {
+                if let Some((peer, context_fallback)) = &self.mesh_turn {
                     let mesh = self.provider.mesh_handle().ok_or_else(|| {
                         SessionError::InvalidOperation("mesh access store unavailable".into())
                     })?;
@@ -1017,14 +1061,14 @@ impl SessionHandle {
                             SessionError::InvalidOperation("mesh access store unavailable".into())
                         })?;
                     let mut built = built;
+                    let quota_inputs = built.quota_inputs(*context_fallback);
                     built.provider = Arc::new(
                         crate::agent::remote::provider_host_backend::hosted_provider(
                             built.provider,
                             peer,
                             store,
-                            config.provider.clone(),
-                            config.model.clone(),
-                            built.mesh_text_stream_limit,
+                            (config.provider.clone(), config.model.clone()),
+                            quota_inputs,
                         ),
                     );
                     return Ok(built);
@@ -1689,6 +1733,15 @@ pub mod tests {
 
     #[cfg(feature = "remote")]
     #[test]
+    fn quota_context_limit_reads_only_the_llama_cpp_factory_config() {
+        let config = r#"{"n_ctx":4096,"speculative":{}}"#;
+        assert_eq!(llama_cpp_context_limit("llama_cpp", config), Some(4096));
+        assert_eq!(llama_cpp_context_limit("fixture", config), None);
+        assert_eq!(llama_cpp_context_limit("llama_cpp", "{}"), None);
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
     fn remote_snapshot_preserves_host_resolved_caps_and_effort() {
         for caps in [
             OutputCaps {
@@ -1705,8 +1758,12 @@ pub mod tests {
                 settings: Default::default(),
                 output_caps: Some(caps),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
-                mesh_text_stream_limit: None,
+                llama_cpp_n_ctx: None,
             };
+            assert_eq!(
+                host.quota_inputs(None).initial_max_tokens,
+                Some(caps.initial)
+            );
             let contract = host.contract_info();
             let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
             assert_eq!(remote.output_caps, Some(caps));

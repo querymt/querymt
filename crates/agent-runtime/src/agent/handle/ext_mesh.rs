@@ -601,43 +601,6 @@ mod access {
             .unwrap_or(Unavailable)
     }
 
-    async fn finite_quota_supported(
-        provider: &crate::session::provider::SessionProvider,
-        id: &str,
-        model: &str,
-    ) -> bool {
-        use crate::agent::remote::provider_host_backend::{
-            has_text_stream_bound, qualified_text_stream_limit,
-        };
-        use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
-        let discovery = async {
-            let binding = provider.provider_resolver().resolve(id).await.ok()?;
-            let schema = binding.factory.config_schema();
-            if !has_text_stream_bound(&schema) {
-                return None;
-            }
-            let defaults = querymt_remote::params_for_remote_provider(provider.initial_params());
-            let resolved = resolve_provider_config(
-                &binding,
-                provider.initial_params(),
-                ProviderConfigMode::Runtime {
-                    model,
-                    params: defaults.as_ref(),
-                    api_key_override: None,
-                    session_id: "standalone",
-                },
-            )
-            .await
-            .ok()?;
-            qualified_text_stream_limit(&schema, &resolved.pruned_config_str)
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(1), discovery)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
     pub(super) async fn dispatch(
         agent: &LocalAgentHandle,
         req: ExtRequest,
@@ -772,19 +735,15 @@ mod access {
         if req.method.as_ref() == "querymt/mesh/getPeerAccess" {
             let mut catalog = Vec::new();
             for (provider_id, models) in local_catalog(&agent.model_inventory) {
-                let mut rows = Vec::with_capacity(models.len());
-                for model_id in models {
-                    let supported =
-                        finite_quota_supported(&agent.config.provider, &provider_id, &model_id)
-                            .await;
-                    rows.push(MeshShareableModel {
-                        model_id,
-                        finite_quota_supported: supported,
-                    });
-                }
                 catalog.push(MeshShareableProvider {
                     provider_id,
-                    models: rows,
+                    models: models
+                        .into_iter()
+                        .map(|model_id| MeshShareableModel {
+                            model_id,
+                            finite_quota_supported: true,
+                        })
+                        .collect(),
                 });
             }
             response.shareable_catalog = Some(catalog);
@@ -909,7 +868,7 @@ mod access {
                 before["shareable_catalog"],
                 json!([{
                     "provider_id": "fixture",
-                    "models": [{"model_id": "old-model", "finite_quota_supported": false}]
+                    "models": [{"model_id": "old-model", "finite_quota_supported": true}]
                 }])
             );
             let before_peer = peer_access(router, &peer, actor.id()).await;

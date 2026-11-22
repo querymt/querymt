@@ -5,10 +5,7 @@
 
 use crate::session::store::LLMConfig;
 use base64::Engine as _;
-use querymt::chat::{
-    ChatInputPart, ChatMessage, ChatMessagePart, ChatOutputItem, ChatRole, MediaKind, MediaPart,
-    MediaSource, ToolResultPart,
-};
+use querymt::chat::{ChatMessage, ChatRole, MediaKind, MediaPart, MediaSource, ToolResultPart};
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 use tracing::instrument;
 
@@ -365,58 +362,8 @@ impl ContentCostEstimator for GenericContentCostEstimator {
 // retain it as a fallback for providers without a counting API.
 #[doc(hidden)]
 pub fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
-    let estimator = GenericContentCostEstimator;
-    messages.iter().fold(0usize, |total, message| {
-        let content_tokens = match message.output() {
-            Some(output) => output.items.iter().fold(0usize, |total, item| {
-                let tokens = match item {
-                    ChatOutputItem::Message(message) => {
-                        message.parts.iter().fold(0usize, |total, part| {
-                            let tokens = match part {
-                                ChatMessagePart::Text { text, .. } => estimator.estimate_text(text),
-                                ChatMessagePart::Refusal { refusal, .. } => {
-                                    estimator.estimate_text(refusal)
-                                }
-                                ChatMessagePart::Media(media) => estimator.estimate_media(media),
-                                ChatMessagePart::Opaque(_) => 0,
-                            };
-                            total.saturating_add(tokens)
-                        })
-                    }
-                    ChatOutputItem::Reasoning(reasoning) => reasoning
-                        .summary
-                        .iter()
-                        .chain(&reasoning.content)
-                        .fold(0usize, |total, part| {
-                            total.saturating_add(estimator.estimate_text(&part.text))
-                        }),
-                    ChatOutputItem::FunctionCall(call) => estimator
-                        .estimate_text(&call.name)
-                        .saturating_add(estimator.estimate_text(&call.arguments)),
-                    ChatOutputItem::Opaque(_) => 0,
-                };
-                total.saturating_add(tokens)
-            }),
-            None => message.input().map_or(0, |parts| {
-                parts.iter().fold(0usize, |total, part| {
-                    let tokens = match part {
-                        ChatInputPart::Text { text } => estimator.estimate_text(text),
-                        ChatInputPart::Attachment(media) => estimator.estimate_media(media),
-                        ChatInputPart::ToolResult(result) => {
-                            estimator.estimate_content(&result.parts).saturating_add(
-                                result
-                                    .name
-                                    .as_deref()
-                                    .map_or(0, |name| estimator.estimate_text(name)),
-                            )
-                        }
-                    };
-                    total.saturating_add(tokens)
-                })
-            }),
-        };
-        // Small allowance for roles, boundaries and tool-result framing.
-        total.saturating_add(content_tokens).saturating_add(4)
+    querymt::chat::estimate_chat_tokens(messages, |media| {
+        GenericContentCostEstimator.estimate_media(media)
     })
 }
 

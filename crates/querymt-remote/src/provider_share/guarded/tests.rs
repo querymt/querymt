@@ -5,8 +5,8 @@ use crate::mesh_ingress::{
 };
 use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaScope, QuotaSettlement, ReservationId,
-    ReservedAttempt,
+    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaEstimate, QuotaScope, QuotaSettlement,
+    ReservationId, ReservedAttempt,
 };
 use crate::peer_access::{
     GrantStore, GrantStoreError, ModelSelection, PeerGrantKey, ProviderGrant, SharingProtocol,
@@ -36,6 +36,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+
+fn estimate() -> QuotaEstimate {
+    QuotaEstimate {
+        reserved_tokens: 25,
+        prompt_tokens: 10,
+    }
+}
 use tokio::time::timeout;
 
 struct Store {
@@ -128,7 +135,7 @@ impl QuotaStore for Store {
         }
         assert_eq!(attempt.provider_id, "fixture");
         assert_eq!(attempt.model_id, "allowed");
-        assert_eq!(attempt.bound_tokens, Some(25));
+        assert_eq!(attempt.estimate.reserved_tokens, 25);
         use std::collections::hash_map::Entry;
         let id = match self
             .attempts
@@ -164,13 +171,7 @@ impl QuotaStore for Store {
     ) -> Result<QuotaSettlement, QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
         self.settled.lock().push((id, usage));
-        Ok(
-            if matches!(usage, AttemptUsage::Observed(tokens) if tokens > 25) {
-                QuotaSettlement::BoundExceeded
-            } else {
-                QuotaSettlement::Recorded
-            },
-        )
+        Ok(QuotaSettlement::Recorded)
     }
     async fn reconcile_startup(&self, _: &NodeId) -> Result<(), QuotaError> {
         unreachable!("no persisted state")
@@ -227,8 +228,12 @@ impl RemoteProviderBackend for Backend {
         Some(serde_json::json!({"base_url": "https://example.test/provider", "max_tokens": 20}))
     }
 
-    fn quota_bound(&self, _: &ProviderBuildRequest, _: &ChatCall<'_>) -> Option<i64> {
-        Some(25)
+    async fn prepare_chat(
+        &self,
+        request: ProviderBuildRequest,
+        _: &ChatCall<'_>,
+    ) -> Result<(Arc<dyn LLMProvider>, QuotaEstimate), Self::Error> {
+        Ok((self.build_provider(request).await?, estimate()))
     }
 
     async fn build_provider(
@@ -1469,7 +1474,7 @@ async fn dropping_reservation_future_releases_a_late_commit_without_charging() {
             provider_id: "fixture".into(),
             model_id: "allowed".into(),
             request_id: Uuid::now_v7(),
-            bound_tokens: Some(25),
+            estimate: estimate(),
             now: 0,
         },
     ));
@@ -1523,7 +1528,7 @@ async fn hosted_provider_requires_session_access_and_never_passes_unmetered_meth
         peer,
         SharingProtocol::V1,
         ("fixture".into(), "allowed".into()),
-        |_, _| Some(25),
+        |_| estimate(),
     );
     assert!(provider.capabilities().streaming);
     let error = provider.chat(&ChatCall::new(&[])).await.unwrap_err();
@@ -1543,7 +1548,7 @@ async fn hosted_provider_requires_session_access_and_never_passes_unmetered_meth
 }
 
 #[tokio::test]
-async fn hosted_stream_never_reports_success_when_usage_exceeds_the_bound() {
+async fn hosted_stream_reports_success_and_actual_usage_above_the_estimate() {
     use futures_util::StreamExt;
 
     let store = Arc::new(Store::default());
@@ -1563,18 +1568,15 @@ async fn hosted_stream_never_reports_success_when_usage_exceeds_the_bound() {
         peer,
         SharingProtocol::V1,
         ("fixture".into(), "allowed".into()),
-        |_, streaming| {
-            assert!(streaming);
-            Some(25)
-        },
+        |_| estimate(),
     );
     let stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
     finish_stream.notify_one();
     let mut chunks = timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
         .await
         .unwrap();
-    let error = chunks.pop().expect("missing terminal error").unwrap_err();
-    assert_eq!(code(policy_error(error)), "mesh_quota_bound_exceeded");
+    let terminal = chunks.pop().expect("missing terminal chunk").unwrap();
+    assert!(querymt::chat::chunk_is_terminal(&terminal));
     assert!(
         chunks
             .into_iter()

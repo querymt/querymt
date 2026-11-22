@@ -156,7 +156,6 @@ impl EventForwarder {
                                 .then_some(())
                                 .ok_or(())
                         },
-                        |_| None,
                         || (),
                     )
                     .await;

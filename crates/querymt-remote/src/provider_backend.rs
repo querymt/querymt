@@ -1,5 +1,8 @@
+use crate::peer_access::quota::QuotaEstimate;
 use async_trait::async_trait;
 use querymt::LLMProvider;
+use querymt::chat::{ChatCall, estimate_chat_tokens};
+use querymt::providers::{ModelInfo, providers_registry};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -40,29 +43,27 @@ pub trait RemoteProviderBackend: Send + Sync {
         request: ProviderBuildRequest,
     ) -> Result<Arc<dyn LLMProvider>, Self::Error>;
 
-    /// Return a conservative total-token bound for this exact prepared call on
-    /// the host binding. The backend must enforce the output ceiling and account
-    /// for all instructions, tools, media, cached tokens, and reasoning. Leave
-    /// unsupported requests unbounded; a heuristic estimate is not sufficient.
-    fn quota_bound(
-        &self,
-        _request: &ProviderBuildRequest,
-        _call: &querymt::chat::ChatCall<'_>,
-    ) -> Option<i64> {
-        None
-    }
-
-    /// Prepare the exact binding and resolve the bound for one dispatch mode.
-    /// Implementations may use qualified host-side facts from the resolved config.
+    /// Prepare the binding and estimate the request without dispatching it.
     async fn prepare_chat(
         &self,
         request: ProviderBuildRequest,
-        call: &querymt::chat::ChatCall<'_>,
-        _streaming: bool,
-    ) -> Result<(Arc<dyn LLMProvider>, Option<i64>), Self::Error> {
-        let bound = self.quota_bound(&request, call);
+        call: &ChatCall<'_>,
+    ) -> Result<(Arc<dyn LLMProvider>, QuotaEstimate), Self::Error> {
+        let param = |key: &str| request.params.as_ref()?.get(key)?.as_u64();
+        let output_cap = param("max_tokens").and_then(|cap| u32::try_from(cap).ok());
+        let n_ctx = matches!(request.provider_name.as_str(), "llama_cpp" | "llama-cpp")
+            .then(|| param("n_ctx"))
+            .flatten();
+        let estimate = QuotaEstimate::for_chat(
+            &request.provider_name,
+            &request.model,
+            call,
+            output_cap,
+            n_ctx,
+            None,
+        );
         let provider = self.build_provider(request).await?;
-        Ok((provider, bound))
+        Ok((provider, estimate))
     }
 
     /// Resolve facts before the first chat request. Backends with generation
@@ -78,6 +79,57 @@ pub trait RemoteProviderBackend: Send + Sync {
             capabilities: provider.capabilities(),
             generation: Default::default(),
         })
+    }
+}
+
+impl QuotaEstimate {
+    /// Estimate chat usage for a host-resolved binding, not as a hard bound.
+    pub fn for_chat(
+        provider: &str,
+        model: &str,
+        call: &ChatCall<'_>,
+        output_cap: Option<u32>,
+        n_ctx: Option<u64>,
+        profile_fallback: Option<usize>,
+    ) -> Self {
+        let registry = providers_registry().ok();
+        let model = registry.as_ref().and_then(|r| r.get_model(provider, model));
+        Self::from_call(call, model, output_cap, n_ctx, profile_fallback)
+    }
+
+    fn from_call(
+        call: &ChatCall<'_>,
+        model: Option<&ModelInfo>,
+        output_cap: Option<u32>,
+        n_ctx: Option<u64>,
+        profile_fallback: Option<usize>,
+    ) -> Self {
+        // Attachments are charged through reported usage, not a separate allowance.
+        let prompt = estimate_chat_tokens(call.messages, |_| 0);
+        let tools = call.tools.and_then(|tools| serde_json::to_vec(tools).ok());
+        let prompt = prompt.saturating_add(tools.map_or(0, |json| json.len().div_ceil(4)));
+        let prompt_tokens = i64::try_from(prompt).unwrap_or(i64::MAX);
+        let output = call
+            .options
+            .max_tokens
+            .or(output_cap)
+            .map(u64::from)
+            .or_else(|| model.and_then(ModelInfo::output_limit))
+            .unwrap_or(32_000);
+        let ceiling = n_ctx.filter(|n| *n > 0).or_else(|| match model {
+            Some(model) => model.context_limit(),
+            // models.dev has no entry, so the profile fallback is the only configured
+            // context size we have. ContextMiddleware uses it for the same case.
+            None => profile_fallback.and_then(|n| u64::try_from(n).ok()),
+        });
+        let total = prompt_tokens.saturating_add(i64::try_from(output).unwrap_or(i64::MAX));
+        Self {
+            reserved_tokens: ceiling
+                .and_then(|cap| i64::try_from(cap).ok())
+                .map_or(total, |cap| total.min(cap))
+                .max(1),
+            prompt_tokens,
+        }
     }
 }
 
@@ -141,6 +193,56 @@ mod tests {
             );
             Ok(Arc::new(DummyProvider))
         }
+    }
+
+    #[test]
+    fn reservation_uses_model_limits_and_the_effective_output_cap() {
+        use querymt::chat::{ChatMessage, GenerationOptions};
+        let model: ModelInfo = serde_json::from_value(json!({
+            "id": "model", "name": "Model", "limit": {"context": 60, "output": 40}
+        }))
+        .unwrap();
+        let messages = [ChatMessage::user().text("abcdefgh").build()];
+        let call = ChatCall::new(&messages);
+        let estimate = |call: &ChatCall<'_>, cap, n_ctx| {
+            QuotaEstimate::from_call(call, Some(&model), cap, n_ctx, Some(3))
+        };
+        assert_eq!(estimate(&call, None, None).prompt_tokens, 6);
+        assert_eq!(estimate(&call, None, None).reserved_tokens, 46);
+        assert_eq!(estimate(&call, Some(100), None).reserved_tokens, 60);
+        assert_eq!(estimate(&call, Some(100), Some(50)).reserved_tokens, 50);
+        let explicit = call.options(GenerationOptions::default().with_max_tokens(20));
+        assert_eq!(estimate(&explicit, Some(100), None).reserved_tokens, 26);
+    }
+
+    #[test]
+    fn reservation_uses_profile_fallback_only_for_a_model_missing_from_models_dev() {
+        let call = ChatCall::new(&[]);
+        assert_eq!(
+            QuotaEstimate::from_call(&call, None, None, None, Some(500)).reserved_tokens,
+            500
+        );
+        assert_eq!(
+            QuotaEstimate::from_call(&call, None, None, None, None).reserved_tokens,
+            32_000
+        );
+        let model: ModelInfo =
+            serde_json::from_value(json!({"id": "model", "name": "Model"})).unwrap();
+        assert_eq!(
+            QuotaEstimate::from_call(&call, Some(&model), None, None, Some(500)).reserved_tokens,
+            32_000
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_backend_estimates_from_host_params_without_model_metadata() {
+        let request =
+            ProviderBuildRequest::new("demo", "m1").with_params(Some(json!({"max_tokens": 128})));
+        let (_, estimate) = DummyBackend
+            .prepare_chat(request, &ChatCall::new(&[]))
+            .await
+            .unwrap();
+        assert_eq!(estimate.reserved_tokens, 128);
     }
 
     #[test]

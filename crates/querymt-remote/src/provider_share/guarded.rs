@@ -216,7 +216,7 @@ impl GuardedProvider {
         let call = ChatCall::new(&msg.messages)
             .maybe_tools(msg.tools.as_deref())
             .options(msg.options.unwrap_or_default());
-        self.prepare(peer, request, &call, request_id, false)
+        self.prepare(peer, request, &call, request_id)
             .await?
             .chat(&call)
             .await
@@ -230,17 +230,17 @@ impl GuardedProvider {
         request: ProviderBuildRequest,
         call: &ChatCall<'_>,
         request_id: Uuid,
-        streaming: bool,
     ) -> Result<MeteredProvider, RemoteProviderHostError> {
         let access = self.access(peer, &request.provider_name, &request.model)?;
         access.check().await.map_err(policy_error)?;
-        // Preparation may need the local tokenizer; it cannot dispatch inference.
-        let (provider, bound) = tokio::select! {
+        let (provider, estimate) = tokio::select! {
             biased;
             error = access.revocation() => return Err(policy_error(error)),
-            result = self.backend.prepare_chat(request, call, streaming) => result?,
+            result = self.backend.prepare_chat(request, call) => result?,
         };
-        Ok(MeteredProvider::direct(provider, access, bound, request_id))
+        Ok(MeteredProvider::direct(
+            provider, access, estimate, request_id,
+        ))
     }
 }
 

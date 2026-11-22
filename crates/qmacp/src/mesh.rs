@@ -213,7 +213,6 @@ pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Valu
                                     | "mesh_quota_reconfigure_required"
                                     | "mesh_quota_in_flight"
                                     | "mesh_access_denied"
-                                    | "mesh_quota_unsupported"
                             )
                         });
                 let mut recovery = json!({

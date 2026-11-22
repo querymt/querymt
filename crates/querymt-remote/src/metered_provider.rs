@@ -17,12 +17,12 @@ use uuid::Uuid;
 
 use crate::ProviderCatalogBackend;
 use crate::peer_access::quota::{
-    AttemptUsage, DispatchedAttempt, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore,
+    AttemptUsage, DispatchedAttempt, QuotaAttempt, QuotaError, QuotaEstimate, QuotaStore,
     ReservedAttempt, StreamMeter,
 };
 use crate::peer_access::{PeerGrant, PeerGrantKey, SharingProtocol, wait_for_policy_loss};
 
-type Bound = dyn Fn(&ChatCall<'_>, bool) -> Option<i64> + Send + Sync;
+type Estimate = dyn Fn(&ChatCall<'_>) -> QuotaEstimate + Send + Sync;
 type Revocation = Pin<Box<dyn Future<Output = LLMError> + Send>>;
 
 #[derive(Clone)]
@@ -104,12 +104,6 @@ impl MeteredAccess {
                 &access.peer,
                 changes,
                 |grant| access.check_grant(grant),
-                |limit| {
-                    limit
-                        .scope
-                        .covers(&access.provider, &access.model)
-                        .then(|| QuotaError::Exhausted(vec![limit.clone()]).into_provider_error())
-                },
                 denied,
             )
             .await
@@ -123,20 +117,19 @@ impl MeteredAccess {
 pub struct MeteredProvider {
     inner: Arc<dyn LLMProvider>,
     access: MeteredAccess,
-    bound: Arc<Bound>,
+    estimate: Arc<Estimate>,
     request_id: Option<Uuid>,
 }
 
 impl MeteredProvider {
-    /// Wrap a pinned provider for a hosted turn. `bound` uses its effective local
-    /// configuration to determine whether a call qualifies for finite quota.
+    /// Wrap a pinned provider for a hosted turn using its effective local configuration.
     pub fn hosted(
         inner: Arc<dyn LLMProvider>,
         store: Arc<dyn QuotaStore>,
         peer: PeerGrantKey,
         protocol: SharingProtocol,
         binding: (String, String),
-        bound: impl Fn(&ChatCall<'_>, bool) -> Option<i64> + Send + Sync + 'static,
+        estimate: impl Fn(&ChatCall<'_>) -> QuotaEstimate + Send + Sync + 'static,
     ) -> Self {
         let (provider, model) = binding;
         Self {
@@ -149,7 +142,7 @@ impl MeteredProvider {
                 model,
                 catalog: None,
             },
-            bound: Arc::new(bound),
+            estimate: Arc::new(estimate),
             request_id: None,
         }
     }
@@ -158,25 +151,21 @@ impl MeteredProvider {
     pub(crate) fn direct(
         inner: Arc<dyn LLMProvider>,
         access: MeteredAccess,
-        bound: Option<i64>,
+        estimate: QuotaEstimate,
         request_id: Uuid,
     ) -> Self {
         Self {
             inner,
             access,
-            bound: Arc::new(move |_, _| bound),
+            estimate: Arc::new(move |_| estimate),
             request_id: Some(request_id),
         }
     }
 
-    pub(crate) async fn reserve(
-        &self,
-        call: &ChatCall<'_>,
-        streaming: bool,
-    ) -> Result<ReservedAttempt, LLMError> {
+    pub(crate) async fn reserve(&self, call: &ChatCall<'_>) -> Result<ReservedAttempt, LLMError> {
         let request_id = self.request_id.unwrap_or_else(Uuid::new_v4);
-        let bound_tokens = (self.bound)(call, streaming);
         self.access.check().await?;
+        let estimate = (self.estimate)(call);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -192,7 +181,7 @@ impl MeteredProvider {
                 provider_id: self.access.provider.clone(),
                 model_id: self.access.model.clone(),
                 request_id,
-                bound_tokens,
+                estimate,
                 now,
             }) => result.map_err(QuotaError::into_provider_error),
         }
@@ -270,18 +259,10 @@ impl MeteredProvider {
         attempt: DispatchedAttempt,
         usage: AttemptUsage,
     ) -> Result<(), LLMError> {
-        if attempt
+        attempt
             .settle(usage)
             .await
-            .map_err(QuotaError::into_provider_error)?
-            == QuotaSettlement::BoundExceeded
-        {
-            return Err(failure(
-                ProviderErrorKind::UnknownPermanent,
-                "mesh_quota_bound_exceeded",
-                "provider exceeded its enforced token bound",
-            ));
-        }
+            .map_err(QuotaError::into_provider_error)?;
         self.access.check().await
     }
 }
@@ -308,7 +289,7 @@ impl ChatProvider for MeteredProvider {
             biased;
             error = &mut revoked => return Err(error),
             result = async {
-                self.reserve(call, false).await?.begin().await.map_err(QuotaError::into_provider_error)
+                self.reserve(call).await?.begin().await.map_err(QuotaError::into_provider_error)
             } => result?,
         };
         let output = tokio::select! {
@@ -326,7 +307,7 @@ impl ChatProvider for MeteredProvider {
     }
 
     async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
-        let reserved = self.reserve(call, true).await?;
+        let reserved = self.reserve(call).await?;
         self.stream_reserved(call, reserved).await
     }
 }

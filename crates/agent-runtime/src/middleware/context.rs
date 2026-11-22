@@ -250,6 +250,11 @@ impl MiddlewareDriver for ContextMiddleware {
         "ContextMiddleware"
     }
 
+    #[cfg(feature = "remote")]
+    fn fallback_context_tokens(&self) -> Option<usize> {
+        Some(self.config.fallback_max_tokens)
+    }
+
     fn supports_restricted_mesh(&self) -> bool {
         true
     }

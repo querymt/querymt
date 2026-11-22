@@ -2880,7 +2880,10 @@ mod node_manager_tests {
                 provider_id: "mock".into(),
                 model_id: "fixture".into(),
                 request_id: Uuid::now_v7(),
-                bound_tokens: Some(20),
+                estimate: querymt_remote::peer_access::quota::QuotaEstimate {
+                    reserved_tokens: 20,
+                    prompt_tokens: 5,
+                },
                 now,
             })
             .await

@@ -131,7 +131,7 @@ pub struct QuotaStatus {
 }
 
 /// An authorized inference preparation. The caller must derive the peer from the
-/// transport and use host-resolved IDs and a host-observed upper bound.
+/// transport and use host-resolved IDs and a host-computed estimate.
 #[derive(Debug, Clone)]
 pub struct QuotaAttempt {
     pub peer: PeerGrantKey,
@@ -141,10 +141,16 @@ pub struct QuotaAttempt {
     pub model_id: String,
     /// Stable for retransmissions; a new upstream attempt needs a new ID.
     pub request_id: Uuid,
-    /// `None` means the prepared request cannot be conservatively bounded.
-    pub bound_tokens: Option<i64>,
+    pub estimate: QuotaEstimate,
     /// Host wall clock at admission, in Unix seconds UTC.
     pub now: i64,
+}
+
+/// Host-side estimate used for reservation and missing-usage accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaEstimate {
+    pub reserved_tokens: i64,
+    pub prompt_tokens: i64,
 }
 
 /// Handle returned by the store for a newly reserved upstream attempt.
@@ -186,13 +192,21 @@ impl AttemptUsage {
     }
 }
 
+/// Code-only policy for charging missing usage in finite quota periods.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownUsageCharge {
+    /// Charge the full reservation.
+    #[default]
+    Reserved,
+    /// Charge the estimated prompt, or the reservation if no prompt estimate was stored.
+    EstimatedPrompt,
+}
+
 /// Result of committing an attempt's settlement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaSettlement {
     Recorded,
     AlreadyFinal,
-    /// Actual usage was recorded and the binding was suspended for finite requests.
-    BoundExceeded,
 }
 
 /// A rejected quota mutation or inference admission.
@@ -210,8 +224,6 @@ pub enum QuotaError {
     Denied,
     #[error("quota exhausted")]
     Exhausted(Vec<LimitingQuota>),
-    #[error("finite quota cannot be enforced for this request")]
-    Unsupported(QuotaScope),
     #[error("quota kind or window changes require explicit reconfiguration")]
     ReconfigureRequired,
     #[error("scope has outstanding attempts")]
@@ -229,7 +241,6 @@ pub enum QuotaError {
 #[serde(untagged, deny_unknown_fields)]
 pub enum QuotaDenialDetails {
     Limits { limits: Vec<LimitingQuota> },
-    Scope { scope: QuotaScope },
 }
 
 const DENIAL_DETAILS_PREFIX: &str = "querymt.mesh.quota.v1:";
@@ -237,13 +248,11 @@ const DENIAL_DETAILS_PREFIX: &str = "querymt.mesh.quota.v1:";
 impl QuotaDenialDetails {
     /// Decode only the metadata matching this mesh policy error's code.
     pub fn from_provider_metadata(code: &str, error_type: Option<&str>) -> Option<Self> {
-        let payload = error_type?.strip_prefix(DENIAL_DETAILS_PREFIX)?;
-        let details = serde_json::from_str(payload).ok()?;
-        match (code, &details) {
-            ("mesh_quota_exhausted", Self::Limits { .. })
-            | ("mesh_quota_unsupported", Self::Scope { .. }) => Some(details),
-            _ => None,
+        if code != "mesh_quota_exhausted" {
+            return None;
         }
+        let payload = error_type?.strip_prefix(DENIAL_DETAILS_PREFIX)?;
+        serde_json::from_str(payload).ok()
     }
 }
 
@@ -256,10 +265,6 @@ impl QuotaError {
                 (ProviderErrorKind::Authentication, "mesh_access_denied")
             }
             Self::Exhausted(_) => (ProviderErrorKind::QuotaExceeded, "mesh_quota_exhausted"),
-            Self::Unsupported(_) => (
-                ProviderErrorKind::UnsupportedOperation,
-                "mesh_quota_unsupported",
-            ),
             Self::DuplicateAttempt => (
                 ProviderErrorKind::InvalidRequest,
                 "mesh_quota_duplicate_attempt",
@@ -279,7 +284,6 @@ impl QuotaError {
         };
         let details = match self {
             Self::Exhausted(limits) => Some(QuotaDenialDetails::Limits { limits }),
-            Self::Unsupported(scope) => Some(QuotaDenialDetails::Scope { scope }),
             _ => None,
         };
         // Keep the native provider error layout unchanged. The existing optional
@@ -301,63 +305,39 @@ mod tests {
 
     #[test]
     fn quota_denial_details_survive_the_provider_wire_and_stay_bound_to_the_error_code() {
-        let scope = QuotaScope {
-            provider_id: "fixture".into(),
-            model_id: Some("small".into()),
-        };
         let limits = vec![LimitingQuota {
-            scope: scope.clone(),
-            available_tokens: 9_007_199_254_740_993,
+            scope: QuotaScope {
+                provider_id: "fixture".into(),
+                model_id: Some("small".into()),
+            },
+            available_tokens: 0,
             next_reset_at: Some(1_800_000_000),
         }];
-        for (denial, expected_kind, code, expected_details) in [
-            (
-                QuotaError::Exhausted(limits.clone()),
-                ProviderErrorKind::QuotaExceeded,
-                "mesh_quota_exhausted",
-                QuotaDenialDetails::Limits { limits },
-            ),
-            (
-                QuotaError::Unsupported(scope.clone()),
-                ProviderErrorKind::UnsupportedOperation,
-                "mesh_quota_unsupported",
-                QuotaDenialDetails::Scope { scope },
-            ),
-        ] {
-            let payload = denial.into_provider_error().to_payload();
-            let LLMError::ProviderResponseError(failure) = LLMError::from_payload(payload) else {
-                panic!("quota denial lost its provider failure type");
-            };
-            assert_eq!(failure.kind(), expected_kind);
-            assert_eq!(failure.code(), Some(code));
-            let details =
-                QuotaDenialDetails::from_provider_metadata(code, failure.error_type()).unwrap();
-            assert_eq!(
-                serde_json::to_value(details).unwrap(),
-                serde_json::to_value(expected_details).unwrap()
-            );
+        let code = "mesh_quota_exhausted";
+        let payload = QuotaError::Exhausted(limits.clone())
+            .into_provider_error()
+            .to_payload();
+        let LLMError::ProviderResponseError(failure) = LLMError::from_payload(payload) else {
+            panic!("quota denial lost its provider failure type");
+        };
+        assert_eq!(failure.kind(), ProviderErrorKind::QuotaExceeded);
+        assert_eq!(failure.code(), Some(code));
+        let QuotaDenialDetails::Limits { limits: decoded } =
+            QuotaDenialDetails::from_provider_metadata(code, failure.error_type()).unwrap();
+        assert_eq!(decoded, limits);
+        for other_code in ["mesh_access_denied", "mesh_quota_unsupported"] {
             assert!(
-                QuotaDenialDetails::from_provider_metadata(
-                    "mesh_access_denied",
-                    failure.error_type()
-                )
-                .is_none()
+                QuotaDenialDetails::from_provider_metadata(other_code, failure.error_type())
+                    .is_none()
             );
         }
-        assert!(
-            QuotaDenialDetails::from_provider_metadata(
-                "mesh_quota_exhausted",
-                Some("rate_limited")
-            )
-            .is_none()
-        );
-        assert!(
-            QuotaDenialDetails::from_provider_metadata(
-                "mesh_quota_exhausted",
-                Some("querymt.mesh.quota.v1:bad-json")
-            )
-            .is_none()
-        );
+        for metadata in [
+            "rate_limited",
+            "querymt.mesh.quota.v1:bad-json",
+            r#"querymt.mesh.quota.v1:{"scope":{"provider_id":"fixture"}}"#,
+        ] {
+            assert!(QuotaDenialDetails::from_provider_metadata(code, Some(metadata)).is_none());
+        }
     }
 
     #[test]
