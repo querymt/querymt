@@ -1,6 +1,7 @@
 use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
 use crate::context::{apply_context_params, resolve_n_batch, resolve_n_ubatch};
+use crate::lora::{Models, new_target_context};
 use crate::response::GenerationTermination;
 use crate::tools::sampler::{ConstrainedSampler, SamplingParams, build_standard_sampler};
 use llama_cpp_2::context::LlamaContext;
@@ -75,8 +76,7 @@ fn validate_models(target: &LlamaModel, draft: &LlamaModel) -> Result<(), LLMErr
 /// The callback returns `false` to stop generation, for example after a stop
 /// sequence or when a stream receiver has disconnected.
 pub(crate) fn run_mtp(
-    model: &Arc<LlamaModel>,
-    draft_model: Option<&Arc<LlamaModel>>,
+    models: Models<'_>,
     cfg: &LlamaCppConfig,
     prompt: &str,
     max_tokens: u32,
@@ -89,7 +89,8 @@ pub(crate) fn run_mtp(
         .as_ref()
         .ok_or_else(|| LLMError::InvalidRequest("speculative decoding is not configured".into()))?;
     let spec_params = speculative_cfg.params().map_err(LLMError::InvalidRequest)?;
-    let draft_model = draft_model.map_or(model.as_ref(), Arc::as_ref);
+    let model = models.target;
+    let draft_model = models.draft.map_or(model.as_ref(), Arc::as_ref);
     validate_models(model, draft_model)?;
 
     let tokens = model
@@ -150,9 +151,14 @@ pub(crate) fn run_mtp(
     }
 
     let backend = llama_backend()?;
-    let target_ctx = model.new_context(&backend, target_params).map_err(|e| {
-        LLMError::ProviderError(format!("Failed to create MTP target context: {e}"))
-    })?;
+    let target_ctx =
+        new_target_context(models, &backend, target_params, None, &cfg.lora).map_err(|err| {
+            err.into_llm_error(|e| {
+                LLMError::ProviderError(format!("Failed to create MTP target context: {e}"))
+            })
+        })?;
+    // The draft context intentionally gets no LoRA adapter: the draft head was
+    // not trained with it, and the target verifies every draft token.
     let draft_ctx = draft_model
         .new_context(&backend, draft_params)
         .map_err(|e| LLMError::ProviderError(format!("Failed to create MTP draft context: {e}")))?;

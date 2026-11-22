@@ -5,6 +5,7 @@ mod config;
 mod context;
 mod gbnf;
 mod generation;
+mod lora;
 mod memory;
 mod messages;
 mod mtp;
@@ -17,7 +18,10 @@ mod template;
 mod test_vocab;
 mod tools;
 
-pub use config::{GrammarBackend, LlamaCppConfig, SpeculativeConfig, SpeculativeType, SplitMode};
+pub use config::{
+    GrammarBackend, LlamaCppConfig, LoraAdapterConfig, LoraScale, LoraScaleError,
+    SpeculativeConfig, SpeculativeType, SplitMode,
+};
 use provider::LlamaCppProvider;
 
 /// Create a provider directly from a config struct (useful for testing and embedding).

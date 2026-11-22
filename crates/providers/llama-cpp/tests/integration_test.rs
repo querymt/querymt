@@ -11,6 +11,10 @@ fn test_config_schema_generation() {
     let schema = schema_for!(LlamaCppConfig);
     let schema = schema.as_value();
     assert!(schema["properties"]["speculative"].is_object());
+    assert!(schema["properties"]["lora"].is_object());
+    let adapter = &schema["$defs"]["LoraAdapterConfig"]["properties"];
+    assert!(adapter["path"].is_object());
+    assert!(adapter["scale"].is_object());
     let schema_json = serde_json::to_string(schema).unwrap();
     assert!(schema_json.contains("mtp"));
     assert!(!schema_json.contains("draft-dflash"));
@@ -26,10 +30,6 @@ fn test_config_serialization() {
         top_p: Some(0.9),
         min_p: Some(0.0),
         top_k: Some(40),
-        repeat_penalty: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        penalty_last_n: None,
         system: vec!["System prompt".to_string()],
         n_ctx: Some(2048),
         n_batch: Some(512),
@@ -37,15 +37,11 @@ fn test_config_serialization() {
         n_threads_batch: Some(4),
         n_gpu_layers: Some(33),
         seed: Some(42),
-        chat_template: None,
         use_chat_template: Some(true),
         add_bos: Some(true),
-        log: None,
         enable_thinking: Some(true),
         reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
         preserve_reasoning: Some(true),
-        thinking_budget: None,
-        flash_attention: None,
         kv_cache_type_k: Some("q4_0".to_string()),
         kv_cache_type_v: Some("q4_0".to_string()),
         mmproj_path: Some("/path/to/mmproj.gguf".to_string()),
@@ -53,15 +49,7 @@ fn test_config_serialization() {
         mmproj_threads: Some(4),
         mmproj_use_gpu: Some(true),
         n_ubatch: Some(4096),
-        text_only: None,
-        speculative: None,
-        backend_sampling: None,
-        json_schema: None,
-        grammar_backend: None,
-        devices: None,
-        tensor_split: None,
-        split_mode: None,
-        main_gpu: None,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&config).expect("Failed to serialize config");

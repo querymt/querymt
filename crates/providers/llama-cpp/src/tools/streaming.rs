@@ -2,33 +2,34 @@ use crate::chat_format::ParsedDelta;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::generation::decode_token_piece;
-use crate::multimodal::MultimodalContext;
+use crate::lora::Models;
+use crate::multimodal::MediaInputs;
 use crate::response::GenerationTermination;
 use crate::tools::generation::parse_tool_response;
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// Generate text with streaming and grammar-constrained sampling for tool calls.
 /// Returns usage, termination, and whether tool calls were made.
 pub(crate) fn generate_streaming_with_tools(
-    model: &Arc<LlamaModel>,
+    models: Models<'_>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
     tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
-    mm_ctx: Option<&MultimodalContext>,
-    bitmaps: &[MtmdBitmap],
+    media: MediaInputs<'_>,
 ) -> Result<(Usage, GenerationTermination, bool), LLMError> {
+    let model = models.target;
+    let MediaInputs {
+        ctx: mm_ctx,
+        bitmaps,
+    } = media;
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
         let sampler = if let Some(schema) = cfg.structured_schema() {
@@ -53,8 +54,7 @@ pub(crate) fn generate_streaming_with_tools(
         let mut stream_state = result.streaming_state();
         let mut reasoning = result.reasoning_counter();
         let stats = crate::mtp::run_mtp(
-            model,
-            mtp_model,
+            models,
             cfg,
             &result.prompt,
             max_tokens,
@@ -135,8 +135,7 @@ pub(crate) fn generate_streaming_with_tools(
             has_calls,
         ));
     }
-    let mut state =
-        prefill_for_tool_generation(model, cfg, &result.prompt, max_tokens, mm_ctx, bitmaps)?;
+    let mut state = prefill_for_tool_generation(models, cfg, &result.prompt, max_tokens, media)?;
 
     log::debug!(
         "Streaming generation with tools: input_tokens={}, max_tokens={}, has_multimodal={}",
@@ -228,25 +227,24 @@ pub(crate) fn generate_streaming_with_tools(
         for delta in stream_state.update(&chunk, !stop_now) {
             // In tool-capable streaming, buffer normal text until final parse so
             // partially generated tool syntax never leaks to the UI.
-            if let ParsedDelta::Thinking(thinking) = delta {
-                if tx
+            if let ParsedDelta::Thinking(thinking) = delta
+                && tx
                     .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                     .is_err()
-                {
-                    let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
-                    return Ok((
-                        Usage {
-                            input_tokens: state.input_tokens,
-                            output_tokens,
-                            cache_read: 0,
-                            cache_write: 0,
-                            reasoning_tokens,
-                            cache_write_tiers: None,
-                        },
-                        GenerationTermination::ConsumerClosed,
-                        false,
-                    ));
-                }
+            {
+                let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
+                return Ok((
+                    Usage {
+                        input_tokens: state.input_tokens,
+                        output_tokens,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning_tokens,
+                        cache_write_tiers: None,
+                    },
+                    GenerationTermination::ConsumerClosed,
+                    false,
+                ));
             }
         }
 
@@ -300,25 +298,24 @@ pub(crate) fn generate_streaming_with_tools(
     }
 
     for delta in stream_state.finish() {
-        if let ParsedDelta::Thinking(thinking) = delta {
-            if tx
+        if let ParsedDelta::Thinking(thinking) = delta
+            && tx
                 .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                 .is_err()
-            {
-                let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
-                return Ok((
-                    Usage {
-                        input_tokens: state.input_tokens,
-                        output_tokens,
-                        cache_read: 0,
-                        cache_write: 0,
-                        reasoning_tokens,
-                        cache_write_tiers: None,
-                    },
-                    GenerationTermination::ConsumerClosed,
-                    false,
-                ));
-            }
+        {
+            let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
+            return Ok((
+                Usage {
+                    input_tokens: state.input_tokens,
+                    output_tokens,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens,
+                    cache_write_tiers: None,
+                },
+                GenerationTermination::ConsumerClosed,
+                false,
+            ));
         }
     }
 

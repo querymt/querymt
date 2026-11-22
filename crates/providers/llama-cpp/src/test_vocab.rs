@@ -385,11 +385,35 @@ pub(crate) const MTP_MODEL: HfFile = HfFile {
     file: "Qwen3.5-0.8B-Q4_0.gguf",
 };
 
+/// Base model of llama.cpp's own LoRA test pair (`tools/server/tests/unit/test_lora.py`).
+pub(crate) const LORA_BASE_MODEL: HfFile = HfFile {
+    repo: "ggml-org-dev/stories15M_MOE",
+    rev: "b79d85fd44cb281d525c0f75e79b522b9fdf714b",
+    file: "stories15M_MOE-F16.gguf",
+};
+
+/// The LoRA adapter that matches [`LORA_BASE_MODEL`].
+pub(crate) const LORA_ADAPTER: HfFile = HfFile {
+    repo: "ggml-org-dev/stories15M_MOE",
+    rev: "b79d85fd44cb281d525c0f75e79b522b9fdf714b",
+    file: "moe_shakespeare15M.gguf",
+};
+
 /// Whole model file (521 MB for [`MTP_MODEL`]), cached next to the vocabularies.
 pub(crate) fn ensure_full_model(hf: &HfFile) -> Result<PathBuf, VocabError> {
+    // Serializes downloads within this process (tests run as threads).
+    static DOWNLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let dir = cache_dir();
     let path = dir.join(format!("{}--{}", &hf.rev[..12], hf.file));
-    if path.metadata().is_ok_and(|m| m.len() > 0) {
+    let cached = || path.metadata().is_ok_and(|m| m.len() > 0);
+    if cached() {
+        return Ok(path);
+    }
+    let _guard = DOWNLOAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Another thread may have finished the download while we waited.
+    if cached() {
         return Ok(path);
     }
     let unavailable = |e: String| VocabError::Unavailable(format!("{hf}: {e}"));
@@ -417,7 +441,13 @@ pub(crate) fn ensure_full_model(hf: &HfFile) -> Result<PathBuf, VocabError> {
         let _ = std::fs::remove_file(&part);
         return Err(unavailable(format!("curl {status}")));
     }
-    std::fs::rename(&part, &path).map_err(|e| unavailable(e.to_string()))?;
+    if let Err(e) = std::fs::rename(&part, &path) {
+        // Another process may have finished first; accept its file.
+        let _ = std::fs::remove_file(&part);
+        if !cached() {
+            return Err(unavailable(e.to_string()));
+        }
+    }
     Ok(path)
 }
 

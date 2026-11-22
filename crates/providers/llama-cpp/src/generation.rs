@@ -6,8 +6,9 @@ use crate::context::{
     DEFAULT_N_BATCH_CAP, apply_context_params, estimate_context_memory, resolve_n_batch,
     resolve_n_ubatch,
 };
+use crate::lora::{Models, new_target_context};
 use crate::messages;
-use crate::multimodal::MultimodalContext;
+use crate::multimodal::MediaInputs;
 use crate::response::{GeneratedText, GenerationTermination};
 use crate::tools::sampler::{SamplingParams, build_fallback_sampler, build_standard_sampler};
 use futures::channel::mpsc;
@@ -55,10 +56,10 @@ pub(crate) fn build_prompt_with(
         );
     }
 
-    if let Ok(template) = model.chat_template(cfg.chat_template.as_deref()) {
-        if let Ok(prompt) = model.apply_chat_template(&template, &chat_messages, true) {
-            return Ok((prompt, true));
-        }
+    if let Ok(template) = model.chat_template(cfg.chat_template.as_deref())
+        && let Ok(prompt) = model.apply_chat_template(&template, &chat_messages, true)
+    {
+        return Ok((prompt, true));
     }
 
     // Fall back to simple text concatenation
@@ -129,51 +130,6 @@ pub(crate) fn decode_piece(
         ));
     }
     Ok(output)
-}
-
-#[cfg(test)]
-mod decoding_tests {
-    use super::decode_piece;
-
-    #[test]
-    fn preserves_utf8_split_across_tokens() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        assert_eq!(decode_piece(&mut decoder, &[0xf0, 0x9f]).unwrap(), "");
-        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
-        assert_eq!(
-            decode_piece(&mut decoder, &[0x98, 0x80]).unwrap(),
-            "\u{1f600}"
-        );
-        assert_eq!(decode_piece(&mut decoder, b" done").unwrap(), " done");
-    }
-
-    #[test]
-    fn decodes_long_piece_after_incomplete_sequence() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        assert_eq!(decode_piece(&mut decoder, &[0xe2]).unwrap(), "");
-        let mut bytes = vec![0x82, 0xac];
-        bytes.extend_from_slice(&vec![b'a'; 1024]);
-        assert_eq!(
-            decode_piece(&mut decoder, &bytes).unwrap(),
-            format!("\u{20ac}{}", "a".repeat(1024))
-        );
-    }
-
-    #[test]
-    fn replaces_malformed_utf8_without_losing_following_text() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        assert_eq!(
-            decode_piece(&mut decoder, &[0xff, b'a']).unwrap(),
-            "\u{fffd}a"
-        );
-        assert_eq!(decode_piece(&mut decoder, b"b").unwrap(), "b");
-    }
-
-    #[test]
-    fn empty_piece_produces_no_text() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
-    }
 }
 
 /// Build the thinking-budget tracker for one generation, capping the budget so
@@ -261,22 +217,24 @@ fn preserved_token_set(
 /// Generate a complete (non-streaming) completion for `prompt`, using MTP
 /// speculative decoding when configured and no images are attached.
 pub(crate) fn generate(
-    model: &Arc<LlamaModel>,
+    models: Models<'_>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
     prompt: &str,
     max_tokens: u32,
     temperature: Option<f32>,
-    mm_ctx: Option<&MultimodalContext>,
-    bitmaps: &[MtmdBitmap],
+    media: MediaInputs<'_>,
 ) -> Result<GeneratedText, LLMError> {
+    let model = models.target;
+    let MediaInputs {
+        ctx: mm_ctx,
+        bitmaps,
+    } = media;
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut output = String::new();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, None);
         let stats = crate::mtp::run_mtp(
-            model,
-            mtp_model,
+            models,
             cfg,
             prompt,
             max_tokens,
@@ -341,28 +299,24 @@ pub(crate) fn generate(
 
     let sampling_params = SamplingParams::from_config(cfg, temperature);
     let backend_sampling = cfg.backend_sampling.unwrap_or(false);
-    let mut ctx = if backend_sampling {
-        model.new_context_with_samplers(
-            &*backend,
-            ctx_params,
-            [(0, build_standard_sampler(model, &sampling_params))],
-        )
-    } else {
-        model.new_context(&*backend, ctx_params)
-    }
-    .map_err(|e| {
-        let n = if effective_n_ctx > 0 {
-            effective_n_ctx
-        } else {
-            512
-        };
-        let est = estimate_context_memory(model, cfg, n);
-        LLMError::ProviderError(format!(
-            "Failed to create context: {}. {}\nTry reducing n_ctx or using KV cache quantization.",
-            e,
-            est.summary()
-        ))
-    })?;
+    let samplers = backend_sampling.then(|| build_standard_sampler(model, &sampling_params));
+    let mut ctx = new_target_context(models, &backend, ctx_params, samplers, &cfg.lora).map_err(
+        |err| {
+            err.into_llm_error(|e| {
+                let n = if effective_n_ctx > 0 {
+                    effective_n_ctx
+                } else {
+                    512
+                };
+                let est = estimate_context_memory(model, cfg, n);
+                LLMError::ProviderError(format!(
+                    "Failed to create context: {}. {}\nTry reducing n_ctx or using KV cache quantization.",
+                    e,
+                    est.summary()
+                ))
+            })
+        },
+    )?;
 
     let n_ctx_total = ctx.n_ctx() as i32;
     let n_batch = resolve_n_batch(cfg, n_ctx_total as u32);
@@ -389,15 +343,15 @@ pub(crate) fn generate(
         // image decoding, requiring all image tokens in a single ubatch.
         let n_ubatch = resolve_n_ubatch(cfg, effective_n_batch, true) as usize;
         for i in 0..chunks.len() {
-            if let Some(chunk) = chunks.get(i) {
-                if chunk.chunk_type() != MtmdInputChunkType::Text {
-                    let img_tokens = chunk.n_tokens();
-                    if img_tokens > n_ubatch {
-                        return Err(LLMError::InvalidRequest(format!(
-                            "Image produces {img_tokens} tokens but n_ubatch is {n_ubatch}. \
-                             Increase n_batch/n_ubatch or use a lower-resolution image."
-                        )));
-                    }
+            if let Some(chunk) = chunks.get(i)
+                && chunk.chunk_type() != MtmdInputChunkType::Text
+            {
+                let img_tokens = chunk.n_tokens();
+                if img_tokens > n_ubatch {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "Image produces {img_tokens} tokens but n_ubatch is {n_ubatch}. \
+                         Increase n_batch/n_ubatch or use a lower-resolution image."
+                    )));
                 }
             }
         }
@@ -485,10 +439,10 @@ pub(crate) fn generate(
         for chunk_start in (0..tokens.len()).step_by(n_batch as usize) {
             batch.clear();
             let chunk_end = (chunk_start + n_batch as usize).min(tokens.len());
-            for i in chunk_start..chunk_end {
+            for (i, &token) in tokens.iter().enumerate().take(chunk_end).skip(chunk_start) {
                 let is_last = i == last_index;
                 batch
-                    .add(tokens[i], i as i32, &[0], is_last)
+                    .add(token, i as i32, &[0], is_last)
                     .map_err(|e| LLMError::ProviderError(e.to_string()))?;
             }
             ctx.decode(&mut batch).map_err(|e| {
@@ -577,24 +531,26 @@ pub(crate) fn generate(
 /// The prompt in `result` must already contain the media marker tokens at the correct
 /// positions (injected by `messages_to_json` → `apply_template_for_thinking`).
 pub(crate) fn generate_streaming_with_thinking(
-    model: &Arc<LlamaModel>,
+    models: Models<'_>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
     tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
-    mm_ctx: Option<&MultimodalContext>,
-    bitmaps: &[MtmdBitmap],
+    media: MediaInputs<'_>,
 ) -> Result<(Usage, GenerationTermination), LLMError> {
+    let model = models.target;
+    let MediaInputs {
+        ctx: mm_ctx,
+        bitmaps,
+    } = media;
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut stream_state = result.streaming_state();
         let mut reasoning = result.reasoning_counter();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, Some(result));
         let stats = crate::mtp::run_mtp(
-            model,
-            mtp_model,
+            models,
             cfg,
             &result.prompt,
             max_tokens,
@@ -671,20 +627,23 @@ pub(crate) fn generate_streaming_with_thinking(
     }
     ctx_params = apply_context_params(cfg, ctx_params)?;
 
-    let mut ctx = model.new_context(&*backend, ctx_params).map_err(|e| {
-        let n = if effective_n_ctx > 0 {
-            effective_n_ctx
-        } else {
-            512
-        };
-        let est = estimate_context_memory(model, cfg, n);
-        LLMError::ProviderError(format!(
-            "Failed to create context: {}. {}\n\
+    let mut ctx =
+        new_target_context(models, &backend, ctx_params, None, &cfg.lora).map_err(|err| {
+            err.into_llm_error(|e| {
+                let n = if effective_n_ctx > 0 {
+                    effective_n_ctx
+                } else {
+                    512
+                };
+                let est = estimate_context_memory(model, cfg, n);
+                LLMError::ProviderError(format!(
+                    "Failed to create context: {}. {}\n\
                      Try reducing n_ctx or using KV cache quantization.",
-            e,
-            est.summary()
-        ))
-    })?;
+                    e,
+                    est.summary()
+                ))
+            })
+        })?;
 
     let n_ctx_total = ctx.n_ctx() as i32;
     let n_batch = resolve_n_batch(cfg, n_ctx_total as u32) as usize;
@@ -716,15 +675,15 @@ pub(crate) fn generate_streaming_with_thinking(
         // image decoding, requiring all image tokens in a single ubatch.
         let n_ubatch = resolve_n_ubatch(cfg, effective_n_batch, true) as usize;
         for i in 0..chunks.len() {
-            if let Some(chunk) = chunks.get(i) {
-                if chunk.chunk_type() != MtmdInputChunkType::Text {
-                    let img_tokens = chunk.n_tokens();
-                    if img_tokens > n_ubatch {
-                        return Err(LLMError::InvalidRequest(format!(
-                            "Image produces {img_tokens} tokens but n_ubatch is {n_ubatch}. \
-                             Increase n_batch/n_ubatch or use a lower-resolution image."
-                        )));
-                    }
+            if let Some(chunk) = chunks.get(i)
+                && chunk.chunk_type() != MtmdInputChunkType::Text
+            {
+                let img_tokens = chunk.n_tokens();
+                if img_tokens > n_ubatch {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "Image produces {img_tokens} tokens but n_ubatch is {n_ubatch}. \
+                         Increase n_batch/n_ubatch or use a lower-resolution image."
+                    )));
                 }
             }
         }
@@ -813,10 +772,10 @@ pub(crate) fn generate_streaming_with_thinking(
         for chunk_start in (0..tokens.len()).step_by(n_batch) {
             batch.clear();
             let chunk_end = (chunk_start + n_batch).min(tokens.len());
-            for i in chunk_start..chunk_end {
+            for (i, &token) in tokens.iter().enumerate().take(chunk_end).skip(chunk_start) {
                 let is_last = i == last_index;
                 batch
-                    .add(tokens[i], i as i32, &[0], is_last)
+                    .add(token, i as i32, &[0], is_last)
                     .map_err(|e| LLMError::ProviderError(e.to_string()))?;
             }
             ctx.decode(&mut batch).map_err(|e| {
@@ -944,4 +903,49 @@ pub(crate) fn generate_streaming_with_thinking(
         },
         termination,
     ))
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::decode_piece;
+
+    #[test]
+    fn preserves_utf8_split_across_tokens() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xf0, 0x9f]).unwrap(), "");
+        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
+        assert_eq!(
+            decode_piece(&mut decoder, &[0x98, 0x80]).unwrap(),
+            "\u{1f600}"
+        );
+        assert_eq!(decode_piece(&mut decoder, b" done").unwrap(), " done");
+    }
+
+    #[test]
+    fn decodes_long_piece_after_incomplete_sequence() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xe2]).unwrap(), "");
+        let mut bytes = vec![0x82, 0xac];
+        bytes.extend_from_slice(&vec![b'a'; 1024]);
+        assert_eq!(
+            decode_piece(&mut decoder, &bytes).unwrap(),
+            format!("\u{20ac}{}", "a".repeat(1024))
+        );
+    }
+
+    #[test]
+    fn replaces_malformed_utf8_without_losing_following_text() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(
+            decode_piece(&mut decoder, &[0xff, b'a']).unwrap(),
+            "\u{fffd}a"
+        );
+        assert_eq!(decode_piece(&mut decoder, b"b").unwrap(), "b");
+    }
+
+    #[test]
+    fn empty_piece_produces_no_text() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
+    }
 }

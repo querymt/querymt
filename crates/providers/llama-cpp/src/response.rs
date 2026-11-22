@@ -31,18 +31,13 @@ impl From<LlamaCppChatResponse> for ChatOutput {
 }
 
 /// Reason generation stopped inside the provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum GenerationTermination {
     Eog,
     StopSequence,
+    #[default]
     MaxTokens,
     ConsumerClosed,
-}
-
-impl Default for GenerationTermination {
-    fn default() -> Self {
-        Self::MaxTokens
-    }
 }
 
 impl GenerationTermination {

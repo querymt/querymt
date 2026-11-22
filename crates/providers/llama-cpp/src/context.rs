@@ -122,7 +122,7 @@ pub(crate) fn estimate_context_memory(
     let n_head = model.n_head() as u64;
     let n_head_kv = model.n_head_kv() as u64;
     let n_embd = model.n_embd() as u64;
-    let head_dim = if n_head > 0 { n_embd / n_head } else { 128 };
+    let head_dim = n_embd.checked_div(n_head).unwrap_or(128);
 
     let bytes_per_elem_k = kv_cache_bytes_per_element(cfg.kv_cache_type_k.as_deref());
     let bytes_per_elem_v = kv_cache_bytes_per_element(cfg.kv_cache_type_v.as_deref());
