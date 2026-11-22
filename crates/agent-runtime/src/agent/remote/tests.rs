@@ -2409,16 +2409,8 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_guarded_schedule_create_rejects_missing_peer_origin() {
-        let (config, dir) = test_agent_config().await;
-        let mesh = bootstrap_guarded_lan(&dir).await;
-        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let nm_ref = RemoteNodeManager::spawn(RemoteNodeManager::new(
-            config,
-            registry,
-            Some(mesh.clone()),
-            Arc::new(parking_lot::Mutex::new(None)),
-        ));
+    async fn test_remote_schedule_create_rejects_missing_peer_origin() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let session = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -2457,8 +2449,6 @@ mod node_manager_tests {
                 .schedules
                 .is_empty()
         );
-        nm_ref.stop_gracefully().await.unwrap();
-        mesh.shutdown().await;
     }
 
     async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {
@@ -2488,7 +2478,7 @@ mod node_manager_tests {
             peers: Vec::new(),
             auto_fallback: false,
         };
-        querymt_remote::bootstrap_mesh_runtime_with_policy(&config, store)
+        crate::agent::remote::mesh::bootstrap_mesh_runtime(&config, store)
             .await
             .unwrap()
             .as_mesh_handle()
@@ -2798,6 +2788,161 @@ mod node_manager_tests {
         );
         assert!(history.get_history(&sid).await.unwrap().is_empty());
         drop(permit);
+        mesh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn peer_access_read_and_usage_hints_are_scoped_to_the_authenticated_peer() {
+        use crate::agent::LocalAgentHandle;
+        use crate::agent::remote::node_manager::{GetPeerSharing, PeerAccessInvalidated};
+        use crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::NodeId;
+        use querymt_remote::mesh_ingress::MeshIngress;
+        use querymt_remote::peer_access::quota::{
+            AttemptUsage, QuotaAttempt, QuotaEdit, QuotaLimit, QuotaScope, QuotaWindow,
+        };
+        use querymt_remote::peer_access::{
+            ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant, SharingProtocol,
+        };
+        use serde_json::{Value, json};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = LocalAgentHandle::from_config(config);
+        handle.set_mesh(mesh.clone());
+        let refs = spawn_and_register_local_mesh_actors(&handle, &mesh).await;
+        let node = refs.node_manager.id();
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let host = NodeId::from_peer_id(*mesh.peer_id());
+        let recipient = libp2p::PeerId::random();
+        let other = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host,
+            peer: NodeId::from_peer_id(recipient),
+        };
+        let get = |peer| async move {
+            let SwarmResponse::Ask(Ok(bytes)) = router
+                .handle_v1(
+                    peer,
+                    node_ask::<RemoteNodeManager, _>(node, &GetPeerSharing),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected peer-specific access snapshot");
+            };
+            rmp_serde::from_slice::<Value>(&bytes).unwrap()
+        };
+        assert_eq!(get(recipient).await, json!({"status":"denied"}));
+        let initial = store.grant(&key).await.unwrap();
+        let custom = store
+            .replace_grant(
+                &key,
+                initial.revision,
+                PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: false,
+                    shell: false,
+                    providers: vec![ProviderGrant {
+                        provider_id: "mock".into(),
+                        models: ModelSelection::All,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let scope = QuotaScope {
+            provider_id: "mock".into(),
+            model_id: None,
+        };
+        let revision = store
+            .edit_quota(
+                &key,
+                custom.revision,
+                &scope,
+                QuotaEdit::Reconfigure(QuotaLimit::Finite {
+                    tokens: 30,
+                    window: QuotaWindow::Manual,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        let visible = get(recipient).await;
+        assert_eq!(visible["status"], "granted");
+        assert_eq!(visible["effective"]["mode"], "custom");
+        assert_eq!(visible["effective"]["shell"], false);
+        assert_eq!(visible["quotas"][0]["limit"]["limit_tokens"], "30");
+        assert_eq!(get(other).await, json!({"status":"denied"}));
+
+        let mut updates = handle.subscribe_ext_notifications();
+        let attempt = store
+            .reserve(QuotaAttempt {
+                peer: key.clone(),
+                protocol: SharingProtocol::V1,
+                provider_id: "mock".into(),
+                model_id: "fixture".into(),
+                request_id: Uuid::now_v7(),
+                estimate: querymt_remote::peer_access::quota::QuotaEstimate {
+                    reserved_tokens: 20,
+                    prompt_tokens: 5,
+                },
+                now,
+            })
+            .await
+            .unwrap();
+        store.mark_dispatched(attempt).await.unwrap();
+        store
+            .settle(attempt, AttemptUsage::Observed(12))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(event.params.get()).unwrap(),
+            json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
+        );
+        assert_eq!(
+            get(recipient).await["quotas"][0]["usage"]["available_tokens"],
+            "18"
+        );
+        assert_eq!(store.grant(&key).await.unwrap().revision, revision);
+
+        let full = store
+            .replace_grant(&key, revision, PeerGrant::Full)
+            .await
+            .unwrap();
+        let visible = get(recipient).await;
+        assert_eq!(visible["effective"]["mode"], "full");
+        assert_eq!(visible["effective"]["shell"], true);
+        assert_eq!(visible["quotas"], json!([]));
+        store
+            .replace_grant(&key, full.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert_eq!(get(recipient).await, json!({"status":"denied"}));
+        let hint = router
+            .handle_v1(
+                other,
+                node_ask::<RemoteNodeManager, _>(node, &PeerAccessInvalidated::Policy),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(hint, SwarmResponse::Ask(Ok(_))));
+        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(event.params.get()).unwrap(),
+            json!({"version":1,"peer_id":other.to_string(),"direction":"incoming","reason":"policy"})
+        );
+        refs.node_manager.stop_gracefully().await.unwrap();
         mesh.shutdown().await;
     }
 

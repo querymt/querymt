@@ -79,6 +79,14 @@ fn state_path(
     path.map_err(|e| MeshError::SwarmError(e.to_string()))
 }
 
+pub(crate) fn open_mesh_state(
+    identity_file: Option<&std::path::Path>,
+) -> Result<Arc<RwLock<MeshStateStore>>, MeshError> {
+    let path = state_path(identity_file, "mesh_state.json")?;
+    MeshStateStore::shared(&path)
+        .map_err(|error| MeshError::SwarmError(format!("mesh access startup: {error}")))
+}
+
 #[derive(Default)]
 struct MeshStores {
     invite_store: Option<Arc<RwLock<InviteStore>>>,

@@ -8,6 +8,8 @@
 
 pub mod acp;
 pub mod api;
+#[cfg(feature = "remote")]
+pub mod mesh_access;
 pub mod prelude;
 pub mod profiles;
 pub mod runner;
@@ -22,10 +24,12 @@ pub use api as simple;
 #[cfg(feature = "plugin-loaders")]
 pub use querymt_agent_runtime::plugin_update;
 pub use querymt_agent_runtime::{
-    agent, auth, chat_session, config, control, delegation, dotagents, elicitation, error, hooks,
+    auth, chat_session, config, control, delegation, dotagents, elicitation, error, hooks,
     mcp_auth, middleware, model_inventory, model_registry, profile_host, scheduler, send_agent,
     skills, slash_commands, template,
 };
+
+pub use querymt_agent_runtime::agent;
 
 // Services, index and core layers.
 pub use querymt_agent_core::events;

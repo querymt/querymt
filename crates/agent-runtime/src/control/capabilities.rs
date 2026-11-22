@@ -59,6 +59,8 @@ pub struct CapabilitiesInfo {
     pub methods: Vec<String>,
     pub notifications: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_access_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation_recovery:
         Option<crate::control::elicitation_recovery::ElicitationRecoveryCapability>,
 }
@@ -238,6 +240,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         },
         methods,
         notifications,
+        mesh_access_version: None,
         elicitation_recovery: Some(
             crate::control::elicitation_recovery::ElicitationRecoveryCapability::default(),
         ),

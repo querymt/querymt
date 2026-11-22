@@ -5,10 +5,10 @@ use std::sync::OnceLock;
 use tokio::sync::OnceCell;
 
 use super::runtime_config::{MeshRuntimeConfig, from_toml_config};
-use crate::agent::remote::{MeshRuntimeHandle, bootstrap_mesh_runtime};
+use crate::agent::remote::MeshRuntimeHandle;
 use crate::config::MeshTomlConfig;
 
-use super::types::{MeshRuntime, MeshSpec};
+use super::types::MeshSpec;
 
 #[derive(Clone, Debug)]
 struct SharedMeshState {
@@ -18,7 +18,8 @@ struct SharedMeshState {
 
 static SHARED_MESH: OnceLock<OnceCell<SharedMeshState>> = OnceLock::new();
 
-pub(crate) async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntime> {
+/// Start or reuse the process-wide guarded mesh.
+pub async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntimeHandle> {
     // The public API exposes a singleton shared remote runtime, so repeat starts must
     // either reuse an equivalent config or fail with a clear mismatch error.
     if matches!(spec, MeshSpec::Disabled) {
@@ -33,7 +34,8 @@ pub(crate) async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntime> 
         .get_or_try_init(|| {
             let requested_cfg = requested_cfg.clone();
             async move {
-                let runtime = bootstrap_mesh_runtime(&requested_cfg).await?;
+                let runtime =
+                    querymt_remote::bootstrap_mesh_runtime_guarded(&requested_cfg).await?;
                 Ok::<SharedMeshState, anyhow::Error>(SharedMeshState {
                     runtime,
                     config: requested_cfg,
@@ -50,7 +52,7 @@ pub(crate) async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntime> 
         ));
     }
 
-    Ok(MeshRuntime::from_handle(existing.runtime.clone()))
+    Ok(existing.runtime.clone())
 }
 
 fn runtime_configs_compatible(existing: &MeshRuntimeConfig, requested: &MeshRuntimeConfig) -> bool {

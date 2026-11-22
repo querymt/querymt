@@ -93,6 +93,8 @@ impl PeerRequest {
 pub enum InboundAccess {
     /// Identity-only discovery or an admission check that validates its payload.
     Identity,
+    /// The caller can read only the effective grant addressed to itself.
+    PeerAccess,
     /// Full access, including on the grant-aware contract.
     Full,
     /// Grant-aware session operations (not sufficient for tool execution).
@@ -112,7 +114,7 @@ impl InboundAccess {
             return grant == &PeerGrant::Full;
         }
         match self {
-            Self::Identity => true,
+            Self::Identity | Self::PeerAccess => true,
             Self::Full => grant == &PeerGrant::Full,
             Self::Sessions => grant.allows_sessions(protocol),
             Self::Filesystem => grant.allows_filesystem(protocol),

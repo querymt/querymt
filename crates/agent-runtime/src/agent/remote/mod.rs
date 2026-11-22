@@ -104,9 +104,7 @@ pub use event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
-pub use mesh::{
-    MeshError, MeshHandle, PeerEvent, bootstrap_mesh_runtime, bootstrap_mesh_runtime_with_policy,
-};
+pub use mesh::{MeshError, MeshHandle, PeerEvent, bootstrap_mesh_runtime};
 #[cfg(feature = "remote")]
 pub use mesh_state::{MeshLocalRole, MeshStateEntry, MeshStateStore, MeshStatus};
 pub use node_id::NodeId;

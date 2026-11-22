@@ -58,6 +58,43 @@ Configure: `set-mode` (`build|plan|review`), `set-model`, `set-effort` (`auto|lo
 
 Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `cancel`, `runtime`
 
+### Mesh access
+
+`mesh nodes` lists discoverable nodes; the other `mesh` commands require the
+server to advertise mesh access v1. Copy the peer ID from the node listing and
+the revision from `outgoing.revision`. Use the revision returned by each
+successful write for the next write.
+
+ACP is unauthenticated. When the mesh access store is configured, every ACP
+connection can read and change mesh sharing policy. Deployments may run ACP
+behind a proxy if needed. Built-in ACP authentication is planned separately.
+
+```sh
+qmacp --quiet mesh nodes
+qmacp --quiet mesh get "$PEER_ID"
+qmacp --quiet mesh set-quota "$PEER_ID" --expected-revision "$REV" \
+  --provider "$PROVIDER_ID" --model "$MODEL_ID" --tokens 2.5M --window daily --operation reconfigure
+qmacp --quiet mesh set "$PEER_ID" --expected-revision "$REV" --grant '{"mode":"none"}'
+qmacp --quiet mesh reset-quota "$PEER_ID" --expected-revision "$REV" --provider "$PROVIDER_ID"
+qmacp --quiet mesh watch "$PEER_ID" --timeout 30
+```
+
+`--tokens` takes a positive whole-token count up to `9223372036854775807`. Use a bare
+integer (`2500000`) or decimal notation with `k` (thousands) or `M` (millions),
+for example `500k` or `2.5M`. A value that represents a fraction of a token is
+rejected rather than rounded.
+
+Full includes shell access. A Custom grant accepts an optional boolean `shell`
+(default `false`). Setting `shell` to `true` requires `filesystem: true`, and
+filesystem access requires `sessions: true`.
+
+`mesh watch` waits for one hint, not a state snapshot. Run `mesh get` after the
+hint. On a conflict or uncertain write, refresh and review before retrying. See
+[mesh sharing and quotas](../../docs/docs/agent/mesh.md#peer-sharing-and-quotas)
+for persistence and downgrade behavior.
+
+### Session workflows
+
 `prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. Auto delivery and idle waits require the updated backend observation metadata; unknown/unavailable status is not usable.
 
 Prompt/follow/watch wait for self-session idle, including queued turns, not for

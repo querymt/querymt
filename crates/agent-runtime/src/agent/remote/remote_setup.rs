@@ -92,8 +92,9 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         crate::agent::handle::ext_mesh::register_peer_access_read(
             router,
             store.clone(),
-            node_manager_ref.id(),
+            &node_manager_ref,
             handle,
+            mesh,
         );
     }
 

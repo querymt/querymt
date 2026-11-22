@@ -98,7 +98,7 @@ pub use remote_impl::{
 };
 
 #[cfg(feature = "remote")]
-pub(crate) use remote_impl::GetPeerSharing;
+pub(crate) use remote_impl::{GetPeerSharing, PeerAccessInvalidated};
 
 #[cfg(feature = "remote")]
 mod remote_impl {
@@ -134,6 +134,28 @@ mod remote_impl {
 
     impl kameo::remote::RemoteMessage<GetPeerSharing> for RemoteNodeManager {
         const REMOTE_ID: &'static str = "querymt::GetPeerSharing.v1";
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum PeerAccessInvalidated {
+        Policy,
+        Quota,
+        Catalog,
+    }
+
+    impl PeerAccessInvalidated {
+        pub(crate) const fn as_str(self) -> &'static str {
+            match self {
+                Self::Policy => "policy",
+                Self::Quota => "quota",
+                Self::Catalog => "catalog",
+            }
+        }
+    }
+
+    impl kameo::remote::RemoteMessage<PeerAccessInvalidated> for RemoteNodeManager {
+        const REMOTE_ID: &'static str = "querymt::PeerAccessInvalidated.v1";
     }
 
     /// Create a new session on this node.
@@ -893,7 +915,7 @@ mod remote_impl {
         async fn create_schedule(
             &self,
             request: CreateRemoteSchedule,
-            authority: TurnAuthority,
+            origin: Arc<PeerTurn>,
         ) -> Result<CreateRemoteScheduleResponse, AgentError> {
             use crate::session::domain::{Task, TaskKind, TaskStatus};
             let CreateRemoteSchedule {
@@ -904,7 +926,7 @@ mod remote_impl {
                 max_cost_usd,
                 max_runs,
             } = request;
-            authority.check().await?;
+            TurnAuthority::Peer(origin.clone()).check().await?;
 
             let store = self.config.provider.history_store();
             let session = store
@@ -944,7 +966,7 @@ mod remote_impl {
             let mut schedule = Schedule::new(task.public_id.clone(), session_public_id, trigger);
             schedule.task_id = task.id;
             schedule.session_id = session.id;
-            schedule.config.origin = authority.stored_origin();
+            schedule.config.origin = origin.schedule_origin();
 
             if max_runs.is_some() {
                 schedule.config.max_runs = max_runs;
@@ -2022,22 +2044,13 @@ mod remote_impl {
 
         async fn handle(
             &mut self,
-            msg: CreateRemoteSchedule,
+            _: CreateRemoteSchedule,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let state = self.shared_state.clone();
-            ctx.spawn(async move {
-                if state
-                    .mesh
-                    .as_ref()
-                    .is_some_and(|mesh| mesh.quota_store().is_some())
-                {
-                    return Err(AgentError::AdmissionRejected {
-                        reason: "remote schedule creation requires an authenticated peer origin"
-                            .into(),
-                    });
-                }
-                state.create_schedule(msg, TurnAuthority::Local).await
+            ctx.spawn(async {
+                Err(AgentError::AdmissionRejected {
+                    reason: "remote schedule creation requires an authenticated peer origin".into(),
+                })
             })
         }
     }
@@ -2051,11 +2064,7 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
-            ctx.spawn(async move {
-                state
-                    .create_schedule(msg.request, TurnAuthority::Peer(msg.authority))
-                    .await
-            })
+            ctx.spawn(async move { state.create_schedule(msg.request, msg.authority).await })
         }
     }
 

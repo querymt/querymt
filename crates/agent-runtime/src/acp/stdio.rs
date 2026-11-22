@@ -1059,6 +1059,24 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         shutdown_tx,
     );
     log::info!("Spawned event forwarder");
+    let mut mesh_access_updates = agent.subscribe_ext_notifications();
+    let mesh_access_bridge = bridge_sender.clone();
+    let mesh_access_forwarder = tokio::spawn(async move {
+        loop {
+            match mesh_access_updates.recv().await {
+                Ok(notification)
+                    if notification.method.as_ref()
+                        == crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED =>
+                {
+                    if mesh_access_bridge.notify_ext(notification).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 
     // 6. Set up stdio streams and connect ACP agent role.
     let stdin = tokio::io::stdin().compat();
@@ -1360,6 +1378,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         }
     };
 
+    mesh_access_forwarder.abort();
     if shutdown_triggered {
         log::info!("Initiating graceful shutdown...");
         log::info!("Shutting down agent...");
