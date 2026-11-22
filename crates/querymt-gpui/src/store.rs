@@ -11,6 +11,7 @@ pub(crate) mod launch;
 pub(crate) mod mcp_notice;
 mod mesh_live;
 mod pins;
+pub(crate) mod plugins;
 pub(crate) mod setup;
 pub(crate) mod worktree;
 
@@ -1219,6 +1220,8 @@ pub struct AgentRuntime {
     pub maintenance: Option<(String, bool)>,
     /// (plugin, message) of failed plugin updates.
     pub failed_plugins: Vec<(String, String)>,
+    /// The plugin update step in progress.
+    pub plugin_progress: Option<plugins::PluginProgress>,
     /// Names of actions in flight (e.g. `invite`, `key:xai`).
     pub pending: std::collections::HashSet<String>,
     pub logs: Vec<String>,
@@ -2448,66 +2451,6 @@ impl AgentsStore {
             params,
             cx,
             |s, id, _, cx| s.refresh_extras(id, cx),
-        );
-    }
-
-    /// Update provider plugins (`querymt/updatePlugins`); the outcome lands in `maintenance`.
-    pub fn update_plugins(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(rt) = self.runtime.get_mut(id) {
-            rt.maintenance = None;
-        }
-        self.ext(
-            id,
-            "plugins",
-            "_querymt/updatePlugins",
-            json!({}),
-            cx,
-            |s, id, res, cx| {
-                let Some(rt) = s.runtime.get_mut(id) else {
-                    return;
-                };
-                if let Ok(v) = res {
-                    let results = v
-                        .get("results")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let failed: Vec<(String, String)> = results
-                        .iter()
-                        .filter(|r| r.get("success").and_then(Value::as_bool) != Some(true))
-                        .map(|r| {
-                            (
-                                r.get("plugin_name")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                                    .unwrap_or_default(),
-                                r.get("message")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| "Update failed.".into()),
-                            )
-                        })
-                        .collect();
-                    let ok = results.len() - failed.len();
-                    rt.maintenance = Some(if failed.is_empty() {
-                        (
-                            format!("Updated {ok} plugin{}.", if ok == 1 { "" } else { "s" }),
-                            false,
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{} of {} plugin updates failed.",
-                                failed.len(),
-                                results.len()
-                            ),
-                            true,
-                        )
-                    });
-                    rt.failed_plugins = failed;
-                }
-                s.refresh_models(id, cx);
-            },
         );
     }
 
@@ -4527,6 +4470,8 @@ impl AgentsStore {
                     self.on_mesh_membership_changed(id, cx);
                 } else if method.trim_start_matches('_') == "querymt/session/mcpAuthRequired" {
                     self.on_mcp_auth_required(id, &params, cx);
+                } else if plugins::is_plugin_update(&method) {
+                    self.on_plugin_update(id, &method, &params, cx);
                 } else if method.trim_start_matches('_') == "querymt/schedules/changed" {
                     if self
                         .live(id, generation)
