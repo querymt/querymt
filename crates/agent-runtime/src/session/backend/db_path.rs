@@ -70,6 +70,28 @@ mod tests {
     }
 
     #[test]
+    fn explicit_db_path_does_not_create_config_or_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-created");
+        let target = parent.join("custom.db");
+        assert_eq!(resolve_agent_db_path(Some(target.clone())).unwrap(), target);
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn default_db_path_rejects_a_file_in_place_of_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("not-a-directory");
+        std::fs::write(&config, "fixture").unwrap();
+        let error = default_agent_db_path_in(config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to create QueryMT config dir")
+        );
+    }
+
+    #[test]
     fn resolve_agent_db_path_prefers_override() {
         let path = PathBuf::from("cli-sessions.db");
         assert_eq!(

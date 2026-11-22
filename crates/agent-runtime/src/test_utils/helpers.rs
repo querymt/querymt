@@ -297,6 +297,21 @@ pub fn plugin_registry_from_path(path: &std::path::Path) -> Result<PluginRegistr
     )?)
 }
 
+#[cfg(test)]
+#[test]
+fn plugin_fixture_does_not_fall_back_when_local_paths_fail() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("providers.toml");
+    let cache = config.with_extension("cache");
+    assert!(plugin_registry_from_path(&config).is_err());
+    assert!(!cache.exists());
+
+    std::fs::write(&config, "providers = []\n").unwrap();
+    std::fs::write(&cache, "not a directory").unwrap();
+    assert!(plugin_registry_from_path(&config).is_err());
+    assert!(cache.is_file());
+}
+
 /// Creates a plugin registry with a mock provider for LLM interaction tests.
 ///
 /// # Returns
