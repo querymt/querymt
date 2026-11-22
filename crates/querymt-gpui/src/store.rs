@@ -489,7 +489,7 @@ pub struct MeshInvite {
     pub created_at: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProviderAuth {
     pub provider: String,
     pub display_name: String,
@@ -509,6 +509,13 @@ impl ProviderAuth {
     /// An MCP server login, not a model provider.
     pub fn is_mcp(&self) -> bool {
         self.provider.starts_with(MCP_AUTH_PREFIX)
+    }
+
+    /// Server name of an MCP login (desktop `mcpServerOfAuthId`).
+    pub fn mcp_server(&self) -> &str {
+        self.provider
+            .strip_prefix(MCP_AUTH_PREFIX)
+            .unwrap_or(&self.provider)
     }
 }
 
