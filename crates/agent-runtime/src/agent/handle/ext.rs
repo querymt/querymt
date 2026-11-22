@@ -2,7 +2,16 @@ use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
-        let capabilities = crate::control::capabilities::get_capabilities(self);
+        let mut capabilities = crate::control::capabilities::get_capabilities(self);
+        if self.has_mesh_access_store() {
+            capabilities.mesh_access_version = Some(1);
+            capabilities
+                .methods
+                .extend(super::ext_mesh::ACCESS_METHODS.map(str::to_owned));
+            capabilities
+                .notifications
+                .push(crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED.to_owned());
+        }
         super::utils::ext_json_response(&capabilities)
     }
 
@@ -70,6 +79,9 @@ impl LocalAgentHandle {
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,
             "querymt/mesh/nodes" => self.handle_ext_mesh_nodes().await,
+            m if super::ext_mesh::ACCESS_METHODS.contains(&m) => {
+                self.handle_ext_mesh_access(req).await
+            }
             "querymt/mesh/createInvite" => self.handle_ext_mesh_create_invite(req).await,
             "querymt/mesh/listInvites" => self.handle_ext_mesh_list_invites().await,
             "querymt/mesh/revokeInvite" => self.handle_ext_mesh_revoke_invite(req).await,

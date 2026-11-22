@@ -271,6 +271,7 @@ pub(crate) async fn compact_history_with(
     let token_estimate_u32 = u32_from_usize(token_estimate, "token_estimate", Some(session_id));
     let message_count = u32_from_usize(messages.len(), "messages.len", Some(session_id));
 
+    env.require_turn_authority().await?;
     let pre_hook = config
         .hooks
         .run_pre_compaction(PreCompactionRequest {
@@ -375,16 +376,17 @@ pub(crate) async fn compact_history_with(
         let ledger = compaction_ledger(config, env, &built);
         match config
             .compaction
-            .process(
+            .process_authorized(
                 &messages,
-                env.execution_config().and_then(|cfg| cfg.max_prompt_bytes),
+                prompt_limit,
                 instructions,
                 &crate::session::compaction::CompactionDispatch {
-                    provider: built.provider.clone(),
+                    provider: built.provider,
                     config,
                     cancel: &env.cancellation_token,
                     ledger: &ledger,
                 },
+                env.turn_authority(),
             )
             .await
         {
@@ -442,6 +444,11 @@ pub(crate) async fn compact_history_with(
         result.summary.push_str(&section);
     }
 
+    if let Err(error) = env.require_turn_authority().await {
+        let error = anyhow::Error::from(error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
     let post_hook = match config
         .hooks
         .run_post_compaction(PostCompactionRequest {
@@ -1382,6 +1389,29 @@ mod tests {
         assert!(
             figure < 100,
             "the baseline's tool list is not counted: {figure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_attachment_prevents_model_request_preparation() {
+        use super::super::transitions::{ContextTrigger, transition_before_llm_call};
+        use crate::acp::protocol::{ContentBlock, ImageContent};
+
+        let (config, env, mut turn, _tempdir) = fixture(Hooks::default(), None).await;
+        let mut message = AgentMessage::new(env.session_id.clone(), ChatRole::User);
+        message.parts.push(MessagePart::Prompt {
+            blocks: vec![ContentBlock::Image(ImageContent::new("%%%", "image/png"))],
+        });
+        env.session_handle.add_message(message).await.unwrap();
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+
+        let result =
+            transition_before_llm_call(&config, &env, &mut turn, ContextTrigger::UserPrompt, None)
+                .await;
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("Invalid stored message content"))
         );
     }
 

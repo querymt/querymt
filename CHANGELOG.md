@@ -8,7 +8,8 @@
   `crates/qmacp`) and the MCP-to-ACP bridge (`qmcp`, `crates/qmcp`) moved from
   their separate repositories, follow the workspace version, and are built for
   every platform and attached to stable and nightly releases. The qmacp agent
-  skill moved to `skills/qmacp`.
+  skill moved to `skills/qmacp`. Use `qmacp mesh` to inspect directional sharing,
+  manage grants and quotas, and wait for access changes.
 - **llama-cpp: LoRA adapters.** New provider option `lora`, a list with one
   GGUF adapter (`path`: local file or Hugging Face `<repo>:<selector>`,
   `scale`: finite float, default `1.0`, `0` disables). The adapter is loaded
@@ -306,6 +307,14 @@
 - **BREAKING (profile catalog):** the embedded `coder-delegate` profile is
   written as `[agent]` with `[[delegates]]`, so its `config_kind` is now
   `single`, not `quorum`.
+- **BREAKING (mesh sharing):** Agent mesh runtimes start with no sharing grants.
+  Joining a scope does not grant access in either direction. Use ACP to grant
+  access explicitly; pre-upgrade clients require Full access on an upgraded host.
+- **Mesh quotas:** Provider and model quotas apply to all shared models on Custom
+  grants. Direct calls and hosted turns use the same prompt-plus-output estimate.
+  Actual usage is charged even above the estimate; missing usage is charged at
+  the estimate by default. Exhaustion blocks new requests but lets admitted work
+  finish. Full access does not spend Custom quotas.
 - Configuration: `[agent]` accepts `[[delegates]]`, `[agent.delegation]`
   (`wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`,
   `verification`, `summary`) and `snapshot_policy`. `[quorum]` / `[planner]` is

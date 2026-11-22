@@ -28,6 +28,11 @@ const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub struct RpcResponseError(Value);
 
 impl RpcResponseError {
+    /// Structured JSON-RPC error data supplied by the server.
+    pub fn data(&self) -> Option<&Value> {
+        self.0.get("data")
+    }
+
     /// Whether the protocol error establishes that the request was rejected.
     pub fn is_rejection(&self) -> bool {
         matches!(
@@ -593,6 +598,25 @@ async fn handle_inbound(
     ) && let Some(event) = events::compact_delegation_update(&params)
     {
         event_sink.emit(event).await;
+    }
+
+    if value.get("id").is_none()
+        && matches!(
+            method.as_str(),
+            "querymt/mesh/peerAccessChanged" | "_querymt/mesh/peerAccessChanged"
+        )
+        && params["version"].as_u64() == Some(1)
+        && let (
+            Some(peer_id),
+            Some(direction @ ("incoming" | "outgoing")),
+            Some(reason @ ("policy" | "quota" | "availability" | "catalog")),
+        ) = (
+            params["peer_id"].as_str(),
+            params["direction"].as_str(),
+            params["reason"].as_str(),
+        )
+    {
+        event_sink.emit(json!({"type": "mesh_peer_access_changed", "version": 1, "peer_id": peer_id, "direction": direction, "reason": reason})).await;
     }
 
     if let Some(id) = value.get("id").cloned() {

@@ -40,17 +40,59 @@ use crate::{
 )]
 mod unified_behaviour {
     use kameo::remote;
-    use libp2p::swarm::{NetworkBehaviour, behaviour::toggle::Toggle};
+    use libp2p::swarm::{NetworkBehaviour, behaviour::toggle::Toggle, derive_prelude::Either};
+
+    use crate::mesh_ingress::{Egress, LegacyWire, SharingWire};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct GuardedMessaging {
+        pub(super) egress: Egress,
+        pub(super) ingress: LegacyWire,
+        pub(super) sharing: SharingWire,
+    }
 
     #[derive(NetworkBehaviour)]
     pub(super) struct UnifiedMeshBehaviour {
-        pub(super) kameo: remote::Behaviour,
+        pub(super) kameo: Either<remote::Behaviour, GuardedMessaging>,
         pub(super) mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     }
 }
-use unified_behaviour::{UnifiedMeshBehaviour, UnifiedMeshBehaviourEvent};
+use libp2p::swarm::derive_prelude::Either;
+use unified_behaviour::{
+    GuardedMessaging, GuardedMessagingEvent, UnifiedMeshBehaviour, UnifiedMeshBehaviourEvent,
+};
 
-fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::Config {
+use crate::mesh_handle::MeshPolicy;
+use crate::mesh_ingress::{
+    Egress, InboundRouter, LegacyWire, MeshIngress, SharingCallError, SharingWire,
+};
+use crate::peer_access::quota::QuotaStore;
+
+fn kameo_behaviour(
+    peer: PeerId,
+    timeout: std::time::Duration,
+    ingress: Option<&Arc<dyn MeshIngress>>,
+) -> Either<remote::Behaviour, GuardedMessaging> {
+    let kameo = remote::Behaviour::new(peer, messaging_config(timeout));
+    match ingress {
+        None => Either::Left(kameo),
+        Some(gate) => Either::Right(GuardedMessaging {
+            egress: Egress(kameo),
+            ingress: LegacyWire::new(Arc::clone(gate), timeout),
+            sharing: SharingWire::new(Arc::clone(gate), timeout),
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn guarded_test_behaviour(
+    peer: PeerId,
+    gate: Arc<dyn MeshIngress>,
+) -> impl NetworkBehaviour {
+    kameo_behaviour(peer, std::time::Duration::from_secs(3), Some(&gate))
+}
+
+pub(crate) fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::Config {
     remote::messaging::Config::default()
         .with_request_timeout(request_timeout)
         .with_request_size_maximum(crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM)
@@ -107,6 +149,36 @@ pub async fn bootstrap_mesh_runtime(
 }
 
 pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHandle, MeshError> {
+    bootstrap_with_ingress(config, None, None).await
+}
+
+/// Start a mesh with all inbound actor RPCs routed through the authenticated
+/// ingress implementation, including legacy messages. Outbound RPCs and actor
+/// discovery still use Kameo.
+#[cfg(test)]
+pub(crate) async fn bootstrap_mesh_handle_with_ingress(
+    config: &MeshRuntimeConfig,
+    ingress: Arc<dyn MeshIngress>,
+) -> Result<MeshHandle, MeshError> {
+    bootstrap_with_ingress(config, Some(ingress), None).await
+}
+
+/// Bootstrap a guarded mesh with a single policy store for this host identity.
+/// The caller owns initialization and exclusive startup reconciliation of the store.
+pub async fn bootstrap_mesh_runtime_with_policy(
+    config: &MeshRuntimeConfig,
+    store: Arc<dyn QuotaStore>,
+) -> Result<MeshRuntimeHandle, MeshError> {
+    bootstrap_with_ingress(config, None, Some(store))
+        .await
+        .map(MeshRuntimeHandle::new)
+}
+
+async fn bootstrap_with_ingress(
+    config: &MeshRuntimeConfig,
+    ingress: Option<Arc<dyn MeshIngress>>,
+    policy_store: Option<Arc<dyn QuotaStore>>,
+) -> Result<MeshHandle, MeshError> {
     config
         .validate()
         .map_err(|error| MeshError::SwarmError(error.to_string()))?;
@@ -144,6 +216,18 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         mesh_state_store,
     } = ctx;
 
+    let policy = policy_store.map(|store| MeshPolicy {
+        router: Arc::new(InboundRouter::new(
+            keypair.public().to_peer_id(),
+            store.clone(),
+        )),
+        store,
+    });
+    let ingress = ingress.or_else(|| {
+        policy
+            .as_ref()
+            .map(|policy| -> Arc<dyn MeshIngress> { policy.router.clone() })
+    });
     let peer_events_tx_loop = peer_events_tx.clone();
     let known_peers_loop = Arc::clone(&known_peers);
     let routes_loop = Arc::clone(&routes);
@@ -207,7 +291,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
                 let kameo_behaviour =
-                    remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout));
+                    kameo_behaviour(local_peer_id, config.request_timeout, ingress.as_ref());
                 let mdns_behaviour = if enable_mdns {
                     let mdns_config = libp2p::mdns::Config {
                         ttl: std::time::Duration::from_secs(30),
@@ -244,7 +328,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
                 let kameo_behaviour =
-                    remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout));
+                    kameo_behaviour(local_peer_id, config.request_timeout, ingress.as_ref());
                 let mdns_behaviour = if enable_mdns {
                     let mdns_config = libp2p::mdns::Config {
                         ttl: std::time::Duration::from_secs(30),
@@ -277,7 +361,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
 
         let local_peer_id = iroh_transport.peer_id;
         let behaviour = UnifiedMeshBehaviour {
-            kameo: remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout)),
+            kameo: kameo_behaviour(local_peer_id, config.request_timeout, ingress.as_ref()),
             mdns: None.into(),
         };
 
@@ -292,11 +376,12 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         )
     };
 
-    swarm
-        .behaviour()
-        .kameo
-        .try_init_global()
-        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+    match &swarm.behaviour().kameo {
+        Either::Left(kameo) => kameo,
+        Either::Right(guarded) => &guarded.egress.0,
+    }
+    .try_init_global()
+    .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     let local_peer_id = *swarm.local_peer_id();
 
@@ -509,6 +594,12 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 }
                             }
                         }
+                        SwarmCommand::Sharing { peer, request, tx } => {
+                            match &mut swarm.behaviour_mut().kameo {
+                                Either::Right(guarded) => guarded.sharing.send(peer, request, tx),
+                                Either::Left(_) => { let _ = tx.send(Err(SharingCallError::Unavailable)); }
+                            }
+                        }
                         SwarmCommand::Shutdown { completion } => {
                             reconnect_targets.clear();
                             reconnect_targets_by_scope.clear();
@@ -529,7 +620,10 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                 }
                 event = next_mesh_event(&mut swarm) => {
                     match event {
-                        SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Kameo(remote::Event::Messaging(event))) => {
+                        SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Kameo(
+                            Either::Left(remote::Event::Messaging(event))
+                            | Either::Right(GuardedMessagingEvent::Egress(remote::Event::Messaging(event))),
+                        )) => {
                             log_kameo_messaging_event(&event);
                         }
                         SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(list))) => {
@@ -622,6 +716,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         config.stream_reconnect_grace,
     );
     handle.iroh_diagnostics = diagnostics;
+    handle.policy = policy;
+    handle.sharing_enabled = ingress.is_some();
     handle.set_config_scopes(config.active_scopes());
     Ok(handle)
 }

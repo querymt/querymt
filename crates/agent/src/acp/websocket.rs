@@ -33,13 +33,14 @@ use crate::acp::shared::{
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
+#[cfg(any(feature = "dashboard", test))]
+use axum::http::{HeaderMap, header};
 use axum::{
     Router,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -1206,7 +1207,7 @@ async fn enforce_same_origin(
     next: axum::middleware::Next,
 ) -> Response {
     if !has_allowed_websocket_origin(request.headers()) {
-        return StatusCode::FORBIDDEN.into_response();
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
 }
@@ -1233,6 +1234,7 @@ pub(crate) fn is_loopback_websocket_peer(peer: Option<std::net::SocketAddr>) -> 
     peer.is_some_and(|peer| peer.ip().is_loopback())
 }
 
+#[cfg(any(feature = "dashboard", test))]
 pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         // Non-browser ACP clients do not send Origin.

@@ -213,10 +213,12 @@ impl LocalAgentHandle {
         session_id: &str,
         events: &[querymt_agent_core::events::AgentEvent],
         deadline: tokio::time::Instant,
-    ) -> Vec<crate::session::load_snapshot::UserPromptRecord> {
+    ) -> Result<Vec<crate::session::load_snapshot::UserPromptRecord>, crate::error::AgentError>
+    {
+        use crate::error::AgentError;
         let ids = crate::session::load_snapshot::prompt_message_ids(events);
         if ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let session_ref = {
             let registry = self.registry.lock().await;
@@ -224,17 +226,18 @@ impl LocalAgentHandle {
         };
         // For a bookmarked session the registry entry is its owner attachment.
         let Some(session_ref) = session_ref else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         match tokio::time::timeout_at(deadline, session_ref.get_user_prompts(Some(ids))).await {
-            Ok(Ok(fetched)) => fetched,
+            Ok(Ok(fetched)) => Ok(fetched),
+            Ok(Err(AgentError::MeshAccessDenied)) => Err(AgentError::MeshAccessDenied),
             Ok(Err(error)) => {
                 tracing::warn!(session_id, %error, "failed to fetch prompt records from owner");
-                Vec::new()
+                Ok(Vec::new())
             }
             Err(_) => {
                 tracing::warn!(session_id, "fetching prompt records from owner timed out");
-                Vec::new()
+                Ok(Vec::new())
             }
         }
     }
@@ -271,6 +274,9 @@ impl LocalAgentHandle {
         budget: std::time::Duration,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
         use crate::error::AgentError;
+        if matches!(&sync, Err(AgentError::MeshAccessDenied)) {
+            return Err(AgentError::MeshAccessDenied.into());
+        }
         let transfer_failed = |message: String| {
             agent_client_protocol::Error::from(AgentError::RemoteTransferFailed {
                 session_id: session_id.to_string(),
@@ -360,6 +366,9 @@ impl LocalAgentHandle {
             );
             match tokio::time::timeout_at(deadline, fetch.ensure_covered(start, end)).await {
                 Ok(Ok(())) => {}
+                Ok(Err(AgentError::MeshAccessDenied)) => {
+                    return Err(AgentError::MeshAccessDenied.into());
+                }
                 Ok(Err(error)) => return Err(transfer_failed(error.to_string())),
                 Err(_) => return Err(transfer_failed("history transfer timed out".into())),
             }
@@ -389,7 +398,7 @@ impl LocalAgentHandle {
                     &snapshot.audit.events,
                     deadline.max(tokio::time::Instant::now() + REMOTE_PROMPT_FETCH_MIN_BUDGET),
                 )
-                .await;
+                .await?;
             crate::session::load_snapshot::merge_prompt_records(
                 snapshot.user_prompts.get_or_insert_with(Vec::new),
                 prompts,

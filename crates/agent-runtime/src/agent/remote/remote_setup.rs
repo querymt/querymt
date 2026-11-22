@@ -5,15 +5,12 @@
 //!
 //! All functionality is feature-gated behind `#[cfg(feature = "remote")]`.
 
-use crate::agent::remote::scope::{
-    scoped_node_manager, scoped_node_manager_for_peer, scoped_provider_host,
-};
+use crate::agent::remote::scope::{scoped_node_manager, scoped_node_manager_for_peer};
 use crate::config::RemoteAgentConfig;
 use crate::delegation::AgentInfo;
 use crate::delegation::roster::{AgentId, Member, MemberAgent, MemberOrigin, RemoteMember};
 use anyhow::Result;
-use querymt_remote::scoped_provider_catalog;
-use querymt_remote::{MeshRuntimeHandle, ProviderCatalogActor, ProviderHostActor};
+use querymt_remote::{MeshRuntimeHandle, ProviderShare};
 use std::sync::Arc;
 
 /// Keepalive refs for local mesh actors registered after an agent is built.
@@ -21,8 +18,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct LocalMeshActorRefs {
     pub node_manager: kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
-    pub provider_host: kameo::actor::ActorRef<ProviderHostActor>,
-    pub provider_catalog: kameo::actor::ActorRef<ProviderCatalogActor>,
+    pub provider_share: ProviderShare,
 }
 
 #[cfg(feature = "remote")]
@@ -48,23 +44,10 @@ pub async fn register_local_mesh_actor_scope(
         per_peer_name
     );
 
-    let ph_dht_name = scoped_provider_host(scope, mesh.peer_id());
-    runtime
-        .register_actor(actor_refs.provider_host.clone(), ph_dht_name.clone())
+    actor_refs
+        .provider_share
+        .register_scope(&runtime, scope)
         .await;
-    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
-
-    let provider_catalog_name = scoped_provider_catalog(scope, mesh.peer_id());
-    runtime
-        .register_actor(
-            actor_refs.provider_catalog.clone(),
-            provider_catalog_name.clone(),
-        )
-        .await;
-    log::info!(
-        "ProviderCatalogActor registered in DHT as '{}'",
-        provider_catalog_name
-    );
 }
 
 /// Spawn and register the local mesh-facing actors for an already-built agent.
@@ -104,24 +87,30 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         None => node_manager,
     };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+    if let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) {
+        RemoteNodeManager::register_guarded_discovery(router, store.clone(), &node_manager_ref);
+        crate::agent::handle::ext_mesh::register_peer_access_read(
+            router,
+            store.clone(),
+            &node_manager_ref,
+            handle,
+            mesh,
+        );
+    }
 
-    let provider_host = crate::agent::remote::provider_host_backend::provider_host_from_config(
-        handle.config.clone(),
-    );
-    let provider_host_ref = ProviderHostActor::spawn(provider_host);
-    let provider_catalog = ProviderCatalogActor::new(Arc::new(
-        crate::agent::remote::provider_catalog_backend::AgentProviderCatalogBackend::new(
+    let provider_backend =
+        crate::agent::remote::provider_host_backend::provider_backend_from_config(
             handle.config.clone(),
-            handle.model_inventory.clone(),
-            crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string(),
-            node_name.clone(),
-        ),
-    ));
-    let provider_catalog_ref = ProviderCatalogActor::spawn(provider_catalog);
+        );
+    let catalog = crate::agent::remote::provider_catalog_backend::AgentProviderCatalogBackend::new(
+        handle.config.clone(),
+        handle.model_inventory.clone(),
+        mesh.peer_id().to_string(),
+        node_name,
+    );
     let actor_refs = LocalMeshActorRefs {
         node_manager: node_manager_ref,
-        provider_host: provider_host_ref,
-        provider_catalog: provider_catalog_ref,
+        provider_share: ProviderShare::new(provider_backend, Arc::new(catalog)),
     };
 
     let runtime = MeshRuntimeHandle::from(mesh.clone());

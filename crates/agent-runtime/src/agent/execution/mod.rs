@@ -147,6 +147,9 @@ async fn run_stop_hook(
     env: &TurnEnv,
     kind: turn::StopHookKind,
 ) -> Result<crate::hooks::StopResult, crate::hooks::HookError> {
+    if env.restricted_mesh_turn() {
+        return Ok(crate::hooks::StopResult::default());
+    }
     let stop_hook = config
         .hooks
         .run_stop(StopRequest {

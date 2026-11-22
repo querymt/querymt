@@ -289,6 +289,7 @@ impl RuntimeContext {
     /// `isolation` is the resolved execution policy (`shared` or `isolated`)
     /// for this delegate; callers resolve the raw request against the
     /// parent's execution mode before recording.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_delegation(
         &self,
         target_agent_id: String,
@@ -297,6 +298,7 @@ impl RuntimeContext {
         constraints: Option<String>,
         expected_output: Option<String>,
         isolation: crate::worktree::DelegationIsolation,
+        origin: querymt_agent_core::session::domain_schedule::ScheduleOrigin,
     ) -> SessionResult<Delegation> {
         let session_internal_id = self.resolve_session_internal_id().await?;
 
@@ -337,8 +339,13 @@ impl RuntimeContext {
             completed_at: None,
         };
 
-        let stored_delegation = self.store.create_delegation(delegation).await?;
-        Ok(stored_delegation)
+        if origin == querymt_agent_core::session::domain_schedule::ScheduleOrigin::Local {
+            self.store.create_delegation(delegation).await
+        } else {
+            self.store
+                .create_delegation_with_origin(delegation, origin)
+                .await
+        }
     }
 
     /// Update task status

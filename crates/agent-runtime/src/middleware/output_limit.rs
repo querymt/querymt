@@ -164,6 +164,10 @@ impl Middleware for OutputLimitRecoveryMiddleware {
         "OutputLimitRecoveryMiddleware"
     }
 
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
+
     fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
         Box::new(OutputLimitTurn {
             config: self.config.clone(),

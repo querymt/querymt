@@ -64,8 +64,7 @@ impl LLMProviderFactory for LlamaCppFactory {
     }
 
     fn config_schema(&self) -> String {
-        let schema = schema_for!(LlamaCppConfig);
-        serde_json::to_string(&schema).expect("LlamaCppConfig schema should always serialize")
+        schema_for!(LlamaCppConfig).to_value().to_string()
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {

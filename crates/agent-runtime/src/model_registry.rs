@@ -172,11 +172,8 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
     let registry = config.provider.plugin_registry();
     registry.load_all_plugins().await;
 
-    let factories = registry.list();
-    let provider_names: Vec<String> = factories
-        .iter()
-        .map(|factory| factory.name().to_string())
-        .collect();
+    let factories = registry.list_bindings();
+    let provider_names: Vec<_> = factories.iter().map(|(name, _)| name.as_str()).collect();
     log::debug!(
         "enumerate_local_models: loaded {} providers: {:?}",
         provider_names.len(),
@@ -185,10 +182,9 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
 
     let futures: Vec<_> = factories
         .into_iter()
-        .map(|factory| {
+        .map(|(provider_name, factory)| {
             let config = config.clone();
             async move {
-                let provider_name = factory.name().to_string();
                 let mut models = fetch_catalog_models(&config, &provider_name).await;
                 let catalog_count = models.len();
 
@@ -395,7 +391,7 @@ fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
 /// Shared remote enumerator used by UI + ACP.
 #[cfg(feature = "remote")]
 async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec<ModelEntry> {
-    use crate::agent::remote::NodeId;
+    use querymt_remote::request_timeout::ask_with_sharing;
     use querymt_remote::{GetProviderCatalog, ProviderCatalogActor, scoped_provider_catalog};
 
     let mut all_remote = Vec::new();
@@ -415,9 +411,16 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
                 continue;
             };
 
-            let snapshot = match catalog_ref
-                .ask::<GetProviderCatalog>(&GetProviderCatalog)
-                .await
+            if catalog_ref.id().peer_id() != Some(&peer_id) {
+                continue;
+            }
+            let snapshot = match ask_with_sharing(
+                mesh,
+                &catalog_ref,
+                &GetProviderCatalog,
+                std::time::Duration::from_secs(10),
+            )
+            .await
             {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
@@ -430,19 +433,13 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
                 }
             };
 
-            if NodeId::parse(&snapshot.node.node_id).is_err() {
-                log::warn!(
-                    "enumerate_remote_models: ignoring node with invalid id '{}'",
-                    snapshot.node.node_id
-                );
-                continue;
-            }
+            let node_id = peer_id.to_string();
 
             log::debug!(
                 "enumerate_remote_models: got {} models from node '{}' ({})",
                 snapshot.providers.len(),
                 snapshot.node.node_label.as_deref().unwrap_or("unknown"),
-                snapshot.node.node_id
+                node_id
             );
 
             for m in snapshot.providers {
@@ -460,7 +457,7 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
                     source: "catalog".to_string(),
                     provider,
                     model,
-                    node_id: Some(snapshot.node.node_id.clone()),
+                    node_id: Some(node_id.clone()),
                     node_label: snapshot.node.node_label.clone(),
                     family: m.family,
                     quant: m.quant,

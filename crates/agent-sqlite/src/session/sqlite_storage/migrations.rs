@@ -189,7 +189,23 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0038_remote_bookmark_fork_origin",
         apply: migration_0038_remote_bookmark_fork_origin,
     },
+    Migration {
+        version: "0039_delegation_origin",
+        apply: migration_0039_delegation_origin,
+    },
 ];
+
+fn migration_0039_delegation_origin(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(delegations)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<HashSet<_>, _>>()?
+    };
+    if !columns.contains("origin_json") {
+        conn.execute("ALTER TABLE delegations ADD COLUMN origin_json TEXT", [])?;
+    }
+    Ok(())
+}
 
 /// Indexes for session message reads.
 ///

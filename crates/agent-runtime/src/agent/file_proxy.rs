@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 /// `Serialize + Deserialize` so it can travel over the kameo mesh as a reply.
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
 pub enum FileProxyError {
+    #[error("mesh filesystem access denied")]
+    AccessDenied,
     #[error("No working directory configured")]
     NoWorkingDirectory,
     #[error("Workspace index not ready")]
@@ -34,6 +36,7 @@ impl From<FileProxyError> for crate::error::AgentError {
     fn from(error: FileProxyError) -> Self {
         match error {
             FileProxyError::Transport(failure) => Self::from_transport_failure(failure),
+            FileProxyError::AccessDenied => Self::MeshAccessDenied,
             other => Self::Internal(other.to_string()),
         }
     }
@@ -43,6 +46,36 @@ impl FileProxyError {
     /// Wrap a classified remote transport failure.
     pub fn from_transport_failure(f: querymt_remote::RemoteTransportFailure) -> Self {
         FileProxyError::Transport(f)
+    }
+}
+
+// Do not expose hidden workspace files, including repository/config metadata.
+#[cfg(feature = "remote")]
+pub(crate) fn is_shareable_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    !path.as_os_str().is_empty()
+        && path.components().all(|component| matches!(component, Component::Normal(name) if !name.as_encoded_bytes().starts_with(b".")))
+}
+
+impl ReadRemoteFileResponse {
+    pub(crate) fn from_blocks(blocks: Vec<querymt::chat::ToolResultPart>) -> Self {
+        use base64::Engine as _;
+        match blocks.into_iter().next() {
+            Some(querymt::chat::ToolResultPart::Attachment(media)) => Self::Image {
+                mime_type: media
+                    .media_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                base64_data: match media.source() {
+                    querymt::chat::MediaSource::Inline { data } => {
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    }
+                    _ => String::new(),
+                },
+            },
+            Some(querymt::chat::ToolResultPart::Text { text }) => Self::Text(text),
+            None => Self::Binary,
+        }
     }
 }
 

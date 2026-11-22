@@ -107,7 +107,7 @@ rmcp = { version = "3.11", features = ["transport-streamable-http-client-unix-so
 [dev-dependencies]
 rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
-querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
+querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support", "mesh-access"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
 rmcp = { version = "3.11", features = ["server", "transport-streamable-http-server"] }
 mockall.workspace = true

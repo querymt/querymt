@@ -1,4 +1,5 @@
 mod commands;
+mod mesh;
 
 use qmacp::{client, error, output, policy, url};
 
@@ -70,6 +71,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     );
     if !cli.quiet {
         eprintln!("connecting {endpoint}");
+    }
+    if let Command::Mesh(mesh::MeshCommand::Watch { peer_id, timeout }) = &cli.command {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+        let client = AcpClient::connect_with_events(&url, &endpoint, cli.permission, event_tx)
+            .await
+            .map_err(|err| CliError::connection_with_cause(&endpoint, err))?;
+        let result = mesh::watch(
+            &client,
+            event_rx,
+            peer_id,
+            std::time::Duration::from_secs(*timeout),
+        )
+        .await?;
+        output::write_json(&output::ok(result), cli.pretty).map_err(CliError::rpc)?;
+        return Ok(ExitCode::Ok);
     }
     let client = AcpClient::connect(&url, &endpoint, cli.permission, stream_events)
         .await
