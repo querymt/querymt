@@ -566,6 +566,34 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn session_details_show_the_worktree_and_copy_its_checkout(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::test::TestWindowExt as _;
+        let h = harness(cx);
+        cx.update_window(h.handle, |_, window, cx| {
+            h.app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                // Listed only under its parent, like a worktree child.
+                let store = app.store.clone();
+                store.update(cx, |s, _| {
+                    let rt = s.runtime_mut_for_test("test-agent");
+                    let child = rt.sessions.remove(0);
+                    rt.children.entry("p".into()).or_default().sessions = vec![child];
+                    assert!(s.session_summary("test-agent", "s").is_some());
+                });
+                app.session_details_open = true;
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(h.handle, cx);
+        let checkout = vcx.debug_bounds("details-checkout").expect("checkout row");
+        vcx.simulate_click(checkout.center(), gpui_kit::Modifiers::none());
+        let copied = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(copied.as_deref(), Some("/wt/s"));
+    }
+
+    #[gpui_kit::test]
     fn a_worktree_child_listed_under_its_parent_can_hand_off(cx: &mut gpui_kit::TestAppContext) {
         let h = harness(cx);
         cx.update(|cx| {
