@@ -79,5 +79,4 @@ ACP errors SHALL be distinguishable by JSON-RPC error `data.code`, not message t
 | `mesh_quota_reconfigure_required` | An amount-only edit cannot change the quota kind or cadence. |
 | `mesh_quota_in_flight` | A quota change that starts a fresh period is blocked; `scope`. |
 | `mesh_access_denied` | An operation is not allowed by the current grant. |
-| `mesh_quota_exhausted` | An operation did not fit; `limits` is an array of `{scope, available_tokens, next_reset_at?}` entries for the limiting scopes. |
-| `mesh_quota_unsupported` | An allowed binding cannot enforce the required finite bound; `scope` identifies an applicable quota. |
+| `mesh_quota_exhausted` | At least one applicable finite scope has no remaining capacity after usage and reservations; `limits` is an array of `{scope, available_tokens, next_reset_at?}` entries for the exhausted scopes. |
