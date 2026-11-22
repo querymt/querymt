@@ -673,6 +673,7 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*fixture.storage.event_journal(),
+        None,
         &session_id,
         None,
     )
@@ -782,6 +783,7 @@ async fn test_cleanup_revert_keeps_run_lifecycle_and_the_new_runs_events() -> Re
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session_id,
         Some("run-3"),
     )
@@ -829,6 +831,7 @@ async fn test_cleanup_revert_without_current_run_start_keeps_lifecycle() -> Resu
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session_id,
         Some("run-not-journaled"),
     )
@@ -844,6 +847,187 @@ async fn test_cleanup_revert_without_current_run_start_keeps_lifecycle() -> Resu
     assert!(!seqs.contains(&seq_prompt));
     assert!(seqs.contains(&seq_start) && seqs.contains(&seq_end));
     assert_eq!(journal.last_unfinished_run(&session_id).await?, None);
+    Ok(())
+}
+
+/// Journal that holds a session stream's writes back until a range delete
+/// starts (or a short grace period passes), then persists them right before
+/// the delete: the writer catching up between cleanup's journal read and its
+/// prune, made deterministic.
+struct GatedWriterJournal {
+    inner: Arc<dyn EventJournal>,
+    open: tokio::sync::watch::Sender<bool>,
+    stream:
+        std::sync::OnceLock<Arc<querymt_agent_services::session_event_stream::SessionEventStream>>,
+}
+
+impl GatedWriterJournal {
+    /// Grace period after which held writes proceed anyway, so an explicit
+    /// flush by the code under test completes instead of deadlocking.
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+}
+
+#[async_trait::async_trait]
+impl EventJournal for GatedWriterJournal {
+    async fn append_durable(
+        &self,
+        event: &NewDurableEvent,
+    ) -> querymt_agent_core::session::error::SessionResult<querymt_agent_core::events::DurableEvent>
+    {
+        let mut open = self.open.subscribe();
+        let _ = tokio::time::timeout(Self::GRACE, open.wait_for(|open| *open)).await;
+        self.inner.append_durable(event).await
+    }
+    async fn max_session_seq(&self, session_id: &str) -> i64 {
+        self.inner.max_session_seq(session_id).await
+    }
+    async fn load_session_stream(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> querymt_agent_core::session::error::SessionResult<
+        Vec<querymt_agent_core::events::DurableEvent>,
+    > {
+        self.inner
+            .load_session_stream(session_id, after_seq, limit)
+            .await
+    }
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> querymt_agent_core::session::error::SessionResult<
+        Vec<querymt_agent_core::events::DurableEvent>,
+    > {
+        self.inner.load_global_stream(after_seq, limit).await
+    }
+    async fn delete_session_events_range(
+        &self,
+        session_id: &str,
+        from_seq: i64,
+        before_seq: Option<i64>,
+    ) -> querymt_agent_core::session::error::SessionResult<usize> {
+        self.open.send_replace(true);
+        if let Some(stream) = self.stream.get() {
+            stream.flush().await;
+        }
+        self.inner
+            .delete_session_events_range(session_id, from_seq, before_seq)
+            .await
+    }
+    async fn append_durable_from_source(
+        &self,
+        event: &NewDurableEvent,
+    ) -> querymt_agent_core::session::error::SessionResult<
+        Option<querymt_agent_core::events::DurableEvent>,
+    > {
+        self.inner.append_durable_from_source(event).await
+    }
+    async fn latest_source_seq(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> querymt_agent_core::session::error::SessionResult<Option<i64>> {
+        self.inner
+            .latest_source_seq(session_id, source_node_id)
+            .await
+    }
+    async fn remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> querymt_agent_core::session::error::SessionResult<Option<i64>> {
+        self.inner
+            .remote_sync_cursor(session_id, source_node_id)
+            .await
+    }
+    async fn advance_remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        source_seq: i64,
+        complete: bool,
+    ) -> querymt_agent_core::session::error::SessionResult<()> {
+        self.inner
+            .advance_remote_sync_cursor(session_id, source_node_id, source_seq, complete)
+            .await
+    }
+    async fn load_remote_session_stream(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> querymt_agent_core::session::error::SessionResult<
+        Vec<querymt_agent_core::events::DurableEvent>,
+    > {
+        self.inner
+            .load_remote_session_stream(session_id, source_node_id)
+            .await
+    }
+    async fn max_stream_seq(
+        &self,
+        session_id: &str,
+    ) -> querymt_agent_core::session::error::SessionResult<i64> {
+        self.inner.max_stream_seq(session_id).await
+    }
+}
+
+/// Regression: the new run's `run_started` is only queued on the session
+/// stream (not yet persisted) when cleanup runs. Cleanup must flush the stream
+/// so the prune is bounded by the new run's start and keeps its events, even
+/// when the writer only persists them after cleanup read the journal.
+#[tokio::test]
+async fn test_cleanup_revert_flushes_queued_run_start_before_pruning() -> Result<()> {
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::session_event_stream::SessionEventStream;
+
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    let msg_id = fixture.add_user_message(&session_id, "only").await?;
+    append_kind(&*journal, &session_id, run_started("run-1")).await;
+    let seq_prompt = append_prompt_event(&*journal, &session_id, &msg_id).await;
+    append_kind(&*journal, &session_id, run_completed("run-1")).await;
+    fixture.undo(&session_id, &msg_id).await?;
+
+    // The new run's events are queued, not awaited, and the writer lags.
+    let gated = Arc::new(GatedWriterJournal {
+        inner: journal.clone(),
+        open: tokio::sync::watch::channel(false).0,
+        stream: std::sync::OnceLock::new(),
+    });
+    let stream = SessionEventStream::new(&session_id, gated.clone(), Arc::new(EventFanout::new()));
+    let _ = gated.stream.set(stream.clone());
+    stream.emit(run_started("run-2"));
+    stream.emit(AgentEventKind::QueuedInputStarted {
+        input_id: "input-2".to_string(),
+        run_id: "run-2".to_string(),
+    });
+
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*gated,
+        Some(&stream),
+        &session_id,
+        Some("run-2"),
+    )
+    .await
+    .expect("cleanup should succeed");
+    stream.flush().await;
+
+    let after = journal.load_session_stream(&session_id, None, None).await?;
+    assert!(
+        !after.iter().any(|e| e.stream_seq == seq_prompt),
+        "undone prompt is pruned"
+    );
+    assert!(
+        after.iter().any(|e| matches!(
+            &e.kind,
+            AgentEventKind::QueuedInputStarted { run_id, .. } if run_id == "run-2"
+        )),
+        "the new run's events must survive"
+    );
     Ok(())
 }
 
@@ -968,6 +1152,7 @@ async fn test_undo_cleanup_bumps_history_epoch_and_appends_do_not() -> Result<()
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*fixture.storage.event_journal(),
+        None,
         &session_id,
         None,
     )
@@ -1040,6 +1225,7 @@ async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session_id,
         None,
     )
@@ -1132,6 +1318,7 @@ async fn test_cleanup_revert_removes_undone_messages_from_history() -> Result<()
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session_id,
         None,
     )
@@ -1668,6 +1855,7 @@ async fn failed_undo_keeps_history_but_its_frame_is_discarded_by_the_next_prompt
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session,
         None,
     )
@@ -1725,6 +1913,7 @@ async fn failed_undo_then_successful_retry_leaves_no_stale_frame_after_the_next_
     crate::agent::undo::cleanup_revert_on_prompt(
         &fixture.handle.config.provider,
         &*journal,
+        None,
         &session,
         None,
     )

@@ -755,13 +755,15 @@ fn is_copied_fork_message(
 /// started the undone turn, so it must also be purged from history.
 ///
 /// `current_run_id` is the run that is about to execute the new prompt. Its
-/// `run_started` (and anything it emitted before this cleanup) is already in
-/// the journal, so the journal prune stops right before it: only events of
-/// the undone turns are removed. Run lifecycle events are never pruned (see
+/// `run_started` is emitted without waiting for persistence, so when
+/// `event_stream` is given it is flushed before the journal is read: the run's
+/// start (and anything it emitted before this cleanup) is then journaled and
+/// the prune stops right before it, removing only events of the undone turns.
+/// Run lifecycle events are never pruned (see
 /// `EventJournal::delete_session_events_range`).
 #[instrument(
     name = "undo.cleanup",
-    skip(provider, event_journal),
+    skip(provider, event_journal, event_stream),
     fields(
         frontier_message = tracing::field::Empty,
         deleted_messages = tracing::field::Empty,
@@ -771,6 +773,7 @@ fn is_copied_fork_message(
 pub(crate) async fn cleanup_revert_on_prompt(
     provider: &crate::session::provider::SessionProvider,
     event_journal: &dyn crate::session::projection::EventJournal,
+    event_stream: Option<&querymt_agent_services::session_event_stream::SessionEventStream>,
     session_id: &str,
     current_run_id: Option<&str>,
 ) -> Result<(), UndoError> {
@@ -825,6 +828,11 @@ pub(crate) async fn cleanup_revert_on_prompt(
     // corresponds to the frontier message, then delete it and everything
     // after it so undone turns don't reappear on page reload.
     let frontier_message_id = revert_state.message_id.clone();
+    // Persist events queued so far (the current run's `run_started` among
+    // them) so the prune is bounded by the current run's start.
+    if let Some(stream) = event_stream {
+        stream.flush().await;
+    }
     if let Ok(events) = event_journal
         .load_session_stream(session_id, None, None)
         .await
