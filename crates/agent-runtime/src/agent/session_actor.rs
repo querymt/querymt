@@ -169,7 +169,7 @@ pub struct SessionActor {
     pub(crate) tool_config: ToolConfig,
 
     // ── Run tracking ─────────────────────────────────────────────
-    /// The run this session executes, if any, with its cancellation token.
+    /// The run this session executes, if any, with its cancellation token and authority.
     /// Only [`SessionActor::start_run`] fills it and `PromptFinished` empties it.
     pub(crate) run: RunSlot,
     /// Advances when a run starts, so a stale `PromptFinished` of an earlier
@@ -286,7 +286,7 @@ impl Actor for SessionActor {
 #[derive(Debug)]
 pub(crate) enum RunSlot {
     Idle,
-    Running(ActiveRun),
+    Running(ActiveRun, TurnAuthority),
 }
 
 impl RunSlot {
@@ -294,7 +294,7 @@ impl RunSlot {
     pub(crate) fn active(&self) -> Option<&ActiveRun> {
         match self {
             RunSlot::Idle => None,
-            RunSlot::Running(run) => Some(run),
+            RunSlot::Running(run, _) => Some(run),
         }
     }
 
@@ -302,7 +302,14 @@ impl RunSlot {
     pub(crate) fn active_mut(&mut self) -> Option<&mut ActiveRun> {
         match self {
             RunSlot::Idle => None,
-            RunSlot::Running(run) => Some(run),
+            RunSlot::Running(run, _) => Some(run),
+        }
+    }
+
+    fn authority(&self) -> Option<&TurnAuthority> {
+        match self {
+            RunSlot::Idle => None,
+            RunSlot::Running(_, authority) => Some(authority),
         }
     }
 
@@ -312,7 +319,7 @@ impl RunSlot {
 
     /// Cancel the running run; nothing happens when idle.
     pub(crate) fn cancel(&self) {
-        if let RunSlot::Running(run) = self {
+        if let RunSlot::Running(run, _) = self {
             run.cancellation.cancel();
         }
     }
@@ -339,6 +346,7 @@ const MAX_SUBMIT_RECEIPT_AGE_MS: u64 = 30 * 60 * 1000;
 #[derive(Debug, Clone)]
 struct SubmitInputReceipt {
     client_input_id: String,
+    authority: TurnAuthority,
     result: SubmitInputResult,
     accepted_at_ms: u64,
 }
@@ -362,8 +370,245 @@ struct Completion {
     queued_input_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) enum TurnAuthority {
+    #[default]
+    Local,
+    #[cfg(feature = "remote")]
+    Peer(Arc<PeerTurn>),
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct PeerTurn {
+    pub(crate) key: querymt_remote::peer_access::PeerGrantKey,
+    pub(crate) protocol: querymt_remote::peer_access::SharingProtocol,
+    pinned: querymt_remote::peer_access::PeerGrant,
+    changes: parking_lot::Mutex<
+        Option<tokio::sync::broadcast::Receiver<querymt_remote::peer_access::PolicyChange>>,
+    >,
+    store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+}
+
+#[cfg(feature = "remote")]
+impl PeerTurn {
+    pub(crate) fn from_request(
+        origin: &querymt_remote::mesh_ingress::PeerRequest,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            key: origin.key().clone(),
+            protocol: origin.protocol(),
+            pinned: origin
+                .grant()
+                .cloned()
+                .ok_or(AgentError::MeshAccessDenied)?,
+            changes: parking_lot::Mutex::new(store.subscribe_changes()),
+            store,
+        })
+    }
+
+    pub(crate) async fn grant(&self) -> Result<querymt_remote::peer_access::PeerGrant, AgentError> {
+        self.grant_for(None).await
+    }
+
+    pub(crate) async fn grant_for(
+        &self,
+        binding: Option<(&str, &str)>,
+    ) -> Result<querymt_remote::peer_access::PeerGrant, AgentError> {
+        let state = self
+            .store
+            .grant(&self.key)
+            .await
+            .map_err(|_| AgentError::MeshAccessDenied)?;
+        self.check_grant(&state.grant, binding)?;
+        Ok(self.pinned.clone())
+    }
+
+    pub(crate) fn allows_shell(&self) -> bool {
+        self.grant_allows_shell(&self.pinned)
+    }
+
+    fn grant_allows_shell(&self, grant: &querymt_remote::peer_access::PeerGrant) -> bool {
+        grant.allows_shell(self.protocol)
+    }
+
+    fn check_grant(
+        &self,
+        grant: &querymt_remote::peer_access::PeerGrant,
+        binding: Option<(&str, &str)>,
+    ) -> Result<(), AgentError> {
+        use querymt_remote::peer_access::PeerGrant;
+
+        if !grant.allows_sessions(self.protocol)
+            // Even a Custom grant with shell does not authorize a Full turn's other tools.
+            || self.pinned == PeerGrant::Full && *grant != PeerGrant::Full
+            || self.allows_shell() && !self.grant_allows_shell(grant)
+            || self.pinned.allows_filesystem(self.protocol)
+                && !grant.allows_filesystem(self.protocol)
+            || binding.is_some_and(|(provider, model)| {
+                !self.pinned.allows_model(self.protocol, provider, model)
+                    || !grant.allows_model(self.protocol, provider, model)
+            })
+        {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn revoked(&self, binding: Option<(&str, &str)>) -> AgentError {
+        let changes = self
+            .changes
+            .lock()
+            .take()
+            .or_else(|| self.store.subscribe_changes());
+        querymt_remote::peer_access::wait_for_policy_loss(
+            self.store.as_ref(),
+            &self.key,
+            changes,
+            |grant| self.check_grant(grant, binding),
+            || AgentError::MeshAccessDenied,
+        )
+        .await
+    }
+
+    pub(crate) fn schedule_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        use querymt_remote::peer_access::SharingProtocol;
+        ScheduleOrigin::Peer {
+            host: self.key.host.to_string(),
+            peer: self.key.peer.to_string(),
+            protocol: match self.protocol {
+                SharingProtocol::Legacy => SchedulePeerProtocol::Legacy,
+                SharingProtocol::V1 => SchedulePeerProtocol::V1,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_peer(
+        key: querymt_remote::peer_access::PeerGrantKey,
+        pinned: querymt_remote::peer_access::PeerGrant,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            protocol: querymt_remote::peer_access::SharingProtocol::V1,
+            pinned,
+            changes: parking_lot::Mutex::new(store.subscribe_changes()),
+            store,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_authority(
+        pinned: querymt_remote::peer_access::PeerGrant,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> TurnAuthority {
+        use querymt_remote::{
+            NodeId,
+            peer_access::{PeerGrantKey, SharingProtocol},
+        };
+        TurnAuthority::Peer(Arc::new(Self {
+            key: PeerGrantKey {
+                host: NodeId::from_peer_id(libp2p::PeerId::random()),
+                peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+            },
+            protocol: SharingProtocol::V1,
+            pinned,
+            changes: parking_lot::Mutex::new(store.subscribe_changes()),
+            store,
+        }))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for PeerTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTurn")
+            .field("key", &self.key)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::session::provider::SessionHandle {
+    async fn check_peer_binding(
+        &self,
+        peer: &PeerTurn,
+    ) -> Result<querymt_remote::peer_access::PeerGrant, AgentError> {
+        let config = self.llm_config().ok_or(AgentError::MeshAccessDenied)?;
+        peer.grant_for(Some((&config.provider, &config.model)))
+            .await
+    }
+}
+
+impl TurnAuthority {
+    /// Guarded peers can use session APIs, but cannot dispatch providers until
+    /// a metered provider path is available.
+    pub(crate) fn require_provider_dispatch(&self) -> Result<(), AgentError> {
+        match self {
+            Self::Local => Ok(()),
+            #[cfg(feature = "remote")]
+            Self::Peer(_) => Err(AgentError::MeshAccessDenied),
+        }
+    }
+
+    pub(crate) fn stored_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
+        match self {
+            Self::Local => crate::session::domain_schedule::ScheduleOrigin::Local,
+            #[cfg(feature = "remote")]
+            Self::Peer(peer) => peer.schedule_origin(),
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn owns_schedule(
+        &self,
+        origin: &crate::session::domain_schedule::ScheduleOrigin,
+    ) -> bool {
+        matches!(
+            origin,
+            crate::session::domain_schedule::ScheduleOrigin::Peer { .. }
+        ) && self.stored_origin() == *origin
+    }
+
+    pub(crate) async fn check(&self) -> Result<(), AgentError> {
+        match self {
+            Self::Local => Ok(()),
+            #[cfg(feature = "remote")]
+            Self::Peer(peer) => peer.grant().await.map(|_| ()),
+        }
+    }
+
+    fn same_origin(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local, Self::Local) => true,
+            #[cfg(feature = "remote")]
+            (Self::Peer(a), Self::Peer(b)) => a.key == b.key && a.protocol == b.protocol,
+            #[cfg(feature = "remote")]
+            _ => false,
+        }
+    }
+
+    fn can_control(&self, target: &Self) -> bool {
+        if matches!(self, Self::Local) {
+            return true;
+        }
+        if !self.same_origin(target) {
+            return false;
+        }
+        #[cfg(feature = "remote")]
+        if let (Self::Peer(caller), Self::Peer(turn)) = (self, target) {
+            return turn.check_grant(&caller.pinned, None).is_ok();
+        }
+        true
+    }
+}
+
 struct QueuedPrompt {
     input_id: String,
+    authority: TurnAuthority,
     req: crate::acp::protocol::PromptRequest,
     reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
 }
@@ -507,11 +752,18 @@ impl SessionActor {
 
     /// Return the original receipt for a repeated `client_input_id`, if it is
     /// still within the bounded cache window.
-    fn cached_submit_receipt(&mut self, client_input_id: &str) -> Option<SubmitInputResult> {
+    fn cached_submit_receipt(
+        &mut self,
+        client_input_id: &str,
+        authority: &TurnAuthority,
+    ) -> Option<SubmitInputResult> {
         self.prune_submit_receipts(now_ms());
         self.submit_receipts
             .iter()
-            .find(|receipt| receipt.client_input_id == client_input_id)
+            .find(|receipt| {
+                receipt.client_input_id == client_input_id
+                    && receipt.authority.same_origin(authority)
+            })
             .map(|receipt| receipt.result.clone())
     }
 
@@ -522,6 +774,7 @@ impl SessionActor {
         &mut self,
         client_input_id: Option<String>,
         result: &SubmitInputResult,
+        authority: TurnAuthority,
     ) {
         let Some(client_input_id) = client_input_id else {
             return;
@@ -530,6 +783,7 @@ impl SessionActor {
         self.prune_submit_receipts(now);
         self.submit_receipts.push_back(SubmitInputReceipt {
             client_input_id,
+            authority,
             result: result.clone(),
             accepted_at_ms: now,
         });
@@ -619,6 +873,7 @@ impl SessionActor {
         completion: Completion,
         turn_id: Option<querymt_agent_core::model::TurnId>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
+        authority: TurnAuthority,
     ) {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
@@ -627,7 +882,7 @@ impl SessionActor {
         let active_run = ActiveRun::new(run_id, generation, CancellationToken::new());
         let steering = active_run.steering.clone();
         let cancel_token = active_run.cancellation.clone();
-        self.run = RunSlot::Running(active_run);
+        self.run = RunSlot::Running(active_run, authority.clone());
         self.emit_runtime_changed(0);
 
         // After the lease is held and before any other event of the run.
@@ -687,7 +942,8 @@ impl SessionActor {
         };
         tokio::spawn(
             async move {
-                let run = execute_prompt_guarded(exec, &config, &session_id, run_id).await;
+                let run =
+                    execute_prompt_guarded(exec, &authority, &config, &session_id, run_id).await;
                 let disposition = run_disposition(cancel_token.is_cancelled(), &run);
                 let finished = PromptFinished {
                     generation,
@@ -783,9 +1039,18 @@ impl SessionActor {
 // 4. Matching PromptFinished empties the run slot.
 
 impl Message<Cancel> for SessionActor {
-    type Reply = ();
+    type Reply = Result<(), AgentError>;
 
-    async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(&mut self, msg: Cancel, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        msg.authority.check().await?;
+        if let Some(authority) = self.run.authority() {
+            if !msg.authority.can_control(authority) {
+                return Err(AgentError::MeshAccessDenied);
+            }
+        } else if !matches!(msg.authority, TurnAuthority::Local) {
+            return Ok(());
+        }
+
         debug!("Session {}: Cancel received", self.session_id);
         self.run.cancel();
         let cancelled_elicitations = crate::elicitation::cancel_pending_elicitations_for_session(
@@ -824,6 +1089,7 @@ impl Message<Cancel> for SessionActor {
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
         self.publish_runtime().await;
+        Ok(())
     }
 }
 
@@ -954,7 +1220,18 @@ impl Message<PromptFinished> for SessionActor {
         // it, so no other owner can start a run between two queued turns.
         // The completion above is already persisted, so a reconciler never
         // sees a free lease with this run still open.
-        if let Some(queued) = self.queued_prompts.pop_front() {
+        while let Some(queued) = self.queued_prompts.pop_front() {
+            if let Err(error) = queued.authority.check().await {
+                self.config.emit_event(
+                    &self.session_id,
+                    AgentEventKind::QueuedInputDiscarded {
+                        input_id: queued.input_id,
+                        reason: "mesh_access_denied".into(),
+                    },
+                );
+                let _ = queued.reply.send(Err(error));
+                continue;
+            }
             self.start_run(
                 ExecutionOrigin::Interactive,
                 queued.req,
@@ -964,11 +1241,12 @@ impl Message<PromptFinished> for SessionActor {
                 },
                 None,
                 ctx.actor_ref().clone(),
+                queued.authority,
             );
-        } else {
-            self.run_lease = None;
-            self.publish_runtime().await;
+            return;
         }
+        self.run_lease = None;
+        self.publish_runtime().await;
     }
 }
 
@@ -1577,8 +1855,8 @@ impl Message<GetRuntimeStatus> for SessionActor {
 
     async fn handle(
         &mut self,
-        _msg: GetRuntimeStatus,
-        _ctx: &mut Context<Self, Self::Reply>,
+        msg: GetRuntimeStatus,
+        _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let pending_steering_count = match self.run.active() {
             Some(run) => run.steering.pending_count().await,
@@ -1587,7 +1865,12 @@ impl Message<GetRuntimeStatus> for SessionActor {
         if pending_steering_count != self.published_pending_steering {
             self.emit_runtime_changed(pending_steering_count);
         }
-        Ok(self.runtime_status(pending_steering_count))
+        let mut status = self.runtime_status(pending_steering_count);
+        status.steerable &= self
+            .run
+            .authority()
+            .is_some_and(|authority| msg.authority.can_control(authority));
+        Ok(status)
     }
 }
 
@@ -1976,99 +2259,174 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
     ) -> Self::Reply {
         #[cfg(feature = "remote")]
         {
-            use crate::agent::remote::event_forwarder::EventForwarder;
-            use crate::agent::remote::event_relay::EventRelayActor;
-
-            // Unsubscribe identifies a relay by sequence ID and peer-scoped name.
-            let relay_name = msg
-                .relay_dht_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| {
-                    AgentError::RemoteActor(
-                        "SubscribeEvents requires a non-empty relay_dht_name for unsubscribe identity"
-                            .to_string(),
-                    )
-                })?;
-            let relay_source = if msg.relay_ref.is_some() {
-                "direct"
-            } else {
-                "dht"
-            };
-            let relay_ref = if let Some(relay_ref) = msg.relay_ref {
-                relay_ref
-            } else {
-                let mesh = self.mesh.as_ref().ok_or(AgentError::MeshNotBootstrapped)?;
-                mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
-                    .await
-                    .map_err(|error| AgentError::SwarmLookupFailed {
-                        key: relay_name.to_string(),
-                        reason: error.to_string(),
-                    })?
-                    .ok_or_else(|| {
-                        AgentError::RemoteActor(format!(
-                            "event relay '{relay_name}' is not available"
-                        ))
-                    })?
-            };
-
-            let relay_id = relay_ref.id();
-            if let Some((_, prev_handle)) = self.relay_forwarder_handles.remove(&relay_id) {
-                prev_handle.abort();
-                log::debug!(
-                    "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
-                    self.session_id,
-                    msg.relay_actor_id
-                );
-            }
-
-            let fanout = self.config.event_sink.fanout().clone();
-            let handle = EventForwarder::start(
-                fanout,
-                relay_ref,
-                format!("session:{}", self.session_id),
-                self.session_id.clone(),
-            );
-            self.relay_forwarder_handles
-                .insert(relay_id, (msg.relay_dht_name, handle));
-
-            // Re-emit readiness if indexing completed before the live path existed.
-            if let Some(workspace) = self.runtime.workspace_handle.get()
-                && let Some(index) = workspace.file_index()
-                && let Err(e) = self
-                    .config
-                    .emit_event_persisted(
-                        &self.session_id,
-                        querymt_agent_core::events::AgentEventKind::WorkspaceIndexReady {
-                            workspace_root: index.root.display().to_string(),
-                        },
-                    )
-                    .await
-            {
-                warn!(
-                    "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
-                    self.session_id, e
-                );
-            }
-
-            log::debug!(
-                "Session {}: SubscribeEvents installed EventForwarder via {} (relay_actor_id={})",
-                self.session_id,
-                relay_source,
-                msg.relay_actor_id,
-            );
-            Ok(())
+            self.install_event_subscription(msg, None).await
         }
 
         #[cfg(not(feature = "remote"))]
         {
             let _ = msg;
-            info!(
-                "Session {}: SubscribeEvents ignored (remote feature not enabled)",
-                self.session_id
-            );
             Ok(())
         }
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct SubscribePeerEvents {
+    pub(crate) message: SubscribeEvents,
+    pub(crate) subscriber: crate::agent::remote::event_forwarder::PeerSubscription,
+}
+
+#[cfg(feature = "remote")]
+impl Message<SubscribePeerEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: SubscribePeerEvents,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.install_event_subscription(msg.message, Some(msg.subscriber))
+            .await
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct UnsubscribePeerEvents {
+    pub(crate) message: UnsubscribeEvents,
+    pub(crate) peer: libp2p::PeerId,
+}
+
+#[cfg(feature = "remote")]
+impl Message<UnsubscribePeerEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: UnsubscribePeerEvents,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let id = kameo::actor::ActorId::new_with_peer_id(msg.message.relay_actor_id, msg.peer);
+        if self
+            .relay_forwarder_handles
+            .get(&id)
+            .is_some_and(|(name, _)| name.as_deref() == Some(msg.message.relay_dht_name.as_str()))
+        {
+            self.relay_forwarder_handles.remove(&id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "remote")]
+impl SessionActor {
+    async fn install_event_subscription(
+        &mut self,
+        msg: SubscribeEvents,
+        subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
+    ) -> Result<(), AgentError> {
+        use crate::agent::remote::event_forwarder::EventForwarder;
+        use crate::agent::remote::event_relay::EventRelayActor;
+
+        // Unsubscribe identifies a relay by sequence ID and peer-scoped name.
+        let relay_name = msg
+            .relay_dht_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                AgentError::RemoteActor(
+                    "SubscribeEvents requires a non-empty relay_dht_name for unsubscribe identity"
+                        .to_string(),
+                )
+            })?;
+        let relay_source = if msg.relay_ref.is_some() {
+            "direct"
+        } else {
+            "dht"
+        };
+        let relay_ref = if let Some(relay_ref) = msg.relay_ref {
+            relay_ref
+        } else {
+            let mesh = subscriber
+                .as_ref()
+                .map(|subscriber| &subscriber.egress)
+                .or(self.mesh.as_ref())
+                .ok_or(AgentError::MeshNotBootstrapped)?;
+            mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
+                .await
+                .map_err(|error| AgentError::SwarmLookupFailed {
+                    key: relay_name.to_string(),
+                    reason: error.to_string(),
+                })?
+                .ok_or_else(|| {
+                    AgentError::RemoteActor(format!("event relay '{relay_name}' is not available"))
+                })?
+        };
+
+        let relay_id = relay_ref.id();
+        if let Some(subscriber) = &subscriber
+            && (relay_id.sequence_id() != msg.relay_actor_id
+                || relay_id.peer_id() != Some(subscriber.origin.key().peer.as_peer_id())
+                || !subscriber.is_current().await)
+        {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        if let Some((_, prev_handle)) = self.relay_forwarder_handles.remove(&relay_id) {
+            prev_handle.abort();
+            log::debug!(
+                "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
+                self.session_id,
+                msg.relay_actor_id
+            );
+        }
+
+        let fanout = self.config.event_sink.fanout().clone();
+        let guarded = subscriber.is_some();
+        let handle = if guarded {
+            EventForwarder::start_with_policy(
+                fanout,
+                relay_ref,
+                format!("session:{}", self.session_id),
+                self.session_id.clone(),
+                subscriber,
+            )
+        } else {
+            EventForwarder::start(
+                fanout,
+                relay_ref,
+                format!("session:{}", self.session_id),
+                self.session_id.clone(),
+            )
+        };
+        self.relay_forwarder_handles
+            .insert(relay_id, (msg.relay_dht_name, handle));
+
+        // Re-emit readiness if indexing completed before the live path existed.
+        if !guarded
+            && let Some(workspace) = self.runtime.workspace_handle.get()
+            && let Some(index) = workspace.file_index()
+            && let Err(e) = self
+                .config
+                .emit_event_persisted(
+                    &self.session_id,
+                    querymt_agent_core::events::AgentEventKind::WorkspaceIndexReady {
+                        workspace_root: index.root.display().to_string(),
+                    },
+                )
+                .await
+        {
+            warn!(
+                "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
+                self.session_id, e
+            );
+        }
+
+        log::debug!(
+            "Session {}: SubscribeEvents installed EventForwarder via {} (relay_actor_id={})",
+            self.session_id,
+            relay_source,
+            msg.relay_actor_id,
+        );
+        Ok(())
     }
 }
 
@@ -2213,7 +2571,6 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
         use crate::tools::builtins::read_shared::render_read_output;
-        use base64::Engine as _;
 
         let cwd = self
             .runtime
@@ -2243,26 +2600,63 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .await
             .map_err(FileProxyError::ReadError)?;
 
-        // Map the single result part returned by render_read_output to the
-        // appropriate ReadRemoteFileResponse variant.
-        let Some(block) = blocks.into_iter().next() else {
-            return Ok(ReadRemoteFileResponse::Binary);
+        Ok(ReadRemoteFileResponse::from_blocks(blocks))
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct ReadPeerFile(pub(crate) ReadRemoteFile);
+
+#[cfg(feature = "remote")]
+impl Message<ReadPeerFile> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::ReadRemoteFileResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        ReadPeerFile(msg): ReadPeerFile,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse, is_shareable_path};
+        use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_confined_file};
+        use std::path::Path;
+
+        let cwd = self
+            .runtime
+            .cwd
+            .as_deref()
+            .ok_or(FileProxyError::NoWorkingDirectory)?;
+        // Anchor to the session's workspace, not an ancestor discovered by a
+        // fresh scan influenced by files the peer can access.
+        let index = self
+            .runtime
+            .workspace_handle
+            .get()
+            .and_then(|workspace| workspace.file_index());
+        let root = index.as_ref().map_or(cwd, |index| index.root.as_path());
+        let supplied = Path::new(&msg.path);
+        let joined = if supplied.is_absolute() {
+            supplied.to_owned()
+        } else {
+            cwd.join(supplied)
         };
-        match block {
-            querymt::chat::ToolResultPart::Attachment(media) => Ok(ReadRemoteFileResponse::Image {
-                mime_type: media
-                    .media_type()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                base64_data: match media.source() {
-                    querymt::chat::MediaSource::Inline { data } => {
-                        base64::engine::general_purpose::STANDARD.encode(data)
-                    }
-                    _ => String::new(),
-                },
-            }),
-            querymt::chat::ToolResultPart::Text { text } => Ok(ReadRemoteFileResponse::Text(text)),
+        let relative = joined
+            .strip_prefix(root)
+            .map_err(|_| FileProxyError::AccessDenied)?;
+        if !is_shareable_path(relative) {
+            return Err(FileProxyError::AccessDenied);
         }
+        let blocks = render_confined_file(
+            root,
+            relative,
+            msg.offset,
+            msg.limit.min(DEFAULT_READ_LIMIT),
+        )
+        .await
+        .map_err(FileProxyError::ReadError)?;
+        Ok(ReadRemoteFileResponse::from_blocks(blocks))
     }
 }
 
@@ -2276,7 +2670,10 @@ impl Message<SubmitSessionInput> for SessionActor {
         msg: SubmitSessionInput,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let input = msg.input;
+        let SubmitSessionInput { input, authority } = msg;
+        let authority = &authority;
+        let actor_ref = ctx.actor_ref();
+        authority.check().await?;
         if input.session_id != self.session_id {
             return Err(AgentError::from(TurnControlError::SessionMismatch {
                 expected: self.session_id.clone(),
@@ -2284,16 +2681,19 @@ impl Message<SubmitSessionInput> for SessionActor {
             }));
         }
         validate_prompt_blocks(&input.prompt)?;
-        let input_id = input
-            .client_input_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Peer idempotency keys are not session-global queue identifiers.
+        let input_id = match authority {
+            TurnAuthority::Local => input.client_input_id.clone(),
+            #[cfg(feature = "remote")]
+            TurnAuthority::Peer(_) => None,
+        }
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Bounded same-actor receipt dedup: a retried keyed submission whose
         // original reply was lost returns the original receipt instead of
         // enqueuing a duplicate turn.
         if let Some(client_input_id) = input.client_input_id.as_deref()
-            && let Some(receipt) = self.cached_submit_receipt(client_input_id)
+            && let Some(receipt) = self.cached_submit_receipt(client_input_id, authority)
         {
             info!(
                 "Session {}: SubmitInput client_input_id={} replayed cached receipt",
@@ -2304,6 +2704,13 @@ impl Message<SubmitSessionInput> for SessionActor {
 
         match input.delivery {
             InputDelivery::Steer => {
+                if self
+                    .run
+                    .authority()
+                    .is_some_and(|active| !authority.can_control(active))
+                {
+                    return Err(AgentError::MeshAccessDenied);
+                }
                 // Steered text would reach the model verbatim; reject built-ins
                 // regardless of which path submitted them.
                 Builtin::parse_for(&input.prompt, Submission::Steer)?;
@@ -2335,6 +2742,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id,
                     }));
                 }
+                authority.check().await?;
                 let blocks = input.prompt.clone();
                 let position = run
                     .steering
@@ -2366,7 +2774,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     input_id,
                     position,
                 };
-                self.record_submit_receipt(input.client_input_id, &result);
+                self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                 self.publish_runtime().await;
                 Ok(result)
             }
@@ -2408,7 +2816,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                             queued_input_id: Some(input_id.clone()),
                         },
                         None,
-                        ctx.actor_ref().clone(),
+                        actor_ref.clone(),
+                        authority.clone(),
                     );
                     let run_id = self
                         .run
@@ -2416,7 +2825,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         .map(|run| run.run_id.to_string())
                         .unwrap_or_default();
                     let result = SubmitInputResult::Started { run_id, input_id };
-                    self.record_submit_receipt(input.client_input_id, &result);
+                    self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                     self.publish_runtime().await;
                     Ok(result)
                 } else {
@@ -2440,11 +2849,12 @@ impl Message<SubmitSessionInput> for SessionActor {
                         .map_err(AgentError::from)?;
                     self.queued_prompts.push_back(QueuedPrompt {
                         input_id: input_id.clone(),
+                        authority: authority.clone(),
                         req,
                         reply,
                     });
                     let result = SubmitInputResult::Queued { input_id, position };
-                    self.record_submit_receipt(input.client_input_id, &result);
+                    self.record_submit_receipt(input.client_input_id, &result, authority.clone());
                     self.publish_runtime().await;
                     Ok(result)
                 }
@@ -2459,14 +2869,16 @@ impl Message<DiscardQueuedInput> for SessionActor {
     async fn handle(
         &mut self,
         msg: DiscardQueuedInput,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let input_id = msg.input_id;
-        let Some(position) = self
-            .queued_prompts
-            .iter()
-            .position(|queued| queued.input_id == input_id)
-        else {
+        let DiscardQueuedInput {
+            input_id,
+            authority,
+        } = msg;
+        authority.check().await?;
+        let Some(position) = self.queued_prompts.iter().position(|queued| {
+            queued.input_id == input_id && authority.can_control(&queued.authority)
+        }) else {
             return Ok(DiscardQueuedInputResult::NotPending { input_id });
         };
         self.config
@@ -2496,25 +2908,51 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
-            return ctx.spawn(async move { Err(AgentError::from(error)) });
+        let queued = self.enqueue_prompt(msg, ctx.actor_ref()).await;
+        ctx.spawn(wait_for_prompt_reply(queued))
+    }
+}
+
+type PromptReceiver = oneshot::Receiver<Result<PromptResponse, AgentError>>;
+
+async fn wait_for_prompt_reply(
+    queued: Result<PromptReceiver, AgentError>,
+) -> Result<PromptResponse, AgentError> {
+    queued?
+        .await
+        .map_err(|_| AgentError::Internal("prompt execution dropped".into()))?
+}
+
+impl SessionActor {
+    async fn enqueue_prompt(
+        &mut self,
+        msg: Prompt,
+        actor_ref: &kameo::actor::ActorRef<Self>,
+    ) -> Result<PromptReceiver, AgentError> {
+        let authority = msg.authority;
+        authority.check().await?;
+        if msg.req.session_id.0.as_ref() != self.session_id {
+            return Err(TurnControlError::SessionMismatch {
+                expected: self.session_id.clone(),
+                received: msg.req.session_id.0.to_string(),
+            }
+            .into());
         }
-        if self.run.is_idle()
-            && let Err(error) = self.acquire_run_lease().await
-        {
-            return ctx.spawn(async move { Err(error) });
+        validate_prompt_blocks(&msg.req.prompt)?;
+        if self.run.is_idle() {
+            self.acquire_run_lease().await?;
         }
         let (reply, receiver) = oneshot::channel();
         if !self.run.is_idle() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
-                let error = queued_prompt_capacity_error(&self.session_id);
-                return ctx.spawn(async move { Err(error) });
+                return Err(queued_prompt_capacity_error(&self.session_id));
             }
             let input_id = Uuid::new_v4().to_string();
             let position = self.queued_prompts.len() + 1;
             let blocks = msg.req.prompt.clone();
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
+                authority,
                 req: msg.req,
                 reply,
             });
@@ -2540,15 +2978,12 @@ impl Message<Prompt> for SessionActor {
                     queued_input_id: None,
                 },
                 None,
-                ctx.actor_ref().clone(),
+                actor_ref.clone(),
+                authority,
             );
         }
         self.publish_runtime().await;
-        ctx.spawn(async move {
-            receiver.await.unwrap_or_else(|_| {
-                Err(AgentError::Internal("prompt execution dropped".to_string()))
-            })
-        })
+        Ok(receiver)
     }
 }
 
@@ -2559,6 +2994,72 @@ impl Message<Prompt> for SessionActor {
 // 2. Sets ExecutionOrigin::Scheduled on the execution context.
 // 3. Emits ScheduledExecutionCompleted / ScheduledExecutionFailed terminal
 //    events so the SchedulerActor can correlate cycle outcomes.
+
+impl TurnAuthority {
+    pub(crate) async fn from_stored_origin(
+        origin: crate::session::domain_schedule::ScheduleOrigin,
+        #[cfg(feature = "remote")] mesh: Option<&querymt_remote::MeshHandle>,
+    ) -> Result<TurnAuthority, AgentError> {
+        use crate::session::domain_schedule::ScheduleOrigin;
+        match origin {
+            ScheduleOrigin::Local => Ok(TurnAuthority::Local),
+            #[cfg(feature = "remote")]
+            ScheduleOrigin::Peer {
+                host,
+                peer,
+                protocol,
+            } => {
+                use crate::session::domain_schedule::SchedulePeerProtocol;
+                use querymt_remote::{
+                    NodeId,
+                    peer_access::{PeerGrantKey, SharingProtocol},
+                };
+
+                let mesh = mesh.ok_or(AgentError::MeshAccessDenied)?;
+                let store = mesh
+                    .quota_store()
+                    .ok_or(AgentError::MeshAccessDenied)?
+                    .clone();
+                let host = NodeId::parse(&host).map_err(|_| AgentError::MeshAccessDenied)?;
+                if host.as_peer_id() != mesh.peer_id() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
+                let peer = NodeId::parse(&peer).map_err(|_| AgentError::MeshAccessDenied)?;
+                let key = PeerGrantKey { host, peer };
+                let changes = parking_lot::Mutex::new(store.subscribe_changes());
+                let state = store
+                    .grant(&key)
+                    .await
+                    .map_err(|_| AgentError::MeshAccessDenied)?;
+                Ok(TurnAuthority::Peer(Arc::new(PeerTurn {
+                    key,
+                    pinned: state.grant,
+                    changes,
+                    protocol: match protocol {
+                        SchedulePeerProtocol::Legacy => SharingProtocol::Legacy,
+                        SchedulePeerProtocol::V1 => SharingProtocol::V1,
+                    },
+                    store,
+                })))
+            }
+            #[cfg(not(feature = "remote"))]
+            ScheduleOrigin::Peer { .. } => Err(AgentError::MeshAccessDenied),
+        }
+    }
+}
+
+impl SessionActor {
+    fn emit_scheduled_admission_failure(&self, msg: &ScheduledPrompt, error: &AgentError) {
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::ScheduledExecutionFailed {
+                schedule_public_id: msg.schedule_public_id.clone(),
+                turn_id: Some(msg.turn_id.to_string()),
+                error: error.to_string(),
+            },
+        );
+    }
+}
 
 impl Message<ScheduledPrompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
@@ -2572,6 +3073,29 @@ impl Message<ScheduledPrompt> for SessionActor {
             "Session {}: ScheduledPrompt received (schedule={})",
             self.session_id, msg.schedule_public_id
         );
+
+        #[cfg(feature = "remote")]
+        let current_mesh = self.config.provider.mesh_handle();
+        let authority = match TurnAuthority::from_stored_origin(
+            msg.origin.clone(),
+            #[cfg(feature = "remote")]
+            current_mesh.as_deref().or(self.mesh.as_ref()),
+        )
+        .await
+        {
+            Ok(authority) => match authority.check().await {
+                Ok(()) => Ok(authority),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let authority = match authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.emit_scheduled_admission_failure(&msg, &error);
+                return ctx.spawn(async move { Err(error) });
+            }
+        };
 
         if !self.run.is_idle() {
             let session_id = self.session_id.clone();
@@ -2592,14 +3116,7 @@ impl Message<ScheduledPrompt> for SessionActor {
         // failure removes the cycle and aborts the timeout. Terminal handling is
         // idempotent per (schedule, turn), so a racing timeout is dropped.
         if let Err(error) = self.acquire_run_lease().await {
-            self.config.emit_event(
-                &self.session_id,
-                AgentEventKind::ScheduledExecutionFailed {
-                    schedule_public_id: msg.schedule_public_id.clone(),
-                    turn_id: Some(msg.turn_id.to_string()),
-                    error: error.to_string(),
-                },
-            );
+            self.emit_scheduled_admission_failure(&msg, &error);
             return ctx.spawn(async move { Err(error) });
         }
 
@@ -2623,6 +3140,7 @@ impl Message<ScheduledPrompt> for SessionActor {
             },
             Some(msg.turn_id),
             ctx.actor_ref().clone(),
+            authority,
         );
         ctx.spawn(async move {
             receiver.await.unwrap_or_else(|_| {
@@ -2846,7 +3364,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
-/// [`execute_prompt_detached`], with a panic of the run turned into the run's
+/// [`execute_authorized_prompt`], with a panic of the run turned into the run's
 /// failure.
 ///
 /// Everything that ends a run (the reply, the scheduled terminal events and
@@ -2855,13 +3373,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// the queued prompts waiting for a run that is gone.
 async fn execute_prompt_guarded(
     exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
     config: &AgentConfig,
     session_id: &str,
     run_id: querymt_agent_core::model::TurnId,
 ) -> Result<PromptRun, AgentError> {
     use futures_util::FutureExt as _;
 
-    match std::panic::AssertUnwindSafe(execute_prompt_detached(exec))
+    match std::panic::AssertUnwindSafe(execute_authorized_prompt(exec, authority))
         .catch_unwind()
         .await
     {
@@ -2880,7 +3399,56 @@ async fn execute_prompt_guarded(
     }
 }
 
+#[cfg(test)]
 async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
+    execute_authorized_prompt(exec, &TurnAuthority::Local).await
+}
+
+async fn execute_authorized_prompt(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+) -> Result<PromptRun, AgentError> {
+    authority.check().await?;
+    #[cfg(feature = "remote")]
+    if let TurnAuthority::Peer(peer) = authority {
+        let session = exec
+            .config
+            .provider
+            .with_session(&exec.session_id)
+            .await
+            .map_err(|error| AgentError::Internal(error.to_string()))?;
+        let binding = session
+            .llm_config()
+            .map(|config| (config.provider.clone(), config.model.clone()));
+        let binding = binding
+            .as_ref()
+            .map(|(provider, model)| (provider.as_str(), model.as_str()));
+        peer.grant_for(binding).await?;
+        let cancel = exec.cancel_token.clone();
+        let run = execute_prompt_with_span(exec, authority, Some(session));
+        tokio::pin!(run);
+        return tokio::select! {
+            biased;
+            error = peer.revoked(binding) => {
+                // Let the normal cancellation path finish accounting and cleanup.
+                cancel.cancel();
+                let _ = run.await;
+                Err(error)
+            }
+            result = &mut run => {
+                peer.grant_for(binding).await?;
+                result
+            }
+        };
+    }
+    execute_prompt_with_span(exec, authority, None).await
+}
+
+async fn execute_prompt_with_span(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+    pinned_session: Option<crate::session::provider::SessionHandle>,
+) -> Result<PromptRun, AgentError> {
     // Construct the existing execution span explicitly: OTel 0.33 starts it on entry,
     // so the request's remote parent must be installed before instrumenting the future.
     let span = info_span!(
@@ -2915,24 +3483,30 @@ async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<Prompt
         let _ = span.set_parent(parent);
     }
     async move {
-        execute_prompt_inner(exec).await.inspect_err(|error| {
-            let error_type = match error {
-                AgentError::PermissionCancelled => return,
-                AgentError::ClientBridgeClosed
-                | AgentError::PermissionChannelDropped
-                | AgentError::WorkspaceQueryChannelDropped => "client_disconnected",
-                AgentError::SessionTimeout { .. } => "timeout",
-                AgentError::InvalidPromptContent { .. } => "invalid_prompt",
-                _ => "agent_error",
-            };
-            genai::error(error_type);
-        })
+        execute_prompt_inner(exec, authority, pinned_session)
+            .await
+            .inspect_err(|error| {
+                let error_type = match error {
+                    AgentError::PermissionCancelled => return,
+                    AgentError::ClientBridgeClosed
+                    | AgentError::PermissionChannelDropped
+                    | AgentError::WorkspaceQueryChannelDropped => "client_disconnected",
+                    AgentError::SessionTimeout { .. } => "timeout",
+                    AgentError::InvalidPromptContent { .. } => "invalid_prompt",
+                    _ => "agent_error",
+                };
+                genai::error(error_type);
+            })
     }
     .instrument(span)
     .await
 }
 
-async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
+async fn execute_prompt_inner(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+    pinned_session: Option<crate::session::provider::SessionHandle>,
+) -> Result<PromptRun, AgentError> {
     let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
@@ -3011,33 +3585,78 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         }
     };
 
+    authority.check().await?;
     let history_store = config.provider.history_store();
     let scheduled_task =
         validate_execution_task(&*history_store, &execution_origin, &session_id).await?;
+    #[cfg(feature = "remote")]
+    let peer_grant = match authority {
+        TurnAuthority::Local => None,
+        TurnAuthority::Peer(peer) => {
+            if cancel_token.is_cancelled() {
+                return Ok(PromptRun::finished(PromptResponse::new(
+                    StopReason::Cancelled,
+                )));
+            }
+            let session = pinned_session
+                .as_ref()
+                .ok_or(AgentError::MeshAccessDenied)?;
+            Some((peer, session.check_peer_binding(peer).await?))
+        }
+    };
+    #[cfg(feature = "remote")]
+    let restricted = peer_grant
+        .as_ref()
+        .is_some_and(|(_, grant)| *grant != querymt_remote::peer_access::PeerGrant::Full);
+    #[cfg(not(feature = "remote"))]
+    let restricted = false;
+    #[cfg(feature = "remote")]
+    let filesystem = peer_grant
+        .as_ref()
+        .is_some_and(|(peer, grant)| grant.allows_filesystem(peer.protocol));
+    #[cfg(not(feature = "remote"))]
+    let filesystem = false;
+    // Unclassified owner hooks can implement mandatory admission rules, so do
+    // not silently bypass them for a restricted turn.
+    if restricted
+        && (builtin.is_some()
+            || config.hooks.is_enabled()
+            || config
+                .middleware_drivers
+                .iter()
+                .any(|driver| !driver.supports_restricted_mesh()))
+    {
+        return Err(AgentError::MeshAccessDenied);
+    }
+
+    authority.require_provider_dispatch()?;
 
     // Clean up revert state if a new prompt is sent while in reverted state.
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
     // `get_history` / `load_working_context` only sees the surviving messages.
-    let event_stream = config.event_sink.session_stream(&session_id);
-    if let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
-        &config.provider,
-        &**config.event_sink.journal(),
-        Some(&event_stream),
-        &session_id,
-        Some(&run_id.to_string()),
-    )
-    .await
+    if !restricted
+        && let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
+            &config.provider,
+            &**config.event_sink.journal(),
+            Some(&config.event_sink.session_stream(&session_id)),
+            &session_id,
+            Some(&run_id.to_string()),
+        )
+        .await
     {
         warn!("Failed to clean up revert state: {}", e);
     }
 
     // Get Session Context (turn-pinned)
-    let session_handle = config
-        .provider
-        .with_session(&session_id)
-        .await
-        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    let session_handle = match pinned_session {
+        Some(session) => session,
+        None => config
+            .provider
+            .with_session(&session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?,
+    };
 
     // Slash-command expansion can alter text, but never attachment capability.
     validate_model_image_support(&req.prompt, session_handle.llm_config())?;
@@ -3082,6 +3701,11 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         runtime: runtime.clone(),
         session_handle: session_handle.clone(),
         model,
+        turn_authority: authority.clone(),
+        restricted_mesh_turn: restricted,
+        confined_mesh_read: restricted
+            && filesystem
+            && cfg!(all(feature = "remote", target_os = "linux")),
         cancellation_token: cancel_token.clone(),
         tool_config: tool_config.clone(),
         knowledge_store: config.knowledge_store(),
@@ -3122,6 +3746,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .as_ref()
         .filter(|command| command.builtin == crate::slash_commands::builtin::Builtin::Compact)
     {
+        authority.check().await?;
         log::info!("Session {}: manual compaction requested", session_id);
         let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
         // The model is resolved first, without a retry (its capabilities size
@@ -3212,7 +3837,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // bound checkout, matching the advertised catalog; legacy local
     // sessions keep the agent-level registry built at startup.
     let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
-    if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
+    if !restricted
+        && let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
             crate::slash_commands::try_expand(&text_content.text, slash_registry)
     {
@@ -3236,21 +3862,26 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
     let message_id = Uuid::new_v4().to_string();
 
-    let hook_result = config
-        .hooks
-        .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
-            session_id: session_id.clone(),
-            turn_id: run_id.to_string(),
-            cwd: runtime.cwd.as_deref().map(|p| p.to_path_buf()),
-            model: session_handle
-                .llm_config()
-                .map(|cfg| cfg.model.clone())
-                .unwrap_or_default(),
-            permission_mode: crate::hooks::permission_mode_label(mode).to_string(),
-            prompt: user_text.clone(),
-        })
-        .await
-        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    authority.check().await?;
+    let hook_result = if restricted {
+        crate::hooks::UserPromptSubmitResult::default()
+    } else {
+        config
+            .hooks
+            .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
+                session_id: session_id.clone(),
+                turn_id: run_id.to_string(),
+                cwd: runtime.cwd.as_deref().map(|p| p.to_path_buf()),
+                model: session_handle
+                    .llm_config()
+                    .map(|cfg| cfg.model.clone())
+                    .unwrap_or_default(),
+                permission_mode: crate::hooks::permission_mode_label(mode).to_string(),
+                prompt: user_text.clone(),
+            })
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?
+    };
     emit_hook_notices(&config, &session_id, hook_result.notices.clone());
     if hook_result.should_block {
         let reason = hook_result
@@ -3269,17 +3900,20 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // message is stored, so the first model request already carries the cards.
     // It is additive and fail-open; it never blocks or alters the prompt.
     let mut context_contributions = hook_result.context_contributions;
-    let orientation = crate::agent::repository_delivery::orientation_contexts(
-        &config,
-        &session_id,
-        runtime.cwd.as_deref(),
-        &tool_config,
-        &mut turn,
-        &user_text,
-        &context_contributions,
-    )
-    .await;
-    context_contributions.extend(orientation);
+    if !restricted {
+        let orientation = crate::agent::repository_delivery::orientation_contexts(
+            &config,
+            &session_id,
+            runtime.cwd.as_deref(),
+            &tool_config,
+            &mut turn,
+            &user_text,
+            &context_contributions,
+        )
+        .await;
+        context_contributions.extend(orientation);
+    }
+    authority.check().await?;
 
     let mut parts = vec![MessagePart::Prompt {
         blocks: req.prompt.clone(),
@@ -3343,8 +3977,10 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     );
 
     let intent_started = std::time::Instant::now();
-    if let Err(error) =
-        maybe_update_session_intent(&config, &session_id, &mut turn, &user_text, &message_id).await
+    if !restricted
+        && let Err(error) =
+            maybe_update_session_intent(&config, &session_id, &mut turn, &user_text, &message_id)
+                .await
     {
         warn!(
             "Failed to update intent projection after storing prompt {}: {}",
@@ -3423,7 +4059,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     );
 
     // Pre-turn snapshot for undo/redo (off critical path)
-    if let Some(ref backend) = config.snapshot_backend
+    if !restricted
+        && let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
         // The start and change records of a run share the run's turn id.
@@ -3504,7 +4141,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     debug!("Session {}: post-turn snapshot start", session_id);
 
     // Post-turn snapshot
-    if let Some(ref backend) = config.snapshot_backend
+    if !restricted
+        && let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
         if let Err(e) = ensure_pre_turn_snapshot_ready(&env, &mut turn, "post_turn_snapshot").await
@@ -4303,17 +4941,15 @@ mod tests {
     }
 
     fn text_submit(session_id: &str, text: &str) -> SubmitSessionInput {
-        SubmitSessionInput {
-            input: SubmitInput {
-                session_id: session_id.to_string(),
-                client_input_id: None,
-                expected_run_id: None,
-                delivery: InputDelivery::Queue,
-                prompt: vec![crate::acp::protocol::ContentBlock::Text(
-                    crate::acp::protocol::TextContent::new(text),
-                )],
-            },
-        }
+        SubmitSessionInput::new(SubmitInput {
+            session_id: session_id.to_string(),
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        })
     }
 
     async fn seed_orphan(f: &ActorFixture, run_id: &str) {
@@ -4418,6 +5054,7 @@ mod tests {
             task_public_id: "task-1".to_string(),
             prompt_text: "scheduled work".to_string(),
             execution_limits: None,
+            origin: crate::session::domain_schedule::ScheduleOrigin::Local,
         }
     }
 
@@ -5770,6 +6407,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_prompt_with_unverifiable_peer_origin_cannot_run_as_owner() {
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+
+        let fixture = ActorFixture::new().await;
+        let mut events = fixture.config.subscribe_events();
+        let prompt = ScheduledPrompt {
+            origin: ScheduleOrigin::Peer {
+                host: "persisted-host".into(),
+                peer: "persisted-peer".into(),
+                protocol: SchedulePeerProtocol::V1,
+            },
+            ..scheduled_prompt()
+        };
+        let cycle_id = prompt.turn_id.to_string();
+        let result = fixture.actor_ref.ask(prompt).await;
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshAccessDenied
+            ))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let AgentEventKind::ScheduledExecutionFailed {
+                    schedule_public_id,
+                    turn_id,
+                    ..
+                } = events.recv().await.unwrap().kind()
+                    && schedule_public_id == "schedule-1"
+                {
+                    assert_eq!(turn_id.as_deref(), Some(cycle_id.as_str()));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(fixture.run_lifecycle().await.is_empty());
+        assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn invalid_scheduled_task_does_not_write_history_or_intent() {
         let fixture = ActorFixture::new().await;
         let (_env, turn) = fixture.turn("test-session").await;
@@ -6093,7 +6772,10 @@ mod tests {
         );
         let run_id = querymt_agent_core::model::TurnId::new();
         actor.generation = 1;
-        actor.run = RunSlot::Running(ActiveRun::new(run_id, 1, CancellationToken::new()));
+        actor.run = RunSlot::Running(
+            ActiveRun::new(run_id, 1, CancellationToken::new()),
+            TurnAuthority::Local,
+        );
         let actor_ref = SessionActor::spawn(actor);
         let mut events = fixture.config.subscribe_events();
         let (tx, rx) = tokio::sync::watch::channel(RunSignal::starting());
@@ -6156,22 +6838,20 @@ mod tests {
         let mut run = ActiveRun::new(held_run_id, 1, CancellationToken::new());
         run.phase = RunPhase::Model;
         exec.steering = Some(run.steering.clone());
-        actor.run = RunSlot::Running(run);
+        actor.run = RunSlot::Running(run, TurnAuthority::Local);
         let actor_ref = SessionActor::spawn(actor);
         let (tx, rx) = tokio::sync::watch::channel(RunSignal::starting());
         exec.phase_reporter = Some(tx);
         let forwarder = tokio::spawn(forward_run_signals(rx, actor_ref.clone(), 1, held_run_id));
         let mut events = fixture.config.subscribe_events();
         actor_ref
-            .ask(SubmitSessionInput {
-                input: SubmitInput {
-                    session_id: exec.session_id.clone(),
-                    client_input_id: Some("steer-once".into()),
-                    expected_run_id: Some(held_run_id.to_string()),
-                    delivery: InputDelivery::Steer,
-                    prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
-                },
-            })
+            .ask(SubmitSessionInput::new(SubmitInput {
+                session_id: exec.session_id.clone(),
+                client_input_id: Some("steer-once".into()),
+                expected_run_id: Some(held_run_id.to_string()),
+                delivery: InputDelivery::Steer,
+                prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
+            }))
             .await
             .unwrap();
         let before = actor_ref.ask(GetRuntimeStatus).await.unwrap();
@@ -6874,7 +7554,10 @@ mod tests {
             ),
         );
         let stop_run_id = querymt_agent_core::model::TurnId::new();
-        actor.run = RunSlot::Running(ActiveRun::new(stop_run_id, 1, CancellationToken::new()));
+        actor.run = RunSlot::Running(
+            ActiveRun::new(stop_run_id, 1, CancellationToken::new()),
+            TurnAuthority::Local,
+        );
         let actor_ref = SessionActor::spawn(actor);
         let mut events = fixture.config.subscribe_events();
 
@@ -6927,32 +7610,31 @@ mod tests {
                 crate::agent::core::McpToolState::empty(),
             ),
         );
-        actor.run = RunSlot::Running(ActiveRun::new(
-            querymt_agent_core::model::TurnId::new(),
-            1,
-            CancellationToken::new(),
-        ));
+        actor.run = RunSlot::Running(
+            ActiveRun::new(
+                querymt_agent_core::model::TurnId::new(),
+                1,
+                CancellationToken::new(),
+            ),
+            TurnAuthority::Local,
+        );
         let actor_ref = SessionActor::spawn(actor);
         let mut events = fixture.config.subscribe_events();
         for input_id in ["queued-1", "queued-2"] {
             actor_ref
-                .ask(SubmitSessionInput {
-                    input: SubmitInput {
-                        session_id: session_id.clone(),
-                        client_input_id: Some(input_id.to_string()),
-                        expected_run_id: None,
-                        delivery: InputDelivery::Queue,
-                        prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
-                    },
-                })
+                .ask(SubmitSessionInput::new(SubmitInput {
+                    session_id: session_id.clone(),
+                    client_input_id: Some(input_id.to_string()),
+                    expected_run_id: None,
+                    delivery: InputDelivery::Queue,
+                    prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
+                }))
                 .await
                 .expect("queue input");
         }
 
         let discarded = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-1".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-1".to_string()))
             .await
             .expect("discard queued input");
         assert_eq!(
@@ -6971,9 +7653,7 @@ mod tests {
         );
 
         let repeated = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-1".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-1".to_string()))
             .await
             .expect("repeat discard queued input");
         assert_eq!(
@@ -7059,20 +7739,23 @@ mod tests {
                 crate::agent::core::McpToolState::empty(),
             ),
         );
-        actor.run = RunSlot::Running(ActiveRun::new(
-            querymt_agent_core::model::TurnId::new(),
-            1,
-            CancellationToken::new(),
-        ));
+        actor.run = RunSlot::Running(
+            ActiveRun::new(
+                querymt_agent_core::model::TurnId::new(),
+                1,
+                CancellationToken::new(),
+            ),
+            TurnAuthority::Local,
+        );
         let actor_ref = SessionActor::spawn(actor);
-        let submit = || SubmitSessionInput {
-            input: SubmitInput {
+        let submit = || {
+            SubmitSessionInput::new(SubmitInput {
                 session_id: session_id.clone(),
                 client_input_id: Some("queued-failure".to_string()),
                 expected_run_id: None,
                 delivery: InputDelivery::Queue,
                 prompt: vec![crate::acp::protocol::ContentBlock::from("queued")],
-            },
+            })
         };
 
         fixture.event_journal.fail_next_append();
@@ -7103,9 +7786,7 @@ mod tests {
 
         fixture.event_journal.fail_next_append();
         let failed_discard = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-failure".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-failure".to_string()))
             .await;
         assert!(matches!(
             failed_discard,
@@ -7122,9 +7803,7 @@ mod tests {
         );
 
         let discarded = actor_ref
-            .ask(DiscardQueuedInput {
-                input_id: "queued-failure".to_string(),
-            })
+            .ask(DiscardQueuedInput::new("queued-failure".to_string()))
             .await
             .expect("discard retry should succeed");
         assert_eq!(
@@ -7225,14 +7904,12 @@ mod tests {
 
         let first = f
             .actor_ref
-            .ask(SubmitSessionInput {
-                input: input.clone(),
-            })
+            .ask(SubmitSessionInput::new(input.clone()))
             .await
             .expect("first keyed submission should be acknowledged");
         let second = f
             .actor_ref
-            .ask(SubmitSessionInput { input })
+            .ask(SubmitSessionInput::new(input))
             .await
             .expect("duplicate keyed submission should return the cached receipt");
 
@@ -7305,7 +7982,10 @@ mod tests {
         let run_id = querymt_agent_core::model::TurnId::new();
         let running_token = CancellationToken::new();
         actor.generation = 4;
-        actor.run = RunSlot::Running(ActiveRun::new(run_id, 4, running_token.clone()));
+        actor.run = RunSlot::Running(
+            ActiveRun::new(run_id, 4, running_token.clone()),
+            TurnAuthority::Local,
+        );
         let actor_ref = SessionActor::spawn(actor);
 
         // A finish of an older generation, even for the same run id.

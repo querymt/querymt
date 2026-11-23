@@ -14,6 +14,8 @@ pub mod mesh_events;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_handle;
 #[cfg(feature = "kameo-mesh")]
+pub mod mesh_ingress;
+#[cfg(feature = "kameo-mesh")]
 pub mod mesh_routes;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_runtime;
@@ -66,7 +68,9 @@ pub use mesh_handle::{MeshHandle, ReRegisterFn, RemoteLookupError};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_routes::{MeshRoute, RouteTable};
 #[cfg(feature = "kameo-mesh")]
-pub use mesh_runtime::{bootstrap_mesh_handle, bootstrap_mesh_runtime};
+pub use mesh_runtime::{
+    bootstrap_mesh_handle, bootstrap_mesh_runtime, bootstrap_mesh_runtime_with_policy,
+};
 pub use mesh_runtime_config::{
     DirectoryMode, IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
 };

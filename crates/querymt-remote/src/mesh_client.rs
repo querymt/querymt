@@ -76,10 +76,24 @@ impl KameoMeshClientTransport {
             .remove(target_locator);
     }
 
+    fn require_legacy_provider_transport(&self) -> Result<(), LLMError> {
+        if self.mesh.sharing_enabled {
+            use querymt::error::{ProviderErrorKind, ProviderFailure};
+            return Err(ProviderFailure::new(
+                ProviderErrorKind::UnsupportedOperation,
+                "provider sharing is not enabled on guarded mesh runtimes",
+            )
+            .with_code(Some("mesh_access_incompatible".into()))
+            .into());
+        }
+        Ok(())
+    }
+
     async fn lookup_provider_host(
         &self,
         target_locator: &str,
     ) -> Result<kameo::actor::RemoteActorRef<ProviderHostActor>, LLMError> {
+        self.require_legacy_provider_transport()?;
         if let Some(cached) = Self::provider_host_cache()
             .read()
             .await
@@ -180,6 +194,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, LLMError> {
+        self.require_legacy_provider_transport()?;
         host.ask(&request)
             .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
             .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
@@ -197,6 +212,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request_id: &str,
         consumer_tx: mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
+        self.require_legacy_provider_transport()?;
         let router = self.get_or_create_stream_router(session_id).await;
         router
             .ask(RegisterRequest {
@@ -228,6 +244,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: &crate::ProviderChatRequest,
     ) -> Result<crate::ProviderChatResponse, LLMError> {
+        self.require_legacy_provider_transport()?;
         let encoded_bytes = crate::provider_transport::remote_ask_request_size(
             host,
             request,
@@ -252,6 +269,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GenericProviderStreamRequest<Self::RemoteRouterRef>,
     ) -> Result<(), LLMError> {
+        self.require_legacy_provider_transport()?;
         let encoded_bytes =
             crate::provider_transport::remote_tell_request_size(host, &request, None)?;
         crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
@@ -269,6 +287,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: CancelProviderStreamRequest,
     ) -> Result<(), LLMError> {
+        self.require_legacy_provider_transport()?;
         host.ask(&request)
             .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
             .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
@@ -285,6 +304,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request_id: &str,
         lease_ttl_secs: u64,
     ) -> Result<bool, LLMError> {
+        self.require_legacy_provider_transport()?;
         host.ask(&crate::RenewProviderStreamLease {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
@@ -302,6 +322,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderStreamStatus,
     ) -> Result<Option<ProviderStreamStatus>, LLMError> {
+        self.require_legacy_provider_transport()?;
         host.ask(&request)
             .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
             .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
@@ -456,6 +477,9 @@ impl LLMProvider for MeshChatProvider {}
     )
 )]
 pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Option<NodeId> {
+    if mesh.sharing_enabled {
+        return None;
+    }
     let mut peers_checked: u32 = 0;
     let mut candidates: Vec<(PeerId, NodeId)> = Vec::new();
 

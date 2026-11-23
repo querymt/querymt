@@ -187,6 +187,8 @@ pub(crate) enum RemoteSessionConnectError {
     LocationConflict { session_id: String, message: String },
     /// Mesh runtime is not bootstrapped locally, so no remote work is possible.
     MeshUnavailable { node_id: String },
+    /// The owner rejected this peer's access to the session.
+    AccessDenied,
     /// The target node could not be contacted at all.
     NodeUnavailable {
         node_id: String,
@@ -230,6 +232,7 @@ impl RemoteSessionConnectError {
             Self::BookmarkLookupFailed { .. } => "session_bookmark_lookup_failed",
             Self::BookmarkSaveFailed { .. } => "session_bookmark_save_failed",
             Self::LocationConflict { .. } => "session_location_conflict",
+            Self::AccessDenied => "mesh_access_denied",
             Self::MeshUnavailable { .. } => "remote_node_unavailable",
             Self::NodeUnavailable { .. } => "remote_node_unavailable",
             Self::RecoveryFailed { .. } => "remote_recovery_failed",
@@ -285,7 +288,8 @@ impl RemoteSessionConnectError {
             | Self::BookmarkLookupFailed { .. }
             | Self::BookmarkSaveFailed { .. }
             | Self::LocationConflict { .. }
-            | Self::SessionNotFoundOnHost { .. } => false,
+            | Self::SessionNotFoundOnHost { .. }
+            | Self::AccessDenied => false,
             Self::MeshUnavailable { .. }
             | Self::NodeUnavailable { .. }
             | Self::RecoveryFailed { .. }
@@ -300,6 +304,7 @@ impl RemoteSessionConnectError {
             Self::BookmarkMissing { .. }
             | Self::LocationConflict { .. }
             | Self::SessionNotFoundOnHost { .. } => -32002,
+            Self::AccessDenied => -32000,
             _ => -32603,
         };
         let mut data = serde_json::json!({
@@ -334,7 +339,7 @@ impl RemoteSessionConnectError {
                 data["session_id"] = serde_json::Value::String(session_id.clone());
                 data["retry_after_ms"] = serde_json::Value::from(*retry_after_ms);
             }
-            Self::RecoveryFailed { .. } | Self::TimedOut { .. } => {}
+            Self::AccessDenied | Self::RecoveryFailed { .. } | Self::TimedOut { .. } => {}
         }
         if let Some(failure) = self.transport_failure() {
             data["transport_kind"] =
@@ -383,6 +388,7 @@ impl std::fmt::Display for RemoteSessionConnectError {
             } => {
                 write!(f, "remote node '{node_id}' is unavailable: {message}")
             }
+            Self::AccessDenied => write!(f, "mesh access denied"),
             Self::RecoveryFailed { message, .. } => {
                 write!(f, "remote session recovery failed: {message}")
             }
@@ -946,6 +952,9 @@ impl LocalAgentHandle {
                 .await
             {
                 Ok(connected) => return Ok(connected),
+                Err(RemoteSessionConnectError::AccessDenied) => {
+                    return Err(RemoteSessionConnectError::AccessDenied);
+                }
                 Err(err) => {
                     log::warn!(
                         "remote session {} connect: DHT-published actor failed validation ({}); \
@@ -979,7 +988,9 @@ impl LocalAgentHandle {
                     // from lookup paths): structural answer, not a transient
                     // recovery failure. Both map to ACP -32002 like the pre-
                     // coordinator pass-through did.
-                    if matches!(
+                    if matches!(e, AgentError::MeshAccessDenied) {
+                        RemoteSessionConnectError::AccessDenied
+                    } else if matches!(
                         e,
                         AgentError::SessionNotFound { .. }
                             | AgentError::RemoteSessionNotFound { .. }
@@ -1111,10 +1122,13 @@ impl LocalAgentHandle {
         )
         .instrument(prepare_span)
         .await
-        .map_err(|error| RemoteSessionConnectError::HealthCheckFailed {
-            session_id: session_id.to_string(),
-            transport: None,
-            message: error.to_string(),
+        .map_err(|error| match error {
+            AgentError::MeshAccessDenied => RemoteSessionConnectError::AccessDenied,
+            error => RemoteSessionConnectError::HealthCheckFailed {
+                session_id: session_id.to_string(),
+                transport: None,
+                message: error.to_string(),
+            },
         })?;
         let session_ref = prepared.session_ref().clone();
         let attachment_id = prepared.attachment_id();
@@ -1132,7 +1146,14 @@ impl LocalAgentHandle {
         }
 
         let health_timeout = Self::remote_connect_health_timeout();
-        let health = tokio::time::timeout(health_timeout, session_ref.get_mode()).await;
+        let health = tokio::time::timeout(health_timeout, async {
+            if session_ref.uses_guarded_mesh() {
+                session_ref.check_history_access().await
+            } else {
+                session_ref.get_mode().await.map(|_| ())
+            }
+        })
+        .await;
         let saved = if matches!(health, Ok(Ok(_))) {
             self.config
                 .provider
@@ -1148,7 +1169,11 @@ impl LocalAgentHandle {
             .take()
             .expect("prepared candidate parked before health check");
         match health {
-            Ok(Ok(_mode)) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(AgentError::MeshAccessDenied)) => {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(RemoteSessionConnectError::AccessDenied);
+            }
             Ok(Err(error)) => {
                 log::warn!(
                     "remote session {} connect: candidate attachment_id={} failed health check: {}",
@@ -1296,7 +1321,7 @@ impl LocalAgentHandle {
             });
         }
         state.wait_synced().await;
-        Ok(())
+        connected.session_ref.check_history_access().await
     }
 
     /// Build candidate metadata without mutating durable state. Persistence is
@@ -1404,7 +1429,9 @@ impl LocalAgentHandle {
         session_id: &str,
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, AgentError> {
         use crate::agent::remote::ResumeRemoteSession;
-        querymt_remote::ask_remote_with_timeout(
+        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
+        querymt_remote::request_timeout::ask_with_sharing(
+            &mesh,
             node_manager_ref,
             &ResumeRemoteSession {
                 session_id: session_id.to_string(),
@@ -1412,12 +1439,7 @@ impl LocalAgentHandle {
             Self::remote_request_timeout(),
         )
         .await
-        .map_err(
-            |error| match querymt_remote::classify_remote_send_error(error) {
-                Ok(failure) => AgentError::from_transport_failure(failure),
-                Err(handler_error) => handler_error,
-            },
-        )
+        .map_err(AgentError::from_sharing_ask)
     }
 
     /// Whether a remote connect/recovery attempt is currently in flight for
@@ -2168,6 +2190,157 @@ mod tests {
                 .remote_attachment_id(session_id),
             Some(attached.attachment_id)
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_discovers_owner_and_replaces_only_the_failed_generation() {
+        use crate::agent::remote::scope::{
+            MeshScopeId, scoped_node_manager_for_peer, scoped_session,
+        };
+        use crate::agent::remote::test_helpers::fixtures::{NodeManagerFixture, get_test_mesh};
+
+        let mesh = get_test_mesh().await;
+        let owner = NodeManagerFixture::new_with_mesh().await;
+        let (viewer, storage, _dir) = handle_with_real_storage().await;
+        viewer.set_mesh(mesh.clone());
+        let node_id = mesh.peer_id().to_string();
+        let scope = MeshScopeId::lan_default();
+        let manager_name = scoped_node_manager_for_peer(&scope, &node_id);
+        mesh.register_actor(owner.actor_ref.clone(), manager_name.clone())
+            .await;
+        let session_id = owner
+            .config
+            .provider
+            .history_store()
+            .create_session(Some("owner session".into()), None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        storage
+            .session_store()
+            .save_remote_session_bookmark(&test_bookmark(&session_id, &node_id))
+            .await
+            .unwrap();
+        let first_event = owner
+            .config
+            .emit_event_persisted(
+                &session_id,
+                AgentEventKind::PromptReceived {
+                    content: "before attach".into(),
+                    message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A persisted owner session with no live publication must be resumed
+        // through the manager registered under that owner's peer ID.
+        let first = viewer
+            .ensure_remote_session_connected(&session_id, None, RemoteConnectReason::Open)
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, RemoteConnectOutcome::Resumed);
+        let current = viewer
+            .ensure_remote_session_connected(
+                &session_id,
+                None,
+                RemoteConnectReason::ExplicitReconnect,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.outcome, RemoteConnectOutcome::Reattached);
+        assert_ne!(current.attachment_id, first.attachment_id);
+        let stale_recovery = viewer
+            .connect_remote_session(
+                &session_id,
+                RemoteConnectOptions {
+                    node_hint: None,
+                    peer_label: None,
+                    preferred_scope: None,
+                    reason: RemoteConnectReason::OperationRecovery,
+                    replace: RemoteReplacePolicy::ReplaceIfMatches(first.attachment_id),
+                    handoff: None,
+                    windowed: false,
+                    fork_origin: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_recovery.outcome, RemoteConnectOutcome::Reused);
+        assert_eq!(stale_recovery.attachment_id, current.attachment_id);
+
+        viewer
+            .sync_remote_for_load(&session_id, &current, false)
+            .await
+            .unwrap();
+
+        // Overflow the forwarder's live queue after persisting a session event.
+        // Only unrelated events remain in the queue, so no later matching event
+        // can reveal the missing tail. The forwarder's lag notice must recover it.
+        use querymt_agent_core::events::{EphemeralEvent, EventEnvelope, EventOrigin};
+        let mut live = viewer.config.event_sink.fanout().subscribe();
+        let missed = owner
+            .config
+            .emit_event_persisted(
+                &session_id,
+                AgentEventKind::PromptReceived {
+                    content: "missed live event".into(),
+                    message_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let unrelated = EventEnvelope::Ephemeral(EphemeralEvent {
+            session_id: "unrelated-session".into(),
+            session_seq: 0,
+            timestamp: missed.timestamp,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::Cancelled,
+        });
+        for _ in 0..4096 {
+            owner.config.event_sink.fanout().publish(unrelated.clone());
+        }
+        let recovered = tokio::time::timeout(Duration::from_secs(3), live.recv())
+            .await
+            .expect("the relay should recover the dropped durable tail")
+            .unwrap();
+        assert!(matches!(
+            recovered.kind(),
+            AgentEventKind::PromptReceived { content, .. } if content == "missed live event"
+        ));
+        let replay = viewer
+            .remote_session_events_from_journal(&session_id, &current.session_ref)
+            .await
+            .unwrap()
+            .unwrap();
+        let prompts = replay
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                AgentEventKind::PromptReceived { content, .. } => {
+                    Some((entry.seq, content.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prompts,
+            vec![
+                (first_event.stream_seq, "before attach"),
+                (missed.stream_seq, "missed live event")
+            ]
+        );
+
+        let attachment = viewer
+            .registry
+            .lock()
+            .await
+            .take_remote_attachment(&session_id)
+            .unwrap();
+        assert_eq!(attachment.attachment_id, current.attachment_id);
+        crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
+        mesh.deregister_actor(&scoped_session(&scope, &session_id));
+        mesh.deregister_actor(&manager_name);
     }
 
     #[tokio::test]

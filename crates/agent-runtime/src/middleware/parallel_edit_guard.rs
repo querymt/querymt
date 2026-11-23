@@ -213,6 +213,10 @@ impl Middleware for ParallelEditGuard {
         "ParallelEditGuard"
     }
 
+    fn supports_restricted_mesh(&self) -> bool {
+        true
+    }
+
     fn begin_turn(&self, _turn: &TurnInfo<'_>) -> Box<dyn TurnMiddleware> {
         Box::new(ParallelEditTurn {
             mode: self.mode,

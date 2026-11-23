@@ -217,6 +217,7 @@ async fn prepare_tool_call_inner(
     call: &MiddlewareToolCall,
     env: &TurnEnv,
 ) -> Result<PreparedCall, anyhow::Error> {
+    env.require_turn_authority().await?;
     // Invalid outer input never executes and never degrades to `{}`. It is
     // rejected before hooks, permissions or invocation.
     if has_invalid_input(call) {
@@ -234,11 +235,6 @@ async fn prepare_tool_call_inner(
         });
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
-    let tool = env.tool_set().find(&call.function.name);
-    let target = ToolTarget::resolve(tool.clone(), env, &call.function.name);
-    let schema = resolve_tool_schema(env, &call.function.name).await;
-    let mut repairs: Vec<Repair> = Vec::new();
-
     let reject = |args: serde_json::Value,
                   repairs: Vec<Repair>,
                   text: String,
@@ -258,6 +254,42 @@ async fn prepare_tool_call_inner(
         }
     };
 
+    if !env.allows_workflow_tool(&call.function.name) {
+        Span::current().set_attribute("querymt.tool.execution", "blocked");
+        genai::error("mesh_access_denied");
+        return Ok(reject(
+            args,
+            Vec::new(),
+            "Error: tool is not available to mesh-hosted turns".into(),
+            "blocked",
+            Vec::new(),
+        ));
+    }
+    let name = &call.function.name;
+    let (tool, target, schema) = if env.restricted_mesh_turn() {
+        let Some((builtin, definition)) = restricted_mesh_tool(config, env, name) else {
+            return Ok(reject(
+                args,
+                Vec::new(),
+                "Error: restricted tool is unavailable".into(),
+                "blocked",
+                Vec::new(),
+            ));
+        };
+        let schema = definition.function.parameters;
+        (
+            Some(builtin.clone()),
+            ToolTarget::Builtin(builtin),
+            Some(schema),
+        )
+    } else {
+        let tool = env.tool_set().find(name);
+        let target = ToolTarget::resolve(tool.clone(), env, name);
+        let schema = resolve_tool_schema(env, name).await;
+        (tool, target, schema)
+    };
+    let mut repairs: Vec<Repair> = Vec::new();
+
     // Hooks must see canonical names, so normalise before running them.
     match normalize_arguments(tool.as_deref(), schema.as_ref(), &mut args) {
         Ok(applied) => repairs.extend(applied),
@@ -274,6 +306,7 @@ async fn prepare_tool_call_inner(
         }
     }
 
+    env.require_turn_authority().await?;
     let hook_result = config
         .hooks
         .run_pre_tool_use(PreToolUseRequest {
@@ -528,28 +561,33 @@ async fn execute_prepared_inner(
     let execution_is_error = is_error;
     let mut result_blocks = raw_result_blocks;
     let mut is_error = is_error;
-    let post_hook = config
-        .hooks
-        .run_post_tool_use(PostToolUseRequest {
-            session_id: env.session_id.clone(),
-            mcp_server: target.server().map(str::to_owned),
-            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
-            turn_id: env.turn_id().to_string(),
-            cwd: env.cwd().map(|path| path.to_path_buf()),
-            model: env
-                .llm_config()
-                .map(|cfg| cfg.model.clone())
-                .unwrap_or_default(),
-            permission_mode: env.permission_mode().to_string(),
-            tool_name: call.function.name.clone(),
-            tool_input: args.clone(),
-            content: result_blocks.clone(),
-            is_error,
-            execution_is_error,
-            tool_source: tool_source.as_str().to_string(),
-            tool_use_id: call.id.clone(),
-        })
-        .await?;
+    // Preserve the result of an already executed tool, but do not start another hook after revocation.
+    let post_hook = if !env.restricted_mesh_turn() && env.require_turn_authority().await.is_ok() {
+        config
+            .hooks
+            .run_post_tool_use(PostToolUseRequest {
+                session_id: env.session_id.clone(),
+                mcp_server: target.server().map(str::to_owned),
+                mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
+                turn_id: env.turn_id().to_string(),
+                cwd: env.cwd().map(|path| path.to_path_buf()),
+                model: env
+                    .llm_config()
+                    .map(|cfg| cfg.model.clone())
+                    .unwrap_or_default(),
+                permission_mode: env.permission_mode().to_string(),
+                tool_name: call.function.name.clone(),
+                tool_input: args.clone(),
+                content: result_blocks.clone(),
+                is_error,
+                execution_is_error,
+                tool_source: tool_source.as_str().to_string(),
+                tool_use_id: call.id.clone(),
+            })
+            .await?
+    } else {
+        Default::default()
+    };
     // A blocked or suppressed result must not regain information through
     // enrichment; decided before the hook result is consumed.
     // Redaction (a rewritten output or error flag) counts the same as a block:
@@ -657,22 +695,24 @@ async fn execute_prepared_inner(
     // truncation. Purely additive context; the result blocks and error flag
     // above are never touched. Contributions already present (for example from
     // a command-hook wrapper) are not delivered again.
-    let enrichment = crate::agent::repository_delivery::index_contexts(
-        config,
-        env,
-        &crate::agent::repository_delivery::FinishedCall {
-            tool_name: &call.function.name,
-            tool_source: tool_source.as_str(),
-            execution_is_error,
-            result_is_error: is_error,
-            output_suppressed,
-            tool_use_id: &call.id,
-            args: &args,
-        },
-        &hook_contexts,
-    )
-    .await;
-    hook_contexts.extend(enrichment);
+    if !env.restricted_mesh_turn() {
+        let enrichment = crate::agent::repository_delivery::index_contexts(
+            config,
+            env,
+            &crate::agent::repository_delivery::FinishedCall {
+                tool_name: &call.function.name,
+                tool_source: tool_source.as_str(),
+                execution_is_error,
+                result_is_error: is_error,
+                output_suppressed,
+                tool_use_id: &call.id,
+                args: &args,
+            },
+            &hook_contexts,
+        )
+        .await;
+        hook_contexts.extend(enrichment);
+    }
     let mut tool_result = ToolResult::new(
         call.id.clone(),
         result_blocks,
@@ -1005,10 +1045,11 @@ async fn dispatch(
     target: &ToolTarget,
     approval: ApprovalNeed,
 ) -> Result<(ToolOutcome, SnapshotState), anyhow::Error> {
+    env.require_turn_authority().await?;
     let tool = target.tool_ref(&call.function.name);
 
     // Per-session config so that runtime SetAllowedTools / SetDeniedTools apply.
-    if !env.tool_config.allows(tool) {
+    if !env.allows_workflow_tool(&call.function.name) || !env.tool_config.allows(tool) {
         let text = format!("Error: tool '{}' is not allowed", call.function.name);
         return Ok((
             ToolOutcome::error_text(text, ToolSource::Blocked, Execution::PolicyBlocked),
@@ -1035,6 +1076,10 @@ async fn dispatch(
         }
     }
 
+    env.require_turn_authority().await?;
+    if env.restricted_mesh_turn() && call.function.name == "read_tool" {
+        return Ok((dispatch_confined_read(env, args).await, SnapshotState::None));
+    }
     let snapshot = if target.is_read_only() {
         SnapshotState::None
     } else {
@@ -1087,7 +1132,98 @@ fn begin_snapshot(config: &AgentConfig, env: &TurnEnv, call: &MiddlewareToolCall
     })
 }
 
-/// Invoke the resolved target.
+/// Resolve the host tool to offer and execute on a restricted turn. Never
+/// substitute an MCP or provider tool with the same name.
+pub(super) fn restricted_mesh_tool(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    name: &str,
+) -> Option<(Arc<dyn Tool>, querymt::chat::Tool)> {
+    let builtin = env.tool_set().find(name)?;
+    if !env.tool_config.allows(ToolRef::builtin(name)) {
+        return None;
+    }
+    match name {
+        "shell" if env.tool_config.policy != crate::agent::core::ToolPolicy::ProviderOnly => {
+            let definition = builtin.definition();
+            Some((builtin, definition))
+        }
+        "read_tool" => Some((
+            Arc::new(crate::tools::builtins::ReadTool::new()),
+            confined_read_definition(),
+        )),
+        "delegate" if config.workspace_service().is_none() => {
+            let roster = config.roster()?.clone();
+            let snapshot = roster.snapshot();
+            let ids: Vec<_> = snapshot
+                .iter()
+                .filter(|member| {
+                    member.location() == crate::delegation::roster::MemberLocation::Local
+                        && member.info().isolation != crate::worktree::DelegationIsolation::Isolated
+                })
+                .map(|member| member.id().to_string())
+                .collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let tool = crate::agent::builtin_tools::DelegateTool::new(roster.clone());
+            let mut definition = tool.definition();
+            definition.function.description =
+                "Delegate a model task to another agent on this host without opening a workspace."
+                    .into();
+            definition.function.parameters["properties"]["target_agent_id"]["enum"] =
+                serde_json::json!(ids);
+            definition.function.parameters["properties"]["isolation"] =
+                serde_json::json!({"type": "string", "enum": ["shared"]});
+            Some((Arc::new(tool), definition))
+        }
+        _ => None,
+    }
+}
+
+fn confined_read_definition() -> querymt::chat::Tool {
+    let mut definition = crate::tools::builtins::ReadTool::new().definition();
+    definition.function.description = "Read a visible regular file under this session's workspace. Use a relative path and optional offset and limit.".into();
+    if let Some(properties) = definition.function.parameters["properties"].as_object_mut() {
+        properties.remove("root");
+    }
+    definition
+}
+
+async fn dispatch_confined_read(exec: &TurnEnv, args: &serde_json::Value) -> ToolOutcome {
+    #[cfg(feature = "remote")]
+    if let Some(cwd) = exec.cwd()
+        && let Some(relative) = args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::Path::new)
+        && args.get("root").is_none()
+        && crate::agent::file_proxy::is_shareable_path(relative)
+    {
+        use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_confined_file};
+        let offset = args
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_default();
+        let limit = args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_READ_LIMIT)
+            .min(DEFAULT_READ_LIMIT);
+        if let Ok(parts) = render_confined_file(cwd, relative, offset, limit).await {
+            return ToolOutcome::new(parts, false, ToolSource::Builtin, Execution::Executed);
+        }
+    }
+    let _ = (exec, args);
+    ToolOutcome::error_text(
+        "Error: workspace file unavailable".into(),
+        ToolSource::Blocked,
+        Execution::PolicyBlocked,
+    )
+}
+
 async fn run_tool(
     config: &AgentConfig,
     env: &TurnEnv,
@@ -1768,6 +1904,9 @@ pub(super) async fn record_tool_side_effects(
     }
 
     if tool_name == "delegate" {
+        if !env.allows_workflow_tool(tool_name) {
+            return Err(crate::error::AgentError::MeshAccessDenied.into());
+        }
         let args: serde_json::Value =
             serde_json::from_str(result.tool_arguments.as_deref().unwrap_or("{}"))
                 .unwrap_or_default();
@@ -1801,6 +1940,7 @@ pub(super) async fn record_tool_side_effects(
             .unwrap_or_default()
             .unwrap_or_default();
 
+        env.require_turn_authority().await?;
         let pre_hook = config
             .hooks
             .run_pre_delegation(PreDelegationRequest {
@@ -1846,7 +1986,11 @@ pub(super) async fn record_tool_side_effects(
         let mut context_val = updated_context.or(context_val);
         let constraints = updated_constraints.or(constraints);
         let expected_output = updated_expected_output.or(expected_output);
-        let requested_isolation = updated_isolation.unwrap_or(isolation);
+        let requested_isolation = if env.restricted_mesh_turn() {
+            crate::worktree::DelegationIsolation::Shared
+        } else {
+            updated_isolation.unwrap_or(isolation)
+        };
 
         if !pre_hook.additional_contexts.is_empty() {
             let extra_context = pre_hook.additional_contexts.join("\n\n");
@@ -1928,6 +2072,7 @@ pub(super) async fn record_tool_side_effects(
             ),
         });
 
+        env.require_turn_authority().await?;
         if let Ok(delegation) = turn
             .state
             .record_delegation(
@@ -1944,6 +2089,7 @@ pub(super) async fn record_tool_side_effects(
                         crate::worktree::DelegationIsolation::Shared
                     }
                 },
+                env.turn_authority().stored_origin(),
             )
             .await
         {
@@ -2043,7 +2189,9 @@ pub(super) async fn store_all_tool_results(
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
     let batch_id = Uuid::new_v4().to_string();
-    crate::agent::repository_delivery::restore_state(config, env, turn).await;
+    if !env.restricted_mesh_turn() {
+        crate::agent::repository_delivery::restore_state(config, env, turn).await;
+    }
     let mut adjusted_results = Vec::with_capacity(ordered_results.len());
     for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
@@ -2054,8 +2202,11 @@ pub(super) async fn store_all_tool_results(
         // Native repository cards draw from the turn's shared budget in
         // stable tool-call order (not completion order). Cards that do not
         // fit are dropped whole, so they are never recorded as delivered.
-        let contexts = std::mem::take(&mut result.hook_contexts);
-        result.hook_contexts = crate::agent::repository_delivery::allocate(config, turn, contexts);
+        if !env.restricted_mesh_turn() {
+            let contexts = std::mem::take(&mut result.hook_contexts);
+            result.hook_contexts =
+                crate::agent::repository_delivery::allocate(config, turn, contexts);
+        }
         adjusted_results.push(result);
     }
 
@@ -3534,6 +3685,245 @@ mod prepared_call_tests {
         execute_tool_call(config, &call, &exec, &turn)
             .await
             .unwrap()
+    }
+
+    #[cfg(all(feature = "remote", target_os = "linux"))]
+    #[tokio::test]
+    async fn custom_read_uses_confined_path_and_never_reaches_general_tools() {
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        let mut registry = ToolRegistry::new();
+        registry.add(Arc::new(crate::tools::builtins::ReadTool::new()));
+        config.tool_registry = Arc::new(registry);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("visible.txt"), "safe fixture").unwrap();
+        std::fs::write(workspace.path().join(".secret"), "must not read").unwrap();
+        let (exec, turn) = fx.agent.turn().await;
+        let mut exec = exec.tools_from(&config);
+        exec.restricted_mesh_turn = true;
+        exec.confined_mesh_read = true;
+        exec.runtime = crate::agent::core::SessionRuntime::new(
+            Some(workspace.path().canonicalize().unwrap()),
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let call = mock_tool_call("read", "read_tool", r#"{"path":"visible.txt"}"#);
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(text(&result).contains("safe fixture"));
+        for (tool, args) in [
+            ("read_tool", r#"{"path":".secret"}"#),
+            ("read_tool", r#"{"path":"../visible.txt"}"#),
+            ("read_tool", r#"{"path":"visible.txt","root":"/tmp"}"#),
+        ] {
+            let call = mock_tool_call("bad", tool, args);
+            let result = execute_tool_call(&config, &call, &exec, &turn)
+                .await
+                .unwrap();
+            assert!(result.is_error, "unexpected success for {tool}: {args}");
+        }
+        exec.confined_mesh_read = false;
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[cfg(feature = "remote")]
+    use crate::{agent::session_actor::PeerTurn, error::AgentError};
+    #[cfg(feature = "remote")]
+    use querymt_remote::{
+        NodeId,
+        peer_access::{
+            GrantStore, GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, PeerGrantState,
+            ProviderGrant,
+        },
+    };
+
+    #[cfg(feature = "remote")]
+    #[derive(Default)]
+    struct Store(parking_lot::Mutex<PeerGrantState>);
+
+    #[cfg(feature = "remote")]
+    #[async_trait::async_trait]
+    impl GrantStore for Store {
+        async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+            Ok(self.0.lock().clone())
+        }
+
+        async fn replace_grant(
+            &self,
+            _: &PeerGrantKey,
+            _: Uuid,
+            _: PeerGrant,
+        ) -> Result<PeerGrantState, GrantStoreError> {
+            unreachable!("test changes the policy directly")
+        }
+
+        async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+            unreachable!("unused by tool dispatch")
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    impl Store {
+        fn set(&self, grant: PeerGrant) {
+            *self.0.lock() = PeerGrantState {
+                revision: Uuid::now_v7(),
+                grant,
+            };
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    fn custom(shell: bool) -> PeerGrant {
+        PeerGrant::Custom {
+            sessions: true,
+            filesystem: true,
+            shell,
+            providers: vec![ProviderGrant {
+                provider_id: "mock".into(),
+                models: ModelSelection::All,
+            }],
+        }
+    }
+
+    #[cfg(all(feature = "remote", unix))]
+    #[tokio::test]
+    async fn custom_shell_offer_and_dispatch_follow_pinned_and_live_grants() {
+        use crate::agent::execution::{Step, transitions::transition_before_llm_call_in_test};
+        use crate::tools::builtins::ShellTool;
+
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        let mut registry = ToolRegistry::new();
+        let shell = ShellTool::new();
+        let shell_definition = shell.definition();
+        registry.add(Arc::new(shell));
+        registry.add(Arc::new(crate::tools::builtins::WriteFileTool::new()));
+        config.tool_registry = Arc::new(registry);
+        let store = Arc::new(Store::default());
+        let (exec, mut turn) = fx
+            .agent
+            .turn_in(fx.agent._tempdir.path().to_path_buf())
+            .await;
+        let mut exec = exec.tools_from(&config);
+        exec.restricted_mesh_turn = true;
+        exec.turn_authority = PeerTurn::test_authority(custom(false), store.clone());
+        let call = mock_tool_call(
+            "shell",
+            "shell",
+            r#"{"command":"printf 'mesh shell fixture' > shell-marker"}"#,
+        );
+        let marker = fx.agent._tempdir.path().join("shell-marker");
+
+        // A wider live grant cannot upgrade an already admitted restricted turn.
+        for live_shell in [false, true] {
+            store.set(custom(live_shell));
+            let Step::Continue(Stage::CallModel(request)) =
+                transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected a model request");
+            };
+            assert!(request.tools.is_empty());
+            let result = execute_tool_call(&config, &call, &exec, &turn)
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            assert!(text(&result).contains("not available to mesh-hosted turns"));
+            assert!(!marker.exists());
+        }
+
+        exec.turn_authority = PeerTurn::test_authority(custom(true), store.clone());
+
+        // The grant permits the builtin, but cannot override the host's tool policy.
+        exec.tool_config.deny = ["shell".parse().unwrap()].into_iter().collect();
+        let Step::Continue(Stage::CallModel(request)) =
+            transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a model request");
+        };
+        assert!(request.tools.is_empty());
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(!marker.exists());
+        exec.tool_config.deny = Default::default();
+
+        let Step::Continue(Stage::CallModel(request)) =
+            transition_before_llm_call_in_test(&config, &exec, &mut turn)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a model request");
+        };
+        assert_eq!(request.tools.as_ref(), &[shell_definition]);
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "mesh shell fixture"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let prepared = prepare_tool_call(&config, &call, &exec).await.unwrap();
+        assert!(matches!(prepared.disposition, Disposition::Ready));
+        store.set(custom(false));
+        let result = execute_prepared_tool_call(&config, &call, prepared, &exec, &turn).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn downgraded_full_peer_cannot_dispatch_prepared_tool_or_run_a_new_hook() {
+        let fx = Fixture::new().await;
+        let config = fx.config(Some(fx.hooks(json!({}))));
+        let store = Arc::new(Store::default());
+        store.set(PeerGrant::Full);
+        let (exec, turn) = fx.agent.turn().await;
+        let mut exec = exec.tools_from(&config);
+        exec.turn_authority = PeerTurn::test_authority(PeerGrant::Full, store.clone());
+        for name in ["route_delegation_to_peer", "use_remote_provider"] {
+            let workflow = mock_tool_call("workflow", name, "{}");
+            let prepared = prepare_tool_call(&config, &workflow, &exec).await.unwrap();
+            assert!(matches!(prepared.disposition, Disposition::Rejected(_)));
+        }
+        assert!(
+            fx.hook_inputs().is_empty(),
+            "blocked tools cannot trigger hooks"
+        );
+        let call = mock_tool_call(
+            "call-1",
+            "rec_edit",
+            r#"{"file_path":"a.rs","new_string":"y"}"#,
+        );
+        let prepared = prepare_tool_call(&config, &call, &exec).await.unwrap();
+        assert!(matches!(prepared.disposition, Disposition::Ready));
+        assert_eq!(fx.hook_inputs().len(), 1);
+
+        store.set(custom(true));
+        let result = execute_prepared_tool_call(&config, &call, prepared, &exec, &turn).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        let result = prepare_tool_call(&config, &call, &exec).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        assert_eq!(fx.hook_inputs().len(), 1);
+        assert!(fx.invoked().is_empty());
     }
 
     #[tokio::test]

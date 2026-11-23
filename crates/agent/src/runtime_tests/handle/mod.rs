@@ -516,6 +516,234 @@ fn should_return_without_force_stop(status: crate::agent::messages::SessionRunti
     status.phase == crate::agent::messages::SessionRuntimePhase::Idle
 }
 
+#[cfg(feature = "remote")]
+struct RemoteScheduleFixture {
+    client: RealStorageHandleFixture,
+    node_id: String,
+    session_id: String,
+    host: tokio::process::Child,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(feature = "remote")]
+impl RemoteScheduleFixture {
+    async fn new(missing_session: bool) -> Self {
+        use querymt_remote::peer_access::SharingProtocol;
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("mesh fixture directory");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("allocate a loopback port")
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen = format!("/ip4/127.0.0.1/tcp/{port}");
+        let mut config =
+            schedule_mesh_config(dir.path().join("client.key"), "/ip4/127.0.0.1/tcp/0".into());
+        let client_peer = schedule_mesh_peer_id(config.identity_file.as_deref().unwrap());
+        let host_peer = schedule_mesh_peer_id(&dir.path().join("host.key"));
+        assert_ne!(client_peer, host_peer);
+
+        // Kameo allows only one mesh identity per process. Start the owner in a
+        // child so the ACP client crosses real authenticated mesh ingress.
+        let mut host = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_tests::handle::remote_schedule_host_helper",
+                "--ignored",
+            ])
+            .env("QMT_TEST_SCHEDULE_HOST_DIR", dir.path())
+            .env("QMT_TEST_SCHEDULE_LISTEN", &listen)
+            .env(
+                "QMT_TEST_SCHEDULE_DELETE_SESSION",
+                if missing_session { "1" } else { "0" },
+            )
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start guarded schedule host");
+        let ready = dir.path().join("ready");
+        let session_id = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(id) = std::fs::read_to_string(&ready) {
+                    break id;
+                }
+                assert!(
+                    host.try_wait().unwrap().is_none(),
+                    "schedule host exited before readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("schedule host did not become ready");
+
+        config.peers.push(format!("{listen}/p2p/{host_peer}"));
+        let mesh = bootstrap_guarded_schedule_mesh(&config)
+            .await
+            .expect("start distinct schedule client");
+        let mesh = mesh.as_mesh_handle();
+        let name = querymt_remote::scoped_node_manager_for_peer(
+            &querymt_remote::MeshScopeId::lan_default(),
+            &host_peer,
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if mesh.is_peer_alive(&host_peer)
+                    && matches!(mesh.lookup_actor_no_retry_with_timeout::<crate::agent::remote::RemoteNodeManager>(&name, Duration::from_secs(1)).await, Ok(Some(actor)) if actor.id().peer_id() == Some(&host_peer))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("client did not discover the guarded node manager");
+        assert_eq!(
+            mesh.select_sharing_protocol(host_peer, config.request_timeout)
+                .await
+                .unwrap(),
+            SharingProtocol::V1
+        );
+        let client = RealStorageHandleFixture::new().await;
+        client.handle.set_mesh(mesh.clone());
+        Self {
+            client,
+            node_id: host_peer.to_string(),
+            session_id,
+            host,
+            _dir: dir,
+        }
+    }
+
+    async fn finish(mut self) {
+        drop(self.host.stdin.take());
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.host.wait())
+            .await
+            .expect("schedule host shutdown timed out")
+            .expect("wait for schedule host");
+        assert!(status.success(), "schedule host failed: {status}");
+    }
+}
+
+#[cfg(feature = "remote")]
+fn schedule_mesh_config(
+    identity: std::path::PathBuf,
+    listen: String,
+) -> querymt_remote::MeshRuntimeConfig {
+    use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
+    use std::time::Duration;
+
+    MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some(listen),
+            discovery: LanDiscovery::None,
+            directory: Default::default(),
+        }),
+        identity_file: Some(identity),
+        iroh_enabled: false,
+        iroh_gso: true,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        request_timeout: Duration::from_secs(3),
+        stream_reconnect_grace: Duration::from_secs(3),
+        node_name: None,
+        peers: vec![],
+        auto_fallback: false,
+    }
+}
+
+#[cfg(feature = "remote")]
+async fn bootstrap_guarded_schedule_mesh(
+    config: &querymt_remote::MeshRuntimeConfig,
+) -> Result<querymt_remote::MeshRuntimeHandle, querymt_remote::MeshError> {
+    let identity = config
+        .identity_file
+        .as_ref()
+        .expect("isolated mesh identity");
+    let mut path = identity.as_os_str().to_os_string();
+    path.push(".mesh_state.json");
+    let store = querymt_remote::MeshAccessStore::new(
+        querymt_remote::MeshStateStore::shared(Path::new(&path)).expect("create test policy store"),
+    );
+    querymt_remote::bootstrap_mesh_runtime_with_policy(config, Arc::new(store)).await
+}
+
+#[cfg(feature = "remote")]
+fn schedule_mesh_peer_id(identity: &Path) -> libp2p::PeerId {
+    querymt_remote::identity::load_or_generate_keypair(Some(identity))
+        .expect("test mesh keypair")
+        .public()
+        .to_peer_id()
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+#[ignore = "subprocess for ACP remote schedule tests"]
+async fn remote_schedule_host_helper() {
+    use crate::agent::remote::{
+        CreateRemoteSession, remote_setup::spawn_and_register_local_mesh_actors_with_name,
+    };
+    use querymt_remote::{
+        NodeId,
+        peer_access::{PeerGrant, PeerGrantKey},
+    };
+    use tokio::io::AsyncReadExt;
+
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("QMT_TEST_SCHEDULE_HOST_DIR").expect("fixture directory"),
+    );
+    let listen = std::env::var("QMT_TEST_SCHEDULE_LISTEN").expect("fixture listen address");
+    let missing_session = std::env::var("QMT_TEST_SCHEDULE_DELETE_SESSION").unwrap() == "1";
+    let host = RealStorageHandleFixture::new().await;
+    let runtime =
+        bootstrap_guarded_schedule_mesh(&schedule_mesh_config(dir.join("host.key"), listen))
+            .await
+            .expect("start guarded schedule host");
+    let mesh = runtime.as_mesh_handle();
+    host.handle.set_mesh(mesh.clone());
+    let store = mesh.quota_store().expect("guarded host policy store");
+    let key = PeerGrantKey {
+        host: NodeId::from_peer_id(*mesh.peer_id()),
+        peer: NodeId::from_peer_id(schedule_mesh_peer_id(&dir.join("client.key"))),
+    };
+    let revision = store.grant(&key).await.unwrap().revision;
+    // Schedule RPCs require a full grant, including over sharing V1.
+    store
+        .replace_grant(&key, revision, PeerGrant::Full)
+        .await
+        .expect("grant schedule access to the distinct client");
+    let actors = spawn_and_register_local_mesh_actors_with_name(
+        &host.handle,
+        mesh,
+        Some("peer-alpha".into()),
+    )
+    .await;
+    let session = actors
+        .node_manager
+        .ask(CreateRemoteSession {
+            cwd: (!missing_session).then(|| "/tmp/remote-schedule".into()),
+        })
+        .await
+        .expect("create remote session");
+    if missing_session {
+        host.storage
+            .session_store()
+            .delete_session(&session.session_id)
+            .await
+            .expect("delete persisted remote session row");
+    }
+
+    std::fs::write(dir.join("session"), session.session_id).unwrap();
+    std::fs::rename(dir.join("session"), dir.join("ready")).unwrap();
+    // The parent holds stdin open for the duration of its ACP requests.
+    assert_eq!(tokio::io::stdin().read(&mut [0]).await.unwrap(), 0);
+    actors.node_manager.stop_gracefully().await.unwrap();
+    runtime.shutdown().await;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 mod capabilities;

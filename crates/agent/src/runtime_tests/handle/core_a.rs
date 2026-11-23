@@ -589,7 +589,7 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn test_list_remote_nodes_prefers_per_peer_lookup() {
+async fn node_discovery_does_not_trust_a_dht_name_for_another_peer() {
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
     use kameo::actor::Spawn;
@@ -612,7 +612,16 @@ async fn test_list_remote_nodes_prefers_per_peer_lookup() {
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
     let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
-    mesh.register_actor(node_manager_ref, per_peer_name).await;
+    mesh.register_actor(node_manager_ref.clone(), per_peer_name.clone())
+        .await;
+    assert_eq!(
+        mesh.lookup_actor_no_retry::<RemoteNodeManager>(per_peer_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        node_manager_ref.id()
+    );
     mesh.inject_known_peer_for_test(peer_id);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -620,8 +629,8 @@ async fn test_list_remote_nodes_prefers_per_peer_lookup() {
     let labels: HashSet<_> = nodes.into_iter().map(|node| node.label).collect();
 
     assert!(
-        labels.contains("peer-alpha"),
-        "per-peer DHT registrations should be visible in list_remote_nodes"
+        !labels.contains("peer-alpha"),
+        "a per-peer DHT name does not prove the actor belongs to that peer"
     );
 }
 

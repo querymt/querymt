@@ -72,7 +72,7 @@ async fn test_remote_node_cache_expires_stale_entries() {
                 ),
                 hostname: "node-a".to_string(),
                 capabilities: vec!["shell".to_string()],
-                active_sessions: 1,
+                active_sessions: Some(1),
             },
             expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
         },

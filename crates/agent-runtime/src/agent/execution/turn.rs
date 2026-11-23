@@ -16,7 +16,9 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig, TurnSnapshot};
 use crate::agent::execution::DelegationRecovery;
 use crate::agent::objective::RunObjective;
+use crate::agent::session_actor::TurnAuthority;
 use crate::agent::turn_control::{RunPhase, RunSignal, SteeringInbox};
+use crate::error::AgentError;
 use crate::knowledge::KnowledgeStore;
 use crate::knowledge::repository::RepositoryKnowledgeRegistry;
 use crate::knowledge::repository::budget::DeliveryBudget;
@@ -94,6 +96,9 @@ pub(crate) struct TurnEnv {
     /// Per-session tool configuration captured at the start of the turn, so
     /// `SetAllowedTools`, `SetDeniedTools` and `SetToolPolicy` are honoured.
     pub tool_config: ToolConfig,
+    pub(crate) turn_authority: TurnAuthority,
+    pub(crate) restricted_mesh_turn: bool,
+    pub(crate) confined_mesh_read: bool,
     /// Optional knowledge store, propagated into tool contexts.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
     /// Lazy per-checkout repository knowledge; `None` unless host-enabled.
@@ -117,6 +122,42 @@ pub(crate) struct TurnEnv {
 }
 
 impl TurnEnv {
+    pub(crate) async fn require_turn_authority(&self) -> Result<(), AgentError> {
+        #[cfg(feature = "remote")]
+        if let TurnAuthority::Peer(peer) = &self.turn_authority {
+            let binding = self
+                .llm_config()
+                .map(|config| (config.provider.as_str(), config.model.as_str()));
+            return peer.grant_for(binding).await.map(|_| ());
+        }
+        self.turn_authority.check().await
+    }
+
+    pub(crate) fn turn_authority(&self) -> &TurnAuthority {
+        &self.turn_authority
+    }
+
+    pub(crate) fn restricted_mesh_turn(&self) -> bool {
+        self.restricted_mesh_turn
+    }
+
+    pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
+        if self.restricted_mesh_turn() {
+            return match name {
+                "delegate" => true,
+                "read_tool" => self.confined_mesh_read,
+                #[cfg(feature = "remote")]
+                "shell" => {
+                    matches!(&self.turn_authority, TurnAuthority::Peer(peer) if peer.allows_shell())
+                }
+                _ => false,
+            };
+        }
+        // These routes can outlive the turn and do not preserve its origin.
+        matches!(self.turn_authority, TurnAuthority::Local)
+            || !matches!(name, "route_delegation_to_peer" | "use_remote_provider")
+    }
+
     /// The run's tool lookup: the session-bound `skill` tool (when the agent
     /// has a skill catalog) over the agent's tool registry.
     pub(crate) fn build_tool_set(

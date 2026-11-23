@@ -266,6 +266,12 @@ pub trait Middleware: Send + Sync {
     ) {
     }
 
+    /// Whether this driver can run without filesystem, tool, or auxiliary
+    /// provider authority. Unclassified drivers are not run for Custom peers.
+    fn supports_restricted_mesh(&self) -> bool {
+        false
+    }
+
     /// Session limits this middleware enforces, if any.
     fn limits(&self) -> Option<SessionLimits> {
         None

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use querymt_agent_core::session::domain::{Delegation, DelegationClaim, DelegationStatus};
+use querymt_agent_core::session::domain_schedule::ScheduleOrigin;
 use querymt_agent_core::session::error::{SessionError, SessionResult};
 use querymt_agent_core::session::repository::DelegationRepository;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -48,11 +49,38 @@ impl SqliteDelegationRepository {
             Err(e) => Err(e),
         }
     }
-}
 
-#[async_trait]
-impl DelegationRepository for SqliteDelegationRepository {
-    async fn create_delegation(&self, mut delegation: Delegation) -> SessionResult<Delegation> {
+    pub(crate) async fn origin(&self, id: &str) -> SessionResult<ScheduleOrigin> {
+        let id = id.to_owned();
+        let origin: Option<String> = self
+            .run_blocking(move |conn| {
+                conn.query_row(
+                    "SELECT origin_json FROM delegations WHERE public_id = ?",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        origin.map_or(Ok(ScheduleOrigin::Local), |json| {
+            serde_json::from_str(&json).map_err(|_| {
+                SessionError::InvalidOperation("invalid stored delegation origin".into())
+            })
+        })
+    }
+
+    pub(crate) async fn create_with_origin(
+        &self,
+        mut delegation: Delegation,
+        origin: ScheduleOrigin,
+    ) -> SessionResult<Delegation> {
+        let origin =
+            if origin == ScheduleOrigin::Local {
+                None
+            } else {
+                Some(serde_json::to_string(&origin).map_err(|_| {
+                    SessionError::InvalidOperation("invalid delegation origin".into())
+                })?)
+            };
         if delegation.public_id.trim().is_empty() {
             delegation.public_id = Uuid::now_v7().to_string();
         }
@@ -75,7 +103,7 @@ impl DelegationRepository for SqliteDelegationRepository {
 
         let internal_id = self.run_blocking(move |conn| {
             conn.execute(
-                "INSERT INTO delegations (public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, isolation, status, retry_count, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO delegations (public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, isolation, status, retry_count, created_at, completed_at, origin_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     public_id,
                     session_id,
@@ -92,6 +120,7 @@ impl DelegationRepository for SqliteDelegationRepository {
                     retry_count,
                     created_at,
                     completed_at,
+                    origin,
                 ],
             )?;
             Ok::<i64, rusqlite::Error>(conn.last_insert_rowid())
@@ -100,6 +129,14 @@ impl DelegationRepository for SqliteDelegationRepository {
 
         delegation.id = internal_id;
         Ok(delegation)
+    }
+}
+
+#[async_trait]
+impl DelegationRepository for SqliteDelegationRepository {
+    async fn create_delegation(&self, delegation: Delegation) -> SessionResult<Delegation> {
+        self.create_with_origin(delegation, ScheduleOrigin::Local)
+            .await
     }
 
     async fn get_delegation(&self, delegation_id: &str) -> SessionResult<Option<Delegation>> {

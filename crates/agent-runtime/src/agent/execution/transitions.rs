@@ -111,6 +111,9 @@ pub(super) async fn transition_before_llm_call(
         return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
+    env.require_turn_authority()
+        .await
+        .map_err(anyhow::Error::from)?;
     let trigger: &'static str = trigger.into();
 
     let collect_span = info_span!(
@@ -119,7 +122,13 @@ pub(super) async fn transition_before_llm_call(
         tools_bytes = tracing::field::Empty
     );
     let capabilities = env.model.profile.capabilities;
-    let tool_updates = capabilities.tool_updates;
+    // Peer turns have a filtered tool set. Do not replay a host turn's tool
+    // baseline, which may include definitions this peer cannot use.
+    let tool_updates = capabilities.tool_updates
+        && matches!(
+            env.turn_authority(),
+            crate::agent::session_actor::TurnAuthority::Local
+        );
     // Default message hints request the configured lifetime, capped at what
     // the provider offers; the provider rounds it to one it supports.
     let hint_ttl_seconds = capabilities
@@ -129,12 +138,22 @@ pub(super) async fn transition_before_llm_call(
     let (tools, tools_json, new_hash) = {
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
-        let tools = config.collect_tools(
+        let mut tools = config.collect_tools(
             Arc::clone(&env.model.provider),
             Some(env.runtime.as_ref()),
             Some(&env.tool_config),
             env.tool_set(),
         );
+        tools.retain(|tool| env.allows_workflow_tool(&tool.function.name));
+        if env.restricted_mesh_turn() {
+            tools = tools
+                .into_iter()
+                .filter_map(|tool| {
+                    super::tool_calls::restricted_mesh_tool(config, env, &tool.function.name)
+                        .map(|(_, definition)| definition)
+                })
+                .collect();
+        }
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
         let new_hash = querymt_agent_core::hash::RapidHash::new(&tools_json);
@@ -216,21 +235,33 @@ pub(super) async fn transition_before_llm_call(
         trigger,
         message_count = messages.len() as u64
     );
-    let hook_result = config
-        .hooks
-        .run_context(crate::hooks::ContextHookRequest {
-            session_id: env.session_id.clone(),
-            mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
-            turn_id: env.turn_id().to_string(),
-            cwd: env.cwd().map(|path| path.to_path_buf()),
-            model: env.model_name().to_string(),
-            permission_mode: env.permission_mode().to_string(),
-            trigger: trigger.to_string(),
-            context_window,
-            messages,
-        })
-        .instrument(hook_span)
-        .await?;
+    env.require_turn_authority()
+        .await
+        .map_err(anyhow::Error::from)?;
+    let hook_result = if env.restricted_mesh_turn() {
+        crate::hooks::ContextHookResult {
+            estimated_tokens: crate::session::pruning::estimate_chat_tokens(&messages),
+            messages: Some(messages),
+            additional_context: Vec::new(),
+            notices: Vec::new(),
+        }
+    } else {
+        config
+            .hooks
+            .run_context(crate::hooks::ContextHookRequest {
+                session_id: env.session_id.clone(),
+                mcp_tool_state: Some(env.runtime.mcp_tool_state.clone()),
+                turn_id: env.turn_id().to_string(),
+                cwd: env.cwd().map(|path| path.to_path_buf()),
+                model: env.model_name().to_string(),
+                permission_mode: env.permission_mode().to_string(),
+                trigger: trigger.to_string(),
+                context_window,
+                messages,
+            })
+            .instrument(hook_span)
+            .await?
+    };
     for notice in hook_result.notices {
         config.emit_event(
             &env.session_id,
@@ -861,6 +892,14 @@ pub(super) async fn transition_call_llm(
         return Ok(Step::Break(CycleOutcome::Cancelled));
     }
 
+    env.require_turn_authority()
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    env.turn_authority()
+        .require_provider_dispatch()
+        .map_err(anyhow::Error::from)?;
+
     // Overrides last for exactly this request. Options the provider does not
     // honour are dropped (and logged); `applied` records what was really sent.
     let options = env
@@ -905,11 +944,8 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    // `tools` is the request's tool list, which for a provider that takes tool
-    // changes as messages is the baseline's: tools can be offered through a
-    // change while that list is empty, so both are read.
+    // Tool changes can offer tools even with an empty baseline.
     let output: ChatOutput = if tools.is_empty() && request.offered_tools.is_empty() {
-        // No tools — always use the non-streaming simple submit path.
         let cancel = env.cancellation_token.clone();
         match super::llm_retry::call_chat_with_retry(
             config,
@@ -928,7 +964,12 @@ pub(super) async fn transition_call_llm(
                         operation,
                         session_handle.billing_basis(),
                         &cancel,
-                        || provider.chat(&call),
+                        || async {
+                            env.require_turn_authority()
+                                .await
+                                .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                            provider.chat(&call).await
+                        },
                     )
                     .await
                 }
@@ -1075,6 +1116,9 @@ pub(super) async fn transition_call_llm(
                     return Ok(Step::Break(CycleOutcome::Cancelled));
                 }
 
+                env.require_turn_authority()
+                    .await
+                    .map_err(anyhow::Error::from)?;
                 // Durable start before the request is sent; a failure here
                 // means nothing was dispatched.
                 let mut attempt = match operation
@@ -1092,6 +1136,13 @@ pub(super) async fn transition_call_llm(
                         return Err(accounting_failure(error).into());
                     }
                 };
+                if let Err(error) = env.require_turn_authority().await {
+                    attempt
+                        .settle_error(&LLMError::InvalidRequest(error.to_string()), false, None)
+                        .await
+                        .map_err(accounting_failure)?;
+                    return Err(anyhow::Error::from(error).into());
+                }
                 let mut response_started = false;
 
                 timing.start();
@@ -1555,18 +1606,22 @@ pub(super) async fn transition_call_llm(
                 || {
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
-                    let tools = tools.as_ref();
                     let cancel = cancel.clone();
                     let operation = &operation;
                     async move {
                         let call = ChatCall::new(messages_with_cache)
-                            .tools(tools)
+                            .tools(tools.as_ref())
                             .options(options);
                         querymt_agent_services::accounting::run_attempt(
                             operation,
                             session_handle.billing_basis(),
                             &cancel,
-                            || provider.chat(&call),
+                            || async {
+                                env.require_turn_authority()
+                                    .await
+                                    .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                                provider.chat(&call).await
+                            },
                         )
                         .await
                     }

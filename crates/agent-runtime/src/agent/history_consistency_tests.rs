@@ -1506,6 +1506,7 @@ async fn a_panicking_scheduled_run_emits_scheduled_failed() {
             task_public_id: "task-1".into(),
             prompt_text: "scheduled work".into(),
             execution_limits: None,
+            origin: crate::session::domain_schedule::ScheduleOrigin::Local,
         })
         .await
         .expect("scheduled prompt is accepted");

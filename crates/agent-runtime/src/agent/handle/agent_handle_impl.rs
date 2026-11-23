@@ -29,6 +29,38 @@ impl LocalAgentHandle {
         Ok((session_id, session_ref))
     }
 
+    #[cfg(feature = "remote")]
+    pub(crate) fn supports_confined_delegation(&self) -> bool {
+        self.profiles().is_none()
+            && self.config.auth_methods.is_empty()
+            && self.session_materializer.supports_restricted_cold_resume()
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn create_confined_delegation_session(
+        &self,
+        parent_session_id: String,
+        authority: &crate::agent::session_actor::TurnAuthority,
+    ) -> Result<(String, SessionActorRef), Error> {
+        if !self.supports_confined_delegation() {
+            return Err(Error::from(crate::error::AgentError::MeshAccessDenied));
+        }
+        authority.check().await.map_err(Error::from)?;
+        let req = NewSessionRequest::new(std::path::PathBuf::new()).meta(
+            serde_json::Map::from_iter([("parent_session_id".into(), parent_session_id.into())]),
+        );
+        let prepared = self.session_materializer.prepare_new_session(req).await?;
+        let session_ref = self
+            .registry_lock()
+            .await
+            .register_prepared_session(&prepared)
+            .await;
+        self.session_materializer
+            .finalize_session_with_index(&prepared, false)
+            .await?;
+        Ok((prepared.session_id, session_ref))
+    }
+
     pub async fn set_session_lifecycle(
         &self,
         session_id: &str,
@@ -73,5 +105,78 @@ impl LocalAgentHandle {
     /// The runtime's event stream.
     pub fn event_fanout(&self) -> &Arc<EventFanout> {
         self.config.event_sink.fanout()
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+    use crate::agent::session_actor::{PeerTurn, TurnAuthority};
+    use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+    use querymt_remote::{
+        NodeId,
+        peer_access::{GrantStore, PeerGrant, PeerGrantKey},
+    };
+
+    #[tokio::test]
+    async fn confined_child_creates_no_workspace_and_refuses_stale_origin() {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &fixture._tempdir.path().join("mesh_state.json"),
+            )
+            .unwrap(),
+        ));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let initial = store
+            .replace_grant(
+                &key,
+                uuid::Uuid::nil(),
+                PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: false,
+                    shell: false,
+                    providers: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let authority = TurnAuthority::Peer(PeerTurn::test_peer(
+            key.clone(),
+            initial.grant,
+            store.clone(),
+        ));
+        let (env, _) = fixture.turn().await;
+        let parent = env.session_id;
+        let (child, _) = fixture
+            .handle
+            .create_confined_delegation_session(parent.clone(), &authority)
+            .await
+            .unwrap();
+        let row = fixture
+            .config
+            .provider
+            .history_store()
+            .get_session(&child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.cwd.is_none());
+        store
+            .replace_grant(&key, initial.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .handle
+                .create_confined_delegation_session(parent, &authority)
+                .await
+                .is_err()
+        );
     }
 }

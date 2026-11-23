@@ -48,6 +48,12 @@ pub async fn register_local_mesh_actor_scope(
         per_peer_name
     );
 
+    // Guarded meshes do not publish or register provider routes until metering
+    // is available. Legacy meshes keep their original actor registrations.
+    if mesh.inbound_router().is_some() {
+        return;
+    }
+
     let ph_dht_name = scoped_provider_host(scope, mesh.peer_id());
     runtime
         .register_actor(actor_refs.provider_host.clone(), ph_dht_name.clone())
@@ -104,6 +110,14 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         None => node_manager,
     };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+    if let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) {
+        RemoteNodeManager::register_guarded_discovery(router, store.clone(), &node_manager_ref);
+        crate::agent::handle::ext_mesh::register_peer_access_read(
+            router,
+            store.clone(),
+            node_manager_ref.id(),
+        );
+    }
 
     let provider_host = crate::agent::remote::provider_host_backend::provider_host_from_config(
         handle.config.clone(),
