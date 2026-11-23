@@ -253,7 +253,7 @@ impl SessionCore {
                     .filter(|key| {
                         matches!(
                             self.store.kind(*key),
-                            Some(EntryKind::UserMessage(user)) if user.status != PromptStatus::Pending
+                            Some(EntryKind::UserMessage(user)) if user.status == PromptStatus::Sent
                         )
                     })
             });
@@ -275,7 +275,7 @@ impl SessionCore {
             return;
         }
         if let Some(id) = &prompt_id {
-            self.drop_pending_prompt(id);
+            self.drop_unsent_prompt(id);
         }
         let (entry_id, hint) = match &message_id {
             Some(id) => (format!("user-{id}"), TurnHint::Message(id.clone())),

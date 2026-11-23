@@ -242,6 +242,11 @@ impl Store {
         self.items.get(&key).map(|slot| &slot.entry.kind)
     }
 
+    /// Id of the entry stored under `key`.
+    pub(crate) fn entry_id(&self, key: i64) -> Option<&str> {
+        self.items.get(&key).map(|slot| slot.entry.id.as_str())
+    }
+
     /// Key of the newest entry of the newest run turn.
     pub(crate) fn last_key(&self) -> Option<i64> {
         let turn = self.turns.get(self.last_run_turn()?)?;
@@ -356,8 +361,10 @@ impl Store {
         let mut added = Vec::new();
         let mut updated = Vec::new();
         let order: Vec<String> = self.order.iter().cloned().collect();
+        let before_by_id: std::collections::HashMap<&str, &Turn> =
+            old.iter().map(|turn| (turn.id.as_str(), turn)).collect();
         for id in &order {
-            let Some(before) = old.iter().find(|turn| turn.id == *id) else {
+            let Some(before) = before_by_id.get(id.as_str()).copied() else {
                 added.push(id.clone());
                 continue;
             };

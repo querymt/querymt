@@ -1,5 +1,6 @@
 //! Subagents (spec: Subagent update patches the child, Tool call links a
 //! child session, Snapshot restores subagents).
+#![cfg(feature = "test-support")]
 
 use querymt_agent_session_core::SessionCore;
 use querymt_agent_session_core::entry::EntryKind;

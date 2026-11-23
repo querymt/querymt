@@ -34,8 +34,8 @@ pub struct InflightMessage {
 /// The in-flight text of a session at one point of its event order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InflightText {
-    /// Highest `session_seq` folded in: every streamed delta at or before it
-    /// is part of `messages`.
+    /// Highest `session_seq` of a streamed delta folded in: every delta at or
+    /// before it is part of `messages`. Other events never move it.
     pub through_seq: i64,
     pub messages: Vec<InflightMessage>,
 }
@@ -83,16 +83,20 @@ impl InflightAccumulator {
                     }),
                 }
             }
-            AgentEventKind::AssistantMessageStored {
-                message_id: Some(message_id),
-                ..
-            } => {
-                if let Some(inflight) = self.sessions.get_mut(session_id) {
-                    inflight.messages.retain(|m| &m.message_id != message_id);
-                    if inflight.messages.is_empty() {
+            AgentEventKind::AssistantMessageStored { message_id, .. } => {
+                match message_id {
+                    Some(message_id) => {
+                        if let Some(inflight) = self.sessions.get_mut(session_id) {
+                            inflight.messages.retain(|m| &m.message_id != message_id);
+                            if inflight.messages.is_empty() {
+                                self.sessions.remove(session_id);
+                            }
+                        }
+                    }
+                    // A message without an id cannot be matched to what
+                    // streamed; the turn's text is stored, so it is over.
+                    None => {
                         self.sessions.remove(session_id);
-                    } else if seq > 0 {
-                        inflight.through_seq = inflight.through_seq.max(seq);
                     }
                 }
             }
@@ -100,13 +104,9 @@ impl InflightAccumulator {
             AgentEventKind::RunCompleted { .. } | AgentEventKind::Cancelled => {
                 self.sessions.remove(session_id);
             }
-            _ => {
-                if seq > 0
-                    && let Some(inflight) = self.sessions.get_mut(session_id)
-                {
-                    inflight.through_seq = inflight.through_seq.max(seq);
-                }
-            }
+            // Only streamed deltas move `through_seq`; other events are not
+            // part of the in-flight text.
+            _ => {}
         }
     }
 
@@ -451,7 +451,8 @@ mod tests {
             .map(|m| m.message_id.as_str())
             .collect();
         assert_eq!(ids, ["m2"]);
-        assert_eq!(inflight.through_seq, 3);
+        // only streamed deltas move the position, not the stored message
+        assert_eq!(inflight.through_seq, 2);
 
         fanout.publish(ephemeral(
             4,
@@ -460,6 +461,28 @@ mod tests {
                 outcome: "completed".into(),
                 stop_type: None,
                 reason: None,
+            },
+        ));
+        assert_eq!(fanout.inflight_text("s1"), None);
+    }
+
+    #[test]
+    fn inflight_through_seq_ignores_other_events_and_idless_store_ends_the_text() {
+        let fanout = EventFanout::new();
+        fanout.publish(content(1, "m1", "a"));
+        fanout.publish(ephemeral(
+            7,
+            AgentEventKind::WorktreeCommandOutput { text: "out".into() },
+        ));
+        assert_eq!(fanout.inflight_text("s1").unwrap().through_seq, 1);
+
+        fanout.publish(ephemeral(
+            8,
+            AgentEventKind::AssistantMessageStored {
+                content: "a".into(),
+                thinking: None,
+                reasoning_parts: Vec::new(),
+                message_id: None,
             },
         ));
         assert_eq!(fanout.inflight_text("s1"), None);

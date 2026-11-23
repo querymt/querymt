@@ -1,6 +1,7 @@
 //! Turns are runs, identity from the agent, run state from state updates
 //! (spec: Turns are agent runs, Identity from the agent, Optimistic prompts,
 //! Client-local prompts, Run state).
+#![cfg(feature = "test-support")]
 
 mod common;
 
@@ -412,5 +413,47 @@ fn a_state_update_for_another_session_or_without_a_run_is_not_applied() {
     ]);
     assert_eq!(report.ignored, 1);
     assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert_eq!(core.header().run_state, RunState::Idle);
+}
+
+#[test]
+fn echo_of_a_failed_prompt_replaces_it() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[
+        optimistic("c1"),
+        SessionInput::PromptFailed {
+            client_prompt_id: "c1".into(),
+            message: "timeout".into(),
+        },
+        state("running", "r1"),
+        live(json!({
+            "sessionUpdate": "user_message_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "hi" },
+            "_meta": { "querymt": { "client_prompt_id": "c1", "runId": "r1" } }
+        })),
+    ]);
+    assert_eq!(
+        core.turn_ids(),
+        ["run-r1"],
+        "no failed prompt is left behind"
+    );
+    let turn = core.turn("run-r1").expect("turn");
+    let EntryKind::UserMessage(user) = &turn.entries[0].kind else {
+        panic!("expected a user message");
+    };
+    assert_eq!(user.status, PromptStatus::Sent);
+    assert_eq!(user.blocks.len(), 1);
+}
+
+#[test]
+fn idle_of_an_older_run_does_not_end_the_current_one() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[state("running", "r2")]);
+    let report = core.apply(&[idle("r1", "end_turn")]);
+    assert_eq!(report.ignored, 1);
+    assert_eq!(core.header().active_run_id.as_deref(), Some("r2"));
+    assert_ne!(core.header().run_state, RunState::Idle);
+    core.apply(&[idle("r2", "end_turn")]);
+    assert_eq!(core.header().active_run_id, None);
     assert_eq!(core.header().run_state, RunState::Idle);
 }
