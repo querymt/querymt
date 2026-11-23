@@ -730,26 +730,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_provider_egress_does_not_issue_a_legacy_lookup() {
-        use crate::{KameoMeshClientTransport, RemoteProviderClientTransport};
-        use querymt::error::{LLMError, ProviderErrorKind};
-
-        let (_dir, mut mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
-        mesh.sharing_enabled = true;
-        let transport = KameoMeshClientTransport::new(mesh);
-        let result = transport.lookup_host("unused-provider-host").await;
-        let Err(LLMError::ProviderResponseError(failure)) = result else {
-            panic!("guarded provider lookup must return a typed rejection");
-        };
-        assert_eq!(failure.kind(), ProviderErrorKind::UnsupportedOperation);
-        assert_eq!(failure.code(), Some("mesh_access_incompatible"));
-        assert!(matches!(
-            commands.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
     async fn failure_does_not_trigger_a_legacy_downgrade() {
         let (_dir, mut mesh, _events, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
         mesh.sharing_enabled = true;

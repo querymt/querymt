@@ -5,6 +5,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution::llm_retry::call_chat_with_retry_if;
+use crate::agent::session_actor::TurnAuthority;
 use crate::agent::utils::genai;
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
@@ -216,6 +217,24 @@ impl SessionCompaction {
         instructions: Option<&str>,
         dispatch: &CompactionDispatch<'_>,
     ) -> Result<CompactionResult> {
+        self.process_authorized(
+            messages,
+            max_prompt_bytes,
+            instructions,
+            dispatch,
+            &TurnAuthority::Local,
+        )
+        .await
+    }
+
+    pub(crate) async fn process_authorized(
+        &self,
+        messages: &[AgentMessage],
+        max_prompt_bytes: Option<usize>,
+        instructions: Option<&str>,
+        dispatch: &CompactionDispatch<'_>,
+        authority: &TurnAuthority,
+    ) -> Result<CompactionResult> {
         // Estimate original token count
         // The compaction request carries no tool records, so none are counted.
         let original_token_count =
@@ -230,7 +249,9 @@ impl SessionCompaction {
         )?;
 
         // Call LLM with retry logic
-        let summary = self.call_with_retry(&chat_messages, dispatch).await?;
+        let summary = self
+            .call_with_retry(&chat_messages, dispatch, authority)
+            .await?;
 
         // The summary is validated before this point; the verbatim task is
         // appended afterwards so it can never rescue an empty summary.
@@ -327,6 +348,7 @@ impl SessionCompaction {
         &self,
         messages: &[querymt::chat::ChatMessage],
         dispatch: &CompactionDispatch<'_>,
+        authority: &TurnAuthority,
     ) -> Result<String> {
         let CompactionDispatch {
             provider,
@@ -368,10 +390,8 @@ impl SessionCompaction {
                 backoff_ms = (backoff_ms as f64 * retry.backoff_multiplier) as u64;
             }
 
-            // An accounting failure is fatal and never retried. It cannot be
-            // returned as an `LLMError` (the shared retry would classify it),
-            // so the attempt parks it here and ends as a cancelled attempt,
-            // which is not retried and adds no attempt event.
+            // Accounting failures and authority denials are fatal and retain
+            // their own errors rather than going through provider retry.
             let fatal = std::sync::Mutex::new(None);
             // A request timeout is a failed attempt like any other, but the
             // remote is probably still working: never resend after one.
@@ -382,7 +402,11 @@ impl SessionCompaction {
                 cancel,
                 |error| error.is_retryable() && !is_request_timeout(error),
                 |reply| matches!(reply, Reply::Rejected(_)),
-                || Self::send_once(messages, dispatch, streaming, &timing, &chat_span, &fatal),
+                || {
+                    Self::send_once(
+                        messages, dispatch, streaming, &timing, &chat_span, &fatal, authority,
+                    )
+                },
             )
             .await;
             if let Some(error) = fatal.into_inner().unwrap_or_else(|e| e.into_inner()) {
@@ -446,6 +470,7 @@ impl SessionCompaction {
         timing: &tokio::sync::Mutex<genai::StreamTiming>,
         chat_span: &tracing::Span,
         fatal: &std::sync::Mutex<Option<anyhow::Error>>,
+        authority: &TurnAuthority,
     ) -> std::result::Result<Reply, LLMError> {
         let CompactionDispatch {
             provider,
@@ -453,10 +478,15 @@ impl SessionCompaction {
             ledger,
             ..
         } = dispatch;
-        let park = |error: AccountingError| {
-            *fatal.lock().unwrap_or_else(|e| e.into_inner()) = Some(accounting_failure(error));
+        let park_fatal = |error| {
+            *fatal.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
             LLMError::Cancelled
         };
+        let park = |error: AccountingError| park_fatal(accounting_failure(error));
+        authority
+            .check()
+            .await
+            .map_err(|error| park_fatal(error.into()))?;
 
         // Prefer streaming to avoid mesh request-response timeout on long
         // inference.  The streaming path uses per-chunk timeouts instead of
@@ -476,6 +506,14 @@ impl SessionCompaction {
             )
             .await
             .map_err(park)?;
+
+        if let Err(error) = authority.check().await {
+            attempt_record
+                .settle_error(&LLMError::InvalidRequest(error.to_string()), false, None)
+                .await
+                .map_err(park)?;
+            return Err(park_fatal(error.into()));
+        }
 
         let raw = if streaming {
             Self::call_streaming(

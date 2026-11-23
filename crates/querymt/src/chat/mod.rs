@@ -27,6 +27,75 @@ pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
     })
 }
 
+/// Estimate prepared messages with a four-byte text heuristic and caller-supplied media costs.
+/// This is neither a token count nor an upper bound.
+#[doc(hidden)]
+pub fn estimate_chat_tokens(
+    messages: &[ChatMessage],
+    estimate_media: impl Fn(&MediaPart) -> usize,
+) -> usize {
+    let text_tokens = |text: &str| text.len().div_ceil(4);
+    messages.iter().fold(0usize, |total, message| {
+        let content_tokens = match message.output() {
+            Some(output) => output.items.iter().fold(0usize, |total, item| {
+                let tokens = match item {
+                    ChatOutputItem::Message(message) => {
+                        message.parts.iter().fold(0usize, |total, part| {
+                            total.saturating_add(match part {
+                                ChatMessagePart::Text { text, .. } => text_tokens(text),
+                                ChatMessagePart::Refusal { refusal, .. } => text_tokens(refusal),
+                                ChatMessagePart::Media(media) => estimate_media(media),
+                                ChatMessagePart::Opaque(_) => 0,
+                            })
+                        })
+                    }
+                    ChatOutputItem::Reasoning(reasoning) => reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .fold(0usize, |total, part| {
+                            total.saturating_add(text_tokens(&part.text))
+                        }),
+                    ChatOutputItem::FunctionCall(call) => {
+                        text_tokens(&call.name).saturating_add(text_tokens(&call.arguments))
+                    }
+                    ChatOutputItem::Opaque(_) => 0,
+                };
+                total.saturating_add(tokens)
+            }),
+            None => message.input().map_or(0, |parts| {
+                parts.iter().fold(0usize, |total, part| {
+                    total.saturating_add(match part {
+                        ChatInputPart::Text { text } => text_tokens(text),
+                        ChatInputPart::Attachment(media) => estimate_media(media),
+                        ChatInputPart::ToolResult(result) => result.parts.iter().fold(
+                            result.name.as_deref().map_or(0, text_tokens),
+                            |total, part| {
+                                total.saturating_add(match part {
+                                    ToolResultPart::Text { text } => text_tokens(text),
+                                    ToolResultPart::Attachment(media) => estimate_media(media),
+                                })
+                            },
+                        ),
+                        ChatInputPart::ToolChange(change) => {
+                            let added = change.added.iter().fold(0usize, |sum, tool| {
+                                let definition = serde_json::to_string(tool).unwrap_or_default();
+                                sum.saturating_add(text_tokens(&definition))
+                            });
+                            change
+                                .removed
+                                .iter()
+                                .fold(added, |sum, name| sum.saturating_add(text_tokens(name)))
+                        }
+                    })
+                })
+            }),
+        };
+        // Roles, message boundaries and tool-result framing.
+        total.saturating_add(content_tokens).saturating_add(4)
+    })
+}
+
 pub use output::{
     ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatMessagePayload,
     ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
@@ -1553,6 +1622,129 @@ impl ChatMessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimates_canonical_text_once_with_overhead_per_message() {
+        let messages = [
+            ChatMessage::user().text("\u{e9}\u{e9}\u{e9}").build(),
+            ChatOutput::from_projections(None, Some("answer".into()), None, None, None).into(),
+            ChatMessage::user().build(),
+        ];
+        assert_eq!(
+            estimate_chat_tokens(&messages, |_| unreachable!()),
+            2 + 2 + 3 * 4
+        );
+        assert_eq!(estimate_chat_tokens(&[], |_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn large_text_still_exceeds_a_context_window() {
+        let message = ChatMessage::user().text("x".repeat(400_004)).build();
+        assert_eq!(
+            estimate_chat_tokens(&[message], |_| unreachable!()),
+            100_005
+        );
+    }
+
+    #[test]
+    fn output_estimate_counts_visible_content_not_transport_metadata() {
+        let mut output = ChatOutput::from_projections(
+            Some("thinking".into()),
+            Some("text".into()),
+            Some(vec![ToolCall {
+                id: "call-identifier-is-not-counted".into(),
+                call_type: "function".into(),
+                function: crate::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            None,
+            Some(FinishReason::Stop),
+        );
+        let estimate =
+            |output: ChatOutput| estimate_chat_tokens(&[output.into()], |_| unreachable!());
+        let expected = 2 + 1 + 1 + 1 + 4;
+        assert_eq!(estimate(output.clone()), expected);
+
+        let opaque = serde_json::json!({"unrecognized": "x".repeat(1000)});
+        output
+            .extensions
+            .insert("raw_response".into(), opaque.clone());
+        output.response_id = Some("response-id-not-in-prompt".into());
+        for item in &mut output.items {
+            match item {
+                ChatOutputItem::Reasoning(reasoning) => {
+                    reasoning.encrypted_content = Some("encrypted-reasoning".into());
+                    reasoning.summary.push(ChatReasoningPart {
+                        text: "summary".into(),
+                        extensions: Default::default(),
+                    });
+                }
+                ChatOutputItem::Message(message) => message.parts.extend([
+                    ChatMessagePart::Refusal {
+                        refusal: "can't".into(),
+                        extensions: Default::default(),
+                    },
+                    ChatMessagePart::Opaque(ChatOpaquePart {
+                        original_type: "future_part".into(),
+                        payload: opaque.clone(),
+                    }),
+                ]),
+                _ => {}
+            }
+        }
+        output.items.push(ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "future_item".into(),
+            payload: opaque,
+        }));
+        assert_eq!(estimate(output), expected + 2 + 2);
+    }
+
+    #[test]
+    fn estimates_media_in_input_output_and_tool_results_via_the_callback() {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            Some("image/png".parse().unwrap()),
+            MediaSource::Inline {
+                data: vec![1, 2, 3],
+            },
+        )
+        .unwrap();
+        let messages = [
+            ChatMessage::from_user_parts(vec![ChatInputPart::attachment(media.clone())]),
+            ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(
+                ToolResult::new("ignored-call-id")
+                    .with_name("fetch")
+                    .with_text("preview")
+                    .with_attachment(media.clone()),
+            )]),
+            ChatMessage::assistant().attachment(media.clone()).build(),
+        ];
+        let calls = std::cell::Cell::new(0);
+        let estimate = estimate_chat_tokens(&messages, |part| {
+            assert_eq!(part, &media);
+            calls.set(calls.get() + 1);
+            7
+        });
+        assert_eq!(calls.get(), 3);
+        assert_eq!(estimate, 3 * 7 + 2 + 2 + 3 * 4);
+        assert_eq!(estimate_chat_tokens(&messages, |_| usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn tool_change_estimate_includes_definitions_and_removed_names() {
+        let tool = sample_tool("search");
+        let definition = serde_json::to_string(&tool).unwrap();
+        let message = ChatMessage::from_tool_change(ToolChange {
+            added: vec![tool],
+            removed: vec!["read".into(), "write".into()],
+        });
+        assert_eq!(
+            estimate_chat_tokens(&[message], |_| unreachable!()),
+            definition.len().div_ceil(4) + 1 + 2 + 4
+        );
+    }
 
     #[test]
     fn generation_options_default_is_empty() {

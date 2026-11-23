@@ -149,7 +149,18 @@ pub async fn bootstrap_mesh_runtime(
 }
 
 pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHandle, MeshError> {
-    bootstrap_with_policy(config, None).await
+    bootstrap_with_ingress(config, None, None).await
+}
+
+/// Start a mesh with all inbound actor RPCs routed through the authenticated
+/// ingress implementation, including legacy messages. Outbound RPCs and actor
+/// discovery still use Kameo.
+#[cfg(test)]
+pub(crate) async fn bootstrap_mesh_handle_with_ingress(
+    config: &MeshRuntimeConfig,
+    ingress: Arc<dyn MeshIngress>,
+) -> Result<MeshHandle, MeshError> {
+    bootstrap_with_ingress(config, Some(ingress), None).await
 }
 
 /// Bootstrap a guarded mesh with a single policy store for this host identity.
@@ -158,13 +169,14 @@ pub async fn bootstrap_mesh_runtime_with_policy(
     config: &MeshRuntimeConfig,
     store: Arc<dyn QuotaStore>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
-    bootstrap_with_policy(config, Some(store))
+    bootstrap_with_ingress(config, None, Some(store))
         .await
         .map(MeshRuntimeHandle::new)
 }
 
-async fn bootstrap_with_policy(
+async fn bootstrap_with_ingress(
     config: &MeshRuntimeConfig,
+    ingress: Option<Arc<dyn MeshIngress>>,
     policy_store: Option<Arc<dyn QuotaStore>>,
 ) -> Result<MeshHandle, MeshError> {
     config
@@ -211,9 +223,11 @@ async fn bootstrap_with_policy(
         )),
         store,
     });
-    let ingress = policy
-        .as_ref()
-        .map(|policy| -> Arc<dyn MeshIngress> { policy.router.clone() });
+    let ingress = ingress.or_else(|| {
+        policy
+            .as_ref()
+            .map(|policy| -> Arc<dyn MeshIngress> { policy.router.clone() })
+    });
     let peer_events_tx_loop = peer_events_tx.clone();
     let known_peers_loop = Arc::clone(&known_peers);
     let routes_loop = Arc::clone(&routes);

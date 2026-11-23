@@ -99,6 +99,8 @@ pub enum InboundAccess {
     Sessions,
     /// Grant-aware workspace operations.
     Filesystem,
+    /// At least one provider is shared. The handler must check the actual binding.
+    Providers,
 }
 
 impl InboundAccess {
@@ -114,6 +116,11 @@ impl InboundAccess {
             Self::Full => grant == &PeerGrant::Full,
             Self::Sessions => grant.allows_sessions(protocol),
             Self::Filesystem => grant.allows_filesystem(protocol),
+            Self::Providers => match grant {
+                PeerGrant::Full => true,
+                PeerGrant::Custom { providers, .. } => !providers.is_empty(),
+                PeerGrant::None => false,
+            },
         }
     }
 }
@@ -252,19 +259,7 @@ impl InboundRouter {
         if actor_id.peer_id() != Some(&self.host) {
             return Ok(Err(RemoteSendError::BadActorType));
         }
-        // Until guarded provider sharing is available, no grant can authorize
-        // provider RPCs or callbacks, even if a handler is registered locally.
-        let actor_type: &str = actor_remote_id.as_ref();
-        if [
-            <crate::ProviderHostActor as RemoteActor>::REMOTE_ID,
-            <crate::ProviderCatalogActor as RemoteActor>::REMOTE_ID,
-            <crate::ProviderStreamRouterActor as RemoteActor>::REMOTE_ID,
-        ]
-        .contains(&actor_type)
-        {
-            return Err(SharingRejection::UnsupportedOperation);
-        }
-        let route_key = (actor_type, message_remote_id.as_ref());
+        let route_key = (actor_remote_id.as_ref(), message_remote_id.as_ref());
         let Some(route) = self
             .routes
             .read()

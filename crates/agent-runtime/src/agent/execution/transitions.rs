@@ -896,10 +896,6 @@ pub(super) async fn transition_call_llm(
         .await
         .map_err(anyhow::Error::from)?;
 
-    env.turn_authority()
-        .require_provider_dispatch()
-        .map_err(anyhow::Error::from)?;
-
     // Overrides last for exactly this request. Options the provider does not
     // honour are dropped (and logged); `applied` records what was really sent.
     let options = env
@@ -944,8 +940,14 @@ pub(super) async fn transition_call_llm(
     // Determine response via streaming or non-streaming path.
     // Each arm produces canonical ordered output so the rest of the function is
     // uniform and item-aware data survives without flattening.
-    // Tool changes can offer tools even with an empty baseline.
-    let output: ChatOutput = if tools.is_empty() && request.offered_tools.is_empty() {
+    // Tool changes can offer tools even with an empty baseline. Mesh calls
+    // keep the streaming path available even when no tools are offered.
+    let mesh_streaming = env.restricted_mesh_turn() || session_handle.uses_explicit_mesh_provider();
+    let call_tools = (!mesh_streaming || !tools.is_empty()).then_some(tools.as_ref());
+    let output: ChatOutput = if tools.is_empty()
+        && request.offered_tools.is_empty()
+        && !mesh_streaming
+    {
         let cancel = env.cancellation_token.clone();
         match super::llm_retry::call_chat_with_retry(
             config,
@@ -1149,7 +1151,7 @@ pub(super) async fn transition_call_llm(
                 let mut stream = match provider
                     .chat_stream(
                         &ChatCall::new(messages_with_cache)
-                            .tools(tools.as_ref())
+                            .maybe_tools(call_tools)
                             .options(options),
                     )
                     .await
@@ -1610,7 +1612,7 @@ pub(super) async fn transition_call_llm(
                     let operation = &operation;
                     async move {
                         let call = ChatCall::new(messages_with_cache)
-                            .tools(tools.as_ref())
+                            .maybe_tools(call_tools)
                             .options(options);
                         querymt_agent_services::accounting::run_attempt(
                             operation,

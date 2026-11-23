@@ -193,6 +193,34 @@ impl From<AgentError> for AcpError {
         } = &e
         {
             let (kind, provider_message) = provider_error_metadata(error);
+            #[cfg(feature = "remote")]
+            if let LLMErrorPayload::ProviderError {
+                code: Some(code),
+                error_type,
+                ..
+            } = error.as_ref()
+                && let Some(details) =
+                    querymt_remote::peer_access::quota::QuotaDenialDetails::from_provider_metadata(
+                        code,
+                        error_type.as_deref(),
+                    )
+            {
+                let querymt_remote::peer_access::quota::QuotaDenialDetails::Limits { limits } =
+                    details;
+                let limits: Vec<_> = limits.into_iter().map(|limit| {
+                    let mut value = serde_json::json!({"scope": limit.scope, "available_tokens": limit.available_tokens.to_string()});
+                    if let Some(reset) = limit.next_reset_at
+                        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                        .and_then(|date| date.format(&time::format_description::well_known::Rfc3339).ok())
+                    {
+                        value["next_reset_at"] = serde_json::json!(reset);
+                    }
+                    value
+                }).collect();
+                let data = serde_json::json!({"code": code, "category": "provider", "kind": kind, "provider": provider, "model": model, "retryable": false, "limits": limits});
+                return AcpError::new(-32000, provider_message.unwrap_or_else(|| message.clone()))
+                    .data(data);
+            }
             return AcpError::new(-32010, "Provider request failed").data(serde_json::json!({
                 "category": "provider",
                 "kind": kind,
@@ -564,6 +592,42 @@ mod tests {
         assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("chat_with_tools"));
         assert!(acp.message.contains("rate limit"));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn quota_denial_identifies_the_relevant_reset_time() {
+        use querymt_remote::peer_access::quota::{LimitingQuota, QuotaError, QuotaScope};
+        let scope = QuotaScope {
+            provider_id: "fixture".into(),
+            model_id: Some("model".into()),
+        };
+        let exhausted = QuotaError::Exhausted(vec![LimitingQuota {
+            scope: scope.clone(),
+            available_tokens: 9007199254740993,
+            next_reset_at: Some(1_709_164_800),
+        }]);
+        let payload = exhausted.into_provider_error().to_payload();
+        let wire = serde_json::to_vec(&payload).unwrap();
+        let payload =
+            querymt::error::LLMError::from_payload(serde_json::from_slice(&wire).unwrap())
+                .to_payload();
+        let acp = AcpError::from(AgentError::ProviderFailure {
+            message: "provider dispatch refused".into(),
+            provider: Some("fixture".into()),
+            model: Some("model".into()),
+            retryable: false,
+            error: Box::new(payload),
+        });
+        assert_eq!(acp.code, ErrorCode::new(-32000));
+        let data = acp.data.unwrap();
+        assert_eq!(data["code"], "mesh_quota_exhausted");
+        assert_eq!(
+            data["limits"],
+            serde_json::json!([{
+                "scope": scope, "available_tokens": "9007199254740993", "next_reset_at": "2024-02-29T00:00:00Z",
+            }])
+        );
     }
 
     #[test]
