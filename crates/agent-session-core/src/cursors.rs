@@ -79,46 +79,31 @@ impl SessionCore {
             return None;
         }
         let idx = &self.store.idx;
-        let entry_id = match text("type")? {
-            "user_message" => {
-                let id = text("messageId")?;
-                idx.user.contains_key(id).then(|| format!("user-{id}"))
-            }
-            "agent_message" => {
-                let id = text("messageId")?;
-                idx.assistant
-                    .contains_key(id)
-                    .then(|| format!("assistant-{id}"))
-            }
+        // The entry's own id is read back from the store: an entry keeps the
+        // id it was created with even when it later learns its message id.
+        let key = match text("type")? {
+            "user_message" => idx.user.get(text("messageId")?).copied(),
+            "agent_message" => idx.assistant.get(text("messageId")?).copied(),
             "agent_thought" => {
                 let id = text("messageId")?;
                 let mut parts = idx
                     .reasoning
                     .range((id.to_owned(), String::new())..)
                     .take_while(|((message, _), _)| message == id)
-                    .map(|((_, part), _)| part);
-                let part = if position == "before" {
+                    .map(|(_, key)| *key);
+                if position == "before" {
                     parts.next()
                 } else {
                     parts.last()
-                }?;
-                Some(format!("reasoning-{id}-{part}"))
+                }
             }
-            "tool_call" => {
-                let id = text("toolCallId")?;
-                idx.tool.contains_key(id).then(|| format!("tool-{id}"))
-            }
-            "compaction" => {
-                let id = text("compactionId")?;
-                idx.compaction
-                    .contains_key(id)
-                    .then(|| format!("compaction-{id}"))
-            }
+            "tool_call" => idx.tool.get(text("toolCallId")?).copied(),
+            "compaction" => idx.compaction.get(text("compactionId")?).copied(),
             // A kind this reducer does not know cannot be placed.
             _ => None,
         }?;
         Some(CursorPlacement {
-            entry_id,
+            entry_id: self.store.entry_id(key)?.to_owned(),
             position: position.to_owned(),
         })
     }

@@ -1,4 +1,5 @@
 //! Session cursors (spec: Session cursors, Cursors across loads).
+#![cfg(feature = "test-support")]
 
 mod common;
 
@@ -182,4 +183,37 @@ fn a_cursor_update_that_does_not_decode_is_reported_and_skipped() {
     let report = core.apply(&[SessionInput::SnapshotLoaded { response }]);
     assert_eq!(report.errors.len(), 1, "{report:?}");
     assert_eq!(core.header().cursors.len(), 1);
+}
+
+#[test]
+fn placement_uses_the_entry_id_the_entry_has() {
+    let mut core = SessionCore::new("s1");
+    // A user entry created without a message id, which it learns later.
+    core.apply(&[
+        live(json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": "one" },
+            "_meta": { "querymt": { "client_prompt_id": "c1" } }
+        })),
+        live(json!({
+            "sessionUpdate": "user_message_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "two" },
+            "_meta": { "querymt": { "client_prompt_id": "c1" } }
+        })),
+        cursor(
+            "cur-1",
+            json!({ "anchor": { "type": "user_message", "messageId": "m1", "position": "after" } }),
+        ),
+    ]);
+    let placement = core.header().cursors[0].placement.clone().expect("placed");
+    let ids: Vec<String> = core
+        .turn_ids()
+        .iter()
+        .flat_map(|id| core.turn(id).expect("turn").entries)
+        .map(|entry| entry.id)
+        .collect();
+    assert!(
+        ids.contains(&placement.entry_id),
+        "{placement:?} not in {ids:?}"
+    );
 }

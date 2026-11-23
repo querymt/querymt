@@ -266,7 +266,16 @@ impl LoadFloor {
             return true;
         }
         let seq = event.session_seq();
-        matches!(event, EventEnvelope::Ephemeral(_)) && seq > 0 && seq <= self.inflight_through
+        // Only streamed text deltas are folded into the in-flight chunk;
+        // every other ephemeral event is still owed to the connection.
+        matches!(event, EventEnvelope::Ephemeral(_))
+            && matches!(
+                event.kind(),
+                querymt_agent_core::events::AgentEventKind::AssistantContentDelta { .. }
+                    | querymt_agent_core::events::AgentEventKind::AssistantThinkingDelta { .. }
+            )
+            && seq > 0
+            && seq <= self.inflight_through
     }
 }
 
@@ -806,6 +815,34 @@ mod tests {
             .await
             .unwrap();
         EventEnvelope::Durable(stored)
+    }
+
+    #[test]
+    fn inflight_floor_drops_only_streamed_deltas() {
+        let floor = LoadFloor {
+            cut: LoadCut::default(),
+            inflight_through: 10,
+        };
+        let ephemeral = |seq, kind| {
+            EventEnvelope::Ephemeral(EphemeralEvent {
+                session_id: "s".into(),
+                session_seq: seq,
+                timestamp: 0,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind,
+            })
+        };
+        assert!(floor.drops(&delta("s", 9)));
+        assert!(!floor.drops(&delta("s", 11)));
+        let progress = ephemeral(
+            9,
+            AgentEventKind::WorktreeCommandOutput { text: "out".into() },
+        );
+        assert!(
+            !floor.drops(&progress),
+            "not folded into the in-flight text"
+        );
     }
 
     fn delta(session: &str, seq: i64) -> EventEnvelope {

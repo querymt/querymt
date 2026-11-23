@@ -105,6 +105,16 @@ impl SessionCore {
                 }
             }
             "idle" => {
+                // The end of an older run does not end the one running now.
+                if self
+                    .header
+                    .active_run_id
+                    .as_deref()
+                    .is_some_and(|active| active != run_id)
+                {
+                    report.ignored += 1;
+                    return;
+                }
                 self.header.active_run_id = None;
                 self.store.active_run = None;
                 let stop = text("stopReason").unwrap_or("end_turn").to_owned();
@@ -282,7 +292,7 @@ impl SessionCore {
                 .get(prompt)
                 .is_some_and(|key| *key != user)
         {
-            self.drop_pending_prompt(prompt);
+            self.drop_unsent_prompt(prompt);
         }
         if self.state_updates_seen {
             return;
@@ -300,16 +310,19 @@ impl SessionCore {
         });
     }
 
-    /// Remove a pending prompt (not a failed one) and its turn.
-    pub(crate) fn drop_pending_prompt(&mut self, client_prompt_id: &str) {
+    /// Remove a client-local prompt (pending or failed) and its turn. The
+    /// agent's own message for the same client prompt id stands for it: a
+    /// prompt marked failed that the agent did receive must not stay behind.
+    pub(crate) fn drop_unsent_prompt(&mut self, client_prompt_id: &str) {
         let Some(key) = self.store.idx.prompt.get(client_prompt_id).copied() else {
             return;
         };
-        let pending = matches!(
+        let unsent = matches!(
             self.store.kind(key),
-            Some(EntryKind::UserMessage(user)) if user.status == PromptStatus::Pending
+            Some(EntryKind::UserMessage(user))
+                if matches!(user.status, PromptStatus::Pending | PromptStatus::Failed)
         );
-        if pending {
+        if unsent {
             self.store.idx.prompt.remove(client_prompt_id);
             self.store.remove(key);
         }
