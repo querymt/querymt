@@ -563,14 +563,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom.key.mesh_state.json");
         let unrelated_path = dir.path().join("mesh_state.json");
-        let mut unrelated = MeshStateStore::load_or_create(&unrelated_path).unwrap();
+        let unrelated = MeshStateStore::shared(&unrelated_path).unwrap();
         unrelated
+            .write()
             .upsert_hosted_mesh("unrelated".into(), None, None)
             .unwrap();
         let original = std::fs::read(&unrelated_path).unwrap();
-        let store = Arc::new(parking_lot::RwLock::new(
-            MeshStateStore::load_or_create(&path).unwrap(),
-        ));
+        let store = MeshStateStore::shared(&path).unwrap();
         let same_store = store.clone();
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let subject = peer();
@@ -608,7 +607,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let reloaded = MeshStateStore::load_or_create(&path).unwrap();
+        drop(same_store);
+        let reloaded = MeshStateStore::shared(&path).unwrap();
+        let reloaded = reloaded.read();
         assert_eq!(
             reloaded.get("joined").unwrap().membership_token,
             Some(token)

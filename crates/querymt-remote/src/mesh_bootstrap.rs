@@ -101,8 +101,8 @@ fn load_stores(identity_file: Option<&std::path::Path>) -> MeshStores {
     };
 
     let mesh_state_store = match state_path(identity_file, "mesh_state.json") {
-        Ok(path) => match MeshStateStore::load_or_create(&path) {
-            Ok(store) => Some(Arc::new(RwLock::new(store))),
+        Ok(path) => match MeshStateStore::shared(&path) {
+            Ok(store) => Some(store),
             Err(e) => {
                 log::warn!(
                     "Failed to load mesh state store: {e}; iroh state will not be persisted"

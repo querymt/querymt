@@ -23,6 +23,7 @@ pub mod mesh_runtime_support;
 pub mod mesh_state;
 pub mod names;
 pub mod node_id;
+pub mod peer_access;
 pub mod provider_backend;
 pub mod provider_backend_helpers;
 pub mod provider_catalog;
@@ -70,7 +71,8 @@ pub use mesh_runtime_config::{
     DirectoryMode, IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
 };
 pub use mesh_state::{
-    MeshLocalRole, MeshState, MeshStateEntry, MeshStateStore, MeshStatus, default_mesh_state_path,
+    MeshAccessStore, MeshLocalRole, MeshState, MeshStateEntry, MeshStateStore, MeshStatus,
+    default_mesh_state_path,
 };
 pub use names::{NODE_MANAGER, event_relay, node_manager_for_peer, provider_host, session};
 pub use node_id::NodeId;

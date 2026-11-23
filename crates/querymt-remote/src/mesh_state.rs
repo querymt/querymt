@@ -1,20 +1,64 @@
+use crate::NodeId;
 use crate::invite::{InviteError, MembershipToken, PeerEntry};
+use crate::peer_access::quota::{QuotaLedger, QuotaRuntime, UnknownUsageCharge};
+use crate::peer_access::{
+    GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+    PolicyEffect,
+};
+use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+const STATE_VERSION: u32 = 2;
+type SharedMeshState = Arc<RwLock<MeshStateStore>>;
+type MeshStateOwners = BTreeMap<PathBuf, Weak<RwLock<MeshStateStore>>>;
+static OWNERS: LazyLock<Mutex<MeshStateOwners>> = LazyLock::new(Mutex::default);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshState {
     pub version: u32,
     pub meshes: BTreeMap<String, MeshStateEntry>,
+    #[serde(default)]
+    peer_access: PeerAccessState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PeerAccessState {
+    #[serde(default)]
+    grants: BTreeMap<String, BTreeMap<String, PeerGrantState>>,
+    #[serde(default)]
+    pub(crate) quotas: QuotaLedger,
+}
+
+impl PeerAccessState {
+    pub(crate) fn grant(&self, key: &PeerGrantKey) -> PeerGrantState {
+        self.grants
+            .get(&key.host.as_str())
+            .and_then(|peers| peers.get(&key.peer.as_str()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn put_grant(&mut self, key: &PeerGrantKey, state: PeerGrantState) {
+        self.grants
+            .entry(key.host.as_str())
+            .or_default()
+            .insert(key.peer.as_str(), state);
+    }
 }
 
 impl Default for MeshState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: STATE_VERSION,
             meshes: BTreeMap::new(),
+            peer_access: PeerAccessState::default(),
         }
     }
 }
@@ -63,24 +107,78 @@ pub enum MeshStatus {
 pub struct MeshStateStore {
     path: PathBuf,
     state: MeshState,
+    quota_runtime: QuotaRuntime,
+    changes: broadcast::Sender<PolicyChange>,
+    usage_changes: broadcast::Sender<PeerGrantKey>,
 }
 
 impl MeshStateStore {
-    pub fn load_or_create(path: &Path) -> Result<Self, InviteError> {
-        let state = if path.exists() {
-            let data = std::fs::read_to_string(path).map_err(|e| {
-                InviteError::StoreError(format!("failed to read {}: {e}", path.display()))
-            })?;
-            serde_json::from_str(&data).map_err(|e| {
-                InviteError::StoreError(format!("failed to parse {}: {e}", path.display()))
-            })?
-        } else {
-            MeshState::default()
+    /// Open the process-wide owner shared by membership and access writers.
+    pub fn shared(path: &Path) -> Result<SharedMeshState, InviteError> {
+        let result = (|| {
+            let parent = state_parent(path);
+            std::fs::create_dir_all(parent)?;
+            match path.canonicalize() {
+                Ok(canonical) => Ok(canonical),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+                    Ok(parent.canonicalize()?.join(name))
+                }
+                Err(e) => Err(e),
+            }
+        })();
+        let path = result.map_err(|e| {
+            InviteError::StoreError(format!("failed to resolve {}: {e}", path.display()))
+        })?;
+        let mut owners = OWNERS.lock();
+        if let Some(owner) = owners.get(&path).and_then(Weak::upgrade) {
+            return Ok(owner);
+        }
+        owners.retain(|_, owner| owner.strong_count() != 0);
+        let owner = Arc::new(RwLock::new(Self::load_or_create(&path)?));
+        owners.insert(path, Arc::downgrade(&owner));
+        Ok(owner)
+    }
+
+    pub(crate) fn load_or_create(path: &Path) -> Result<Self, InviteError> {
+        let (mut state, initialize) = match std::fs::read(path) {
+            Ok(data) => {
+                let state: MeshState = serde_json::from_slice(&data).map_err(|e| {
+                    InviteError::StoreError(format!("failed to parse {}: {e}", path.display()))
+                })?;
+                match state.version {
+                    1 => (state, true),
+                    STATE_VERSION => (state, false),
+                    version => {
+                        return Err(InviteError::StoreError(format!(
+                            "unsupported mesh state version {version}"
+                        )));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (MeshState::default(), true),
+            Err(e) => {
+                return Err(InviteError::StoreError(format!(
+                    "failed to read {}: {e}",
+                    path.display()
+                )));
+            }
         };
-        Ok(Self {
+        if initialize {
+            state.version = STATE_VERSION;
+            state.peer_access = PeerAccessState::default();
+        }
+        let store = Self {
             path: path.to_path_buf(),
             state,
-        })
+            quota_runtime: QuotaRuntime::default(),
+            changes: broadcast::channel(64).0,
+            usage_changes: broadcast::channel(64).0,
+        };
+        if initialize {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn active_mesh_ids(&self) -> Vec<String> {
@@ -304,20 +402,158 @@ impl MeshStateStore {
             .collect()
     }
 
-    pub fn save(&self) -> Result<(), InviteError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                InviteError::StoreError(format!(
-                    "failed to create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let data = serde_json::to_string_pretty(&self.state)
-            .map_err(|e| InviteError::StoreError(format!("failed to serialize mesh state: {e}")))?;
-        std::fs::write(&self.path, data).map_err(|e| {
-            InviteError::StoreError(format!("failed to write {}: {e}", self.path.display()))
+    fn save(&self) -> Result<(), InviteError> {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let parent = state_parent(&self.path);
+            std::fs::create_dir_all(parent)?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            serde_json::to_writer_pretty(&mut temp, &self.state)?;
+            temp.as_file().sync_all()?;
+            temp.persist(&self.path)?;
+            Ok(())
+        })();
+        result.map_err(|e| {
+            InviteError::StoreError(format!("failed to save {}: {e}", self.path.display()))
         })
+    }
+
+    fn save_access(&mut self, access: PeerAccessState) -> Result<(), GrantStoreError> {
+        let before = std::mem::replace(&mut self.state.peer_access, access);
+        if let Err(error) = self.save() {
+            self.state.peer_access = before;
+            return Err(store_error(error));
+        }
+        Ok(())
+    }
+}
+
+fn state_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn store_error(error: impl std::error::Error + Send + Sync + 'static) -> GrantStoreError {
+    GrantStoreError::Backend(Box::new(error))
+}
+
+/// Policy and quota interface over the same state owner used by mesh membership.
+#[derive(Clone)]
+pub struct MeshAccessStore {
+    owner: SharedMeshState,
+    pub(crate) changes: broadcast::Sender<PolicyChange>,
+    pub(crate) usage_changes: broadcast::Sender<PeerGrantKey>,
+    pub(crate) unknown_usage_charge: UnknownUsageCharge,
+}
+
+impl MeshAccessStore {
+    pub fn new(owner: SharedMeshState) -> Self {
+        let (changes, usage_changes) = {
+            let state = owner.read();
+            (state.changes.clone(), state.usage_changes.clone())
+        };
+        Self {
+            owner,
+            changes,
+            usage_changes,
+            unknown_usage_charge: UnknownUsageCharge::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_unknown_usage_charge(mut self, charge: UnknownUsageCharge) -> Self {
+        self.unknown_usage_charge = charge;
+        self
+    }
+
+    pub(crate) async fn transact<T, E>(
+        &self,
+        f: impl FnOnce(&mut PeerAccessState, &mut QuotaRuntime) -> Result<(T, bool), E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<GrantStoreError> + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        tokio::task::spawn_blocking(move || {
+            let mut state = owner.write();
+            let mut access = state.state.peer_access.clone();
+            let mut runtime = state.quota_runtime.clone();
+            let (value, persist) = f(&mut access, &mut runtime)?;
+            if persist {
+                state.save_access(access)?;
+            }
+            state.quota_runtime = runtime;
+            Ok(value)
+        })
+        .await
+        .map_err(store_error)?
+    }
+}
+
+#[async_trait]
+impl GrantStore for MeshAccessStore {
+    async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+        Ok(self.owner.read().state.peer_access.grant(key))
+    }
+
+    async fn replace_grant(
+        &self,
+        key: &PeerGrantKey,
+        expected: Uuid,
+        grant: PeerGrant,
+    ) -> Result<PeerGrantState, GrantStoreError> {
+        grant.validate()?;
+        let owner = Arc::clone(&self.owner);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = owner.write();
+            let current = state.state.peer_access.grant(&key);
+            if expected != current.revision {
+                return Err(GrantStoreError::Conflict {
+                    expected,
+                    actual: current.revision,
+                });
+            }
+            if grant == current.grant {
+                return Ok(current);
+            }
+            let mut access = state.state.peer_access.clone();
+            let next = PeerGrantState {
+                revision: Uuid::now_v7(),
+                grant,
+            };
+            access.put_grant(&key, next.clone());
+            state.save_access(access)?;
+            let _ = state.changes.send(PolicyChange {
+                key,
+                effect: PolicyEffect::Grant(next.grant.clone()),
+            });
+            Ok(next)
+        })
+        .await
+        .map_err(store_error)?
+    }
+
+    fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+        Some(self.changes.subscribe())
+    }
+
+    async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+        let owner = self.owner.read();
+        owner
+            .state
+            .peer_access
+            .grants
+            .get(&host.as_str())
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .map(|peer| {
+                NodeId::parse(peer).map_err(|err| {
+                    store_error(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+                })
+            })
+            .collect()
     }
 }
 
@@ -358,6 +594,88 @@ mod tests {
             expires_at: 0,
             signature: "sig".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn migrates_v1_and_shares_membership_and_policy_writes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let old = serde_json::json!({
+            "version": 1,
+            "meshes": {"host:fixture": {
+                "mesh_id": "host:fixture", "name": "fixture", "role": "host", "status": "active",
+                "membership_token": null, "admitted_peers": {"peer": sample_token("host:fixture", "peer", "invite")},
+                "known_peers": {"peer": {"peer_id": "peer", "addrs": ["/ip4/127.0.0.1/tcp/2345"]}},
+                "invite_ids": ["invite"], "created_at": 10, "updated_at": 11, "last_connected": null
+            }}
+        });
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let owner = MeshStateStore::shared(&path).unwrap();
+        let same = MeshStateStore::shared(&dir.path().join("./mesh_state.json")).unwrap();
+        assert!(Arc::ptr_eq(&owner, &same));
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["version"], 2);
+        assert_eq!(upgraded["meshes"], old["meshes"]);
+        let key = grant_key();
+        let access = MeshAccessStore::new(same);
+        assert_eq!(access.grant(&key).await.unwrap(), PeerGrantState::default());
+        let next = access
+            .replace_grant(&key, Uuid::nil(), PeerGrant::Full)
+            .await
+            .unwrap();
+        owner
+            .write()
+            .upsert_hosted_mesh("host:fixture".into(), None, Some("second".into()))
+            .unwrap();
+        assert!(
+            matches!(access.replace_grant(&key, Uuid::nil(), PeerGrant::None).await, Err(GrantStoreError::Conflict { actual, .. }) if actual == next.revision)
+        );
+        assert_eq!(
+            access.managed_peers(&key.host).await.unwrap(),
+            vec![key.peer.clone()]
+        );
+        drop(access);
+        drop(owner);
+        let reopened = MeshStateStore::shared(&path).unwrap();
+        assert_eq!(
+            reopened.read().get("host:fixture").unwrap().invite_ids,
+            ["invite", "second"]
+        );
+        assert_eq!(
+            MeshAccessStore::new(reopened).grant(&key).await.unwrap(),
+            next
+        );
+    }
+
+    fn grant_key() -> PeerGrantKey {
+        PeerGrantKey {
+            host: NodeId::parse("12D3KooWJ5MP5JUR1c8pF37dNHGGrVhCGHEHwrCYyowX6dPJtV6t").unwrap(),
+            peer: NodeId::parse("12D3KooWQKkiEPk7f8Sp2LXj7S2BJMAMePSz23RQPYGVBCGiyhJE").unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_save_does_not_commit_or_publish_grant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let owner = MeshStateStore::shared(&path).unwrap();
+        let access = MeshAccessStore::new(owner);
+        let mut changes = access.subscribe_changes().unwrap();
+        let key = grant_key();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            access
+                .replace_grant(&key, Uuid::nil(), PeerGrant::Full)
+                .await,
+            Err(GrantStoreError::Backend(_))
+        ));
+        assert_eq!(access.grant(&key).await.unwrap(), PeerGrantState::default());
+        assert!(matches!(
+            changes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
