@@ -37,4 +37,4 @@ uuid.workspace = true
 [dev-dependencies]
 futures-util = "0.3"
 jsonschema.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
