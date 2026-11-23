@@ -15,6 +15,7 @@ enum Reply {
     Result(Value),
     WithNotifications(Vec<Value>, Value),
     Error(i64, &'static str),
+    ErrorWithData(Value),
     Disconnect,
     Pending,
 }
@@ -62,6 +63,9 @@ impl MockServer {
                     Reply::Error(code, message) => json!({
                         "jsonrpc": "2.0", "id": request["id"],
                         "error": {"code": code, "message": message},
+                    }),
+                    Reply::ErrorWithData(error) => json!({
+                        "jsonrpc": "2.0", "id": request["id"], "error": error,
                     }),
                     Reply::Disconnect => {
                         requests.push(request);
@@ -122,6 +126,322 @@ fn events(output: &Output) -> Vec<Value> {
     text.lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn mesh_capabilities() -> Value {
+    json!({
+        "mesh_access_version": 1,
+        "methods": ["querymt/mesh/nodes", "querymt/mesh/getPeerAccess", "querymt/mesh/setPeerAccess",
+                    "querymt/mesh/setPeerQuota", "querymt/mesh/resetPeerQuota"],
+        "notifications": ["querymt/mesh/peerAccessChanged"],
+    })
+}
+
+#[tokio::test]
+async fn mesh_commands_require_advertised_support() {
+    for operation in [
+        vec!["nodes"],
+        vec!["get", "peer"],
+        vec![
+            "reset-quota",
+            "peer",
+            "--expected-revision",
+            "r1",
+            "--provider",
+            "test",
+        ],
+    ] {
+        let server = MockServer::start(|request| match request["method"].as_str() {
+            Some("_querymt/capabilities") => {
+                Reply::Result(json!({"methods": ["querymt/mesh/nodes"]}))
+            }
+            Some("_querymt/mesh/nodes") => Reply::Result(json!({"nodes": []})),
+            _ => unexpected(request),
+        })
+        .await;
+        let out = invoke(
+            cli()
+                .args(["--quiet", "--url", &server.url, "mesh"])
+                .args(&operation),
+            None,
+        )
+        .await;
+        let should_succeed = operation[0] == "nodes";
+        assert_eq!(out.status.success(), should_succeed);
+        assert_eq!(events(&out)[0]["ok"], should_succeed);
+        assert_eq!(
+            server.finish().await.len(),
+            if should_succeed { 3 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_grant_replacements_forward_full_and_custom_with_an_explicit_revision() {
+    let missing = invoke(
+        cli().args(["mesh", "set", "peer", "--grant", r#"{"mode":"full"}"#]),
+        None,
+    )
+    .await;
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--expected-revision"));
+
+    for grant in [
+        json!({"mode": "full"}),
+        json!({"mode": "custom", "sessions": true, "filesystem": true, "providers": []}),
+        json!({"mode": "custom", "sessions": true, "filesystem": true, "shell": true, "providers": []}),
+    ] {
+        let server = MockServer::start(|request| match request["method"].as_str() {
+            Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+            Some("_querymt/mesh/setPeerAccess") => Reply::Result(
+                json!({"version": 1, "peer_id": "peer", "outgoing": {"revision": "r2"}}),
+            ),
+            _ => unexpected(request),
+        })
+        .await;
+        let out = invoke(
+            cli().args([
+                "--quiet",
+                "--url",
+                &server.url,
+                "mesh",
+                "set",
+                "peer",
+                "--expected-revision",
+                "r1",
+                "--grant",
+                &grant.to_string(),
+            ]),
+            None,
+        )
+        .await;
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let requests = server.finish().await;
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|req| req["method"] == "_querymt/mesh/setPeerAccess")
+            .map(|req| &req["params"])
+            .collect();
+        assert_eq!(
+            writes,
+            [&json!({"version": 1, "peer_id": "peer", "expected_revision": "r1", "grant": grant})]
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_custom_grant_rejects_invalid_capability_combinations_before_writing() {
+    for (grant, message) in [
+        (
+            json!({"mode": "custom", "sessions": true, "filesystem": false, "shell": true, "providers": []}),
+            "shell requires filesystem access",
+        ),
+        (
+            json!({"mode": "custom", "sessions": false, "filesystem": true, "providers": []}),
+            "filesystem requires session access",
+        ),
+        (
+            json!({"mode": "custom", "sessions": true, "filesystem": true, "shell": "true", "providers": []}),
+            "custom grant shell must be a boolean",
+        ),
+    ] {
+        let server = MockServer::start(unexpected).await;
+        let out = invoke(
+            cli().args([
+                "--quiet",
+                "--url",
+                &server.url,
+                "mesh",
+                "set",
+                "peer",
+                "--expected-revision",
+                "r1",
+                "--grant",
+                &grant.to_string(),
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(events(&out)[0]["error"].as_str().unwrap().contains(message));
+        let requests = server.finish().await;
+        assert!(requests.is_empty(), "{requests:?}");
+    }
+}
+
+#[tokio::test]
+async fn mesh_quota_requests_retain_exact_scoped_limits() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+        Some(method @ ("_querymt/mesh/setPeerQuota" | "_querymt/mesh/resetPeerQuota")) => {
+            let mut expected = json!({"version": 1, "peer_id": "peer", "scope": {"provider_id": "test", "model_id": "model"}});
+            if method == "_querymt/mesh/setPeerQuota" {
+                expected["expected_revision"] = json!("r1");
+                expected["operation"] = json!("reconfigure");
+                expected["limit"] = json!({"kind": "finite", "limit_tokens": "2000001", "window": "daily"});
+            } else {
+                expected["expected_revision"] = json!("r2");
+            }
+            assert_eq!(request["params"], expected);
+            Reply::Result(json!({"version": 1, "peer_id": "peer", "outgoing": {"revision": "r2"}}))
+        }
+        _ => unexpected(request),
+    }).await;
+    let out = invoke(cli().args([
+        "--quiet", "--url", &server.url, "exec",
+        "mesh set-quota peer --expected-revision r1 --provider test --model model --tokens 2.000001M --window daily --operation reconfigure",
+        "mesh reset-quota peer --expected-revision r2 --provider test --model model",
+    ]), None).await;
+    assert!(out.status.success(), "{:?}", events(&out));
+    let requests = server.finish().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|req| req["method"] == "_querymt/mesh/resetPeerQuota")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn mesh_invalid_token_count_is_a_usage_error_without_a_quota_write() {
+    for input in ["0.0001k", "9223372036854.775808M"] {
+        let server = MockServer::start(unexpected).await;
+        let out = invoke(
+            cli().args([
+                "--quiet",
+                "--url",
+                &server.url,
+                "mesh",
+                "set-quota",
+                "peer",
+                "--expected-revision",
+                "r1",
+                "--provider",
+                "test",
+                "--tokens",
+                input,
+                "--operation",
+                "reconfigure",
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            events(&out)[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("--tokens")
+        );
+        let requests = server.finish().await;
+        assert!(requests.is_empty(), "{requests:?}");
+    }
+}
+
+#[tokio::test]
+async fn mesh_mutation_rejection_is_not_automatically_retried() {
+    for disconnect in [false, true] {
+        let server = MockServer::start(move |request| match request["method"].as_str() {
+            Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+            Some("_querymt/mesh/setPeerAccess") if disconnect => Reply::Disconnect,
+            Some("_querymt/mesh/setPeerAccess") => Reply::ErrorWithData(json!({"code": -32000, "message": "conflict", "data": {"code": "mesh_access_conflict", "actual_revision": "r2"}})),
+            _ => unexpected(request),
+        }).await;
+        let out = invoke(
+            cli().args([
+                "--quiet",
+                "--url",
+                &server.url,
+                "mesh",
+                "set",
+                "peer",
+                "--expected-revision",
+                "r1",
+                "--grant",
+                "{\"mode\":\"none\"}",
+            ]),
+            None,
+        )
+        .await;
+        assert!(!out.status.success());
+        let values = events(&out);
+        let recovery = &values[0]["recovery"];
+        assert_eq!(
+            recovery["deliveryState"],
+            if disconnect { "unknown" } else { "rejected" }
+        );
+        assert_eq!(recovery["expectedRevision"], "r1");
+        assert_eq!(recovery["peerId"], "peer");
+        if !disconnect {
+            assert_eq!(recovery["rpcData"]["code"], "mesh_access_conflict");
+        }
+        assert_eq!(server.finish().await.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn mesh_watch_filters_notifications_without_a_session() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => {
+            let notices = (0..70).map(|_| "other").chain(["peer"]).map(|peer|
+                json!({"jsonrpc": "2.0", "method": "querymt/mesh/peerAccessChanged",
+                    "params": {"version": 1, "peer_id": peer, "direction": "incoming", "reason": "quota"}})
+            ).collect();
+            Reply::WithNotifications(notices, mesh_capabilities())
+        }
+        _ => unexpected(request),
+    }).await;
+    let out = invoke(
+        cli().args([
+            "--quiet",
+            "--url",
+            &server.url,
+            "mesh",
+            "watch",
+            "peer",
+            "--timeout",
+            "2",
+        ]),
+        None,
+    )
+    .await;
+    assert!(out.status.success(), "{:?}", events(&out));
+    let values = events(&out);
+    assert_eq!(
+        values,
+        vec![
+            json!({"ok": true, "type": "mesh_peer_access_changed", "version": 1, "peer_id": "peer", "direction": "incoming", "reason": "quota"})
+        ]
+    );
+    assert_eq!(server.finish().await.len(), 2);
+}
+
+#[tokio::test]
+async fn mesh_watch_times_out_without_a_match() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+        _ => unexpected(request),
+    })
+    .await;
+    let out = invoke(
+        cli().args([
+            "--quiet",
+            "--url",
+            &server.url,
+            "mesh",
+            "watch",
+            "peer",
+            "--timeout",
+            "1",
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(events(&out)[0]["ok"], false);
+    assert_eq!(server.finish().await.len(), 2);
 }
 
 fn runtime(phase: &str, steerable: bool) -> Reply {

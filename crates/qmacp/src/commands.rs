@@ -62,6 +62,9 @@ pub enum Command {
     Caps,
     /// List QueryMT profiles advertised by the server.
     Profiles,
+    /// Discover mesh nodes and manage per-peer sharing.
+    #[command(subcommand)]
+    Mesh(crate::mesh::MeshCommand),
     /// List models advertised by the server.
     Models {
         #[arg(long)]
@@ -271,6 +274,7 @@ pub async fn run(
     match command {
         Command::Caps => write_ok(pretty, caps(client).await?),
         Command::Profiles => write_ok(pretty, profiles(client).await?),
+        Command::Mesh(command) => write_ok(pretty, crate::mesh::run(client, command).await?),
         Command::Models {
             refresh,
             query,
@@ -1254,6 +1258,11 @@ fn validate_batch_command(command: &Command) -> Result<(), CliError> {
         | Command::Find { cwd, .. }
         | Command::Inspect { cwd, .. }
         | Command::Status { cwd, .. } => session::validate_cwd(cwd.as_deref(), false),
+        Command::Mesh(crate::mesh::MeshCommand::Watch { .. }) => {
+            return Err(CliError::Usage(
+                "mesh watch must be run outside exec".into(),
+            ));
+        }
         Command::Exec { commands } => {
             if commands.is_empty() {
                 return Err(CliError::Usage(

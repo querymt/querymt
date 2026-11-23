@@ -25,4 +25,26 @@ typeshare \
   --lang=typescript \
   --output-file="$TS_OUT"
 
+# Typeshare 1.x cannot emit internally tagged unions with fields. Keep these
+# flat shapes in sync with the serde wire enums rather than changing the wire.
+cat >>"$TS_OUT" <<'TS'
+
+export type ModelSelection =
+  | { mode: "all" }
+  | { mode: "selected"; model_ids: string[] };
+
+export type PeerGrant =
+  | { mode: "none" }
+  | { mode: "full" }
+  | { mode: "custom"; sessions: boolean; filesystem: boolean; providers: ProviderGrant[] };
+
+export type MeshQuotaLimit =
+  | { kind: "unlimited" }
+  | { kind: "finite"; limit_tokens: string; window?: QuotaWindow };
+
+export type MeshPeerIncomingAccess =
+  | { status: "granted"; effective: MeshPeerEffectiveAccess; quotas: MeshPeerQuota[] }
+  | { status: "denied" | "legacy" | "unavailable" | "incompatible" };
+TS
+
 echo "Done."

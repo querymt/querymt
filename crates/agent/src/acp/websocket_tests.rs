@@ -71,6 +71,152 @@ fn recovery_transport_accepts_only_loopback_websocket_peers() {
     assert!(!is_loopback_websocket_peer(None));
 }
 
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn plain_websocket_connections_share_the_mesh_access_contract() {
+    use crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED;
+    use crate::mesh_access::bootstrap_mesh_runtime;
+    use futures_util::{SinkExt, StreamExt};
+    use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
+    use serde_json::{Value, json};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+    use tokio_util::task::AbortOnDropHandle;
+
+    type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn receive(socket: &mut Socket, matches: impl Fn(&Value) -> bool) -> Value {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if matches(&value) {
+                        return value;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected WebSocket message")
+    }
+
+    async fn call(socket: &mut Socket, id: u64, method: &str, params: Value) -> Value {
+        socket
+            .send(Message::Text(
+                json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let response = receive(socket, |message| message["id"] == id).await;
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        response["result"].clone()
+    }
+
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let mesh = bootstrap_mesh_runtime(&MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: Default::default(),
+        }),
+        iroh_enabled: false,
+        iroh_gso: true,
+        iroh_dns: None,
+        iroh_scopes: Vec::new(),
+        identity_file: Some(fixture._tempdir.path().join("identity.key")),
+        request_timeout: Duration::from_secs(5),
+        stream_reconnect_grace: Duration::from_secs(5),
+        node_name: None,
+        peers: Vec::new(),
+        auto_fallback: false,
+    })
+    .await
+    .expect("guarded LAN mesh");
+    fixture.handle.set_mesh(mesh.as_mesh_handle().clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/acp/ws", listener.local_addr().unwrap());
+    let app = router(fixture.handle.clone());
+    let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    }));
+    let (mut writer, _) = timeout(Duration::from_secs(5), connect_async(&url))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut reader, _) = timeout(Duration::from_secs(5), connect_async(&url))
+        .await
+        .unwrap()
+        .unwrap();
+
+    for socket in [&mut writer, &mut reader] {
+        let caps = call(socket, 1, "_querymt/capabilities", json!({})).await;
+        assert_eq!(caps["mesh_access_version"], 1);
+        for method in [
+            "nodes",
+            "getPeerAccess",
+            "setPeerAccess",
+            "setPeerQuota",
+            "resetPeerQuota",
+        ] {
+            assert!(
+                caps["methods"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(format!("querymt/mesh/{method}")))
+            );
+        }
+        assert!(
+            caps["notifications"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED))
+        );
+    }
+
+    let peer = libp2p::PeerId::random().to_string();
+    let read = json!({"version":1, "peer_id":peer});
+    let initial = call(&mut writer, 2, "_querymt/mesh/getPeerAccess", read.clone()).await;
+    assert_eq!(initial["outgoing"]["grant"]["mode"], "none");
+    let updated = call(
+        &mut writer,
+        3,
+        "_querymt/mesh/setPeerAccess",
+        json!({
+            "version":1, "peer_id":peer, "expected_revision":initial["outgoing"]["revision"],
+            "grant":{"mode":"custom", "sessions":true, "filesystem":false, "providers":[]}
+        }),
+    )
+    .await;
+    assert_eq!(updated["outgoing"]["grant"]["mode"], "custom");
+
+    let hint = receive(&mut reader, |message| {
+        message["method"] == QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED
+            && message["params"]["peer_id"] == peer
+    })
+    .await;
+    assert_eq!(
+        hint["params"],
+        json!({"version":1,"peer_id":peer,"direction":"outgoing","reason":"policy"})
+    );
+    let snapshot = call(&mut reader, 2, "_querymt/mesh/getPeerAccess", read).await;
+    assert_eq!(snapshot["outgoing"], updated["outgoing"]);
+    let nodes = call(&mut reader, 3, "_querymt/mesh/nodes", json!({})).await;
+    assert_eq!(nodes["managed_peer_ids"], json!([peer]));
+
+    writer.close(None).await.unwrap();
+    reader.close(None).await.unwrap();
+    mesh.as_mesh_handle().shutdown().await;
+}
+
 #[test]
 fn dashboard_websocket_origin_must_match_host() {
     let mut headers = HeaderMap::new();

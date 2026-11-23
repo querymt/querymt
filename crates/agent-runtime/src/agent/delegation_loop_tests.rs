@@ -55,7 +55,7 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
         peers: vec![],
         auto_fallback: false,
     };
-    let mesh = querymt_remote::bootstrap_mesh_runtime_with_policy(&config, store)
+    let mesh = crate::agent::remote::bootstrap_mesh_runtime(&config, store)
         .await
         .unwrap();
     let mesh = mesh.as_mesh_handle();

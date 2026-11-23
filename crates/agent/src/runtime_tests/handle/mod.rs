@@ -580,7 +580,7 @@ impl RemoteScheduleFixture {
         .expect("schedule host did not become ready");
 
         config.peers.push(format!("{listen}/p2p/{host_peer}"));
-        let mesh = bootstrap_guarded_schedule_mesh(&config)
+        let mesh = crate::mesh_access::bootstrap_mesh_runtime(&config)
             .await
             .expect("start distinct schedule client");
         let mesh = mesh.as_mesh_handle();
@@ -656,22 +656,6 @@ fn schedule_mesh_config(
 }
 
 #[cfg(feature = "remote")]
-async fn bootstrap_guarded_schedule_mesh(
-    config: &querymt_remote::MeshRuntimeConfig,
-) -> Result<querymt_remote::MeshRuntimeHandle, querymt_remote::MeshError> {
-    let identity = config
-        .identity_file
-        .as_ref()
-        .expect("isolated mesh identity");
-    let mut path = identity.as_os_str().to_os_string();
-    path.push(".mesh_state.json");
-    let store = querymt_remote::MeshAccessStore::new(
-        querymt_remote::MeshStateStore::shared(Path::new(&path)).expect("create test policy store"),
-    );
-    querymt_remote::bootstrap_mesh_runtime_with_policy(config, Arc::new(store)).await
-}
-
-#[cfg(feature = "remote")]
 fn schedule_mesh_peer_id(identity: &Path) -> libp2p::PeerId {
     querymt_remote::identity::load_or_generate_keypair(Some(identity))
         .expect("test mesh keypair")
@@ -698,10 +682,12 @@ async fn remote_schedule_host_helper() {
     let listen = std::env::var("QMT_TEST_SCHEDULE_LISTEN").expect("fixture listen address");
     let missing_session = std::env::var("QMT_TEST_SCHEDULE_DELETE_SESSION").unwrap() == "1";
     let host = RealStorageHandleFixture::new().await;
-    let runtime =
-        bootstrap_guarded_schedule_mesh(&schedule_mesh_config(dir.join("host.key"), listen))
-            .await
-            .expect("start guarded schedule host");
+    let runtime = crate::mesh_access::bootstrap_mesh_runtime(&schedule_mesh_config(
+        dir.join("host.key"),
+        listen,
+    ))
+    .await
+    .expect("start guarded schedule host");
     let mesh = runtime.as_mesh_handle();
     host.handle.set_mesh(mesh.clone());
     let store = mesh.quota_store().expect("guarded host policy store");

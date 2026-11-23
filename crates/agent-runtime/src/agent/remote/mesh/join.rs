@@ -1,6 +1,7 @@
 use crate::agent::remote::mesh::{MeshError, MeshScopeId};
 use libp2p::PeerId;
 use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig, MeshRuntimeHandle};
+use std::path::PathBuf;
 
 /// Join an existing mesh using a signed invite grant.
 ///
@@ -23,7 +24,7 @@ use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig, MeshRuntimeHandle};
 /// - `iroh_gso` - whether to enable GSO on the actor endpoint
 pub async fn join_mesh_via_invite(
     invite: &crate::agent::remote::invite::SignedInviteGrant,
-    identity_file: Option<std::path::PathBuf>,
+    identity_file: Option<PathBuf>,
     iroh_gso: bool,
     iroh_dns: Option<querymt_remote::IrohDnsConfig>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
@@ -57,7 +58,7 @@ pub async fn join_mesh_via_invite(
         peers: Vec::new(),
         auto_fallback: false,
     };
-    let runtime = querymt_remote::bootstrap_mesh_runtime(&config).await?;
+    let runtime = querymt_remote::bootstrap_mesh_runtime_guarded(&config).await?;
     let mesh = runtime.as_mesh_handle();
     let mesh_state = mesh
         .mesh_state_store()

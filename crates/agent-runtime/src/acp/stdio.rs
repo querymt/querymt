@@ -987,6 +987,26 @@ fn spawn_event_bridge_forwarder(
     })
 }
 
+async fn forward_mesh_access_updates(
+    mut updates: tokio::sync::broadcast::Receiver<crate::acp::protocol::ExtNotification>,
+    bridge: ClientBridgeSender,
+) {
+    loop {
+        match updates.recv().await {
+            Ok(notification)
+                if notification.method.as_ref()
+                    == crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED =>
+            {
+                if bridge.notify_ext(notification).await.is_err() {
+                    break;
+                }
+            }
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Run an ACP stdio server with a QueryMTAgent.
 ///
 /// This is a convenience function for running QueryMTAgent over stdio with the ACP protocol.
@@ -1059,6 +1079,10 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         shutdown_tx,
     );
     log::info!("Spawned event forwarder");
+    let mesh_access_forwarder = tokio::spawn(forward_mesh_access_updates(
+        agent.subscribe_ext_notifications(),
+        bridge_sender.clone(),
+    ));
 
     // 6. Set up stdio streams and connect ACP agent role.
     let stdin = tokio::io::stdin().compat();
@@ -1360,6 +1384,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         }
     };
 
+    mesh_access_forwarder.abort();
     if shutdown_triggered {
         log::info!("Initiating graceful shutdown...");
         log::info!("Shutting down agent...");
@@ -1408,6 +1433,52 @@ mod stdio_tests {
     use tokio::sync::{Mutex, Notify, mpsc};
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    #[tokio::test]
+    async fn stdio_forwards_mesh_invalidation_after_lag_without_forwarding_unrelated_updates() {
+        use crate::acp::protocol::ExtNotification;
+        use crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED;
+        use serde_json::{json, value::to_raw_value};
+
+        let (updates, subscription) = tokio::sync::broadcast::channel(2);
+        let payload = json!({"version": 1, "direction": "outgoing", "reason": "policy"});
+        for (method, params) in [
+            (
+                QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED,
+                json!({"reason": "superseded"}),
+            ),
+            ("querymt/session/runtimeChanged", json!({})),
+            (QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED, payload.clone()),
+        ] {
+            updates
+                .send(ExtNotification::new(
+                    method,
+                    to_raw_value(&params).unwrap().into(),
+                ))
+                .unwrap();
+        }
+        drop(updates);
+
+        let (bridge, mut messages) = mpsc::channel(4);
+        timeout(
+            Duration::from_secs(2),
+            super::forward_mesh_access_updates(subscription, ClientBridgeSender::new(bridge)),
+        )
+        .await
+        .expect("forwarder drains the subscription and stops when it closes");
+        let Some(ClientBridgeMessage::ExtNotification(notification)) = messages.recv().await else {
+            panic!("expected the latest mesh access invalidation");
+        };
+        assert_eq!(
+            notification.method.as_ref(),
+            QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(notification.params.get()).unwrap(),
+            payload
+        );
+        assert!(messages.recv().await.is_none());
+    }
 
     fn assert_structured_user_message_replay(prompt_part: querymt_agent_core::model::MessagePart) {
         let event = querymt_agent_core::events::AgentEvent {

@@ -149,7 +149,7 @@ pub async fn bootstrap_mesh_runtime(
 }
 
 pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHandle, MeshError> {
-    bootstrap_with_ingress(config, None, None).await
+    bootstrap_with_ingress(config, None, None, false).await
 }
 
 /// Start a mesh with all inbound actor RPCs routed through the authenticated
@@ -160,7 +160,7 @@ pub(crate) async fn bootstrap_mesh_handle_with_ingress(
     config: &MeshRuntimeConfig,
     ingress: Arc<dyn MeshIngress>,
 ) -> Result<MeshHandle, MeshError> {
-    bootstrap_with_ingress(config, Some(ingress), None).await
+    bootstrap_with_ingress(config, Some(ingress), None, false).await
 }
 
 /// Bootstrap a guarded mesh with a single policy store for this host identity.
@@ -169,7 +169,16 @@ pub async fn bootstrap_mesh_runtime_with_policy(
     config: &MeshRuntimeConfig,
     store: Arc<dyn QuotaStore>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
-    bootstrap_with_ingress(config, None, Some(store))
+    bootstrap_with_ingress(config, None, Some(store), false)
+        .await
+        .map(MeshRuntimeHandle::new)
+}
+
+/// Bootstrap a guarded mesh with sharing and membership on the same state owner.
+pub async fn bootstrap_mesh_runtime_guarded(
+    config: &MeshRuntimeConfig,
+) -> Result<MeshRuntimeHandle, MeshError> {
+    bootstrap_with_ingress(config, None, None, true)
         .await
         .map(MeshRuntimeHandle::new)
 }
@@ -178,6 +187,7 @@ async fn bootstrap_with_ingress(
     config: &MeshRuntimeConfig,
     ingress: Option<Arc<dyn MeshIngress>>,
     policy_store: Option<Arc<dyn QuotaStore>>,
+    use_mesh_state_policy: bool,
 ) -> Result<MeshHandle, MeshError> {
     config
         .validate()
@@ -198,6 +208,13 @@ async fn bootstrap_with_ingress(
         _ => unreachable!(),
     };
 
+    let state_owner = if use_mesh_state_policy {
+        Some(crate::mesh_bootstrap::open_mesh_state(
+            config.identity_file.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let ctx = prepare_runtime_bootstrap(
         config.identity_file.as_deref(),
         &config.peers,
@@ -216,6 +233,16 @@ async fn bootstrap_with_ingress(
         mesh_state_store,
     } = ctx;
 
+    let mesh_state_store = state_owner.or(mesh_state_store);
+    let policy_store = if use_mesh_state_policy {
+        mesh_state_store
+            .as_ref()
+            .map(|owner| -> Arc<dyn QuotaStore> {
+                Arc::new(crate::MeshAccessStore::new(owner.clone()))
+            })
+    } else {
+        policy_store
+    };
     let policy = policy_store.map(|store| MeshPolicy {
         router: Arc::new(InboundRouter::new(
             keypair.public().to_peer_id(),
