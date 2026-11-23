@@ -86,6 +86,10 @@ pub(crate) trait InboundProtocol: Default + 'static {
     ) -> impl Future<Output = Self::Response> + Send;
     fn overloaded(request: Self::ActorRequest) -> Self::Response;
 
+    fn dispatch_budget(_: &Self::ActorRequest, wire_budget: Duration) -> Duration {
+        wire_budget
+    }
+
     fn outbound_result(
         &mut self,
         _peer: PeerId,
@@ -222,7 +226,8 @@ impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
                     }
                     InboundRequest::Dispatch(request) => {
                         let gate = Arc::clone(&self.gate);
-                        let deadline = Instant::now() + self.dispatch_timeout;
+                        let deadline =
+                            Instant::now() + P::dispatch_budget(&request, self.dispatch_timeout);
                         let task = self.tasks.spawn(async move {
                             if !channel.is_open() {
                                 return (request_id, None);

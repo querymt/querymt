@@ -188,42 +188,46 @@ async fn sharing_wire_expiry_drops_handler_and_reclaims_slot() {
         }
     }
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let (tx, mut dropped) = mpsc::unbounded_channel();
-        let gate = Arc::new(PendingGate(tokio::sync::Mutex::new(Some(tx))));
-        let mut server = lan(|_| SharingWire::new(gate.clone(), Duration::from_millis(250)));
-        let mut client = lan(|_| SharingWire::new(gate, Duration::from_secs(2)));
-        let addr = listening(&mut server, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
-        let host = *server.local_peer_id();
-        client.add_peer_address(host, addr);
-        let ask = SwarmRequest::Ask {
-            actor_id: ActorId::new_with_peer_id(17, host),
-            actor_remote_id: "test::Echo".into(),
-            message_remote_id: "test::EchoRequest".into(),
-            payload: vec![],
-            mailbox_timeout: None,
-            reply_timeout: None,
-            immediate: false,
-        };
-        assert!(
-            exchange(
-                &mut client,
-                &mut server,
-                SharingRequest::Actor(Box::new(ask))
-            )
-            .await
-            .is_err()
-        );
-        assert!(dropped.recv().await.is_none());
-        assert!(matches!(
-            exchange(&mut client, &mut server, SharingRequest::Probe).await,
-            Ok(SharingResponse::Supported)
-        ));
-        assert!(server.behaviour().tasks.is_empty());
-        assert!(server.behaviour().pending_dispatch.is_empty());
-    })
-    .await
-    .expect("handler was not reclaimed on wire expiry");
+    let short = Duration::from_millis(250);
+    let long = Duration::from_secs(10);
+    for (wire_budget, reply_budget) in [(short, None), (long, Some(short))] {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (tx, mut dropped) = mpsc::unbounded_channel();
+            let gate = Arc::new(PendingGate(tokio::sync::Mutex::new(Some(tx))));
+            let mut server = lan(|_| SharingWire::new(gate.clone(), wire_budget));
+            let mut client = lan(|_| SharingWire::new(gate, long));
+            let addr = listening(&mut server, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+            let host = *server.local_peer_id();
+            client.add_peer_address(host, addr);
+            let ask = SwarmRequest::Ask {
+                actor_id: ActorId::new_with_peer_id(17, host),
+                actor_remote_id: "test::Echo".into(),
+                message_remote_id: "test::EchoRequest".into(),
+                payload: vec![],
+                mailbox_timeout: None,
+                reply_timeout: reply_budget,
+                immediate: false,
+            };
+            assert!(
+                exchange(
+                    &mut client,
+                    &mut server,
+                    SharingRequest::Actor(Box::new(ask))
+                )
+                .await
+                .is_err()
+            );
+            assert!(dropped.recv().await.is_none());
+            assert!(matches!(
+                exchange(&mut client, &mut server, SharingRequest::Probe).await,
+                Ok(SharingResponse::Supported)
+            ));
+            assert!(server.behaviour().tasks.is_empty());
+            assert!(server.behaviour().pending_dispatch.is_empty());
+        })
+        .await
+        .expect("handler was not reclaimed on wire or V1 exchange budget expiry");
+    }
 }
 
 #[tokio::test]
