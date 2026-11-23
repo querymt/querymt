@@ -830,57 +830,6 @@ impl SessionRegistry {
         })
     }
 
-    /// Fork an existing session at the latest message.
-    pub async fn fork_session(
-        &self,
-        req: crate::acp::protocol::ForkSessionRequest,
-    ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
-        let source_session_id = req.session_id.to_string();
-
-        let _session = self
-            .config
-            .provider
-            .history_store()
-            .get_session(&source_session_id)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?
-            .ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "source session not found",
-                    "session_id": source_session_id,
-                }))
-            })?;
-
-        let history = self
-            .config
-            .provider
-            .history_store()
-            .get_history(&source_session_id)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        let target_message_id = history
-            .last()
-            .map(|msg| msg.id.clone())
-            .ok_or_else(|| Error::from(AgentError::EmptySessionFork))?;
-
-        let new_session_id = self
-            .config
-            .provider
-            .history_store()
-            .fork_session(
-                &source_session_id,
-                &target_message_id,
-                crate::session::domain::ForkOrigin::User,
-            )
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        Ok(crate::acp::protocol::ForkSessionResponse::new(
-            new_session_id,
-        ))
-    }
-
     /// Resume an existing session without history replay.
     pub async fn resume_session(
         &mut self,
@@ -1362,8 +1311,6 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::agent::session_actor::SessionActor;
-    use crate::session::backend::StorageBackend;
-    use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
@@ -1715,71 +1662,6 @@ mod tests {
         let req = ListSessionsRequest::new();
         let resp = f.registry.list_sessions(req).await.expect("list_sessions");
         assert!(resp.sessions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_fork_session_empty_history_fails() {
-        let _f = RegistryFixture::new().await;
-
-        // Override: get_history returns empty vec, get_session returns Some
-        let mut store2 = MockSessionStore::new();
-        let session = mock_session("source-session");
-        store2
-            .expect_get_session()
-            .returning(move |_| Ok(Some(session.clone())))
-            .times(0..);
-        store2
-            .expect_get_history()
-            .returning(|_| Ok(vec![]))
-            .times(0..);
-        store2
-            .expect_get_session_llm_config()
-            .returning(|_| Ok(None))
-            .times(0..);
-        store2
-            .expect_list_sessions()
-            .returning(|| Ok(vec![]))
-            .times(0..);
-
-        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
-        let shared = SharedLlmProvider {
-            inner: provider,
-            tools: vec![].into_boxed_slice(),
-        };
-        let factory = Arc::new(TestProviderFactory::new(shared));
-        let (plugin_registry, _temp) = mock_plugin_registry(factory).expect("registry");
-        let storage = Arc::new(
-            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
-                .await
-                .expect("create event store"),
-        );
-        let store: Arc<dyn SessionStore> = Arc::new(store2);
-        let provider = Arc::new(crate::session::provider::SessionProvider::new(
-            Arc::new(plugin_registry),
-            store,
-            LLMParams::new().provider("mock").model("mock-model"),
-        ));
-        let config = Arc::new(
-            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
-                .build(),
-        );
-
-        let registry = SessionRegistry::new(config);
-
-        let req = crate::acp::protocol::ForkSessionRequest::new(
-            crate::acp::protocol::SessionId::from("source-session".to_string()),
-            std::path::PathBuf::from("/tmp"),
-        );
-        let result = registry.fork_session(req).await;
-        // Should fail with EmptySessionFork since history is empty
-        assert!(result.is_err(), "expected error for empty session fork");
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("empty")
-                || err.code == agent_client_protocol::ErrorCode::INTERNAL_ERROR,
-            "unexpected error: {}",
-            err
-        );
     }
 
     // ── merged_mcp_servers tests ─────────────────────────────────────────────

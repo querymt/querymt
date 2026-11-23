@@ -119,6 +119,17 @@ A model is the same model when its provider, model name and context limit are un
 - **WHEN** a compaction finishes and reports the context the session holds afterwards
 - **THEN** that value is the last context measurement on every path: live delivery, history replay, the load snapshot's summary, and a connection seeded from a load
 
+### Requirement: Active time in the whole-session summary
+The whole-session summary SHALL carry the session's active time in `activeMs`: the sum, over every run of the session that has ended, of the time from its start to its end, as recorded in the journal. A run that has not ended SHALL NOT be counted; its start is reported by the runtime status (`run_started_at_ms`). The value SHALL cover the whole session, not only the loaded window.
+
+#### Scenario: Ended runs are summed
+- **WHEN** a session has two ended runs of 30 and 90 seconds
+- **THEN** its summary carries `activeMs` 120000, with and without a load window
+
+#### Scenario: Running run is not counted
+- **WHEN** a session is loaded while its third run is active
+- **THEN** the summary's `activeMs` covers the two ended runs, and the runtime status names the active run's start
+
 ### Requirement: Load snapshots carry whole-session state
 Every load snapshot SHALL carry the whole-session summary (token usage totals, the last context measurement, the current model and provider with its context limit, pending inputs and child-session links), whether or not the client requested a load window. For the same session and the same locally held history, the summary SHALL be identical with and without a window.
 

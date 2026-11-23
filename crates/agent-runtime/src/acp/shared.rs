@@ -1237,7 +1237,15 @@ where
     // The run an event belongs to is the enclosing `RunStarted`; updates carry
     // its id as live updates do.
     let mut current_run: Option<String> = None;
+    // Cursors of the replayed window only (`events` is the window), each
+    // announced once, derived by the same rules as live delivery.
+    let mut announced_cursors: HashSet<String> = HashSet::new();
     for event in events {
+        let cursor_entities = if capabilities.cursors {
+            querymt_agent_core::replay::message_cursor_entities(&event.kind)
+        } else {
+            Vec::new()
+        };
         if let AgentEventKind::RunStarted { run_id, .. } = &event.kind {
             current_run = Some(run_id.clone());
         }
@@ -1284,6 +1292,14 @@ where
             }
             push(update, &mut notifications);
         }
+        for entity in cursor_entities {
+            if announced_cursors.insert(entity.cursor_id()) {
+                push(
+                    querymt_agent_core::replay::cursor_update(&entity),
+                    &mut notifications,
+                );
+            }
+        }
         // A delegate tool call points at its child right after it starts,
         // where the live stream sends the reference once the child exists.
         if let Some(tool_call_id) = started_tool_call {
@@ -1321,6 +1337,24 @@ where
                     querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
                 }
                 push(update, &mut notifications);
+            }
+        }
+        // A compaction cursor follows a compaction update, which only a
+        // client that advertised `compaction` was sent.
+        if capabilities.cursors && capabilities.compaction {
+            for terminal in materialized
+                .compactions
+                .iter()
+                .filter(|t| t.seq == seq && matches!(t.status, CompactionStatus::Completed))
+            {
+                let entity =
+                    querymt_agent_core::replay::CursorEntity::Compaction(terminal.id.0.to_string());
+                if announced_cursors.insert(entity.cursor_id()) {
+                    push(
+                        querymt_agent_core::replay::cursor_update(&entity),
+                        &mut notifications,
+                    );
+                }
             }
         }
         if ends_run {
@@ -2024,6 +2058,10 @@ pub struct AcpLiveEventTranslator {
     /// Delegated child sessions announced to this connection with a
     /// `subagent_update`, so each child is announced once, before its traffic.
     announced_children: HashSet<String>,
+    /// `(session id, cursor id)` pairs already sent to this connection, so a
+    /// cursor is announced once even when live and recovered paths both see
+    /// its entity.
+    announced_cursors: HashSet<(String, String)>,
 }
 
 /// One internal event as translated for a connection: the delegation
@@ -2142,6 +2180,9 @@ impl Default for AcpLiveEventTranslator {
     }
 }
 
+/// Most cursor ids a live translator remembers before it starts over.
+const MAX_ANNOUNCED_CURSORS: usize = 4096;
+
 impl AcpLiveEventTranslator {
     pub fn new() -> Self {
         Self {
@@ -2156,7 +2197,45 @@ impl AcpLiveEventTranslator {
             announced_todo_plans: HashSet::new(),
             runs: HashMap::new(),
             announced_children: HashSet::new(),
+            announced_cursors: HashSet::new(),
         }
+    }
+
+    /// The `cursor_update`s an event causes for a client that advertised
+    /// `session.cursors`: one per anchor the event completes, not yet sent.
+    /// They follow the entity's own update in the caller's vector.
+    fn cursor_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        use querymt_agent_core::replay::CursorEntity;
+        if !self.capabilities.cursors {
+            return Vec::new();
+        }
+        let mut entities = querymt_agent_core::replay::message_cursor_entities(event.kind());
+        // A compaction cursor follows a compaction update, which only a
+        // client that advertised `compaction` is sent.
+        if self.capabilities.compaction
+            && let AgentEventKind::CompactionEnd { compaction_id, .. } = event.kind()
+        {
+            let id = compaction_identity(compaction_id.as_deref(), event);
+            entities.push(CursorEntity::Compaction(id.0.to_string()));
+        }
+        if entities.is_empty() {
+            return Vec::new();
+        }
+        // The set only suppresses a repeat announcement, which is harmless
+        // (a cursor update is idempotent), so it is bounded by dropping it
+        // rather than growing with the session.
+        if self.announced_cursors.len() >= MAX_ANNOUNCED_CURSORS {
+            self.announced_cursors.clear();
+        }
+        let session_id = event.session_id();
+        entities
+            .into_iter()
+            .filter(|entity| {
+                self.announced_cursors
+                    .insert((session_id.to_owned(), entity.cursor_id()))
+            })
+            .map(|entity| querymt_agent_core::replay::cursor_update(&entity))
+            .collect()
     }
 
     /// Observe one live event and return the run state transition it causes.
@@ -2533,6 +2612,8 @@ impl AcpLiveEventTranslator {
         self.announced_todo_plans.remove(session_id);
         self.runs.remove(session_id);
         self.announced_children.remove(session_id);
+        self.announced_cursors
+            .retain(|(session, _)| session != session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
         self.structured_user_messages
@@ -2589,6 +2670,13 @@ impl AcpLiveEventTranslator {
                 let session_id = event.session_id().to_owned();
                 updates.extend(
                     self.translate_unstamped_updates(event)
+                        .into_iter()
+                        .map(|update| (session_id.clone(), update)),
+                );
+                // Cursors follow the entity update that introduced them.
+                let cursors = self.cursor_updates(event);
+                updates.extend(
+                    cursors
                         .into_iter()
                         .map(|update| (session_id.clone(), update)),
                 );

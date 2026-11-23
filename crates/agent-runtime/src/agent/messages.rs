@@ -319,12 +319,6 @@ pub struct Undo {
 #[derive(Serialize, Deserialize)]
 pub struct Redo;
 
-/// Fork a session at a specific message boundary.
-#[derive(Serialize, Deserialize)]
-pub struct ForkAtMessage {
-    pub message_id: String,
-}
-
 // ══════════════════════════════════════════════════════════════════════════
 //  Extensions
 // ══════════════════════════════════════════════════════════════════════════

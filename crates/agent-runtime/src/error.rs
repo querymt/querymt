@@ -139,6 +139,18 @@ pub enum AgentError {
     #[error("invalid prompt content: {message}")]
     InvalidPromptContent { message: String },
 
+    /// A `session/fork` the owning node refused with a client-facing error
+    /// (an invalid target or workspace option, a read-only source). The owner's
+    /// ACP code, message and data travel unchanged, so a viewer reports the
+    /// same error a local fork would. Nothing was created.
+    #[error("fork rejected ({code}): {message}")]
+    ForkRejected {
+        code: i32,
+        message: String,
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+    },
+
     #[error("session control revision conflict: expected {expected}, found {found}")]
     SessionControlRevisionConflict { expected: u64, found: u64 },
 
@@ -237,6 +249,18 @@ impl From<AgentError> for AcpError {
                 "kind": kind,
                 "message": message,
             }));
+        }
+        if let AgentError::ForkRejected {
+            code,
+            message,
+            data,
+        } = &e
+        {
+            let error = AcpError::new(*code, message.clone());
+            return match data {
+                Some(data) => error.data(data.clone()),
+                None => error,
+            };
         }
         if let AgentError::InvalidPromptContent { message } = &e {
             return AcpError::new(-32602, message.clone()).data(serde_json::json!({
@@ -425,6 +449,26 @@ impl AgentError {
     pub(crate) fn is_session_control_revision_conflict(&self) -> bool {
         matches!(self, Self::SessionControlRevisionConflict { .. })
     }
+
+    /// An owner's failed `session/fork`, as it travels to the viewer.
+    ///
+    /// A client-facing refusal (an invalid target or option `-32602`, a
+    /// read-only source `-32600`) keeps its code, message and data, so the
+    /// viewer reports what a local fork would. An internal error stays
+    /// internal.
+    #[cfg(feature = "remote")]
+    pub(crate) fn from_fork_error(error: AcpError) -> Self {
+        let code: i32 = error.code.into();
+        if code == -32603 {
+            AgentError::Internal(error.to_string())
+        } else {
+            AgentError::ForkRejected {
+                code,
+                message: error.message,
+                data: error.data,
+            }
+        }
+    }
 }
 
 impl From<crate::session::error::SessionError> for AgentError {
@@ -461,6 +505,74 @@ mod tests {
         }
         .into();
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn fork_rejected_keeps_the_owners_code_and_data_across_the_wire() {
+        // A read-only source is `-32600` with a machine-readable code; the
+        // viewer must report exactly that, not an internal error.
+        let owner_error = AcpError::invalid_request().data(serde_json::json!({
+            "code": "owner_transferred",
+            "ownerSessionId": "successor",
+            "message": "session s handed its workspace to successor and is read-only",
+        }));
+        let rejected = AgentError::ForkRejected {
+            code: owner_error.code.into(),
+            message: owner_error.message.clone(),
+            data: owner_error.data.clone(),
+        };
+        let wire = serde_json::to_string(&rejected).unwrap();
+        let received: AgentError = serde_json::from_str(&wire).unwrap();
+
+        let error: AcpError = received.into();
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(error.message, owner_error.message);
+        assert_eq!(error.data, owner_error.data);
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn owner_fork_errors_keep_their_code_unless_internal() {
+        use crate::agent::session_materializer::ReadOnlyReason;
+
+        for reason in [
+            ReadOnlyReason::OwnerTransferred {
+                owner: "successor".to_string(),
+            },
+            ReadOnlyReason::WorkspaceArchived {
+                workspace_id: "w1".to_string(),
+            },
+        ] {
+            let local = reason.error("s1");
+            let viewer: AcpError = AgentError::from_fork_error(local.clone()).into();
+            assert_eq!(viewer.code, ErrorCode::INVALID_REQUEST, "{reason:?}");
+            assert_eq!(viewer.message, local.message);
+            assert_eq!(viewer.data, local.data);
+            assert_eq!(viewer.data.as_ref().unwrap()["code"], reason.code());
+        }
+
+        let options = AcpError::invalid_params().data(serde_json::json!({
+            "code": "invalid_options",
+            "message": "forking a managed session requires an independent worktree",
+        }));
+        let viewer: AcpError = AgentError::from_fork_error(options.clone()).into();
+        assert_eq!(viewer.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(viewer.data, options.data);
+
+        let internal = AgentError::from_fork_error(AcpError::internal_error().data("disk"));
+        assert!(matches!(internal, AgentError::Internal(_)), "{internal:?}");
+    }
+
+    #[test]
+    fn fork_rejected_without_data_maps_to_a_bare_error() {
+        let error: AcpError = AgentError::ForkRejected {
+            code: -32602,
+            message: "Invalid params".to_string(),
+            data: None,
+        }
+        .into();
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.data.is_none());
     }
 
     #[test]

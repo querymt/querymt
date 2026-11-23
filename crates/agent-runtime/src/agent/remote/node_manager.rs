@@ -234,12 +234,28 @@ mod remote_impl {
         pub created_at: i64,
     }
 
-    /// Fork an existing session on this node at a specific message boundary.
+    /// Fork an existing session on this node.
+    ///
+    /// The target is resolved on this node by the same rule as a local
+    /// `session/fork` (cursor, then message id, then the last message), and an
+    /// explicit target must belong to the source session.
+    ///
+    /// Wire compatibility: `message_id` used to be a required `String`, and
+    /// messages travel as named msgpack. A request with `message_id: Some(..)`
+    /// and no cursor reads the same on an older owner. A request with a
+    /// cursor, or with no target at all, carries `message_id: nil`, which an
+    /// older owner cannot decode, so it fails instead of forking elsewhere.
+    /// The cursor field itself is omitted when absent.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ForkRemoteSession {
         pub source_session_id: String,
-        /// An empty ID selects the latest persisted message on the owner.
-        pub message_id: String,
+        /// Message to fork after. `None` (or an empty ID, as older viewers
+        /// send) forks at the last message.
+        #[serde(default)]
+        pub message_id: Option<String>,
+        /// Session cursor to fork at; wins over `message_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor_id: Option<String>,
     }
 
     /// Response from `ForkRemoteSession`.
@@ -1502,7 +1518,8 @@ mod remote_impl {
             skip(self, ctx),
             fields(
                 source_session_id = %msg.source_session_id,
-                message_id = %msg.message_id,
+                message_id = ?msg.message_id,
+                cursor_id = ?msg.cursor_id,
                 session_id = tracing::field::Empty,
                 actor_id = tracing::field::Empty,
             )
@@ -1557,7 +1574,10 @@ mod remote_impl {
                             })?;
                         (handle.config.clone(), handle.session_materializer.clone())
                     }
-                    None => (shared_state.config.clone(), shared_state.session_materializer.clone()),
+                    None => (
+                        shared_state.config.clone(),
+                        shared_state.session_materializer.clone(),
+                    ),
                 };
                 if restricted && !materializer.supports_restricted_cold_resume() {
                     return Err(AgentError::MeshAccessDenied);
@@ -1572,21 +1592,74 @@ mod remote_impl {
                         session_id: msg.source_session_id.clone(),
                     })?;
 
-                let store = config.provider.history_store();
-                let message_id = if msg.message_id.is_empty() {
-                    store.get_history(&msg.source_session_id).await
-                        .map_err(|e| AgentError::Internal(e.to_string()))?
-                        .pop().ok_or(AgentError::EmptySessionFork)?.id
-                } else {
-                    msg.message_id
-                };
-                if let Some(peer) = &peer {
-                    peer.check_mutation().await?;
-                }
+                // The owner forks exactly as a local `session/fork` does, so
+                // the target rules, isolation and read-only checks agree.
+                // Client-facing refusals keep their ACP code and data, so the
+                // viewer reports what a local fork would.
+                let fork_error = AgentError::from_fork_error;
+                materializer
+                    .ensure_writable(&msg.source_session_id)
+                    .await
+                    .map_err(fork_error)?;
+                // Older viewers send an empty ID for "the last message".
+                let message_id = msg.message_id.filter(|id| !id.is_empty());
+                let meta = message_id.as_ref().map(|message_id| {
+                    let mut meta = serde_json::Map::new();
+                    meta.insert(
+                        "querymt".to_string(),
+                        serde_json::json!({ "message_id": message_id }),
+                    );
+                    meta
+                });
                 let forked_session_id = match peer.as_ref().filter(|_| restricted) {
-                    Some(peer) => store.fork_peer_session(&msg.source_session_id, &message_id, peer.schedule_origin()).await,
-                    None => store.fork_session(&msg.source_session_id, &message_id, crate::session::domain::ForkOrigin::User).await,
-                }.map_err(|e| AgentError::Internal(e.to_string()))?;
+                    // A restricted peer's fork stays confined to its origin.
+                    // `supports_restricted_cold_resume` (checked above) rules
+                    // out workspace isolation, so a plain copy is equivalent.
+                    Some(peer) => {
+                        let store = config.provider.history_store();
+                        let history = store
+                            .get_history(&msg.source_session_id)
+                            .await
+                            .map_err(|e| AgentError::Internal(e.to_string()))?;
+                        let target_message_id =
+                            crate::agent::session_materializer::resolve_fork_target(
+                                msg.cursor_id.as_deref(),
+                                meta.as_ref(),
+                                &history,
+                            )
+                            .map_err(fork_error)?;
+                        peer.check_mutation().await?;
+                        store
+                            .fork_peer_session(
+                                &msg.source_session_id,
+                                &target_message_id,
+                                peer.schedule_origin(),
+                            )
+                            .await
+                            .map_err(|e| AgentError::Internal(e.to_string()))?
+                    }
+                    None => {
+                        let mut fork_request = crate::acp::protocol::ForkSessionRequest::new(
+                            crate::acp::protocol::SessionId::from(msg.source_session_id.clone()),
+                            session.cwd.clone().unwrap_or_default(),
+                        );
+                        if let Some(cursor_id) = &msg.cursor_id {
+                            fork_request.cursor_id = Some(cursor_id.clone().into());
+                        }
+                        if let Some(meta) = meta {
+                            fork_request = fork_request.meta(meta);
+                        }
+                        if let Some(peer) = &peer {
+                            peer.check_mutation().await?;
+                        }
+                        materializer
+                            .prepare_fork_session(fork_request)
+                            .await
+                            .map_err(fork_error)?
+                            .session_id
+                            .to_string()
+                    }
+                };
 
                 if let (Some(profiles), Some(runtime)) =
                     (profiles.as_ref().as_ref(), &owner_runtime)
@@ -1628,7 +1701,7 @@ mod remote_impl {
 
                 tracing::Span::current().record("session_id", &forked_session_id);
 
-                let handoff = shared_state
+                let handoff = match shared_state
                     .materialize_remote_session(
                         forked_session_id.clone(),
                         cwd_path,
@@ -1637,7 +1710,32 @@ mod remote_impl {
                         created_at,
                         peer.as_deref(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(handoff) => handoff,
+                    Err(error) => {
+                        // The fork exists only to be handed to the viewer:
+                        // remove it so a failed handoff leaves nothing behind.
+                        // As with any session delete, an isolated fork's
+                        // workspace record is retained.
+                        if let Err(cleanup) = config
+                            .provider
+                            .history_store()
+                            .delete_session(&forked_session_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                session_id = %forked_session_id,
+                                %cleanup,
+                                "failed to remove fork after a failed handoff"
+                            );
+                        }
+                        if let Some(profiles) = profiles.as_ref().as_ref() {
+                            profiles.forget_session_binding(&forked_session_id).await;
+                        }
+                        return Err(error);
+                    }
+                };
 
                 Ok(ForkRemoteSessionResponse {
                     session_id: forked_session_id,

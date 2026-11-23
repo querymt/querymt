@@ -2071,27 +2071,6 @@ impl Message<Redo> for SessionActor {
     }
 }
 
-impl Message<ForkAtMessage> for SessionActor {
-    type Reply = Result<String, AgentError>;
-
-    async fn handle(
-        &mut self,
-        msg: ForkAtMessage,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.config
-            .provider
-            .history_store()
-            .fork_session(
-                &self.session_id,
-                &msg.message_id,
-                crate::session::domain::ForkOrigin::User,
-            )
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))
-    }
-}
-
 impl Message<ExtMethod> for SessionActor {
     type Reply = Result<ExtResponse, AgentError>;
 
@@ -3757,6 +3736,13 @@ impl PromptRun {
         self
     }
 
+    /// Attach the token usage of the run's execution cycle to the response.
+    /// `None` leaves `usage` omitted.
+    fn with_usage(mut self, usage: Option<crate::acp::protocol::Usage>) -> Self {
+        self.response = self.response.usage(usage);
+        self
+    }
+
     /// The reply the client receives: the ACP response with the inserted
     /// message id in `_meta.querymt.messageId`.
     fn into_reply(self) -> PromptResponse {
@@ -3765,6 +3751,34 @@ impl PromptRun {
             None => self.response,
         }
     }
+}
+
+/// Token usage of one execution cycle as the ACP `PromptResponse.usage`.
+///
+/// The counts are per cycle, not per session (the schema's "across session"
+/// wording notwithstanding): a cycle starts with zero committed spend, so
+/// earlier prompts never leak into it. Returns `None` when no attempt of the
+/// cycle reported tokens, so an unknown usage is omitted rather than shown as
+/// zero. `total` is the sum of the five categories.
+pub(crate) fn turn_usage(
+    cycle: &querymt_agent_services::accounting::CycleAccounting,
+) -> Option<crate::acp::protocol::Usage> {
+    let tokens = cycle.cycle_totals().tokens;
+    let total = tokens
+        .input
+        .saturating_add(tokens.output)
+        .saturating_add(tokens.reasoning)
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write);
+    if total == 0 {
+        return None;
+    }
+    Some(
+        crate::acp::protocol::Usage::new(total, tokens.input, tokens.output)
+            .thought_tokens(tokens.reasoning)
+            .cached_read_tokens(tokens.cache_read)
+            .cached_write_tokens(tokens.cache_write),
+    )
 }
 
 /// How a finished prompt task ended, for `run_completed`.
@@ -4120,6 +4134,8 @@ async fn execute_prompt_inner(
         .map_err(|e| AgentError::Internal(format!("failed to load accounting: {e}")))?;
     let cycle_accounting =
         querymt_agent_services::accounting::CycleAccounting::begin(session_accounting);
+    // `TurnEnv` takes the cycle; the response reads the same cycle's totals.
+    let usage_cycle = cycle_accounting.clone();
 
     // The run's read-only inputs, built into a `TurnEnv` once the run's model
     // is resolved. For a prompt that is after the prompt is stored, so a
@@ -4218,7 +4234,8 @@ async fn execute_prompt_inner(
             };
         return match outcome {
             Ok(crate::agent::execution::CompactionOutcome::Completed { .. }) => Ok(
-                PromptRun::finished(PromptResponse::new(StopReason::EndTurn)),
+                PromptRun::finished(PromptResponse::new(StopReason::EndTurn))
+                    .with_usage(turn_usage(&usage_cycle)),
             ),
             Ok(crate::agent::execution::CompactionOutcome::Blocked { message }) => {
                 config.emit_event(
@@ -4229,9 +4246,10 @@ async fn execute_prompt_inner(
                         is_error: false,
                     },
                 );
-                Ok(PromptRun::finished(PromptResponse::new(
-                    StopReason::EndTurn,
-                )))
+                Ok(
+                    PromptRun::finished(PromptResponse::new(StopReason::EndTurn))
+                        .with_usage(turn_usage(&usage_cycle)),
+                )
             }
             Ok(crate::agent::execution::CompactionOutcome::PriceLimit { message }) => {
                 Ok(PromptRun {
@@ -4240,7 +4258,8 @@ async fn execute_prompt_inner(
                     )),
                     stop: Some((querymt_agent_core::events::StopType::PriceLimit, message)),
                     message_id: None,
-                })
+                }
+                .with_usage(turn_usage(&usage_cycle)))
             }
             Ok(crate::agent::execution::CompactionOutcome::NothingToCompact) => {
                 config.emit_event(
@@ -4251,9 +4270,10 @@ async fn execute_prompt_inner(
                         is_error: false,
                     },
                 );
-                Ok(PromptRun::finished(PromptResponse::new(
-                    StopReason::EndTurn,
-                )))
+                Ok(
+                    PromptRun::finished(PromptResponse::new(StopReason::EndTurn))
+                        .with_usage(turn_usage(&usage_cycle)),
+                )
             }
             Err(error) => {
                 let message = error.to_string();
@@ -4474,7 +4494,8 @@ async fn execute_prompt_inner(
             Ok(None) => {
                 return Ok(
                     PromptRun::finished(PromptResponse::new(StopReason::Cancelled))
-                        .with_message_id(&message_id),
+                        .with_message_id(&message_id)
+                        .with_usage(turn_usage(&usage_cycle)),
                 );
             }
             Err(error) => {
@@ -4677,15 +4698,18 @@ async fn execute_prompt_inner(
     debug!("Session {}: post-turn snapshot done", session_id);
 
     let result = caught.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+    let usage = turn_usage(&usage_cycle);
     match result {
         Ok(CycleOutcome::Completed) => Ok(PromptRun::finished(PromptResponse::new(
             StopReason::EndTurn,
         ))
-        .with_message_id(&message_id)),
+        .with_message_id(&message_id)
+        .with_usage(usage)),
         Ok(CycleOutcome::Cancelled) => Ok(PromptRun::finished(PromptResponse::new(
             StopReason::Cancelled,
         ))
-        .with_message_id(&message_id)),
+        .with_message_id(&message_id)
+        .with_usage(usage)),
         Ok(CycleOutcome::Stopped {
             stop_reason,
             stop_type,
@@ -4694,7 +4718,8 @@ async fn execute_prompt_inner(
             response: PromptResponse::new(stop_reason),
             stop: Some((stop_type, reason)),
             message_id: Some(message_id.clone()),
-        }),
+        }
+        .with_usage(usage)),
         Err(e) => {
             let message = e.to_string();
             config.emit_event(

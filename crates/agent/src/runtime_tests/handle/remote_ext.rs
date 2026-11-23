@@ -2339,3 +2339,260 @@ async fn prompt_attachments_do_not_count_toward_the_window_byte_budget() {
         64 * 1024
     );
 }
+
+/// `session/fork` on a viewer of a session another node owns: the owner forks
+/// (so the fork is remote, on the owner), the viewer bookmarks it, and the
+/// target rules are the local ones.
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn session_fork_of_a_remote_hosted_source_is_forked_by_the_owner() {
+    use crate::send_agent::SendAgent as _;
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    let owner = RealStorageHandleFixture::new().await;
+    let (node_id, node_manager) = register_remote_node(mesh, &owner, "owner").await;
+
+    // The owner holds two sessions with their own histories.
+    let mut sessions = Vec::new();
+    for name in ["a", "b"] {
+        let created = node_manager
+            .ask(crate::agent::remote::CreateRemoteSession { cwd: None })
+            .await
+            .expect("create owner session");
+        for n in 1..=3 {
+            owner
+                .storage
+                .session_store()
+                .add_message(
+                    &created.session_id,
+                    crate::model::AgentMessage {
+                        id: format!("{name}-{n}"),
+                        session_id: created.session_id.clone(),
+                        role: querymt::chat::ChatRole::User,
+                        parts: vec![crate::model::MessagePart::Text {
+                            content: format!("{name} message {n}"),
+                        }],
+                        created_at: time::OffsetDateTime::now_utc().unix_timestamp() + n,
+                        parent_message_id: None,
+                        source_provider: None,
+                        source_model: None,
+                    },
+                )
+                .await
+                .expect("seed owner history");
+        }
+        sessions.push(created.session_id);
+    }
+    let a = sessions[0].clone();
+    // The viewer follows session `a` (bookmark only; no local session row).
+    ext_method_json(
+        &viewer.handle,
+        "querymt/remote/attachSession",
+        serde_json::json!({ "node_id": node_id, "session_id": a }),
+    )
+    .await;
+
+    let fork_request = |cursor: Option<&str>, hint: Option<&str>| {
+        let mut req = crate::acp::protocol::ForkSessionRequest::new(
+            SessionId::from(a.clone()),
+            std::path::PathBuf::from("/tmp"),
+        );
+        if let Some(cursor) = cursor {
+            req.cursor_id = Some(cursor.to_owned().into());
+        }
+        if let Some(hint) = hint {
+            let mut meta = serde_json::Map::new();
+            meta.insert("querymt".into(), serde_json::json!({ "message_id": hint }));
+            req = req.meta(meta);
+        }
+        req
+    };
+    let owner_sessions = || async {
+        owner
+            .storage
+            .session_store()
+            .list_sessions()
+            .await
+            .unwrap()
+            .len()
+    };
+    let bookmarks = || async {
+        viewer
+            .storage
+            .session_store()
+            .list_remote_session_bookmarks()
+            .await
+            .unwrap()
+            .len()
+    };
+
+    // A forkable cursor forks at that message, on the owner, and the viewer
+    // bookmarks the fork instead of holding a local session.
+    let (sessions_before, bookmarks_before) = (owner_sessions().await, bookmarks().await);
+    let forked = viewer
+        .handle
+        .fork_session(fork_request(Some("m:a-2"), None))
+        .await
+        .expect("fork at a cursor of a remote-hosted session");
+    let fork_id = forked.session_id.to_string();
+    assert_eq!(owner_sessions().await, sessions_before + 1);
+    assert_eq!(
+        owner
+            .storage
+            .session_store()
+            .get_history(&fork_id)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "through a-2 and nothing after it, as a local fork"
+    );
+    assert_eq!(bookmarks().await, bookmarks_before + 1);
+    let fork_bookmark = viewer
+        .storage
+        .session_store()
+        .get_remote_session_bookmark(&fork_id)
+        .await
+        .unwrap()
+        .expect("the viewer bookmarks the fork");
+    assert_eq!(fork_bookmark.node_id, node_id);
+    assert_eq!(
+        fork_bookmark.fork_origin,
+        Some(crate::session::domain::ForkOrigin::User),
+        "a user fork is recorded as one"
+    );
+    let owner_fork = owner
+        .storage
+        .session_store()
+        .get_session(&fork_id)
+        .await
+        .unwrap()
+        .expect("the fork exists on the owner");
+    assert_eq!(
+        Some(fork_bookmark.created_at),
+        owner_fork.created_at.map(|ts| ts.unix_timestamp()),
+        "the bookmark carries the owner's creation time"
+    );
+    assert!(
+        viewer
+            .storage
+            .session_store()
+            .get_session(&fork_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the fork lives on the owner"
+    );
+
+    // The message-id hint still works, with the same boundary rule.
+    let hinted = viewer
+        .handle
+        .fork_session(fork_request(None, Some("a-1")))
+        .await
+        .expect("fork at the hint");
+    assert_eq!(
+        owner
+            .storage
+            .session_store()
+            .get_history(&hinted.session_id.to_string())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // A cursor takes precedence over the hint.
+    let both = viewer
+        .handle
+        .fork_session(fork_request(Some("m:a-3"), Some("a-1")))
+        .await
+        .expect("fork with both");
+    assert_eq!(
+        owner
+            .storage
+            .session_store()
+            .get_history(&both.session_id.to_string())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Invalid targets are `-32602`, create nothing on either node and never
+    // fall back to forking the whole session.
+    let (sessions_before, bookmarks_before) = (owner_sessions().await, bookmarks().await);
+    for (label, request) in [
+        ("unknown cursor", fork_request(Some("m:never"), None)),
+        ("undecodable cursor", fork_request(Some("x:a-1"), None)),
+        ("non-forkable cursor", fork_request(Some("c:call-1"), None)),
+        (
+            "another session's cursor",
+            fork_request(Some("m:b-1"), None),
+        ),
+        ("another session's hint", fork_request(None, Some("b-1"))),
+    ] {
+        let error = viewer.handle.fork_session(request).await.expect_err(label);
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::new(-32602),
+            "{label}: {error:?}"
+        );
+    }
+    assert_eq!(owner_sessions().await, sessions_before, "no owner fork");
+    assert_eq!(bookmarks().await, bookmarks_before, "no viewer bookmark");
+
+    // Workspace options do not travel over the mesh. They are refused rather
+    // than dropped, which would silently turn an isolated fork into a shared
+    // one, and nothing is created on either node.
+    for (label, workspace) in [
+        (
+            "isolation request",
+            serde_json::json!({ "execution": "worktree" }),
+        ),
+        (
+            "explicit local options",
+            serde_json::json!({ "execution": "local" }),
+        ),
+    ] {
+        let mut request = fork_request(Some("m:a-2"), None);
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "querymt".into(),
+            serde_json::json!({ "sessionWorkspace": workspace }),
+        );
+        request = request.meta(meta);
+        let error = viewer.handle.fork_session(request).await.expect_err(label);
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::new(-32602),
+            "{label}: {error:?}"
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!("remote_fork_workspace_options")),
+            "{label}: {error:?}"
+        );
+    }
+    // A malformed option keeps the validation error a local fork reports.
+    let mut request = fork_request(Some("m:a-2"), None);
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionWorkspace": { "execution": 7 } }),
+    );
+    request = request.meta(meta);
+    let error = viewer
+        .handle
+        .fork_session(request)
+        .await
+        .expect_err("malformed options");
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::new(-32602));
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&serde_json::json!("invalid_options")),
+        "{error:?}"
+    );
+    assert_eq!(owner_sessions().await, sessions_before, "no owner fork");
+    assert_eq!(bookmarks().await, bookmarks_before, "no viewer bookmark");
+}
