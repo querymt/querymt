@@ -23,6 +23,7 @@ jobs:
   format:
     name: Check Nix formatting
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

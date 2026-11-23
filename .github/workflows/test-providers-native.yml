@@ -60,6 +60,7 @@ jobs:
   detect-changes:
     name: Detect relevant changes
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     outputs:
       izwi:       ${{ steps.filter.outputs.izwi }}
       llama-cpp: ${{ steps.filter.outputs.llama-cpp }}

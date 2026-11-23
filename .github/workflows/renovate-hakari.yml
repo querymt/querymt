@@ -6,37 +6,55 @@ name: Renovate hakari
 # workflow regenerates the workspace-hack on Renovate branches and pushes the
 # result, so the PR goes green without manual work.
 #
+# Ordering: this workflow is the only one that handles Renovate's own commit.
+# Every other PR workflow skips jobs when `github.actor == 'renovate[bot]'`.
+# This workflow always pushes a commit (empty if the workspace-hack was already
+# up to date); that push is made by the PAT owner, so the regular PR CI runs on
+# it. Net effect: hakari first, then everything else.
+#
+# Triggering on pull_request (not push) guarantees the PR exists before we
+# push, so our push always produces a `synchronize` event for CI.
+#
 # The push uses HAKARI_PUSH_TOKEN (fine-grained PAT, Contents: read/write on
 # this repo). A push made with the default GITHUB_TOKEN would not trigger CI
-# again, leaving the PR stuck on the stale check.
+# again, leaving the PR without any checks.
 #
-# Loop safety: the job only runs for pushes by renovate[bot], and it only
-# commits when hakari actually produces a diff.
+# Loop safety: the job only runs for events caused by renovate[bot]; our own
+# push is attributed to the PAT owner.
 #
 # The commit author below is listed in `gitIgnoredAuthors` in
 # .github/renovate.json so Renovate keeps updating these branches.
+#
+# Branch protection: mark "Regenerate workspace-hack" as a required check. It
+# is skipped (counts as passing) on non-Renovate PRs and on our own push, and
+# pending/blocking on Renovate's commit until we are done.
 on:
-  push:
-    branches: ["renovate/**"]
+  pull_request:
+  # Manual runs from a renovate/** branch.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   hakari:
     name: Regenerate workspace-hack
-    # workflow_dispatch is for manual runs from a renovate/** branch.
-    if: github.actor == 'renovate[bot]' || github.event_name == 'workflow_dispatch'
+    if: >-
+      startsWith(github.head_ref || github.ref_name, 'renovate/') &&
+      (github.actor == 'renovate[bot]' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
+          # Pin to the triggering commit. If the branch moved in the meantime,
+          # the push below is rejected as non-fast-forward and the newer run
+          # takes over.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.HAKARI_PUSH_TOKEN }}
 
       - name: Install Rust toolchain
@@ -57,15 +75,15 @@ jobs:
           cargo hakari generate
           cargo hakari manage-deps --yes
 
-      - name: Commit and push changes
+      - name: Commit and push (hands off to CI)
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          if git diff --quiet; then
-            echo "workspace-hack is up to date; nothing to commit."
-            exit 0
-          fi
           git config user.name "hakari-bot"
           git config user.email "hakari-bot@querymt.invalid"
-          git commit -am "chore: regenerate workspace-hack"
+          if git diff --quiet; then
+            git commit --allow-empty -m "ci: workspace-hack up to date"
+          else
+            git commit -am "chore: regenerate workspace-hack"
+          fi
           git push origin "HEAD:refs/heads/${BRANCH}"

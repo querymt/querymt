@@ -30,6 +30,7 @@ jobs:
   detect-changes:
     name: Detect changed providers
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     outputs:
       anthropic:    ${{ steps.filter.outputs.anthropic }}
       codex:        ${{ steps.filter.outputs.codex }}

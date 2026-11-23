@@ -28,6 +28,7 @@ jobs:
   clippy:
     name: Clippy lints
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -45,6 +46,7 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
 
     steps:
       - name: Checkout code

@@ -28,6 +28,7 @@ jobs:
   detect:
     name: Detect affected packages
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     permissions:
       contents: read
       # dorny/paths-filter lists the files of a pull request through the API

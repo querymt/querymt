@@ -35,6 +35,7 @@ jobs:
   test-python-packages:
     name: ${{ matrix.package_name }}
     runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
     strategy:
       fail-fast: false
       matrix:
