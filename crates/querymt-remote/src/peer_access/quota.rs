@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{GrantStoreError, PeerGrantKey, SharingProtocol, valid_id};
 
 mod store;
-pub use store::{DispatchedAttempt, QuotaStore, ReservedAttempt};
+pub use store::{AccessEdit, DispatchedAttempt, QuotaStore, ReservedAttempt};
 
 /// Accumulates usage only when an upstream stream has reached a semantic terminal.
 #[derive(Default)]
@@ -328,8 +328,8 @@ mod ledger {
 
     use super::*;
     use crate::NodeId;
-    use crate::mesh_state::MeshAccessStore;
-    use crate::peer_access::{PeerGrant, PeerGrantState};
+    use crate::mesh_state::{MeshAccessStore, PeerAccessState};
+    use crate::peer_access::{PeerGrant, PeerGrantState, PolicyChange, PolicyEffect};
 
     /// Durable allowances, settled usage and replay keys. No open attempt is serialized.
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -600,6 +600,59 @@ mod ledger {
         }
     }
 
+    fn apply_quota_edit(
+        state: &mut PeerAccessState,
+        runtime: &QuotaRuntime,
+        key: &PeerGrantKey,
+        scope: QuotaScope,
+        edit: QuotaEdit,
+        now: i64,
+    ) -> Result<(bool, bool), QuotaError> {
+        let slot = state.quotas.ensure_slot(key, scope);
+        let entry = &mut state.quotas.scopes[slot];
+        let rolled = entry.roll_forward(runtime, slot, now)?;
+        let current = entry.periods.first_mut();
+        if let QuotaEdit::Update(limit) = edit {
+            let Some(period) = current else {
+                return Err(QuotaError::ReconfigureRequired);
+            };
+            if !matches!((period.limit, limit), (QuotaLimit::Finite { window, .. }, QuotaLimit::Finite { window: proposed, .. }) if window == proposed)
+            {
+                return Err(QuotaError::ReconfigureRequired);
+            }
+            let changed = period.limit != limit;
+            period.limit = limit;
+            return Ok((changed, rolled));
+        }
+        let clock = current
+            .as_ref()
+            .map_or(now, |period| now.max(period.started_at));
+        let (limit, next) = match edit {
+            QuotaEdit::Reset => match current {
+                Some(period) if matches!(period.limit, QuotaLimit::Finite { .. }) => {
+                    (period.limit, period.next_reset_at)
+                }
+                _ => return Err(QuotaError::NotFinite),
+            },
+            QuotaEdit::Reconfigure(limit) => {
+                let next = match limit {
+                    QuotaLimit::Unlimited => None,
+                    QuotaLimit::Finite { window, .. } => {
+                        boundaries(window, clock)?.map(|(_, end)| end)
+                    }
+                };
+                (limit, next)
+            }
+            QuotaEdit::Update(_) => unreachable!(),
+        };
+        if runtime.covers_open_attempt(key, &entry.scope) {
+            return Err(QuotaError::InFlight);
+        }
+        entry.open_period(limit, clock, next)?;
+        entry.prune(runtime, slot);
+        Ok((true, rolled))
+    }
+
     fn utc_date(now: i64) -> Result<Date, QuotaError> {
         OffsetDateTime::from_unix_timestamp(now)
             .map(|dt| dt.date())
@@ -674,6 +727,33 @@ mod ledger {
         status
     }
 
+    fn snapshot_quotas(
+        state: &mut PeerAccessState,
+        runtime: &QuotaRuntime,
+        key: &PeerGrantKey,
+        now: i64,
+    ) -> Result<(Vec<QuotaStatus>, bool), QuotaError> {
+        let mut quotas = Vec::new();
+        let mut persist = false;
+        for (slot, entry) in state
+            .quotas
+            .scopes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, entry)| entry.belongs_to(key))
+        {
+            persist |= entry.roll_forward(runtime, slot, now)?;
+            if let Some(period) = entry.periods.first() {
+                quotas.push(status(entry.scope.clone(), period, runtime, slot));
+            }
+        }
+        quotas.sort_by(|a, b| {
+            (&a.scope.provider_id, &a.scope.model_id)
+                .cmp(&(&b.scope.provider_id, &b.scope.model_id))
+        });
+        Ok((quotas, persist))
+    }
+
     #[async_trait]
     impl QuotaStore for MeshAccessStore {
         async fn access_snapshot(
@@ -684,95 +764,62 @@ mod ledger {
             utc_date(now)?;
             let key = key.clone();
             self.transact(move |state, runtime| {
-                let grant = state.grant(&key);
-                let mut quotas = Vec::new();
-                let mut persist = false;
-                for (slot, entry) in state
-                    .quotas
-                    .scopes
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(_, entry)| entry.belongs_to(&key))
-                {
-                    persist |= entry.roll_forward(runtime, slot, now)?;
-                    if let Some(period) = entry.periods.first() {
-                        quotas.push(status(entry.scope.clone(), period, runtime, slot));
-                    }
-                }
-                quotas.sort_by(|a, b| {
-                    (&a.scope.provider_id, &a.scope.model_id)
-                        .cmp(&(&b.scope.provider_id, &b.scope.model_id))
-                });
-                Ok(((grant, quotas), persist))
+                let (quotas, persist) = snapshot_quotas(state, runtime, &key, now)?;
+                Ok(((state.grant(&key), quotas), persist))
             })
             .await
         }
 
-        async fn edit_quota(
+        async fn edit_access(
             &self,
             key: &PeerGrantKey,
             expected: Uuid,
-            scope: &QuotaScope,
-            edit: QuotaEdit,
+            edit: AccessEdit,
             now: i64,
-        ) -> Result<Uuid, QuotaError> {
-            scope.validate()?;
+        ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError> {
             utc_date(now)?;
-            if let QuotaEdit::Update(limit) | QuotaEdit::Reconfigure(limit) = edit {
-                limit.validate()?;
+            match &edit {
+                AccessEdit::Grant(grant) => grant.validate().map_err(GrantStoreError::from)?,
+                AccessEdit::Quota(scope, edit) => {
+                    scope.validate()?;
+                    if let QuotaEdit::Update(limit) | QuotaEdit::Reconfigure(limit) = *edit {
+                        limit.validate()?;
+                    }
+                }
             }
-            let (key, scope) = (key.clone(), scope.clone());
-            self.transact(move |state, runtime| {
+            let key = key.clone();
+            self.transact_access(move |state, runtime| {
                 let mut grant = state.grant(&key);
                 if expected != grant.revision {
-                    return Err(GrantStoreError::Conflict { expected, actual: grant.revision }.into());
-                }
-                let slot = state.quotas.ensure_slot(&key, scope);
-                let entry = &mut state.quotas.scopes[slot];
-                let rolled = entry.roll_forward(runtime, slot, now)?;
-                let current = entry.periods.first_mut();
-                match edit {
-                    QuotaEdit::Update(limit) => {
-                        let Some(period) = current else {
-                            return Err(QuotaError::ReconfigureRequired);
-                        };
-                        if !matches!((period.limit, limit), (QuotaLimit::Finite { window, .. }, QuotaLimit::Finite { window: proposed, .. }) if window == proposed) {
-                            return Err(QuotaError::ReconfigureRequired);
-                        }
-                        if period.limit == limit {
-                            return Ok((grant.revision, rolled));
-                        }
-                        period.limit = limit;
+                    return Err(GrantStoreError::Conflict {
+                        expected,
+                        actual: grant.revision,
                     }
-                    QuotaEdit::Reset | QuotaEdit::Reconfigure(_) => {
-                        let clock = current.as_ref().map_or(now, |period| now.max(period.started_at));
-                        let (limit, next) = match edit {
-                            QuotaEdit::Reset => match current {
-                                Some(period) if matches!(period.limit, QuotaLimit::Finite { .. }) => (period.limit, period.next_reset_at),
-                                _ => return Err(QuotaError::NotFinite),
-                            },
-                            QuotaEdit::Reconfigure(limit) => {
-                                let next = match limit {
-                                    QuotaLimit::Unlimited => None,
-                                    QuotaLimit::Finite { window, .. } => boundaries(window, clock)?.map(|(_, end)| end),
-                                };
-                                (limit, next)
-                            }
-                            QuotaEdit::Update(_) => unreachable!(),
-                        };
-                        if runtime.covers_open_attempt(&key, &entry.scope) {
-                            return Err(QuotaError::InFlight);
-                        }
-                        entry.open_period(limit, clock, next)?;
-                        entry.prune(runtime, slot);
-                    }
+                    .into());
                 }
-                grant.revision = Uuid::now_v7();
-                let revision = grant.revision;
-                state.put_grant(&key, grant);
-                // Amount and period edits do not invalidate allowed work.
-                Ok((revision, true))
-            }).await
+                let mut change = None;
+                let (edited, rolled_target) = match edit {
+                    AccessEdit::Grant(next) if next == grant.grant => (false, false),
+                    AccessEdit::Grant(next) => {
+                        change = Some(PolicyChange {
+                            key: key.clone(),
+                            effect: PolicyEffect::Grant(next.clone()),
+                        });
+                        grant.grant = next;
+                        (true, false)
+                    }
+                    AccessEdit::Quota(scope, edit) => {
+                        apply_quota_edit(state, runtime, &key, scope, edit, now)?
+                    }
+                };
+                if edited {
+                    grant.revision = Uuid::now_v7();
+                    state.put_grant(&key, grant.clone());
+                }
+                let (quotas, rolled) = snapshot_quotas(state, runtime, &key, now)?;
+                Ok(((grant, quotas), edited || rolled || rolled_target, change))
+            })
+            .await
         }
 
         async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
@@ -1403,6 +1450,30 @@ mod ledger {
                     f.store.reserve(req).await.unwrap();
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn grant_edit_does_not_commit_or_publish_when_snapshot_rollover_fails() {
+            let f = Fixture::new().await;
+            let revision = f.limit(&scope(None), 50, QuotaWindow::Daily).await;
+            let mut changes = f.store.subscribe_changes().unwrap();
+            let last_day = Date::MAX.midnight().assume_utc().unix_timestamp();
+            assert!(matches!(
+                f.store
+                    .edit_access(
+                        &f.key,
+                        revision,
+                        AccessEdit::Grant(PeerGrant::Full),
+                        last_day
+                    )
+                    .await,
+                Err(QuotaError::InvalidTime)
+            ));
+            let grant = f.store.grant(&f.key).await.unwrap();
+            assert_eq!(grant.revision, revision);
+            assert_eq!(grant.grant, f.custom);
+            assert!(matches!(changes.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(f.restart().revision().await, revision);
         }
 
         #[tokio::test]

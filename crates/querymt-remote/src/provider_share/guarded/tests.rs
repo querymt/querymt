@@ -5,7 +5,7 @@ use crate::mesh_ingress::{
 };
 use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaEstimate, QuotaScope, QuotaSettlement,
+    AccessEdit, AttemptUsage, QuotaAttempt, QuotaEstimate, QuotaSettlement, QuotaStatus,
     ReservationId, ReservedAttempt,
 };
 use crate::peer_access::{
@@ -115,15 +115,14 @@ impl GrantStore for Store {
 
 #[async_trait]
 impl QuotaStore for Store {
-    async fn edit_quota(
+    async fn edit_access(
         &self,
         _: &PeerGrantKey,
         _: Uuid,
-        _: &QuotaScope,
-        _: QuotaEdit,
+        _: AccessEdit,
         _: i64,
-    ) -> Result<Uuid, QuotaError> {
-        unreachable!("fixture has immutable caps")
+    ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError> {
+        unreachable!("fixture has immutable policy")
     }
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
         if !self.grants.lock()[&attempt.peer].grant.allows_model(

@@ -108,7 +108,9 @@ mod access {
         peer_access::{
             GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant,
             SharingProtocol,
-            quota::{QuotaEdit, QuotaError, QuotaLimit, QuotaScope, QuotaStatus, QuotaWindow},
+            quota::{
+                AccessEdit, QuotaEdit, QuotaError, QuotaLimit, QuotaScope, QuotaStatus, QuotaWindow,
+            },
         },
     };
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -267,11 +269,6 @@ mod access {
         incoming: Option<MeshPeerIncomingAccess>,
         #[serde(skip_serializing_if = "Option::is_none")]
         shareable_catalog: Option<Vec<MeshShareableProvider>>,
-    }
-
-    enum Edit {
-        Grant(Uuid, PeerGrant),
-        Quota(Uuid, QuotaScope, QuotaEdit),
     }
 
     fn invalid() -> Error {
@@ -621,7 +618,7 @@ mod access {
                 (
                     version,
                     peer_id,
-                    Some(Edit::Grant(expected_revision, grant)),
+                    Some((expected_revision, AccessEdit::Grant(grant))),
                 )
             }
             "querymt/mesh/setPeerQuota" => {
@@ -655,7 +652,7 @@ mod access {
                 (
                     version,
                     peer_id,
-                    Some(Edit::Quota(expected_revision, scope, edit)),
+                    Some((expected_revision, AccessEdit::Quota(scope, edit))),
                 )
             }
             "querymt/mesh/resetPeerQuota" => {
@@ -668,7 +665,10 @@ mod access {
                 (
                     version,
                     peer_id,
-                    Some(Edit::Quota(expected_revision, scope, QuotaEdit::Reset)),
+                    Some((
+                        expected_revision,
+                        AccessEdit::Quota(scope, QuotaEdit::Reset),
+                    )),
                 )
             }
             _ => return Err(Error::method_not_found()),
@@ -691,33 +691,27 @@ mod access {
         }
         let key = PeerGrantKey { host, peer };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let change = match edit {
-            Some(Edit::Grant(expected, grant)) => {
-                let state = store
-                    .replace_grant(&key, expected, grant)
-                    .await
-                    .map_err(grant_error)?;
-                (state.revision != expected)
-                    .then_some(crate::agent::remote::node_manager::PeerAccessInvalidated::Policy)
+        let (state, statuses) = if let Some((expected, edit)) = edit {
+            use crate::agent::remote::node_manager::PeerAccessInvalidated;
+            let (reason, scope) = match &edit {
+                AccessEdit::Grant(_) => (PeerAccessInvalidated::Policy, None),
+                AccessEdit::Quota(scope, _) => (PeerAccessInvalidated::Quota, Some(scope.clone())),
+            };
+            let snapshot = store
+                .edit_access(&key, expected, edit, now)
+                .await
+                .map_err(|error| quota_error(error, scope.as_ref()))?;
+            if snapshot.0.revision != expected {
+                notify(&agent.ext_notifications, &key.peer, "outgoing", reason);
+                notify_peer(mesh.clone(), key.peer.clone(), reason);
             }
-            Some(Edit::Quota(expected, scope, edit)) => {
-                let revision = store
-                    .edit_quota(&key, expected, &scope, edit, now)
-                    .await
-                    .map_err(|error| quota_error(error, Some(&scope)))?;
-                (revision != expected)
-                    .then_some(crate::agent::remote::node_manager::PeerAccessInvalidated::Quota)
-            }
-            None => None,
+            snapshot
+        } else {
+            store
+                .access_snapshot(&key, now)
+                .await
+                .map_err(|error| quota_error(error, None))?
         };
-        if let Some(reason) = change {
-            notify(&agent.ext_notifications, &key.peer, "outgoing", reason);
-            notify_peer(mesh.clone(), key.peer.clone(), reason);
-        }
-        let (state, statuses) = store
-            .access_snapshot(&key, now)
-            .await
-            .map_err(|error| quota_error(error, None))?;
         let quotas: Vec<_> = statuses
             .into_iter()
             .map(|quota| quota_wire(&state.grant, quota))

@@ -474,16 +474,39 @@ impl MeshAccessStore {
         T: Send + 'static,
         E: From<GrantStoreError> + Send + 'static,
     {
+        self.transact_access(move |access, runtime| {
+            let (value, persist) = f(access, runtime)?;
+            Ok((value, persist, None))
+        })
+        .await
+    }
+
+    pub(crate) async fn transact_access<T, E>(
+        &self,
+        f: impl FnOnce(
+            &mut PeerAccessState,
+            &mut QuotaRuntime,
+        ) -> Result<(T, bool, Option<PolicyChange>), E>
+        + Send
+        + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<GrantStoreError> + Send + 'static,
+    {
         let owner = Arc::clone(&self.owner);
         tokio::task::spawn_blocking(move || {
             let mut state = owner.write();
             let mut access = state.state.peer_access.clone();
             let mut runtime = state.quota_runtime.clone();
-            let (value, persist) = f(&mut access, &mut runtime)?;
+            let (value, persist, change) = f(&mut access, &mut runtime)?;
             if persist {
                 state.save_access(access)?;
             }
             state.quota_runtime = runtime;
+            if let Some(change) = change {
+                let _ = state.changes.send(change);
+            }
             Ok(value)
         })
         .await

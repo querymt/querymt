@@ -9,8 +9,14 @@ use super::{
 };
 use crate::{
     NodeId,
-    peer_access::{GrantStore, PeerGrantKey},
+    peer_access::{GrantStore, PeerGrant, PeerGrantKey, PeerGrantState},
 };
+
+/// An owner edit guarded by the shared grant/quota revision.
+pub enum AccessEdit {
+    Grant(PeerGrant),
+    Quota(QuotaScope, QuotaEdit),
+}
 
 /// Durable quota operations. All implementations must serialize admission and edits.
 #[async_trait]
@@ -29,6 +35,15 @@ pub trait QuotaStore: GrantStore {
         Ok((self.grant(key).await?, Vec::new()))
     }
 
+    /// Apply an owner edit and build its grant and quota snapshot in the same transaction.
+    async fn edit_access(
+        &self,
+        key: &PeerGrantKey,
+        expected: Uuid,
+        edit: AccessEdit,
+        now: i64,
+    ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError>;
+
     /// Edit a quota and advance the same revision used for grant edits.
     async fn edit_quota(
         &self,
@@ -37,7 +52,12 @@ pub trait QuotaStore: GrantStore {
         scope: &QuotaScope,
         edit: QuotaEdit,
         now: i64,
-    ) -> Result<Uuid, QuotaError>;
+    ) -> Result<Uuid, QuotaError> {
+        let (grant, _) = self
+            .edit_access(key, expected, AccessEdit::Quota(scope.clone(), edit), now)
+            .await?;
+        Ok(grant.revision)
+    }
 
     /// Require the initiating grant revision and atomically reserve all applicable finite scopes.
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError>;
