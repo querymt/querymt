@@ -641,6 +641,8 @@ mod tests {
         contract_info: std::sync::Mutex<ProviderContractInfo>,
         contract_calls: AtomicUsize,
         contract_error: Option<TransportErrorKind>,
+        consumer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>>>,
+        terminal_on_renewal: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -682,9 +684,10 @@ mod tests {
             _host: &Self::HostRef,
             _session_id: &str,
             _request_id: &str,
-            _consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
+            consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
         ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
-            unreachable!("not used by contract tests")
+            *self.consumer.lock().unwrap() = Some(consumer_tx);
+            Ok(((), ()))
         }
 
         async fn send_chat_request(
@@ -700,7 +703,7 @@ mod tests {
             _host: &Self::HostRef,
             _request: ProviderStreamRequest<Self::RemoteRouterRef>,
         ) -> Result<(), LLMError> {
-            unreachable!("not used by contract tests")
+            Ok(())
         }
 
         async fn cancel_stream(
@@ -718,7 +721,20 @@ mod tests {
             _request_id: &str,
             _lease_ttl_secs: u64,
         ) -> Result<bool, LLMError> {
-            Ok(true)
+            if self.terminal_on_renewal.swap(false, Ordering::Relaxed) {
+                self.consumer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .send(StreamRelayMessage::Chunk(
+                        querymt::chat::StreamChunk::Done {
+                            finish_reason: querymt::chat::FinishReason::Stop,
+                        },
+                    ))
+                    .unwrap();
+            }
+            Ok(false)
         }
 
         async fn get_stream_status(
@@ -752,6 +768,8 @@ mod tests {
             contract_info: std::sync::Mutex::new(contract_info),
             contract_calls: AtomicUsize::new(0),
             contract_error,
+            consumer: Default::default(),
+            terminal_on_renewal: Default::default(),
         });
         let core = RemoteProviderClientCore::new(
             Arc::clone(&transport),
@@ -846,6 +864,46 @@ mod tests {
         provider.core().negotiate_contract().await.unwrap();
         assert!(provider.capabilities().streaming);
         assert_eq!(provider.output_provenance(), None);
+    }
+
+    #[tokio::test]
+    async fn remote_stream_waits_for_an_in_flight_terminal_but_ends_if_it_is_lost() {
+        use futures_util::StreamExt as _;
+        use querymt::chat::ChatProvider as _;
+        for terminal in [true, false] {
+            let (transport, _) = core_with_contract(ProviderContractInfo {
+                protocol_version: Some(MESH_PROTOCOL_VERSION),
+                capabilities: ChatCapabilities::NONE.with_streaming(true),
+                item_aware_chat_version: None,
+                generation: Default::default(),
+            });
+            transport
+                .terminal_on_renewal
+                .store(terminal, Ordering::Relaxed);
+            let core = RemoteProviderClientCore::new(
+                transport,
+                RemoteProviderClientConfig::new("peer", "fixture", "model")
+                    .with_stream_controls(10, 3),
+            );
+            let provider = crate::RemoteChatProvider::new(core);
+            let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if terminal {
+                assert!(querymt::chat::chunk_is_terminal(&result.unwrap()));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(LLMError::Transport {
+                        kind: TransportErrorKind::ConnectionClosed,
+                        ..
+                    })
+                ));
+            }
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use querymt::chat::{
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -259,13 +259,21 @@ where
             "remote provider stream consumer ready"
         );
 
+        let relay_timeout = crate::provider_host_actor::STREAM_RELAY_TIMEOUT;
+        // Authorization and the first send can each consume a relay timeout
+        // before the host detects a disconnect and starts its own grace.
+        let lease_loss_grace = reconnect_grace
+            .max(Duration::from_secs(1))
+            .saturating_add(relay_timeout.saturating_mul(2));
         let stream = futures_util::stream::unfold(
-            (
+            Some((
                 raw_stream,
                 RemoteProviderStreamState::new(),
                 tokio::time::Instant::now() + lease_renew_every,
-            ),
-            move |(mut raw_stream, mut stream_state, mut renew_due)| {
+                None::<tokio::time::Instant>,
+                None::<crate::provider_client_runtime::RenewLeaseFuture>,
+            )),
+            move |state| {
                 let session_id_for_stream = session_id_for_stream.clone();
                 let request_id_for_stream = request_id_for_stream.clone();
                 let target_peer_id_display = target_peer_id_display.clone();
@@ -277,6 +285,13 @@ where
                 let renew_lease = renew_lease_factory.clone();
                 let peer_alive_fn = peer_alive_fn.clone();
                 async move {
+                    let (
+                        mut raw_stream,
+                        mut stream_state,
+                        mut renew_due,
+                        mut lease_lost_at,
+                        mut renewal,
+                    ) = state?;
                     if stream_state.is_finished() {
                         tracing::debug!(
                             target: "querymt_remote::provider::stream",
@@ -311,54 +326,52 @@ where
                                 "stream terminal received from remote provider pending batch"
                             );
                         }
-                        return Some((Ok(chunk), (raw_stream, stream_state, renew_due)));
+                        return Some((
+                            Ok(chunk),
+                            Some((raw_stream, stream_state, renew_due, lease_lost_at, renewal)),
+                        ));
                     }
 
                     loop {
                         let now = tokio::time::Instant::now();
-                        let sleep = if now >= renew_due {
-                            let _ = renew_lease().await;
-                            renew_due = tokio::time::Instant::now() + lease_renew_every;
-                            tokio::time::sleep(std::time::Duration::ZERO)
-                        } else {
-                            tokio::time::sleep_until(renew_due)
+                        if renewal.is_none() && now >= renew_due {
+                            let renew = renew_lease();
+                            renewal = Some(Box::pin(async move {
+                                tokio::time::timeout(lease_renew_every, renew)
+                                    .await
+                                    .unwrap_or(false)
+                            }));
+                        }
+                        let reconnect = stream_state.reconnect_remaining(reconnect_grace);
+                        // The host may unregister before its terminal is delivered.
+                        // A positive renewal clears this deadline; callbacks alone do not.
+                        let lost =
+                            lease_lost_at.map(|at| lease_loss_grace.saturating_sub(at.elapsed()));
+                        let next = tokio::select! {
+                            biased;
+                            _ = sleep_if_set(lost) => return Some((Err(LLMError::Transport {
+                                kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                                message: "remote provider stream lease could not be renewed and no terminal arrived".into(),
+                            }), None)),
+                            _ = sleep_if_set(reconnect) => return Some((
+                                Err(RemoteProviderClientCore::<TTransport>::reconnect_timeout_error(reconnect_grace)), None,
+                            )),
+                            renewed = async { renewal.as_mut().expect("renewal branch requires a future").await }, if renewal.is_some() => {
+                                let now = tokio::time::Instant::now();
+                                if renewed {
+                                    lease_lost_at = None;
+                                } else {
+                                    lease_lost_at.get_or_insert(now);
+                                }
+                                renewal = None;
+                                renew_due = now + if renewed { lease_renew_every } else { lease_renew_every.min(lease_loss_grace / 2) };
+                                continue;
+                            }
+                            item = raw_stream.next() => item,
+                            _ = tokio::time::sleep_until(renew_due), if renewal.is_none() => continue,
                         };
 
-                        let next = if let Some(remaining) =
-                            stream_state.reconnect_remaining(reconnect_grace)
-                        {
-                            if remaining.is_zero() {
-                                return Some((
-                                    Err(RemoteProviderClientCore::<TTransport>::reconnect_timeout_error(reconnect_grace)),
-                                    (raw_stream, stream_state, renew_due),
-                                ));
-                            }
-                            tokio::select! {
-                                item = raw_stream.next() => item,
-                                _ = sleep => {
-                                    let _ = renew_lease().await;
-                                    renew_due = tokio::time::Instant::now() + lease_renew_every;
-                                    continue;
-                                }
-                                _ = tokio::time::sleep(remaining) => {
-                                    return Some((
-                                        Err(RemoteProviderClientCore::<TTransport>::reconnect_timeout_error(reconnect_grace)),
-                                        (raw_stream, stream_state, renew_due),
-                                    ));
-                                }
-                            }
-                        } else {
-                            tokio::select! {
-                                item = raw_stream.next() => item,
-                                _ = sleep => {
-                                    let _ = renew_lease().await;
-                                    renew_due = tokio::time::Instant::now() + lease_renew_every;
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let peer_alive = peer_alive_fn().await;
+                        let peer_alive = next.is_some() || peer_alive_fn().await;
                         match RemoteProviderClientCore::<TTransport>::poll_stream_message(
                             crate::PollStreamContext {
                                 setup_span: setup_span.clone(),
@@ -376,13 +389,22 @@ where
                             peer_alive,
                         ) {
                             Ok(Some(chunk)) => {
-                                break Some((Ok(chunk), (raw_stream, stream_state, renew_due)));
+                                break Some((
+                                    Ok(chunk),
+                                    Some((
+                                        raw_stream,
+                                        stream_state,
+                                        renew_due,
+                                        lease_lost_at,
+                                        renewal,
+                                    )),
+                                ));
                             }
                             Ok(None) => {
                                 continue;
                             }
                             Err(error) => {
-                                break Some((Err(error), (raw_stream, stream_state, renew_due)));
+                                break Some((Err(error), None));
                             }
                         }
                     }
@@ -391,6 +413,14 @@ where
         );
 
         Ok(Box::pin(stream))
+    }
+}
+
+async fn sleep_if_set(duration: Option<Duration>) {
+    match duration {
+        Some(duration) if !duration.is_zero() => tokio::time::sleep(duration).await,
+        Some(_) => {}
+        None => std::future::pending().await,
     }
 }
 
