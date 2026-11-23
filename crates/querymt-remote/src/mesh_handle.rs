@@ -267,6 +267,19 @@ impl MeshHandle {
     ) where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
+        let _ = self.start_register_actor(actor_ref, name).await;
+    }
+
+    /// Install the registration before returning, then publish in the background.
+    /// Owners can serialize this call with deregistration without awaiting DHT I/O.
+    pub fn start_register_actor<A>(
+        &self,
+        actor_ref: kameo::actor::ActorRef<A>,
+        name: impl Into<String>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
         let name = name.into();
         let re_register = {
             let mut states = self.registration_states.lock();
@@ -323,7 +336,17 @@ impl MeshHandle {
         };
         // Let publication finish its compensating withdrawal even if an
         // attachment deadline cancels the caller while Kameo is publishing.
-        let _ = tokio::spawn(re_register()).await;
+        tokio::spawn(re_register())
+    }
+
+    /// Whether these handles use the same local registration owner.
+    pub fn same_export_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registration_states, &other.registration_states)
+            && match (self.inbound_router(), other.inbound_router()) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub async fn lookup_actor<A>(

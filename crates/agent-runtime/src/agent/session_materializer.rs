@@ -25,8 +25,6 @@ use crate::acp::protocol::{
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
-#[cfg(feature = "remote")]
-use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_mcp::{
     ConnectedMcpPeer, SessionMaterializationKind, SessionMcpAttachmentContext,
@@ -37,8 +35,6 @@ use crate::agent::session_registry::{
 use crate::worktree::{WorkspaceBinding, WorkspaceService};
 use kameo::actor::{ActorRef, Spawn};
 use querymt_agent_core::events::AgentEventKind;
-#[cfg(feature = "remote")]
-use querymt_remote::MeshRuntimeHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1546,26 +1542,6 @@ impl SessionMaterializer {
         prepared: &PreparedSession,
         initialize_workspace_index: bool,
     ) -> Result<(), Error> {
-        // Register in DHT if requested (for remote sessions)
-        #[cfg(feature = "remote")]
-        if prepared.register_in_dht
-            && let Some(mesh) = self.mesh()
-        {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            crate::agent::remote::remote_actor_impl::register_session_routes(
-                &mesh,
-                &prepared.actor_ref,
-            );
-            for scope in runtime.active_scopes() {
-                let dht_name = scoped_session(&scope, &prepared.session_id);
-                let runtime = runtime.clone();
-                let actor_ref = prepared.actor_ref.clone();
-                tokio::spawn(async move {
-                    runtime.register_actor(actor_ref, dht_name).await;
-                });
-            }
-        }
-
         // Emit SessionCreated before later setup events so callers that await finalization
         // can observe session creation deterministically.
         self.config

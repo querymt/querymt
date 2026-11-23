@@ -42,6 +42,8 @@ impl LocalAgentHandle {
         let mut registry_inner = SessionRegistry::new(config.clone());
         #[cfg(feature = "remote")]
         registry_inner.set_remote_disconnect_tx(remote_disconnect_tx);
+        #[cfg(feature = "remote")]
+        let session_exports = registry_inner.exports.clone();
         let registry = Arc::new(Mutex::new(registry_inner));
         #[cfg(feature = "remote")]
         {
@@ -106,6 +108,8 @@ impl LocalAgentHandle {
             default_reasoning_effort: ArcSwap::from_pointee(None),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
+            #[cfg(feature = "remote")]
+            session_exports,
             #[cfg(feature = "remote")]
             local_mesh_actor_refs: OnceCell::new(),
             #[cfg(feature = "remote")]

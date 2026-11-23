@@ -124,7 +124,7 @@ mod remote_impl {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
     use tokio::sync::Mutex;
 
     // ── Messages ──────────────────────────────────────────────────────────────
@@ -510,7 +510,7 @@ mod remote_impl {
         pub mesh: Option<MeshHandle>,
         /// Per-session async locks preventing concurrent materialization of the
         /// same `session_id`.  Different sessions are independent.
-        pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+        materialization_locks: Arc<MaterializationLocks>,
         /// Shared scheduler owner borrowed from the local agent handle.
         pub scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
         /// Serializes first-start attempts so concurrent requests converge on one result.
@@ -565,7 +565,7 @@ mod remote_impl {
                 session_materializer,
                 session_meta: Arc::new(Mutex::new(HashMap::new())),
                 mesh,
-                materialization_locks: Arc::new(Mutex::new(HashMap::new())),
+                materialization_locks: Default::default(),
                 scheduler_handle,
                 scheduler_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
@@ -1110,9 +1110,6 @@ mod remote_impl {
                 return SessionHandoff::no_attach_path();
             }
 
-            if let Some(mesh) = &self.mesh {
-                crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor_ref);
-            }
             match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
                 .catch_unwind()
                 .await
@@ -1151,14 +1148,8 @@ mod remote_impl {
             // Prevents two concurrent callers from materializing the same
             // session_id into separate SessionActor instances.  Different
             // session IDs proceed independently.
-            let session_lock = {
-                let mut locks = self.materialization_locks.lock().await;
-                locks
-                    .entry(session_id.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .clone()
-            };
-            let _guard = session_lock.lock().await;
+            let session_lock = MaterializationTicket::new(&self.materialization_locks, &session_id);
+            let _guard = session_lock.lock.lock().await;
 
             let (registry, materializer) = self
                 .bound_session_runtime(&session_id)
@@ -1171,10 +1162,7 @@ mod remote_impl {
             if let Some(crate::agent::remote::SessionActorRef::Local(existing)) =
                 crate::agent::session_registry::live_session(&registry, &session_id).await
             {
-                let handoff = self.handoff_for_local_actor(&session_id, existing).await;
-                self.cleanup_materialization_lock(&session_id, &session_lock)
-                    .await;
-                return Ok(handoff);
+                return Ok(self.handoff_for_local_actor(&session_id, existing).await);
             }
 
             let restricted = match peer {
@@ -1253,25 +1241,70 @@ mod remote_impl {
                 title
             );
 
-            drop(_guard);
-            self.cleanup_materialization_lock(&session_id, &session_lock)
-                .await;
-
             Ok(handoff)
         }
+    }
 
-        /// Best-effort cleanup of a per-session lock map entry when no other
-        /// task is waiting on it.
-        async fn cleanup_materialization_lock(
-            &self,
-            session_id: &str,
-            lock: &Arc<tokio::sync::Mutex<()>>,
-        ) {
-            let mut locks = self.materialization_locks.lock().await;
-            if Arc::strong_count(lock) == 2 {
-                locks.remove(session_id);
+    type MaterializationLocks = parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>;
+
+    struct MaterializationTicket<'a> {
+        id: String,
+        lock: Arc<Mutex<()>>,
+        locks: &'a MaterializationLocks,
+    }
+
+    impl<'a> MaterializationTicket<'a> {
+        fn new(locks: &'a MaterializationLocks, id: &str) -> Self {
+            use std::collections::hash_map::Entry;
+            let lock = match locks.lock().entry(id.to_owned()) {
+                Entry::Occupied(entry) => {
+                    entry.get().upgrade().expect("live materialization ticket")
+                }
+                Entry::Vacant(entry) => {
+                    let lock = Arc::new(Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            };
+            Self {
+                id: id.to_owned(),
+                lock,
+                locks,
             }
         }
+    }
+
+    impl Drop for MaterializationTicket<'_> {
+        fn drop(&mut self) {
+            let mut locks = self.locks.lock();
+            // Release the ticket's strong reference under the same lock used
+            // to admit waiters, including when an awaiting caller is dropped.
+            if Arc::strong_count(&self.lock) == 1 {
+                locks.remove(&self.id);
+            } else {
+                // Drop before releasing the map lock so concurrent drops
+                // cannot both count each other and leave an expired entry.
+                drop(std::mem::take(&mut self.lock));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_materialization_waiter_retires_its_ticket() {
+        let locks = MaterializationLocks::default();
+        let owner = MaterializationTicket::new(&locks, "session");
+        let hold = owner.lock.lock().await;
+        let waiter = MaterializationTicket::new(&locks, "session");
+        assert!(Arc::ptr_eq(&owner.lock, &waiter.lock));
+        let mut acquire = Box::pin(async move {
+            let _guard = waiter.lock.lock().await;
+        });
+        assert!(futures_util::poll!(&mut acquire).is_pending());
+        drop(acquire);
+        assert!(locks.lock().contains_key("session"));
+        drop(hold);
+        drop(owner);
+        assert!(locks.lock().is_empty());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

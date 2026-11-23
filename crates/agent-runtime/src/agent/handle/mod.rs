@@ -138,6 +138,9 @@ pub struct LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 
+    #[cfg(feature = "remote")]
+    session_exports: Arc<ParkingMutex<crate::agent::session_registry::SessionExports>>,
+
     /// Keepalive refs for mesh-visible local actors so new scopes can re-register
     /// the existing node manager/provider host without respawning them.
     #[cfg(feature = "remote")]
