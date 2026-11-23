@@ -311,6 +311,44 @@ async fn provider_relay_requires_expected_host_and_active_request_without_revers
     assert!(
         matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "legacy data")
     );
+
+    let ask = |request_id: &str| {
+        let SwarmRequest::Tell {
+            actor_id,
+            actor_remote_id,
+            message_remote_id,
+            payload,
+            ..
+        } = relay(request_id, "V1 data")
+        else {
+            unreachable!()
+        };
+        SwarmRequest::Ask {
+            actor_id,
+            actor_remote_id,
+            message_remote_id,
+            payload,
+            mailbox_timeout: None,
+            reply_timeout: None,
+            immediate: false,
+        }
+    };
+    assert!(matches!(
+        ingress.handle_v1(PeerId::random(), ask("active")).await,
+        Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+    ));
+    assert!(matches!(
+        ingress.handle_v1(host, ask("missing")).await,
+        Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+    ));
+    assert!(rx.try_recv().is_err());
+    assert!(matches!(
+        ingress.handle_v1(host, ask("active")).await,
+        Ok(SwarmResponse::Ask(Ok(_)))
+    ));
+    assert!(
+        matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "V1 data")
+    );
 }
 
 #[tokio::test]
