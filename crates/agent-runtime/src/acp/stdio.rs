@@ -56,6 +56,8 @@ pub struct AcpSessionLoadOutcome {
     /// The last event the answer (snapshot or replay) contains.
     #[doc(hidden)]
     pub cut: Option<crate::acp::delivery::LoadCut>,
+    /// The response's snapshot, read once for the cut and the translator seed.
+    pub(crate) snapshot: Option<crate::acp::snapshot_view::LoadSnapshotView>,
 }
 
 fn stored_user_prompt_blocks(
@@ -277,6 +279,7 @@ async fn prepare_session_load(
     // The snapshot carries the session's cursors only for a client that
     // advertised them.
     crate::acp::shared::scope_load_cursor_updates(response.meta.as_mut(), capabilities);
+    let snapshot = crate::acp::snapshot_view::LoadSnapshotView::from_meta(response.meta.as_ref());
     // Snapshot-capable clients hydrate history from the load-response snapshot.
     // Skipping replay here also avoids the redundant event-stream and message
     // reads that only exist to produce historical notifications.
@@ -288,7 +291,7 @@ async fn prepare_session_load(
         (
             Vec::new(),
             0,
-            crate::acp::delivery::LoadCut::from_snapshot_meta(response.meta.as_ref()),
+            snapshot.as_ref().map(|snapshot| snapshot.cut),
         )
     };
     tracing::Span::current().record("session.load.event_count", event_count as i64);
@@ -301,6 +304,7 @@ async fn prepare_session_load(
         notifications,
         event_count,
         cut,
+        snapshot,
     })
 }
 
@@ -371,6 +375,7 @@ async fn load_session_and_enqueue_replay(
             Some(agent.as_ref()),
             &session_id,
             &outcome.response,
+            outcome.snapshot.as_ref(),
             translator,
         )
         .await;

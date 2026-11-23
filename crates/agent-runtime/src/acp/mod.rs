@@ -10,6 +10,7 @@ pub mod cwd;
 pub mod delivery;
 pub use querymt_agent_core::protocol;
 pub mod shared;
+mod snapshot_view;
 #[doc(hidden)]
 pub mod stdio;
 #[doc(hidden)]

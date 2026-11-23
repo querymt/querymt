@@ -15,6 +15,7 @@ use crate::acp::protocol::{
     TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     UsageUpdate,
 };
+use crate::acp::snapshot_view::LoadSnapshotView;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::delegation_notifications::DelegationUpdateNotification;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
@@ -623,17 +624,10 @@ pub(crate) async fn session_events(
 pub(crate) async fn seed_loaded_run_state(
     agent: &AgentHandle,
     session_id: &str,
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    snapshot: Option<&LoadSnapshotView>,
     translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
 ) {
-    let from_snapshot = meta
-        .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
-        .map(|snapshot| {
-            snapshot
-                .pointer("/runtimeStatus/active_run_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
+    let from_snapshot = snapshot.map(|snapshot| snapshot.active_run_id.clone());
     let session_ref = agent.owned_session_ref(session_id).await;
     let run_id = match from_snapshot {
         Some(run_id) => run_id,
@@ -664,16 +658,20 @@ pub(crate) async fn seed_loaded_run_state(
 /// state (when the agent is local), the configuration options and the usage,
 /// delegation and compaction state of the history the snapshot carries.
 ///
+/// `snapshot` is the view of `response`'s snapshot, read once by the caller
+/// (it also takes the load's cut from it).
+///
 /// Returns the delegation updates that history recovered, or `None` when the
-/// response carries no snapshot, so the caller reads the history itself.
+/// response carries no snapshot history, so the caller reads it itself.
 pub(crate) async fn seed_translator_from_load(
     local_agent: Option<&AgentHandle>,
     session_id: &str,
     response: &crate::acp::protocol::LoadSessionResponse,
+    snapshot: Option<&LoadSnapshotView>,
     translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
 ) -> Option<Vec<DelegationUpdateNotification>> {
     if let Some(local_agent) = local_agent {
-        seed_loaded_run_state(local_agent, session_id, response.meta.as_ref(), translator).await;
+        seed_loaded_run_state(local_agent, session_id, snapshot, translator).await;
     }
     let mut translator = translator
         .lock()
@@ -681,7 +679,7 @@ pub(crate) async fn seed_translator_from_load(
     if let Some(options) = response.config_options.as_ref() {
         translator.seed_config_options(session_id, options);
     }
-    translator.seed_history_from_meta(session_id, response.meta.as_ref())
+    translator.seed_history_from_snapshot(session_id, snapshot?)
 }
 
 pub(crate) async fn restore_session_history(
@@ -1765,18 +1763,6 @@ fn model_changed_update(
     SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta))
 }
 
-/// The whole-session summary of a windowed load snapshot, when the snapshot
-/// does not contain the complete history.
-fn windowed_summary(
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<crate::session::history_window::SessionHistorySummary> {
-    let snapshot = meta?.get("querymt/sessionLoadSnapshot.v1")?;
-    if snapshot["history"]["complete"].as_bool() != Some(false) {
-        return None;
-    }
-    serde_json::from_value(snapshot.get("summary")?.clone()).ok()
-}
-
 /// The model a session uses, as far as its context measurement is concerned.
 /// Selecting the same provider, model and limit again (another configuration
 /// or node) does not make a measurement stale.
@@ -2575,62 +2561,35 @@ impl AcpLiveEventTranslator {
     }
 
     /// Reuse load snapshots rather than issuing a second full history read.
+    /// `None` when the snapshot carries no event list.
+    pub(crate) fn seed_history_from_snapshot(
+        &mut self,
+        session_id: &str,
+        snapshot: &LoadSnapshotView,
+    ) -> Option<Vec<DelegationUpdateNotification>> {
+        let history = snapshot.history.as_ref()?;
+        if let Some(summary) = &snapshot.summary {
+            self.seed_prior_usage(session_id, summary);
+        }
+        let recovered = self.seed_history(session_id, &history.events);
+        if let Some(summary) = &snapshot.summary {
+            self.seed_whole_session_state(session_id, summary);
+        }
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        usage.partial |= history.partial;
+        // A later load after the fill reports exact values and lifts the limit.
+        usage.untransferred_history = snapshot.untransferred_history;
+        Some(recovered)
+    }
+
+    /// [`Self::seed_history_from_snapshot`] for a response's `_meta`.
+    #[cfg(test)]
     pub(crate) fn seed_history_from_meta(
         &mut self,
         session_id: &str,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Option<Vec<DelegationUpdateNotification>> {
-        let events = meta
-            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
-            .and_then(|snapshot| snapshot.get("audit"))
-            .and_then(|audit| audit.get("events"))
-            .and_then(serde_json::Value::as_array)?;
-        let mut partial = false;
-        let mut history = Vec::new();
-        for event in events {
-            if !matches!(
-                event["kind"]["type"].as_str(),
-                Some(
-                    "llm_request_end"
-                        | "compaction_end"
-                        | "provider_changed"
-                        | "llm_attempt_started"
-                        | "llm_attempt_settled"
-                        | "delegation_requested"
-                        | "session_forked"
-                        | "delegation_completed"
-                        | "delegation_failed"
-                        | "delegation_cancelled"
-                )
-            ) {
-                continue;
-            }
-            match serde_json::from_value::<AgentEvent>(event.clone()) {
-                Ok(event) => history.push(event),
-                Err(_) => partial = true,
-            }
-        }
-        let summary = windowed_summary(meta);
-        if let Some(summary) = &summary {
-            self.seed_prior_usage(session_id, summary);
-        }
-        let recovered = self.seed_history(session_id, &history);
-        if let Some(summary) = &summary {
-            self.seed_whole_session_state(session_id, summary);
-        }
-        let untransferred = meta
-            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
-            .and_then(|snapshot| snapshot["accounting"]["session"]["reasons"].as_array())
-            .is_some_and(|reasons| {
-                reasons
-                    .iter()
-                    .any(|reason| reason["kind"] == "untransferred_history")
-            });
-        let usage = self.usage.entry(session_id.to_owned()).or_default();
-        usage.partial |= partial;
-        // A later load after the fill reports exact values and lifts the limit.
-        usage.untransferred_history = untransferred;
-        Some(recovered)
+        self.seed_history_from_snapshot(session_id, &LoadSnapshotView::from_meta(meta)?)
     }
 
     /// Before the window's own events are observed: start token totals from
@@ -3717,14 +3676,16 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
-                                    let mut cut = crate::acp::delivery::LoadCut::from_snapshot_meta(
-                                        r.meta.as_ref(),
-                                    );
+                                    // The cut and the translator seed read the
+                                    // snapshot together, once.
+                                    let snapshot = LoadSnapshotView::from_meta(r.meta.as_ref());
+                                    let mut cut = snapshot.as_ref().map(|snapshot| snapshot.cut);
                                     if let Some(translator) = context.translator.as_ref() {
                                         let recovered = seed_translator_from_load(
                                             agent.as_any().downcast_ref::<AgentHandle>(),
                                             &session_id,
                                             &r,
+                                            snapshot.as_ref(),
                                             translator,
                                         )
                                         .await;

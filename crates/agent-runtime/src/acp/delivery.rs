@@ -18,6 +18,7 @@
 //! lost, so a response is never withheld indefinitely.
 
 use crate::acp::protocol::{Meta, PromptResponse};
+use crate::acp::snapshot_view::LoadSnapshotView;
 use crate::session::projection::EventJournal;
 use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
 use querymt_agent_services::event_fanout::{InflightText, LIVE_EVENT_CAPACITY};
@@ -178,9 +179,6 @@ impl Drop for DeliveredGuard {
     }
 }
 
-/// `_meta` key of the load snapshot in a `session/load` response.
-const SNAPSHOT_META_KEY: &str = crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY;
-
 /// Where a session load's answer stands in the session's event order: the
 /// last event the answer contains.
 ///
@@ -198,26 +196,11 @@ pub struct LoadCut {
 impl LoadCut {
     /// The cut of a load answered with a snapshot: its stream cursor and the
     /// newest event it contains. `None` when the response carries no snapshot.
+    ///
+    /// A connection that also seeds its translator from the snapshot reads
+    /// both from one [`LoadSnapshotView`] instead.
     pub fn from_snapshot_meta(meta: Option<&Meta>) -> Option<Self> {
-        let snapshot = meta?.get(SNAPSHOT_META_KEY)?;
-        let local_stream_seq = snapshot
-            .pointer("/cursor/local_seq")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        let session_seq = snapshot
-            .pointer("/audit/events")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|events| {
-                events
-                    .iter()
-                    .filter_map(|event| event.get("session_seq")?.as_i64())
-                    .max()
-            })
-            .unwrap_or(0);
-        Some(Self {
-            session_seq,
-            local_stream_seq,
-        })
+        LoadSnapshotView::from_meta(meta).map(|snapshot| snapshot.cut)
     }
 
     /// The cut of a load answered by replaying `events`.
