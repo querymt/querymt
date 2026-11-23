@@ -1,9 +1,6 @@
-use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
-use querymt_agent::LocalAgentHandle;
 use querymt_agent::acp::protocol::ExtRequest;
-use querymt_agent::agent::agent_config_builder::AgentConfigBuilder;
-use querymt_agent::api::{Mesh, MeshRuntime};
+use querymt_agent::api::{Agent, AgentInfra, Mesh, MeshRuntime};
 use querymt_agent::config::{MeshDiscoveryConfig, MeshTomlConfig};
 use querymt_agent::send_agent::SendAgent;
 use querymt_agent::session::sqlite_storage::SqliteStorage;
@@ -22,15 +19,17 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
             .await
             .expect("test storage"),
     );
-    let config = Arc::new(
-        AgentConfigBuilder::new(
-            registry,
-            storage,
-            LLMParams::new().provider("mock").model("mock"),
-        )
-        .build(),
+    let disabled = Mesh::disabled();
+    assert!(disabled.is_disabled());
+    assert!(
+        disabled
+            .start()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disabled")
     );
-    let handle = LocalAgentHandle::from_config(config);
+
     let identity = dir.path().join("identity.key");
     let store_path = dir.path().join("identity.key.mesh_state.json");
     let spec = Mesh::from_toml(MeshTomlConfig {
@@ -38,6 +37,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         listen: Some("/ip4/127.0.0.1/tcp/0".into()),
         discovery: MeshDiscoveryConfig::None,
         identity_file: Some(identity.to_str().unwrap().into()),
+        node_name: Some("fixture-host".into()),
         ..MeshTomlConfig::default()
     });
     std::fs::write(&store_path, "not JSON").unwrap();
@@ -45,11 +45,21 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     assert!(error.to_string().contains("mesh access startup"));
     std::fs::write(&store_path, r#"{"version":1,"meshes":{}}"#).unwrap();
 
-    let runtime = spec
-        .start()
+    let agent = Agent::builder()
+        .provider("mock", "mock")
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .mesh(spec.clone())
+        .build()
         .await
-        .expect("guarded LAN mesh on retry")
-        .handle();
+        .expect("public agent API starts and publishes the guarded LAN mesh on retry");
+    let handle = agent.handle();
+    let published = agent.mesh().expect("agent exposes the mesh it started");
+    let runtime = published.runtime();
     let reused = MeshRuntime::shared(spec.spec_for_internal_use().clone())
         .await
         .expect("reuse the same mesh state owner")
@@ -67,7 +77,32 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&store_path).unwrap()).unwrap();
     assert_eq!(saved["version"], 2);
-    handle.set_mesh(mesh.clone());
+    // The default hybrid preset cannot silently reuse an already running LAN-only host.
+    let mismatch = Mesh::shared().start().await.unwrap_err().to_string();
+    assert!(
+        mismatch.contains("already started with lan mesh"),
+        "{mismatch}"
+    );
+    assert!(mismatch.contains("requested hybrid mesh"), "{mismatch}");
+
+    // A syntactically valid invite with a tampered payload must fail before admission.
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let mut invite =
+        querymt_remote::invite::InviteStore::load_or_create(&dir.path().join("invites.json"))
+            .unwrap()
+            .create_invite(
+                &key,
+                &key.public().to_peer_id().to_string(),
+                None,
+                None,
+                1,
+                Default::default(),
+            )
+            .unwrap();
+    invite.grant.mesh_name = Some("tampered".into());
+    let error = published.join(invite.encode()).await.unwrap_err();
+    assert!(error.to_string().contains("signature"), "{error}");
+    assert!(runtime.joined_iroh_scopes().is_empty());
 
     let response = handle
         .ext_method(ExtRequest::new(

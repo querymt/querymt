@@ -44,7 +44,7 @@ pub async fn join_mesh_via_invite_with_dns(
 
 #[cfg(test)]
 mod tests {
-    use super::join_mesh_via_invite_with_dns;
+    use super::{bootstrap_mesh_runtime, join_mesh_via_invite, join_mesh_via_invite_with_dns};
     use querymt_remote::invite::InviteStore;
 
     #[tokio::test]
@@ -72,11 +72,32 @@ mod tests {
         assert!(error.to_string().contains("signature"));
         assert!(!store_path.exists());
 
-        std::fs::write(store_path, "not JSON").unwrap();
-        let error = join_mesh_via_invite_with_dns(&invite, Some(identity.clone()), false, None)
+        std::fs::write(&store_path, "not JSON").unwrap();
+        let error = join_mesh_via_invite(&invite, Some(identity.clone()))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("mesh access startup"));
         assert!(!identity.exists());
+
+        // Direct host startup, used by qmtcode, must fail closed on the same corrupt state.
+        let error = bootstrap_mesh_runtime(&querymt_remote::MeshRuntimeConfig {
+            enabled: true,
+            lan: None,
+            iroh_enabled: true,
+            iroh_gso: true,
+            iroh_dns: None,
+            iroh_scopes: vec![],
+            identity_file: Some(identity.clone()),
+            request_timeout: std::time::Duration::from_secs(5),
+            stream_reconnect_grace: std::time::Duration::from_secs(5),
+            node_name: None,
+            peers: vec![],
+            auto_fallback: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("mesh access startup"));
+        assert!(!identity.exists());
+        assert_eq!(std::fs::read_to_string(store_path).unwrap(), "not JSON");
     }
 }
