@@ -151,6 +151,51 @@ fn usage_update_replaces_context_usage() {
 }
 
 #[test]
+fn model_change_hides_stale_context_live() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[usage(12000, 200000, json!({}))]);
+    assert!(core.header().context.is_some());
+    core.apply(&[live(json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": { "querymt": { "contextInvalidated": true } }
+    }))]);
+    assert_eq!(core.header().context, None);
+    // The signal changes neither the title nor anything else.
+    assert_eq!(core.header().title, None);
+    core.apply(&[usage(3000, 100000, json!({}))]);
+    let context = core.header().context.clone().expect("context usage");
+    assert_eq!((context.used, context.size), (3000, 100000));
+}
+
+#[test]
+fn model_change_names_the_new_model_live() {
+    let mut core = SessionCore::new("s1");
+    assert!(core.header().provider.is_none());
+    core.apply(&[live(json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": { "querymt": { "contextInvalidated": true,
+            "model": { "provider": "mock", "model": "mock-2", "node": "n1",
+                       "contextLimit": 100000 } } }
+    }))]);
+    let provider = core.header().provider.clone().expect("the new model");
+    assert_eq!(
+        (provider.provider.as_str(), provider.model.as_str()),
+        ("mock", "mock-2")
+    );
+    assert_eq!(provider.node.as_deref(), Some("n1"));
+    assert_eq!(provider.context_limit, Some(100000));
+    // A live update carries no journal position.
+    assert_eq!(provider.position, 0);
+
+    // A signal without a model leaves the header's model alone.
+    core.apply(&[live(json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": { "querymt": { "contextInvalidated": true } }
+    }))]);
+    assert_eq!(core.header().provider, Some(provider));
+}
+
+#[test]
 fn usage_update_carries_the_token_breakdown() {
     let mut core = SessionCore::new("s1");
     let tokens = json!({ "inputTokens": 5, "outputTokens": 2, "reasoningTokens": 0,

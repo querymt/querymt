@@ -2265,7 +2265,9 @@ mod stdio_tests {
         /// Publish one generated envelope through the agent's event sink:
         /// durable events are journaled, ephemeral ones only streamed.
         async fn emit_envelope(&self, envelope: &querymt_agent_core::events::EventEnvelope) {
-            let kind = envelope.kind().clone();
+            let mut kind = envelope.kind().clone();
+            // Attempts are charged to the session that journals them.
+            querymt_agent_session_core::testing::charge_to_session(&mut kind, &self.session_id);
             let sink = &self.fixture.config.event_sink;
             match envelope {
                 querymt_agent_core::events::EventEnvelope::Durable(_) => {

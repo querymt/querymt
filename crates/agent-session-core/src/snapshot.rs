@@ -308,24 +308,35 @@ impl SessionCore {
 }
 
 impl SessionCore {
-    /// Windowed loads: whole-session state comes from the summary, and
-    /// shortened tool content is marked with its full size.
+    /// Whole-session state comes from the summary every snapshot carries,
+    /// windowed or not; shortened tool content is marked with its full size.
     fn hydrate_summary(&mut self, parsed: &ParsedSnapshot) {
         if let Some(summary) = &parsed.summary {
             let usage = &summary.usage;
-            self.header.tokens = Some(crate::view::TokenUsageView {
+            // A session without a model request has no token breakdown, as
+            // live where no `usage_update` arrived.
+            self.header.tokens = (usage.request_count > 0).then(|| crate::view::TokenUsageView {
                 latest_request: usage.latest_request.clone(),
                 session_totals: usage.session_totals.clone(),
                 partial: usage.partial,
             });
             self.header.provider = summary.provider.clone();
             self.header.pending_inputs = summary.pending_inputs.clone();
-            if let (Some(used), Some(size)) = (
+            // A measurement taken before the current model was selected does
+            // not describe the new model (the agent's `reliable_used` rule).
+            let stale = match (usage.context_position, &summary.provider) {
+                (Some(position), Some(provider)) => position < provider.position,
+                _ => false,
+            };
+            self.header.context = match (
                 usage.context_tokens,
                 summary.provider.as_ref().and_then(|p| p.context_limit),
             ) {
-                self.header.context = Some(crate::view::ContextUsage { used, size });
-            }
+                (Some(used), Some(size)) if !stale => {
+                    Some(crate::view::ContextUsage { used, size })
+                }
+                _ => None,
+            };
             for link in &summary.child_sessions {
                 if let Some(tool_id) = &link.tool_call_id {
                     self.link_child_session(tool_id, &link.child_session_id);

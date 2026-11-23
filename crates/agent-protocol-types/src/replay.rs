@@ -9,9 +9,23 @@
 use crate::events::{AgentEventKind, ReasoningPartStored};
 use crate::protocol::{
     CompactionId, Content, ContentBlock, ContentChunk, MaybeUndefined, MessageId, Meta, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId, PlanUpdate, PlanUpdateContent,
+    SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+
+/// Deterministic plan identity for QueryMT's todo list within a session.
+pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+
+/// A todo list as a plan-operations `plan_update` under
+/// [`QUERYMT_TODO_PLAN_ID`]: the same update on the live, replay and
+/// snapshot paths, so a plan keeps its identity across a reload.
+pub fn todo_plan_update(entries: Vec<PlanEntry>) -> SessionUpdate {
+    SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+        PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
+        entries,
+    )))
+}
 
 /// QueryMT extension namespace inside ACP's `_meta` escape hatch.
 pub const QUERYMT_META_NAMESPACE: &str = "querymt";
@@ -19,17 +33,109 @@ pub const QUERYMT_META_NAMESPACE: &str = "querymt";
 /// `_meta.querymt` key holding the id of the run an update belongs to.
 pub const RUN_ID_META_KEY: &str = "runId";
 
-/// Merge `_meta.querymt.runId` into `meta`, keeping every other key.
-fn merge_run_id(meta: &mut Meta, run_id: &str) {
-    let namespace = meta
+/// `_meta.querymt` key carrying the token breakdown of a usage update.
+pub const USAGE_META_KEY: &str = "usage";
+
+/// `_meta.querymt` key carrying the replacement accounting DTO.
+pub const ACCOUNTING_META_KEY: &str = "accounting";
+
+/// `_meta.querymt` key telling a client that its last context measurement no
+/// longer applies (the session's model changed).
+pub const CONTEXT_INVALIDATED_META_KEY: &str = "contextInvalidated";
+
+/// `_meta.querymt` key naming the model a session switched to, next to
+/// [`CONTEXT_INVALIDATED_META_KEY`]: `provider`, `model`, optional `node` and
+/// optional `contextLimit`.
+pub const MODEL_META_KEY: &str = "model";
+
+/// `_meta.querymt` key on compaction updates holding the context size around
+/// the compaction: `tokensBefore` and, once known, `tokensAfter`.
+pub const COMPACTION_META_KEY: &str = "compaction";
+
+/// Key of [`COMPACTION_META_KEY`]: the last context measurement before the
+/// compaction started (the compaction's token estimate when there is none).
+pub const COMPACTION_TOKENS_BEFORE_KEY: &str = "tokensBefore";
+
+/// Key of [`COMPACTION_META_KEY`]: the context tokens after the compaction.
+pub const COMPACTION_TOKENS_AFTER_KEY: &str = "tokensAfter";
+
+/// Run `edit` on the `_meta.querymt` object of `meta`, creating it (or
+/// replacing a value that is not an object) when needed.
+fn with_querymt_namespace(
+    meta: &mut Meta,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let slot = meta
         .entry(QUERYMT_META_NAMESPACE.to_owned())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !namespace.is_object() {
-        *namespace = serde_json::Value::Object(serde_json::Map::new());
+    if let serde_json::Value::Object(map) = slot {
+        edit(map);
+    } else {
+        let mut map = serde_json::Map::new();
+        edit(&mut map);
+        *slot = serde_json::Value::Object(map);
     }
-    if let Some(namespace) = namespace.as_object_mut() {
+}
+
+/// Merge `_meta.querymt.runId` into `meta`, keeping every other key.
+fn merge_run_id(meta: &mut Meta, run_id: &str) {
+    with_querymt_namespace(meta, |namespace| {
         namespace.insert(RUN_ID_META_KEY.to_owned(), run_id.into());
+    });
+}
+
+/// Merge the known compaction token counts into `meta.querymt.compaction`,
+/// keeping every other key (a count that is not known is not written).
+fn merge_compaction_tokens(meta: &mut Meta, before: Option<u64>, after: Option<u64>) {
+    if before.is_none() && after.is_none() {
+        return;
     }
+    with_querymt_namespace(meta, |namespace| {
+        let slot = namespace
+            .entry(COMPACTION_META_KEY.to_owned())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !slot.is_object() {
+            *slot = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let serde_json::Value::Object(counts) = slot {
+            if let Some(before) = before {
+                counts.insert(COMPACTION_TOKENS_BEFORE_KEY.to_owned(), before.into());
+            }
+            if let Some(after) = after {
+                counts.insert(COMPACTION_TOKENS_AFTER_KEY.to_owned(), after.into());
+            }
+        }
+    });
+}
+
+/// Stamp the token counts of a compaction on a `compaction_update`:
+/// `_meta.querymt.compaction.{tokensBefore, tokensAfter}`, merged next to the
+/// existing keys. Other update kinds are left unchanged, and a count that is
+/// `None` is omitted. The live translator, the history replay and a load
+/// snapshot's projection all call this, so the three agree.
+pub fn stamp_compaction_tokens(
+    update: &mut SessionUpdate,
+    before: Option<u64>,
+    after: Option<u64>,
+) {
+    if let SessionUpdate::CompactionUpdate(compaction) = update {
+        let mut meta = match std::mem::take(&mut compaction.meta) {
+            MaybeUndefined::Value(meta) => meta,
+            _ => Meta::new(),
+        };
+        merge_compaction_tokens(&mut meta, before, after);
+        compaction.meta = if meta.is_empty() {
+            MaybeUndefined::Undefined
+        } else {
+            MaybeUndefined::Value(meta)
+        };
+    }
+}
+
+/// `tokensBefore` of a compaction that starts now: the last context
+/// measurement, or the compaction's own token estimate when there is none.
+pub fn compaction_tokens_before(last_measurement: Option<u64>, token_estimate: u32) -> u64 {
+    last_measurement.unwrap_or(u64::from(token_estimate))
 }
 
 /// Stamp the id of the run an update belongs to on the update kinds that
@@ -344,13 +450,51 @@ pub fn legacy_compaction_id(position: i64) -> CompactionId {
 /// that follows it are one compaction and get one derived identity; an id-less
 /// end without a start gets its own. An explicit id or a failure closes the
 /// open start.
+///
+/// It also follows the context measurements of the journal, so each
+/// compaction's `tokensBefore` is the last measurement before its start
+/// ([`compaction_tokens_before`]). Call [`observe`](Self::observe) with every
+/// event, after handling it.
 #[derive(Debug, Default)]
 pub struct CompactionIds {
     open_legacy: Option<CompactionId>,
     legacy_count: usize,
+    /// The last context measurement seen: a request end or a finished
+    /// compaction (the same measurements the agent's usage projection takes).
+    last_measurement: Option<u64>,
+    /// `tokensBefore` of the compactions that started and did not settle.
+    open_tokens_before: std::collections::BTreeMap<String, u64>,
 }
 
 impl CompactionIds {
+    /// Take the context measurement `kind` reports, if it is one.
+    pub fn observe(&mut self, kind: &AgentEventKind) {
+        match kind {
+            AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
+                self.last_measurement = Some(*context_tokens);
+            }
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(tokens),
+                ..
+            } => self.last_measurement = Some(*tokens),
+            _ => {}
+        }
+    }
+
+    /// `tokensBefore` of the compaction `id` that starts now, remembered
+    /// until it settles.
+    pub fn start_tokens(&mut self, id: &CompactionId, token_estimate: u32) -> u64 {
+        let before = compaction_tokens_before(self.last_measurement, token_estimate);
+        self.open_tokens_before.insert(id.0.to_string(), before);
+        before
+    }
+
+    /// `tokensBefore` remembered for `id`, forgotten once its compaction
+    /// settles (end or failure).
+    pub fn take_tokens_before(&mut self, id: &CompactionId) -> Option<u64> {
+        self.open_tokens_before.remove(&*id.0)
+    }
+
     fn next_legacy(&mut self, seq: i64) -> CompactionId {
         self.legacy_count += 1;
         let count = i64::try_from(self.legacy_count).unwrap_or(i64::MAX);
@@ -455,6 +599,21 @@ mod tests {
     }
 
     #[test]
+    fn todo_plan_update_uses_the_shared_plan_id() {
+        let entries =
+            todo_entries_from_arguments(r#"{"todos":[{"content":"a","status":"pending"}]}"#)
+                .unwrap();
+        let SessionUpdate::PlanUpdate(update) = todo_plan_update(entries) else {
+            panic!("expected a plan update");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected an item-based plan");
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+        assert_eq!(items.entries.len(), 1);
+    }
+
+    #[test]
     fn worktree_events_project_to_agent_messages() {
         let archived = AgentEventKind::WorktreeArchived {
             workspace_id: "w1".into(),
@@ -465,5 +624,56 @@ mod tests {
             updates.as_slice(),
             [SessionUpdate::AgentMessageChunk(_)]
         ));
+    }
+
+    fn compaction_update(id: &str) -> SessionUpdate {
+        SessionUpdate::CompactionUpdate(crate::protocol::CompactionUpdate::new(
+            CompactionId::from(id.to_owned()),
+            crate::protocol::CompactionStatus::Completed,
+        ))
+    }
+
+    fn meta_of(update: &SessionUpdate) -> Option<serde_json::Value> {
+        let SessionUpdate::CompactionUpdate(c) = update else {
+            return None;
+        };
+        match &c.meta {
+            MaybeUndefined::Value(meta) => Some(serde_json::Value::Object(meta.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn compaction_counts_merge_next_to_the_run_id() {
+        let mut update = compaction_update("c1");
+        stamp_run_id(&mut update, "r1");
+        stamp_compaction_tokens(&mut update, Some(150_000), Some(20_000));
+        assert_eq!(
+            meta_of(&update),
+            Some(serde_json::json!({ "querymt": {
+                "runId": "r1",
+                "compaction": { "tokensBefore": 150_000, "tokensAfter": 20_000 }
+            } }))
+        );
+    }
+
+    #[test]
+    fn an_unknown_compaction_count_is_omitted() {
+        let mut update = compaction_update("c1");
+        stamp_compaction_tokens(&mut update, Some(7), None);
+        assert_eq!(
+            meta_of(&update),
+            Some(serde_json::json!({ "querymt": { "compaction": { "tokensBefore": 7 } } }))
+        );
+        // Nothing known: no meta at all.
+        let mut bare = compaction_update("c2");
+        stamp_compaction_tokens(&mut bare, None, None);
+        assert_eq!(meta_of(&bare), None);
+    }
+
+    #[test]
+    fn tokens_before_is_the_last_measurement_or_the_estimate() {
+        assert_eq!(compaction_tokens_before(Some(150_000), 90_000), 150_000);
+        assert_eq!(compaction_tokens_before(None, 90_000), 90_000);
     }
 }

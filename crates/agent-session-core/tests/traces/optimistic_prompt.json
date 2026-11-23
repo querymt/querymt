@@ -82,6 +82,7 @@
       "context": null,
       "tokens": null,
       "cost": null,
+      "accounting": null,
       "provider": null,
       "title": null,
       "currentMode": null,

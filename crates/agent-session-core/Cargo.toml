@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [features]
 # Seeded lorem-ipsum trace generator used by tests, benches and the regen-traces example.
-test-support = []
+test-support = ["querymt-agent-protocol-types/test-support"]
 
 [[example]]
 name = "regen-traces"

@@ -12,6 +12,11 @@ use querymt_agent_protocol_types::protocol::{
     MaybeUndefined, Plan, PlanRemoved, PlanUpdate, PlanUpdateContent, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallUpdate,
 };
+use querymt_agent_protocol_types::replay::{
+    ACCOUNTING_META_KEY, CONTEXT_INVALIDATED_META_KEY, MODEL_META_KEY, QUERYMT_META_NAMESPACE,
+    RUN_ID_META_KEY,
+};
+use querymt_agent_protocol_types::session::history::SummaryProvider;
 use serde::Serialize;
 
 /// The snake-case wire string of an ACP enum value.
@@ -22,6 +27,27 @@ fn wire_str<T: Serialize>(value: &T) -> String {
     }
 }
 
+/// Merge `patch` into `target` key by key. Objects merge recursively, a
+/// `null` removes the key and any other value replaces it.
+fn merge_meta(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in patch {
+        match (target.get_mut(key), value) {
+            (_, serde_json::Value::Null) => {
+                target.remove(key);
+            }
+            (Some(serde_json::Value::Object(current)), serde_json::Value::Object(next)) => {
+                merge_meta(current, next);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 fn content_values(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
     content
         .iter()
@@ -29,12 +55,29 @@ fn content_values(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The model a `_meta.querymt.model` object names. A live update carries no
+/// journal position, so the position is 0 (unknown).
+fn selected_model(value: &serde_json::Value) -> Option<SummaryProvider> {
+    Some(SummaryProvider {
+        provider: value.get("provider")?.as_str()?.to_owned(),
+        model: value.get("model")?.as_str()?.to_owned(),
+        node: value
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        context_limit: value
+            .get("contextLimit")
+            .and_then(serde_json::Value::as_u64),
+        position: 0,
+    })
+}
+
 /// A string under `_meta.querymt.<key>` of a chunk.
 fn querymt_meta<'a>(chunk: &'a ContentChunk, key: &str) -> Option<&'a str> {
     chunk
         .meta
         .as_ref()?
-        .get("querymt")?
+        .get(QUERYMT_META_NAMESPACE)?
         .get(key)?
         .as_str()
         .filter(|value| !value.is_empty())
@@ -63,8 +106,8 @@ fn run_id_of(update: &SessionUpdate) -> Option<String> {
         },
         _ => None,
     }?;
-    meta.get("querymt")?
-        .get("runId")?
+    meta.get(QUERYMT_META_NAMESPACE)?
+        .get(RUN_ID_META_KEY)?
         .as_str()
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
@@ -110,11 +153,29 @@ impl SessionCore {
                     MaybeUndefined::Null => self.header.title = None,
                     MaybeUndefined::Value(title) => self.header.title = Some(title),
                 }
-                if let Some(accounting) = update
+                let querymt = update
                     .meta
                     .as_ref()
-                    .and_then(|meta| meta.get("querymt"))
-                    .and_then(|q| q.get("accounting"))
+                    .and_then(|meta| meta.get(QUERYMT_META_NAMESPACE));
+                // The session's model changed: the last context measurement
+                // does not apply to the new one until the next usage update,
+                // and the header names the new model.
+                if querymt
+                    .and_then(|q| q.get(CONTEXT_INVALIDATED_META_KEY))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    self.header.context = None;
+                    if let Some(provider) = querymt
+                        .and_then(|q| q.get(MODEL_META_KEY))
+                        .and_then(selected_model)
+                    {
+                        self.header.provider = Some(provider);
+                    }
+                }
+                self.set_token_usage(querymt);
+                if let Some(accounting) = querymt
+                    .and_then(|q| q.get(ACCOUNTING_META_KEY))
                     .and_then(|v| {
                         <querymt_agent_protocol_types::accounting::AccountingSnapshot as serde::Deserialize>::deserialize(v).ok()
                     })
@@ -413,7 +474,14 @@ impl SessionCore {
             match &update.meta {
                 MaybeUndefined::Undefined => {}
                 MaybeUndefined::Null => entry.meta = None,
-                MaybeUndefined::Value(meta) => entry.meta = Some(meta.clone()),
+                // Merged key by key, objects included, so a later update that
+                // adds `tokensAfter` keeps the `tokensBefore` (and the run id)
+                // an earlier one set.
+                MaybeUndefined::Value(meta) => {
+                    let mut merged = entry.meta.take().unwrap_or_default();
+                    merge_meta(&mut merged, meta);
+                    entry.meta = Some(merged);
+                }
             }
             *entry != before
         });

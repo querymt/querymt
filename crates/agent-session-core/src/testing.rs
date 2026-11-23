@@ -3,8 +3,11 @@
 //! Emits `AgentEvent` JSON sequences and the equivalent ACP notification
 //! stream. No clock, no OS randomness: the same seed gives the same trace.
 
+use querymt_agent_protocol_types::accounting::{
+    AttemptPurpose, AttemptRef, RequestAccounting, samples,
+};
 use querymt_agent_protocol_types::events::{
-    AgentEvent, AgentEventKind, EventOrigin, ReasoningPartStored,
+    AgentEvent, AgentEventKind, EventOrigin, ExecutionMetrics, ReasoningPartStored,
 };
 use querymt_agent_protocol_types::protocol::{ContentBlock, TextContent};
 use serde_json::{Value, json};
@@ -75,6 +78,15 @@ pub struct TraceSpec {
     pub compaction_every: usize,
     /// Words in a tool result.
     pub result_words: usize,
+    /// Each turn makes one model call, journaled as the agent does:
+    /// `ProviderChanged` once at the start, then `LlmAttemptStarted`,
+    /// `LlmAttemptSettled` and `LlmRequestEnd` per call. Off: the session has
+    /// no model call at all (no usage, no cost, no context).
+    pub model_calls: bool,
+    /// With model calls: the third request reports no usage, the model
+    /// changes halfway, and it changes once more after the last request (its
+    /// context measurement is then stale).
+    pub usage_gaps: bool,
 }
 
 impl TraceSpec {
@@ -85,6 +97,8 @@ impl TraceSpec {
             max_tools: 2,
             compaction_every: 4,
             result_words: 40,
+            model_calls: true,
+            usage_gaps: false,
         }
     }
 
@@ -121,6 +135,96 @@ fn push(events: &mut Vec<Value>, seq: &mut i64, kind: AgentEventKind) {
     events.push(serde_json::to_value(&event).expect("an agent event serializes"));
 }
 
+/// A model selection with a context limit.
+fn provider_changed(config_id: i64, model: &str, context_limit: u64) -> AgentEventKind {
+    AgentEventKind::ProviderChanged {
+        provider: "mock".to_owned(),
+        model: model.to_owned(),
+        config_id,
+        context_limit: Some(context_limit),
+        provider_node_id: None,
+    }
+}
+
+/// One model call: the attempt start, its settlement and the request end.
+/// `usage` is the (input, output) tokens, none for a call that reported no
+/// usage.
+fn model_call(
+    events: &mut Vec<Value>,
+    seq: &mut i64,
+    turn: usize,
+    model: &str,
+    usage: Option<(u32, u32)>,
+) {
+    let attempt = AttemptRef {
+        operation_id: format!("op{turn}"),
+        attempt_id: format!("att{turn}"),
+        attempt_index: 0,
+        session_id: "s1".to_owned(),
+        cycle_id: format!("cycle{turn}"),
+        purpose: AttemptPurpose::MainResponse,
+    };
+    push(
+        events,
+        seq,
+        AgentEventKind::LlmAttemptStarted {
+            start: samples::start_for(attempt.clone(), "mock", model),
+        },
+    );
+    let settlement = samples::settlement_for(
+        attempt.clone(),
+        usage.map(|(input, output)| samples::sample_usage(input, output)),
+    );
+    let accounting = RequestAccounting {
+        operation_id: attempt.operation_id.clone(),
+        attempt_ids: vec![attempt.attempt_id.clone()],
+        known_subtotal_usd: settlement.valuation.known_subtotal_usd,
+        complete: settlement.valuation.complete_total_usd.is_some(),
+        reasons: Vec::new(),
+    };
+    let cost_usd = settlement.valuation.complete_total_usd;
+    let request_usage = settlement.usage.clone();
+    push(
+        events,
+        seq,
+        AgentEventKind::LlmAttemptSettled { settlement },
+    );
+    let (input, output) = usage.unwrap_or((1_000 + 300 * turn as u32, 40));
+    push(
+        events,
+        seq,
+        AgentEventKind::LlmRequestEnd {
+            usage: request_usage,
+            tool_calls: 0,
+            finish_reason: None,
+            cost_usd,
+            cumulative_cost_usd: None,
+            context_tokens: u64::from(input) + u64::from(output),
+            metrics: ExecutionMetrics { steps: 1, turns: 1 },
+            accounting: Some(accounting),
+            prefix_change: None,
+            idle_secs: None,
+        },
+    );
+}
+
+/// Charge the generated model-call events to `session_id`. The generator
+/// names its own session (`s1`); a rig that journals the events under another
+/// session id calls this on each event kind before journaling it, so the
+/// attempt records belong to the session that holds them. This is the one
+/// place that knows which event kinds carry a session id.
+pub fn charge_to_session(kind: &mut AgentEventKind, session_id: &str) {
+    match kind {
+        AgentEventKind::LlmAttemptStarted { start } => {
+            start.attempt.session_id = session_id.to_owned();
+        }
+        AgentEventKind::LlmAttemptSettled { settlement } => {
+            settlement.attempt.session_id = session_id.to_owned();
+        }
+        _ => {}
+    }
+}
+
 /// One journal event as JSON, with history position `seq`.
 pub fn event(seq: i64, kind: AgentEventKind) -> Value {
     let mut events = Vec::new();
@@ -141,8 +245,16 @@ pub fn generate(spec: TraceSpec) -> Trace {
     let mut rng = Rng::new(spec.seed);
     let mut events = Vec::new();
     let mut seq = 0i64;
+    let mut model = "mock-model";
+    if spec.model_calls {
+        push(&mut events, &mut seq, provider_changed(1, model, 200_000));
+    }
     for turn in 0..spec.turns {
         let run_id = format!("r{turn}");
+        if spec.model_calls && spec.usage_gaps && turn == spec.turns / 2 {
+            model = "mock-model-2";
+            push(&mut events, &mut seq, provider_changed(2, model, 100_000));
+        }
         push(
             &mut events,
             &mut seq,
@@ -205,6 +317,11 @@ pub fn generate(spec: TraceSpec) -> Trace {
                     latency_ms: 5,
                 },
             );
+        }
+        if spec.model_calls {
+            let usage = (!(spec.usage_gaps && turn == 2))
+                .then(|| (1_000 + 300 * turn as u32, 50 + turn as u32));
+            model_call(&mut events, &mut seq, turn, model, usage);
         }
         let reasoning_words = 4 + rng.below(6);
         let reasoning = rng.lorem(reasoning_words);
@@ -299,7 +416,10 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 &mut events,
                 &mut seq,
                 AgentEventKind::CompactionStart {
-                    token_estimate: 1000,
+                    // With a model call just before, the compaction's
+                    // `tokensBefore` is that request's context; the estimate
+                    // is the fallback of a session with no measurement.
+                    token_estimate: 1_000 + 10 * turn as u32,
                     compaction_id: Some(id.clone()),
                 },
             );
@@ -311,7 +431,7 @@ pub fn generate(spec: TraceSpec) -> Trace {
                     summary,
                     summary_len: 12,
                     compaction_id: Some(id),
-                    context_tokens: Some(200),
+                    context_tokens: Some(200 + turn as u64),
                 },
             );
         }
@@ -359,6 +479,15 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 },
             );
         }
+    }
+    if spec.model_calls && spec.usage_gaps {
+        // The model changes after the last request: its context measurement
+        // does not describe the new model.
+        push(
+            &mut events,
+            &mut seq,
+            provider_changed(3, "mock-model-3", 50_000),
+        );
     }
     Trace {
         session_id: "s1".to_owned(),
@@ -608,7 +737,56 @@ pub fn golden_cases() -> Vec<GoldenCase> {
             ),
         }],
     ];
+    // Usage: a measurement, the model change that makes it stale, a new
+    // measurement; then snapshots whose summary is stale and fresh, and one
+    // whose accounting covers no model call.
+    let totals = json!({ "inputTokens": 9, "outputTokens": 1, "reasoningTokens": 0,
+                         "cacheReadTokens": 0, "cacheWriteTokens": 0 });
+    let summary = |context_position: i64| {
+        json!({ "summary": {
+            "usage": { "latestRequest": totals, "sessionTotals": totals, "partial": false,
+                       "requestCount": 2, "contextTokens": 12000,
+                       "contextPosition": context_position,
+                       "accounting": serde_json::to_value(
+                           querymt_agent_protocol_types::accounting::ScopeTotals::default())
+                           .unwrap_or(Value::Null) },
+            "provider": { "provider": "mock", "model": "mock-model-2",
+                          "contextLimit": 100000, "position": 10 },
+            "pendingInputs": [], "childSessions": [] } })
+    };
+    let usage = vec![
+        vec![
+            live(
+                json!({ "sessionUpdate": "usage_update", "used": 12000, "size": 200000,
+                          "_meta": { "querymt": { "usage": { "version": 1,
+                              "latestRequest": totals, "sessionTotals": totals,
+                              "partial": false } } } }),
+            ),
+            live(json!({ "sessionUpdate": "session_info_update",
+                          "_meta": { "querymt": { "contextInvalidated": true } } })),
+        ],
+        vec![live(
+            json!({ "sessionUpdate": "usage_update", "used": 3000, "size": 100000 }),
+        )],
+        vec![SessionInput::SnapshotLoaded {
+            response: snapshot_response(&generate(TraceSpec::small(7)).events, summary(4)),
+        }],
+        vec![SessionInput::SnapshotLoaded {
+            response: snapshot_response(&generate(TraceSpec::small(7)).events, summary(12)),
+        }],
+    ];
+    let usage_gaps = vec![vec![loaded(TraceSpec {
+        usage_gaps: true,
+        ..TraceSpec::small(8)
+    })]];
+    let no_model_calls = vec![vec![loaded(TraceSpec {
+        model_calls: false,
+        ..TraceSpec::small(9)
+    })]];
     vec![
+        case("usage", usage),
+        case("usage_gaps", usage_gaps),
+        case("no_model_calls", no_model_calls),
         case("small_snapshot", vec![vec![loaded(TraceSpec::small(1))]]),
         case("snapshot_1x", vec![vec![loaded(TraceSpec::scaled(2, 4))]]),
         case("snapshot_4x", vec![vec![loaded(TraceSpec::scaled(2, 16))]]),

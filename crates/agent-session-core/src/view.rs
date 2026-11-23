@@ -1,6 +1,7 @@
 //! Session header (everything except the turns) and change reports.
 
 use crate::input::UndoFrame;
+use querymt_agent_protocol_types::accounting::AccountingSnapshot;
 use querymt_agent_protocol_types::protocol::PlanEntry;
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::{
@@ -157,6 +158,10 @@ pub struct SessionHeader {
     pub context: Option<ContextUsage>,
     pub tokens: Option<TokenUsageView>,
     pub cost: Option<CostView>,
+    /// The latest accounting snapshot as the agent sent it (load snapshot,
+    /// `_meta.querymt.accounting`). `cost` is derived from it. Empty for a
+    /// session without model calls.
+    pub accounting: Option<AccountingSnapshot>,
     pub provider: Option<SummaryProvider>,
     pub title: Option<String>,
     pub current_mode: Option<String>,

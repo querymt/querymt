@@ -77,6 +77,198 @@ fn snapshot_accounting_sets_cost() {
     );
 }
 
+/// An accounting scope that covers no model call.
+fn empty_scope() -> serde_json::Value {
+    serde_json::json!({
+        "knownSubtotalUsd": 0.0, "completeTotalUsd": 0.0, "complete": true,
+        "billing": "empty", "reasons": [],
+        "pricedAttempts": 0, "excludedAttempts": 0, "unresolvedAttempts": 0,
+        "incompleteAttempts": 0, "unaccountedGenerations": 0
+    })
+}
+
+#[test]
+fn session_without_model_calls_has_no_cost() {
+    use querymt_agent_session_core::input::SessionInput;
+    let accounting = serde_json::json!({ "version": 1, "session": empty_scope(), "cycle": null });
+
+    // A snapshot.
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(load_response(
+        vec![prompt(1, "u1", "x")],
+        serde_json::json!({ "accounting": accounting }),
+    ))]);
+    assert_eq!(core.header().cost, None);
+
+    // A snapshot replaces a cost the view held before.
+    let priced = serde_json::json!({ "accounting": {
+        "version": 1, "session": scope(true, Some(0.42)), "cycle": null } });
+    core.apply(&[loaded(load_response(vec![prompt(1, "u1", "x")], priced))]);
+    assert!(core.header().cost.is_some());
+    core.apply(&[loaded(load_response(
+        vec![prompt(1, "u1", "x")],
+        serde_json::json!({ "accounting": accounting }),
+    ))]);
+    assert_eq!(core.header().cost, None);
+
+    // The same rule for accounting in live `_meta`.
+    let live = |update: serde_json::Value| SessionInput::AcpNotification {
+        notification: serde_json::json!({ "sessionId": "s1", "update": update }),
+        replayed: false,
+        at_ms: 0,
+    };
+    let meta = serde_json::json!({ "querymt": { "accounting": accounting } });
+    let mut core = SessionCore::new("s1");
+    core.apply(&[live(serde_json::json!({
+        "sessionUpdate": "usage_update", "used": 10, "size": 100, "_meta": meta }))]);
+    assert_eq!(core.header().cost, None);
+    core.apply(&[live(serde_json::json!({
+        "sessionUpdate": "session_info_update", "_meta": meta }))]);
+    assert_eq!(core.header().cost, None);
+    assert_eq!(core.header().accounting, None);
+}
+
+fn live_update(update: serde_json::Value) -> querymt_agent_session_core::input::SessionInput {
+    querymt_agent_session_core::input::SessionInput::AcpNotification {
+        notification: serde_json::json!({ "sessionId": "s1", "update": update }),
+        replayed: false,
+        at_ms: 0,
+    }
+}
+
+#[test]
+fn subscription_only_accounting() {
+    use querymt_agent_protocol_types::accounting::AccountingBillingScope;
+    let excluded = serde_json::json!({
+        "knownSubtotalUsd": 0.0, "completeTotalUsd": null, "complete": false,
+        "billing": "excluded", "reasons": [],
+        "pricedAttempts": 0, "excludedAttempts": 3, "unresolvedAttempts": 0,
+        "incompleteAttempts": 0, "unaccountedGenerations": 0
+    });
+    let accounting = serde_json::json!({ "version": 1, "session": excluded, "cycle": null });
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(load_response(
+        vec![prompt(1, "u1", "x")],
+        serde_json::json!({ "accounting": accounting }),
+    ))]);
+    let held = core.header().accounting.clone().expect("accounting");
+    assert_eq!(held.session.billing, AccountingBillingScope::Excluded);
+    assert_eq!(held.session.excluded_attempts, 3);
+    let cost = core.header().cost.clone().expect("cost");
+    assert!(!cost.complete);
+}
+
+#[test]
+fn live_accounting_replaces_the_snapshots() {
+    let older = serde_json::json!({ "accounting": {
+        "version": 1, "session": scope(true, Some(0.42)), "cycle": null } });
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(load_response(vec![prompt(1, "u1", "x")], older))]);
+    assert_eq!(
+        core.header()
+            .accounting
+            .as_ref()
+            .map(|a| a.session.known_subtotal_usd),
+        Some(0.42)
+    );
+
+    let newer =
+        serde_json::json!({ "version": 1, "session": scope(true, Some(0.9)), "cycle": null });
+    let meta = serde_json::json!({ "querymt": { "accounting": newer } });
+    core.apply(&[live_update(serde_json::json!({
+        "sessionUpdate": "usage_update", "used": 10, "size": 100, "_meta": meta }))]);
+    assert_eq!(
+        core.header()
+            .accounting
+            .as_ref()
+            .map(|a| a.session.known_subtotal_usd),
+        Some(0.9)
+    );
+    let cost = core.header().cost.clone().expect("cost");
+    assert_eq!((cost.amount, cost.complete), (0.9, true));
+
+    // The metadata-only fallback replaces it too.
+    let newest =
+        serde_json::json!({ "version": 1, "session": scope(true, Some(1.5)), "cycle": null });
+    core.apply(&[live_update(serde_json::json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": { "querymt": { "accounting": newest } } }))]);
+    assert_eq!(core.header().cost.as_ref().map(|c| c.amount), Some(1.5));
+    assert_eq!(
+        core.header()
+            .accounting
+            .as_ref()
+            .map(|a| a.session.known_subtotal_usd),
+        Some(1.5)
+    );
+}
+
+#[test]
+fn budget_is_kept() {
+    let accounting = serde_json::json!({
+        "version": 1,
+        "session": scope(true, Some(2.0)),
+        "cycle": {
+            "cycleId": "cycle-1",
+            "scope": scope(false, None),
+            "budget": {
+                "knownSubtotalUsd": 1.25, "completeTotalUsd": null, "reasons": [],
+                "incompleteAttempts": 2, "bestEffort": true
+            }
+        }
+    });
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(load_response(
+        vec![prompt(1, "u1", "x")],
+        serde_json::json!({ "accounting": accounting }),
+    ))]);
+    let held = core.header().accounting.clone().expect("accounting");
+    let cycle = held.cycle.expect("cycle");
+    assert_eq!(cycle.cycle_id, "cycle-1");
+    assert_eq!(cycle.budget.known_subtotal_usd, 1.25);
+    assert_eq!(cycle.budget.complete_total_usd, None);
+    assert_eq!(cycle.budget.incomplete_attempts, 2);
+    assert!(cycle.budget.best_effort);
+}
+
+#[test]
+fn todo_plan_keeps_its_id_after_a_reload() {
+    use querymt_agent_session_core::input::SessionInput;
+    let args =
+        r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#;
+
+    // Live: the agent sends the todo list as a plan_update under its id.
+    let mut live = SessionCore::new("s1");
+    live.apply(&[SessionInput::AcpNotification {
+        notification: serde_json::json!({ "sessionId": "s1", "update": {
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "items", "planId": "querymt-todos", "entries": [
+                { "content": "a", "priority": "medium", "status": "pending" },
+                { "content": "b", "priority": "medium", "status": "in_progress" },
+            ] } } }),
+        replayed: false,
+        at_ms: 0,
+    }]);
+    let live_plan = live.header().plan.clone().expect("live plan");
+    assert_eq!(live_plan.plan_id.as_deref(), Some("querymt-todos"));
+
+    // Reload: a snapshot holding the todowrite call.
+    let events = vec![
+        prompt(1, "u1", "go"),
+        event(
+            2,
+            "tool_call_start",
+            serde_json::json!({ "tool_call_id": "t1", "tool_name": "todowrite", "arguments": args }),
+        ),
+        tool_end(3, "t1", "ok"),
+    ];
+    let mut reloaded = SessionCore::new("s1");
+    reloaded.apply(&[loaded(load_response(events, serde_json::json!({})))]);
+    let plan = reloaded.header().plan.clone().expect("reloaded plan");
+    assert_eq!(plan.plan_id, live_plan.plan_id);
+    assert_eq!(plan.entries, live_plan.entries);
+}
+
 #[test]
 fn truncated_result_is_marked() {
     let extra = serde_json::json!({
@@ -118,6 +310,55 @@ fn windowed_snapshot_takes_whole_session_state_from_the_summary() {
     let tokens = h.tokens.clone().expect("tokens");
     assert!(tokens.partial);
     assert_eq!(tokens.session_totals.expect("totals").input_tokens, 9);
+}
+
+/// An unwindowed snapshot (no `history` key) whose summary has a context
+/// measurement at `context_position` and a model selected at `model_position`.
+fn context_snapshot(context_position: i64, model_position: i64) -> serde_json::Value {
+    let extra = serde_json::json!({
+        "summary": {
+            "usage": { "latestRequest": null, "sessionTotals": null, "partial": false,
+                       "requestCount": 1, "contextTokens": 12000,
+                       "contextPosition": context_position,
+                       "accounting": serde_json::to_value(
+                           querymt_agent_protocol_types::accounting::ScopeTotals::default()).unwrap() },
+            "provider": { "provider": "p", "model": "m", "contextLimit": 200000,
+                          "position": model_position },
+            "pendingInputs": [],
+            "childSessions": []
+        }
+    });
+    load_response(vec![prompt(5, "u1", "x")], extra)
+}
+
+#[test]
+fn unwindowed_snapshot_reports_context() {
+    let mut core = SessionCore::new("s1");
+    let response = context_snapshot(7, 3);
+    assert!(response["_meta"]["querymt/sessionLoadSnapshot.v1"]["history"].is_null());
+    let report = core.apply(&[loaded(response)]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let context = core.header().context.clone().expect("context usage");
+    assert_eq!((context.used, context.size), (12000, 200000));
+}
+
+#[test]
+fn snapshot_ignores_a_measurement_older_than_the_model() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(context_snapshot(3, 7))]);
+    assert_eq!(core.header().context, None);
+    assert_eq!(
+        core.header().provider.as_ref().map(|p| p.model.as_str()),
+        Some("m")
+    );
+}
+
+#[test]
+fn measurement_after_the_model_change_is_kept() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(context_snapshot(8, 7))]);
+    let context = core.header().context.clone().expect("context usage");
+    assert_eq!((context.used, context.size), (12000, 200000));
 }
 
 #[test]
