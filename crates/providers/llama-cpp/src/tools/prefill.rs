@@ -59,13 +59,12 @@ pub(crate) fn prefill_for_tool_generation<'a>(
             .tokenize(input_text, &bitmap_refs)
             .map_err(|e| LLMError::ProviderError(format!("MTMD tokenization failed: {}", e)))?;
 
-        let input_tokens = chunks.total_tokens() as u32;
-        let n_ctx_needed = input_tokens + max_tokens;
-        let n_ctx_raw = cfg
-            .n_ctx
-            .unwrap_or_else(|| n_ctx_needed.min(model.n_ctx_train()));
-        let n_ctx = NonZeroU32::new(n_ctx_raw)
-            .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
+        let (input_tokens, n_len_total, n_ctx) = prefill_bounds(
+            chunks.total_tokens(),
+            max_tokens,
+            cfg.n_ctx,
+            model.n_ctx_train(),
+        )?;
 
         let n_batch = resolve_n_batch(cfg, n_ctx.get());
         let n_ubatch = resolve_n_ubatch(cfg, n_batch, true);
@@ -96,13 +95,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
                 })
             })?;
 
-        let n_ctx_total = ctx.n_ctx() as i32;
-        let n_len_total = input_tokens as i32 + max_tokens as i32;
-        if n_len_total > n_ctx_total {
-            return Err(LLMError::InvalidRequest(format!(
-                "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
-            )));
-        }
+        check_context_fit(n_len_total.cast_unsigned(), ctx.n_ctx())?;
 
         // Vision models decode media chunks non-causally, which requires each media
         // chunk to fit in a single physical micro-batch.
@@ -144,27 +137,8 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         ));
     }
 
-    let input_tokens = u32::try_from(tokens.len())
-        .map_err(|_| LLMError::InvalidRequest("prompt token count exceeds u32".into()))?;
-    let n_len_total = input_tokens
-        .checked_add(max_tokens)
-        .and_then(|total| i32::try_from(total).ok())
-        .ok_or_else(|| {
-            LLMError::InvalidRequest(
-                "prompt and output token count exceeds supported positions".into(),
-            )
-        })?;
-    let n_ctx_needed = n_len_total as u32;
-    if cfg.n_ctx.is_some_and(|limit| n_ctx_needed > limit) {
-        return Err(LLMError::InvalidRequest(
-            "prompt and output exceed configured n_ctx".into(),
-        ));
-    }
-    let n_ctx_raw = cfg
-        .n_ctx
-        .unwrap_or_else(|| n_ctx_needed.min(model.n_ctx_train()));
-    let n_ctx = NonZeroU32::new(n_ctx_raw)
-        .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
+    let (input_tokens, n_len_total, n_ctx) =
+        prefill_bounds(tokens.len(), max_tokens, cfg.n_ctx, model.n_ctx_train())?;
 
     let n_batch = resolve_n_batch(cfg, n_ctx.get());
     let n_ubatch = resolve_n_ubatch(cfg, n_batch, false);
@@ -195,12 +169,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
             })
         })?;
 
-    let n_ctx_total = ctx.n_ctx() as i32;
-    if n_len_total > n_ctx_total {
-        return Err(LLMError::InvalidRequest(format!(
-            "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
-        )));
-    }
+    check_context_fit(n_len_total.cast_unsigned(), ctx.n_ctx())?;
 
     let mut batch = LlamaBatch::new(n_batch as usize, 1);
     let last_index = tokens.len().saturating_sub(1);
@@ -233,4 +202,59 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         n_len_total,
         n_batch: n_batch as usize,
     })
+}
+
+// Both tokenizers feed this check before allocating a native context.
+fn prefill_bounds(
+    input: usize,
+    output: u32,
+    configured_ctx: Option<u32>,
+    trained_ctx: u32,
+) -> Result<(u32, i32, NonZeroU32), LLMError> {
+    let input = u32::try_from(input)
+        .map_err(|_| LLMError::InvalidRequest("prompt token count exceeds u32".into()))?;
+    let (needed, positions) = input
+        .checked_add(output)
+        .and_then(|needed| Some((needed, i32::try_from(needed).ok()?)))
+        .ok_or_else(|| {
+            LLMError::InvalidRequest(
+                "prompt and output token count exceeds supported positions".into(),
+            )
+        })?;
+    let n_ctx = NonZeroU32::new(configured_ctx.unwrap_or(needed.min(trained_ctx)))
+        .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
+    check_context_fit(needed, n_ctx.get())?;
+    Ok((input, positions, n_ctx))
+}
+
+fn check_context_fit(needed: u32, n_ctx: u32) -> Result<(), LLMError> {
+    if needed > n_ctx {
+        return Err(LLMError::InvalidRequest(format!(
+            "Prompt + max_tokens ({needed}) exceeds context window ({n_ctx})"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_checks_positions_and_window_before_allocating_context() {
+        let (input, positions, window) = prefill_bounds(512, 128, None, 1024).unwrap();
+        assert_eq!((input, positions, window.get()), (512, 640, 640));
+        assert!(matches!(
+            prefill_bounds(512, 128, None, 639),
+            Err(LLMError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            prefill_bounds(512, 128, Some(639), 1024),
+            Err(LLMError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            prefill_bounds(512, i32::MAX as u32, None, 1024),
+            Err(LLMError::InvalidRequest(_))
+        ));
+    }
 }
