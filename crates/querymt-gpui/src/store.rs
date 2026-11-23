@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 
 use crate::rpc::{Incoming, RpcClient};
-use crate::session::{ParentSession, SessionView, UndoFrame, UserAttachment};
+use crate::session::{ParentSession, SessionView, UndoFrame};
 use crate::transport::{self, Inbound, Target};
 use crate::util::now_ms;
 
@@ -171,6 +171,12 @@ pub fn model_key(id: &str, node_id: Option<&str>) -> String {
         None => id.to_string(),
     }
 }
+
+/// Delay before queued session inputs are applied as one batch (about half a
+/// frame at 60 Hz).
+const SESSION_FLUSH_MS: u64 = 8;
+/// A load response larger than this is decoded off the UI thread (native).
+const HYDRATE_BYTES: usize = 256 * 1024;
 
 const REMOTE_MODEL_KEY: &str = "querymt:model:";
 
@@ -434,16 +440,6 @@ impl Attachment {
 
     pub fn is_image(&self) -> bool {
         self.mime.starts_with("image/")
-    }
-
-    /// Transcript representation of this attachment (keeps image bytes for the thumbnail).
-    pub fn to_user_attachment(&self) -> UserAttachment {
-        UserAttachment {
-            name: self.name.clone(),
-            mime: self.mime.clone(),
-            size: Some(self.size),
-            data: self.is_image().then(|| self.data.clone()),
-        }
     }
 }
 
@@ -930,21 +926,7 @@ fn parse_request(
             })
             .collect();
         // Reuse the transcript's tool parsing for the command / path preview.
-        let summary = {
-            let mut call = crate::session::SessionView::default();
-            let mut update = tool.clone();
-            if let Some(obj) = update.as_object_mut() {
-                obj.insert("sessionUpdate".into(), Value::from("tool_call"));
-            }
-            call.apply(&update);
-            match call.items.first().map(|i| &i.kind) {
-                Some(crate::session::ItemKind::Work(entries)) => match entries.first() {
-                    Some(crate::session::WorkEntry::Tool(c)) => c.summary(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
-            }
-        };
+        let summary = crate::session::SessionView::tool_call_summary(tool);
         let fallback = str_at(tool, "toolCallId")
             .filter(|id| !id.is_empty())
             .map(|tc| format!("tc:{}:{tc}", session_id.as_deref().unwrap_or_default()));
@@ -2670,9 +2652,14 @@ impl AgentsStore {
                         // `_meta.querymt.sessionLoadSnapshot.epoch` (as the desktop app): the
                         // transcript is built from the `session/load` snapshot, so the agent
                         // skips the historical `session/update` replay.
+                        // `plan` (the todo list as `plan_update`) and `subagents`
+                        // (`subagent_update`, tool-call session links): the session
+                        // reducer is tested against exactly these shapes.
                         "clientCapabilities": {
                             "fs": {},
                             "terminal": false,
+                            "plan": {},
+                            "subagents": {},
                             "session": { "compaction": {} },
                             "elicitation": { "form": {} },
                             "_meta": { "querymt": { "sessionLoadSnapshot": { "epoch": 1 } } },
@@ -2926,11 +2913,13 @@ impl AgentsStore {
                         _ => log(format!("Reasoning effort {reasoning} is not offered for this model."), cx),
                     }
                 }
+                let first_prompt = prompt_content(&prompt, &attachments, image_mode);
+                let prompt_id = crate::session::next_client_id();
                 let _ = this.update(cx, |s, cx| {
                     let mut view = SessionView::new(&agent_id, &session_id, &cwd, &prompt.chars().take(80).collect::<String>());
-                    view.push_local_user(&prompt, attachments.iter().map(Attachment::to_user_attachment).collect());
+                    view.prompt_optimistic(&prompt_id, &first_prompt);
                     view.prompting = true;
-                    view.sync_work(crate::util::now_ms());
+                    view.sync_inputs();
                     view.apply_modes(created.get("modes"));
                     view.options = options.clone();
                     view.mode = Some(mode.clone());
@@ -2942,12 +2931,16 @@ impl AgentsStore {
                 // The prompt resolves when the turn ends; keep it running in the background.
                 let turn = rpc.request(
                     "session/prompt",
-                    json!({ "sessionId": session_id, "prompt": prompt_content(&prompt, &attachments, image_mode) }),
+                    json!({
+                        "sessionId": session_id,
+                        "prompt": first_prompt,
+                        "_meta": { "querymt": { "client_prompt_id": prompt_id } },
+                    }),
                 );
                 let (this2, agent_id2, session_id2) = (this.clone(), agent_id.clone(), session_id.clone());
                 cx.spawn(async move |cx| {
                     let result = turn.await;
-                    let _ = this2.update(cx, |s, cx| s.finish_prompt(&agent_id2, &session_id2, result, cx));
+                    let _ = this2.update(cx, |s, cx| s.finish_prompt(&agent_id2, &session_id2, &prompt_id, result, cx));
                 })
                 .detach();
                 let _ = this.update(cx, |s, cx| {
@@ -3059,69 +3052,80 @@ impl AgentsStore {
                 .await;
             let elapsed_ms = now_ms() - started;
             let apply_started = now_ms();
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                else {
-                    return;
-                };
-                view.loading = false;
-                match result {
-                    Ok(v) => {
-                        view.access = crate::session::SessionAccess::parse(&v);
-                        if let Some(rt) = s.runtime.get_mut(&agent_id) {
-                            mcp_notice::record(
-                                rt,
-                                &session_id,
-                                mcp_notice::from_response(&v),
-                                false,
-                            );
+            let job = this
+                .update(cx, |s, cx| {
+                    let view = s
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == agent_id && v.session_id == session_id)?;
+                    let mut job = None;
+                    match result {
+                        Ok(v) => {
+                            if let Some(rt) = s.runtime.get_mut(&agent_id) {
+                                mcp_notice::record(
+                                    rt,
+                                    &session_id,
+                                    mcp_notice::from_response(&v),
+                                    false,
+                                );
+                            }
+                            // The core takes the whole response (its snapshot, run
+                            // state, history window and options). A large one is
+                            // decoded off the UI thread: the view keeps loading and
+                            // queues inputs behind it (design D6; native only).
+                            let big = !cfg!(target_arch = "wasm32") && json_size(&v) > HYDRATE_BYTES;
+                            let v = if big {
+                                match view.begin_load(v) {
+                                    Ok(started) => {
+                                        job = Some(started);
+                                        None
+                                    }
+                                    Err(v) => Some(v),
+                                }
+                            } else {
+                                Some(v)
+                            };
+                            if let Some(v) = v {
+                                view.loading = false;
+                                view.load(v);
+                            }
                         }
-                        view.apply_config(v.get("configOptions"));
-                        view.apply_modes(v.get("modes"));
-                        let snap = v.pointer("/_meta/querymt~1sessionLoadSnapshot.v1");
-                        if let Some(rt) = snap.and_then(|s| s.get("runtimeStatus")) {
-                            view.apply_runtime(rt);
-                        }
-                        if let Some(snap) = snap {
-                            view.apply_load_snapshot(snap);
-                        }
-                        view.sync_work(crate::util::now_ms());
-                        view.history_more = snap
-                            .and_then(|s| s.pointer("/history/complete"))
-                            .and_then(Value::as_bool)
-                            == Some(false);
-                        view.history_before = snap
-                            .and_then(|s| s.pointer("/history/before"))
-                            .and_then(Value::as_str)
-                            .filter(|_| view.history_more)
-                            .map(str::to_owned);
-                        if let Some(notice) = view.after_load_notice.take() {
-                            view.push_notice(notice, false);
+                        Err(err) => {
+                            view.loading = false;
+                            view.error = Some(format!("Could not load the session: {err}"));
+                            view.error_details = Some(load_error_report(
+                                &agent_line,
+                                &request_params,
+                                &err,
+                                elapsed_ms,
+                            ));
                         }
                     }
-                    Err(err) => {
-                        view.error = Some(format!("Could not load the session: {err}"));
-                        view.error_details = Some(load_error_report(
-                            &agent_line,
-                            &request_params,
-                            &err,
-                            elapsed_ms,
-                        ));
+                    if job.is_none() {
+                        s.finish_session_load(&load_span, cx);
                     }
-                }
-                if let Some(view) = s.session.as_ref() {
-                    load_span.record("session.items", view.items.len());
-                    if let Some(err) = &view.error {
-                        load_span.record("session.error", err.as_str());
-                    }
-                }
-                s.refresh_undo_stack(cx);
-                s.refresh_delegates(cx);
-                cx.notify();
-            });
+                    job
+                })
+                .ok()
+                .flatten();
+            if let Some(job) = job {
+                let hydrated = cx
+                    .background_executor()
+                    .spawn(async move { job.hydrate() })
+                    .await;
+                let _ = this.update(cx, |s, cx| {
+                    let Some(view) = s
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                    else {
+                        return;
+                    };
+                    view.loading = false;
+                    view.finish_load(hydrated);
+                    s.finish_session_load(&load_span, cx);
+                });
+            }
             load_span.record("session.apply_ms", now_ms() - apply_started);
         })
         .detach();
@@ -3170,27 +3174,12 @@ impl AgentsStore {
                         let events = page
                             .get("events")
                             .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        let prompts = page
-                            .get("userPrompts")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        view.prepend_events(&events, &prompts);
-                        view.apply_truncation(page.get("truncated"));
+                            .map_or(0, Vec::len);
+                        // The core inserts the page above and moves the paging
+                        // cursor (`history_before`, `history_more`).
+                        view.history_page(&page);
                         crate::telemetry::record_history_load("ok");
-                        tracing::info!(events = events.len(), "older history page loaded");
-                        let complete = page
-                            .pointer("/history/complete")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(true);
-                        view.history_before = page
-                            .pointer("/history/before")
-                            .and_then(Value::as_str)
-                            .filter(|_| !complete)
-                            .map(str::to_owned);
-                        view.history_more = view.history_before.is_some();
+                        tracing::info!(events, "older history page loaded");
                     }
                     // An undo rewrote history: the cursor is void, reload from scratch.
                     Err(err) if err.contains("history_changed") => {
@@ -3345,7 +3334,7 @@ impl AgentsStore {
                     .as_mut()
                     .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
                 {
-                    view.undo_stack = UndoFrame::parse_stack(&resp);
+                    view.set_undo_stack(&UndoFrame::parse_stack(&resp));
                     cx.notify();
                 }
             });
@@ -3440,7 +3429,7 @@ impl AgentsStore {
                 return;
             }
         };
-        view.undo_stack = UndoFrame::parse_stack(&resp);
+        view.set_undo_stack(&UndoFrame::parse_stack(&resp));
         if resp.get("success").and_then(Value::as_bool) != Some(true) {
             let msg = resp
                 .get("message")
@@ -3571,7 +3560,7 @@ impl AgentsStore {
             } else {
                 "steer"
             };
-            let input_id = format!("gpui-{}", now_ms() as u64);
+            let input_id = crate::session::next_client_id();
             // The message waits in the activity dock; the agent echoes it into
             // the transcript once it is applied (steer) or started (queue).
             view.add_pending_input(crate::session::PendingInput {
@@ -3601,7 +3590,7 @@ impl AgentsStore {
                         let _ = this.update(cx, |s, cx| {
                             if let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) {
                                 view.apply_runtime(rt);
-                                view.sync_work(now_ms());
+                                view.sync_inputs();
                                 cx.notify();
                             }
                         });
@@ -3637,12 +3626,10 @@ impl AgentsStore {
                             let delivery = if status == "queued" { "queue" } else { delivery };
                             view.set_input_state(&id, delivery, state);
                             // A notification may have overtaken this response.
-                            if let Some((d, st)) = view.input_notes.remove(&id).or_else(|| view.input_notes.remove(&input_id)) {
-                                view.set_input_state(&id, &d, &st);
-                            }
+                            view.apply_input_notes(&id, &input_id);
                             if status == "started" {
                                 view.phase = "starting".into();
-                                view.sync_work(now_ms());
+                                view.sync_inputs();
                             }
                         }
                     }
@@ -3652,24 +3639,23 @@ impl AgentsStore {
             .detach();
             return;
         }
-        view.push_local_user(
-            &text,
-            attachments
-                .iter()
-                .map(Attachment::to_user_attachment)
-                .collect(),
-        );
+        let prompt_id = crate::session::next_client_id();
+        view.prompt_optimistic(&prompt_id, &content);
         view.prompting = true;
-        view.sync_work(crate::util::now_ms());
+        view.sync_inputs();
         let turn = rpc.request(
             "session/prompt",
-            json!({ "sessionId": session_id, "prompt": content }),
+            json!({
+                "sessionId": session_id,
+                "prompt": content,
+                "_meta": { "querymt": { "client_prompt_id": prompt_id } },
+            }),
         );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = turn.await;
             let _ = this.update(cx, |s, cx| {
-                s.finish_prompt(&agent_id, &session_id, result, cx)
+                s.finish_prompt(&agent_id, &session_id, &prompt_id, result, cx)
             });
         })
         .detach();
@@ -3683,14 +3669,14 @@ impl AgentsStore {
         let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
             return;
         };
-        let Some(input) = view
+        if !view
             .pending_inputs
-            .iter_mut()
-            .find(|i| i.input_id == input_id && i.state == "queued" && !i.discard_pending)
-        else {
+            .iter()
+            .any(|i| i.input_id == input_id && i.state == "queued" && !i.discard_pending)
+        {
             return;
-        };
-        input.discard_pending = true;
+        }
+        view.set_discard_pending(input_id, true);
         let (agent_id, session_id, input_id) = (
             view.agent_id.clone(),
             view.session_id.clone(),
@@ -3714,13 +3700,7 @@ impl AgentsStore {
                 match result {
                     Ok(_) => view.set_input_state(&input_id, "queue", "discarded"),
                     Err(err) => {
-                        if let Some(i) = view
-                            .pending_inputs
-                            .iter_mut()
-                            .find(|i| i.input_id == input_id)
-                        {
-                            i.discard_pending = false;
-                        }
+                        view.set_discard_pending(&input_id, false);
                         view.push_notice(
                             format!("Could not remove the queued message: {err}"),
                             true,
@@ -3958,6 +3938,7 @@ impl AgentsStore {
         &mut self,
         agent_id: &str,
         session_id: &str,
+        client_prompt_id: &str,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
@@ -3967,7 +3948,17 @@ impl AgentsStore {
             .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
         {
             view.prompting = false;
-            view.sync_work(crate::util::now_ms());
+            // The outcome goes to the core in order with everything else: the
+            // prompt is linked to its echo by id, or marked failed.
+            match &result {
+                Ok(v) => view.prompt_completed(
+                    Some(client_prompt_id),
+                    v.pointer("/_meta/querymt/messageId").and_then(Value::as_str),
+                    v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn"),
+                ),
+                Err(err) => view.prompt_failed(client_prompt_id, err),
+            }
+            view.sync_inputs();
             match &result {
                 Err(err) => view.push_notice(format!("Prompt failed: {err}"), true),
                 Ok(v) => match v.get("stopReason").and_then(Value::as_str) {
@@ -4412,16 +4403,16 @@ impl AgentsStore {
                         .session
                         .as_mut()
                         .filter(|v| v.agent_id == id && v.session_id == session_id)
-                        && let Some(update) = params.get("update")
                     {
-                        view.apply(update);
-                        cx.notify();
+                        view.queue_session_update(&params);
+                        self.schedule_session_flush(cx);
                     }
                 }
-                if method.ends_with("session/delegationUpdate") {
+                // Run state of any run, including ones other clients started.
+                // Child links arrive as `subagent_update`s through the core.
+                if method.trim_start_matches('_').ends_with("session/stateUpdate") {
                     let sid = params
                         .get("sessionId")
-                        .or_else(|| params.get("session_id"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     if let Some(view) = self
@@ -4429,8 +4420,8 @@ impl AgentsStore {
                         .as_mut()
                         .filter(|v| v.agent_id == id && v.session_id == sid)
                     {
-                        view.apply_child_links(std::slice::from_ref(&params));
-                        cx.notify();
+                        view.queue_state_update(&params);
+                        self.schedule_session_flush(cx);
                     }
                 }
                 if method.ends_with("session/runtimeChanged") {
@@ -4450,9 +4441,9 @@ impl AgentsStore {
                         .filter(|v| v.agent_id == id && v.session_id == sid)
                     {
                         if let Some(rt) = params.get("runtime") {
-                            view.apply_runtime(rt);
+                            view.queue_runtime(rt);
                         }
-                        view.sync_work(crate::util::now_ms());
+                        self.schedule_session_flush(cx);
                     }
                     if let Some(s) = self
                         .runtime
@@ -4488,14 +4479,12 @@ impl AgentsStore {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        if view.pending_inputs.iter().any(|i| i.input_id == input_id) {
-                            view.set_input_state(&input_id, &delivery, &state);
-                        } else {
-                            // Its submit response hasn't arrived yet (or the id
-                            // is still the client's); apply it when it does.
-                            view.input_notes.insert(input_id, (delivery, state));
-                        }
-                        cx.notify();
+                        // The core lists the input for any client; an input
+                        // sent from here waits for its submit response to
+                        // learn its agent id, so an early state is kept.
+                        view.queue_input_state(&params);
+                        view.note_input_state(&input_id, &delivery, &state);
+                        self.schedule_session_flush(cx);
                     }
                 }
                 if method
@@ -4543,6 +4532,50 @@ impl AgentsStore {
                 }
             }
         }
+    }
+
+    /// What follows a finished load of the open session, inline or hydrated.
+    fn finish_session_load(&mut self, span: &tracing::Span, cx: &mut Context<Self>) {
+        if let Some(view) = self.session.as_ref() {
+            span.record("session.items", view.items.len());
+            if let Some(err) = &view.error {
+                span.record("session.error", err.as_str());
+            }
+        }
+        self.refresh_undo_stack(cx);
+        self.refresh_delegates(cx);
+        cx.notify();
+    }
+
+    /// Apply the queued session inputs once, a frame from now: a burst of
+    /// chunks is one batch, one change report and one repaint (design D6).
+    /// Prompt, history and load actions feed at once, which flushes the queue
+    /// first, so order is kept.
+    fn schedule_session_flush(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
+        if !view.claim_flush() {
+            return;
+        }
+        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SESSION_FLUSH_MS))
+                .await;
+            let _ = this.update(cx, |s, cx| {
+                if let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                {
+                    view.flush_done();
+                    view.flush();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Debounced `session/list` refresh after runtime notifications.
@@ -5163,6 +5196,23 @@ fn load_error_report(
 
 /// ACP prompt blocks: text plus attachments. Images are native `image` blocks
 /// unless `image_mode` asks for resources; other files are always embedded resources.
+/// Serialized size of a value, counted without building the string.
+fn json_size(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
 fn prompt_content(
     prompt: &str,
     attachments: &[Attachment],

@@ -97,7 +97,18 @@
           version = cargoToml.package.version;
           src = lib.cleanSource ./.;
 
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # One hash for the whole querymt/querymt checkout at the pinned
+            # rev (Cargo.toml); refresh all three together when the rev moves.
+            outputHashes = let
+              querymt = "sha256-GNVgmbM+iypT0FzDCGyLbTcLKykFDtJBYpyVM0GOdMc=";
+            in {
+              "querymt-0.6.0" = querymt;
+              "querymt-agent-protocol-types-0.6.0" = querymt;
+              "querymt-agent-session-core-0.6.0" = querymt;
+            };
+          };
 
           nativeBuildInputs = with pkgs; [pkg-config makeWrapper copyDesktopItems];
           buildInputs = runtimeLibs ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.alsa-lib pkgs.zstd];
