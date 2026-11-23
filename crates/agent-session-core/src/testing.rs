@@ -717,6 +717,29 @@ fn state_update(state: &str, run_id: &str, stop_reason: Option<&str>) -> Session
     }
 }
 
+/// A state update with the host's time (`atMs`).
+fn state_update_at(
+    state: &str,
+    run_id: &str,
+    stop_reason: Option<&str>,
+    host_at_ms: Option<i64>,
+) -> SessionInput {
+    let SessionInput::StateUpdate {
+        mut notification,
+        at_ms,
+    } = state_update(state, run_id, stop_reason)
+    else {
+        unreachable!("state_update builds a StateUpdate")
+    };
+    if let Some(at) = host_at_ms {
+        notification["atMs"] = json!(at);
+    }
+    SessionInput::StateUpdate {
+        notification,
+        at_ms,
+    }
+}
+
 fn loaded(spec: TraceSpec) -> SessionInput {
     let trace = generate(spec);
     SessionInput::SnapshotLoaded {
@@ -959,7 +982,54 @@ pub fn golden_cases() -> Vec<GoldenCase> {
         model_calls: false,
         ..TraceSpec::small(9)
     })]];
+    // Active time: a load during a run (total from the summary, start from
+    // the runtime status), the sync that follows it, the run ending, a
+    // second run with a permission wait, and a reload that sets the total.
+    let active_load = |active_ms: u64, running: bool| {
+        let mut status = json!({ "phase": "idle", "active_run_id": null, "steerable": false,
+            "pending_steering_count": 0, "queued_input_count": 0, "run_started_at_ms": null,
+            "observation": { "availability": "live" } });
+        if running {
+            status["phase"] = json!("model");
+            status["active_run_id"] = json!("r-live");
+            status["run_started_at_ms"] = json!(50_000);
+        }
+        SessionInput::SnapshotLoaded {
+            response: snapshot_response(
+                &generate(TraceSpec::small(10)).events,
+                json!({ "runtimeStatus": status,
+                    "summary": { "usage": { "latestRequest": null, "sessionTotals": null,
+                        "partial": false, "requestCount": 0, "contextTokens": null,
+                        "contextPosition": null,
+                        "accounting": serde_json::to_value(
+                            querymt_agent_protocol_types::accounting::ScopeTotals::default())
+                            .unwrap_or(Value::Null) },
+                        "provider": null, "pendingInputs": [], "childSessions": [],
+                        "activeMs": active_ms } }),
+            ),
+        }
+    };
+    let active_time = vec![
+        vec![
+            active_load(120_000, true),
+            state_update_at("running", "r-live", None, None),
+        ],
+        vec![state_update_at(
+            "idle",
+            "r-live",
+            Some("end_turn"),
+            Some(65_000),
+        )],
+        vec![
+            state_update_at("running", "r-next", None, Some(70_000)),
+            state_update_at("requires_action", "r-next", None, Some(71_000)),
+            state_update_at("running", "r-next", None, Some(72_000)),
+            state_update_at("idle", "r-next", Some("end_turn"), Some(80_000)),
+        ],
+        vec![active_load(145_000, false)],
+    ];
     vec![
+        case("active_time", active_time),
         case("usage", usage),
         case("usage_gaps", usage_gaps),
         case("no_model_calls", no_model_calls),

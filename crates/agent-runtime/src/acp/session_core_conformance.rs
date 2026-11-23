@@ -54,6 +54,15 @@ pub(super) fn journal(spec: TraceSpec) -> Vec<AgentEvent> {
 /// summary comes from the agent's summarizer), then without a window. The
 /// session's id is returned with them.
 pub(super) async fn agent_snapshots(events: &[AgentEvent]) -> (String, Value, Value) {
+    let (sid, windowed, unwindowed, _) = agent_snapshots_with_journal(events).await;
+    (sid, windowed, unwindowed)
+}
+
+/// [`agent_snapshots`], plus the events as the journal stored them (the
+/// storage stamps its own timestamps), under the id `SESSION`.
+pub(super) async fn agent_snapshots_with_journal(
+    events: &[AgentEvent],
+) -> (String, Value, Value, Vec<AgentEvent>) {
     let fixture = crate::session::run_reconcile::tests::fixture().await;
     let sid = fixture
         .storage
@@ -92,7 +101,22 @@ pub(super) async fn agent_snapshots(events: &[AgentEvent]) -> (String, Value, Va
         .await
         .expect("the snapshot builds");
     let response = |snapshot: &crate::session::load_snapshot::SessionLoadSnapshot| json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } });
-    (sid, response(&windowed), response(&unwindowed))
+    let stored = crate::session::projection::EventJournal::load_session_stream(
+        fixture.storage.as_ref(),
+        &sid,
+        None,
+        None,
+    )
+    .await
+    .expect("the stored journal")
+    .into_iter()
+    .map(AgentEvent::from)
+    .map(|mut event| {
+        event.session_id = SESSION.to_owned();
+        event
+    })
+    .collect();
+    (sid, response(&windowed), response(&unwindowed), stored)
 }
 
 fn notification(update: &impl serde::Serialize) -> SessionInput {
@@ -494,6 +518,68 @@ async fn snapshot_and_live_stream_produce_the_same_turns() {
             from_snapshot.header().active_run_id,
             from_live.header().active_run_id,
             "{name}"
+        );
+    }
+}
+
+/// The run time a journal reports, read the way the agent's summary does.
+fn summary_active_ms(events: &[AgentEvent]) -> u64 {
+    querymt_agent_services::session::history_window::summarize_events(
+        SESSION,
+        events.iter().map(|event| (event.seq, event)),
+    )
+    .summary
+    .active_ms
+}
+
+/// Active time agrees live and after a load: the live stream's state updates
+/// carry the event time as `atMs`, and the snapshot's summary sums the same
+/// run boundaries. Run on the journal as storage stamped it (real
+/// timestamps, all three views of one journal) and on the generated journal
+/// (timestamps that make every run last a known time).
+#[tokio::test]
+async fn active_time_agrees_live_and_after_a_load() {
+    for (name, spec) in specs() {
+        let events = journal(spec);
+        let (sid, windowed, unwindowed, stored) = agent_snapshots_with_journal(&events).await;
+        let from_snapshot = apply_all(&sid, &[SessionInput::SnapshotLoaded { response: windowed }]);
+        let from_unwindowed = apply_all(
+            &sid,
+            &[SessionInput::SnapshotLoaded {
+                response: unwindowed,
+            }],
+        );
+        let from_stored_live = apply_all(SESSION, &live_stream(&stored));
+        let expected = from_snapshot.header().active_time.clone();
+        assert!(
+            expected.is_some(),
+            "{name}: the snapshot reports active time"
+        );
+        assert_eq!(expected.as_ref().and_then(|t| t.active_since_ms), None);
+        assert_eq!(
+            expected.as_ref().map(|t| t.total_ms),
+            Some(summary_active_ms(&stored))
+        );
+        assert_eq!(from_unwindowed.header().active_time, expected, "{name}");
+        assert_eq!(from_stored_live.header().active_time, expected, "{name}");
+
+        // Generated timestamps: each run lasts its events' span in seconds.
+        let generated = summary_active_ms(&events);
+        assert!(generated > 0, "{name}: the generated runs take time");
+        let from_live = apply_all(SESSION, &live_stream(&events));
+        assert_eq!(
+            from_live.header().active_time.as_ref().map(|t| t.total_ms),
+            Some(generated),
+            "{name}: live total"
+        );
+        assert_eq!(
+            from_live
+                .header()
+                .active_time
+                .as_ref()
+                .and_then(|t| t.active_since_ms),
+            None,
+            "{name}: no run is active at the end"
         );
     }
 }

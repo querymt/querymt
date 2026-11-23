@@ -250,4 +250,10 @@ pub struct SessionHistorySummary {
     pub provider: Option<SummaryProvider>,
     pub pending_inputs: Vec<PendingInputSummary>,
     pub child_sessions: Vec<ChildSessionLink>,
+    /// Total time of the session's ended runs (`RunStarted` to
+    /// `RunCompleted`) in milliseconds, over the whole journal. A run that has
+    /// not ended is not counted.
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub active_ms: u64,
 }

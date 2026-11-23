@@ -2246,6 +2246,14 @@ impl AcpLiveEventTranslator {
     /// reason, and a blocking permission or elicitation wait is
     /// `requires_action` until the last one resolves.
     pub fn translate_state_update(&mut self, event: &EventEnvelope) -> Option<SessionStateUpdate> {
+        // The host's time of the transition, in ms (event timestamps are
+        // whole seconds): both ends of a run are measured on this clock.
+        let at_ms = event.timestamp().saturating_mul(1000);
+        self.translate_state_transition(event)
+            .map(|update| update.at(at_ms))
+    }
+
+    fn translate_state_transition(&mut self, event: &EventEnvelope) -> Option<SessionStateUpdate> {
         let session_id = event.session_id();
         match event.kind() {
             AgentEventKind::RunStarted { run_id, .. } => {
@@ -10900,6 +10908,79 @@ mod session_update_tests {
             .collect()
     }
 
+    /// A durable event stamped `timestamp` (whole seconds).
+    fn envelope_at(seq: i64, timestamp: i64, kind: AgentEventKind) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
+            event_id: format!("evt-{seq}"),
+            stream_seq: seq,
+            timestamp,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        })
+    }
+
+    #[test]
+    fn state_updates_carry_the_host_time_of_the_event() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let started = envelope_at(
+            1,
+            100,
+            AgentEventKind::RunStarted {
+                run_id: "r1".into(),
+                origin: "interactive".into(),
+            },
+        );
+        let waiting = envelope_at(
+            2,
+            101,
+            AgentEventKind::PermissionRequested {
+                permission_id: "p1".into(),
+                task_id: None,
+                tool_name: "shell".into(),
+                reason: "needs approval".into(),
+                tool_call_id: "call-1".into(),
+                request: None,
+            },
+        );
+        let granted = envelope_at(
+            3,
+            103,
+            AgentEventKind::PermissionGranted {
+                permission_id: "p1".into(),
+                granted: true,
+            },
+        );
+        let done = envelope_at(
+            4,
+            110,
+            AgentEventKind::RunCompleted {
+                run_id: "r1".into(),
+                outcome: "completed".into(),
+                stop_type: None,
+                reason: None,
+            },
+        );
+        let at: Vec<Option<i64>> = [started, waiting, granted, done]
+            .iter()
+            .map(|event| {
+                translator
+                    .translate_state_update(event)
+                    .and_then(|u| u.at_ms)
+            })
+            .collect();
+        assert_eq!(
+            at,
+            [Some(100_000), Some(101_000), Some(103_000), Some(110_000)]
+        );
+        // The sync after a load has no host time of its own.
+        translator.seed_run_state("s-1", Some("r2".into()), false);
+        let current = translator.current_state_update("s-1").expect("running");
+        assert_eq!(current.at_ms, None);
+    }
+
     #[test]
     fn prompted_run_reports_running_and_idle() {
         let mut translator = AcpLiveEventTranslator::new();
@@ -10920,9 +11001,12 @@ mod session_update_tests {
         assert_eq!(
             updates,
             [
-                serde_json::json!({"sessionId": "s-1", "state": "running", "runId": "r1"}),
                 serde_json::json!({
-                    "sessionId": "s-1", "state": "idle", "runId": "r1", "stopReason": "end_turn"
+                    "sessionId": "s-1", "state": "running", "runId": "r1", "atMs": 0
+                }),
+                serde_json::json!({
+                    "sessionId": "s-1", "state": "idle", "runId": "r1",
+                    "stopReason": "end_turn", "atMs": 0
                 }),
             ]
         );

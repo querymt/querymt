@@ -141,6 +141,20 @@ pub struct CursorView {
     pub placement: Option<CursorPlacement>,
 }
 
+/// The session's active time: run time, on the host's clock.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveTime {
+    /// Total time of the ended runs, in milliseconds.
+    #[typeshare(serialized_as = "number")]
+    pub total_ms: u64,
+    /// Host time (ms since the epoch) the active run started, if one is
+    /// active. The client adds `now - active_since_ms` while it runs.
+    #[typeshare(serialized_as = "Option<number>")]
+    pub active_since_ms: Option<i64>,
+}
+
 /// The session header: all whole-session state.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -176,6 +190,9 @@ pub struct SessionHeader {
     /// Session cursors in the order they were announced, keyed by cursor id.
     pub cursors: Vec<CursorView>,
     pub runtime: Option<SessionRuntimeStatus>,
+    /// Run time of the session; `None` until a snapshot or a state update
+    /// reported it. History pages do not change it.
+    pub active_time: Option<ActiveTime>,
     pub history: HistoryPaging,
 }
 

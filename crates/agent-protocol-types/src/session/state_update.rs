@@ -37,9 +37,20 @@ pub struct SessionStateUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[typeshare(serialized_as = "string")]
     pub stop_reason: Option<StopReason>,
+    /// Host time of the transition in milliseconds since the epoch (the
+    /// event's timestamp). Absent on the current-state sync after a load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "Option<number>")]
+    pub at_ms: Option<i64>,
 }
 
 impl SessionStateUpdate {
+    /// Set the host time of the transition.
+    pub fn at(mut self, at_ms: i64) -> Self {
+        self.at_ms = Some(at_ms);
+        self
+    }
+
     pub fn running(session_id: &str, run_id: &str) -> Self {
         Self::new(session_id, SessionRunState::Running, run_id, None)
     }
@@ -63,6 +74,7 @@ impl SessionStateUpdate {
             state,
             run_id: run_id.to_string(),
             stop_reason,
+            at_ms: None,
         }
     }
 }
@@ -98,6 +110,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&waiting).unwrap(),
             serde_json::json!({"sessionId": "s1", "state": "requires_action", "runId": "r1"})
+        );
+        let timed = SessionStateUpdate::running("s1", "r1").at(10_000);
+        assert_eq!(
+            serde_json::to_value(&timed).unwrap(),
+            serde_json::json!({"sessionId": "s1", "state": "running", "runId": "r1", "atMs": 10000})
         );
     }
 
