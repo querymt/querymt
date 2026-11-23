@@ -36,7 +36,7 @@ export type ModelSelection =
 export type PeerGrant =
   | { mode: "none" }
   | { mode: "full" }
-  | { mode: "custom"; sessions: boolean; filesystem: boolean; providers: ProviderGrant[] };
+  | { mode: "custom"; sessions: boolean; filesystem: boolean; shell?: boolean; providers: ProviderGrant[] };
 
 export type MeshQuotaLimit =
   | { kind: "unlimited" }
