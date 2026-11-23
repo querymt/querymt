@@ -6,9 +6,9 @@ use crate::entry::{
     ToolCallEntry, UserMessage,
 };
 use crate::store::TurnHint;
-use crate::view::PlanView;
+use crate::view::{PlanView, SlashCommandView};
 use querymt_agent_protocol_types::protocol::{
-    CompactionStatus, CompactionSummaryChunk, CompactionUpdate, ContentBlock, ContentChunk,
+    AvailableCommand, AvailableCommandInput, CompactionStatus, CompactionSummaryChunk, CompactionUpdate, ContentBlock, ContentChunk,
     MaybeUndefined, Plan, PlanRemoved, PlanUpdate, PlanUpdateContent, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallUpdate,
 };
@@ -53,6 +53,32 @@ fn content_values(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|item| serde_json::to_value(item).ok())
         .collect()
+}
+
+/// The slash commands of an `available_commands_update`, as the header
+/// holds them: names without a leading `/`, entries with an empty name
+/// dropped, the first of duplicate names kept. The input hint comes from the
+/// unstructured input; an input kind this core does not know takes input
+/// with an empty hint.
+fn slash_commands(commands: &[AvailableCommand]) -> Vec<SlashCommandView> {
+    let mut out: Vec<SlashCommandView> = Vec::with_capacity(commands.len());
+    for command in commands {
+        let name = command.name.trim_start_matches('/');
+        if name.is_empty() || out.iter().any(|known| known.name == name) {
+            continue;
+        }
+        let input_hint = match &command.input {
+            Some(AvailableCommandInput::Unstructured(input)) => Some(input.hint.clone()),
+            Some(_) => Some(String::new()),
+            None => None,
+        };
+        out.push(SlashCommandView {
+            name: name.to_owned(),
+            description: command.description.clone(),
+            input_hint,
+        });
+    }
+    out
 }
 
 /// The model a `_meta.querymt.model` object names. A live update carries no
@@ -143,6 +169,9 @@ impl SessionCore {
                     .filter_map(|option| serde_json::to_value(option).ok())
                     .collect();
                 self.merge_config_options(options);
+            }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.header.available_commands = slash_commands(&update.available_commands);
             }
             SessionUpdate::CurrentModeUpdate(update) => {
                 self.header.current_mode = Some(update.current_mode_id.0.to_string());

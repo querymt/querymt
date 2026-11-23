@@ -155,6 +155,20 @@ pub struct ActiveTime {
     pub active_since_ms: Option<i64>,
 }
 
+/// A slash command the agent advertises for the session
+/// (`available_commands_update`).
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommandView {
+    /// The command name without a leading `/`.
+    pub name: String,
+    pub description: String,
+    /// The hint of the command's input, when it takes input. Empty when the
+    /// command takes input but gives no hint.
+    pub input_hint: Option<String>,
+}
+
 /// The session header: all whole-session state.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -182,6 +196,9 @@ pub struct SessionHeader {
     /// ACP config options, merged by id, kept as received.
     #[typeshare(serialized_as = "any")]
     pub config_options: Vec<serde_json::Value>,
+    /// The slash commands of the agent's latest `available_commands_update`,
+    /// replaced as a whole. Loads do not change them.
+    pub available_commands: Vec<SlashCommandView>,
     pub plan: Option<PlanView>,
     pub undo_stack: Vec<UndoFrame>,
     pub pending_inputs: Vec<PendingInputSummary>,
