@@ -14,17 +14,20 @@ See proposal.md (Why). Current state that shapes the approach:
   - `crates/agent-services/src/session/history_window.rs` `LoadWindow`, `HistoryInfo`, `ToolContentPart`, `TruncatedEntry`, `SessionHistorySummary` and its parts. The windowing functions and `WindowRead` stay.
   - `crates/agent-runtime/src/session/load_snapshot.rs` `SessionLoadSnapshot`, `UserPromptRecord`. `crates/agent-runtime/src/control/notifications.rs` `SessionInputStateNotification`, `SessionInputDelivery`, `SessionInputState`.
 - **What blocks a browser build:**
-  - agent-core depends on `tokio`, `async-trait`, `whatlang`, `rust-stemmers`, `mockall`, and on `agent-client-protocol` 2.2, which pulls in `async-io`, `async-process`, `blocking` and `rustix`.
+  - agent-core depends on `tokio`, `async-trait`, `whatlang`, `rust-stemmers`, `mockall`, and on `agent-client-protocol` 5.4, which pulls in `async-io`, `async-process`, `blocking` and `rustix`.
   - `querymt` with `default-features = false` still depends on `which`, but only `mcp/config.rs` (behind `mcp`) uses it.
-- **ACP schema.** `agent-client-protocol` 2.2 re-exports `agent-client-protocol-schema` 1.9 (`schema::v1::*`). The schema crate needs only serde, serde_json, serde_with, strum, derive_more and anyhow.
-- **Compaction and plans are standard ACP.** The ACP v1 schema defines `CompactionCapabilities` (client capability `session.compaction`), `CompactionUpdate`, `CompactionSummaryChunk`, `CompactionId` and `CompactionStatus`; the schema crate ships them behind `unstable_session_compaction`. Plan operations (`plan_update`, `plan_removed`) ship behind `unstable_plan_operations`. The agent already emits these as `SessionUpdate::CompactionUpdate` (`crates/agent-runtime/src/acp/shared.rs` `AcpLiveEventTranslator`, gated on the client capability), and querymt-desktop already advertises `session: { compaction: {} }` (`src/lib/querymt/acp-client.ts` `buildClientCapabilities`).
-- **How the agent replays history.** `crates/agent-runtime/src/acp/shared.rs` `replay_agent_events_to_session_notifications` and `translate_replay_event_to_updates` turn journal events into the ACP updates that clients receive live. The new conformance test uses them as the reference.
-- **Load ordering.** For a client without the snapshot capability, `session/load` sends the replayed `session/update` notifications (marked `_meta.querymtReplay`) *before* the response (`RpcDispatchOutput::notify_before_response`). A snapshot-capable client gets no replay (`prefers_snapshot_history`), but a client must still cope with an agent that replays anyway.
+- **ACP schema.** `agent-client-protocol` 5.4 re-exports `agent-client-protocol-schema` 1.19 (`agent_client_protocol::v1::schema::*`). The schema crate needs only serde, serde_json, serde_with, strum, derive_more and anyhow. Its v2 module sits behind `unstable_protocol_v2`, which QueryMT does not enable.
+- **Compaction, plans, subagents and cursors are standard ACP.** The ACP v1 schema defines `CompactionCapabilities` (client capability `session.compaction`), `CompactionUpdate`, `CompactionSummaryChunk`, `CompactionId` and `CompactionStatus`; in 1.19 they are not behind a feature. Plan operations (`plan_update`, `plan_removed`), subagents (`subagent_update`, `session.subagents`) and session cursors (`cursor_update`, `session.cursors`) ship behind `unstable_plan_operations`, `unstable_subagents` and `unstable_session_cursors`, all part of `unstable`. The agent emits compactions and plans from `crates/agent-runtime/src/acp/shared.rs` `AcpLiveEventTranslator`, gated on the client capability; subagents and cursors come with `adopt-acp-subagents-cursors-usage`.
+- **ACP v2 drafts used as the target shape** (not compiled in): `state_update` (foreground work `running` / `requires_action` / `idle` with a stop reason, for prompted and agent-started work alike), the `session/prompt` response returning the inserted user message's `messageId`, entities keyed by type and id with the first update fixing the position, and `session/resume` with `replayFrom`: updates are held until `replay_complete`, running work is split at a cut point, and a current `state_update` follows. The session cursors RFD keeps cursors as positions in history; a point in what a client has received is left open, so the snapshot's stream cursor is not an ACP cursor.
+- **How the agent translates events.** Live: each connection's forwarder (`acp/mod.rs`, `websocket.rs`) checks session ownership when it receives an event, then `AcpLiveEventTranslator::translate_notifications`. It tracks streamed messages (a stored message whose deltas were sent is suppressed), structured prompt blocks and `plan_operations`. Replay: `replay_agent_events_materialized`. Both share the stateless projection in `querymt_agent_protocol_types::replay` (task 4.0).
+- **Runs.** The agent's turn is a run (`session-history-loading` / Turn boundaries, `agent-services` `session::turns`), from `RunStarted` to `RunCompleted { stop_type }`. Neither event is translated for clients today; only input-state notifications carry a run id. The runtime phase reaches clients as `querymt/session/runtimeChanged` through a `watch` channel, which coalesces transitions (`restructure-agent-turn-state` 6.6). Applied steering emits `UserPromptBlock` and `PromptReceived` inside the running run; scheduled runs emit `RunStarted` with origin `scheduled`.
+- **Load ordering.** `LocalAgentHandle::load_session` reads the snapshot (`session_load_snapshot_meta`), and only afterwards does `session/load` subscribe the connection (`attach_rpc_session_locked` → `subscribe_connection`). Events between the two are dropped by the ownership check or, if still queued, delivered on top of the snapshot. Assistant deltas are not journaled, so a connection that attaches mid-message receives only the later deltas, and its translator then suppresses the stored message. For a client without the snapshot capability, replayed `session/update` notifications (marked `_meta.querymtReplay`) come *before* the response (`notify_before_response`); a snapshot-capable client gets no replay (`prefers_snapshot_history`).
 - **Older-history response.** `_querymt/session/history` returns `events`, `history`, `truncated` and, for remote sessions, `userPrompts` (`crates/agent-runtime/src/agent/handle/ext_session_history.rs` `SessionHistoryResponse`).
-- **Prompt echo and QueryMT `_meta`.** The agent reads `_meta.querymt.client_prompt_id` from `session/prompt` and puts it back on the echoed `user_message_chunk` (`user_prompt_chunk` in `shared.rs`). Reasoning chunks carry `_meta.querymt.reasoning_part_id`; `usage_update` carries the token breakdown in `_meta.querymt.usage`.
+- **Prompt echo and QueryMT `_meta`.** The agent reads `_meta.querymt.client_prompt_id` from `session/prompt` and puts it back on the echoed `user_message_chunk` (`user_prompt_chunk` in `shared.rs`). Reasoning chunks carry `_meta.querymt.reasoning_part_id`; `usage_update` carries the token breakdown in `_meta.querymt.usage`. The v1 prompt response arrives when the run ends and carries only the stop reason (and `usage` with `adopt-acp-subagents-cursors-usage`).
+- **Related changes.** `adopt-acp-subagents-cursors-usage` replaces `querymt/session/delegationUpdate` and the snapshot's `delegationUpdates` with `subagent_update` and `subagentUpdates`, and announces `cursor_update`s with ids derived from their anchors (its D1). It also adds `PromptResponse.usage`.
 - **Other clients:** querymt-desktop (`session-updates.ts`, `session-snapshot.ts`, `session-conversation.ts`), querymt-mobile (`sessionUpdateReducer.ts`) and querymt-gpui (`src/session.rs`, a native Rust reducer over `serde_json::Value`). They are the behavioural reference for the reducer.
 - **Workspace hack.** `.config/hakari.toml` builds `querymt-workspace-hack` (tokio full, rusqlite, libp2p, reqwest) and adds it to every agent-stack crate; `querymt` is in `[final-excludes]` because the wasm32-wasip1 plugins share it. `lint.yml` runs `cargo hakari verify`.
-- **Related change.** `split-agent-crate` has landed and is archived (2026-11-15); its facade paths are final.
+- **Landed changes.** `split-agent-crate` (2026-11-15): its facade paths are final. `restructure-agent-turn-state` and `unify-model-call-path` (2026-11-22): run start ordering (`RunStarted` before the prompt is stored), scheduled runs, steering stored as its own message, retries during compaction.
 
 ## Goals / Non-Goals
 
@@ -36,7 +39,7 @@ See proposal.md (Why). Current state that shapes the approach:
 **Non-Goals:**
 - Rendering (markdown, HTML, diffs). Clients keep it.
 - A JS-side state copy. The state lives inside the module.
-- Changing what the agent emits.
+- ACP v2. The agent additions follow v2's shapes but stay v1 extensions (D8).
 
 ## Decisions
 
@@ -45,7 +48,7 @@ See proposal.md (Why). Current state that shapes the approach:
 ```mermaid
 flowchart BT
   qmt["querymt (default-features = false)"]
-  acps["agent-client-protocol-schema 1.9 (default-features = false, unstable)"]
+  acps["agent-client-protocol-schema 1.19 (default-features = false, unstable)"]
   apt["querymt-agent-protocol-types"]
   asc["querymt-agent-session-core"]
   wasm["querymt-agent-session-core-wasm (cdylib, publish = false)"]
@@ -63,7 +66,7 @@ flowchart BT
 ```
 
 - `querymt-agent-protocol-types` depends on serde, serde_json, typeshare, time (`serde`, `formatting`, `parsing`), rapidhash, `querymt` with `default-features = false`, and `agent-client-protocol-schema`. All of them are added as workspace dependencies.
-  - `agent-client-protocol-schema = { version = "1.9", default-features = false, features = ["unstable"] }` is a new workspace entry. It must be the same major/minor version that `agent-client-protocol` 2.2 re-exports, so the types are identical. A compile-time assertion (`fn same(_: querymt_agent_protocol_types::protocol::SessionNotification) -> agent_client_protocol::schema::v1::SessionNotification`) in agent-core enforces this.
+  - `agent-client-protocol-schema = { version = "1.19", default-features = false, features = ["unstable"] }` is a new workspace entry. It must be the same major/minor version that `agent-client-protocol` 5.4 re-exports, so the types are identical. A compile-time assertion (`fn same(_: querymt_agent_protocol_types::protocol::SessionNotification) -> agent_client_protocol::v1::schema::SessionNotification`) in agent-core enforces this.
   - The agent's own build still enables the schema's `schemars` feature through `agent-client-protocol`. Feature unification makes that harmless.
 - `querymt-agent-session-core` depends only on protocol-types, serde and serde_json.
 - **Workspace hack.** `querymt-agent-protocol-types`, `querymt-agent-session-core` and `querymt-agent-session-core-wasm` go under hakari `[final-excludes]`, like `querymt`. They still count for feature unification but never get the `querymt-workspace-hack` dependency, so their closure has no tokio or rusqlite on any target and is the same when built from another workspace.
@@ -75,6 +78,8 @@ flowchart BT
 ### D2. Extraction keeps existing paths
 - **What moves.** Types move with their serde and typeshare attributes and with any inherent methods that only use other moved types (for example `LoadWindow::clamped`, `AccountingSnapshot::mark_untransferred_history`, `observe_cursor`).
 - **Re-exports.** Each old module re-exports the moved items under the same name: `querymt_agent_core::events::*`, `::hash`, `::stream_cursor`, `::runtime_status`, `::delegation_update`, `::session::domain`, `projection::{AuditView, SessionWorkspaceView}`, services `accounting::snapshot::*` and `session::history_window` payload types, runtime `session::load_snapshot::*` and `control::notifications` input-state types. Callers compile unchanged.
+- **Accounting totals.** `SummaryUsage` and `PriorUsage` embed `ScopeTotals`, so `ScopeTotals`, `ComponentSums` and `TokenSums` move to `protocol_types::accounting::totals` with their read-only helpers; the reducer's mutators become private functions in `agent-services` `accounting::reducer`.
+- **Shared replay projection.** `protocol_types::replay` holds the stateless event-to-update rules both sides use: `replayable_updates`, `stored_summary_updates`, the todo-list plan, tool kinds, worktree announcements and `CompactionIds` (legacy compaction identity). agent-core re-exports it as `querymt_agent_core::replay`.
 - **Methods that need agent logic become functions in the crate that owns the logic.** Rust forbids inherent impls on foreign types:
   - `AccountingSnapshot::{from_reducer, from_events}` → `querymt_agent_services::accounting::{snapshot_from_reducer, snapshot_from_events}`.
   - `impl From<McpServerConfig> for McpServerInfo` → `McpServerConfig::server_info()`, because the orphan rule allows neither side to hold the impl.
@@ -89,15 +94,29 @@ flowchart BT
 ### D4. Reducer model
 - **Not a wire protocol.** `SessionInput` and `ChangeReport` are an in-process API between a client's ACP transport and the reducer. They never go between agent and client. The agent and client still exchange only ACP messages, unchanged.
 - **API.** `SessionCore::new(session_id)`, `apply(&mut self, batch: &[SessionInput]) -> ChangeReport`, plus read accessors `header()`, `turn_ids()`, `turn(id)`, `turns(ids)` and `debug_log()`. Every input goes through `apply`, so the module is the single writer. `SessionCore` is `Send + 'static` (no `Rc`, no `RefCell`); a compile-time assertion keeps it so.
-- **`SessionInput`** (typeshare, `#[serde(tag = "type")]`):
+- **`SessionInput`** (typeshare, adjacently tagged `type` + `data`):
   - `snapshot_loaded { response }`: the raw load response.
-  - `acp_notification { notification, replayed, at_ms }`
-  - `history_page { response }`: the raw `_querymt/session/history` response (`events`, `history`, `truncated`, `userPrompts`).
-  - `prompt_optimistic { client_prompt_id, blocks, at_ms }`, `prompt_completed { stop_reason, at_ms }`, `prompt_failed { client_prompt_id, message }`. Clients send the same id as `_meta.querymt.client_prompt_id` on `session/prompt`; the agent echoes it on the `user_message_chunk`, which is how the echo is matched.
-  - `runtime_observed { status }`, `input_state { notification }`, `undo_stack { frames }`, `config_options { options }`, `delegation_update { update }`, `tool_content { tool_call_id, part, content }`
+  - `acp_notification { notification, replayed, at_ms }`: any `session/update`, including `subagent_update` and `cursor_update`.
+  - `state_update { notification, at_ms }`: the raw `querymt/session/stateUpdate` notification (D8).
+  - `history_page { response }`: the raw `_querymt/session/history` response (`events`, `history`, `truncated`, `userPrompts`, `cursorUpdates`).
+  - `prompt_optimistic { client_prompt_id, blocks, at_ms }`, `prompt_completed { client_prompt_id, message_id, stop_reason, at_ms }` (`message_id` from the response's `_meta.querymt.messageId`, optional), `prompt_failed { client_prompt_id, message }`. Clients send the same id as `_meta.querymt.client_prompt_id` on `session/prompt`; the agent echoes it on the `user_message_chunk`.
+  - `runtime_observed { status }`, `input_state { notification }`, `undo_stack { frames }`, `config_options { options }`, `tool_content { tool_call_id, part, content }`.
+  - There is no delegation input: subagents arrive as `acp_notification` and in the snapshot's `subagentUpdates`. The snapshot's `delegationUpdates` key, if present, is ignored.
+- **ACP v2 alignment.** Each input stands in for a v2 construct, so moving to v2 changes the transport mapping and not the reducer:
+
+  | Input / rule | v1 + QueryMT today | ACP v2 |
+  |---|---|---|
+  | `state_update` | `querymt/session/stateUpdate` | `state_update` |
+  | run grouping | `_meta.querymt.runId` on updates | `_meta.querymt.runId` (v2 has no turn entity) |
+  | `prompt_completed.message_id` | `_meta.querymt.messageId` on the response, at run end | `PromptResponse.messageId`, at insertion |
+  | `snapshot_loaded` ends replay | load response | `replay_complete` |
+  | entity keys | type + id, ids from the agent | same (Entity IDs) |
+  | client prompt match | `_meta.querymt.client_prompt_id` echo | JSON-RPC response id + `messageId` |
+  | message content | append-only chunks; the agent sends in-flight text at the cut (D8) | `agent_message` upsert replaces content |
 - **Load response and replay.**
   - Replayed notifications (`_meta.querymtReplay`) that arrive before the response are applied like live ones; they are not deduplicated, because they were never applied live.
-  - `snapshot_loaded` with a snapshot rebuilds the item store from the snapshot, which replaces any replayed items.
+  - The load response ends replay, like v2 `replay_complete`. The agent guarantees that nothing after it repeats an event at or before the cut and that nothing is missing (D8), so the reducer does no sequence-based deduplication of live updates.
+  - `snapshot_loaded` with a snapshot rebuilds the item store from the snapshot, which replaces any replayed items. Pending and failed prompt placeholders are client-local and are carried over. Cursors are discarded and rebuilt from the snapshot's `cursorUpdates`.
   - `snapshot_loaded` without a snapshot keeps the items, and takes config options and modes from the response.
   - Tools without a result in an idle snapshot keep their last status; the run state only stops naming them as the active tool. Clients decide how to present them.
 - **Decoding is two-step for tolerance.**
@@ -108,18 +127,21 @@ flowchart BT
   - Ignored, unknown and error counts go into the change report (spec: Tolerant input handling).
 - **State layout.**
   - An item store (transcript items, tool calls, compactions) keyed by stable id and ordered by history position (`seq`).
-  - Turns are built from the item store. A turn starts at a user prompt or a compaction boundary.
-  - Each turn exposes ordered **entries** (user message, assistant message, reasoning part, tool call, compaction), each `{ id, revision, … }`. Entry ids come from the item store (message id plus part id, tool call id, compaction id), so they are stable for the life of the view.
-  - Index maps (`tool_call_id → turn`, `message_id → item`, `client_prompt_id → item`) let one update find its turn in O(1) instead of scanning.
+  - **A turn is a run.** Live, an update joins the turn of its `_meta.querymt.runId`; without one, the turn of the run the last `state_update` reported running; without either, the last turn. A `state_update` `running` for an unknown run opens its turn. In snapshots and pages, events between `RunStarted` and `RunCompleted` belong to that run. Fallback for agents without run ids (no `runId`, no state updates, no `RunStarted`): a turn starts at a user message or a compaction outside a turn, as before.
+  - Each turn exposes ordered **entries** (user message, assistant message, reasoning part, tool call, compaction), each `{ id, revision, … }`. Entries are keyed by entity type and the agent's id: `user-<messageId>`, `assistant-<messageId>`, `reasoning-<messageId>-<partId>`, `tool-<toolCallId>`, `compaction-<compactionId>`. An assistant message and a thought with the same `messageId` are separate entries.
+  - **Pending prompts** are not entries of a run. Each is a client-local turn `pending-<clientPromptId>` after the last run turn. When the agent's user message for it arrives (echo carrying the client prompt id, or `prompt_completed.message_id`), the pending turn is removed and the user message is an entry of its run. A failed prompt stays as a pending turn marked failed until the client drops it.
+  - Index maps (`tool_call_id → turn`, `message_id → entry`, `run_id → turn`, `client_prompt_id → pending turn`) let one update find its turn in O(1) instead of scanning.
+  - **Header** additionally holds `subagents` (upserts of `subagent_update` keyed by child session id; tool calls whose content references a child are linked to it) and `cursors` (keyed by cursor id: first anchor kept, capabilities patched, placed when the anchored entity is in the view, otherwise unplaced).
 - **Cost of an update.**
   - A live update rebuilds only the turns it touches, usually the last one. Each turn and each entry carries a `revision: u64` from one view-wide counter that grows on every change. Clients can cache per turn `(id, revision)` (desktop) or per entry (gpui, whose virtual list rows are entries).
   - A history page builds only the new turns and inserts them in front; turn boundaries in pages follow the agent's turn definition (`session-history-loading` / Turn boundaries).
   - Rebuilding everything happens only on `snapshot_loaded`.
-- **Turn ids** come from the first item's history position (`turn-<seq>`), or from the client prompt id for optimistic prompts. When the echo arrives, the optimistic item is re-keyed in place and the turn id stays the same.
+- **Turn ids** are `run-<runId>`. Without run ids they come from the opening user message (`turn-<messageId>`), or from the event's history position (`turn-<seq>`) when the message has no id. They never come from client-made ids, so a turn has the same id live and after a reload; `finish_rebuild` then reports only turns whose content changed.
 - **Determinism.** No clock and no randomness. Times come from `at_ms` or event `timestamp`. Iteration uses ordered maps or vectors, never `HashMap` iteration order.
 - **Replay dedup.** A bounded set of hashes of the newest 2,000 applied live notifications. Inputs with `replayed: true` are dropped when their hash is in the set. Live inputs are never deduplicated.
 - **Debug log.** A ring of 1,000 entries plus a dropped count.
-- **Run state and usage** are derived exactly as the desktop does today (`applySessionNotification`, `projectSessionRuntime`, `endSessionWork`). Cost comes only from `accounting` and `usage_update`.
+- **Run state.** Whether a run is active, its id, `requires_action` and the last stop reason come from `state_update`. Session updates only refine an active run (thinking, streaming, tool running, active tool). `prompt_completed` and `runtime_observed` decide only when no state update has been seen; `runtime_observed` maps every non-idle phase (`starting`, `model`, `tools`, `waiting`, `closing`, `cancel_requested`) to an active run.
+- **Usage** is derived as the desktop does today. Cost comes only from `accounting` and `usage_update`.
 - **Schema version.** `SCHEMA_VERSION: u32 = 1` is exported. It is bumped whenever an input or output shape changes in a way old clients cannot read.
 
 ### D5. WebAssembly boundary
@@ -146,15 +168,29 @@ flowchart BT
 - `scripts/release/write-release-json.sh` gains an optional fifth argument, the archive path. It adds `session_core_wasm: { file, sha256, schema_version }` to `release.json`. The fields that querymt-desktop's `resolve-qmtcode.mjs` reads today are unchanged.
 
 ### D7. Tests without a live backend
-- **Seeded trace generator.** It lives in `agent-session-core` behind a `test-support` feature. It emits lorem-ipsum `AgentEvent` sequences: prompts, streamed text, reasoning, tool calls with large results, compactions, delegations, steering, errors.
+- **Seeded trace generator.** It lives in `agent-session-core` behind a `test-support` feature and builds `AgentEvent` values from `AgentEventKind`, so a changed event shape stops it compiling. It emits lorem-ipsum sessions as the agent journals them: `RunStarted` before the prompt, prompts, reasoning parts, tool calls with large results, the todo-list tool, compactions, delegations, applied steering (with its `UserPromptBlock` and `PromptReceived`), permission waits, scheduled runs without a prompt, errors and `RunCompleted`.
 - **Conformance in `querymt-agent-runtime`** (dev-dependency on session-core with `test-support`). Generated events are turned into:
-  - a load snapshot, by building `SessionLoadSnapshot`, and
-  - a live stream, through `replay_agent_events_to_session_notifications`.
+  - a load snapshot, by building `SessionLoadSnapshot`;
+  - the **live** stream, through `AcpLiveEventTranslator` with gpui's capabilities (plan operations, compaction, notices, subagents, cursors), with streamed deltas and structured prompt blocks generated from the stored messages, plus the state updates (D8);
+  - the history replay, through `replay_agent_events_materialized`.
   
-  Session-core must produce equal turns from both. This guards drift between the agent's translation and the reducer, without a running agent.
+  Session-core must produce equal turns (ids included) from all three. A mid-run variant loads at a cut inside a streaming message and applies the rest live. This guards drift between the agent's translation and the reducer, without a running agent.
 - **Proptest** in session-core for chunking invariance, determinism and the "unchanged turns keep id and content" property.
 - **Golden traces.** `crates/agent-session-core/tests/traces/*.json` holds inputs plus expected outputs, regenerated by `cargo run -p querymt-agent-session-core --example regen-traces --features test-support`. The native tests compare against them. `scripts/session-core-wasm/conformance.mjs` loads the built module in Node, applies the same traces and diffs the output byte for byte. The desktop reuses these traces.
 - **Criterion benchmark** `stream_into_long_session` at 1x and 4x session size. It is informational; the CI gate is the change-report test in the spec.
+
+### D8. Agent wire additions (ACP v1 extensions shaped on v2)
+- **`querymt/session/stateUpdate`.** Params `{ sessionId, state, runId, stopReason? }`, `state` one of `running`, `requires_action`, `idle` (v2 `state_update` values). The type lives in protocol-types (typeshare). Emitted from the event stream, not from the coalescing runtime `watch`: `RunStarted` → `running`, `RunCompleted` → `idle` with the ACP stop reason mapped from `stop_type`/outcome, a blocking permission or elicitation wait → `requires_action`, its resolution → `running`. Delivered through the same per-connection path as `session/update`, so it is ordered with the updates of the same run. Not replayed. After a load, one current state is sent first among the released live updates (v2 current-state sync). `querymt/session/runtimeChanged` stays for the detailed phase.
+- **`_meta.querymt.runId`.** The live translator stamps the run id of the session's current run on `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update` and `compaction_update`; the replay projection stamps it from the enclosing `RunStarted`. It merges into existing `_meta.querymt` objects (reasoning part id, client prompt id).
+- **`_meta.querymt.messageId` on the prompt response.** The message id the run's `PromptReceived` stored. v1 answers at run end, so the echo carrying the client prompt id stays the primary link.
+- **Hold and cut on `session/load`.** Order: subscribe the connection with a hold buffer → read the snapshot (cut = its stream cursor; for replay clients, the last replayed event) → answer → release the buffer, dropping events at or before the cut. Ownership is no longer the only filter for that window. Remote-hosted sessions apply the same rule to relayed events.
+- **In-flight text at the cut.** Deltas are not journaled, so the agent keeps a per-session accumulator of the text and reasoning streamed for the current message since its last stored event. On release it sends that text as one chunk (message id, reasoning part id) and marks the message streamed in the connection's translator, so the stored message stays suppressed and later deltas append.
+- **Cursors in snapshots and pages.** For `session.cursors` clients, `SessionLoadSnapshot` and `SessionHistoryResponse` gain `cursorUpdates`, built with the same cursor helper replay uses (`adopt-acp-subagents-cursors-usage` D1/D2), for the returned events only.
+- *Alternative considered:* a client-side seq cursor on live updates. Rejected: v2 forbids relying on entity ids to deduplicate replay against what a client holds, and the agent already knows the cut.
+
+### D9. Subagents and cursors from `adopt-acp-subagents-cursors-usage`
+- The reducer reads only `subagent_update`, tool-call session references and `subagentUpdates`; the `delegation_update` input and `delegationUpdates` parsing are removed. Against an agent without that change, the view shows no subagents but everything else works.
+- Cursors are opaque to the reducer: it never builds or parses a cursor id. It stores anchor and capabilities per id; gpui offers fork at cursors with the `fork` capability.
 
 ## Risks / Trade-offs
 
@@ -166,15 +202,22 @@ flowchart BT
 - **[WASM size]** → The ACP schema and serde_json dominate. Mitigated by the size budget, `opt-level = "s"` and `wasm-opt`. If the budget fails, decode ACP updates through narrower local structs.
 - **[Reducer behaviour differs from today's desktop]** → The desktop change runs a differential test against its current TS path on the same traces before switching. Intentional differences are listed there.
 - **[Hidden non-wasm dependency in the extracted closure]** → Spike task 1.1 runs first, and a CI step `cargo check -p querymt-agent-session-core --target wasm32-unknown-unknown` keeps it that way.
+- **[Ordering with `adopt-acp-subagents-cursors-usage`]** → The reducer reads subagents and cursors only; the gpui pin requires that change's groups 3 and 4 on the agent. Tasks 5.4 and 5.5 can land before it, tested with fixture updates, since the shapes come from the ACP schema. The cursor part of 4.5 waits for its cursor helper (its task 3.1).
+- **[Hold buffer grows during a slow load]** → The buffer holds only one session's events for the duration of one load; it is bounded by the existing per-connection channel limit, and an overflow fails the load instead of dropping events.
+- **[Agents without the additions]** → The reducer keeps the fallbacks (user-message turns, inferred run state, prompt completion); views are then as good as before but ids may differ after a reload.
+- **[Desktop and mobile see behaviour changes]** → Additive `_meta` and an extension notification; replayed compactions move to their place and loads stop losing or repeating events. Listed in the CHANGELOG.
 
 ## Migration Plan
 
 1. Land protocol-types with re-exports. This is a pure move; typeshare declarations stay identical.
-2. Land session-core, the wasm crate, the traces and the release job. Nightly then publishes the module.
-3. querymt-desktop adopts it (`adopt-agent-session-core`).
-4. querymt-gpui adopts it natively (git dependency on a pinned rev); it can start once step 2's native crates land, without waiting for the release job.
-5. Rollback: the desktop pins a module version and gpui pins a rev; the crates can stay in the agent unused.
+2. Land the agent wire additions (D8) and the reducer's run, identity, subagent and cursor model, then the conformance test against the live translator.
+3. Land the wasm crate, the traces and the release job. Nightly then publishes the module.
+4. querymt-desktop adopts it (`adopt-agent-session-core`).
+5. querymt-gpui adopts it natively (git dependency on a pinned rev) once step 2 and `adopt-acp-subagents-cursors-usage` groups 3–4 have landed, without waiting for the release job.
+6. Rollback: the desktop pins a module version and gpui pins a rev; the crates can stay in the agent unused. The wire additions are additive and can stay.
 
 ## Open Questions
 
 - Should querymt-mobile-ffi expose session-core over FFI for querymt-ios? Deferred; nothing in this change blocks it.
+- Does every permission and elicitation wait block the run in a way the agent can report as `requires_action`, or only tool approvals? Task 4.1 records what it finds.
+- Should `querymt/session/runtimeChanged` be retired once clients read `stateUpdate`? Not in this change.

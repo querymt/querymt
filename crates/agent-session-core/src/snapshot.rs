@@ -102,6 +102,7 @@ use crate::store::Store;
 use crate::view::ChangeReport;
 use querymt_agent_protocol_types::events::AgentEventKind;
 use querymt_agent_protocol_types::protocol::{ContentChunk, MessageId, SessionUpdate};
+use querymt_agent_protocol_types::replay::CompactionIds;
 use std::collections::BTreeMap;
 
 impl SessionCore {
@@ -160,6 +161,7 @@ impl SessionCore {
             .iter()
             .map(|record| (record.message_id.as_str(), record))
             .collect();
+        let mut compaction_ids = CompactionIds::default();
         for event in events {
             self.store.seq_hint = Some(event.seq);
             self.seqs.insert(event.seq);
@@ -177,7 +179,7 @@ impl SessionCore {
                         )
                     })
                     .collect(),
-                _ => event_updates(event),
+                _ => event_updates(event, &mut compaction_ids),
             };
             for update in updates {
                 self.apply_update(update);

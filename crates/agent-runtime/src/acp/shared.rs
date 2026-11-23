@@ -10,17 +10,20 @@ use crate::acp::protocol::{
     ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined,
-    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
-    PlanRemoved, PlanUpdate, PlanUpdateContent, RequestPermissionOutcome, SessionId,
-    SessionInfoUpdate, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanId, PlanRemoved, PlanUpdate,
+    PlanUpdateContent, RequestPermissionOutcome, SessionId, SessionInfoUpdate, SessionModeId,
+    SessionUpdate, TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, UsageUpdate,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::delegation_notifications::DelegationUpdateNotification;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
-use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
+use querymt_agent_core::replay::{
+    CompactionIds, is_todo_write_tool, stored_summary_updates, todo_entries_from_arguments,
+};
 use querymt_agent_services::event_fanout::EventFanout;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -985,45 +988,6 @@ where
     replay_agent_events_with_user_prompts(session_id, events, &HashMap::new())
 }
 
-fn thought_chunk(content: &str, message_id: &str, part_id: Option<&str>) -> ContentChunk {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
-        .message_id(MessageId::from(message_id.to_string()));
-    match part_id.filter(|part_id| !part_id.is_empty()) {
-        Some(part_id) => chunk.meta(serde_json::Map::from_iter([(
-            "querymt".to_string(),
-            serde_json::json!({ "reasoning_part_id": part_id }),
-        )])),
-        None => chunk,
-    }
-}
-
-fn stored_summary_updates(
-    content: &str,
-    message_id: Option<&str>,
-    reasoning_parts: &[ReasoningPartStored],
-) -> Vec<SessionUpdate> {
-    let mut updates = Vec::new();
-    if let Some(message_id) = message_id {
-        for part in reasoning_parts {
-            if part.text.is_empty() {
-                continue;
-            }
-            updates.push(SessionUpdate::AgentThoughtChunk(thought_chunk(
-                &part.text,
-                message_id,
-                Some(&part.id),
-            )));
-        }
-    }
-    if !content.is_empty() {
-        updates.push(SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
-                .message_id(message_id.map(|id| MessageId::from(id.to_string()))),
-        ));
-    }
-    updates
-}
-
 fn user_prompt_chunk(
     message_id: &str,
     client_prompt_id: Option<&str>,
@@ -1181,27 +1145,10 @@ where
         }
     }
 
-    // 5. Terminal compactions with their original identities and final
-    // summaries; chunks and in-progress states are omitted.
-    if capabilities.compaction {
-        for terminal in &materialized.compactions {
-            let mut update = CompactionUpdate::new(
-                CompactionId::from(terminal.id.clone()),
-                terminal.status.clone(),
-            );
-            if let Some(summary) = &terminal.summary {
-                update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
-                    summary.clone(),
-                ))]));
-            }
-            if let Some(error) = &terminal.error {
-                update = update.error(error.clone());
-            }
-            push(SessionUpdate::CompactionUpdate(update), &mut notifications);
-        }
-    }
-
-    // 6. Historical conversation/tool content in order.
+    // 5. Historical conversation/tool content in order. A compaction's
+    // terminal state (original identity, final summary; chunks and in-progress
+    // states are omitted) is sent where its terminal event happened, so a
+    // client places it in the timeline where it occurred.
     for event in events {
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
@@ -1218,12 +1165,28 @@ where
             }),
             _ => None,
         };
+        let seq = event.seq;
         let updates = structured_updates.unwrap_or_else(|| {
             let envelope = EventEnvelope::from(event);
             translate_replay_event_to_updates(&envelope)
         });
         for update in updates {
             push(update, &mut notifications);
+        }
+        if capabilities.compaction {
+            for terminal in materialized.compactions.iter().filter(|t| t.seq == seq) {
+                let mut update =
+                    CompactionUpdate::new(terminal.id.clone(), terminal.status.clone());
+                if let Some(summary) = &terminal.summary {
+                    update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                        summary.clone(),
+                    ))]));
+                }
+                if let Some(error) = &terminal.error {
+                    update = update.error(error.clone());
+                }
+                push(SessionUpdate::CompactionUpdate(update), &mut notifications);
+            }
         }
     }
 
@@ -1232,7 +1195,9 @@ where
 
 /// Final folded state of one compaction entity.
 struct ReplayCompactionTerminal {
-    id: String,
+    id: CompactionId,
+    /// The event that settled it; the update is sent at that position.
+    seq: i64,
     status: CompactionStatus,
     summary: Option<String>,
     error: Option<String>,
@@ -1245,9 +1210,7 @@ fn materialize_replay_state(
 ) -> MaterializedReplayState {
     let _ = capabilities;
     let mut state = MaterializedReplayState::default();
-    // Most recent legacy (ID-less) compaction start, for pairing terminals.
-    let mut open_legacy_start: Option<String> = None;
-    let mut legacy_counter: usize = 0;
+    let mut compaction_ids = CompactionIds::default();
 
     for event in events {
         state
@@ -1286,37 +1249,22 @@ fn materialize_replay_state(
                     state.usage_used = None;
                 }
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => match compaction_id {
-                Some(_) => open_legacy_start = None,
-                None => {
-                    legacy_counter += 1;
-                    open_legacy_start = Some(format!(
-                        "querymt-compaction-legacy-{}",
-                        envelope.seq().max(legacy_counter as i64)
-                    ));
-                }
-            },
+            AgentEventKind::CompactionStart { compaction_id, .. } => {
+                compaction_ids.start(compaction_id.as_deref(), envelope.seq());
+            }
             AgentEventKind::CompactionEnd {
                 compaction_id,
                 summary,
                 context_tokens,
                 ..
             } => {
-                let id = match compaction_id {
-                    Some(id) => id,
-                    None => open_legacy_start.take().unwrap_or_else(|| {
-                        legacy_counter += 1;
-                        format!(
-                            "querymt-compaction-legacy-{}",
-                            envelope.seq().max(legacy_counter as i64)
-                        )
-                    }),
-                };
+                let id = compaction_ids.end(compaction_id.as_deref(), envelope.seq());
                 state
                     .compactions
                     .retain(|c: &ReplayCompactionTerminal| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
-                    id: id.clone(),
+                    id,
+                    seq: envelope.seq(),
                     status: CompactionStatus::Completed,
                     summary: (!summary.trim().is_empty()).then_some(summary),
                     error: None,
@@ -1324,16 +1272,18 @@ fn materialize_replay_state(
                 if let Some(tokens) = context_tokens {
                     state.usage_used = Some(tokens);
                 }
-                open_legacy_start = None;
             }
             AgentEventKind::CompactionFailed {
                 compaction_id,
                 reason,
                 cancelled,
             } => {
-                state.compactions.retain(|c| c.id != compaction_id);
+                compaction_ids.failed();
+                let id = CompactionId::from(compaction_id);
+                state.compactions.retain(|c| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
-                    id: compaction_id.clone(),
+                    id,
+                    seq: envelope.seq(),
                     status: if cancelled {
                         CompactionStatus::Cancelled
                     } else {
@@ -1342,7 +1292,6 @@ fn materialize_replay_state(
                     summary: None,
                     error: (!cancelled).then_some(reason),
                 });
-                open_legacy_start = None;
             }
             AgentEventKind::CompactionSummaryChunk { .. }
             | AgentEventKind::HookNotice { .. }
@@ -2588,198 +2537,7 @@ pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUp
 /// (mode/config, metadata, usage, notices, capability-gated plans, and
 /// compaction) are projected by their owners instead.
 fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
-    match event.kind() {
-        AgentEventKind::PromptReceived {
-            content,
-            message_id,
-        } => vec![SessionUpdate::UserMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                .message_id(message_id.clone().map(MessageId::from)),
-        )],
-        AgentEventKind::UserPromptBlock { .. } => Vec::new(),
-        // Live-only: progress is transient and never part of replayed history.
-        AgentEventKind::ToolCallProgress { .. } => Vec::new(),
-        // Live-only: delivered as an ext notification, never replayed.
-        AgentEventKind::McpServerAuthRequired { .. } => Vec::new(),
-        AgentEventKind::AssistantMessageStored {
-            content,
-            message_id,
-            ..
-        } => {
-            if content.is_empty() {
-                return Vec::new();
-            }
-            vec![SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(message_id.clone().map(MessageId::from)),
-            )]
-        }
-        // Streaming text deltas are live-only; replay uses persisted messages.
-        AgentEventKind::AssistantContentDelta { .. } => Vec::new(),
-        AgentEventKind::AssistantThinkingDelta {
-            content,
-            message_id,
-            part_id,
-        } => {
-            if content.is_empty() {
-                return Vec::new();
-            }
-            vec![SessionUpdate::AgentThoughtChunk(thought_chunk(
-                content,
-                message_id,
-                part_id.as_deref(),
-            ))]
-        }
-        AgentEventKind::ToolCallStart {
-            tool_call_id,
-            tool_name,
-            arguments,
-        } => {
-            if is_todo_write_tool(tool_name) {
-                // Ungated contexts receive the legacy full-replacement plan;
-                // plan-operations connections intercept todowrite earlier.
-                return todo_entries_from_arguments(arguments)
-                    .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
-                    .unwrap_or_default();
-            }
-
-            let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-            vec![SessionUpdate::ToolCall(
-                ToolCall::new(
-                    ToolCallId::from(tool_call_id.clone()),
-                    format!("Run {}", tool_name),
-                )
-                .kind(tool_kind_for_tool(tool_name))
-                .status(ToolCallStatus::InProgress)
-                .raw_input(args),
-            )]
-        }
-        AgentEventKind::ToolCallEnd {
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-        } => {
-            if is_todo_write_tool(tool_name) {
-                return Vec::new();
-            }
-
-            let status = if *is_error {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            };
-            let raw_output = serde_json::from_str(result).ok();
-            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                ToolCallId::from(tool_call_id.clone()),
-                ToolCallUpdateFields::new()
-                    .kind(tool_kind_for_tool(tool_name))
-                    .status(status)
-                    .title(format!("Run {}", tool_name))
-                    .content(vec![ToolCallContent::Content(Content::new(
-                        ContentBlock::Text(TextContent::new(result.clone())),
-                    ))])
-                    .raw_output(raw_output),
-            ))]
-        }
-        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))),
-        )],
-        AgentEventKind::WorktreeOwnershipTransferred {
-            workspace_id,
-            successor_session_id,
-            summary_seeded,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
-            workspace_id,
-            successor_session_id,
-            *summary_seeded,
-        ))],
-        AgentEventKind::WorktreeArchived {
-            workspace_id,
-            by_session_id,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
-            workspace_id,
-            by_session_id.as_deref(),
-        ))],
-        _ => Vec::new(),
-    }
-}
-
-/// Announcement of an archived workspace. The `message_id` is derived from the
-/// workspace so live delivery and replay agree on identity.
-fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
-    let text = format!(
-        "This session's workspace {workspace_id} was archived. This session is now \
-         read-only; run `/worktree remove` to delete the checkout."
-    );
-    let mut details = serde_json::json!({ "workspaceId": workspace_id });
-    if let Some(by) = by_session_id {
-        details["bySessionId"] = by.into();
-    }
-    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
-        .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
-        .meta(serde_json::Map::from_iter([(
-            QUERYMT_META_NAMESPACE.to_string(),
-            serde_json::json!({ "worktreeArchived": details }),
-        )]))
-}
-
-/// Announcement of an ownership handoff. The `message_id` is derived from the
-/// workspace and successor so live delivery and replay agree on identity.
-fn worktree_handoff_chunk(
-    workspace_id: &str,
-    successor_session_id: &str,
-    summary_seeded: bool,
-) -> ContentChunk {
-    let text = format!(
-        "This session's workspace {workspace_id} was handed off to session \
-         {successor_session_id}. This session is now read-only."
-    );
-    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
-        .message_id(MessageId::from(format!(
-            "worktree-handoff-{workspace_id}-{successor_session_id}"
-        )))
-        .meta(serde_json::Map::from_iter([(
-            QUERYMT_META_NAMESPACE.to_string(),
-            serde_json::json!({
-                "worktreeHandoff": {
-                    "workspaceId": workspace_id,
-                    "successorSessionId": successor_session_id,
-                    "summarySeeded": summary_seeded,
-                }
-            }),
-        )]))
-}
-
-fn is_todo_write_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "todowrite" | "mcp_todowrite")
-}
-
-fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let todos = parsed.get("todos")?.as_array()?;
-    let mut entries = Vec::with_capacity(todos.len());
-
-    for todo in todos {
-        let content = todo.get("content")?.as_str()?.to_string();
-        let Some(status) = todo
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .and_then(todo_status_to_plan_status)
-        else {
-            continue;
-        };
-
-        let priority = todo
-            .get("priority")
-            .and_then(serde_json::Value::as_str)
-            .and_then(todo_priority_to_plan_priority)
-            .unwrap_or(PlanEntryPriority::Medium);
-
-        entries.push(PlanEntry::new(content, priority, status));
-    }
-
-    Some(entries)
+    querymt_agent_core::replay::replayable_updates(event.kind())
 }
 
 /// Resolves the protocol compaction identity for a compaction event. Live
@@ -2788,7 +2546,7 @@ fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
 fn compaction_identity(explicit: Option<&str>, event: &EventEnvelope) -> CompactionId {
     match explicit {
         Some(id) if !id.is_empty() => CompactionId::from(id.to_string()),
-        _ => CompactionId::from(format!("querymt-compaction-legacy-{}", event.seq())),
+        _ => querymt_agent_core::replay::legacy_compaction_id(event.seq()),
     }
 }
 
@@ -2798,26 +2556,6 @@ fn parse_reasoning_effort(value: &str) -> Option<querymt::chat::ReasoningEffort>
         return None;
     }
     serde_json::from_value(serde_json::json!(value)).ok()
-}
-
-fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
-    match priority {
-        "high" => Some(PlanEntryPriority::High),
-        "medium" => Some(PlanEntryPriority::Medium),
-        "low" => Some(PlanEntryPriority::Low),
-        _ => None,
-    }
-}
-
-fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
-    match status {
-        "pending" => Some(PlanEntryStatus::Pending),
-        "in_progress" => Some(PlanEntryStatus::InProgress),
-        "completed" => Some(PlanEntryStatus::Completed),
-        // ACP plans do not support a cancelled state; omit these entries.
-        "cancelled" => None,
-        _ => None,
-    }
 }
 
 /// Map tool names to ToolKind enum.
@@ -3724,7 +3462,9 @@ fn acp_method_span(method: &str) -> tracing::Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::protocol::{PlanEntryPriority, PlanEntryStatus};
     use crate::agent::core::AgentMode;
+    use querymt_agent_core::events::ReasoningPartStored;
 
     #[test]
     fn unknown_session_errors_are_recognized() {
@@ -9655,6 +9395,51 @@ mod session_update_tests {
                 .starts_with("querymt-compaction-legacy-")
         );
         assert_eq!(compaction.status, CompactionStatus::Completed);
+    }
+
+    #[test]
+    fn replay_sends_a_compaction_where_it_happened() {
+        let prompt = |seq, id: &str| {
+            agent_event(
+                seq,
+                AgentEventKind::PromptReceived {
+                    content: id.to_string(),
+                    message_id: Some(id.to_string()),
+                },
+            )
+        };
+        let events = vec![
+            prompt(1, "u1"),
+            agent_event(
+                2,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+            prompt(4, "u2"),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let order: Vec<&str> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(_) => Some("user"),
+                SessionUpdate::CompactionUpdate(_) => Some("compaction"),
+                _ => None,
+            })
+            .collect();
+        // The compaction sits between the prompts around it, not before both.
+        assert_eq!(order, ["user", "compaction", "user"]);
     }
 
     #[test]

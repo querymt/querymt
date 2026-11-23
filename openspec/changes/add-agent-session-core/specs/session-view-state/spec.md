@@ -7,7 +7,7 @@ Turns the agent's session output (load snapshot, ACP session updates, older-hist
 ## ADDED Requirements
 
 ### Requirement: Session view from a load snapshot
-Given a session load response that carries `querymt/sessionLoadSnapshot.v1`, the session view SHALL contain the conversation turns, tool calls with their arguments and results, compaction boundaries, usage and cost accounting, delegation state, pending inputs, the runtime status and the history paging state that the snapshot describes.
+Given a session load response that carries `querymt/sessionLoadSnapshot.v1`, the session view SHALL contain the conversation turns, tool calls with their arguments and results, compaction boundaries, usage and cost accounting, subagents, session cursors, pending inputs, the runtime status and the history paging state that the snapshot describes. A load response SHALL count as the end of history replay: updates applied after it continue from the state it describes.
 
 #### Scenario: Full snapshot hydrates the conversation
 - **WHEN** a load response with a complete snapshot of 3 prompts, their assistant replies and 4 tool calls is applied to an empty view
@@ -30,6 +30,25 @@ Given a session load response that carries `querymt/sessionLoadSnapshot.v1`, the
 #### Scenario: Snapshot with an idle runtime keeps unfinished tool status
 - **WHEN** a snapshot whose runtime status is idle contains a tool call with no result
 - **THEN** the tool call keeps its last reported status and is not reported as the active tool call
+
+### Requirement: Turns are agent runs
+A turn SHALL be one agent run, as the agent defines it (`session-history-loading` / Turn boundaries), identified by the run's id. Content SHALL join the turn of the run id it carries, or, without one, the turn of the run the session's state reports as running. Steering prompts and compactions that happen during a run SHALL stay in that run's turn. When the agent reports no run ids at all (an older agent), a turn SHALL start at each user message and at each compaction outside a turn.
+
+#### Scenario: Steering stays in the running turn
+- **WHEN** a run's updates are followed by a steering user message carrying the same run id, then more agent output
+- **THEN** the view holds one turn for the run, containing both user messages and all agent output in order
+
+#### Scenario: Compaction during a run stays in the turn
+- **WHEN** a `compaction_update` carrying a run id arrives while that run is the last turn
+- **THEN** the compaction is an entry of that turn and no new turn starts
+
+#### Scenario: Run without a prompt is its own turn
+- **WHEN** the session reports a new run running and that run's agent output arrives with no user message
+- **THEN** the view holds a new turn for that run containing the output
+
+#### Scenario: Older agent without run ids
+- **WHEN** updates without run ids are applied and no run state is reported
+- **THEN** each user message starts a new turn
 
 ### Requirement: Live ACP session updates
 ACP `session/update` notifications SHALL be applied in arrival order. Notifications for a different session id SHALL be ignored and reported as ignored.
@@ -70,18 +89,32 @@ Context compaction SHALL be read from the standard ACP `compaction_update` and `
 - **THEN** the compaction keeps status `completed` and takes the new summary
 
 ### Requirement: Snapshot and live stream equivalence
-Hydrating a snapshot SHALL produce the same turns as applying the equivalent sequence of live ACP session updates, ignoring arrival timestamps. Splitting the same text into different chunk sizes SHALL produce the same view.
+Hydrating a snapshot SHALL produce the same turns as applying the session's live stream (ACP session updates and state updates as the agent sends them live, including streamed deltas and structured prompt blocks), and the same turns as applying the agent's history replay, ignoring arrival timestamps.
 
 #### Scenario: Snapshot and live stream produce the same turns
-- **WHEN** one generated session is applied once as a load snapshot and once as its live ACP notification stream
-- **THEN** both views have equal turns, tool calls, compactions and usage
+- **WHEN** one generated session is applied once as a load snapshot and once as its live stream
+- **THEN** both views have equal turns with equal ids, entries, tool calls, compactions, plan and usage
+
+#### Scenario: Snapshot and replay produce the same turns
+- **WHEN** the same session is applied once as a load snapshot and once as the agent's history replay before a load response without a snapshot
+- **THEN** both views have equal turns, tool calls, compactions and plan
+
+### Requirement: Load during a run
+A view built from a load taken during a run, followed by the updates the agent sends after that load, SHALL equal the view built from the whole live stream.
+
+#### Scenario: Load during a run continues seamlessly
+- **WHEN** a session is loaded while an assistant message is streaming, and the updates the agent sends after the load are applied
+- **THEN** the view equals the view of a client that received the whole live stream, and the assistant message's text appears once and in full
+
+### Requirement: Chunking invariance
+Splitting the same text into different chunk sizes SHALL produce the same view.
 
 #### Scenario: Chunk size does not change the view
 - **WHEN** the same assistant text is streamed once in 1-character chunks and once in 64-character chunks
 - **THEN** both views are equal
 
 ### Requirement: Change reports
-Every applied batch SHALL return a change report that lists the ids of added, updated and removed turns, whether the session header changed, and any ignored or rejected inputs. Turns not listed SHALL be unchanged. Turn ids SHALL stay stable for the life of the view.
+Every applied batch SHALL return a change report that lists the ids of added, updated and removed turns, whether the session header changed, and any ignored or rejected inputs. Turns not listed SHALL be unchanged. Turn ids SHALL stay stable for the life of the view. After a load rebuilds the view, a turn with the same id and equal content as before SHALL NOT be reported.
 
 #### Scenario: Streaming chunk reports only the last turn
 - **WHEN** an `agent_message_chunk` extends the last turn of a 500-turn view
@@ -97,6 +130,17 @@ Each turn SHALL hold its content as ordered entries (user message, assistant mes
 #### Scenario: Streaming chunk changes one entry
 - **WHEN** an `agent_message_chunk` extends the assistant message of a turn that also holds 3 tool calls
 - **THEN** only the assistant message entry gets a new revision, the 3 tool call entries keep their ids and revisions, and the turn's revision grows
+
+### Requirement: Identity from the agent
+Entries SHALL be keyed by entity type together with the agent's id for that entity (message id, tool call id, compaction id), as ACP keys entities, and turns by run id. Turn and entry ids SHALL NOT come from client-made ids, so the same session has the same ids live and after a reload.
+
+#### Scenario: Reload keeps turn and entry ids
+- **WHEN** a session watched live, including a prompt sent optimistically by this client, is loaded again from a snapshot
+- **THEN** every turn and entry has the same id as before, and the change report lists no turn whose content is unchanged
+
+#### Scenario: Same id on different entity types
+- **WHEN** an agent message and an agent thought arrive with the same `messageId`
+- **THEN** the view holds two entries, one assistant message and one reasoning entry
 
 ### Requirement: Older history pages
 An older-history page SHALL be applied from the agent's raw older-history response, including its structured user prompts and truncation entries. It SHALL be merged in front of the existing turns by history position. Events already in the view SHALL NOT be duplicated, and the streaming turn, optimistic prompts and live updates received since the load SHALL be kept.
@@ -119,15 +163,26 @@ An older-history page SHALL be applied from the agent's raw older-history respon
 - **THEN** that turn's user message holds the text and the image attachment
 
 ### Requirement: Optimistic prompts
-A prompt submitted by the client SHALL appear at once as a pending user message identified by its client prompt id. The agent's echo with the same client prompt id SHALL replace it in place. A prompt reported as failed SHALL be marked failed.
+A prompt submitted by the client SHALL appear at once as a pending prompt after the last turn, identified by its client prompt id. When the agent's user message for it arrives (matched by the client prompt id it carries, or by the message id the prompt response names), the pending prompt SHALL be removed and the agent's user message SHALL stand for it in its run's turn. A prompt SHALL NOT be matched by content or arrival order.
 
 #### Scenario: Agent echo replaces the optimistic prompt
-- **WHEN** an optimistic prompt is followed by a `user_message_chunk` carrying the same client prompt id
-- **THEN** the view holds one user message for that prompt, in the optimistic prompt's position
+- **WHEN** an optimistic prompt is followed by a `user_message_chunk` carrying the same client prompt id, a message id and a run id
+- **THEN** the view holds one user message for that prompt, in the run's turn and with an id from the agent's message id, and no pending prompt
+
+#### Scenario: Prompt response links the prompt
+- **WHEN** an optimistic prompt's user message arrived without a client prompt id, and the prompt then completes with a response naming that message id
+- **THEN** the pending prompt is removed and the agent's user message stands for it
+
+### Requirement: Client-local prompts
+A prompt reported as failed SHALL stay as a failed prompt. Pending and failed prompts are client-local and SHALL survive a load.
 
 #### Scenario: Failed prompt is marked failed
 - **WHEN** an optimistic prompt is reported as failed with a message
 - **THEN** the prompt is marked failed with that message and no agent reply is attached to it
+
+#### Scenario: Snapshot keeps client-local prompts
+- **WHEN** a load response with a snapshot is applied while the view holds one pending and one failed prompt that the snapshot does not contain
+- **THEN** the view still holds both prompts with their status, after the snapshot's turns
 
 ### Requirement: Replayed updates applied once
 Notifications that the client marks as replayed (for example, buffered updates drained after a webview reattach) SHALL be ignored when an identical notification was already applied live in the same view. Live notifications SHALL always be applied.
@@ -141,15 +196,34 @@ Notifications that the client marks as replayed (for example, buffered updates d
 - **THEN** the message text contains the text twice
 
 ### Requirement: Run state
-The view SHALL report the session's run state (idle, submitting, thinking, streaming, tool running, cancelled or failed), the active tool call, the last stop reason and the last error, derived from session updates, prompt outcomes and runtime observations.
+The view SHALL report the session's run state (idle, submitting, thinking, streaming, tool running, waiting for the user, cancelled or failed), the running run's id, the active tool call, the last stop reason and the last error. Whether a run is active SHALL come from the agent's state updates (`running`, `requires_action`, `idle` with its stop reason), for any run. Session updates SHALL only refine an active run (thinking, streaming, tool running).
+
+#### Scenario: State update starts and ends a run
+- **WHEN** a state update reports run `r1` running, then a state update reports idle with stop reason `end_turn`
+- **THEN** the run state is active with run id `r1`, then idle with last stop reason `end_turn`
+
+#### Scenario: Run started elsewhere is shown
+- **WHEN** a state update reports a run running that this client did not prompt
+- **THEN** the run state is active with that run's id
+
+#### Scenario: Waiting for the user
+- **WHEN** a state update reports `requires_action` during a run
+- **THEN** the run state is waiting for the user, and a later `running` returns it to an active state
 
 #### Scenario: Running tool sets tool-running state
 - **WHEN** a `tool_call` with status `in_progress` arrives during a run
 - **THEN** the run state is tool running and the active tool call is that tool
 
+### Requirement: Run state without state updates
+When the agent sends no state updates, prompt outcomes and runtime observations SHALL decide whether a run is active. A runtime observation SHALL count any non-idle phase as an active run.
+
 #### Scenario: Completed prompt returns to idle
-- **WHEN** the client reports the prompt completed with stop reason `end_turn`
+- **WHEN** the agent sends no state updates and the client reports the prompt completed with stop reason `end_turn`
 - **THEN** the run state is idle and the last stop reason is `end_turn`
+
+#### Scenario: Busy runtime observation is an active run
+- **WHEN** a runtime observation reports phase tools, waiting or closing on an idle view
+- **THEN** the run state is active
 
 #### Scenario: Idle runtime observation ends a stale run
 - **WHEN** a runtime observation reports the session idle while the view still shows a run
@@ -181,8 +255,8 @@ The view SHALL hold the session's current plan, replaced by `plan` and `plan_upd
 - **WHEN** `agent_thought_chunk` updates for one message arrive with reasoning part ids `p0`, `p0`, `p1`
 - **THEN** that message holds two reasoning parts, `p0` with both of its chunks and `p1` with one
 
-### Requirement: Session configuration, undo, inputs and delegations
-The view SHALL hold the current config options, the undo stack and last undo result, pending queued and steered inputs, and delegation activity, each updated by its matching event and merged by id.
+### Requirement: Session configuration, undo, inputs and subagents
+The view SHALL hold the current config options, the undo stack and last undo result, pending queued and steered inputs, and the session's subagents, each updated by its matching event and merged by id. Subagents SHALL come from ACP `subagent_update` updates (an upsert per child session id) and from the snapshot's `subagentUpdates`. A tool call whose content references a child session SHALL be linked to that subagent.
 
 #### Scenario: Config option update merges by id
 - **WHEN** a `config_option_update` carries only the model option
@@ -196,9 +270,39 @@ The view SHALL hold the current config options, the undo stack and last undo res
 - **WHEN** an undo stack with two frames, one with a failed restore, is applied
 - **THEN** the view lists both frames in order and marks the failed one
 
-#### Scenario: Delegation update links a child session
-- **WHEN** a delegation update for a tool call carries a child session id
-- **THEN** that tool call is linked to the child session
+#### Scenario: Subagent update patches the child
+- **WHEN** a `subagent_update` announces a child session as running, then another for the same child reports it idle
+- **THEN** the view holds one subagent for that child, with state idle and the fields of the first update that the second did not change
+
+#### Scenario: Tool call links a child session
+- **WHEN** a `tool_call_update` carries content that references a child session announced by `subagent_update`
+- **THEN** that tool call is linked to the child's subagent
+
+#### Scenario: Snapshot restores subagents
+- **WHEN** a snapshot whose `subagentUpdates` lists two children is applied
+- **THEN** the view holds both subagents with their latest state
+
+### Requirement: Session cursors
+The view SHALL hold the session cursors the agent announces with ACP `cursor_update`, keyed by cursor id, each with its anchor and capabilities. The first anchor received for a cursor SHALL be kept; later updates SHALL only patch its capabilities. A cursor whose anchored entity is not in the view SHALL be kept but reported as unplaced, never placed by guess.
+
+#### Scenario: Cursor is placed at its anchor
+- **WHEN** a `cursor_update` with a fork capability is anchored after an agent message the view holds
+- **THEN** the view lists the cursor with the fork capability, placed after that message's entry
+
+#### Scenario: Capabilities are patched, the anchor is kept
+- **WHEN** a later `cursor_update` for the same cursor clears its capabilities and names a different anchor
+- **THEN** the cursor keeps its first anchor and has no capabilities
+
+#### Scenario: Cursor without its entity is unplaced
+- **WHEN** a `cursor_update` is anchored to a message the view does not hold
+- **THEN** the cursor is listed as unplaced
+
+### Requirement: Cursors across loads
+A load SHALL discard the cursors held for the session and rebuild them from the cursors it carries. An older-history page SHALL add its cursors to the ones held.
+
+#### Scenario: Load rebuilds cursors
+- **WHEN** a view holding three cursors applies a load whose snapshot carries one cursor
+- **THEN** the view holds only that one cursor
 
 ### Requirement: Truncated tool content
 Tool arguments or results marked as truncated in a windowed snapshot SHALL be reported as truncated with their full size. Full content supplied later by the client SHALL replace the truncated value.

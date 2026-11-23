@@ -13,6 +13,7 @@ pub mod elicitation;
 pub mod events;
 pub mod hash;
 pub mod protocol;
+pub mod replay;
 pub mod runtime_status;
 pub mod session;
 pub mod snapshot_id;

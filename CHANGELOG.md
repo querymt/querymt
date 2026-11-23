@@ -51,6 +51,14 @@
 
 ### Behavior changes
 
+- **A replayed compaction is sent where it happened.** On a load without a
+  snapshot the agent used to send every finished compaction before the whole
+  conversation. It now sends each one at the position of the event that
+  settled it, between the messages around it. A compaction without an id is
+  still paired with its start, and the todo-list, tool-kind and workspace
+  announcement rules are one projection
+  (`querymt_agent_protocol_types::replay`) shared with the session reducer.
+
 - **The replay identity of a stored reply comes from the provider.** The agent
   used to complete the protocol and endpoint a reply is replayed against from
   the latest stored reply of the same provider and model. When the provider
