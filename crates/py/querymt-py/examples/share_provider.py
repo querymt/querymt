@@ -1,15 +1,11 @@
 import asyncio
-import os
 
 import querymt
 
 
 async def main() -> None:
     registry = await querymt.Registry.default()
-    runtime = await querymt.MeshRuntime.lan(
-        node_name="python-share",
-        peer_access_store=os.environ.get("QMT_PEER_ACCESS_STORE"),
-    )
+    runtime = await querymt.MeshRuntime.lan(node_name="python-share")
     share = await runtime.share_provider(
         registry=registry,
         provider="openai",

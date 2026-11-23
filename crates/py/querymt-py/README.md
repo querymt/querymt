@@ -61,7 +61,6 @@ a host-managed mesh state file:
 runtime = await querymt.MeshRuntime.lan(peer_access_store="/path/to/mesh_state.json")
 ```
 
-The `share_provider.py` example reads this path from `QMT_PEER_ACCESS_STORE`.
 This option does not change the node's identity. Grants in the file must be for
 this host's `runtime.peer_id` and the authenticated calling peer. A new store
 starts with no grants; a store that cannot be opened fails startup. Peer grants
