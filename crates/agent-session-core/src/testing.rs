@@ -1028,7 +1028,26 @@ pub fn golden_cases() -> Vec<GoldenCase> {
         ],
         vec![active_load(145_000, false)],
     ];
+    // Commands: an update, a load that keeps them, a replacement with a
+    // `/`-prefixed name and an input, then an empty update that clears them.
+    let commands = |list: Value| {
+        live(json!({ "sessionUpdate": "available_commands_update",
+                      "availableCommands": list }))
+    };
+    let available_commands = vec![
+        vec![commands(json!([
+            { "name": "compact", "description": "Compact the conversation" },
+            { "name": "worktree", "description": "Work in a worktree" },
+        ]))],
+        vec![loaded(TraceSpec::small(11))],
+        vec![commands(json!([
+            { "name": "/compact", "description": "Compact the conversation",
+              "input": { "hint": "[optional instructions]" } },
+        ]))],
+        vec![commands(json!([]))],
+    ];
     vec![
+        case("available_commands", available_commands),
         case("active_time", active_time),
         case("usage", usage),
         case("usage_gaps", usage_gaps),

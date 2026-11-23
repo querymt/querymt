@@ -550,3 +550,41 @@ fn a_cancelled_compaction_carries_no_error() {
     assert_eq!(compactions.len(), 1);
     assert_eq!(compactions[0].error, None);
 }
+
+fn advertise(commands: serde_json::Value) -> querymt_agent_session_core::input::SessionInput {
+    querymt_agent_session_core::input::SessionInput::AcpNotification {
+        notification: serde_json::json!({ "sessionId": "s1", "update": {
+            "sessionUpdate": "available_commands_update", "availableCommands": commands } }),
+        replayed: false,
+        at_ms: 0,
+    }
+}
+
+fn compact_command() -> serde_json::Value {
+    serde_json::json!([{ "name": "compact", "description": "Compact" }])
+}
+
+#[test]
+fn snapshot_load_keeps_commands() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[advertise(compact_command())]);
+    let events = vec![prompt(1, "u1", "q"), reply(2, "a1", "r")];
+    let report = core.apply(&[loaded(load_response(events, serde_json::json!({})))]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(core.header().available_commands.len(), 1);
+    assert_eq!(core.header().available_commands[0].name, "compact");
+    // An update after the load still replaces the list.
+    core.apply(&[advertise(serde_json::json!([]))]);
+    assert!(core.header().available_commands.is_empty());
+}
+
+#[test]
+fn load_without_snapshot_keeps_commands() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[advertise(compact_command())]);
+    core.apply(&[loaded(serde_json::json!({
+        "modes": { "currentModeId": "build", "availableModes": [] }
+    }))]);
+    assert_eq!(core.header().available_commands.len(), 1);
+    assert_eq!(core.header().current_mode.as_deref(), Some("build"));
+}

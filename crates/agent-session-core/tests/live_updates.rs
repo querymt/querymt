@@ -302,3 +302,76 @@ fn streaming_chunk_changes_one_entry() {
         assert_eq!(a.id, b.id);
     }
 }
+
+fn commands_update(commands: Value) -> SessionInput {
+    live(json!({ "sessionUpdate": "available_commands_update", "availableCommands": commands }))
+}
+
+fn command_names(core: &SessionCore) -> Vec<String> {
+    core.header()
+        .available_commands
+        .iter()
+        .map(|command| command.name.clone())
+        .collect()
+}
+
+#[test]
+fn available_commands_replace_the_list() {
+    let mut core = SessionCore::new("s1");
+    let report = core.apply(&[commands_update(json!([
+        { "name": "compact", "description": "Compact" },
+        { "name": "worktree", "description": "Worktree" }
+    ]))]);
+    assert!(report.header_changed);
+    assert_eq!(command_names(&core), ["compact", "worktree"]);
+    core.apply(&[commands_update(json!([
+        { "name": "compact", "description": "Compact again" }
+    ]))]);
+    assert_eq!(command_names(&core), ["compact"]);
+    assert_eq!(core.header().available_commands[0].description, "Compact again");
+}
+
+#[test]
+fn empty_update_clears_commands() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([{ "name": "compact", "description": "c" }]))]);
+    assert_eq!(command_names(&core), ["compact"]);
+    core.apply(&[commands_update(json!([]))]);
+    assert!(core.header().available_commands.is_empty());
+}
+
+#[test]
+fn slash_prefix_is_trimmed() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([
+        { "name": "/compact", "description": "first" },
+        { "name": "compact", "description": "duplicate" },
+        { "name": "/", "description": "empty after trimming" },
+        { "name": "", "description": "empty" },
+        { "name": "web", "description": "spec style" }
+    ]))]);
+    assert_eq!(command_names(&core), ["compact", "web"]);
+    assert_eq!(core.header().available_commands[0].description, "first");
+}
+
+#[test]
+fn input_hint_is_kept() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([
+        { "name": "compact", "description": "c", "input": { "hint": "[instructions]" } },
+        { "name": "worktree", "description": "w" }
+    ]))]);
+    let commands = &core.header().available_commands;
+    assert_eq!(commands[0].input_hint.as_deref(), Some("[instructions]"));
+    assert_eq!(commands[1].input_hint, None);
+}
+
+#[test]
+fn malformed_command_entries_are_skipped() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([
+        { "description": "no name" },
+        { "name": "compact", "description": "c" }
+    ]))]);
+    assert_eq!(command_names(&core), ["compact"]);
+}
