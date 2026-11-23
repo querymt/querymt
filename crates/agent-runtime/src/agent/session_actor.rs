@@ -2516,7 +2516,7 @@ impl SessionActor {
     async fn install_event_subscription(
         &mut self,
         msg: SubscribeEvents,
-        subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
+        mut subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
     ) -> Result<(), AgentError> {
         use crate::agent::remote::event_forwarder::EventForwarder;
         use crate::agent::remote::event_relay::EventRelayActor;
@@ -2557,7 +2557,7 @@ impl SessionActor {
         };
 
         let relay_id = relay_ref.id();
-        if let Some(subscriber) = &subscriber
+        if let Some(subscriber) = &mut subscriber
             && (relay_id.sequence_id() != msg.relay_actor_id
                 || relay_id.peer_id() != Some(subscriber.origin.key().peer.as_peer_id())
                 || !subscriber.is_current().await)

@@ -110,6 +110,45 @@ fn key(host: PeerId, peer: PeerId) -> PeerGrantKey {
 }
 
 #[tokio::test]
+async fn session_handler_receives_policy_watch_started_at_admission() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(1, host);
+    let store = Arc::new(TestStore::default());
+    let key = key(host, peer);
+    let revision = store
+        .replace_grant(&key, Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap()
+        .revision;
+    let router = InboundRouter::new(host, store.clone());
+    router.register::<FixtureActor, Echo, _, (), _, _>(
+        actor,
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        move |origin, _| {
+            let store = store.clone();
+            let key = key.clone();
+            async move {
+                // An uninterrupted grant should stay authorized; the handler
+                // still needs to observe changes before it took ownership.
+                store
+                    .replace_grant(&key, revision, PeerGrant::Full)
+                    .await
+                    .unwrap();
+                let mut changes = origin.take_policy_changes().unwrap();
+                assert!(matches!(changes.try_recv(), Ok(change) if change.key == key));
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(
+        router.handle_v1(peer, request(actor, peer)).await,
+        Ok(SwarmResponse::Ask(Ok(_)))
+    ));
+}
+
+#[tokio::test]
 async fn legacy_router_requires_transport_bound_full_grant() {
     let host = PeerId::random();
     let allowed = PeerId::random();

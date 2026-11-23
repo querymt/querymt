@@ -331,11 +331,12 @@ pub(super) fn register_session_subscriptions(
 ) {
     let weak = actor.downgrade();
     let egress = mesh.sharing_egress();
-    let subscribe = move |origin, message| {
+    let subscribe = move |origin: PeerRequest, message| {
         let weak = weak.clone();
         let subscriber = PeerSubscription {
             egress: egress.clone(),
             store: store.clone(),
+            changes: origin.take_policy_changes(),
             origin,
         };
         async move {
