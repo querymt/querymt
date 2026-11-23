@@ -375,4 +375,33 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[tokio::test]
+    async fn confined_listing_skips_symlinks_hard_links_and_nested_hidden_entries() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("src/.hidden")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("src/visible.txt"), "visible").unwrap();
+        fs::write(root.join("src/.hidden/file.txt"), "hidden").unwrap();
+        fs::write(outside.join("file.txt"), "outside").unwrap();
+        fs::write(dir.path().join("shared.txt"), "hard-linked").unwrap();
+
+        symlink(outside.join("file.txt"), root.join("file-link")).unwrap();
+        symlink(&outside, root.join("dir-link")).unwrap();
+        // An in-root link also exercises the symlink ban, not just containment.
+        symlink("visible.txt", root.join("src/file-alias")).unwrap();
+        fs::hard_link(dir.path().join("shared.txt"), root.join("hard-link")).unwrap();
+
+        let entries = list_confined_workspace(&root).await.unwrap();
+        let mut listed: Vec<_> = entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.is_dir))
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, [("src", true), ("src/visible.txt", false)]);
+    }
 }
