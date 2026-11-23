@@ -1758,6 +1758,172 @@ async fn cancelled_delegation_resolves_child_after_terminal_claim() {
 }
 
 #[tokio::test]
+async fn client_cancels_a_running_child() {
+    use crate::acp::protocol::MaybeUndefined;
+    use crate::acp::protocol::{CancelNotification, StateUpdate};
+    use crate::send_agent::SendAgent as _;
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut harness = TestHarness::new(
+        vec![],
+        DelegateBehavior::PauseBeforeLlmCall {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+    )
+    .await;
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_session_id = harness.env.session_id.clone();
+    let mut run = Box::pin(harness.run_single_delegation());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            outcome = &mut run => panic!("cycle ended before the child started: {outcome:?}"),
+            _ = entered.notified() => {}
+        }
+    })
+    .await
+    .expect("delegated child did not start");
+    let child_session_id = store
+        .list_child_sessions(&parent_session_id)
+        .await
+        .expect("child sessions")
+        .into_iter()
+        .next()
+        .expect("created child session");
+    let delegation = store
+        .list_delegations(&parent_session_id)
+        .await
+        .expect("list delegation")
+        .into_iter()
+        .find(|delegation| delegation.status == DelegationStatus::Running)
+        .expect("running delegation");
+
+    // The child is announced as running and cancellable before the client acts.
+    let running = config
+        .event_sink
+        .live_delegation_activity(&parent_session_id)
+        .into_iter()
+        .find_map(|snapshot| crate::acp::shared::subagent_update_from_snapshot(&snapshot))
+        .expect("running child is announced");
+    assert!(matches!(
+        running.state,
+        MaybeUndefined::Value(StateUpdate::Running(_))
+    ));
+    assert!(matches!(running.capabilities, MaybeUndefined::Value(_)));
+
+    // The client cancels the child session, not the parent.
+    let client_handle = crate::agent::LocalAgentHandle::from_config(config.clone());
+    client_handle
+        .cancel(CancelNotification::new(child_session_id.clone()))
+        .await
+        .expect("cancel running child");
+
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = store
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation");
+            if current.status == DelegationStatus::Cancelled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    release.notify_one();
+    cancelled.expect("client cancel did not cancel the delegation");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("delegation cycle did not finish after the client cancel");
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    // The cancel went through the delegation path on the parent session.
+    let events = config
+        .event_sink
+        .journal()
+        .load_session_stream(&parent_session_id, None, None)
+        .await
+        .expect("parent events");
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        AgentEventKind::DelegationCancelRequested { delegation_id }
+            if *delegation_id == delegation.public_id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        AgentEventKind::DelegationCancelled { delegation_id }
+            if *delegation_id == delegation.public_id
+    )));
+
+    // What a client that advertised `subagents` receives: the child ends
+    // `idle` without the cancel capability, and the delegate tool call, which
+    // ended `completed` when the delegation was accepted, ends `failed`.
+    let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+    translator.set_capabilities(crate::acp::shared::AcpSessionUpdateCapabilities {
+        subagents: true,
+        ..Default::default()
+    });
+    let mut received = Vec::new();
+    for event in &events {
+        for (session_id, update) in translator
+            .translate_event(&querymt_agent_core::events::EventEnvelope::Durable(
+                event.clone(),
+            ))
+            .updates
+        {
+            received.push((
+                session_id,
+                serde_json::to_value(update).expect("update serializes"),
+            ));
+        }
+    }
+    let kind_of = |update: &serde_json::Value| {
+        update["sessionUpdate"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let last_subagent = received
+        .iter()
+        .rev()
+        .find(|(_, update)| kind_of(update) == "subagent_update")
+        .expect("child is reported to the client");
+    assert_eq!(last_subagent.0, parent_session_id);
+    assert_eq!(last_subagent.1["sessionId"], child_session_id.as_str());
+    assert_eq!(last_subagent.1["state"]["state"], "idle");
+    assert_eq!(last_subagent.1["capabilities"], serde_json::json!(null));
+    let last_call_status = received
+        .iter()
+        .rev()
+        .find(|(_, update)| {
+            kind_of(update) == "tool_call_update"
+                && update["toolCallId"] == "call-1"
+                && update["status"].is_string()
+        })
+        .map(|(_, update)| update["status"].clone());
+    assert_eq!(last_call_status, Some(serde_json::json!("failed")));
+
+    // The child's state is idle and the cancel capability is withdrawn.
+    let idle = config
+        .event_sink
+        .fanout()
+        .delegation_snapshots(std::slice::from_ref(&parent_session_id))
+        .into_iter()
+        .find_map(|snapshot| crate::acp::shared::subagent_update_from_snapshot(&snapshot))
+        .expect("child is still reported");
+    assert!(matches!(
+        idle.state,
+        MaybeUndefined::Value(StateUpdate::Idle(_))
+    ));
+    assert!(matches!(idle.capabilities, MaybeUndefined::Null));
+    harness.stop_harness_orchestrator();
+}
+
+#[tokio::test]
 async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct() {
     use crate::control::delegation_notifications::{DelegationActivity, DelegationStage};
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;

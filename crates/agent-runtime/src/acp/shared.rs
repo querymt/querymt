@@ -1253,6 +1253,11 @@ where
             AgentEventKind::ToolCallStart { tool_call_id, .. } => Some(tool_call_id.clone()),
             _ => None,
         };
+        let unsuccessful_delegation = match &event.kind {
+            AgentEventKind::DelegationFailed { delegation_id, .. }
+            | AgentEventKind::DelegationCancelled { delegation_id } => Some(delegation_id.clone()),
+            _ => None,
+        };
         let ends_run = matches!(&event.kind, AgentEventKind::RunCompleted { .. });
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
@@ -1298,6 +1303,18 @@ where
                     querymt_agent_core::replay::cursor_update(&entity),
                     &mut notifications,
                 );
+            }
+        }
+        // A failed or cancelled delegation fails its delegate tool call where
+        // the journal recorded the outcome, after the call's own end.
+        if let Some(delegation_id) = unsuccessful_delegation {
+            for snapshot in subagents
+                .iter()
+                .filter(|snapshot| snapshot.delegation_id == delegation_id)
+            {
+                if let Some(outcome) = delegation_outcome_update(snapshot) {
+                    push(outcome, &mut notifications);
+                }
             }
         }
         // A delegate tool call points at its child right after it starts,
@@ -2162,6 +2179,28 @@ fn session_reference_update(tool_call_id: &str, child_session_id: &str) -> Sessi
     ))
 }
 
+/// The final status of a delegate tool call whose delegation did not
+/// succeed. The tool call itself ends `completed` as soon as the delegation is
+/// accepted, so a failed or cancelled delegation is reported by a later update
+/// of the same call. `None` for a delegation that completed or is still running.
+fn delegation_outcome_update(
+    snapshot: &querymt_agent_services::control::delegation_notifications::SubagentSnapshot,
+) -> Option<SessionUpdate> {
+    use querymt_agent_core::delegation_update::DelegationUpdateState;
+    if !matches!(
+        snapshot.state,
+        DelegationUpdateState::Failed | DelegationUpdateState::Cancelled
+    ) {
+        return None;
+    }
+    snapshot.child_session_id.as_ref()?;
+    let tool_call_id = snapshot.tool_call_id.as_deref()?;
+    Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(tool_call_id.to_owned()),
+        ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+    )))
+}
+
 /// Stand-in wait id for a wait a load found pending: its real id is unknown
 /// until its resolution event arrives.
 const LOAD_PENDING_WAIT: &str = "\u{0}load-pending";
@@ -2649,7 +2688,15 @@ impl AcpLiveEventTranslator {
         if self.announced_children.insert(child.to_owned())
             && let Some(tool_call_id) = snapshot.tool_call_id.as_deref()
         {
-            updates.push((parent, session_reference_update(tool_call_id, child)));
+            updates.push((
+                parent.clone(),
+                session_reference_update(tool_call_id, child),
+            ));
+        }
+        // A failed or cancelled delegation fails its tool call, after the
+        // child's final state.
+        if let Some(outcome) = delegation_outcome_update(snapshot) {
+            updates.push((parent, outcome));
         }
         updates
     }

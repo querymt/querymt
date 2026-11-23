@@ -73,8 +73,9 @@ qmacp --quiet close "$SESSION_ID"
   contract (`live` or known `inactive`); a bare phase is not usable evidence.
   `runtime.delegation_activity` is separate direct-workflow activity and may remain
   live after self idle. Prompt/follow idle results retain the full `runtime`.
-  Live `delegation` events report workflow lifecycle separately from dispatch
-  `tool` events; neither changes follow's self-idle completion scope.
+  Live `delegation` events (from `subagent_update`) report workflow lifecycle
+  separately from dispatch `tool` events; neither changes follow's self-idle
+  completion scope.
 - `steer --run-id` is optional; if omitted, qmacp pins `runtime.active_run_id`.
   Missing/empty run IDs fail before submission rather than steering unguarded.
 - Queued submit returns `clientInputId`. `input_state` events expose the same ID

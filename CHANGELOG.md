@@ -49,7 +49,52 @@
   providers implement it. The plugin contract is unchanged, so an Extism
   provider reports `None`.
 
+- **ACP: subagent updates for delegations.** For a client that advertises
+  `clientCapabilities.subagents`, a delegated child session is announced on the
+  parent session with a `subagent_update` (title = target agent, description =
+  objective, `running` while the delegation executes, verifies or finalizes,
+  `idle` once it ends, `_meta.querymt.stage`, model, node and timestamps), before
+  any event of the child. The delegate tool call gains a `session` reference to
+  the child. Load snapshots carry `subagentUpdates` and `session/load` replays one
+  `subagent_update` per child. The `querymt/session/delegationUpdate`
+  notification and `delegationUpdates` are still sent for now, and are removed
+  with the desktop switch.
+
+- **ACP: session cursors and fork at a cursor.** For a client that advertises
+  `clientCapabilities.session.cursors`, the agent sends a `cursor_update` after
+  each user message, agent message, thought, tool call and compaction, live and
+  on replay. Ids are derived from the anchor, so they are the same after a
+  reconnect or restart. `session/fork` accepts `cursorId` (messages only; an
+  unknown, foreign or non-forkable cursor is `-32602` and creates no session),
+  which takes precedence over `_meta.querymt.message_id`. Forking a remote-hosted
+  session is now done by its owner node.
+
+- **ACP: `PromptResponse.usage`.** `session/prompt` reports the token counts of
+  the execution cycle that answered the prompt (input, output, reasoning, cache
+  read and write, and their sum), on every stop reason, and omits it when no
+  provider reported usage.
+
+- **ACP: `session/cancel` on a delegation child.** Cancelling a child session
+  while its delegation runs cancels that delegation, as a cancel requested by the
+  agent does.
+
 ### Behavior changes
+
+- **BREAKING (ACP): a delegation that fails or is cancelled fails its delegate
+  tool call.** The delegate tool call ends `completed` when the delegation is
+  accepted. For a client that advertises `subagents`, a delegation that later
+  fails or is cancelled now sends a final `tool_call_update` with status
+  `failed` for that call, live and on replay. Clients without the capability see
+  no change.
+
+- **BREAKING (ACP): a `session/fork` of a remote-hosted session, and a fork
+  `message_id` that is not in the source session.** A fork of a session hosted
+  on another mesh node is created by that node and recorded locally as a remote
+  session; it used to fail with `source session not found`. Workspace options in
+  the fork's `_meta.querymt.sessionWorkspace` are rejected with `-32602` for a
+  remote source. A `_meta.querymt.message_id` that is not a message of the source
+  session is rejected with `-32602`; before, the store accepted a message of
+  another session.
 
 - **Active time is run time, in the summary and on state updates.** The
   whole-session summary of a load snapshot carries `activeMs`: the sum, over

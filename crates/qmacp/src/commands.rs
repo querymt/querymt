@@ -240,6 +240,18 @@ pub enum Command {
     Cancel { session_id: String },
     /// Close a materialized session.
     Close { session_id: String },
+    /// Fork a session at a cursor, or at its end without `--cursor`.
+    ///
+    /// Cursor ids are opaque: use one announced for SESSION_ID (the `cursor`
+    /// events of `follow`, or `cursors` in `inspect`). Only cursors with
+    /// `forkable: true` (after a user or agent message) can be forked.
+    Fork {
+        session_id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
 }
 
 impl Command {
@@ -439,7 +451,33 @@ pub async fn run(
         Command::Exec { commands } => exec(client, commands, pretty).await,
         Command::Cancel { session_id } => write_ok(pretty, cancel(client, session_id).await?),
         Command::Close { session_id } => write_ok(pretty, close(client, session_id).await?),
+        Command::Fork {
+            session_id,
+            cursor,
+            cwd,
+        } => write_ok(pretty, fork(client, session_id, cursor, cwd).await?),
     }
+}
+
+async fn fork(
+    client: &AcpClient,
+    session_id: String,
+    cursor: Option<String>,
+    cwd: Option<PathBuf>,
+) -> Result<Value, CliError> {
+    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    client.initialize().await.map_err(CliError::from_request)?;
+    // The agent decides whether the cursor is valid; its error (for example
+    // `-32602`) is reported with its code and exits as an RPC error.
+    let forked = client
+        .fork_session(session_id.clone(), cwd, cursor.clone())
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(json!({
+        "sessionId": forked.session_id.to_string(),
+        "forkedFrom": session_id,
+        "cursorId": cursor,
+    }))
 }
 
 fn write_ok(pretty: bool, value: Value) -> Result<CommandOutcome, CliError> {
@@ -876,6 +914,8 @@ async fn inspect(
         .load_session(session_id.clone(), cwd.clone().unwrap_or_default())
         .await
         .map_err(CliError::from_request)?;
+    // The cursors the load replayed, for `fork --cursor`.
+    let cursors = client.announced_cursors(&session_id).await;
     if full {
         return Ok(json!({
             "sessionId": session_id,
@@ -885,17 +925,20 @@ async fn inspect(
                 loaded.modes.as_ref(),
                 &load_value,
             ),
+            "cursors": cursors,
             "raw": load_value,
         }));
     }
-    Ok(session::compact_inspect(
+    let mut compact = session::compact_inspect(
         &session_id,
         cwd.as_deref(),
         loaded.modes.as_ref(),
         &load_value,
         messages,
         tools,
-    ))
+    );
+    compact["cursors"] = json!(cursors);
+    Ok(compact)
 }
 
 async fn status(
@@ -1047,12 +1090,14 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     let timeout = timeout.map(Duration::from_secs);
     recovery["stage"] = json!("submit");
     let mut receipt = None;
+    let mut usage = session::usage_summary(None);
     let stop_reason = match chosen {
         Delivery::Prompt => {
             let response = client
                 .prompt(session_id.clone(), text, timeout)
                 .await
                 .map_err(|error| request_failure(error, recovery.clone()))?;
+            usage = session::usage_summary(response.usage.as_ref());
             stop_reason_name(&response.stop_reason)
         }
         Delivery::Steer | Delivery::Queue => {
@@ -1098,7 +1143,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         "type": "done", "ok": true, "sessionId": session_id,
         "delivery": delivery_name(chosen), "deliveryState": "accepted",
         "observationState": if observed.is_some() { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
-        "stopReason": stop_reason, "text": text, "textTruncated": truncated,
+        "stopReason": stop_reason, "usage": usage, "text": text, "textTruncated": truncated,
         "loadSession": initialized.agent_capabilities.load_session,
     });
     if let Some(observed) = observed {
@@ -1257,6 +1302,7 @@ fn validate_batch_command(command: &Command) -> Result<(), CliError> {
         | Command::Sessions { cwd, .. }
         | Command::Find { cwd, .. }
         | Command::Inspect { cwd, .. }
+        | Command::Fork { cwd, .. }
         | Command::Status { cwd, .. } => session::validate_cwd(cwd.as_deref(), false),
         Command::Mesh(crate::mesh::MeshCommand::Watch { .. }) => {
             return Err(CliError::Usage(

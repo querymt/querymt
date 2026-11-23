@@ -130,6 +130,16 @@ fn failed() -> EventEnvelope {
     )
 }
 
+fn cancelled() -> EventEnvelope {
+    durable(
+        PARENT,
+        5,
+        AgentEventKind::DelegationCancelled {
+            delegation_id: "delegation-1".into(),
+        },
+    )
+}
+
 fn delegate_tool_end(is_error: bool) -> EventEnvelope {
     durable(
         PARENT,
@@ -322,16 +332,60 @@ fn failure_reports_idle_and_a_failed_tool_call() {
     let mut translator = translator(subagents());
     fork_updates(&mut translator);
 
+    // The delegate tool call ends `completed` as soon as the delegation is
+    // accepted; the delegation's failure arrives later.
+    updates(&mut translator, &delegate_tool_end(false));
+
     let failure = updates(&mut translator, &failed());
     assert_eq!(subagent_update(&failure)["state"]["state"], "idle");
-
-    let end = updates(&mut translator, &delegate_tool_end(true));
-    let call = end
+    let call = failure
         .iter()
         .map(|(_, update)| update)
         .find(|update| kind(update) == "tool_call_update")
-        .expect("the delegate tool call ends");
+        .expect("the failed delegation fails its tool call");
+    assert_eq!(call["toolCallId"], "call-1");
     assert_eq!(call["status"], "failed");
+    let order: Vec<_> = failure.iter().map(|(_, update)| kind(update)).collect();
+    assert_eq!(order, ["subagent_update", "tool_call_update"]);
+}
+
+#[test]
+fn cancellation_reports_idle_and_a_failed_tool_call() {
+    let mut translator = translator(subagents());
+    fork_updates(&mut translator);
+    updates(&mut translator, &delegate_tool_end(false));
+
+    let cancelled = updates(&mut translator, &cancelled());
+    assert_eq!(subagent_update(&cancelled)["state"]["state"], "idle");
+    let call = cancelled
+        .iter()
+        .map(|(_, update)| update)
+        .find(|update| kind(update) == "tool_call_update")
+        .expect("the cancelled delegation fails its tool call");
+    assert_eq!(call["toolCallId"], "call-1");
+    assert_eq!(call["status"], "failed");
+}
+
+#[test]
+fn completion_leaves_the_tool_call_completed() {
+    let mut translator = translator(subagents());
+    fork_updates(&mut translator);
+    updates(&mut translator, &delegate_tool_end(false));
+
+    let done = updates(&mut translator, &completed());
+    assert!(
+        done.iter()
+            .all(|(_, update)| kind(update) != "tool_call_update"),
+        "a completed delegation does not touch its tool call: {done:?}"
+    );
+}
+
+#[test]
+fn failure_without_the_subagents_capability_leaves_the_tool_call_alone() {
+    let mut translator = translator(AcpSessionUpdateCapabilities::default());
+    updates(&mut translator, &requested());
+    updates(&mut translator, &forked(None, None));
+    assert!(updates(&mut translator, &failed()).is_empty());
 }
 
 #[test]
@@ -413,12 +467,32 @@ fn agent_event(seq: i64, kind: AgentEventKind) -> querymt_agent_core::events::Ag
 }
 
 /// A completed delegation as the journal records it: the delegate tool call
-/// starts, the delegation is requested, forks its child and completes.
+/// starts and ends (delegation is asynchronous), then the delegation is
+/// requested, forks its child and completes.
 fn delegation_history(
     n: i64,
     delegation_id: &str,
     tool_call_id: &str,
     child: &str,
+) -> Vec<querymt_agent_core::events::AgentEvent> {
+    delegation_history_ending(
+        n,
+        delegation_id,
+        tool_call_id,
+        child,
+        AgentEventKind::DelegationCompleted {
+            delegation_id: delegation_id.into(),
+            result: Some("done".into()),
+        },
+    )
+}
+
+fn delegation_history_ending(
+    n: i64,
+    delegation_id: &str,
+    tool_call_id: &str,
+    child: &str,
+    outcome: AgentEventKind,
 ) -> Vec<querymt_agent_core::events::AgentEvent> {
     let mut delegation = delegation();
     delegation.public_id = delegation_id.into();
@@ -433,6 +507,15 @@ fn delegation_history(
         ),
         agent_event(
             n * 10 + 1,
+            AgentEventKind::ToolCallEnd {
+                tool_call_id: tool_call_id.into(),
+                tool_name: "delegate".into(),
+                is_error: false,
+                result: "{}".into(),
+            },
+        ),
+        agent_event(
+            n * 10 + 2,
             AgentEventKind::DelegationRequested {
                 delegation,
                 tool_call_id: Some(tool_call_id.into()),
@@ -441,7 +524,7 @@ fn delegation_history(
             },
         ),
         agent_event(
-            n * 10 + 2,
+            n * 10 + 3,
             AgentEventKind::SessionForked {
                 parent_session_id: PARENT.into(),
                 child_session_id: child.into(),
@@ -454,22 +537,7 @@ fn delegation_history(
                 selected_provider_node_id: None,
             },
         ),
-        agent_event(
-            n * 10 + 3,
-            AgentEventKind::DelegationCompleted {
-                delegation_id: delegation_id.into(),
-                result: Some("done".into()),
-            },
-        ),
-        agent_event(
-            n * 10 + 4,
-            AgentEventKind::ToolCallEnd {
-                tool_call_id: tool_call_id.into(),
-                tool_name: "delegate".into(),
-                is_error: false,
-                result: "{}".into(),
-            },
-        ),
+        agent_event(n * 10 + 4, outcome),
     ]
 }
 
@@ -531,6 +599,52 @@ fn replay_restores_completed_delegations() {
             .iter()
             .all(|update| update["content"][0]["type"] != "session")
     );
+}
+
+#[test]
+fn replay_fails_the_tool_call_of_a_failed_or_cancelled_delegation() {
+    let mut history = delegation_history_ending(
+        1,
+        "delegation-1",
+        "call-1",
+        "c1",
+        AgentEventKind::DelegationFailed {
+            delegation_id: "delegation-1".into(),
+            error: "boom".into(),
+        },
+    );
+    history.extend(delegation_history_ending(
+        2,
+        "delegation-2",
+        "call-2",
+        "c2",
+        AgentEventKind::DelegationCancelled {
+            delegation_id: "delegation-2".into(),
+        },
+    ));
+    history.extend(delegation_history(3, "delegation-3", "call-3", "c3"));
+    let updates = replayed(history.clone(), subagents());
+
+    // The last status of each delegate call: the failed and the cancelled
+    // delegation end `failed` (after the call's own `completed`), the
+    // completed one stays `completed`.
+    let last_status = |call: &str| {
+        updates
+            .iter()
+            .rev()
+            .find(|update| {
+                kind(update) == "tool_call_update"
+                    && update["toolCallId"] == call
+                    && update["status"].is_string()
+            })
+            .map(|update| update["status"].clone())
+    };
+    assert_eq!(last_status("call-1"), Some(json!("failed")));
+    assert_eq!(last_status("call-2"), Some(json!("failed")));
+    assert_eq!(last_status("call-3"), Some(json!("completed")));
+
+    let without = replayed(history, AcpSessionUpdateCapabilities::default());
+    assert!(without.iter().all(|update| update["status"] != "failed"));
 }
 
 #[tokio::test]

@@ -231,6 +231,24 @@ impl EventFanout {
             .collect()
     }
 
+    /// The running delegation whose child session is `child_session_id`, or
+    /// `None` when the session is not the child of a live, unfinished
+    /// delegation observed by this node.
+    #[doc(hidden)]
+    pub fn running_delegation_for_child(
+        &self,
+        child_session_id: &str,
+    ) -> Option<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.delegation_activity
+            .lock()
+            .snapshot_for_child(child_session_id)
+            .filter(|update| {
+                update.activity
+                    == crate::control::delegation_notifications::DelegationActivity::Live
+                    && !update.state.is_terminal()
+            })
+    }
+
     #[doc(hidden)]
     pub fn delegation_snapshots(
         &self,
