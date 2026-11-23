@@ -20,20 +20,21 @@ impl StreamMeter {
     pub fn observe(&mut self, chunk: &querymt::chat::StreamChunk) {
         use querymt::chat::{StreamChunk, StructuredStreamEvent, chunk_is_terminal};
         self.terminal |= chunk_is_terminal(chunk);
-        let usage = match chunk {
-            StreamChunk::Usage(usage) => Some(usage),
-            StreamChunk::Structured(
-                StructuredStreamEvent::ResponseMetadata { usage, .. }
-                | StructuredStreamEvent::ResponseTerminal { usage, .. },
-            ) => usage.as_ref(),
-            _ => None,
-        };
-        if let Some(usage) = usage {
-            self.usage = Some(
-                self.usage
-                    .take()
-                    .map_or_else(|| usage.clone(), |current| current.merge_max(usage.clone())),
-            );
+        match chunk {
+            StreamChunk::Usage(usage) => {
+                self.usage = Some(
+                    self.usage
+                        .take()
+                        .map_or_else(|| usage.clone(), |current| current.merge_max(usage.clone())),
+                );
+            }
+            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal { usage, .. }) => {
+                // Unlike in-progress metadata, terminal usage is authoritative.
+                if let Some(usage) = usage {
+                    self.usage = Some(usage.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1683,6 +1684,40 @@ mod ledger {
 mod tests {
     use super::*;
     use querymt::error::{LLMError, ProviderErrorKind};
+
+    #[test]
+    fn stream_meter_distinguishes_start_metadata_from_authoritative_zero_output() {
+        use querymt::chat::{ChatOutputStatus, StreamChunk, StructuredStreamEvent};
+
+        let start = querymt::Usage {
+            input_tokens: 12,
+            ..Default::default()
+        };
+        for (final_usage, expected) in [
+            (None, AttemptUsage::Unknown),
+            (Some(start.clone()), AttemptUsage::Observed(12)),
+        ] {
+            let mut meter = StreamMeter::default();
+            meter.observe(&StreamChunk::Structured(
+                StructuredStreamEvent::ResponseMetadata {
+                    response_id: None,
+                    status: Some(ChatOutputStatus::InProgress),
+                    usage: Some(start.clone()),
+                    finish_reason: None,
+                    provenance: None,
+                },
+            ));
+            meter.observe(&StreamChunk::Structured(
+                StructuredStreamEvent::ResponseTerminal {
+                    status: ChatOutputStatus::Completed,
+                    usage: final_usage,
+                    finish_reason: None,
+                    detail: None,
+                },
+            ));
+            assert_eq!(meter.complete_usage(), expected);
+        }
+    }
 
     #[test]
     fn quota_denial_details_survive_the_provider_wire_and_stay_bound_to_the_error_code() {

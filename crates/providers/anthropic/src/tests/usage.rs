@@ -116,6 +116,39 @@ fn test_streaming_message_start_usage() {
 }
 
 #[test]
+fn terminal_usage_requires_final_output_but_accepts_explicit_zero() {
+    use querymt::chat::StreamChunk;
+
+    for (delta, expected_output) in [
+        (
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            None,
+        ),
+        (
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+            Some(0),
+        ),
+    ] {
+        let (_, chunks) = stream_output(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}"#,
+            delta,
+        ]);
+        let StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal { usage, .. }) =
+            &chunks[terminal_index(&chunks)]
+        else {
+            panic!("expected a structured terminal");
+        };
+        assert_eq!(
+            usage.as_ref().map(|usage| usage.output_tokens),
+            expected_output
+        );
+        if let Some(usage) = usage {
+            assert_eq!(usage.input_tokens, 7);
+        }
+    }
+}
+
+#[test]
 fn test_streaming_usage_merge_max_gives_correct_totals() {
     // The terminal carries the start usage overlaid with the final output
     // count, so the accumulated usage is already correct.
