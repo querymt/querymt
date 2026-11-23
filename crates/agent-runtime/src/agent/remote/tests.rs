@@ -2485,6 +2485,175 @@ mod node_manager_tests {
             .clone()
     }
 
+    fn successful_ask<R: serde::de::DeserializeOwned>(
+        reply: Result<
+            kameo::remote::messaging::SwarmResponse,
+            querymt_remote::mesh_ingress::SharingRejection,
+        >,
+    ) -> R {
+        let Ok(kameo::remote::messaging::SwarmResponse::Ask(Ok(bytes))) = reply else {
+            panic!("expected successful guarded ask, got {reply:?}");
+        };
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn guarded_full_peer_can_recover_and_resolve_its_own_remote_approval() {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionKind, RequestPermissionRequest, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+        use crate::agent::messages::{
+            ClaimInteractionDelivery, InputDelivery, ListPendingInteractions, ResolveInteraction,
+            SubmitInput, SubmitInputResult, SubmitSessionInput,
+        };
+        use crate::elicitation::{
+            ClaimedElicitationDelivery, ElicitationResolution, ElicitationResponse,
+            PendingElicitationSnapshot,
+        };
+        use querymt_remote::mesh_ingress::{MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(peer),
+        };
+        let grant = store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                PeerGrant::Full,
+            )
+            .await
+            .unwrap();
+        let id = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let _permit = runtime
+            .execution_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let session = SessionActor::spawn(SessionActor::new(config.clone(), id.clone(), runtime));
+        crate::agent::remote::remote_actor_impl::register_session_routes(&mesh, &session);
+        let input = SubmitSessionInput::new(SubmitInput {
+            session_id: id.clone(),
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec!["remote approval fixture".into()],
+        });
+        let SubmitInputResult::Started { run_id, .. } = successful_ask(
+            router
+                .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &input))
+                .await,
+        ) else {
+            panic!("expected the peer to start a run");
+        };
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let interaction_id = "approval-fixture".to_string();
+        let permission = RequestPermissionRequest::new(
+            id.clone(),
+            ToolCallUpdate::new("tool-fixture", ToolCallUpdateFields::new()),
+            vec![PermissionOption::new(
+                "allow_once",
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        crate::elicitation::register_pending_permission(
+            &config.pending_elicitations,
+            interaction_id.clone(),
+            id,
+            permission,
+            Some(run_id),
+            Some("tool-fixture".into()),
+            tx,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let list = node_ask::<SessionActor, _>(
+            session.id(),
+            &ListPendingInteractions {
+                assign_authority: Some("recovery-verifier".into()),
+            },
+        );
+        let pending: Vec<PendingElicitationSnapshot> =
+            successful_ask(router.handle_v1(peer, list).await);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].owner_authority.as_deref(),
+            Some("recovery-verifier")
+        );
+        let claim = node_ask::<SessionActor, _>(
+            session.id(),
+            &ClaimInteractionDelivery {
+                interaction_id: None,
+                connection_id: "connection".into(),
+                authority: Some("recovery-verifier".into()),
+            },
+        );
+        let deliveries: Vec<ClaimedElicitationDelivery> =
+            successful_ask(router.handle_v1(peer, claim).await);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].elicitation_id, interaction_id);
+        let resolve = || {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &ResolveInteraction {
+                    interaction_id: interaction_id.clone(),
+                    connection_id: "connection".into(),
+                    delivery_generation: Some(deliveries[0].delivery_generation),
+                    response: ElicitationResponse::permission_selected("allow_once"),
+                },
+            )
+        };
+        assert!(matches!(
+            router.handle_v1(libp2p::PeerId::random(), resolve()).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let resolution: ElicitationResolution =
+            successful_ask(router.handle_v1(peer, resolve()).await);
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.try_recv().unwrap().selected_permission_option(),
+            Some("allow_once")
+        );
+
+        store
+            .replace_grant(&key, grant.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            router.handle_v1(peer, resolve()).await,
+            Err(SharingRejection::Denied)
+        ));
+    }
+
     #[tokio::test]
     async fn due_peer_schedule_waits_for_mesh_after_scheduler_restart() {
         verify_schedule_after_scheduler_restart(true).await;

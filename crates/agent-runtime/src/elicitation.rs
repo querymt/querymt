@@ -338,9 +338,16 @@ pub async fn register_pending_permission(
 pub async fn snapshot_pending_elicitations(
     pending_map: &PendingElicitationMap,
 ) -> Vec<PendingElicitationSnapshot> {
-    let pending = pending_map.lock().await;
-    let mut snapshot = pending
+    snapshot_matching(&*pending_map.lock().await, |_| true)
+}
+
+pub(crate) fn snapshot_matching(
+    entries: &HashMap<String, PendingElicitation>,
+    matches: impl Fn(&PendingElicitation) -> bool,
+) -> Vec<PendingElicitationSnapshot> {
+    let mut snapshot = entries
         .iter()
+        .filter(|(_, entry)| matches(entry))
         .map(|(elicitation_id, entry)| PendingElicitationSnapshot {
             elicitation_id: elicitation_id.clone(),
             session_id: entry.session_id.clone(),
@@ -504,14 +511,21 @@ pub async fn claim_deliveries_in_map(
     authority_verifier: Option<&str>,
     connection_id: &str,
 ) -> Vec<ClaimedElicitationDelivery> {
-    let mut claims = Vec::new();
-    let mut entries = map.lock().await;
-    for (entry_id, entry) in entries.iter_mut().filter(|(entry_id, entry)| {
+    claim_matching(&mut *map.lock().await, connection_id, |entry_id, entry| {
         entry.session_id == session_id
-            && elicitation_id.is_none_or(|expected| entry_id.as_str() == expected)
+            && elicitation_id.is_none_or(|expected| entry_id == expected)
             && authority_verifier
                 .is_none_or(|verifier| entry.owner_authority.as_deref() == Some(verifier))
-    }) {
+    })
+}
+
+pub(crate) fn claim_matching(
+    entries: &mut HashMap<String, PendingElicitation>,
+    connection_id: &str,
+    matches: impl Fn(&str, &PendingElicitation) -> bool,
+) -> Vec<ClaimedElicitationDelivery> {
+    let mut claims = Vec::new();
+    for (entry_id, entry) in entries.iter_mut().filter(|(id, entry)| matches(id, entry)) {
         entry.delivery_generation = entry.delivery_generation.saturating_add(1);
         entry.delivery_connection = Some(connection_id.to_string());
         claims.push(ClaimedElicitationDelivery {
@@ -568,13 +582,27 @@ pub async fn resolve_in_map(
     delivery_generation: Option<u64>,
     response: ElicitationResponse,
 ) -> Result<ElicitationResolution, agent_client_protocol::Error> {
-    let mut entries = map.lock().await;
-    let Some(entry) = entries.get(elicitation_id) else {
+    resolve_matching(
+        &mut *map.lock().await,
+        elicitation_id,
+        connection_id,
+        delivery_generation,
+        response,
+        |entry| session_id.is_none_or(|session_id| entry.session_id == session_id),
+    )
+}
+
+pub(crate) fn resolve_matching(
+    entries: &mut HashMap<String, PendingElicitation>,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: Option<u64>,
+    response: ElicitationResponse,
+    matches: impl FnOnce(&PendingElicitation) -> bool,
+) -> Result<ElicitationResolution, agent_client_protocol::Error> {
+    let Some(entry) = entries.get(elicitation_id).filter(|entry| matches(entry)) else {
         return Ok(ElicitationResolution::NotFound);
     };
-    if session_id.is_some_and(|session_id| entry.session_id != session_id) {
-        return Ok(ElicitationResolution::NotFound);
-    }
     let allowed = match delivery_generation {
         Some(generation) => {
             entry.delivery_generation == generation
@@ -590,7 +618,6 @@ pub async fn resolve_in_map(
     let entry = entries
         .remove(elicitation_id)
         .expect("pending entry exists while registry lock is held");
-    drop(entries);
     let _ = entry.sender.send(response);
     Ok(ElicitationResolution::Resolved)
 }

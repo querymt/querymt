@@ -2071,12 +2071,177 @@ impl Message<ResolveInteraction> for SessionActor {
             msg.response,
         )
         .await
-        .map_err(|error| AgentError::InvalidInteractionResponse {
-            detail: match error.data {
-                Some(serde_json::Value::String(data)) => data,
-                _ => error.message,
+        .map_err(interaction_response_error)
+    }
+}
+
+fn interaction_response_error(error: crate::acp::protocol::Error) -> AgentError {
+    AgentError::InvalidInteractionResponse {
+        detail: match error.data {
+            Some(serde_json::Value::String(data)) => data,
+            _ => error.message,
+        },
+    }
+}
+
+// Only the authenticated ingress adapter constructs this mailbox message.
+#[cfg(feature = "remote")]
+pub(crate) struct PeerInteraction<M> {
+    pub(crate) peer: Arc<PeerTurn>,
+    pub(crate) message: M,
+}
+
+#[cfg(feature = "remote")]
+struct PeerInteractionScope<'a> {
+    session_id: &'a str,
+    run_id: String,
+    prefix: String,
+}
+
+#[cfg(feature = "remote")]
+impl PeerInteractionScope<'_> {
+    fn matches(&self, entry: &crate::elicitation::PendingElicitation) -> bool {
+        entry.session_id == self.session_id
+            && entry.run_id.as_deref() == Some(self.run_id.as_str())
+            && entry
+                .owner_authority
+                .as_deref()
+                .is_none_or(|id| id.starts_with(&self.prefix))
+            && entry
+                .delivery_connection
+                .as_deref()
+                .is_none_or(|id| id.starts_with(&self.prefix))
+    }
+
+    fn bind(&self, id: &str) -> String {
+        format!("{}{id}", self.prefix)
+    }
+
+    fn unbind(&self, id: Option<String>) -> Option<String> {
+        id.and_then(|id| id.strip_prefix(&self.prefix).map(str::to_owned))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl SessionActor {
+    async fn peer_interaction_scope(
+        &self,
+        peer: Arc<PeerTurn>,
+    ) -> Result<Option<PeerInteractionScope<'_>>, AgentError> {
+        // ACP verifiers and connection IDs are meaningful only within the sending peer.
+        let prefix = format!("mesh:{}:", peer.key.peer);
+        let caller = TurnAuthority::Peer(peer);
+        caller.check().await?;
+        let RunSlot::Running(run, authority) = &self.run else {
+            return Ok(None);
+        };
+        if !caller.can_control(authority) {
+            return Ok(None);
+        }
+        authority.check().await?;
+        if run.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(PeerInteractionScope {
+            session_id: &self.session_id,
+            run_id: run.run_id.to_string(),
+            prefix,
+        }))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ListPendingInteractions>> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::PendingElicitationSnapshot>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ListPendingInteractions>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut entries = self.config.pending_elicitations.lock().await;
+        let Some(scope) = self.peer_interaction_scope(peer).await? else {
+            return Ok(Vec::new());
+        };
+        if let Some(verifier) = message.assign_authority.as_deref() {
+            let bound = scope.bind(verifier);
+            for entry in entries.values_mut().filter(|entry| scope.matches(entry)) {
+                if entry.owner_authority.is_none() {
+                    entry.owner_authority = Some(bound.clone());
+                }
+            }
+        }
+        let mut snapshots =
+            crate::elicitation::snapshot_matching(&entries, |entry| scope.matches(entry));
+        for snapshot in &mut snapshots {
+            snapshot.owner_authority = scope.unbind(snapshot.owner_authority.take());
+            snapshot.delivery_connection = scope.unbind(snapshot.delivery_connection.take());
+        }
+        Ok(snapshots)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ClaimInteractionDelivery>> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::ClaimedElicitationDelivery>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ClaimInteractionDelivery>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if message.authority.is_none() && message.interaction_id.is_none() {
+            return Err(AgentError::InvalidInteractionResponse {
+                detail: "claim requires an interaction id or an authority".to_string(),
+            });
+        }
+        let mut entries = self.config.pending_elicitations.lock().await;
+        let Some(scope) = self.peer_interaction_scope(peer).await? else {
+            return Ok(Vec::new());
+        };
+        let verifier = message.authority.as_deref().map(|id| scope.bind(id));
+        Ok(crate::elicitation::claim_matching(
+            &mut entries,
+            &scope.bind(&message.connection_id),
+            |id, entry| {
+                scope.matches(entry)
+                    && message
+                        .interaction_id
+                        .as_deref()
+                        .is_none_or(|expected| id == expected)
+                    && verifier
+                        .as_ref()
+                        .is_none_or(|verifier| entry.owner_authority.as_ref() == Some(verifier))
             },
-        })
+        ))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ResolveInteraction>> for SessionActor {
+    type Reply = Result<crate::elicitation::ElicitationResolution, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ResolveInteraction>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::elicitation::ElicitationResolution;
+
+        let mut entries = self.config.pending_elicitations.lock().await;
+        let Some(scope) = self.peer_interaction_scope(peer).await? else {
+            return Ok(ElicitationResolution::NotFound);
+        };
+        let connection = scope.bind(&message.connection_id);
+        crate::elicitation::resolve_matching(
+            &mut entries,
+            &message.interaction_id,
+            &connection,
+            message.delivery_generation,
+            message.response,
+            |entry| scope.matches(entry) && entry.delivery_connection.is_some(),
+        )
+        .map_err(interaction_response_error)
     }
 }
 

@@ -479,12 +479,38 @@ impl SessionActorRef {
     /// does not register these messages answers `UnknownMessage`; that means
     /// the node runs an older agent and must be upgraded.
     #[cfg(feature = "remote")]
-    fn map_interaction_remote_error(
+    async fn ask_remote_interaction<M, R>(
         &self,
-        error: kameo::error::RemoteSendError<AgentError>,
+        mesh: Option<&crate::agent::remote::MeshHandle>,
+        actor: &kameo::actor::RemoteActorRef<SessionActor>,
+        message: &M,
         timeout_message: &str,
-    ) -> AgentError {
-        map_interaction_send_error(self.node_label(), error, timeout_message)
+    ) -> Result<R, AgentError>
+    where
+        SessionActor: kameo::message::Message<M, Reply = Result<R, AgentError>>
+            + kameo::remote::RemoteMessage<M>,
+        M: serde::Serialize + Send + Sync + 'static,
+        R: serde::de::DeserializeOwned + Send + 'static,
+    {
+        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+
+        let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
+        let error = match mesh {
+            Some(mesh) => match ask_with_sharing(mesh, actor, message, timeout).await {
+                Ok(reply) => return Ok(reply),
+                Err(SharingAskError::Actor(error)) => error,
+                Err(error) => return Err(AgentError::from_sharing_ask(error)),
+            },
+            None => match querymt_remote::ask_remote_with_timeout(actor, message, timeout).await {
+                Ok(reply) => return Ok(reply),
+                Err(error) => error,
+            },
+        };
+        Err(map_interaction_send_error(
+            self.node_label(),
+            error,
+            timeout_message,
+        ))
     }
 
     /// Snapshot this session's pending interactions (see
@@ -500,18 +526,17 @@ impl SessionActorRef {
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                self.ask_remote_interaction(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    "ListPendingInteractions timed out on remote session",
+                )
                 .await
-                .map_err(|error| {
-                    self.map_interaction_remote_error(
-                        error,
-                        "ListPendingInteractions timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -534,18 +559,17 @@ impl SessionActorRef {
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                self.ask_remote_interaction(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    "ClaimInteractionDelivery timed out on remote session",
+                )
                 .await
-                .map_err(|error| {
-                    self.map_interaction_remote_error(
-                        error,
-                        "ClaimInteractionDelivery timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -569,18 +593,17 @@ impl SessionActorRef {
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                self.ask_remote_interaction(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    "ResolveInteraction timed out on remote session",
+                )
                 .await
-                .map_err(|error| {
-                    self.map_interaction_remote_error(
-                        error,
-                        "ResolveInteraction timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 

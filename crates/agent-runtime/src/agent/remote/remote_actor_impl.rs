@@ -100,6 +100,53 @@ pub(crate) fn register_session_routes(
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
     register_session_turns(router, store.clone(), actor);
+    register_session_interactions(router, store.clone(), actor);
+}
+
+fn register_session_interactions(
+    router: &InboundRouter,
+    store: Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) {
+    register_peer_interaction::<messages::ListPendingInteractions, _>(router, &store, actor);
+    register_peer_interaction::<messages::ClaimInteractionDelivery, _>(router, &store, actor);
+    register_peer_interaction::<messages::ResolveInteraction, _>(router, &store, actor);
+}
+
+fn register_peer_interaction<M, R>(
+    router: &InboundRouter,
+    store: &Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) where
+    SessionActor: RemoteMessage<M>
+        + Message<crate::agent::session_actor::PeerInteraction<M>, Reply = Result<R, AgentError>>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    R: serde::Serialize + Send + 'static,
+{
+    let weak = actor.downgrade();
+    let store = store.clone();
+    router.register::<SessionActor, M, _, _, _, _>(
+        actor.id(),
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        move |request, message| {
+            let weak = weak.clone();
+            let store = store.clone();
+            async move {
+                let actor = weak
+                    .upgrade()
+                    .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+                let peer = Arc::new(PeerTurn::from_request(&request, store)?);
+                actor
+                    .ask(crate::agent::session_actor::PeerInteraction { peer, message })
+                    .mailbox_timeout(Duration::from_secs(10))
+                    .reply_timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(local_session_error)
+            }
+        },
+    );
 }
 
 pub(super) fn register_session_turns(
