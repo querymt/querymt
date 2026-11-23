@@ -24,6 +24,10 @@ use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use querymt_agent_core::replay::{
     CompactionIds, is_todo_write_tool, stored_summary_updates, todo_entries_from_arguments,
 };
+use querymt_agent_protocol_types::session::state_update::stop_reason_for_outcome;
+pub use querymt_agent_protocol_types::session::state_update::{
+    SESSION_STATE_UPDATE_METHOD, SessionStateUpdate,
+};
 use querymt_agent_services::event_fanout::EventFanout;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -267,6 +271,13 @@ pub struct RpcDispatchOutput {
     /// history, and the client needs that content before its load promise
     /// resolves so replay is never misapplied as live traffic.
     pub notify_before_response: bool,
+    /// Set when a `session/load` answered: the live events it held back are
+    /// released once the transport has sent the response.
+    #[doc(hidden)]
+    pub load_release: Option<(
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    )>,
 }
 
 impl RpcDispatchOutput {
@@ -342,6 +353,7 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let RpcDispatchOutput {
         notifications,
         mut response,
+        load_release,
         ..
     } = output;
 
@@ -380,6 +392,14 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
                 let _ = tx.send(json).await;
             }
             Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
+        }
+    }
+
+    // The response is queued: the held live events follow it.
+    if let Some((hold, cut)) = load_release {
+        match agent.as_any().downcast_ref::<AgentHandle>() {
+            Some(local) => hold.release_with(cut, local.config.event_sink.fanout()),
+            None => hold.release(cut.unwrap_or_default(), None),
         }
     }
 }
@@ -580,6 +600,52 @@ pub(crate) async fn session_events(
     session_ref.get_event_stream().await
 }
 
+/// Tell a connection's translator which run a just-loaded session is in, so
+/// the state sent after the load and the run id on later updates are right.
+///
+/// The snapshot's runtime status names the run when the load carries one;
+/// otherwise the session's actor is asked. A session without a run (or one
+/// whose actor is not reachable here) is seeded as idle.
+pub(crate) async fn seed_loaded_run_state(
+    agent: &AgentHandle,
+    session_id: &str,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+) {
+    let from_snapshot = meta
+        .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
+        .map(|snapshot| {
+            snapshot
+                .pointer("/runtimeStatus/active_run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let session_ref = agent.owned_session_ref(session_id).await;
+    let run_id = match from_snapshot {
+        Some(run_id) => run_id,
+        None => match &session_ref {
+            Some(session_ref) => session_ref
+                .get_runtime_status()
+                .await
+                .ok()
+                .and_then(|status| status.active_run_id),
+            None => None,
+        },
+    };
+    let waiting = match (&run_id, &session_ref) {
+        (Some(_), Some(session_ref)) => session_ref
+            .list_pending_interactions(None)
+            .await
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false),
+        _ => false,
+    };
+    translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .seed_run_state(session_id, run_id, waiting);
+}
+
 pub(crate) async fn restore_session_history(
     agent: &AgentHandle,
     session_id: &str,
@@ -691,6 +757,14 @@ fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Valu
         "method": method,
         "params": params,
     })
+}
+
+/// JSON-RPC notification for a run state update.
+pub fn state_update_notification(update: &SessionStateUpdate) -> serde_json::Value {
+    ext_notification(
+        SESSION_STATE_UPDATE_METHOD,
+        serde_json::to_value(update).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 pub fn mesh_nodes_changed_notification(peer_id: &str, change: &str) -> serde_json::Value {
@@ -1149,7 +1223,14 @@ where
     // terminal state (original identity, final summary; chunks and in-progress
     // states are omitted) is sent where its terminal event happened, so a
     // client places it in the timeline where it occurred.
+    // The run an event belongs to is the enclosing `RunStarted`; updates carry
+    // its id as live updates do.
+    let mut current_run: Option<String> = None;
     for event in events {
+        if let AgentEventKind::RunStarted { run_id, .. } = &event.kind {
+            current_run = Some(run_id.clone());
+        }
+        let ends_run = matches!(&event.kind, AgentEventKind::RunCompleted { .. });
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
@@ -1170,7 +1251,10 @@ where
             let envelope = EventEnvelope::from(event);
             translate_replay_event_to_updates(&envelope)
         });
-        for update in updates {
+        for mut update in updates {
+            if let Some(run_id) = &current_run {
+                querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
+            }
             push(update, &mut notifications);
         }
         if capabilities.compaction {
@@ -1185,8 +1269,15 @@ where
                 if let Some(error) = &terminal.error {
                     update = update.error(error.clone());
                 }
-                push(SessionUpdate::CompactionUpdate(update), &mut notifications);
+                let mut update = SessionUpdate::CompactionUpdate(update);
+                if let Some(run_id) = &current_run {
+                    querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
+                }
+                push(update, &mut notifications);
             }
+        }
+        if ends_run {
+            current_run = None;
         }
     }
 
@@ -1761,6 +1852,21 @@ pub struct AcpLiveEventTranslator {
     /// Sessions whose deterministic todo plan is currently announced to a
     /// plan-operations client, so an empty snapshot removes it exactly once.
     announced_todo_plans: HashSet<String>,
+    /// Current run and blocking waits per session, for run state updates and
+    /// the run id stamped on session updates.
+    runs: HashMap<String, RunTracking>,
+}
+
+/// Stand-in wait id for a wait a load found pending: its real id is unknown
+/// until its resolution event arrives.
+const LOAD_PENDING_WAIT: &str = "\u{0}load-pending";
+
+/// The run a session is executing and the interactions it waits on.
+#[derive(Debug, Default, Clone)]
+struct RunTracking {
+    run_id: Option<String>,
+    /// Pending permission and elicitation ids of the current run.
+    waiting: HashSet<String>,
 }
 
 impl Default for AcpLiveEventTranslator {
@@ -1781,7 +1887,161 @@ impl AcpLiveEventTranslator {
             usage: HashMap::new(),
             config: HashMap::new(),
             announced_todo_plans: HashSet::new(),
+            runs: HashMap::new(),
         }
+    }
+
+    /// Observe one live event and return the run state transition it causes.
+    ///
+    /// Call it for every event before [`Self::translate_updates`], so the run
+    /// id stamped on the event's updates is the one the event belongs to.
+    /// `RunStarted` is `running`, `RunCompleted` is `idle` with the mapped stop
+    /// reason, and a blocking permission or elicitation wait is
+    /// `requires_action` until the last one resolves.
+    pub fn translate_state_update(&mut self, event: &EventEnvelope) -> Option<SessionStateUpdate> {
+        let session_id = event.session_id();
+        match event.kind() {
+            AgentEventKind::RunStarted { run_id, .. } => {
+                let tracking = self.runs.entry(session_id.to_owned()).or_default();
+                tracking.run_id = Some(run_id.clone());
+                tracking.waiting.clear();
+                Some(SessionStateUpdate::running(session_id, run_id))
+            }
+            AgentEventKind::RunCompleted {
+                run_id,
+                outcome,
+                stop_type,
+                ..
+            } => {
+                let tracking = self.runs.get_mut(session_id)?;
+                // A completion of an older run does not end the current one.
+                if tracking.run_id.as_deref().is_some_and(|id| id != run_id) {
+                    return None;
+                }
+                self.runs.remove(session_id);
+                Some(SessionStateUpdate::idle(
+                    session_id,
+                    run_id,
+                    stop_reason_for_outcome(outcome, *stop_type),
+                ))
+            }
+            AgentEventKind::PermissionRequested { permission_id, .. } => {
+                self.begin_wait(session_id, permission_id)
+            }
+            AgentEventKind::ElicitationRequested { elicitation_id, .. } => {
+                self.begin_wait(session_id, elicitation_id)
+            }
+            AgentEventKind::PermissionGranted { permission_id, .. } => {
+                self.end_wait(session_id, permission_id)
+            }
+            AgentEventKind::ElicitationResolved { elicitation_id, .. } => {
+                self.end_wait(session_id, elicitation_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn begin_wait(&mut self, session_id: &str, interaction_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get_mut(session_id)?;
+        let run_id = tracking.run_id.clone()?;
+        let was_empty = tracking.waiting.is_empty();
+        let inserted = tracking.waiting.insert(interaction_id.to_owned());
+        (inserted && was_empty).then(|| SessionStateUpdate::requires_action(session_id, &run_id))
+    }
+
+    fn end_wait(&mut self, session_id: &str, interaction_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get_mut(session_id)?;
+        let run_id = tracking.run_id.clone()?;
+        // A wait the load found pending resolves under its real id.
+        let removed =
+            tracking.waiting.remove(interaction_id) || tracking.waiting.remove(LOAD_PENDING_WAIT);
+        (removed && tracking.waiting.is_empty())
+            .then(|| SessionStateUpdate::running(session_id, &run_id))
+    }
+
+    /// Replace what this connection knows of the session's run with the state
+    /// a load found: the run in progress (if any) and whether it waits for
+    /// the user. Later events refine it.
+    pub fn seed_run_state(&mut self, session_id: &str, run_id: Option<String>, waiting: bool) {
+        let Some(run_id) = run_id else {
+            self.runs.remove(session_id);
+            return;
+        };
+        let tracking = self.runs.entry(session_id.to_owned()).or_default();
+        tracking.run_id = Some(run_id);
+        tracking.waiting.clear();
+        if waiting {
+            // The ids of the waits are unknown; any resolution of a wait the
+            // connection did not see leaves this marker until the run moves on.
+            tracking.waiting.insert(LOAD_PENDING_WAIT.to_owned());
+        }
+    }
+
+    /// The text of messages that were streaming when a load answered, as the
+    /// chunks a client holding the stored history is missing. Each message's
+    /// text is marked streamed, so its stored form is not delivered again and
+    /// later deltas append to it.
+    pub fn inflight_updates(
+        &mut self,
+        session_id: &str,
+        inflight: &querymt_agent_services::event_fanout::InflightText,
+    ) -> Vec<SessionUpdate> {
+        let mut updates = Vec::new();
+        for message in &inflight.messages {
+            for part in message.reasoning.iter().filter(|p| !p.text.is_empty()) {
+                updates.push(SessionUpdate::AgentThoughtChunk(
+                    querymt_agent_core::replay::thought_chunk(
+                        &part.text,
+                        &message.message_id,
+                        part.part_id.as_deref(),
+                    ),
+                ));
+            }
+            if !message.text.is_empty() {
+                self.streamed_assistant_messages
+                    .insert((session_id.to_owned(), message.message_id.clone()));
+                updates.push(SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(message.text.clone())))
+                        .message_id(MessageId::from(message.message_id.clone())),
+                ));
+            }
+        }
+        if let Some(run_id) = self.current_run_id(session_id) {
+            for update in &mut updates {
+                querymt_agent_core::replay::stamp_run_id(update, run_id);
+            }
+        }
+        updates
+    }
+
+    /// What a connection is owed first when a load released its held events:
+    /// the session's current run state (none while idle) and the in-flight
+    /// text, ahead of every other live update.
+    pub fn released_load_prelude(
+        &mut self,
+        session_id: &str,
+        inflight: Option<&querymt_agent_services::event_fanout::InflightText>,
+    ) -> (Option<SessionStateUpdate>, Vec<SessionUpdate>) {
+        let updates = inflight
+            .map(|inflight| self.inflight_updates(session_id, inflight))
+            .unwrap_or_default();
+        (self.current_state_update(session_id), updates)
+    }
+
+    /// The run the session is executing, as observed on this connection.
+    pub fn current_run_id(&self, session_id: &str) -> Option<&str> {
+        self.runs.get(session_id)?.run_id.as_deref()
+    }
+
+    /// Current state of the session's foreground work; `None` when idle.
+    pub fn current_state_update(&self, session_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get(session_id)?;
+        let run_id = tracking.run_id.as_deref()?;
+        Some(if tracking.waiting.is_empty() {
+            SessionStateUpdate::running(session_id, run_id)
+        } else {
+            SessionStateUpdate::requires_action(session_id, run_id)
+        })
     }
 
     /// Applies the connection's negotiated Preview capability snapshot.
@@ -1997,6 +2257,7 @@ impl AcpLiveEventTranslator {
         self.usage.remove(session_id);
         self.config.remove(session_id);
         self.announced_todo_plans.remove(session_id);
+        self.runs.remove(session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
         self.structured_user_messages
@@ -2099,7 +2360,20 @@ impl AcpLiveEventTranslator {
     }
 
     /// Translates one internal event into zero or more ordered session updates.
+    ///
+    /// Updates that belong to a run carry its id in `_meta.querymt.runId`: the
+    /// run [`Self::translate_state_update`] last observed for the session.
     pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        let mut updates = self.translate_unstamped_updates(event);
+        if let Some(run_id) = self.current_run_id(event.session_id()) {
+            for update in &mut updates {
+                querymt_agent_core::replay::stamp_run_id(update, run_id);
+            }
+        }
+        updates
+    }
+
+    fn translate_unstamped_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
         match event.kind() {
             AgentEventKind::UserPromptBlock {
                 message_id,
@@ -2627,6 +2901,12 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
     let mut notifications = Vec::new();
+    // A `session/load` that answered: its held live events are released once
+    // the transport has sent the response.
+    let mut load_release: Option<(
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    )> = None;
     let result: Result<serde_json::Value, Error> =
         run_with_acp_span(&rpc_method, &rpc_params, async {
             let method = req.method.clone();
@@ -2796,11 +3076,32 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     ) {
                         Ok(params) => {
                             let session_id = params.session_id.to_string();
+                            // Live events of the session wait from here until the
+                            // response is out (see `ConnectionDelivery::begin_load`).
+                            let hold = context
+                                .delivery
+                                .as_ref()
+                                .map(|delivery| delivery.begin_load(&session_id));
                             // MCP attachments are now resolved internally by the
                             // materializer via the runtime attachment source.
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
+                                    let mut cut = crate::acp::delivery::LoadCut::from_snapshot_meta(
+                                        r.meta.as_ref(),
+                                    );
+                                    if let (Some(translator), Some(local_agent)) = (
+                                        context.translator.as_ref(),
+                                        agent.as_any().downcast_ref::<AgentHandle>(),
+                                    ) {
+                                        seed_loaded_run_state(
+                                            local_agent,
+                                            &session_id,
+                                            r.meta.as_ref(),
+                                            translator,
+                                        )
+                                        .await;
+                                    }
                                     if let Some(translator) = context.translator.as_ref() {
                                         let mut translator = translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                         if let Some(options) = r.config_options.as_ref() {
@@ -2861,13 +3162,13 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                             })
                                             .unwrap_or_default();
                                         let replay =
-                                            crate::acp::stdio::replay_loaded_session(
+                                            crate::acp::stdio::replay_loaded_session_with_cut(
                                                 local_agent,
                                                 &session_id,
                                                 &capabilities,
                                             )
                                             .await;
-                                        let (replay, _) = match replay {
+                                        let (replay, _, replay_cut) = match replay {
                                             Ok(replay) => replay,
                                             Err(error) => {
                                                 if ownership_inserted {
@@ -2881,6 +3182,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                                 return Err(error);
                                             }
                                         };
+                                        cut = Some(replay_cut);
                                         for notification in replay {
                                             let mut params = serde_json::to_value(notification)
                                                 .map_err(Error::into_internal_error)?;
@@ -2896,6 +3198,28 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         available_commands_session_update(agent, &session_id).await
                                     {
                                         notifications.push(notification);
+                                    }
+                                    if let Some(hold) = hold {
+                                        // More live events than the connection can
+                                        // buffer arrived: answering would leave a
+                                        // gap, so the load fails and can be retried.
+                                        if hold.check().is_err() {
+                                            if ownership_inserted {
+                                                unsubscribe_connection(
+                                                    session_owners,
+                                                    &session_id,
+                                                    conn_id,
+                                                )
+                                                .await;
+                                            }
+                                            return Err(Error::internal_error().data(
+                                                serde_json::json!({
+                                                    "message": "Too many live events arrived while loading the session; retry the load",
+                                                    "sessionId": session_id,
+                                                }),
+                                            ));
+                                        }
+                                        load_release = Some((hold, cut));
                                     }
                                     Ok(value)
                                 }
@@ -3324,6 +3648,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
         // Only `session/load` replays history through the notification queue;
         // every other method keeps the respond-first ordering.
         notify_before_response: rpc_method == AGENT_METHOD_NAMES.session_load,
+        load_release,
     }
 }
 
@@ -9364,6 +9689,64 @@ mod session_update_tests {
     }
 
     #[test]
+    fn compaction_without_an_id() {
+        // A session recorded before compactions carried ids: each start and
+        // its end are one compaction, replayed once.
+        let compaction = |seq, kind| agent_event(seq, kind);
+        let events = vec![
+            compaction(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: None,
+                },
+            ),
+            compaction(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "one".to_string(),
+                    summary_len: 3,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+            compaction(
+                3,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 20,
+                    compaction_id: None,
+                },
+            ),
+            compaction(
+                4,
+                AgentEventKind::CompactionEnd {
+                    summary: "two".to_string(),
+                    summary_len: 3,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let ids: Vec<String> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::CompactionUpdate(compaction) => {
+                    Some(compaction.compaction_id.0.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "each compaction is replayed once: {ids:?}");
+        assert_ne!(ids[0], ids[1]);
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("querymt-compaction-legacy-"))
+        );
+    }
+
+    #[test]
     fn replay_pairs_legacy_compaction_terminal_with_stable_id() {
         let events = vec![
             agent_event(
@@ -9398,7 +9781,7 @@ mod session_update_tests {
     }
 
     #[test]
-    fn replay_sends_a_compaction_where_it_happened() {
+    fn compaction_between_two_prompts() {
         let prompt = |seq, id: &str| {
             agent_event(
                 seq,
@@ -9457,5 +9840,422 @@ mod session_update_tests {
                 .iter()
                 .all(|u| !matches!(u, SessionUpdate::CompactionUpdate(_)))
         );
+    }
+
+    // ── Run state updates ──────────────────────────────────────────────────
+
+    fn run_started(seq: i64, run_id: &str, origin: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::RunStarted {
+                run_id: run_id.to_string(),
+                origin: origin.to_string(),
+            },
+        )
+    }
+
+    fn run_completed(seq: i64, run_id: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::RunCompleted {
+                run_id: run_id.to_string(),
+                outcome: "completed".to_string(),
+                stop_type: None,
+                reason: None,
+            },
+        )
+    }
+
+    fn permission_requested(seq: i64, id: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::PermissionRequested {
+                permission_id: id.to_string(),
+                task_id: None,
+                tool_name: "shell".to_string(),
+                reason: "needs approval".to_string(),
+                tool_call_id: "call-1".to_string(),
+                request: None,
+            },
+        )
+    }
+
+    fn permission_granted(seq: i64, id: &str, granted: bool) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::PermissionGranted {
+                permission_id: id.to_string(),
+                granted,
+            },
+        )
+    }
+
+    fn states(
+        translator: &mut AcpLiveEventTranslator,
+        events: Vec<EventEnvelope>,
+    ) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|event| translator.translate_state_update(event))
+            .map(|update| serde_json::to_value(update).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn prompted_run_reports_running_and_idle() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                envelope(
+                    2,
+                    AgentEventKind::PromptReceived {
+                        content: "hi".to_string(),
+                        message_id: Some("m1".to_string()),
+                    },
+                ),
+                run_completed(3, "r1"),
+            ],
+        );
+        assert_eq!(
+            updates,
+            [
+                serde_json::json!({"sessionId": "s-1", "state": "running", "runId": "r1"}),
+                serde_json::json!({
+                    "sessionId": "s-1", "state": "idle", "runId": "r1", "stopReason": "end_turn"
+                }),
+            ]
+        );
+        assert_eq!(translator.current_state_update("s-1"), None);
+    }
+
+    #[test]
+    fn scheduled_run_is_reported() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r-sched", "scheduled"),
+                run_completed(2, "r-sched"),
+            ],
+        );
+        let states: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["running", "idle"]);
+        assert!(updates.iter().all(|u| u["runId"] == "r-sched"));
+    }
+
+    #[test]
+    fn waiting_for_permission() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+                permission_granted(3, "p1", true),
+            ],
+        );
+        let kinds: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["running", "requires_action", "running"]);
+        assert!(updates.iter().all(|u| u["runId"] == "r1"));
+    }
+
+    #[test]
+    fn overlapping_waits_resolve_to_running_once() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+                permission_requested(3, "p2"),
+                permission_granted(4, "p1", false),
+                permission_granted(5, "p2", true),
+            ],
+        );
+        let kinds: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["running", "requires_action", "running"]);
+    }
+
+    #[test]
+    fn short_run_is_not_coalesced() {
+        // Both transitions arrive before anything reads them: the translator
+        // still yields one update per transition, in order.
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![run_started(1, "r1", "interactive"), run_completed(2, "r1")],
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["state"], "running");
+        assert_eq!(updates[1]["state"], "idle");
+    }
+
+    #[test]
+    fn cancelled_and_stopped_runs_map_their_stop_reason() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let cancelled = |run_id: &str, seq| {
+            envelope(
+                seq,
+                AgentEventKind::RunCompleted {
+                    run_id: run_id.to_string(),
+                    outcome: "cancelled".to_string(),
+                    stop_type: None,
+                    reason: None,
+                },
+            )
+        };
+        let updates = states(
+            &mut translator,
+            vec![run_started(1, "r1", "interactive"), cancelled("r1", 2)],
+        );
+        assert_eq!(updates[1]["stopReason"], "cancelled");
+    }
+
+    // ── Run identity on updates ────────────────────────────────────────────
+
+    fn run_id_of(update: &SessionUpdate) -> Option<String> {
+        let meta = match update {
+            SessionUpdate::UserMessageChunk(chunk)
+            | SessionUpdate::AgentMessageChunk(chunk)
+            | SessionUpdate::AgentThoughtChunk(chunk) => chunk.meta.clone(),
+            SessionUpdate::ToolCall(call) => call.meta.clone(),
+            SessionUpdate::ToolCallUpdate(call) => call.meta.clone(),
+            SessionUpdate::CompactionUpdate(update) => match &update.meta {
+                MaybeUndefined::Value(meta) => Some(meta.clone()),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        meta.get("querymt")?
+            .get("runId")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    fn run_events() -> Vec<EventEnvelope> {
+        vec![
+            run_started(1, "r1", "interactive"),
+            envelope(
+                2,
+                AgentEventKind::PromptReceived {
+                    content: "go".to_string(),
+                    message_id: Some("u1".to_string()),
+                },
+            ),
+            envelope(
+                3,
+                AgentEventKind::AssistantContentDelta {
+                    content: "working".to_string(),
+                    message_id: "a1".to_string(),
+                },
+            ),
+            envelope(
+                4,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ),
+            envelope(
+                5,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+            run_completed(6, "r1"),
+        ]
+    }
+
+    #[test]
+    fn live_updates_carry_the_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let mut updates = Vec::new();
+        for event in run_events() {
+            translator.translate_state_update(&event);
+            updates.extend(translator.translate_updates(&event));
+        }
+        // user message, assistant chunk, tool call, tool call update
+        assert_eq!(updates.len(), 4);
+        for update in &updates {
+            assert_eq!(run_id_of(update).as_deref(), Some("r1"), "{update:?}");
+        }
+    }
+
+    #[test]
+    fn live_updates_outside_a_run_carry_no_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let events = run_events();
+        for event in &events {
+            translator.translate_state_update(event);
+            translator.translate_updates(event);
+        }
+        let after = envelope(
+            7,
+            AgentEventKind::PromptReceived {
+                content: "later".to_string(),
+                message_id: Some("u2".to_string()),
+            },
+        );
+        translator.translate_state_update(&after);
+        let updates = translator.translate_updates(&after);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(run_id_of(&updates[0]), None);
+    }
+
+    #[test]
+    fn existing_querymt_meta_keys_survive_the_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_state_update(&run_started(1, "r1", "interactive"));
+        let thought = envelope(
+            2,
+            AgentEventKind::AssistantThinkingDelta {
+                content: "hm".to_string(),
+                message_id: "a1".to_string(),
+                part_id: Some("p1".to_string()),
+            },
+        );
+        let updates = translator.translate_updates(&thought);
+        let SessionUpdate::AgentThoughtChunk(chunk) = &updates[0] else {
+            panic!("expected thought chunk");
+        };
+        let namespace = chunk.meta.as_ref().unwrap().get("querymt").unwrap();
+        assert_eq!(namespace["reasoning_part_id"], "p1");
+        assert_eq!(namespace["runId"], "r1");
+    }
+
+    #[test]
+    fn replay_carries_the_same_run_id() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::RunStarted {
+                    run_id: "r1".to_string(),
+                    origin: "interactive".to_string(),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::PromptReceived {
+                    content: "go".to_string(),
+                    message_id: Some("u1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+            agent_event(
+                5,
+                AgentEventKind::RunCompleted {
+                    run_id: "r1".to_string(),
+                    outcome: "completed".to_string(),
+                    stop_type: None,
+                    reason: None,
+                },
+            ),
+            agent_event(
+                6,
+                AgentEventKind::RunStarted {
+                    run_id: "r2".to_string(),
+                    origin: "interactive".to_string(),
+                },
+            ),
+            agent_event(
+                7,
+                AgentEventKind::PromptReceived {
+                    content: "again".to_string(),
+                    message_id: Some("u2".to_string()),
+                },
+            ),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let ids: Vec<Option<String>> = updates
+            .iter()
+            .filter(|update| {
+                matches!(
+                    update,
+                    SessionUpdate::UserMessageChunk(_)
+                        | SessionUpdate::ToolCall(_)
+                        | SessionUpdate::ToolCallUpdate(_)
+                )
+            })
+            .map(run_id_of)
+            .collect();
+        let expected = |id: &str| Some(id.to_string());
+        assert_eq!(
+            ids,
+            [
+                expected("r1"),
+                expected("r1"),
+                expected("r1"),
+                expected("r2")
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_prompt_joins_the_running_run() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_state_update(&run_started(1, "r1", "interactive"));
+        let steering = envelope(
+            2,
+            AgentEventKind::UserPromptBlock {
+                message_id: "steer-1".to_string(),
+                client_prompt_id: None,
+                block: ContentBlock::Text(TextContent::new("also do x")),
+            },
+        );
+        translator.translate_state_update(&steering);
+        let updates = translator.translate_updates(&steering);
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(updates[0], SessionUpdate::UserMessageChunk(_)));
+        assert_eq!(run_id_of(&updates[0]).as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn current_state_reflects_a_run_in_progress() {
+        let mut translator = AcpLiveEventTranslator::new();
+        states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+            ],
+        );
+        let current = translator.current_state_update("s-1").unwrap();
+        assert_eq!(current.run_id, "r1");
+        assert_eq!(
+            current.state,
+            querymt_agent_protocol_types::session::state_update::SessionRunState::RequiresAction
+        );
+        assert_eq!(translator.current_run_id("s-1"), Some("r1"));
     }
 }

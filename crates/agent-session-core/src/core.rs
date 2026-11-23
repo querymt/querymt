@@ -19,6 +19,10 @@ pub struct SessionCore {
     pub(crate) seen: SeenLive,
     /// History positions of events already applied from a snapshot or page.
     pub(crate) seqs: std::collections::BTreeSet<i64>,
+    /// The agent sent a state update: from then on state updates decide
+    /// whether a run is active, and prompt outcomes and runtime observations
+    /// no longer do.
+    pub(crate) state_updates_seen: bool,
 }
 
 // A client may hydrate on a background thread and move the view to its UI
@@ -41,6 +45,7 @@ impl SessionCore {
             debug: DebugRing::default(),
             seen: SeenLive::default(),
             seqs: std::collections::BTreeSet::new(),
+            state_updates_seen: false,
         }
     }
 
@@ -56,6 +61,8 @@ impl SessionCore {
             self.debug.push(describe(input));
             self.apply_one(index, input, &mut report);
         }
+        // Entities arrive in any order: place cursors against the final view.
+        self.refresh_cursor_placement();
         let changes = self.store.take_changes();
         report.added = changes.added;
         report.updated = changes.updated;
@@ -110,11 +117,22 @@ impl SessionCore {
                 client_prompt_id,
                 message,
             } => self.prompt_failed(client_prompt_id, message),
-            SessionInput::PromptCompleted { stop_reason, .. } => {
-                self.prompt_completed(stop_reason);
+            SessionInput::PromptCompleted {
+                client_prompt_id,
+                message_id,
+                stop_reason,
+                ..
+            } => {
+                self.prompt_completed(
+                    client_prompt_id.as_deref(),
+                    message_id.as_deref(),
+                    stop_reason,
+                );
+            }
+            SessionInput::StateUpdate { notification, .. } => {
+                self.state_update(notification, index, report);
             }
             SessionInput::RuntimeObserved { status } => self.runtime_observed(status),
-            SessionInput::DelegationUpdate { update } => self.delegation_update(update),
             SessionInput::ToolContent {
                 tool_call_id,
                 part,
@@ -177,7 +195,18 @@ fn describe(input: &SessionInput) -> DebugEntry {
         SessionInput::PromptOptimistic {
             client_prompt_id, ..
         } => ("prompt_optimistic", client_prompt_id.clone(), None),
-        SessionInput::PromptCompleted { .. } => ("prompt_completed", String::new(), None),
+        SessionInput::PromptCompleted { message_id, .. } => {
+            ("prompt_completed", String::new(), message_id.clone())
+        }
+        SessionInput::StateUpdate { notification, .. } => (
+            "state_update",
+            notification
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            None,
+        ),
         SessionInput::PromptFailed {
             client_prompt_id, ..
         } => ("prompt_failed", client_prompt_id.clone(), None),
@@ -190,9 +219,6 @@ fn describe(input: &SessionInput) -> DebugEntry {
         }
         SessionInput::ConfigOptions { options } => {
             ("config_options", format!("{} options", options.len()), None)
-        }
-        SessionInput::DelegationUpdate { update } => {
-            ("delegation_update", update.delegation_id.clone(), None)
         }
         SessionInput::ToolContent { tool_call_id, .. } => {
             ("tool_content", tool_call_id.clone(), None)

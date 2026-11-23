@@ -48,9 +48,38 @@ fn chunk_text(chunk: &ContentChunk) -> Option<&str> {
     }
 }
 
+/// The run id an update carries (`_meta.querymt.runId`), on the update kinds
+/// that belong to a run.
+fn run_id_of(update: &SessionUpdate) -> Option<String> {
+    let meta = match update {
+        SessionUpdate::UserMessageChunk(chunk)
+        | SessionUpdate::AgentMessageChunk(chunk)
+        | SessionUpdate::AgentThoughtChunk(chunk) => chunk.meta.as_ref(),
+        SessionUpdate::ToolCall(call) => call.meta.as_ref(),
+        SessionUpdate::ToolCallUpdate(call) => call.meta.as_ref(),
+        SessionUpdate::CompactionUpdate(update) => match &update.meta {
+            MaybeUndefined::Value(meta) => Some(meta),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    meta.get("querymt")?
+        .get("runId")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 impl SessionCore {
-    /// Apply one decoded update to the view.
+    /// Apply one decoded update to the view. The update joins the turn of the
+    /// run it carries, or of the run that is running.
     pub(crate) fn apply_update(&mut self, update: SessionUpdate) {
+        self.store.update_run = run_id_of(&update);
+        self.apply_update_inner(update);
+        self.store.update_run = None;
+    }
+
+    fn apply_update_inner(&mut self, update: SessionUpdate) {
         self.observe_run(&update);
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => self.assistant_chunk(&chunk),
@@ -96,8 +125,18 @@ impl SessionCore {
             SessionUpdate::Plan(plan) => self.set_plan(&plan),
             SessionUpdate::PlanUpdate(update) => self.plan_update(update),
             SessionUpdate::PlanRemoved(removed) => self.plan_removed(&removed),
-            SessionUpdate::ToolCall(call) => self.tool_call(&call),
-            SessionUpdate::ToolCallUpdate(update) => self.tool_call_update(&update),
+            SessionUpdate::ToolCall(call) => {
+                self.tool_call(&call);
+                self.link_session_content(&call.tool_call_id.0, &call.content);
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                self.tool_call_update(&update);
+                if let Some(content) = &update.fields.content {
+                    self.link_session_content(&update.tool_call_id.0, content);
+                }
+            }
+            SessionUpdate::SubagentUpdate(update) => self.subagent_update(&update),
+            SessionUpdate::CursorUpdate(update) => self.cursor_update(&update),
             _ => {}
         }
     }
@@ -195,12 +234,15 @@ impl SessionCore {
         });
     }
 
-    /// A user chunk joins the message with its id; the agent's echo of an
-    /// optimistic prompt (same client prompt id) re-keys that prompt in place.
+    /// A user chunk joins the message with its id. The agent's message for a
+    /// pending prompt (same client prompt id) replaces the pending prompt: the
+    /// pending prompt goes away and the message stands in its run's turn.
     fn user_chunk(&mut self, chunk: &ContentChunk) {
         let message_id = chunk.message_id.as_ref().map(|id| id.0.to_string());
         let prompt_id = querymt_meta(chunk, "client_prompt_id").map(str::to_owned);
         let block = chunk.content.clone();
+        // More content of a message already in the view (the structured
+        // blocks of one prompt share its message id).
         let existing = message_id
             .as_ref()
             .and_then(|id| self.store.idx.user.get(id).copied())
@@ -208,26 +250,22 @@ impl SessionCore {
                 prompt_id
                     .as_ref()
                     .and_then(|id| self.store.idx.prompt.get(id).copied())
+                    .filter(|key| {
+                        matches!(
+                            self.store.kind(*key),
+                            Some(EntryKind::UserMessage(user)) if user.status != PromptStatus::Pending
+                        )
+                    })
             });
         if let Some(key) = existing {
-            let (new_message_id, new_prompt_id) = (message_id.clone(), prompt_id.clone());
+            let new_message_id = message_id.clone();
             self.store.modify(key, |kind| {
                 let EntryKind::UserMessage(message) = kind else {
                     return false;
                 };
-                if message.status == PromptStatus::Pending {
-                    // The echo replaces the optimistic content.
-                    message.blocks = vec![block];
-                    message.status = PromptStatus::Sent;
-                    message.at_ms = None;
-                } else {
-                    message.blocks.push(block);
-                }
+                message.blocks.push(block);
                 if new_message_id.is_some() {
                     message.message_id = new_message_id;
-                }
-                if new_prompt_id.is_some() {
-                    message.client_prompt_id = new_prompt_id;
                 }
                 true
             });
@@ -236,20 +274,23 @@ impl SessionCore {
             }
             return;
         }
-        let hint = match &prompt_id {
-            Some(id) => TurnHint::Prompt(id.clone()),
-            None => TurnHint::Live,
-        };
-        let entry_id = match (&message_id, &prompt_id) {
-            (Some(id), _) => format!("user-{id}"),
-            (None, Some(id)) => format!("user-{id}"),
-            (None, None) => format!("user-live-{}", self.store.next_anon()),
+        if let Some(id) = &prompt_id {
+            self.drop_pending_prompt(id);
+        }
+        let (entry_id, hint) = match &message_id {
+            Some(id) => (format!("user-{id}"), TurnHint::Message(id.clone())),
+            None => (
+                format!("user-live-{}", self.store.next_anon()),
+                TurnHint::Live,
+            ),
         };
         let key = self.store.push(
             entry_id,
             EntryKind::UserMessage(UserMessage {
                 message_id: message_id.clone(),
-                client_prompt_id: prompt_id.clone(),
+                // Only pending and failed prompts carry the client's id; the
+                // agent's message is the same after a reload.
+                client_prompt_id: None,
                 blocks: vec![block],
                 status: PromptStatus::Sent,
                 error: None,
@@ -397,6 +438,14 @@ impl SessionCore {
     /// thinks, and an in-progress tool call is the active tool.
     fn observe_run(&mut self, update: &SessionUpdate) {
         use crate::view::RunState;
+        // With state updates the agent decides whether a run is active;
+        // session updates only refine a run that is.
+        if self.state_updates_seen
+            && (self.header.active_run_id.is_none()
+                || self.header.run_state == RunState::WaitingForUser)
+        {
+            return;
+        }
         match update {
             SessionUpdate::AgentMessageChunk(_) => self.set_run(RunState::Streaming),
             SessionUpdate::AgentThoughtChunk(_) => self.set_run(RunState::Thinking),

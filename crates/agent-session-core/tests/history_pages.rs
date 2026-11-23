@@ -104,7 +104,7 @@ fn overlapping_page_events_are_not_duplicated() {
         None,
         None,
     )]);
-    assert_eq!(core.turn_ids(), vec!["turn-3", "turn-5"]);
+    assert_eq!(core.turn_ids(), vec!["turn-u3", "turn-u5"]);
     let users = core
         .turns(&core.turn_ids())
         .iter()

@@ -6,7 +6,6 @@ use crate::entry::{EntryKind, PromptStatus, UserMessage};
 use crate::input::UndoFrame;
 use crate::store::TurnHint;
 use crate::view::RunState;
-use querymt_agent_protocol_types::delegation_update::DelegationUpdateNotification;
 use querymt_agent_protocol_types::protocol::{ContentBlock, StopReason};
 use querymt_agent_protocol_types::runtime_status::{SessionRuntimePhase, SessionRuntimeStatus};
 use querymt_agent_protocol_types::session::history::ToolContentPart;
@@ -27,12 +26,23 @@ impl SessionCore {
         }
     }
 
-    /// A runtime observation. An idle runtime ends a stale run (the active
-    /// tool is no longer reported; tool entries keep their last status); a
-    /// busy runtime moves an idle view to the matching run state.
+    /// A runtime observation. It decides the run state only while the agent
+    /// sends no state updates; the status itself is always kept.
     pub(crate) fn runtime_observed(&mut self, status: &SessionRuntimeStatus) {
-        let idle = status.phase == SessionRuntimePhase::Idle;
         self.header.runtime = Some(status.clone());
+        if !self.state_updates_seen {
+            self.apply_runtime_phase(status);
+        }
+    }
+
+    /// Take the run state from a runtime status. An idle runtime ends a stale
+    /// run (the active tool is no longer reported; tool entries keep their
+    /// last status); every other known phase is an active run, so an idle view
+    /// moves to the matching run state.
+    pub(crate) fn apply_runtime_phase(&mut self, status: &SessionRuntimeStatus) {
+        let idle = status.phase == SessionRuntimePhase::Idle;
+        self.header.active_run_id = status.active_run_id.clone();
+        self.store.active_run = status.active_run_id.clone();
         if idle {
             if !matches!(
                 self.header.run_state,
@@ -45,10 +55,73 @@ impl SessionCore {
         } else if self.header.run_state == RunState::Idle {
             self.set_run(match status.phase {
                 SessionRuntimePhase::Starting => RunState::Submitting,
-                SessionRuntimePhase::Model => RunState::Thinking,
-                _ => RunState::Idle,
+                SessionRuntimePhase::Waiting => RunState::WaitingForUser,
+                SessionRuntimePhase::Unknown | SessionRuntimePhase::Idle => RunState::Idle,
+                // model, tools, closing, cancel requested
+                _ => RunState::Thinking,
             });
         }
+    }
+
+    /// A `querymt/session/stateUpdate`: whether a run is active, which run,
+    /// whether it waits for the user, and how it ended. Once one arrives the
+    /// agent decides the run state; session updates only refine it.
+    pub(crate) fn state_update(
+        &mut self,
+        notification: &serde_json::Value,
+        index: u32,
+        report: &mut crate::view::ChangeReport,
+    ) {
+        let params = notification.get("params").unwrap_or(notification);
+        let mut reject = |message: String| {
+            report.errors.push(crate::view::InputError {
+                input_index: index,
+                seq: None,
+                message,
+            });
+        };
+        let text = |key: &str| params.get(key).and_then(serde_json::Value::as_str);
+        if let Some(session) = text("sessionId")
+            && session != self.header.session_id
+        {
+            report.ignored += 1;
+            return;
+        }
+        let (Some(state), Some(run_id)) = (text("state"), text("runId")) else {
+            reject("state update has no `state` or `runId`".to_owned());
+            return;
+        };
+        match state {
+            "running" | "requires_action" => {
+                self.header.active_run_id = Some(run_id.to_owned());
+                self.store.active_run = Some(run_id.to_owned());
+                if state == "requires_action" {
+                    self.set_run(RunState::WaitingForUser);
+                } else if !matches!(
+                    self.header.run_state,
+                    RunState::Thinking | RunState::Streaming | RunState::ToolRunning
+                ) {
+                    self.set_run(RunState::Thinking);
+                }
+            }
+            "idle" => {
+                self.header.active_run_id = None;
+                self.store.active_run = None;
+                let stop = text("stopReason").unwrap_or("end_turn").to_owned();
+                let cancelled = stop == "cancelled";
+                self.header.last_stop_reason = Some(stop);
+                self.set_run(if cancelled {
+                    RunState::Cancelled
+                } else {
+                    RunState::Idle
+                });
+            }
+            other => {
+                reject(format!("unknown state `{other}`"));
+                return;
+            }
+        }
+        self.state_updates_seen = true;
     }
 
     /// Accepted and queued inputs are pending (upserted by id); applied,
@@ -90,22 +163,6 @@ impl SessionCore {
                 created_at: 0,
             }),
         }
-    }
-
-    /// Upsert the delegation by id and link its tool call to the child session.
-    pub(crate) fn delegation_update(&mut self, update: &DelegationUpdateNotification) {
-        let delegations = &mut self.header.delegations;
-        match delegations
-            .iter_mut()
-            .find(|d| d.delegation_id == update.delegation_id)
-        {
-            Some(current) => *current = update.clone(),
-            None => delegations.push(update.clone()),
-        }
-        let (Some(tool_id), Some(child)) = (&update.tool_call_id, &update.child_session_id) else {
-            return;
-        };
-        self.link_child_session(tool_id, child);
     }
 
     /// Link a tool call to the child session it spawned.
@@ -169,7 +226,7 @@ impl SessionCore {
             return;
         }
         let key = self.store.push(
-            format!("user-{client_prompt_id}"),
+            format!("user-pending-{client_prompt_id}"),
             EntryKind::UserMessage(UserMessage {
                 message_id: None,
                 client_prompt_id: Some(client_prompt_id.to_owned()),
@@ -178,7 +235,7 @@ impl SessionCore {
                 error: None,
                 at_ms: Some(at_ms),
             }),
-            TurnHint::Prompt(client_prompt_id.to_owned()),
+            TurnHint::Pending(client_prompt_id.to_owned()),
         );
         self.store
             .idx
@@ -205,7 +262,31 @@ impl SessionCore {
     }
 
     /// The `session/prompt` request returned with a stop reason.
-    pub(crate) fn prompt_completed(&mut self, stop_reason: &StopReason) {
+    ///
+    /// The message id the response names links a pending prompt whose echo
+    /// carried no client prompt id: the agent's user message stands for it.
+    /// The stop reason decides the run state only while the agent sends no
+    /// state updates.
+    pub(crate) fn prompt_completed(
+        &mut self,
+        client_prompt_id: Option<&str>,
+        message_id: Option<&str>,
+        stop_reason: &StopReason,
+    ) {
+        if let (Some(prompt), Some(message)) = (client_prompt_id, message_id)
+            && let Some(user) = self.store.idx.user.get(message).copied()
+            && self
+                .store
+                .idx
+                .prompt
+                .get(prompt)
+                .is_some_and(|key| *key != user)
+        {
+            self.drop_pending_prompt(prompt);
+        }
+        if self.state_updates_seen {
+            return;
+        }
         let text = match serde_json::to_value(stop_reason) {
             Ok(serde_json::Value::String(text)) => text,
             _ => String::new(),
@@ -217,5 +298,20 @@ impl SessionCore {
         } else {
             RunState::Idle
         });
+    }
+
+    /// Remove a pending prompt (not a failed one) and its turn.
+    pub(crate) fn drop_pending_prompt(&mut self, client_prompt_id: &str) {
+        let Some(key) = self.store.idx.prompt.get(client_prompt_id).copied() else {
+            return;
+        };
+        let pending = matches!(
+            self.store.kind(key),
+            Some(EntryKind::UserMessage(user)) if user.status == PromptStatus::Pending
+        );
+        if pending {
+            self.store.idx.prompt.remove(client_prompt_id);
+            self.store.remove(key);
+        }
     }
 }

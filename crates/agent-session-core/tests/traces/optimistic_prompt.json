@@ -46,7 +46,7 @@
     "reports": [
       {
         "added": [
-          "turn-c1"
+          "pending-c1"
         ],
         "updated": [],
         "removed": [],
@@ -57,11 +57,13 @@
         "errors": []
       },
       {
-        "added": [],
-        "updated": [
-          "turn-c1"
+        "added": [
+          "turn-u-echo"
         ],
-        "removed": [],
+        "updated": [],
+        "removed": [
+          "pending-c1"
+        ],
         "headerChanged": false,
         "ignored": 0,
         "unknown": 0,
@@ -71,8 +73,9 @@
     ],
     "header": {
       "sessionId": "s1",
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "runState": "submitting",
+      "activeRunId": null,
       "activeToolCallId": null,
       "lastStopReason": null,
       "lastError": null,
@@ -86,7 +89,8 @@
       "plan": null,
       "undoStack": [],
       "pendingInputs": [],
-      "delegations": [],
+      "subagents": [],
+      "cursors": [],
       "runtime": null,
       "history": {
         "hasOlder": false,
@@ -95,21 +99,21 @@
       }
     },
     "turnIds": [
-      "turn-c1"
+      "turn-u-echo"
     ],
     "turns": [
       {
-        "id": "turn-c1",
-        "revision": 2,
+        "id": "turn-u-echo",
+        "revision": 3,
         "entries": [
           {
-            "id": "user-c1",
-            "revision": 2,
+            "id": "user-u-echo",
+            "revision": 3,
             "kind": {
               "type": "user_message",
               "data": {
                 "messageId": "u-echo",
-                "clientPromptId": "c1",
+                "clientPromptId": null,
                 "blocks": [
                   {
                     "type": "text",

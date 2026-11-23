@@ -34,7 +34,7 @@
                           "tool_call_id": "t2-0",
                           "tool_name": "shell",
                           "is_error": false,
-                          "result": "lorem ut do elit tempor elit do tempor sit adipiscing ipsum labore sit dolor sed ut lorem elit ipsum do eiusmod aliqua tempor adipiscing lorem labore amet labore et tempor tempor adipiscing sed elit do consectetur dolore eiusmod labore lorem"
+                          "result": "adipiscing aliqua dolor lorem do elit sed incididunt sit ut amet elit adipiscing adipiscing labore do aliqua elit et sed elit ut consectetur amet tempor tempor elit lorem incididunt eiusmod consectetur incididunt ipsum lorem amet sit ut tempor tempor sit"
                         }
                       }
                     },
@@ -65,7 +65,7 @@
                           "tool_call_id": "t2-1",
                           "tool_name": "shell",
                           "is_error": true,
-                          "result": "amet dolore ut aliqua et elit consectetur tempor dolor tempor do dolore eiusmod et consectetur lorem adipiscing eiusmod dolore tempor incididunt do lorem aliqua ut sit magna ipsum ut lorem incididunt aliqua ut magna labore consectetur et magna ut et"
+                          "result": "ipsum eiusmod lorem dolor ipsum dolore aliqua sit dolor aliqua magna tempor consectetur ipsum eiusmod elit do eiusmod magna sed sed incididunt labore eiusmod sit elit amet dolore eiusmod et adipiscing do labore incididunt dolore et lorem eiusmod eiusmod dolore"
                         }
                       }
                     },
@@ -106,7 +106,7 @@
                       "kind": {
                         "type": "prompt_received",
                         "data": {
-                          "content": "magna amet labore amet tempor labore amet tempor incididunt",
+                          "content": "ipsum consectetur sed do elit consectetur",
                           "message_id": "u3"
                         }
                       }
@@ -134,12 +134,13 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
-                        "type": "steering_applied",
+                        "type": "user_prompt_block",
                         "data": {
-                          "run_id": "r3",
-                          "input_id": "i3",
-                          "boundary": "before_model_request",
-                          "latency_ms": 5
+                          "message_id": "s3",
+                          "block": {
+                            "type": "text",
+                            "text": "aliqua lorem ut"
+                          }
                         }
                       }
                     },
@@ -150,16 +151,10 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
-                        "type": "assistant_message_stored",
+                        "type": "prompt_received",
                         "data": {
-                          "content": "dolore eiusmod do magna incididunt ut ut consectetur amet tempor dolore sit incididunt sed incididunt tempor et amet consectetur ipsum lorem et elit labore et dolore adipiscing eiusmod dolor tempor consectetur ut magna dolor adipiscing consectetur elit lorem lorem eiusmod sit do do elit eiusmod elit sit incididunt consectetur aliqua ipsum amet sed eiusmod eiusmod sed incididunt sed labore et amet labore do dolore sit incididunt elit magna ipsum",
-                          "reasoning_parts": [
-                            {
-                              "id": "a3:summary:0",
-                              "text": "eiusmod dolore dolore adipiscing adipiscing tempor amet do sit"
-                            }
-                          ],
-                          "message_id": "a3"
+                          "content": "aliqua lorem ut",
+                          "message_id": "s3"
                         }
                       }
                     },
@@ -170,11 +165,12 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
-                        "type": "tool_call_start",
+                        "type": "steering_applied",
                         "data": {
-                          "tool_call_id": "t3-0",
-                          "tool_name": "shell",
-                          "arguments": "{\"cmd\":\"ls\"}"
+                          "run_id": "r3",
+                          "input_id": "i3",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
                         }
                       }
                     },
@@ -185,12 +181,16 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
-                        "type": "tool_call_end",
+                        "type": "assistant_message_stored",
                         "data": {
-                          "tool_call_id": "t3-0",
-                          "tool_name": "shell",
-                          "is_error": false,
-                          "result": "lorem dolor ipsum amet adipiscing adipiscing incididunt sit ipsum labore consectetur lorem eiusmod labore et amet sit eiusmod dolor incididunt dolore labore magna do labore dolore incididunt dolore ipsum ipsum lorem do tempor aliqua dolore ut lorem labore tempor amet"
+                          "content": "adipiscing ipsum labore sit dolor sed ut lorem elit ipsum do eiusmod aliqua tempor adipiscing lorem labore amet labore et tempor tempor adipiscing sed elit do",
+                          "reasoning_parts": [
+                            {
+                              "id": "a3:summary:0",
+                              "text": "elit tempor elit do tempor"
+                            }
+                          ],
+                          "message_id": "a3"
                         }
                       }
                     },
@@ -217,7 +217,7 @@
                       "kind": {
                         "type": "compaction_end",
                         "data": {
-                          "summary": "lorem sed elit elit eiusmod dolore ut ut incididunt elit dolore aliqua",
+                          "summary": "dolore eiusmod labore lorem amet dolore ut aliqua et elit consectetur tempor",
                           "summary_len": 12,
                           "compaction_id": "c3",
                           "context_tokens": 200
@@ -261,7 +261,7 @@
                       "kind": {
                         "type": "prompt_received",
                         "data": {
-                          "content": "dolore tempor aliqua aliqua",
+                          "content": "tempor do dolore eiusmod et consectetur lorem",
                           "message_id": "u4"
                         }
                       }
@@ -275,11 +275,11 @@
                       "kind": {
                         "type": "assistant_message_stored",
                         "data": {
-                          "content": "ipsum do dolore labore aliqua ut tempor incididunt lorem sed sit ipsum incididunt tempor ipsum ipsum ipsum consectetur sed sed dolor magna labore",
+                          "content": "ut sit magna ipsum ut lorem incididunt aliqua ut magna labore consectetur et magna ut et sit magna amet labore amet tempor labore amet tempor incididunt magna eiusmod dolore dolore adipiscing adipiscing tempor amet do sit aliqua dolore eiusmod do magna incididunt ut ut consectetur amet tempor dolore sit incididunt sed incididunt tempor et amet consectetur ipsum lorem et elit labore et dolore adipiscing eiusmod dolor tempor consectetur ut magna dolor adipiscing consectetur elit lorem lorem eiusmod",
                           "reasoning_parts": [
                             {
                               "id": "a4:summary:0",
-                              "text": "et elit elit elit sit"
+                              "text": "eiusmod dolore tempor incididunt do lorem"
                             }
                           ],
                           "message_id": "a4"
@@ -293,6 +293,99 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 39,
+                      "session_seq": 39,
+                      "timestamp": 1000039,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p4",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t4-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 40,
+                      "session_seq": 40,
+                      "timestamp": 1000040,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p4",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 41,
+                      "session_seq": 41,
+                      "timestamp": 1000041,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "do do elit eiusmod elit sit incididunt consectetur aliqua ipsum amet sed eiusmod eiusmod sed incididunt sed labore et amet labore do dolore sit incididunt elit magna ipsum consectetur lorem dolor ipsum amet adipiscing adipiscing incididunt sit ipsum labore consectetur"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 42,
+                      "session_seq": 42,
+                      "timestamp": 1000042,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 43,
+                      "session_seq": 43,
+                      "timestamp": 1000043,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "lorem eiusmod labore et amet sit eiusmod dolor incididunt dolore labore magna do labore dolore incididunt dolore ipsum ipsum lorem do tempor aliqua dolore ut lorem labore tempor amet lorem sed elit elit eiusmod dolore ut ut incididunt elit dolore"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 44,
+                      "session_seq": 44,
+                      "timestamp": 1000044,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
                         "type": "run_completed",
                         "data": {
                           "run_id": "r4",
@@ -301,9 +394,51 @@
                       }
                     },
                     {
-                      "seq": 39,
-                      "session_seq": 39,
-                      "timestamp": 1000039,
+                      "seq": 45,
+                      "session_seq": 45,
+                      "timestamp": 1000045,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "sched4",
+                          "origin": "scheduled:s1:t4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 46,
+                      "session_seq": 46,
+                      "timestamp": 1000046,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "tempor dolore tempor aliqua aliqua do et elit elit elit sit sit ipsum do dolore",
+                          "message_id": "sa4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 47,
+                      "session_seq": 47,
+                      "timestamp": 1000047,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "sched4",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 48,
+                      "session_seq": 48,
+                      "timestamp": 1000048,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -315,23 +450,23 @@
                       }
                     },
                     {
-                      "seq": 40,
-                      "session_seq": 40,
-                      "timestamp": 1000040,
+                      "seq": 49,
+                      "session_seq": 49,
+                      "timestamp": 1000049,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
                         "type": "prompt_received",
                         "data": {
-                          "content": "adipiscing et lorem dolor elit amet",
+                          "content": "aliqua ut tempor incididunt lorem sed sit",
                           "message_id": "u5"
                         }
                       }
                     },
                     {
-                      "seq": 41,
-                      "session_seq": 41,
-                      "timestamp": 1000041,
+                      "seq": 50,
+                      "session_seq": 50,
+                      "timestamp": 1000050,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -345,9 +480,40 @@
                       }
                     },
                     {
-                      "seq": 42,
-                      "session_seq": 42,
-                      "timestamp": 1000042,
+                      "seq": 51,
+                      "session_seq": 51,
+                      "timestamp": 1000051,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s5",
+                          "block": {
+                            "type": "text",
+                            "text": "ipsum incididunt tempor"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 52,
+                      "session_seq": 52,
+                      "timestamp": 1000052,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "ipsum incididunt tempor",
+                          "message_id": "s5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 53,
+                      "session_seq": 53,
+                      "timestamp": 1000053,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -361,19 +527,19 @@
                       }
                     },
                     {
-                      "seq": 43,
-                      "session_seq": 43,
-                      "timestamp": 1000043,
+                      "seq": 54,
+                      "session_seq": 54,
+                      "timestamp": 1000054,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
                         "type": "assistant_message_stored",
                         "data": {
-                          "content": "adipiscing dolore sed dolore tempor et amet et incididunt labore dolore lorem sit consectetur et dolore dolore do adipiscing eiusmod dolor sed et tempor lorem ipsum adipiscing sit ipsum consectetur lorem eiusmod adipiscing amet ut labore sit ut sed ipsum magna et ipsum adipiscing labore dolore amet aliqua ut tempor consectetur incididunt tempor eiusmod aliqua dolore sed eiusmod do adipiscing dolor aliqua aliqua labore adipiscing sit elit amet amet ipsum sit dolore lorem labore",
+                          "content": "labore consectetur dolor adipiscing et lorem dolor elit amet aliqua amet incididunt eiusmod magna lorem adipiscing dolore sed dolore tempor et amet et incididunt labore dolore lorem sit consectetur et dolore dolore do adipiscing eiusmod dolor sed et tempor lorem ipsum adipiscing sit",
                           "reasoning_parts": [
                             {
                               "id": "a5:summary:0",
-                              "text": "amet incididunt eiusmod magna"
+                              "text": "ipsum ipsum consectetur sed sed dolor"
                             }
                           ],
                           "message_id": "a5"
@@ -381,9 +547,9 @@
                       }
                     },
                     {
-                      "seq": 44,
-                      "session_seq": 44,
-                      "timestamp": 1000044,
+                      "seq": 55,
+                      "session_seq": 55,
+                      "timestamp": 1000055,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -396,9 +562,9 @@
                       }
                     },
                     {
-                      "seq": 45,
-                      "session_seq": 45,
-                      "timestamp": 1000045,
+                      "seq": 56,
+                      "session_seq": 56,
+                      "timestamp": 1000056,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -412,71 +578,9 @@
                       }
                     },
                     {
-                      "seq": 46,
-                      "session_seq": 46,
-                      "timestamp": 1000046,
-                      "session_id": "s1",
-                      "origin": "local",
-                      "kind": {
-                        "type": "tool_call_start",
-                        "data": {
-                          "tool_call_id": "t5-0",
-                          "tool_name": "shell",
-                          "arguments": "{\"cmd\":\"ls\"}"
-                        }
-                      }
-                    },
-                    {
-                      "seq": 47,
-                      "session_seq": 47,
-                      "timestamp": 1000047,
-                      "session_id": "s1",
-                      "origin": "local",
-                      "kind": {
-                        "type": "tool_call_end",
-                        "data": {
-                          "tool_call_id": "t5-0",
-                          "tool_name": "shell",
-                          "is_error": false,
-                          "result": "ut dolor elit lorem et do elit tempor et ut sit magna eiusmod dolor lorem labore ipsum incididunt do incididunt incididunt amet adipiscing consectetur aliqua eiusmod dolore consectetur consectetur dolor labore dolor dolor sit sit elit aliqua incididunt elit consectetur"
-                        }
-                      }
-                    },
-                    {
-                      "seq": 48,
-                      "session_seq": 48,
-                      "timestamp": 1000048,
-                      "session_id": "s1",
-                      "origin": "local",
-                      "kind": {
-                        "type": "tool_call_start",
-                        "data": {
-                          "tool_call_id": "t5-1",
-                          "tool_name": "shell",
-                          "arguments": "{\"cmd\":\"ls\"}"
-                        }
-                      }
-                    },
-                    {
-                      "seq": 49,
-                      "session_seq": 49,
-                      "timestamp": 1000049,
-                      "session_id": "s1",
-                      "origin": "local",
-                      "kind": {
-                        "type": "tool_call_end",
-                        "data": {
-                          "tool_call_id": "t5-1",
-                          "tool_name": "shell",
-                          "is_error": true,
-                          "result": "dolor eiusmod eiusmod magna elit sit adipiscing amet do ut et tempor lorem lorem amet eiusmod consectetur magna incididunt lorem consectetur et adipiscing sed elit tempor do incididunt ut magna elit et incididunt ipsum incididunt ut elit magna eiusmod labore"
-                        }
-                      }
-                    },
-                    {
-                      "seq": 50,
-                      "session_seq": 50,
-                      "timestamp": 1000050,
+                      "seq": 57,
+                      "session_seq": 57,
+                      "timestamp": 1000057,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -516,7 +620,7 @@
                   },
                   "cycle": null
                 },
-                "delegationUpdates": [],
+                "subagentUpdates": [],
                 "history": {
                   "complete": false,
                   "before": "tok-1"
@@ -603,12 +707,13 @@
                 "session_id": "s1",
                 "origin": "local",
                 "kind": {
-                  "type": "tool_call_end",
+                  "type": "permission_requested",
                   "data": {
-                    "tool_call_id": "t0-0",
+                    "permission_id": "p0",
+                    "task_id": null,
                     "tool_name": "shell",
-                    "is_error": false,
-                    "result": "amet ut sed aliqua dolore ipsum elit consectetur lorem dolore magna dolor et ut sit adipiscing lorem magna ut eiusmod ipsum adipiscing do lorem tempor ut dolor sit aliqua incididunt amet do adipiscing ipsum et aliqua dolor magna sed magna"
+                    "reason": "needs approval",
+                    "tool_call_id": "t0-0"
                   }
                 }
               },
@@ -619,10 +724,10 @@
                 "session_id": "s1",
                 "origin": "local",
                 "kind": {
-                  "type": "run_completed",
+                  "type": "permission_granted",
                   "data": {
-                    "run_id": "r0",
-                    "outcome": "completed"
+                    "permission_id": "p0",
+                    "granted": true
                   }
                 }
               },
@@ -633,10 +738,12 @@
                 "session_id": "s1",
                 "origin": "local",
                 "kind": {
-                  "type": "run_started",
+                  "type": "tool_call_end",
                   "data": {
-                    "run_id": "r1",
-                    "origin": "interactive"
+                    "tool_call_id": "t0-0",
+                    "tool_name": "shell",
+                    "is_error": false,
+                    "result": "amet ut sed aliqua dolore ipsum elit consectetur lorem dolore magna dolor et ut sit adipiscing lorem magna ut eiusmod ipsum adipiscing do lorem tempor ut dolor sit aliqua incididunt amet do adipiscing ipsum et aliqua dolor magna sed magna"
                   }
                 }
               },
@@ -647,10 +754,10 @@
                 "session_id": "s1",
                 "origin": "local",
                 "kind": {
-                  "type": "prompt_received",
+                  "type": "run_completed",
                   "data": {
-                    "content": "eiusmod incididunt sed ut aliqua labore consectetur ipsum lorem",
-                    "message_id": "u1"
+                    "run_id": "r0",
+                    "outcome": "completed"
                   }
                 }
               }
@@ -669,10 +776,10 @@
       {
         "added": [
           "turn-21",
-          "turn-26",
-          "turn-32",
-          "turn-36",
-          "turn-40"
+          "run-r3",
+          "run-r4",
+          "run-sched4",
+          "run-r5"
         ],
         "updated": [],
         "removed": [],
@@ -684,8 +791,7 @@
       },
       {
         "added": [
-          "turn-2",
-          "turn-8"
+          "run-r0"
         ],
         "updated": [],
         "removed": [],
@@ -698,8 +804,9 @@
     ],
     "header": {
       "sessionId": "s1",
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "runState": "idle",
+      "activeRunId": null,
       "activeToolCallId": null,
       "lastStopReason": null,
       "lastError": null,
@@ -727,7 +834,8 @@
       },
       "undoStack": [],
       "pendingInputs": [],
-      "delegations": [],
+      "subagents": [],
+      "cursors": [],
       "runtime": {
         "phase": "idle",
         "active_run_id": null,
@@ -747,22 +855,21 @@
       }
     },
     "turnIds": [
-      "turn-2",
-      "turn-8",
+      "run-r0",
       "turn-21",
-      "turn-26",
-      "turn-32",
-      "turn-36",
-      "turn-40"
+      "run-r3",
+      "run-r4",
+      "run-sched4",
+      "run-r5"
     ],
     "turns": [
       {
-        "id": "turn-2",
-        "revision": 26,
+        "id": "run-r0",
+        "revision": 27,
         "entries": [
           {
             "id": "user-u0",
-            "revision": 22,
+            "revision": 23,
             "kind": {
               "type": "user_message",
               "data": {
@@ -782,7 +889,7 @@
           },
           {
             "id": "reasoning-a0-a0:summary:0",
-            "revision": 23,
+            "revision": 24,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -794,7 +901,7 @@
           },
           {
             "id": "assistant-a0",
-            "revision": 24,
+            "revision": 25,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -805,7 +912,7 @@
           },
           {
             "id": "tool-t0-0",
-            "revision": 26,
+            "revision": 27,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -835,32 +942,6 @@
         ]
       },
       {
-        "id": "turn-8",
-        "revision": 27,
-        "entries": [
-          {
-            "id": "user-u1",
-            "revision": 27,
-            "kind": {
-              "type": "user_message",
-              "data": {
-                "messageId": "u1",
-                "clientPromptId": null,
-                "blocks": [
-                  {
-                    "type": "text",
-                    "text": "eiusmod incididunt sed ut aliqua labore consectetur ipsum lorem"
-                  }
-                ],
-                "status": "sent",
-                "error": null,
-                "atMs": null
-              }
-            }
-          }
-        ]
-      },
-      {
         "id": "turn-21",
         "revision": 4,
         "entries": [
@@ -881,7 +962,7 @@
                     "type": "content",
                     "content": {
                       "type": "text",
-                      "text": "lorem ut do elit tempor elit do tempor sit adipiscing ipsum labore sit dolor sed ut lorem elit ipsum do eiusmod aliqua tempor adipiscing lorem labore amet labore et tempor tempor adipiscing sed elit do consectetur dolore eiusmod labore lorem"
+                      "text": "adipiscing aliqua dolor lorem do elit sed incididunt sit ut amet elit adipiscing adipiscing labore do aliqua elit et sed elit ut consectetur amet tempor tempor elit lorem incididunt eiusmod consectetur incididunt ipsum lorem amet sit ut tempor tempor sit"
                     }
                   }
                 ],
@@ -910,7 +991,7 @@
                     "type": "content",
                     "content": {
                       "type": "text",
-                      "text": "amet dolore ut aliqua et elit consectetur tempor dolor tempor do dolore eiusmod et consectetur lorem adipiscing eiusmod dolore tempor incididunt do lorem aliqua ut sit magna ipsum ut lorem incididunt aliqua ut magna labore consectetur et magna ut et"
+                      "text": "ipsum eiusmod lorem dolor ipsum dolore aliqua sit dolor aliqua magna tempor consectetur ipsum eiusmod elit do eiusmod magna sed sed incididunt labore eiusmod sit elit amet dolore eiusmod et adipiscing do labore incididunt dolore et lorem eiusmod eiusmod dolore"
                     }
                   }
                 ],
@@ -923,8 +1004,8 @@
         ]
       },
       {
-        "id": "turn-26",
-        "revision": 9,
+        "id": "run-r3",
+        "revision": 10,
         "entries": [
           {
             "id": "user-u3",
@@ -937,7 +1018,27 @@
                 "blocks": [
                   {
                     "type": "text",
-                    "text": "magna amet labore amet tempor labore amet tempor incididunt"
+                    "text": "ipsum consectetur sed do elit consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s3",
+            "revision": 6,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s3",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "aliqua lorem ut"
                   }
                 ],
                 "status": "sent",
@@ -948,65 +1049,30 @@
           },
           {
             "id": "reasoning-a3-a3:summary:0",
-            "revision": 6,
+            "revision": 7,
             "kind": {
               "type": "reasoning",
               "data": {
                 "messageId": "a3",
                 "partId": "a3:summary:0",
-                "text": "eiusmod dolore dolore adipiscing adipiscing tempor amet do sit"
+                "text": "elit tempor elit do tempor"
               }
             }
           },
           {
             "id": "assistant-a3",
-            "revision": 7,
+            "revision": 8,
             "kind": {
               "type": "assistant_message",
               "data": {
                 "messageId": "a3",
-                "text": "dolore eiusmod do magna incididunt ut ut consectetur amet tempor dolore sit incididunt sed incididunt tempor et amet consectetur ipsum lorem et elit labore et dolore adipiscing eiusmod dolor tempor consectetur ut magna dolor adipiscing consectetur elit lorem lorem eiusmod sit do do elit eiusmod elit sit incididunt consectetur aliqua ipsum amet sed eiusmod eiusmod sed incididunt sed labore et amet labore do dolore sit incididunt elit magna ipsum"
+                "text": "adipiscing ipsum labore sit dolor sed ut lorem elit ipsum do eiusmod aliqua tempor adipiscing lorem labore amet labore et tempor tempor adipiscing sed elit do"
               }
             }
           },
           {
-            "id": "tool-t3-0",
-            "revision": 9,
-            "kind": {
-              "type": "tool_call",
-              "data": {
-                "toolCallId": "t3-0",
-                "title": "Run shell",
-                "kind": "execute",
-                "status": "completed",
-                "rawInput": {
-                  "cmd": "ls"
-                },
-                "rawOutput": null,
-                "content": [
-                  {
-                    "type": "content",
-                    "content": {
-                      "type": "text",
-                      "text": "lorem dolor ipsum amet adipiscing adipiscing incididunt sit ipsum labore consectetur lorem eiusmod labore et amet sit eiusmod dolor incididunt dolore labore magna do labore dolore incididunt dolore ipsum ipsum lorem do tempor aliqua dolore ut lorem labore tempor amet"
-                    }
-                  }
-                ],
-                "resultFullBytes": null,
-                "argumentsFullBytes": null,
-                "childSessionId": null
-              }
-            }
-          }
-        ]
-      },
-      {
-        "id": "turn-32",
-        "revision": 11,
-        "entries": [
-          {
             "id": "compaction-c3",
-            "revision": 11,
+            "revision": 10,
             "kind": {
               "type": "compaction",
               "data": {
@@ -1016,7 +1082,7 @@
                 "summary": [
                   {
                     "type": "text",
-                    "text": "lorem sed elit elit eiusmod dolore ut ut incididunt elit dolore aliqua"
+                    "text": "dolore eiusmod labore lorem amet dolore ut aliqua et elit consectetur tempor"
                   }
                 ],
                 "error": null,
@@ -1027,12 +1093,12 @@
         ]
       },
       {
-        "id": "turn-36",
-        "revision": 14,
+        "id": "run-r4",
+        "revision": 17,
         "entries": [
           {
             "id": "user-u4",
-            "revision": 12,
+            "revision": 11,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1041,7 +1107,7 @@
                 "blocks": [
                   {
                     "type": "text",
-                    "text": "dolore tempor aliqua aliqua"
+                    "text": "tempor do dolore eiusmod et consectetur lorem"
                   }
                 ],
                 "status": "sent",
@@ -1052,83 +1118,34 @@
           },
           {
             "id": "reasoning-a4-a4:summary:0",
-            "revision": 13,
+            "revision": 12,
             "kind": {
               "type": "reasoning",
               "data": {
                 "messageId": "a4",
                 "partId": "a4:summary:0",
-                "text": "et elit elit elit sit"
+                "text": "eiusmod dolore tempor incididunt do lorem"
               }
             }
           },
           {
             "id": "assistant-a4",
-            "revision": 14,
+            "revision": 13,
             "kind": {
               "type": "assistant_message",
               "data": {
                 "messageId": "a4",
-                "text": "ipsum do dolore labore aliqua ut tempor incididunt lorem sed sit ipsum incididunt tempor ipsum ipsum ipsum consectetur sed sed dolor magna labore"
+                "text": "ut sit magna ipsum ut lorem incididunt aliqua ut magna labore consectetur et magna ut et sit magna amet labore amet tempor labore amet tempor incididunt magna eiusmod dolore dolore adipiscing adipiscing tempor amet do sit aliqua dolore eiusmod do magna incididunt ut ut consectetur amet tempor dolore sit incididunt sed incididunt tempor et amet consectetur ipsum lorem et elit labore et dolore adipiscing eiusmod dolor tempor consectetur ut magna dolor adipiscing consectetur elit lorem lorem eiusmod"
               }
             }
-          }
-        ]
-      },
-      {
-        "id": "turn-40",
-        "revision": 21,
-        "entries": [
+          },
           {
-            "id": "user-u5",
+            "id": "tool-t4-0",
             "revision": 15,
-            "kind": {
-              "type": "user_message",
-              "data": {
-                "messageId": "u5",
-                "clientPromptId": null,
-                "blocks": [
-                  {
-                    "type": "text",
-                    "text": "adipiscing et lorem dolor elit amet"
-                  }
-                ],
-                "status": "sent",
-                "error": null,
-                "atMs": null
-              }
-            }
-          },
-          {
-            "id": "reasoning-a5-a5:summary:0",
-            "revision": 16,
-            "kind": {
-              "type": "reasoning",
-              "data": {
-                "messageId": "a5",
-                "partId": "a5:summary:0",
-                "text": "amet incididunt eiusmod magna"
-              }
-            }
-          },
-          {
-            "id": "assistant-a5",
-            "revision": 17,
-            "kind": {
-              "type": "assistant_message",
-              "data": {
-                "messageId": "a5",
-                "text": "adipiscing dolore sed dolore tempor et amet et incididunt labore dolore lorem sit consectetur et dolore dolore do adipiscing eiusmod dolor sed et tempor lorem ipsum adipiscing sit ipsum consectetur lorem eiusmod adipiscing amet ut labore sit ut sed ipsum magna et ipsum adipiscing labore dolore amet aliqua ut tempor consectetur incididunt tempor eiusmod aliqua dolore sed eiusmod do adipiscing dolor aliqua aliqua labore adipiscing sit elit amet amet ipsum sit dolore lorem labore"
-              }
-            }
-          },
-          {
-            "id": "tool-t5-0",
-            "revision": 19,
             "kind": {
               "type": "tool_call",
               "data": {
-                "toolCallId": "t5-0",
+                "toolCallId": "t4-0",
                 "title": "Run shell",
                 "kind": "execute",
                 "status": "completed",
@@ -1141,7 +1158,7 @@
                     "type": "content",
                     "content": {
                       "type": "text",
-                      "text": "ut dolor elit lorem et do elit tempor et ut sit magna eiusmod dolor lorem labore ipsum incididunt do incididunt incididunt amet adipiscing consectetur aliqua eiusmod dolore consectetur consectetur dolor labore dolor dolor sit sit elit aliqua incididunt elit consectetur"
+                      "text": "do do elit eiusmod elit sit incididunt consectetur aliqua ipsum amet sed eiusmod eiusmod sed incididunt sed labore et amet labore do dolore sit incididunt elit magna ipsum consectetur lorem dolor ipsum amet adipiscing adipiscing incididunt sit ipsum labore consectetur"
                     }
                   }
                 ],
@@ -1152,12 +1169,12 @@
             }
           },
           {
-            "id": "tool-t5-1",
-            "revision": 21,
+            "id": "tool-t4-1",
+            "revision": 17,
             "kind": {
               "type": "tool_call",
               "data": {
-                "toolCallId": "t5-1",
+                "toolCallId": "t4-1",
                 "title": "Run shell",
                 "kind": "execute",
                 "status": "failed",
@@ -1170,13 +1187,99 @@
                     "type": "content",
                     "content": {
                       "type": "text",
-                      "text": "dolor eiusmod eiusmod magna elit sit adipiscing amet do ut et tempor lorem lorem amet eiusmod consectetur magna incididunt lorem consectetur et adipiscing sed elit tempor do incididunt ut magna elit et incididunt ipsum incididunt ut elit magna eiusmod labore"
+                      "text": "lorem eiusmod labore et amet sit eiusmod dolor incididunt dolore labore magna do labore dolore incididunt dolore ipsum ipsum lorem do tempor aliqua dolore ut lorem labore tempor amet lorem sed elit elit eiusmod dolore ut ut incididunt elit dolore"
                     }
                   }
                 ],
                 "resultFullBytes": null,
                 "argumentsFullBytes": null,
                 "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-sched4",
+        "revision": 18,
+        "entries": [
+          {
+            "id": "assistant-sa4",
+            "revision": 18,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "sa4",
+                "text": "tempor dolore tempor aliqua aliqua do et elit elit elit sit sit ipsum do dolore"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r5",
+        "revision": 22,
+        "entries": [
+          {
+            "id": "user-u5",
+            "revision": 19,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "aliqua ut tempor incididunt lorem sed sit"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s5",
+            "revision": 20,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "ipsum incididunt tempor"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a5-a5:summary:0",
+            "revision": 21,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a5",
+                "partId": "a5:summary:0",
+                "text": "ipsum ipsum consectetur sed sed dolor"
+              }
+            }
+          },
+          {
+            "id": "assistant-a5",
+            "revision": 22,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a5",
+                "text": "labore consectetur dolor adipiscing et lorem dolor elit amet aliqua amet incididunt eiusmod magna lorem adipiscing dolore sed dolore tempor et amet et incididunt labore dolore lorem sit consectetur et dolore dolore do adipiscing eiusmod dolor sed et tempor lorem ipsum adipiscing sit"
               }
             }
           }

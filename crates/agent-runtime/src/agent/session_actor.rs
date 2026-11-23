@@ -1044,8 +1044,8 @@ impl SessionActor {
                         // its connection has delivered every update of this
                         // prompt.
                         let tip = event_stream.resolved_tip().await;
-                        let result =
-                            run.map(|run| crate::acp::delivery::with_event_tip(run.response, tip));
+                        let result = run
+                            .map(|run| crate::acp::delivery::with_event_tip(run.into_reply(), tip));
                         let _ = reply.send(result);
                         let _ = actor_ref.tell(finished).await;
                     }
@@ -1077,7 +1077,7 @@ impl SessionActor {
                                 error
                             );
                         }
-                        let _ = reply.send(run.map(|run| run.response));
+                        let _ = reply.send(run.map(PromptRun::into_reply));
                     }
                 }
             }
@@ -3738,6 +3738,9 @@ async fn validate_execution_task(
 struct PromptRun {
     response: PromptResponse,
     stop: Option<(querymt_agent_core::events::StopType, String)>,
+    /// Id of the user message the prompt inserted; `None` when the run did
+    /// not insert one (a slash command).
+    message_id: Option<String>,
 }
 
 impl PromptRun {
@@ -3745,6 +3748,21 @@ impl PromptRun {
         Self {
             response,
             stop: None,
+            message_id: None,
+        }
+    }
+
+    fn with_message_id(mut self, message_id: &str) -> Self {
+        self.message_id = Some(message_id.to_owned());
+        self
+    }
+
+    /// The reply the client receives: the ACP response with the inserted
+    /// message id in `_meta.querymt.messageId`.
+    fn into_reply(self) -> PromptResponse {
+        match self.message_id {
+            Some(message_id) => crate::acp::delivery::with_message_id(self.response, &message_id),
+            None => self.response,
         }
     }
 }
@@ -4221,6 +4239,7 @@ async fn execute_prompt_inner(
                         querymt_agent_core::events::StopType::PriceLimit,
                     )),
                     stop: Some((querymt_agent_core::events::StopType::PriceLimit, message)),
+                    message_id: None,
                 })
             }
             Ok(crate::agent::execution::CompactionOutcome::NothingToCompact) => {
@@ -4453,9 +4472,10 @@ async fn execute_prompt_inner(
         {
             Ok(Some(model)) => model,
             Ok(None) => {
-                return Ok(PromptRun::finished(PromptResponse::new(
-                    StopReason::Cancelled,
-                )));
+                return Ok(
+                    PromptRun::finished(PromptResponse::new(StopReason::Cancelled))
+                        .with_message_id(&message_id),
+                );
             }
             Err(error) => {
                 let message = error.to_string();
@@ -4660,10 +4680,12 @@ async fn execute_prompt_inner(
     match result {
         Ok(CycleOutcome::Completed) => Ok(PromptRun::finished(PromptResponse::new(
             StopReason::EndTurn,
-        ))),
+        ))
+        .with_message_id(&message_id)),
         Ok(CycleOutcome::Cancelled) => Ok(PromptRun::finished(PromptResponse::new(
             StopReason::Cancelled,
-        ))),
+        ))
+        .with_message_id(&message_id)),
         Ok(CycleOutcome::Stopped {
             stop_reason,
             stop_type,
@@ -4671,6 +4693,7 @@ async fn execute_prompt_inner(
         }) => Ok(PromptRun {
             response: PromptResponse::new(stop_reason),
             stop: Some((stop_type, reason)),
+            message_id: Some(message_id.clone()),
         }),
         Err(e) => {
             let message = e.to_string();
@@ -8047,6 +8070,7 @@ mod tests {
                 querymt_agent_core::events::StopType::ModelTokenLimit,
                 "cut off".into(),
             )),
+            message_id: None,
         });
         assert_eq!(
             run_disposition(false, &stopped),

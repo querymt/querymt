@@ -1540,3 +1540,90 @@ async fn a_panicking_scheduled_run_emits_scheduled_failed() {
     assert!(error.contains("run panicked"), "{error}");
     assert_eq!(run_outcomes(&mut events, &run.session, 1).await, ["failed"]);
 }
+
+// ---- prompt response identity ----
+
+/// The `_meta.querymt.messageId` of a prompt response.
+fn response_message_id(response: &crate::acp::protocol::PromptResponse) -> Option<String> {
+    response
+        .meta
+        .as_ref()?
+        .get("querymt")?
+        .get("messageId")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn response_matches_the_echo() {
+    use querymt_agent_core::events::AgentEventKind;
+
+    let run = Run::new(ScriptedProvider::new(false, |_| done(10)), Setup::default()).await;
+    let mut events = run.fixture.handle.config.subscribe_events();
+    let response = run
+        .fixture
+        .prompt_to_completion(&run.session, "hello")
+        .await
+        .expect("run completes");
+
+    let message_id = response_message_id(&response).expect("the response names the message");
+    let mut echoed = Vec::new();
+    while let Ok(envelope) = events.try_recv() {
+        if envelope.session_id() != run.session {
+            continue;
+        }
+        if let AgentEventKind::UserPromptBlock { message_id, .. } = envelope.kind() {
+            echoed.push(message_id.clone());
+        }
+    }
+    assert!(!echoed.is_empty(), "the prompt is echoed as user chunks");
+    assert!(echoed.iter().all(|id| *id == message_id), "{echoed:?}");
+}
+
+#[tokio::test]
+async fn replay_keeps_the_id() {
+    use crate::acp::protocol::SessionUpdate;
+    use querymt_agent_core::events::{AgentEvent, AgentEventKind};
+
+    let run = Run::new(ScriptedProvider::new(false, |_| done(10)), Setup::default()).await;
+    let response = run
+        .fixture
+        .prompt_to_completion(&run.session, "hello")
+        .await
+        .expect("run completes");
+    let message_id = response_message_id(&response).expect("the response names the message");
+
+    let durable = run
+        .fixture
+        .storage
+        .event_journal()
+        .load_session_stream(&run.session, None, None)
+        .await
+        .expect("durable events");
+    let stored: Vec<&String> = durable
+        .iter()
+        .filter_map(|event| match &event.kind {
+            AgentEventKind::PromptReceived {
+                message_id: Some(id),
+                ..
+            } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored, [&message_id], "the journal keeps the id");
+
+    let replay = crate::acp::shared::replay_agent_events_to_session_notifications(
+        &run.session,
+        durable.into_iter().map(AgentEvent::from),
+    );
+    let replayed: Vec<String> = replay
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::UserMessageChunk(chunk) => {
+                chunk.message_id.as_ref().map(|id| id.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, [message_id]);
+}

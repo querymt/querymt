@@ -1,7 +1,6 @@
 //! Session header (everything except the turns) and change reports.
 
 use crate::input::UndoFrame;
-use querymt_agent_protocol_types::delegation_update::DelegationUpdateNotification;
 use querymt_agent_protocol_types::protocol::PlanEntry;
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::{
@@ -22,6 +21,8 @@ pub enum RunState {
     Thinking,
     Streaming,
     ToolRunning,
+    /// The run waits for the user (a permission or a question).
+    WaitingForUser,
     Cancelled,
     Failed,
 }
@@ -83,6 +84,62 @@ pub struct PlanView {
     pub markdown: Option<String>,
 }
 
+/// A child session of this session (a subagent), as `subagent_update`
+/// patches describe it. The tool call that spawned it carries the link
+/// (`child_session_id` on its entry).
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentView {
+    /// The child's session id; the key of this list.
+    pub session_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// The child's foreground state as the agent reported it: `running`,
+    /// `idle`, `requires_action`, `unknown` or an implementation-specific value.
+    pub state: Option<String>,
+    /// `_meta.querymt.stage` of the update that last set the state.
+    pub stage: Option<String>,
+    /// What the client may do with the child, as received.
+    #[typeshare(serialized_as = "any")]
+    pub capabilities: Option<serde_json::Value>,
+    pub cwd: Option<String>,
+    pub additional_directories: Option<Vec<String>>,
+    /// `_meta` of the update, as received.
+    #[typeshare(serialized_as = "any")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Where a cursor sits in the view: next to an entry.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorPlacement {
+    /// The entry the cursor is anchored to.
+    pub entry_id: String,
+    /// `before` or `after` that entry.
+    pub position: String,
+}
+
+/// A session cursor the agent announced. The id is the agent's and opaque;
+/// the first anchor is kept for the life of the cursor.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorView {
+    pub cursor_id: String,
+    /// The anchor as received (ACP `CursorAnchor`).
+    #[typeshare(serialized_as = "any")]
+    pub anchor: serde_json::Value,
+    /// The methods that accept the cursor (ACP `CursorCapabilities`), as received.
+    #[typeshare(serialized_as = "any")]
+    pub capabilities: Option<serde_json::Value>,
+    #[typeshare(serialized_as = "any")]
+    pub meta: Option<serde_json::Value>,
+    /// Where the anchored entity is in the view; `None` while it is not (unplaced).
+    pub placement: Option<CursorPlacement>,
+}
+
 /// The session header: all whole-session state.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -91,6 +148,8 @@ pub struct SessionHeader {
     pub session_id: String,
     pub schema_version: u32,
     pub run_state: RunState,
+    /// The id of the run that is running, when there is one.
+    pub active_run_id: Option<String>,
     pub active_tool_call_id: Option<String>,
     #[typeshare(serialized_as = "Option<string>")]
     pub last_stop_reason: Option<String>,
@@ -107,7 +166,10 @@ pub struct SessionHeader {
     pub plan: Option<PlanView>,
     pub undo_stack: Vec<UndoFrame>,
     pub pending_inputs: Vec<PendingInputSummary>,
-    pub delegations: Vec<DelegationUpdateNotification>,
+    /// Child sessions in the order they first appeared, merged by session id.
+    pub subagents: Vec<SubagentView>,
+    /// Session cursors in the order they were announced, keyed by cursor id.
+    pub cursors: Vec<CursorView>,
     pub runtime: Option<SessionRuntimeStatus>,
     pub history: HistoryPaging,
 }

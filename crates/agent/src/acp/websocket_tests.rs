@@ -3316,8 +3316,14 @@ async fn prompt_response_waits_for_updates_and_is_released_on_connection_close()
     assert_eq!(message["id"], serde_json::json!(7));
     assert!(message.get("error").is_none() || message["error"].is_null());
     assert!(
-        message["result"].get("_meta").is_none(),
+        message["result"]["_meta"]["querymt"]
+            .get("eventTip")
+            .is_none(),
         "the internal event tip never reaches the client: {message}"
+    );
+    assert!(
+        message["result"]["_meta"]["querymt"]["messageId"].is_string(),
+        "the response names the inserted message: {message}"
     );
     task.await.unwrap();
 }

@@ -90,6 +90,6 @@ fn snapshot_response(events: &[Value]) -> Value {
             "completeTotalUsd": 0.0, "complete": true, "billing": "empty", "reasons": [],
             "pricedAttempts": 0, "excludedAttempts": 0, "unresolvedAttempts": 0,
             "incompleteAttempts": 0, "unaccountedGenerations": 0 }, "cycle": null },
-        "delegationUpdates": []
+        "subagentUpdates": []
     } } })
 }

@@ -3,7 +3,6 @@
 //! These are an in-process API between a client's ACP transport and the
 //! reducer, not a wire protocol between agent and client.
 
-use querymt_agent_protocol_types::delegation_update::DelegationUpdateNotification;
 use querymt_agent_protocol_types::protocol::{ContentBlock, StopReason};
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::ToolContentPart;
@@ -58,8 +57,24 @@ pub enum SessionInput {
         #[typeshare(serialized_as = "number")]
         at_ms: i64,
     },
+    /// The raw `querymt/session/stateUpdate` notification params
+    /// (`sessionId`, `state`, `runId`, `stopReason`).
+    StateUpdate {
+        #[typeshare(serialized_as = "any")]
+        notification: serde_json::Value,
+        #[typeshare(serialized_as = "number")]
+        at_ms: i64,
+    },
     /// The `session/prompt` request returned.
     PromptCompleted {
+        /// The prompt this response answers, when the client sent one.
+        #[serde(default)]
+        client_prompt_id: Option<String>,
+        /// The user message the prompt inserted (`_meta.querymt.messageId` of
+        /// the response); it links a pending prompt whose echo carried no
+        /// client prompt id.
+        #[serde(default)]
+        message_id: Option<String>,
         #[typeshare(serialized_as = "string")]
         stop_reason: StopReason,
         #[typeshare(serialized_as = "number")]
@@ -84,9 +99,6 @@ pub enum SessionInput {
     ConfigOptions {
         #[typeshare(serialized_as = "any")]
         options: Vec<serde_json::Value>,
-    },
-    DelegationUpdate {
-        update: DelegationUpdateNotification,
     },
     /// Full tool content fetched after a truncated load.
     ToolContent {
