@@ -314,8 +314,12 @@ impl LocalSessionExport {
         }
         scopes
             .iter()
-            .filter(|scope| self.scopes.insert((*scope).clone()))
-            .map(|scope| mesh.start_register_actor(actor.clone(), scoped_session(scope, id)))
+            .filter_map(|scope| {
+                let name = scoped_session(scope, id);
+                // Leaving a scope can remove its callbacks without changing the export runtime.
+                (self.scopes.insert(scope.clone()) || !mesh.has_re_register_fn(&name))
+                    .then(|| mesh.start_register_actor(actor.clone(), name))
+            })
             .collect()
     }
 
@@ -1482,6 +1486,41 @@ mod tests {
             .unwrap();
         assert!(!mesh.has_re_register_fn(&name));
         assert!(!mesh.has_re_register_fn(&extra));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn registry_republishes_existing_session_after_scope_rejoin() {
+        let f = RegistryFixture::new().await;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        let mesh_id = "registry-rejoin-fixture";
+        let scope = MeshScopeId::Iroh {
+            mesh_id: mesh_id.into(),
+        };
+        let state = mesh.mesh_state_store().unwrap();
+        state
+            .write()
+            .upsert_hosted_mesh(mesh_id.into(), None, None)
+            .unwrap();
+
+        let actor = f.spawn_actor();
+        let id = "registry-rejoin-session";
+        let name = scoped_session(&scope, id);
+        let mut exports = f.registry.exports.lock();
+        exports.set_mesh(Some(mesh.clone()));
+        exports.insert(id, &actor);
+        assert!(mesh.has_re_register_fn(&name));
+        assert!(mesh.leave_iroh_scope(mesh_id).unwrap());
+        assert!(!mesh.has_re_register_fn(&name));
+
+        mesh.join_iroh_scope(mesh_id, Vec::new());
+        assert!(mesh.active_scopes().contains(&scope));
+        assert_eq!(exports.publish_scope(&runtime, &scope).len(), 1);
+        assert!(mesh.has_re_register_fn(&name));
+        assert!(exports.publish_scope(&runtime, &scope).is_empty());
+        assert!(mesh.leave_iroh_scope(mesh_id).unwrap());
+        exports.remove(id);
     }
 
     #[tokio::test]
