@@ -128,7 +128,7 @@ rusqlite = { version = "0.43", features = ["bundled", "time", "uuid"] }
 rust-embed-utils = { version = "8", default-features = false, features = ["debug-embed", "include-exclude"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
-schemars = { version = "1", features = ["chrono04"] }
+schemars = { version = "1", features = ["chrono04", "indexmap2"] }
 scrypt = { version = "0.12", default-features = false, features = ["phc"] }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
