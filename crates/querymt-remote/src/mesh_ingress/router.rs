@@ -27,6 +27,7 @@ use tokio::sync::broadcast;
 mod tests;
 
 type AskResult = Result<Vec<u8>, RemoteSendError<Vec<u8>>>;
+type ReplyCheck = fn(&[u8], &PeerGrant, SharingProtocol) -> bool;
 type Handler =
     dyn Fn(PeerRequest, Vec<u8>) -> Pin<Box<dyn Future<Output = AskResult> + Send>> + Send + Sync;
 type RouteKey = (&'static str, &'static str);
@@ -141,6 +142,7 @@ struct Route {
     delivery: InboundDelivery,
     access: InboundAccess,
     handler: Box<Handler>,
+    reply_check: Option<ReplyCheck>,
 }
 
 /// Host-bound registry for explicitly supported guarded messages. Unknown routes
@@ -179,6 +181,24 @@ impl InboundRouter {
         F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
+        self.register_checked::<A, M, R, E, F, Fut>(actor_id, delivery, access, handler, None);
+    }
+
+    pub(crate) fn register_checked<A, M, R, E, F, Fut>(
+        &self,
+        actor_id: ActorId,
+        delivery: InboundDelivery,
+        access: InboundAccess,
+        handler: F,
+        reply_check: Option<ReplyCheck>,
+    ) where
+        A: RemoteActor + RemoteMessage<M>,
+        M: DeserializeOwned + Send + 'static,
+        R: Serialize + Send,
+        E: Serialize + Send,
+        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let handler: Box<Handler> = Box::new(move |peer, bytes| {
             let handler = Arc::clone(&handler);
@@ -206,6 +226,7 @@ impl InboundRouter {
                 delivery,
                 access,
                 handler,
+                reply_check,
             }),
         );
     }
@@ -311,8 +332,18 @@ impl InboundRouter {
             return Ok(Err(RemoteSendError::ActorNotRunning));
         }
         let result = (route.handler)(origin.clone(), payload).await;
-        if origin.grant.is_some() && self.authorize(&origin, route.access).await.is_err() {
-            return Err(SharingRejection::Changed);
+        let permits_reply = |grant: &PeerGrant| match (route.reply_check, &result) {
+            (Some(check), Ok(reply)) => check(reply, grant, protocol),
+            _ => true,
+        };
+        if origin.grant.is_some() {
+            let grant = self
+                .authorize(&origin, route.access)
+                .await
+                .map_err(|_| SharingRejection::Changed)?;
+            if grant.as_ref().is_some_and(|grant| !permits_reply(grant)) {
+                return Err(SharingRejection::Changed);
+            }
         }
         // Restoring a grant must not resume delivery of a revoked request.
         if let Some(mut changes) = changes {
@@ -321,7 +352,7 @@ impl InboundRouter {
                 match changes.try_recv() {
                     Ok(change)
                         if change.key == origin.key
-                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol)) =>
+                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol) || !permits_reply(grant)) =>
                     {
                         return Err(SharingRejection::Changed);
                     }

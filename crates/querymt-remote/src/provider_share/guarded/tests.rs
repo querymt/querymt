@@ -52,6 +52,7 @@ struct Store {
     pause_reserve: Mutex<Option<PauseReserve>>,
     released: Notify,
     fail_next_grant_read: AtomicBool,
+    pause_grant_read: Mutex<Option<(usize, PauseReserve)>>,
     changes: broadcast::Sender<crate::peer_access::PolicyChange>,
 }
 
@@ -64,6 +65,7 @@ impl Default for Store {
             pause_reserve: Default::default(),
             released: Default::default(),
             fail_next_grant_read: Default::default(),
+            pause_grant_read: Default::default(),
             changes: broadcast::channel(16).0,
         }
     }
@@ -72,6 +74,21 @@ impl Default for Store {
 #[async_trait]
 impl GrantStore for Store {
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+        let pause = {
+            let mut slot = self.pause_grant_read.lock();
+            match slot.as_mut() {
+                Some((0, _)) => slot.take().map(|(_, pause)| pause),
+                Some((remaining, _)) => {
+                    *remaining -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(pause) = pause {
+            pause.committed.send(()).unwrap();
+            let _ = pause.resume.await;
+        }
         if self.fail_next_grant_read.swap(false, Ordering::Relaxed) {
             return Err(GrantStoreError::Backend(Box::new(std::io::Error::other(
                 "fixture grant read failed",
@@ -184,6 +201,19 @@ struct PauseReserve {
 }
 
 impl Store {
+    fn pause_grant_after(&self, reads: usize) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, read) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        *self.pause_grant_read.lock() = Some((
+            reads,
+            PauseReserve {
+                committed: arrived,
+                resume: wait,
+            },
+        ));
+        (read, resume)
+    }
+
     fn pause_reserve(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (committed_tx, committed) = oneshot::channel();
         let (resume, resume_rx) = oneshot::channel();
@@ -542,6 +572,32 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
         ));
     }
     assert_eq!(store.attempts.lock().len(), 1);
+
+    store
+        .replace_grant(
+            &binding,
+            store.grant(&binding).await.unwrap().revision,
+            PeerGrant::Full,
+        )
+        .await
+        .unwrap();
+    share.provider_host().stop_gracefully().await.unwrap();
+    share.provider_host().wait_for_shutdown().await;
+    let contract = GetProviderContractInfo {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        params: None,
+    };
+    for request in [
+        ask_request::<ProviderHostActor, _>(provider, &contract),
+        ask_request::<ProviderHostActor, _>(provider, &chat),
+    ] {
+        assert!(matches!(
+            router.handle_v1(peer, request).await,
+            Ok(SwarmResponse::Ask(Err(_)))
+        ));
+    }
+    assert_eq!(store.attempts.lock().len(), 1);
     mesh.shutdown().await;
 }
 
@@ -563,13 +619,44 @@ async fn guarded_catalog_and_chat_enforce_grants_host_binding_and_attempt_identi
         "fixture",
         ["allowed".into(), "denied".into()],
     ));
-    let router = InboundRouter::new(host, store.clone());
+    let router = Arc::new(InboundRouter::new(host, store.clone()));
+    let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
     Arc::new(GuardedProvider {
         backend: backend.clone(),
         catalog,
         store: store.clone(),
     })
-    .install(&router, catalog_id, provider_id);
+    .install(&router, catalog_id, provider_id, &host_actor);
+    let binding = key(host, peer);
+    let narrowed = store
+        .replace_grant(
+            &binding,
+            store.grant(&binding).await.unwrap().revision,
+            PeerGrant::Full,
+        )
+        .await
+        .unwrap();
+    let (reading, resume) = store.pause_grant_after(2);
+    let (stale, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            router.handle_v1(
+                peer,
+                ask_request::<ProviderCatalogActor, _>(catalog_id, &GetProviderCatalog)
+            ),
+            async {
+                reading.await.unwrap();
+                store
+                    .replace_grant(&binding, narrowed.revision, allowed())
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+            }
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(stale, Err(SharingRejection::Changed)));
+
     let snapshot = ask::<ProviderCatalogActor, _, ProviderCatalogSnapshot, String>(
         &router,
         peer,
@@ -1325,7 +1412,8 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
             .unwrap();
     }
     let backend = Arc::new(Backend::default());
-    let router = InboundRouter::new(host, store.clone());
+    let router = Arc::new(InboundRouter::new(host, store.clone()));
+    let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
     Arc::new(GuardedProvider {
         backend: backend.clone(),
         catalog: Arc::new(StaticCatalogBackend::provider(
@@ -1335,7 +1423,7 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
         )),
         store: store.clone(),
     })
-    .install(&router, catalog_id, actor);
+    .install(&router, catalog_id, actor, &host_actor);
 
     let browse_catalog = |peer| {
         ask::<ProviderCatalogActor, _, ProviderCatalogSnapshot, String>(

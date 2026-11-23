@@ -72,15 +72,16 @@ impl ProviderShare {
                     catalog: self.catalog.clone(),
                     store: store.clone(),
                 });
-                provider.clone().install(
-                    router,
-                    self.provider_catalog.id(),
-                    self.provider_host.id(),
-                );
                 guarded::streams::install(
-                    provider,
+                    provider.clone(),
                     mesh,
                     router,
+                    self.provider_host.id(),
+                    &self.provider_host,
+                );
+                provider.install(
+                    router,
+                    self.provider_catalog.id(),
                     self.provider_host.id(),
                     &self.provider_host,
                 );
