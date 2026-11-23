@@ -82,10 +82,6 @@ impl TokenUsage {
         ]
     }
 
-    fn any_missing(&self) -> bool {
-        self.all().iter().any(Option::is_none)
-    }
-
     /// Live (`inputTokens`, …) or historical audit (`input_tokens`, `cache_read`, …) shape.
     pub fn read(value: &Value, historical: bool) -> Option<Self> {
         let obj = value.as_object()?;
@@ -113,59 +109,6 @@ pub struct Breakdown {
 }
 
 impl Breakdown {
-    /// `_meta.querymt.usage` v1 of a `usage_update`.
-    pub fn from_meta(meta: Option<&Value>) -> Option<Self> {
-        let p = meta?.pointer("/querymt/usage")?;
-        if p.get("version").and_then(Value::as_u64) != Some(1) {
-            return None;
-        }
-        let partial = p.get("partial").and_then(Value::as_bool)?;
-        let side = |k: &str| -> Result<Option<TokenUsage>, ()> {
-            match p.get(k) {
-                None | Some(Value::Null) => Ok(None),
-                Some(v) => TokenUsage::read(v, false).map(Some).ok_or(()),
-            }
-        };
-        let (latest, totals) = (side("latestRequest").ok()?, side("sessionTotals").ok()?);
-        let partial = partial
-            || [latest, totals]
-                .iter()
-                .flatten()
-                .any(TokenUsage::any_missing);
-        Some(Self {
-            latest,
-            totals,
-            partial,
-        })
-    }
-
-    /// Fold one audit `llm_request_end.usage` (disjoint categories) into the totals.
-    pub fn append_historical(prev: Option<Self>, value: Option<&Value>) -> Self {
-        let latest = value.and_then(|v| TokenUsage::read(v, true));
-        let mut totals = prev.and_then(|p| p.totals);
-        if let Some(l) = latest {
-            let add =
-                |before: Option<u64>, count: Option<u64>, had_prev: bool| match (before, count) {
-                    (_, None) => None,
-                    (None, Some(_)) if had_prev => None,
-                    (b, Some(c)) => b.unwrap_or(0).checked_add(c),
-                };
-            let had = totals.is_some();
-            let t = totals.unwrap_or_default();
-            totals = Some(TokenUsage {
-                input: add(t.input, l.input, had),
-                output: add(t.output, l.output, had),
-                reasoning: add(t.reasoning, l.reasoning, had),
-                cache_read: add(t.cache_read, l.cache_read, had),
-                cache_write: add(t.cache_write, l.cache_write, had),
-            });
-        }
-        Self {
-            latest,
-            totals,
-            partial: prev.is_some_and(|p| p.partial) || latest.is_none_or(|l| l.any_missing()),
-        }
-    }
 }
 
 // ---- charts -----------------------------------------------------------------
@@ -330,11 +273,6 @@ impl Accounting {
             None => None,
         };
         Some(Self { session, budget })
-    }
-
-    /// Replacement accounting in `_meta.querymt.accounting`.
-    pub fn from_meta(meta: Option<&Value>) -> Option<Self> {
-        Self::read(meta?.pointer("/querymt/accounting"))
     }
 }
 
@@ -520,17 +458,6 @@ pub fn cost_lines(accounting: Option<&Accounting>, standard_usd: Option<f64>) ->
     lines
 }
 
-/// Standard ACP `usage_update.cost` (`{ amount, currency: "USD" }`).
-pub fn read_cost_usd(v: Option<&Value>) -> Option<f64> {
-    let v = v?;
-    v.get("currency")
-        .and_then(Value::as_str)
-        .filter(|c| c.eq_ignore_ascii_case("USD"))?;
-    v.get("amount")
-        .and_then(Value::as_f64)
-        .filter(|a| a.is_finite())
-}
-
 // ---- formatting -------------------------------------------------------------
 
 fn trim_decimal(v: f64) -> String {
@@ -591,36 +518,6 @@ pub fn format_duration(ms: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn reads_live_breakdown_meta() {
-        let meta = json!({ "querymt": { "usage": {
-            "version": 1, "partial": false,
-            "latestRequest": { "inputTokens": 10, "outputTokens": 5, "reasoningTokens": 0, "cacheReadTokens": 100, "cacheWriteTokens": 3 },
-            "sessionTotals": null,
-        } } });
-        let b = Breakdown::from_meta(Some(&meta)).unwrap();
-        assert_eq!(b.latest.unwrap().cache_read, Some(100));
-        assert!(b.totals.is_none());
-        assert!(!b.partial);
-        // A side that is present but unreadable rejects the whole payload.
-        let bad = json!({ "querymt": { "usage": { "version": 1, "partial": false, "latestRequest": {}, "sessionTotals": null } } });
-        assert!(Breakdown::from_meta(Some(&bad)).is_none());
-    }
-
-    #[test]
-    fn historical_usage_accumulates_and_flags_gaps() {
-        let full = json!({ "input_tokens": 1, "output_tokens": 2, "reasoning_tokens": 3, "cache_read": 4, "cache_write": 5 });
-        let b = Breakdown::append_historical(None, Some(&full));
-        let b = Breakdown::append_historical(Some(b), Some(&full));
-        assert_eq!(b.totals.unwrap().cache_write, Some(10));
-        assert!(!b.partial);
-        let gap = json!({ "input_tokens": 1 });
-        let b = Breakdown::append_historical(Some(b), Some(&gap));
-        assert_eq!(b.totals.unwrap().input, Some(3));
-        assert_eq!(b.totals.unwrap().output, None);
-        assert!(b.partial);
-    }
 
     #[test]
     fn charts_match_desktop_takeaways() {

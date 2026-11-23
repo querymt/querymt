@@ -3365,50 +3365,6 @@ fn turn_actions_of(ix: usize, rc: &RenderCtx) -> Option<(usize, usize, usize)> {
         .filter(|&(adds, dels, _)| !rc.live_turn(ix) || adds > 0 || dels > 0)
 }
 
-/// For each turn's closing Agent/Work item, the message id of its user prompt.
-fn turn_users(items: &[Item]) -> HashMap<usize, String> {
-    let mut out = HashMap::new();
-    let mut user: Option<&str> = None;
-    let mut last: Option<usize> = None;
-    let mut flush = |user: Option<&str>, last: &mut Option<usize>| {
-        if let (Some(u), Some(ix)) = (user, last.take()) {
-            out.insert(ix, u.to_string());
-        }
-    };
-    for (ix, item) in items.iter().enumerate() {
-        match item.kind {
-            ItemKind::User { .. } => {
-                flush(user, &mut last);
-                user = Some(&item.key);
-            }
-            ItemKind::Agent { .. } | ItemKind::Work(_) => last = Some(ix),
-            ItemKind::Notice { .. } | ItemKind::Compaction(_) => {}
-        }
-    }
-    flush(user, &mut last);
-    out
-}
-
-/// Turn boundaries: for each turn, the last Agent/Work item and the turn's change stats.
-fn turn_ends(items: &[Item]) -> HashMap<usize, (usize, usize, usize)> {
-    let mut out = HashMap::new();
-    let mut last: Option<usize> = None;
-    let flush = |last: &mut Option<usize>, out: &mut HashMap<usize, (usize, usize, usize)>| {
-        if let Some(ix) = last.take() {
-            out.insert(ix, SessionView::turn_change_stats(items, ix));
-        }
-    };
-    for (ix, item) in items.iter().enumerate() {
-        match item.kind {
-            ItemKind::User { .. } => flush(&mut last, &mut out),
-            ItemKind::Agent { .. } | ItemKind::Work(_) => last = Some(ix),
-            ItemKind::Notice { .. } | ItemKind::Compaction(_) => {}
-        }
-    }
-    flush(&mut last, &mut out);
-    out
-}
-
 /// Context-compaction divider (desktop `SessionCompactionDivider`): a rule
 /// with status, token counts and an expandable summary.
 fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement {
@@ -3850,7 +3806,7 @@ impl QmtApp {
             .read(cx)
             .session
             .as_ref()
-            .map(|v| SessionView::turn_text(&v.items, ix))
+            .map(|v| v.turn_text(ix))
             .unwrap_or_default();
         if text.is_empty() {
             return;
@@ -4227,7 +4183,7 @@ impl QmtApp {
             });
 
             // ---- cost + activity
-            let cost = usage::cost_lines(view.accounting.as_ref(), view.standard_cost_usd);
+            let cost = usage::cost_lines(view.accounting.as_ref(), None);
             let line = |id: SharedString, label: SharedString, value: AnyElement, title: SharedString| {
                 h_flex()
                     .id(id)
@@ -5023,12 +4979,8 @@ impl QmtApp {
             _ => None,
         };
 
-        let turn_end = turn_ends(&view.items);
-        let reverted_from = view.reverted_from().and_then(|id| {
-            view.items
-                .iter()
-                .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
-        });
+        let turn_end = view.turn_ends();
+        let reverted_from = view.reverted_from();
         // Desktop: forks only from settled, live turns while nothing else runs.
         let fork_ready = store.session_supports_fork()
             && !store.fork_pending()
@@ -5057,25 +5009,15 @@ impl QmtApp {
             smooth_scroll: self.smooth_scroll.clone(),
             expanded: self.expanded_items.clone(),
             running,
-            last_turn_start: view
-                .items
-                .iter()
-                .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
-                .unwrap_or(0),
+            last_turn_start: view.last_turn_start(),
             last_ix: view.items.len().saturating_sub(1),
             turn_end,
             copied: self.copied.clone(),
             block_scrolls: self.transcript.block_scrolls.clone(),
             cwd: view.cwd.clone(),
-            turn_user: turn_users(&view.items),
+            turn_user: view.turn_users(),
             undo_ready: store.session_supports_undo() && !running && !loading && !view.undo_pending,
-            undoable: view
-                .items
-                .iter()
-                .filter(|i| matches!(i.kind, ItemKind::User { .. }))
-                .filter(|i| view.undo_affected_turns(&i.key).is_some())
-                .map(|i| i.key.clone())
-                .collect(),
+            undoable: view.undoable(),
             redo_target: view.redo_target().map(str::to_owned),
             fork_points,
             diff_open,
@@ -5873,7 +5815,6 @@ mod tests {
     fn thought(id: &str, part: Option<&str>) -> WorkEntry {
         WorkEntry::Thought(Thought {
             id: id.into(),
-            message: "m".into(),
             part: part.map(Into::into),
             text: format!("**{id}**"),
         })
@@ -6148,7 +6089,7 @@ mod perf {
             app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
                 // Expand the work group ("+N previous work entries").
-                app.expanded_items.insert("work-t0".into());
+                app.expanded_items.insert("tool-t0".into());
             });
             for _ in 0..3 {
                 window.refresh();
@@ -6230,14 +6171,14 @@ mod split_tests {
             };
             assert_eq!(rows(&app, cx), 2);
             app.update(cx, |app, cx| {
-                app.expanded_items.insert("work-t0".into());
+                app.expanded_items.insert("tool-t0".into());
                 cx.notify();
             });
             window.render_frame(cx);
             // Expanded: the prompt, the header, and a row per call.
             assert_eq!(rows(&app, cx), 1 + 1 + 300);
             app.update(cx, |app, cx| {
-                app.expanded_items.remove("work-t0");
+                app.expanded_items.remove("tool-t0");
                 cx.notify();
             });
             window.render_frame(cx);
@@ -6250,10 +6191,15 @@ mod split_tests {
     fn shortened_output_is_fetched_whole(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt as _;
         let mut view = big_session(3);
-        view.apply_truncation(Some(&json!([
-            { "tool_call_id": "t1", "part": "result", "full_bytes": 50000 },
-            { "tool_call_id": "t2", "part": "arguments", "path": "/command", "full_bytes": 9000 }
-        ])));
+        // A page with no events still marks the shortened tool calls it names.
+        view.history_page(&json!({
+            "events": [],
+            "history": { "complete": true },
+            "truncated": [
+                { "tool_call_id": "t1", "part": "result", "full_bytes": 50000 },
+                { "tool_call_id": "t2", "part": "arguments", "path": "/command", "full_bytes": 9000 }
+            ],
+        }));
         let t1 = view.truncated_tool("t1").unwrap();
         assert_eq!(t1.truncated_result, Some(50000));
         assert_eq!(
@@ -6338,7 +6284,7 @@ mod perf_export {
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.expanded_items.insert("work-t0".into());
+                app.expanded_items.insert("tool-t0".into());
             });
             for _ in 0..120 {
                 app.update(cx, |app, _| {

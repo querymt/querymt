@@ -230,6 +230,7 @@ mod tests {
                 "content": { "type": "text", "text": format!("reply {id}") } }),
             );
         }
+        view.settle();
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
         store.runtime_mut_for_test("test-agent").can_fork_sessions = true;
