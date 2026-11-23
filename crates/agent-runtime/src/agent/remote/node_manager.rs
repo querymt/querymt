@@ -1183,7 +1183,7 @@ mod remote_impl {
             );
 
             let (prepared, actor_ref) = match materializer
-                .prepare_load_session(req, Some(&registry))
+                .prepare_peer_load_session(req, &registry)
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?
             {

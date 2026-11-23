@@ -1,5 +1,39 @@
 use super::*;
 
+#[cfg(feature = "remote")]
+fn committed_fork_attach_error(
+    error: super::remote_connect::RemoteSessionConnectError,
+    node_id: &str,
+    session_id: &str,
+) -> Error {
+    let mut response = error.to_acp_error();
+    if let Some(data) = response.data.as_mut() {
+        data["session_id"] = serde_json::json!(session_id);
+        data["node_id"] = serde_json::json!(node_id);
+        data["fork_committed"] = serde_json::json!(true);
+        data["retriable"] = serde_json::json!(false);
+        data["message"] = serde_json::json!(format!(
+            "Remote fork committed; retry querymt/remote/attachSession with the child ID, not session/fork: {error}"
+        ));
+    }
+    response
+}
+
+#[cfg(all(test, feature = "remote"))]
+#[test]
+fn failed_attachment_reports_committed_remote_fork_for_recovery() {
+    let error = committed_fork_attach_error(
+        super::remote_connect::RemoteSessionConnectError::TimedOut { budget_ms: 500 },
+        "owner",
+        "child",
+    );
+    let data = error.data.unwrap();
+    assert_eq!(data["session_id"], "child");
+    assert_eq!(data["node_id"], "owner");
+    assert_eq!(data["fork_committed"], true);
+    assert_eq!(data["retriable"], false);
+}
+
 impl LocalAgentHandle {
     pub(super) async fn handle_initialize(
         &self,
@@ -157,7 +191,9 @@ impl LocalAgentHandle {
                     false,
                 )
                 .await
-                .map_err(|error| error.to_acp_error())?;
+                .map_err(|error| {
+                    committed_fork_attach_error(error, &bookmark.node_id, &fork.session_id)
+                })?;
                 return Ok(ForkSessionResponse::new(fork.session_id));
             }
         }

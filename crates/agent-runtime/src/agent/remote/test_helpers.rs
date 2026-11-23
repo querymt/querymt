@@ -305,6 +305,26 @@ pub mod fixtures {
     }
 
     impl ProviderHostFixture {
+        /// The test mesh and its peer-derived provider locator are process-wide.
+        pub async fn registered(mesh: &'static MeshHandle) -> &'static Self {
+            static HOST: OnceCell<ProviderHostFixture> = OnceCell::const_new();
+            HOST.get_or_init(|| async {
+                mesh_runtime()
+                    .spawn(async move {
+                        let fixture = Self::new().await;
+                        let name = crate::agent::remote::scope::scoped_provider_host(
+                            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                            mesh.peer_id(),
+                        );
+                        mesh.register_actor(fixture.actor_ref.clone(), name).await;
+                        fixture
+                    })
+                    .await
+                    .expect("provider host registration task panicked")
+            })
+            .await
+        }
+
         pub async fn new() -> Self {
             let f = AgentConfigFixture::new().await;
             let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(
@@ -496,74 +516,21 @@ pub mod fixtures {
     /// Fixture for provider-routing integration tests.
     ///
     /// Sets up:
-    ///  - Alpha's `ProviderHostActor` (with a `MockLLMProvider`) registered in DHT.
+    ///  - The shared provider host registered in DHT.
     ///  - Beta's `RemoteNodeManager` registered in DHT.
     ///  - The shared mesh handle.
-    ///
-    /// ```rust,ignore
-    /// let f = ProviderRoutingFixture::new(&test_id).await;
-    /// // f.provider_host_ref  — ActorRef<ProviderHostActor> for alpha
-    /// // f.provider_host_dht  — "provider_host::peer::alpha-{test_id}"
-    /// // f.beta               — MeshNodeManagerFixture
-    /// // f.call_count         — Arc<Mutex<usize>> to verify mock was invoked
-    /// ```
     pub struct ProviderRoutingFixture {
-        pub _provider_host_ref: ActorRef<ProviderHostActor>,
-        pub _provider_host_dht: String,
         pub beta: MeshNodeManagerFixture,
-        pub _alpha_config: Arc<AgentConfig>,
-        pub _call_count: Arc<Mutex<usize>>,
         pub mesh: &'static MeshHandle,
-        pub _alpha_tempdir: TempDir,
     }
 
     impl ProviderRoutingFixture {
         pub async fn new(test_id: &str) -> Self {
             let mesh = get_test_mesh().await;
 
-            // Alpha: AgentConfig + ProviderHostActor
-            let alpha_f = AgentConfigFixture::new().await;
-            let mock = MockLLMProvider::new("provider routing response");
-            let call_count = mock.call_counter();
-            let _mock_arc: Arc<dyn LLMProvider> = Arc::new(mock);
-
-            // We use the real ProviderHostActor with the alpha AgentConfig.
-            // The mock provider won't be invoked via the normal plugin path;
-            // provider routing integration tests that need the mock to fire
-            // should use direct `ask(ProviderChatRequest)` with a provider
-            // name resolvable from the config.
-            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(
-                alpha_f.config.clone(),
-            );
-            let actor_ref = ProviderHostActor::spawn(actor);
-
-            let provider_host_dht = crate::agent::remote::scope::scoped_provider_host(
-                &crate::agent::remote::scope::MeshScopeId::lan_default(),
-                mesh.peer_id(),
-            );
-            let mesh_for_registration = mesh.clone();
-            let actor_ref_for_registration = actor_ref.clone();
-            let provider_host_registration = provider_host_dht.clone();
-            mesh_runtime()
-                .spawn(async move {
-                    mesh_for_registration
-                        .register_actor(actor_ref_for_registration, provider_host_registration)
-                        .await;
-                })
-                .await
-                .expect("provider host registration task panicked");
-
+            ProviderHostFixture::registered(mesh).await;
             let beta = MeshNodeManagerFixture::new("beta", test_id).await;
-
-            Self {
-                _provider_host_ref: actor_ref,
-                _provider_host_dht: provider_host_dht,
-                beta,
-                _alpha_config: alpha_f.config,
-                _call_count: call_count,
-                mesh,
-                _alpha_tempdir: alpha_f._tempdir,
-            }
+            Self { beta, mesh }
         }
     }
 

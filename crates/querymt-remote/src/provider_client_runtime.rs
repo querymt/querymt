@@ -274,8 +274,13 @@ where
     ) -> Result<ProviderChatResponse, LLMError> {
         let request = self.config.build_chat_request(call);
         let host = self.lookup_host().await?;
-        self.validate_contract(&host, request.item_aware_contract_version)
-            .await?;
+        if let Err(error) = self
+            .validate_contract(&host, request.item_aware_contract_version)
+            .await
+        {
+            self.invalidate_cached_host().await;
+            return Err(error);
+        }
         self.send_chat_request_with_retry(&host, &request, should_retry)
             .await
     }
@@ -640,6 +645,7 @@ mod tests {
     struct TestTransport {
         contract_info: std::sync::Mutex<ProviderContractInfo>,
         contract_calls: AtomicUsize,
+        host_invalidations: AtomicUsize,
         contract_error: Option<TransportErrorKind>,
         consumer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>>>,
         terminal_on_renewal: std::sync::atomic::AtomicBool,
@@ -659,7 +665,9 @@ mod tests {
             "remote".into()
         }
 
-        async fn invalidate_cached_host(&self, _target_locator: &str) {}
+        async fn invalidate_cached_host(&self, _target_locator: &str) {
+            self.host_invalidations.fetch_add(1, Ordering::SeqCst);
+        }
 
         async fn lookup_host(&self, _target_locator: &str) -> Result<Self::HostRef, LLMError> {
             Ok(())
@@ -767,6 +775,7 @@ mod tests {
         let transport = Arc::new(TestTransport {
             contract_info: std::sync::Mutex::new(contract_info),
             contract_calls: AtomicUsize::new(0),
+            host_invalidations: AtomicUsize::new(0),
             contract_error,
             consumer: Default::default(),
             terminal_on_renewal: Default::default(),
@@ -922,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_transport_failure_is_not_reported_as_invalid_request() {
+    async fn chat_handshake_transport_failure_evicts_host_and_preserves_error() {
         // Regression: a mesh I/O timeout used to be wrapped as
         // `InvalidRequest`, which made the client report
         // "Provider rejected the request" for a connectivity problem.
@@ -937,7 +946,7 @@ mod tests {
             Some(transport_error),
         );
 
-        let error = core.validate_contract(&(), None).await.unwrap_err();
+        let error = core.chat(&ChatCall::new(&[]), |_| true).await.unwrap_err();
         assert!(matches!(
             error,
             LLMError::Transport {
@@ -947,6 +956,7 @@ mod tests {
         ));
         assert!(error.is_retryable());
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.host_invalidations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

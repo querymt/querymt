@@ -864,6 +864,25 @@ impl SessionMaterializer {
         req: LoadSessionRequest,
         registry: Option<&Mutex<SessionRegistry>>,
     ) -> Result<PreparedSessionResult, Error> {
+        self.prepare_load_session_inner(req, registry, false).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn prepare_peer_load_session(
+        &self,
+        req: LoadSessionRequest,
+        registry: &Mutex<SessionRegistry>,
+    ) -> Result<PreparedSessionResult, Error> {
+        self.prepare_load_session_inner(req, Some(registry), true)
+            .await
+    }
+
+    async fn prepare_load_session_inner(
+        &self,
+        req: LoadSessionRequest,
+        registry: Option<&Mutex<SessionRegistry>>,
+        peer_request: bool,
+    ) -> Result<PreparedSessionResult, Error> {
         let session_id = req.session_id.to_string();
 
         let single_flight_guard = self.acquire_session_lock(&session_id).await;
@@ -891,11 +910,13 @@ impl SessionMaterializer {
             })?;
 
         let request_cwd = acp_cwd_to_optional(&req.cwd)?;
-        self.check_peer_session_start(
-            &session_id,
-            request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
-        )
-        .await?;
+        if peer_request {
+            self.check_peer_session_start(
+                &session_id,
+                request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
+            )
+            .await?;
+        }
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // bound sessions always use their bound execution path, conflicting
         // cwd requests and missing checkouts fail closed.
@@ -994,11 +1015,6 @@ impl SessionMaterializer {
             })?;
 
         let request_cwd = acp_cwd_to_optional(&req.cwd)?;
-        self.check_peer_session_start(
-            &session_id,
-            request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
-        )
-        .await?;
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // resume of a bound session always uses the persisted execution
         // path, conflicting cwd requests and missing checkouts fail closed.

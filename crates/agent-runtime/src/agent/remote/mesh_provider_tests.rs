@@ -160,13 +160,8 @@ mod mesh_provider_tests {
     async fn test_mesh_chat_provider_chat_with_tools_local_host() {
         let mesh = get_test_mesh().await;
 
-        let f = ProviderHostFixture::new().await;
+        ProviderHostFixture::registered(mesh).await;
         let node_id = mesh.peer_id().to_string();
-        let dht_name = crate::agent::remote::scope::scoped_provider_host(
-            &crate::agent::remote::scope::MeshScopeId::lan_default(),
-            &node_id,
-        );
-        mesh.register_actor(f.actor_ref, dht_name.clone()).await;
 
         let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");
 
