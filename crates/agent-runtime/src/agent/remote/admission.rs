@@ -18,7 +18,9 @@ use super::node_manager::{
 };
 use super::scope::{MeshScopeId, scoped_node_manager_for_peer};
 use kameo::error::RemoteSendError;
-use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+use querymt_remote::request_timeout::{
+    SharingAskError, ask_remote_with_timeout, ask_sharing_v1, with_sharing_protocol,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionPolicy {
@@ -80,6 +82,9 @@ pub(crate) enum AdmissionError {
         timeout: Duration,
         last_error: String,
     },
+
+    #[error("admission protocol selection failed before dispatch: {0}")]
+    BeforeDispatch(#[source] querymt_remote::mesh_ingress::SharingCallError),
 
     #[error("admission transport error: {0}")]
     Transport(String),
@@ -159,14 +164,22 @@ impl AdmissionTransport for MeshAdmissionTransport {
         target: Self::Target,
         request: AdmissionRequest,
     ) -> Result<AdmissionResponse, AdmissionError> {
-        ask_with_sharing(&self.mesh, &target, &request, Duration::from_secs(10))
-            .await
-            .map_err(|error| match error {
-                SharingAskError::Actor(RemoteSendError::HandlerError(rejection)) => {
-                    AdmissionError::from(rejection)
-                }
-                other => AdmissionError::transport(other),
-            })
+        let timeout = Duration::from_secs(10);
+        with_sharing_protocol(
+            &self.mesh,
+            target.id().peer_id().copied(),
+            timeout,
+            ask_sharing_v1(&self.mesh, &target, &request, timeout),
+            async { Ok(ask_remote_with_timeout(&target, &request, timeout).await?) },
+        )
+        .await
+        .map_err(AdmissionError::BeforeDispatch)?
+        .map_err(|error| match error {
+            SharingAskError::Actor(RemoteSendError::HandlerError(rejection)) => {
+                AdmissionError::from(rejection)
+            }
+            other => AdmissionError::transport(other),
+        })
     }
 }
 
@@ -215,10 +228,14 @@ where
                     .await
                 {
                     Ok(Some(target)) => {
-                        let response = self
-                            .transport
-                            .send_admission(target, request.clone())
-                            .await?;
+                        let response =
+                            match self.transport.send_admission(target, request.clone()).await {
+                                Err(error @ AdmissionError::BeforeDispatch(_)) => {
+                                    last_error = error.to_string();
+                                    continue;
+                                }
+                                result => result?,
+                            };
                         if let AdmissionResponse::Rejected { reason } = response {
                             return Err(AdmissionError::Rejected { reason });
                         }
@@ -356,6 +373,8 @@ mod tests {
         lookup_after_attempt: HashMap<PeerId, u32>,
         lookup_attempts: HashMap<PeerId, u32>,
         responses: HashMap<PeerId, AdmissionResponse>,
+        unavailable_before_dispatch: HashSet<PeerId>,
+        uncertain_after_dispatch: HashSet<PeerId>,
         dials: Vec<(PeerId, MeshScopeId)>,
         lookups: Vec<(PeerId, MeshScopeId)>,
         admissions: VecDeque<PeerId>,
@@ -421,7 +440,15 @@ mod tests {
             _request: AdmissionRequest,
         ) -> Result<AdmissionResponse, AdmissionError> {
             let mut inner = self.inner.lock();
+            if inner.unavailable_before_dispatch.contains(&target.0) {
+                return Err(AdmissionError::BeforeDispatch(
+                    querymt_remote::mesh_ingress::SharingCallError::Unavailable,
+                ));
+            }
             inner.admissions.push_back(target.0);
+            if inner.uncertain_after_dispatch.contains(&target.0) {
+                return Err(AdmissionError::transport("reply lost"));
+            }
             Ok(inner
                 .responses
                 .get(&target.0)
@@ -506,6 +533,53 @@ mod tests {
             .expect("fallback admission should succeed");
 
         assert_eq!(transport.admissions(), vec![fallback]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_only_tries_another_owner_before_dispatch() {
+        let inviter = peer();
+        let fallback = peer();
+        for probe_failed in [true, false] {
+            let scope = MeshScopeId::Iroh {
+                mesh_id: "mesh-a".into(),
+            };
+            let transport = FakeAdmissionTransport::default()
+                .make_visible_after(inviter, 1)
+                .make_visible_after(fallback, 1);
+            if probe_failed {
+                transport
+                    .inner
+                    .lock()
+                    .unavailable_before_dispatch
+                    .insert(inviter);
+            } else {
+                transport
+                    .inner
+                    .lock()
+                    .uncertain_after_dispatch
+                    .insert(inviter);
+            }
+            let service = AdmissionService::new(transport.clone(), AdmissionPolicy::test_fast());
+            let result = service
+                .admit(
+                    "mesh-a",
+                    scope,
+                    &inviter.to_string(),
+                    &[PeerEntry {
+                        peer_id: fallback.to_string(),
+                        addrs: vec![],
+                    }],
+                    request(peer()),
+                )
+                .await;
+            if probe_failed {
+                assert!(matches!(result, Ok(AdmissionResponse::Readmitted { .. })));
+                assert_eq!(transport.admissions(), vec![fallback]);
+            } else {
+                assert!(matches!(result, Err(AdmissionError::Transport(_))));
+                assert_eq!(transport.admissions(), vec![inviter]);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
