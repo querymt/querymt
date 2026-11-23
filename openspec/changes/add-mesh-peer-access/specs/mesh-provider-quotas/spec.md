@@ -66,7 +66,7 @@ Before dispatch, the host SHALL atomically reserve the full token estimate in ea
 
 ### Requirement: All providers use the same reservation estimate
 
-For all providers and request forms, the estimate SHALL include the prepared prompt (including separately configured system context and tool definitions) plus the effective output cap, limited by configured llama.cpp `n_ctx` or the models.dev context window. If there is no configured `n_ctx` and the model is absent from models.dev, the host SHALL use the profile context middleware's `fallback_max_tokens` if available. With no applicable ceiling the estimate SHALL be uncapped. The host SHALL NOT use profile context overrides or add a separate media allowance.
+The estimate SHALL add the prepared prompt (including configured system text and tool definitions) to the effective output cap. The host SHALL clamp the sum to llama.cpp `n_ctx` if configured, otherwise to the models.dev context window. If neither applies and the model is absent from models.dev, the host SHALL use `fallback_max_tokens` when configured. With no applicable ceiling, the sum SHALL be uncapped. The host SHALL NOT add a media allowance or use profile context overrides.
 
 #### Scenario: One reservation estimate applies to every provider and request form
 - **WHEN** otherwise authorized requests with finite quotas use one-shot or streaming inference, including requests containing media, and some supply an explicit `max_tokens`
