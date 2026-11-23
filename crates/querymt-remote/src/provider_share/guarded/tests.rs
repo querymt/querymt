@@ -1189,6 +1189,61 @@ async fn dropping_guarded_admission_cancels_an_in_progress_prepare() {
 }
 
 #[tokio::test]
+async fn session_cancellation_continues_after_one_stream_fails_authorization() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let first = fixture.request();
+    let second = fixture.request();
+    for request in [&first, &second] {
+        fixture.call::<_, ()>(request).await.unwrap();
+        let (_, reply) = fixture.relay(request).await;
+        ack(reply);
+    }
+    let cancel = CancelProviderStreamRequest {
+        session_id: first.session_id,
+        request_id: None,
+        reason: None,
+    };
+    // The router's admission read succeeds; the first per-stream check fails.
+    let (reading, resume) = fixture.store.pause_grant_after(1);
+    let (cancelled, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(fixture.call::<_, usize>(&cancel), async {
+            reading.await.unwrap();
+            fixture
+                .store
+                .fail_next_grant_read
+                .store(true, Ordering::Relaxed);
+            resume.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(cancelled.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn dropping_admission_during_final_policy_read_releases_quota() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (committed, resume_reserve) = fixture.store.pause_reserve();
+    let mut admission = Box::pin(fixture.call::<_, ()>(&request));
+    timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            _ = &mut admission => panic!("admission returned before reservation was released"),
+            ready = committed => ready.unwrap(),
+        }
+        let (reading, _hold_read) = fixture.store.pause_grant_after(0);
+        resume_reserve.send(()).unwrap();
+        reading.await.unwrap();
+        drop(admission);
+        fixture.store.released.notified().await;
+    })
+    .await
+    .unwrap();
+    assert!(fixture.store.attempts.lock().is_empty());
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn stopping_host_cancels_and_settles_a_guarded_stream_with_egress_blocked() {
     let mut fixture = StreamFixture::new(StreamEnding::Done).await;
     let request = fixture.request();
@@ -1275,6 +1330,73 @@ async fn guarded_stream_reconnect_retries_data_and_terminal_without_restarting_i
 }
 
 #[tokio::test]
+async fn guarded_terminal_preserves_a_transient_final_policy_error() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    ack(reply);
+    let store = fixture.store.clone();
+    // The metered stream checks once after settlement, before relay delivery.
+    let (reading, resume) = store.pause_grant_after(1);
+    fixture.backend.finish_stream.notify_one();
+    let ((terminal, reply), ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(fixture.relay(&request), async {
+            reading.await.unwrap();
+            store.fail_next_grant_read.store(true, Ordering::Relaxed);
+            resume.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected scoped error")
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected typed policy failure")
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    disconnect(reply);
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 0 }
+    ));
+    ack(reply);
+    let (retry, reply) = fixture.relay(&request).await;
+    assert_eq!(retry.seq, None);
+    let StreamRelayMessage::ProviderError { error } = retry.message else {
+        panic!("retried a protected terminal")
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected typed policy failure")
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_gets_full_reconnect_grace_after_an_unanswered_callback() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, unanswered) = fixture.relay(&request).await;
+    // V1's first callback can consume more than the configured reconnect grace.
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+    assert!(fixture.store.settled.lock().is_empty());
+    ack(reply);
+    let (retried, reply) = fixture.relay(&request).await;
+    assert_eq!(retried.seq, initial.seq);
+    ack(reply);
+    drop(unanswered);
+}
+
+#[tokio::test]
 async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeout() {
     let mut fixture = StreamFixture::new(StreamEnding::Done).await;
     let request = fixture.request();
@@ -1311,6 +1433,34 @@ async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeou
             .unwrap()
             .is_none()
     );
+    ack(reply);
+}
+
+#[tokio::test]
+async fn renewal_keeps_the_guarded_stream_live_past_its_old_deadline() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    request.lease_ttl_secs = 1;
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    ack(reply);
+    let renew = RenewProviderStreamLease {
+        session_id: request.session_id.clone(),
+        request_id: request.request_id.clone(),
+        lease_ttl_secs: 60,
+    };
+    assert!(fixture.call::<_, bool>(&renew).await.unwrap());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fixture.backend.finish_stream.notify_one();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert!(terminal.seq.is_some() && crate::relay_message_is_terminal(&terminal.message));
     ack(reply);
 }
 

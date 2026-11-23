@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 mod streams;
+
+pub(crate) const STREAM_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 use streams::{LiveStreams, Owner, Relay, StreamRequest, matching};
 
 #[cfg(feature = "kameo-mesh")]
@@ -344,13 +346,20 @@ impl Message<GuardedStreamStart> for ProviderHostActor {
                     Ok::<_, RemoteProviderHostError>((provider, reservation))
                 } => result?,
             };
-            if admission.is_cancelled() {
+            let authorized = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(RemoteProviderHostError::Internal("provider host stopped".into())),
+                _ = admission.cancelled() => Err(RemoteProviderHostError::Internal("stream admission cancelled".into())),
+                result = access.check() => result.map_err(policy_error),
+            };
+            let authorized = if cancel.is_cancelled() || admission.is_cancelled() {
+                Err(RemoteProviderHostError::Internal("stream admission cancelled".into()))
+            } else {
+                authorized
+            };
+            if let Err(error) = authorized {
                 reservation.release().await.map_err(quota_error)?;
-                return Err(RemoteProviderHostError::Internal("stream admission cancelled".into()));
-            }
-            if let Err(error) = access.check().await {
-                reservation.release().await.map_err(quota_error)?;
-                return Err(policy_error(error));
+                return Err(error);
             }
             let relay = Relay::new(streams, &msg, owner, cancel, Some((mesh, access)))?;
             let settled = reservation.completion();
@@ -424,11 +433,18 @@ guarded_control!(
     usize,
     msg.request_id.as_deref(),
     |streams, msg| {
+        let mut cancelled = 0;
         for stream in &streams {
-            stream.authorize().await?;
-            stream.cancel(msg.reason.as_deref());
+            match stream.authorize().await {
+                Ok(()) => {
+                    stream.cancel(msg.reason.as_deref());
+                    cancelled += 1;
+                }
+                Err(error) if msg.request_id.is_some() => return Err(error),
+                Err(_) => continue,
+            }
         }
-        Ok(streams.len())
+        Ok(cancelled)
     }
 );
 
