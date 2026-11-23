@@ -286,6 +286,7 @@ impl SessionCore {
         self.header.active_tool_call_id = None;
         self.header.runtime = Some(parsed.runtime_status.clone());
         self.apply_runtime_phase(&parsed.runtime_status);
+        self.hydrate_active_time(parsed);
         self.set_accounting(&parsed.accounting);
         self.header.subagents.clear();
         for update in &parsed.subagent_updates {
@@ -304,6 +305,33 @@ impl SessionCore {
             },
             None => crate::view::HistoryPaging::default(),
         };
+    }
+}
+
+impl SessionCore {
+    /// Active time: the total of the ended runs from the summary, and the
+    /// start of the run active now from the runtime status (both on the
+    /// host's clock). A snapshot without a summary keeps the total held.
+    fn hydrate_active_time(&mut self, parsed: &ParsedSnapshot) {
+        let since = parsed
+            .runtime_status
+            .run_started_at_ms
+            .and_then(|ms| i64::try_from(ms).ok());
+        let total = parsed.summary.as_ref().map(|summary| summary.active_ms);
+        if total.is_none() && since.is_none() && self.header.active_time.is_none() {
+            self.active_start_is_host = false;
+            return;
+        }
+        let held = self
+            .header
+            .active_time
+            .as_ref()
+            .map_or(0, |time| time.total_ms);
+        self.header.active_time = Some(crate::view::ActiveTime {
+            total_ms: total.unwrap_or(held),
+            active_since_ms: since,
+        });
+        self.active_start_is_host = since.is_some();
     }
 }
 

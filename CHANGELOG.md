@@ -51,6 +51,15 @@
 
 ### Behavior changes
 
+- **Active time is run time, in the summary and on state updates.** The
+  whole-session summary of a load snapshot carries `activeMs`: the sum, over
+  the session's ended runs, of the time from `RunStarted` to `RunCompleted`
+  (paired by run id, over the whole journal; a run still active is reported
+  by the runtime status's `run_started_at_ms`). `querymt/session/stateUpdate`
+  carries `atMs`, the event's timestamp in milliseconds, on every transition
+  the agent derives from an event; the current-state sync after a load has
+  none. The session reducer reports both as `SessionHeader.active_time`.
+
 - **A replayed compaction is sent where it happened.** On a load without a
   snapshot the agent used to send every finished compaction before the whole
   conversation. It now sends each one at the position of the event that

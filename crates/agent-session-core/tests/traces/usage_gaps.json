@@ -1887,6 +1887,7 @@
         },
         "delegation_activity": []
       },
+      "activeTime": null,
       "history": {
         "hasOlder": false,
         "before": null,

@@ -5,7 +5,7 @@ use crate::core::SessionCore;
 use crate::entry::{EntryKind, PromptStatus, UserMessage};
 use crate::input::UndoFrame;
 use crate::store::TurnHint;
-use crate::view::RunState;
+use crate::view::{ActiveTime, RunState};
 use querymt_agent_protocol_types::protocol::{ContentBlock, StopReason};
 use querymt_agent_protocol_types::runtime_status::{SessionRuntimePhase, SessionRuntimeStatus};
 use querymt_agent_protocol_types::session::history::ToolContentPart;
@@ -31,8 +31,82 @@ impl SessionCore {
     pub(crate) fn runtime_observed(&mut self, status: &SessionRuntimeStatus) {
         self.header.runtime = Some(status.clone());
         if !self.state_updates_seen {
+            self.observe_active_time(status);
             self.apply_runtime_phase(status);
         }
+    }
+
+    /// Active time for an agent without state updates: the status's run
+    /// start (the host's clock) starts the run, an idle status ends it. An
+    /// observation carries no host end time, so an ended run adds nothing
+    /// here; a reload brings the exact total. Called before
+    /// `apply_runtime_phase` replaces the active run id.
+    fn observe_active_time(&mut self, status: &SessionRuntimeStatus) {
+        if status.phase == SessionRuntimePhase::Idle {
+            if let Some(time) = self.header.active_time.as_mut() {
+                time.active_since_ms = None;
+            }
+            self.active_start_is_host = false;
+            return;
+        }
+        let Some(started) = status
+            .run_started_at_ms
+            .and_then(|ms| i64::try_from(ms).ok())
+        else {
+            return;
+        };
+        let same_run =
+            status.active_run_id.is_some() && self.header.active_run_id == status.active_run_id;
+        let has_start = self
+            .header
+            .active_time
+            .as_ref()
+            .is_some_and(|time| time.active_since_ms.is_some());
+        if !(same_run && has_start) {
+            self.header
+                .active_time
+                .get_or_insert_with(ActiveTime::default)
+                .active_since_ms = Some(started);
+            self.active_start_is_host = true;
+        }
+    }
+
+    /// Start the active run's clock. A host time (`atMs`) is preferred; the
+    /// client's own time is used only when the agent sent none.
+    fn start_active_run(&mut self, host_at: Option<i64>, client_at: i64) {
+        let (since, host) = match host_at {
+            Some(at) => (at, true),
+            None => (client_at, false),
+        };
+        self.header
+            .active_time
+            .get_or_insert_with(ActiveTime::default)
+            .active_since_ms = Some(since);
+        self.active_start_is_host = host;
+    }
+
+    /// End the active run's clock and add its time to the total. Both ends
+    /// must come from the same clock; otherwise the run adds nothing. The
+    /// added time is never negative.
+    fn end_active_run(&mut self, host_at: Option<i64>, client_at: i64) {
+        let host_start = self.active_start_is_host;
+        let time = self
+            .header
+            .active_time
+            .get_or_insert_with(ActiveTime::default);
+        if let Some(start) = time.active_since_ms.take() {
+            let end = match (host_at, host_start) {
+                (Some(at), true) => Some(at),
+                (None, false) => Some(client_at),
+                _ => None,
+            };
+            if let Some(end) = end {
+                time.total_ms = time
+                    .total_ms
+                    .saturating_add(u64::try_from(end.saturating_sub(start)).unwrap_or(0));
+            }
+        }
+        self.active_start_is_host = false;
     }
 
     /// Take the run state from a runtime status. An idle runtime ends a stale
@@ -69,6 +143,7 @@ impl SessionCore {
     pub(crate) fn state_update(
         &mut self,
         notification: &serde_json::Value,
+        client_at_ms: i64,
         index: u32,
         report: &mut crate::view::ChangeReport,
     ) {
@@ -81,6 +156,7 @@ impl SessionCore {
             });
         };
         let text = |key: &str| params.get(key).and_then(serde_json::Value::as_str);
+        let host_at = params.get("atMs").and_then(serde_json::Value::as_i64);
         if let Some(session) = text("sessionId")
             && session != self.header.session_id
         {
@@ -93,6 +169,18 @@ impl SessionCore {
         };
         match state {
             "running" | "requires_action" => {
+                // One start per run: a repeated `running` for the active run
+                // (after a permission wait, or the sync that follows a load)
+                // and `requires_action` keep the start, including one
+                // restored from a snapshot.
+                let has_start = self
+                    .header
+                    .active_time
+                    .as_ref()
+                    .is_some_and(|time| time.active_since_ms.is_some());
+                if self.header.active_run_id.as_deref() != Some(run_id) || !has_start {
+                    self.start_active_run(host_at, client_at_ms);
+                }
                 self.header.active_run_id = Some(run_id.to_owned());
                 self.store.active_run = Some(run_id.to_owned());
                 if state == "requires_action" {
@@ -115,6 +203,7 @@ impl SessionCore {
                     report.ignored += 1;
                     return;
                 }
+                self.end_active_run(host_at, client_at_ms);
                 self.header.active_run_id = None;
                 self.store.active_run = None;
                 let stop = text("stopReason").unwrap_or("end_turn").to_owned();

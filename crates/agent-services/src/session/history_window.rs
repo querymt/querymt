@@ -360,6 +360,10 @@ struct SummaryAcc {
     pending: Vec<PendingInputSummary>,
     children: Vec<ChildSessionLink>,
     delegation_tools: HashMap<String, String>,
+    /// Start time (ms) of each run that has started and not ended.
+    run_starts: HashMap<String, i64>,
+    /// Total time of the ended runs, in ms.
+    active_ms: u64,
 }
 
 impl SummaryAcc {
@@ -405,6 +409,23 @@ impl SummaryAcc {
                 ..
             } => {
                 self.context = Some((*tokens, position));
+            }
+            // Active time is run time: the sum over ended runs of the time
+            // from `RunStarted` to `RunCompleted`, paired by run id. A start
+            // without an end is the active run (the runtime status reports
+            // it); an end without a start is ignored. Event timestamps are
+            // whole seconds, so the total is exact to one second per run.
+            AgentEventKind::RunStarted { run_id, .. } => {
+                self.run_starts
+                    .insert(run_id.clone(), event.timestamp.saturating_mul(1000));
+            }
+            AgentEventKind::RunCompleted { run_id, .. } => {
+                if let Some(start) = self.run_starts.remove(run_id) {
+                    let ended = event.timestamp.saturating_mul(1000);
+                    self.active_ms = self
+                        .active_ms
+                        .saturating_add(u64::try_from(ended.saturating_sub(start)).unwrap_or(0));
+                }
             }
             AgentEventKind::ProviderChanged {
                 provider,
@@ -665,6 +686,7 @@ impl SummaryFold {
                 provider: acc.provider,
                 pending_inputs: acc.pending,
                 child_sessions: acc.children,
+                active_ms: acc.active_ms,
             },
         }
     }
@@ -1097,6 +1119,76 @@ mod tests {
         assert_eq!(held.accounting, journal.accounting);
         assert_eq!(held.cursor.local_seq, journal.cursor.local_seq);
         assert_eq!(held.summary.usage.request_count, 6);
+    }
+
+    /// A run boundary at `timestamp` seconds, for the active-time tests.
+    fn run_event(seq: i64, timestamp: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            seq,
+            session_seq: seq,
+            timestamp,
+            session_id: SID.into(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    fn run_end(run_id: &str) -> AgentEventKind {
+        AgentEventKind::RunCompleted {
+            run_id: run_id.into(),
+            outcome: "completed".into(),
+            stop_type: None,
+            reason: None,
+        }
+    }
+
+    fn active_ms(events: &[AgentEvent], window_start: Option<i64>) -> u64 {
+        let mut fold = SummaryFold::new(SID, window_start);
+        for event in events {
+            fold.observe(event.seq, event);
+        }
+        fold.finish().summary.active_ms
+    }
+
+    #[test]
+    fn ended_runs_are_summed() {
+        let events = vec![
+            run_event(1, 100, run(0)),
+            run_event(2, 130, run_end("r0")),
+            run_event(3, 200, run(1)),
+            run_event(4, 290, run_end("r1")),
+        ];
+        assert_eq!(active_ms(&events, None), 120_000);
+        // The total covers the whole session, not the window.
+        assert_eq!(active_ms(&events, Some(3)), 120_000);
+        let held = summarize_events(SID, events.iter().map(|event| (event.seq, event)));
+        assert_eq!(held.summary.active_ms, 120_000);
+    }
+
+    #[test]
+    fn running_run_is_not_counted() {
+        let events = vec![
+            run_event(1, 100, run(0)),
+            run_event(2, 130, run_end("r0")),
+            run_event(3, 200, run(1)),
+            run_event(4, 290, run_end("r1")),
+            run_event(5, 400, run(2)),
+        ];
+        assert_eq!(active_ms(&events, None), 120_000);
+    }
+
+    #[test]
+    fn an_end_without_a_start_is_ignored_and_pairs_are_per_run_id() {
+        let events = vec![
+            run_event(1, 100, run_end("orphan")),
+            run_event(2, 200, run(1)),
+            run_event(3, 205, run(2)),
+            run_event(4, 210, run_end("r2")),
+            run_event(5, 230, run_end("r1")),
+        ];
+        // r2: 5 s, r1: 30 s.
+        assert_eq!(active_ms(&events, None), 35_000);
     }
 
     #[tokio::test]

@@ -89,6 +89,7 @@
       "subagents": [],
       "cursors": [],
       "runtime": null,
+      "activeTime": null,
       "history": {
         "hasOlder": false,
         "before": null,

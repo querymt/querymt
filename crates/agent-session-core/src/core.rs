@@ -23,6 +23,10 @@ pub struct SessionCore {
     /// whether a run is active, and prompt outcomes and runtime observations
     /// no longer do.
     pub(crate) state_updates_seen: bool,
+    /// The active run's start is on the host's clock (a snapshot's run start
+    /// or a state update's `atMs`). A start taken from the client's clock is
+    /// never paired with a host time, nor the reverse.
+    pub(crate) active_start_is_host: bool,
 }
 
 // A client may hydrate on a background thread and move the view to its UI
@@ -46,6 +50,7 @@ impl SessionCore {
             seen: SeenLive::default(),
             seqs: std::collections::BTreeSet::new(),
             state_updates_seen: false,
+            active_start_is_host: false,
         }
     }
 
@@ -129,8 +134,11 @@ impl SessionCore {
                     stop_reason,
                 );
             }
-            SessionInput::StateUpdate { notification, .. } => {
-                self.state_update(notification, index, report);
+            SessionInput::StateUpdate {
+                notification,
+                at_ms,
+            } => {
+                self.state_update(notification, *at_ms, index, report);
             }
             SessionInput::RuntimeObserved { status } => self.runtime_observed(status),
             SessionInput::ToolContent {

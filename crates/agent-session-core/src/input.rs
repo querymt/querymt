@@ -58,10 +58,12 @@ pub enum SessionInput {
         at_ms: i64,
     },
     /// The raw `querymt/session/stateUpdate` notification params
-    /// (`sessionId`, `state`, `runId`, `stopReason`).
+    /// (`sessionId`, `state`, `runId`, `stopReason`, `atMs`).
     StateUpdate {
         #[typeshare(serialized_as = "any")]
         notification: serde_json::Value,
+        /// The client's clock when the update arrived. Used for active time
+        /// only when the notification carries no host time (`atMs`).
         #[typeshare(serialized_as = "number")]
         at_ms: i64,
     },
