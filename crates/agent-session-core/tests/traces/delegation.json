@@ -235,6 +235,7 @@
       "title": null,
       "currentMode": null,
       "configOptions": [],
+      "availableCommands": [],
       "plan": null,
       "undoStack": [],
       "pendingInputs": [],

@@ -1863,6 +1863,7 @@
       "title": null,
       "currentMode": null,
       "configOptions": [],
+      "availableCommands": [],
       "plan": {
         "planId": "querymt-todos",
         "entries": [
