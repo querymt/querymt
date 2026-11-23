@@ -4,6 +4,7 @@
 //! original inbound messaging substreams. The legacy listener and the separate
 //! grant-aware protocol deliver authenticated caller identity to the same gate.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -26,7 +27,8 @@ use libp2p::swarm::{
 };
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::{Instant, sleep_until};
 
 use crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM;
 
@@ -94,7 +96,7 @@ pub(crate) trait InboundProtocol: Default + 'static {
 }
 
 type Wire<P> = cbor::Behaviour<<P as InboundProtocol>::Request, <P as InboundProtocol>::Response>;
-type ReplyTask<R> = (rpc::ResponseChannel<R>, R);
+type ReplyTask<R> = (rpc::InboundRequestId, Option<(rpc::ResponseChannel<R>, R)>);
 
 /// Each instance negotiates exactly one protocol. In particular, a sharing
 /// request never offers the legacy protocol as an outbound fallback.
@@ -103,6 +105,8 @@ pub(crate) struct Inbound<P: InboundProtocol> {
     protocol: P,
     gate: Arc<dyn MeshIngress>,
     tasks: JoinSet<ReplyTask<P::Response>>,
+    dispatch_timeout: Duration,
+    pending_dispatch: HashMap<rpc::InboundRequestId, AbortHandle>,
 }
 
 impl<P: InboundProtocol> Inbound<P> {
@@ -119,6 +123,8 @@ impl<P: InboundProtocol> Inbound<P> {
             protocol: P::default(),
             gate,
             tasks: JoinSet::new(),
+            dispatch_timeout: timeout,
+            pending_dispatch: HashMap::new(),
         }
     }
 }
@@ -181,10 +187,19 @@ impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<(), THandlerInEvent<Self>>> {
         while let Poll::Ready(Some(result)) = self.tasks.poll_join_next(cx) {
             match result {
-                Ok((channel, reply)) => {
-                    let _ = self.wire.send_response(channel, reply);
+                Ok((id, response)) => {
+                    self.pending_dispatch.remove(&id);
+                    if let Some((channel, reply)) = response {
+                        let _ = self.wire.send_response(channel, reply);
+                    }
                 }
-                Err(error) => tracing::error!(%error, "{}", P::TASK_FAILURE),
+                Err(error) => {
+                    self.pending_dispatch
+                        .retain(|_, task| task.id() != error.id());
+                    if !error.is_cancelled() {
+                        tracing::error!(%error, "{}", P::TASK_FAILURE);
+                    }
+                }
             }
         }
         while let Poll::Ready(event) = self.wire.poll(cx) {
@@ -193,7 +208,9 @@ impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
                     peer,
                     message:
                         rpc::Message::Request {
-                            request, channel, ..
+                            request_id,
+                            request,
+                            channel,
                         },
                     ..
                 }) => match P::receive(request) {
@@ -205,9 +222,19 @@ impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
                     }
                     InboundRequest::Dispatch(request) => {
                         let gate = Arc::clone(&self.gate);
-                        self.tasks.spawn(async move {
-                            (channel, P::dispatch(&*gate, peer, request).await)
+                        let deadline = Instant::now() + self.dispatch_timeout;
+                        let task = self.tasks.spawn(async move {
+                            if !channel.is_open() {
+                                return (request_id, None);
+                            }
+                            let response = tokio::select! {
+                                biased;
+                                _ = sleep_until(deadline) => None,
+                                reply = P::dispatch(&*gate, peer, request) => Some((channel, reply)),
+                            };
+                            (request_id, response)
                         });
+                        self.pending_dispatch.insert(request_id, task);
                         // Register the waker even when the first task was spawned
                         // after polling an empty JoinSet.
                         cx.waker().wake_by_ref();
@@ -230,6 +257,11 @@ impl<P: InboundProtocol> NetworkBehaviour for Inbound<P> {
                     error,
                     ..
                 }) => self.protocol.outbound_result(peer, request_id, Err(error)),
+                ToSwarm::GenerateEvent(rpc::Event::InboundFailure { request_id, .. }) => {
+                    if let Some(task) = self.pending_dispatch.remove(&request_id) {
+                        task.abort();
+                    }
+                }
                 ToSwarm::GenerateEvent(_) => {}
                 event => return Poll::Ready(event.map_out(|_| ())),
             }
