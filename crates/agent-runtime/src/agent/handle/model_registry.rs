@@ -98,9 +98,9 @@ impl LocalAgentHandle {
     /// snapshot from the local journal (the same builder local sessions use).
     ///
     /// The whole transfer shares one budget (60 s by default). A failed or
-    /// timed-out transfer is served from the local copy, marked stale, only
-    /// when the requested window is already local; otherwise the load fails
-    /// with a retryable `remote_transfer_failed` error.
+    /// unreachable owner may be served from a complete local copy, marked
+    /// stale, unless access is known to be denied. A transfer that exceeds
+    /// its budget fails with a retryable `remote_transfer_failed` error.
     #[cfg(feature = "remote")]
     pub(crate) async fn load_remote_snapshot(
         &self,
@@ -158,6 +158,9 @@ impl LocalAgentHandle {
         };
         let sink = self.config.event_sink.clone();
         let state = sink.remote_sync(session_id, &bookmark.node_id);
+        if state.history_denied() {
+            return Err(crate::error::AgentError::MeshAccessDenied);
+        }
         let internal = |error: crate::session::error::SessionError| {
             crate::error::AgentError::Internal(error.to_string())
         };
@@ -187,6 +190,9 @@ impl LocalAgentHandle {
             .load_remote_history(session_id, &bookmark.node_id)
             .await
             .map_err(internal)?;
+        if state.history_denied() {
+            return Err(crate::error::AgentError::MeshAccessDenied);
+        }
         // Nothing synced and nothing local: let the caller use its own source.
         if tip == 0 && history.is_empty() {
             return Ok(None);
