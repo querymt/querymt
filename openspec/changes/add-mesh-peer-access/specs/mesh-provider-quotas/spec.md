@@ -66,11 +66,11 @@ Before dispatch, the host SHALL atomically reserve the full token estimate in ea
 
 ### Requirement: All providers use the same reservation estimate
 
-For all providers and request forms, the estimate SHALL be prompt tokens plus the effective output cap, limited by configured llama.cpp `n_ctx` or the models.dev context window. If there is no configured `n_ctx` and the model is absent from models.dev, the host SHALL use the profile context middleware's `fallback_max_tokens` if available. With no applicable ceiling the estimate SHALL be uncapped. The host SHALL NOT use profile context overrides or add a separate media allowance.
+For all providers and request forms, the estimate SHALL include the prepared prompt (including separately configured system context and tool definitions) plus the effective output cap, limited by configured llama.cpp `n_ctx` or the models.dev context window. If there is no configured `n_ctx` and the model is absent from models.dev, the host SHALL use the profile context middleware's `fallback_max_tokens` if available. With no applicable ceiling the estimate SHALL be uncapped. The host SHALL NOT use profile context overrides or add a separate media allowance.
 
 #### Scenario: One reservation estimate applies to every provider and request form
 - **WHEN** otherwise authorized requests with finite quotas use one-shot or streaming inference, including requests containing media, and some supply an explicit `max_tokens`
-- **THEN** each reservation is the estimated prompt plus the effective output cap, using the explicit cap when supplied and clamping the sum to models.dev context or configured llama.cpp `n_ctx` as applicable, without separate media rules or use of a context override
+- **THEN** each reservation is the estimated prompt plus the effective output cap, using the explicit cap when the bound provider supports the override and clamping the sum to models.dev context or configured llama.cpp `n_ctx` as applicable, without separate media rules or use of a context override
 
 #### Scenario: Absent model metadata does not prevent admission
 - **WHEN** the model is absent from models.dev, no llama.cpp `n_ctx` is configured, and each applicable finite scope has capacity
