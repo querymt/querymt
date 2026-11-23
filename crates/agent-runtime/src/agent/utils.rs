@@ -1,6 +1,6 @@
 //! Utility functions for the agent
 
-use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
+use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation};
 use log::warn;
 use querymt::chat::ChatRole;
 use querymt_agent_core::model::{AgentMessage, MessagePart};
@@ -765,18 +765,9 @@ pub fn approximate_token_count(messages: &[querymt::chat::ChatMessage]) -> usize
     (chars / 4).max(1)
 }
 
-/// Determines the tool kind for a given tool name
-pub fn tool_kind_for_tool(name: &str) -> ToolKind {
-    match name {
-        "search_text" => ToolKind::Search,
-        "mdq" => ToolKind::Search,
-        "write_file" | "edit" | "multiedit" | "accept_delegation_result" => ToolKind::Edit,
-        "delete_file" => ToolKind::Delete,
-        "shell" => ToolKind::Execute,
-        "web_fetch" | "browse" => ToolKind::Fetch,
-        _ => ToolKind::Other,
-    }
-}
+/// Determines the tool kind for a given tool name. Shared with clients so a
+/// replayed journal and a live session classify tools the same way.
+pub use querymt_agent_core::replay::tool_kind_for_tool;
 
 /// Extracts file paths from tool arguments for location tracking
 pub fn extract_locations(args: &serde_json::Value) -> Vec<ToolCallLocation> {

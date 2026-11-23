@@ -28,8 +28,8 @@ pub mod worktree;
 
 // Wire types live in `querymt-agent-protocol-types`; the old paths keep resolving.
 pub use querymt_agent_protocol_types::{
-    accounting, agent_mode, dedup, delegation_update, elicitation, events, hash, runtime_status,
-    snapshot_id, stream_cursor, verification,
+    accounting, agent_mode, dedup, delegation_update, elicitation, events, hash, replay,
+    runtime_status, snapshot_id, stream_cursor, verification,
 };
 
 pub use diff_paths::DiffPaths;

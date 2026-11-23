@@ -1,0 +1,423 @@
+//! Journal event to ACP update projection, shared by the agent and by clients.
+//!
+//! The agent replays a session's journal to a client as ACP updates, and a
+//! client reducer rebuilds the same view from a load snapshot's events. Both
+//! must project one event to the same updates, so the stateless rules live
+//! here and neither side keeps a copy: tool kinds, the todo plan, reasoning
+//! chunks, workspace announcements and compaction identity.
+
+use crate::events::{AgentEventKind, ReasoningPartStored};
+use crate::protocol::{
+    CompactionId, Content, ContentBlock, ContentChunk, MessageId, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+};
+
+/// QueryMT extension namespace inside ACP's `_meta` escape hatch.
+pub const QUERYMT_META_NAMESPACE: &str = "querymt";
+
+/// Tool kind by tool name, as the agent reports it.
+pub fn tool_kind_for_tool(name: &str) -> ToolKind {
+    match name {
+        "search_text" | "mdq" => ToolKind::Search,
+        "write_file" | "edit" | "multiedit" | "accept_delegation_result" => ToolKind::Edit,
+        "delete_file" => ToolKind::Delete,
+        "shell" => ToolKind::Execute,
+        "web_fetch" | "browse" => ToolKind::Fetch,
+        _ => ToolKind::Other,
+    }
+}
+
+/// True for the todo-list tool, which projects to a plan and not a tool call.
+pub fn is_todo_write_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "todowrite" | "mcp_todowrite")
+}
+
+/// The plan entries of a `todowrite` call. `None` when the arguments are not
+/// a todo list; entries with an unknown status (and `cancelled`, which ACP
+/// plans cannot express) are left out.
+pub fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = parsed.get("todos")?.as_array()?;
+    let mut entries = Vec::with_capacity(todos.len());
+
+    for todo in todos {
+        let content = todo.get("content")?.as_str()?.to_string();
+        let Some(status) = todo
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(todo_status_to_plan_status)
+        else {
+            continue;
+        };
+        let priority = todo
+            .get("priority")
+            .and_then(serde_json::Value::as_str)
+            .and_then(todo_priority_to_plan_priority)
+            .unwrap_or(PlanEntryPriority::Medium);
+        entries.push(PlanEntry::new(content, priority, status));
+    }
+    Some(entries)
+}
+
+fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
+    match priority {
+        "high" => Some(PlanEntryPriority::High),
+        "medium" => Some(PlanEntryPriority::Medium),
+        "low" => Some(PlanEntryPriority::Low),
+        _ => None,
+    }
+}
+
+fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
+    match status {
+        "pending" => Some(PlanEntryStatus::Pending),
+        "in_progress" => Some(PlanEntryStatus::InProgress),
+        "completed" => Some(PlanEntryStatus::Completed),
+        // ACP plans do not support a cancelled state; omit these entries.
+        _ => None,
+    }
+}
+
+fn text_block(content: &str) -> ContentBlock {
+    ContentBlock::Text(TextContent::new(content.to_owned()))
+}
+
+/// A reasoning chunk; a non-empty `part_id` is carried in `_meta` so a client
+/// can tell reasoning parts of one message apart.
+pub fn thought_chunk(content: &str, message_id: &str, part_id: Option<&str>) -> ContentChunk {
+    let chunk =
+        ContentChunk::new(text_block(content)).message_id(MessageId::from(message_id.to_owned()));
+    match part_id.filter(|part_id| !part_id.is_empty()) {
+        Some(part_id) => chunk.meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_owned(),
+            serde_json::json!({ "reasoning_part_id": part_id }),
+        )])),
+        None => chunk,
+    }
+}
+
+/// What a stored assistant message stands for: its reasoning parts (only when
+/// it has an id to attach them to), then its text.
+pub fn stored_summary_updates(
+    content: &str,
+    message_id: Option<&str>,
+    reasoning_parts: &[ReasoningPartStored],
+) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    if let Some(message_id) = message_id {
+        for part in reasoning_parts.iter().filter(|part| !part.text.is_empty()) {
+            updates.push(SessionUpdate::AgentThoughtChunk(thought_chunk(
+                &part.text,
+                message_id,
+                Some(&part.id),
+            )));
+        }
+    }
+    if !content.is_empty() {
+        updates.push(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text_block(content))
+                .message_id(message_id.map(|id| MessageId::from(id.to_owned()))),
+        ));
+    }
+    updates
+}
+
+/// Announcement of an archived workspace. The `message_id` is derived from the
+/// workspace so live delivery and replay agree on identity.
+pub fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was archived. This session is now \
+         read-only; run `/worktree remove` to delete the checkout."
+    );
+    let mut details = serde_json::json!({ "workspaceId": workspace_id });
+    if let Some(by) = by_session_id {
+        details["bySessionId"] = by.into();
+    }
+    ContentChunk::new(text_block(&text))
+        .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_owned(),
+            serde_json::json!({ "worktreeArchived": details }),
+        )]))
+}
+
+/// Announcement of an ownership handoff. The `message_id` is derived from the
+/// workspace and successor so live delivery and replay agree on identity.
+pub fn worktree_handoff_chunk(
+    workspace_id: &str,
+    successor_session_id: &str,
+    summary_seeded: bool,
+) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was handed off to session \
+         {successor_session_id}. This session is now read-only."
+    );
+    ContentChunk::new(text_block(&text))
+        .message_id(MessageId::from(format!(
+            "worktree-handoff-{workspace_id}-{successor_session_id}"
+        )))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_owned(),
+            serde_json::json!({
+                "worktreeHandoff": {
+                    "workspaceId": workspace_id,
+                    "successorSessionId": successor_session_id,
+                    "summarySeeded": summary_seeded,
+                }
+            }),
+        )]))
+}
+
+/// The stateless, replay-safe projection of one event: conversation, tool and
+/// workspace-announcement content.
+///
+/// Streaming text deltas and per-block user prompts are live-only (replay
+/// reconstructs them from stored messages), and the stateful kinds (mode and
+/// config, metadata, usage, notices, compactions) are projected by their
+/// owners. A stored assistant message is projected here as text only; use
+/// [`stored_summary_updates`] to include its reasoning parts.
+pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
+    match kind {
+        AgentEventKind::PromptReceived {
+            content,
+            message_id,
+        } => vec![SessionUpdate::UserMessageChunk(
+            ContentChunk::new(text_block(content))
+                .message_id(message_id.clone().map(MessageId::from)),
+        )],
+        AgentEventKind::AssistantMessageStored {
+            content,
+            message_id,
+            ..
+        } => {
+            if content.is_empty() {
+                return Vec::new();
+            }
+            vec![SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(text_block(content))
+                    .message_id(message_id.clone().map(MessageId::from)),
+            )]
+        }
+        AgentEventKind::AssistantThinkingDelta {
+            content,
+            message_id,
+            part_id,
+        } => {
+            if content.is_empty() {
+                return Vec::new();
+            }
+            vec![SessionUpdate::AgentThoughtChunk(thought_chunk(
+                content,
+                message_id,
+                part_id.as_deref(),
+            ))]
+        }
+        AgentEventKind::ToolCallStart {
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => {
+            if is_todo_write_tool(tool_name) {
+                // Ungated contexts receive the legacy full-replacement plan;
+                // plan-operations connections intercept todowrite earlier.
+                return todo_entries_from_arguments(arguments)
+                    .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
+                    .unwrap_or_default();
+            }
+            let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+            vec![SessionUpdate::ToolCall(
+                ToolCall::new(
+                    ToolCallId::from(tool_call_id.clone()),
+                    format!("Run {tool_name}"),
+                )
+                .kind(tool_kind_for_tool(tool_name))
+                .status(ToolCallStatus::InProgress)
+                .raw_input(args),
+            )]
+        }
+        AgentEventKind::ToolCallEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => {
+            if is_todo_write_tool(tool_name) {
+                return Vec::new();
+            }
+            let status = if *is_error {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+            let raw_output = serde_json::from_str(result).ok();
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                ToolCallId::from(tool_call_id.clone()),
+                ToolCallUpdateFields::new()
+                    .kind(tool_kind_for_tool(tool_name))
+                    .status(status)
+                    .title(format!("Run {tool_name}"))
+                    .content(vec![ToolCallContent::Content(Content::new(text_block(
+                        result,
+                    )))])
+                    .raw_output(raw_output),
+            ))]
+        }
+        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text_block(text)),
+        )],
+        AgentEventKind::WorktreeOwnershipTransferred {
+            workspace_id,
+            successor_session_id,
+            summary_seeded,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
+            workspace_id,
+            successor_session_id,
+            *summary_seeded,
+        ))],
+        AgentEventKind::WorktreeArchived {
+            workspace_id,
+            by_session_id,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
+            workspace_id,
+            by_session_id.as_deref(),
+        ))],
+        _ => Vec::new(),
+    }
+}
+
+/// Identity of a compaction recorded before events carried an id, derived from
+/// its position in the journal.
+pub fn legacy_compaction_id(position: i64) -> CompactionId {
+    CompactionId::from(format!("querymt-compaction-legacy-{position}"))
+}
+
+/// Hands out compaction identities while a journal is folded in order.
+///
+/// An event with an explicit id keeps it. An id-less start and the id-less end
+/// that follows it are one compaction and get one derived identity; an id-less
+/// end without a start gets its own. An explicit id or a failure closes the
+/// open start.
+#[derive(Debug, Default)]
+pub struct CompactionIds {
+    open_legacy: Option<CompactionId>,
+    legacy_count: usize,
+}
+
+impl CompactionIds {
+    fn next_legacy(&mut self, seq: i64) -> CompactionId {
+        self.legacy_count += 1;
+        let count = i64::try_from(self.legacy_count).unwrap_or(i64::MAX);
+        legacy_compaction_id(seq.max(count))
+    }
+
+    /// Identity of a `compaction_start` at `seq`.
+    pub fn start(&mut self, explicit: Option<&str>, seq: i64) -> CompactionId {
+        match explicit.filter(|id| !id.is_empty()) {
+            Some(id) => {
+                self.open_legacy = None;
+                CompactionId::from(id.to_owned())
+            }
+            None => {
+                let id = self.next_legacy(seq);
+                self.open_legacy = Some(id.clone());
+                id
+            }
+        }
+    }
+
+    /// Identity of a `compaction_end` at `seq`; it closes the open start.
+    pub fn end(&mut self, explicit: Option<&str>, seq: i64) -> CompactionId {
+        let open = self.open_legacy.take();
+        match explicit.filter(|id| !id.is_empty()) {
+            Some(id) => CompactionId::from(id.to_owned()),
+            None => open.unwrap_or_else(|| self.next_legacy(seq)),
+        }
+    }
+
+    /// A failed compaction closes the open start.
+    pub fn failed(&mut self) {
+        self.open_legacy = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_less_start_and_end_are_one_compaction() {
+        let mut ids = CompactionIds::default();
+        let start = ids.start(None, 5);
+        let end = ids.end(None, 9);
+        assert_eq!(start, end);
+        assert_eq!(start, legacy_compaction_id(5));
+    }
+
+    #[test]
+    fn id_less_end_without_a_start_gets_its_own_identity() {
+        let mut ids = CompactionIds::default();
+        assert_eq!(ids.end(None, 9), legacy_compaction_id(9));
+    }
+
+    #[test]
+    fn explicit_ids_are_kept_and_close_the_open_start() {
+        let mut ids = CompactionIds::default();
+        ids.start(None, 1);
+        assert_eq!(
+            ids.start(Some("c1"), 2),
+            CompactionId::from("c1".to_owned())
+        );
+        // the legacy start was closed: an id-less end is a new compaction
+        assert_ne!(ids.end(None, 3), legacy_compaction_id(1));
+    }
+
+    #[test]
+    fn a_failure_closes_the_open_start() {
+        let mut ids = CompactionIds::default();
+        ids.start(None, 1);
+        ids.failed();
+        assert_ne!(ids.end(None, 4), legacy_compaction_id(1));
+    }
+
+    #[test]
+    fn empty_explicit_id_counts_as_absent() {
+        let mut ids = CompactionIds::default();
+        assert_eq!(ids.start(Some(""), 7), legacy_compaction_id(7));
+    }
+
+    #[test]
+    fn todowrite_projects_to_a_plan_and_no_tool_call() {
+        let start = AgentEventKind::ToolCallStart {
+            tool_call_id: "t".into(),
+            tool_name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"a","status":"pending","priority":"high"},{"content":"b","status":"cancelled"}]}"#.into(),
+        };
+        let updates = replayable_updates(&start);
+        assert_eq!(updates.len(), 1);
+        let SessionUpdate::Plan(plan) = &updates[0] else {
+            panic!("expected a plan, got {:?}", updates[0]);
+        };
+        assert_eq!(plan.entries.len(), 1);
+        let end = AgentEventKind::ToolCallEnd {
+            tool_call_id: "t".into(),
+            tool_name: "todowrite".into(),
+            result: "ok".into(),
+            is_error: false,
+        };
+        assert!(replayable_updates(&end).is_empty());
+    }
+
+    #[test]
+    fn worktree_events_project_to_agent_messages() {
+        let archived = AgentEventKind::WorktreeArchived {
+            workspace_id: "w1".into(),
+            by_session_id: None,
+        };
+        let updates = replayable_updates(&archived);
+        assert!(matches!(
+            updates.as_slice(),
+            [SessionUpdate::AgentMessageChunk(_)]
+        ));
+    }
+}

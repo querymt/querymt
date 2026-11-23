@@ -200,3 +200,110 @@ fn snapshot_replaces_replayed_turns() {
         .collect();
     assert_eq!(texts, vec![2, 2]);
 }
+
+// The snapshot's events are projected by the rules the agent's own replay
+// uses (`querymt_agent_protocol_types::replay`); these pin the cases where a
+// separate copy used to disagree.
+
+fn compactions_of(core: &SessionCore) -> Vec<querymt_agent_session_core::entry::CompactionEntry> {
+    core.turn_ids()
+        .iter()
+        .flat_map(|id| core.turn(id).expect("turn").entries)
+        .filter_map(|e| match e.kind {
+            EntryKind::Compaction(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+fn load(events: Vec<serde_json::Value>) -> SessionCore {
+    let mut core = SessionCore::new("s1");
+    let report = core.apply(&[loaded(load_response(events, serde_json::json!({})))]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    core
+}
+
+#[test]
+fn todowrite_becomes_the_plan_and_not_a_tool_call() {
+    let args = r#"{"todos":[{"content":"a","status":"pending","priority":"high"}]}"#;
+    let core = load(vec![
+        prompt(1, "u1", "go"),
+        event(
+            2,
+            "tool_call_start",
+            serde_json::json!({ "tool_call_id": "t1", "tool_name": "todowrite", "arguments": args }),
+        ),
+        event(
+            3,
+            "tool_call_end",
+            serde_json::json!({ "tool_call_id": "t1", "tool_name": "todowrite",
+                               "is_error": false, "result": "ok" }),
+        ),
+    ]);
+    let plan = core.header().plan.clone().expect("a plan");
+    assert_eq!(plan.entries.len(), 1);
+    let tool_calls = core
+        .turn_ids()
+        .iter()
+        .flat_map(|id| core.turn(id).expect("turn").entries)
+        .filter(|e| matches!(e.kind, EntryKind::ToolCall(_)))
+        .count();
+    assert_eq!(tool_calls, 0);
+}
+
+#[test]
+fn workspace_announcements_are_conversation_entries() {
+    let core = load(vec![
+        prompt(1, "u1", "go"),
+        event(
+            2,
+            "worktree_archived",
+            serde_json::json!({ "workspace_id": "w1" }),
+        ),
+    ]);
+    let messages = core
+        .turn_ids()
+        .iter()
+        .flat_map(|id| core.turn(id).expect("turn").entries)
+        .filter(|e| matches!(e.kind, EntryKind::AssistantMessage(_)))
+        .count();
+    assert_eq!(messages, 1);
+}
+
+#[test]
+fn id_less_compaction_start_and_end_are_one_entry() {
+    let core = load(vec![
+        prompt(1, "u1", "go"),
+        event(
+            2,
+            "compaction_start",
+            serde_json::json!({ "token_estimate": 10 }),
+        ),
+        event(
+            3,
+            "compaction_end",
+            serde_json::json!({ "summary": "done", "summary_len": 4 }),
+        ),
+    ]);
+    let compactions = compactions_of(&core);
+    assert_eq!(compactions.len(), 1, "{compactions:?}");
+    assert_eq!(
+        compactions[0].state,
+        querymt_agent_session_core::entry::CompactionState::Completed
+    );
+}
+
+#[test]
+fn a_cancelled_compaction_carries_no_error() {
+    let core = load(vec![
+        prompt(1, "u1", "go"),
+        event(
+            2,
+            "compaction_failed",
+            serde_json::json!({ "compaction_id": "c1", "reason": "user cancelled", "cancelled": true }),
+        ),
+    ]);
+    let compactions = compactions_of(&core);
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(compactions[0].error, None);
+}

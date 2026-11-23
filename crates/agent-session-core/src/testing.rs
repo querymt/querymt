@@ -3,6 +3,9 @@
 //! Emits `AgentEvent` JSON sequences and the equivalent ACP notification
 //! stream. No clock, no OS randomness: the same seed gives the same trace.
 
+use querymt_agent_protocol_types::events::{
+    AgentEvent, AgentEventKind, EventOrigin, ReasoningPartStored,
+};
 use serde_json::{Value, json};
 
 const WORDS: &[&str] = &[
@@ -100,78 +103,174 @@ pub struct Trace {
     pub events: Vec<Value>,
 }
 
-fn event(seq: i64, session: &str, kind: &str, data: Value) -> Value {
-    json!({
-        "seq": seq, "session_seq": seq, "timestamp": 1_000_000 + seq, "session_id": session,
-        "origin": "local", "kind": { "type": kind, "data": data }
-    })
+/// Appends `kind` as the next journal event. Events are built as
+/// [`AgentEventKind`] values and serialized, so a renamed or reshaped event
+/// stops this generator compiling instead of drifting from the agent.
+fn push(events: &mut Vec<Value>, seq: &mut i64, kind: AgentEventKind) {
+    *seq += 1;
+    let event = AgentEvent {
+        seq: *seq,
+        session_seq: *seq,
+        timestamp: 1_000_000 + *seq,
+        session_id: "s1".to_owned(),
+        origin: EventOrigin::Local,
+        source_node: None,
+        kind,
+    };
+    events.push(serde_json::to_value(&event).expect("an agent event serializes"));
 }
 
-/// Generate a session of prompts, replies, tool calls, compactions and an
-/// event kind the reducer ignores.
+/// Generate a session as the agent journals it: per turn a run start (before
+/// the prompt is stored), the prompt, a reply with reasoning, tool calls (one
+/// failing, a todo-list update every third turn), steering, the run end and,
+/// every n-th turn, a compaction. Steering and run events are kinds the
+/// reducer ignores; run state comes from updates.
 pub fn generate(spec: TraceSpec) -> Trace {
-    let session = "s1".to_owned();
     let mut rng = Rng::new(spec.seed);
     let mut events = Vec::new();
     let mut seq = 0i64;
-    let mut next = |events: &mut Vec<Value>, kind: &str, data: Value| {
-        seq += 1;
-        events.push(event(seq, "s1", kind, data));
-    };
     for turn in 0..spec.turns {
+        let run_id = format!("r{turn}");
+        push(
+            &mut events,
+            &mut seq,
+            AgentEventKind::RunStarted {
+                run_id: run_id.clone(),
+                origin: "interactive".to_owned(),
+            },
+        );
         let words = 3 + rng.below(8);
         let prompt = rng.lorem(words);
-        next(
+        push(
             &mut events,
-            "prompt_received",
-            json!({ "content": prompt, "message_id": format!("u{turn}") }),
+            &mut seq,
+            AgentEventKind::PromptReceived {
+                content: prompt,
+                message_id: Some(format!("u{turn}")),
+            },
         );
-        next(
-            &mut events,
-            "run_started",
-            json!({ "run_id": format!("r{turn}"), "origin": "user" }),
-        );
+        if turn % 2 == 1 {
+            let input_id = format!("i{turn}");
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::SteeringAccepted {
+                    run_id: run_id.clone(),
+                    input_id: input_id.clone(),
+                    position: 0,
+                    blocks: Vec::new(),
+                    accepted_at_ms: Some(1),
+                },
+            );
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::SteeringApplied {
+                    run_id: run_id.clone(),
+                    input_id,
+                    boundary: "before_model_request".to_owned(),
+                    latency_ms: 5,
+                },
+            );
+        }
+        let reasoning_words = 4 + rng.below(6);
+        let reasoning = rng.lorem(reasoning_words);
         let reply_words = 20 + rng.below(60);
         let reply = rng.lorem(reply_words);
-        next(
+        push(
             &mut events,
-            "assistant_message_stored",
-            json!({ "content": reply, "message_id": format!("a{turn}") }),
+            &mut seq,
+            AgentEventKind::AssistantMessageStored {
+                content: reply,
+                thinking: None,
+                reasoning_parts: vec![ReasoningPartStored {
+                    id: format!("a{turn}:summary:0"),
+                    text: reasoning,
+                }],
+                message_id: Some(format!("a{turn}")),
+            },
         );
+        if turn % 3 == 2 {
+            let id = format!("todo{turn}");
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: id.clone(),
+                    tool_name: "todowrite".to_owned(),
+                    arguments: r#"{"todos":[{"content":"lorem","status":"in_progress","priority":"high"}]}"#
+                        .to_owned(),
+                },
+            );
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: id,
+                    tool_name: "todowrite".to_owned(),
+                    is_error: false,
+                    result: "ok".to_owned(),
+                },
+            );
+        }
         for tool in 0..rng.below(spec.max_tools + 1) {
             let id = format!("t{turn}-{tool}");
-            next(
+            push(
                 &mut events,
-                "tool_call_start",
-                json!({
-                "tool_call_id": id, "tool_name": "shell", "arguments": "{\"cmd\":\"ls\"}" }),
+                &mut seq,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: id.clone(),
+                    tool_name: "shell".to_owned(),
+                    arguments: "{\"cmd\":\"ls\"}".to_owned(),
+                },
             );
             let result = rng.lorem(spec.result_words);
-            next(
+            push(
                 &mut events,
-                "tool_call_end",
-                json!({
-                "tool_call_id": id, "tool_name": "shell", "is_error": false, "result": result }),
+                &mut seq,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: id,
+                    tool_name: "shell".to_owned(),
+                    is_error: tool == 1,
+                    result,
+                },
             );
         }
         if spec.compaction_every > 0 && (turn + 1) % spec.compaction_every == 0 {
             let id = format!("c{turn}");
-            next(
+            push(
                 &mut events,
-                "compaction_start",
-                json!({ "token_estimate": 1000, "compaction_id": id }),
+                &mut seq,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 1000,
+                    compaction_id: Some(id.clone()),
+                },
             );
             let summary = rng.lorem(12);
-            next(
+            push(
                 &mut events,
-                "compaction_end",
-                json!({
-                "summary": summary, "summary_len": 12, "compaction_id": id }),
+                &mut seq,
+                AgentEventKind::CompactionEnd {
+                    summary,
+                    summary_len: 12,
+                    compaction_id: Some(id),
+                    context_tokens: Some(200),
+                },
             );
         }
+        push(
+            &mut events,
+            &mut seq,
+            AgentEventKind::RunCompleted {
+                run_id,
+                outcome: "completed".to_owned(),
+                stop_type: None,
+                reason: None,
+            },
+        );
     }
     Trace {
-        session_id: session,
+        session_id: "s1".to_owned(),
         events,
     }
 }
