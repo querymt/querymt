@@ -170,11 +170,18 @@ pub(crate) async fn bootstrap_mesh_handle_with_ingress(
 }
 
 /// Bootstrap a guarded mesh with a single policy store for this host identity.
+/// The store must support committed policy-change subscriptions for metered sharing.
 /// The caller owns initialization and exclusive startup reconciliation of the store.
 pub async fn bootstrap_mesh_runtime_with_policy(
     config: &MeshRuntimeConfig,
     store: Arc<dyn QuotaStore>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
+    if store.subscribe_changes().is_none() {
+        return Err(MeshError::SwarmError(
+            "guarded mesh requires a quota store with policy change tracking (GrantStore::subscribe_changes)"
+                .into(),
+        ));
+    }
     bootstrap_with_ingress(config, None, Some(store), false)
         .await
         .map(MeshRuntimeHandle::new)

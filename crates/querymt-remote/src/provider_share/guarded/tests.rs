@@ -49,12 +49,16 @@ struct Store {
     grants: Mutex<HashMap<PeerGrantKey, PeerGrantState>>,
     attempts: Mutex<HashMap<(PeerGrantKey, Uuid), ReservationId>>,
     settled: Mutex<Vec<(ReservationId, AttemptUsage)>>,
+    fail_settlement: AtomicBool,
+    settlement_failed: Notify,
+    settlement_recorded: Notify,
     pause_reserve: Mutex<Option<PauseReserve>>,
     reserve_calls: AtomicUsize,
     released: Notify,
     fail_next_grant_read: AtomicBool,
     pause_grant_read: Mutex<Option<(usize, PauseReserve)>>,
     changes: broadcast::Sender<crate::peer_access::PolicyChange>,
+    watchless: bool,
 }
 
 impl Default for Store {
@@ -63,12 +67,16 @@ impl Default for Store {
             grants: Default::default(),
             attempts: Default::default(),
             settled: Default::default(),
+            fail_settlement: Default::default(),
+            settlement_failed: Default::default(),
+            settlement_recorded: Default::default(),
             pause_reserve: Default::default(),
             reserve_calls: Default::default(),
             released: Default::default(),
             fail_next_grant_read: Default::default(),
             pause_grant_read: Default::default(),
             changes: broadcast::channel(16).0,
+            watchless: false,
         }
     }
 }
@@ -125,7 +133,7 @@ impl GrantStore for Store {
         Ok(state)
     }
     fn subscribe_changes(&self) -> Option<broadcast::Receiver<crate::peer_access::PolicyChange>> {
-        Some(self.changes.subscribe())
+        (!self.watchless).then(|| self.changes.subscribe())
     }
     async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
         unreachable!("not needed for provider requests")
@@ -215,7 +223,14 @@ impl QuotaStore for Store {
         usage: AttemptUsage,
     ) -> Result<QuotaSettlement, QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
+        if self.fail_settlement.load(Ordering::Relaxed) {
+            self.settlement_failed.notify_one();
+            return Err(QuotaError::Store(GrantStoreError::Backend(Box::new(
+                std::io::Error::other("fixture settlement unavailable"),
+            ))));
+        }
         self.settled.lock().push((id, usage));
+        self.settlement_recorded.notify_one();
         Ok(QuotaSettlement::Recorded)
     }
     async fn reconcile_startup(&self, _: &NodeId) -> Result<(), QuotaError> {
@@ -492,30 +507,39 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
     };
 
     let cache = tempfile::tempdir().unwrap();
+    let identity = cache.path().join("identity");
+    let config = MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: Default::default(),
+        }),
+        identity_file: Some(identity.clone()),
+        iroh_enabled: false,
+        iroh_gso: false,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        request_timeout: Duration::from_secs(3),
+        stream_reconnect_grace: Duration::from_secs(3),
+        node_name: Some("catalog-fixture".into()),
+        peers: vec![],
+        auto_fallback: false,
+    };
+    let watchless = Arc::new(Store {
+        watchless: true,
+        ..Store::default()
+    });
+    let Err(error) = bootstrap_mesh_runtime_with_policy(&config, watchless).await else {
+        panic!("guarded mesh started without policy change tracking");
+    };
+    assert!(error.to_string().contains("GrantStore::subscribe_changes"));
+    assert!(!identity.exists());
+
     let store = Arc::new(Store::default());
-    let runtime = bootstrap_mesh_runtime_with_policy(
-        &MeshRuntimeConfig {
-            enabled: true,
-            lan: Some(LanMeshConfig {
-                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
-                discovery: LanDiscovery::None,
-                directory: Default::default(),
-            }),
-            identity_file: Some(cache.path().join("identity")),
-            iroh_enabled: false,
-            iroh_gso: false,
-            iroh_dns: None,
-            iroh_scopes: vec![],
-            request_timeout: Duration::from_secs(3),
-            stream_reconnect_grace: Duration::from_secs(3),
-            node_name: Some("catalog-fixture".into()),
-            peers: vec![],
-            auto_fallback: false,
-        },
-        store.clone(),
-    )
-    .await
-    .unwrap();
+    let runtime = bootstrap_mesh_runtime_with_policy(&config, store.clone())
+        .await
+        .unwrap();
     let host = *runtime.peer_id();
     let peer = PeerId::random();
     let backend = Arc::new(Backend::default());
@@ -1561,13 +1585,68 @@ async fn guarded_stream_heartbeat_does_not_renew_the_lease() {
                 TransportErrorKind::Timeout,
                 "lease or deadline expired",
             );
-            fixture.assert_settled(&request, AttemptUsage::Unknown);
             ack(reply);
+            fixture.store.settlement_recorded.notified().await;
+            fixture.assert_settled(&request, AttemptUsage::Unknown);
             break;
         }
     })
     .await
     .expect("stream lease did not expire");
+}
+
+#[tokio::test]
+async fn guarded_stream_stops_waiting_for_settlement_at_lease_expiry() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    request.lease_ttl_secs = 2;
+    fixture.store.fail_settlement.store(true, Ordering::Relaxed);
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+    fixture.backend.finish_stream.notify_one();
+    timeout(
+        Duration::from_secs(3),
+        fixture.store.settlement_failed.notified(),
+    )
+    .await
+    .unwrap();
+    // The final usage batch already entered the relay before settlement failed.
+    let (usage, reply) = fixture.relay(&request).await;
+    assert_eq!(usage.seq, Some(1));
+    ack(reply);
+
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected a terminal provider error");
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected a structured provider error");
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    ack(reply);
+    assert!(fixture.store.settled.lock().is_empty());
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    fixture
+        .store
+        .fail_settlement
+        .store(false, Ordering::Relaxed);
+    timeout(
+        Duration::from_secs(3),
+        fixture.store.settlement_recorded.notified(),
+    )
+    .await
+    .unwrap();
+    fixture.assert_settled(&request, AttemptUsage::Observed(18));
 }
 
 #[tokio::test]

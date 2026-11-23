@@ -154,34 +154,35 @@ impl ActiveStream {
         Ok(())
     }
 
-    async fn interrupted(&self) -> LLMError {
-        let lease = async {
-            loop {
-                let deadline = {
-                    // Observe and decide expiration under the same lock as renewal.
-                    let mut progress = self.progress.lock();
-                    if Instant::now() >= progress.lease_expires {
-                        if self.key.owner.guarded() {
-                            return transport(
-                                TransportErrorKind::Timeout,
-                                "provider stream lease or deadline expired",
-                            );
-                        }
-                        progress.phase = ProviderStreamPhase::LeaseExpired;
-                        progress.last_error = Some("stream lease expired".into());
+    async fn lease_expired(&self) -> LLMError {
+        loop {
+            let deadline = {
+                // Observe and decide expiration under the same lock as renewal.
+                let mut progress = self.progress.lock();
+                if Instant::now() >= progress.lease_expires {
+                    if self.key.owner.guarded() {
                         return transport(
-                            TransportErrorKind::ConnectionClosed,
-                            "provider stream cancelled",
+                            TransportErrorKind::Timeout,
+                            "provider stream lease or deadline expired",
                         );
                     }
-                    progress.lease_expires
-                };
-                tokio::select! {
-                    _ = time::sleep_until(deadline) => {},
-                    _ = self.lease_changed.notified() => {},
+                    progress.phase = ProviderStreamPhase::LeaseExpired;
+                    progress.last_error = Some("stream lease expired".into());
+                    return transport(
+                        TransportErrorKind::ConnectionClosed,
+                        "provider stream cancelled",
+                    );
                 }
+                progress.lease_expires
+            };
+            tokio::select! {
+                _ = time::sleep_until(deadline) => {},
+                _ = self.lease_changed.notified() => {},
             }
-        };
+        }
+    }
+
+    async fn interrupted(&self) -> LLMError {
         let revoked = async {
             #[cfg(feature = "kameo-mesh")]
             if let Some(access) = &self.access {
@@ -193,7 +194,7 @@ impl ActiveStream {
             biased;
             _ = self.cancel.cancelled() => transport(TransportErrorKind::ConnectionClosed, "provider stream cancelled"),
             error = revoked => error,
-            error = lease => error,
+            error = self.lease_expired() => error,
         }
     }
 }
@@ -344,11 +345,16 @@ impl Relay {
                 self.forward(stream, &mut delivery).await.map_err(|error| (error, false))
             } => result,
         };
-        // If an interruption dropped the upstream read, the quota guard still
-        // owns the accounting. Wait for it before sending the terminal.
+        // The quota guard owns accounting even after the relay lease expires.
+        // Wait for confirmation only while the lease still permits the relay.
         let outcome = if let Some(settled) = settled {
-            match (outcome, settled.await) {
-                (Ok(_), Err(error)) => Err((host_error(&crate_quota_error(error)), false)),
+            let result = tokio::select! {
+                biased;
+                result = settled => result.map_err(crate_quota_error),
+                error = self.active.lease_expired() => Err(error),
+            };
+            match (outcome, result) {
+                (Ok(_), Err(error)) => Err((host_error(&error), false)),
                 (outcome, _) => outcome,
             }
         } else {

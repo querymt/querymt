@@ -94,10 +94,18 @@ pub trait RemoteProviderBackend: Send + Sync {
 
 /// Estimate system text supplied separately in the effective provider configuration.
 pub fn configured_system_tokens(params: Option<&Value>) -> usize {
-    params
-        .and_then(|params| params.get("system"))
-        .and_then(Value::as_str)
-        .map_or(0, |text| text.len().div_ceil(4))
+    let Some(system) = params.and_then(|params| params.get("system")) else {
+        return 0;
+    };
+    let text_tokens = |part: &Value| {
+        part.as_str()
+            .or_else(|| part.get("text").and_then(Value::as_str))
+            .map_or(0, |text| text.len().div_ceil(4))
+    };
+    match system {
+        Value::Array(parts) => parts.iter().map(text_tokens).sum(),
+        part => text_tokens(part),
+    }
 }
 
 impl QuotaEstimate {
@@ -260,13 +268,22 @@ mod tests {
     #[tokio::test]
     async fn standalone_backend_counts_configured_system_and_ignores_an_unsupported_cap() {
         use querymt::chat::{ChatMessage, GenerationOptions};
-        let request = ProviderBuildRequest::new("demo", "m1")
-            .with_params(Some(json!({"max_tokens": 128, "system": "Be brief"})));
         let messages = [ChatMessage::user().text("abcdefgh").build()];
         let call = ChatCall::new(&messages).options(GenerationOptions::NONE.with_max_tokens(1));
-        let (_, estimate) = DummyBackend.prepare_chat(request, &call).await.unwrap();
-        assert_eq!(estimate.prompt_tokens, 8);
-        assert_eq!(estimate.reserved_tokens, 136);
+        for (system, prompt_tokens) in [
+            (json!("Be brief"), 8),
+            (json!(["Be brief"]), 8),
+            (
+                json!([{"text": "Be brief", "cache": {"ephemeral": {"ttl_seconds": 1800}}}, "Use Markdown"]),
+                11,
+            ),
+        ] {
+            let request = ProviderBuildRequest::new("demo", "m1")
+                .with_params(Some(json!({"max_tokens": 128, "system": system})));
+            let (_, estimate) = DummyBackend.prepare_chat(request, &call).await.unwrap();
+            assert_eq!(estimate.prompt_tokens, prompt_tokens);
+            assert_eq!(estimate.reserved_tokens, 128 + prompt_tokens);
+        }
     }
 
     #[test]
