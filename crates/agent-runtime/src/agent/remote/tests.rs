@@ -2655,6 +2655,94 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
+    async fn guarded_full_peer_can_create_delegation_and_change_mode() {
+        use crate::agent::core::AgentMode;
+        use crate::agent::messages::SetMode;
+        use crate::agent::remote::{CreateRemoteDelegationSession, CreateRemoteSessionResponse};
+        use crate::agent::session_control::SessionControlTransition;
+        use crate::session::domain::ForkOrigin;
+        use querymt_remote::mesh_ingress::{MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = crate::agent::LocalAgentHandle::from_config(config.clone());
+        let refs = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+            &handle, &mesh,
+        )
+        .await;
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(peer),
+        };
+        let custom = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        let grant = store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                custom.clone(),
+            )
+            .await
+            .unwrap();
+        let create = || {
+            node_ask::<RemoteNodeManager, _>(
+                refs.node_manager.id(),
+                &CreateRemoteDelegationSession { cwd: None },
+            )
+        };
+        assert!(matches!(
+            router.handle_v1(peer, create()).await,
+            Err(SharingRejection::Denied)
+        ));
+        let full = store
+            .replace_grant(&key, grant.revision, PeerGrant::Full)
+            .await
+            .unwrap();
+        let created: CreateRemoteSessionResponse =
+            successful_ask(router.handle_v1(peer, create()).await);
+        assert_eq!(
+            config
+                .provider
+                .get_session(&created.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .fork_origin,
+            Some(ForkOrigin::Delegation),
+        );
+        let session = handle
+            .registry
+            .lock()
+            .await
+            .get(&created.session_id)
+            .unwrap()
+            .clone();
+        let crate::agent::SessionActorRef::Local(session) = session else {
+            panic!("expected a local owner actor");
+        };
+        let set_mode = |mode| node_ask::<SessionActor, _>(session.id(), &SetMode { mode });
+        let transition: SessionControlTransition =
+            successful_ask(router.handle_v1(peer, set_mode(AgentMode::Plan)).await);
+        assert_eq!(transition.current.active_mode, AgentMode::Plan);
+        store
+            .replace_grant(&key, full.revision, custom)
+            .await
+            .unwrap();
+        assert!(matches!(
+            router.handle_v1(peer, set_mode(AgentMode::Build)).await,
+            Err(SharingRejection::Denied)
+        ));
+    }
+
+    #[tokio::test]
     async fn due_peer_schedule_waits_for_mesh_after_scheduler_restart() {
         verify_schedule_after_scheduler_restart(true).await;
     }

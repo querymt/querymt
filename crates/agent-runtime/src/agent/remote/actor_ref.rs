@@ -713,18 +713,42 @@ impl SessionActorRef {
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SetMode { mode })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "SetMode timed out on remote session",
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                use querymt_remote::request_timeout::{
+                    SharingAskError, ask_sharing_v1, with_sharing_protocol,
+                };
+
+                let message = messages::SetMode { mode };
+                let legacy = async {
+                    actor_ref
+                        .ask(&message)
+                        .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                        .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
+                        .send()
+                        .await
+                };
+                if let Some(mesh) = mesh {
+                    with_sharing_protocol(
+                        mesh,
+                        actor_ref.id().peer_id().copied(),
+                        Self::REMOTE_MODEL_REPLY_TIMEOUT,
+                        ask_sharing_v1(mesh, actor_ref, &message, Self::REMOTE_MODEL_REPLY_TIMEOUT),
+                        async { Ok(legacy.await?) },
                     )
-                }),
+                    .await
+                    .map_err(|error| AgentError::from_sharing_ask(SharingAskError::Sharing(error)))?
+                    .map_err(AgentError::from_sharing_ask)
+                } else {
+                    legacy.await.map_err(|error| {
+                        Self::map_agent_timeout_remote_send_error(
+                            error,
+                            "SetMode timed out on remote session",
+                        )
+                    })
+                }
+            }
         }
     }
 

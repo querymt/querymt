@@ -651,6 +651,11 @@ mod remote_impl {
                 InboundAccess::Sessions,
             );
             register_session_request::<_, CreateRemoteSession>(router, actor, InboundAccess::Full);
+            register_session_request::<_, CreateRemoteDelegationSession>(
+                router,
+                actor,
+                InboundAccess::Full,
+            );
             register_session_request::<_, CreateRemoteSessionWithProfile>(
                 router,
                 actor,

@@ -96,6 +96,7 @@ pub(crate) fn register_session_routes(
     register_session_read::<_, messages::SessionDeliveryBarrier>(router, actor);
     register_session_read::<_, messages::GetSessionControl>(router, actor);
     register_session_read::<_, messages::GetMode>(router, actor);
+    register_session_request::<_, messages::SetMode>(router, actor, InboundAccess::Full);
     register_session_read::<_, messages::GetSessionLimits>(router, actor);
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
