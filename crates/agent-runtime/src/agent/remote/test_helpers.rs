@@ -539,7 +539,7 @@ pub mod fixtures {
 
             let provider_host_dht = crate::agent::remote::scope::scoped_provider_host(
                 &crate::agent::remote::scope::MeshScopeId::lan_default(),
-                &format!("alpha-{}", test_id),
+                mesh.peer_id(),
             );
             let mesh_for_registration = mesh.clone();
             let actor_ref_for_registration = actor_ref.clone();
