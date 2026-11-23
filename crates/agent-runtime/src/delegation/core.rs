@@ -1363,13 +1363,30 @@ async fn execute_delegation_inner(
                 .clone()
                 .unwrap_or_else(|| delegation.public_id.clone());
             match service
-                .allocate_for_delegation(
+                .allocate_for_delegation_checked(
                     &parent_session_id,
                     parent_record.as_ref(),
                     &parent_cwd,
                     parent_gate.as_ref(),
                     &delegation.public_id,
                     Some(batch_id),
+                    || async {
+                        let cancelled = || {
+                            crate::worktree::WorktreeError::InvalidOperation(
+                                "delegation cancelled".into(),
+                            )
+                        };
+                        if cancel_token.is_cancelled() {
+                            return Err(cancelled());
+                        }
+                        authority.check().await.map_err(|error| {
+                            crate::worktree::WorktreeError::InvalidOperation(error.to_string())
+                        })?;
+                        if cancel_token.is_cancelled() {
+                            return Err(cancelled());
+                        }
+                        Ok(())
+                    },
                 )
                 .await
             {
