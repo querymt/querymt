@@ -270,10 +270,13 @@ async fn prepare_session_load(
     preferences: &crate::acp::shared::AcpSessionLoadPreferences,
 ) -> Result<AcpSessionLoadOutcome, acp::Error> {
     let session_id = req.session_id.to_string();
-    let response = agent
+    let mut response = agent
         .load_session(req)
         .instrument(info_span!("agent.session_load", session.id = %session_id))
         .await?;
+    // The snapshot carries the session's cursors only for a client that
+    // advertised them.
+    crate::acp::shared::scope_load_cursor_updates(response.meta.as_mut(), capabilities);
     // Snapshot-capable clients hydrate history from the load-response snapshot.
     // Skipping replay here also avoids the redundant event-stream and message
     // reads that only exist to produce historical notifications.
@@ -364,22 +367,13 @@ async fn load_session_and_enqueue_replay(
         // and the answer. The caller releases the hold after responding.
         let hold = delivery.begin_load(&session_id);
         let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
-        crate::acp::shared::seed_loaded_run_state(
-            agent,
+        let recovered = crate::acp::shared::seed_translator_from_load(
+            Some(agent.as_ref()),
             &session_id,
-            outcome.response.meta.as_ref(),
+            &outcome.response,
             translator,
         )
         .await;
-        let recovered = {
-            let mut translator = translator
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(options) = outcome.response.config_options.as_ref() {
-                translator.seed_config_options(&session_id, options);
-            }
-            translator.seed_history_from_meta(&session_id, outcome.response.meta.as_ref())
-        };
         let recovered = match recovered {
             Some(updates) => updates,
             None => {
@@ -1491,18 +1485,30 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             {
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
+                let translator = translator.clone();
                 async move |dispatch: acp::v1::Dispatch<ClientRequest, ClientNotification>, _cx| {
                     match dispatch {
                         acp::v1::Dispatch::Request(ClientRequest::ExtMethodRequest(req), responder) => {
                             let method = req.method.to_string();
                             let params: serde_json::Value =
                                 serde_json::from_str(req.params.get()).unwrap_or_default();
-                            let ext_value: Result<serde_json::Value, acp::Error> =
+                            let mut ext_value: Result<serde_json::Value, acp::Error> =
                                 agent.ext_method(req).await.and_then(|resp| {
                                     serde_json::from_str(resp.0.get()).map_err(|e| {
                                         acp::Error::internal_error().data(e.to_string())
                                     })
                                 });
+                            if let Ok(value) = ext_value.as_mut() {
+                                let capabilities = translator
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .capabilities();
+                                crate::acp::shared::scope_ext_response_cursor_updates(
+                                    &method,
+                                    value,
+                                    &capabilities,
+                                );
+                            }
                             // A remote attach binds a session to this connection
                             // without session/new|load|resume, so advertise its
                             // slash-command catalog here, after the response.

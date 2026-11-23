@@ -179,7 +179,7 @@ impl Drop for DeliveredGuard {
 }
 
 /// `_meta` key of the load snapshot in a `session/load` response.
-const SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
+const SNAPSHOT_META_KEY: &str = crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY;
 
 /// Where a session load's answer stands in the session's event order: the
 /// last event the answer contains.

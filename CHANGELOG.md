@@ -67,7 +67,11 @@
   reconnect or restart. `session/fork` accepts `cursorId` (messages only; an
   unknown, foreign or non-forkable cursor is `-32602` and creates no session),
   which takes precedence over `_meta.querymt.message_id`. Forking a remote-hosted
-  session is now done by its owner node.
+  session is now done by its owner node. The load snapshot
+  (`querymt/sessionLoadSnapshot.v1`) and each `querymt/session/history` page
+  carry the cursors of the events they hold in `cursorUpdates`, with the ids
+  replay announces; a client without `session.cursors` gets no `cursorUpdates`,
+  and one without `compaction` gets no compaction cursors.
 
 - **ACP: `PromptResponse.usage`.** `session/prompt` reports the token counts of
   the execution cycle that answered the prompt (input, output, reasoning, cache

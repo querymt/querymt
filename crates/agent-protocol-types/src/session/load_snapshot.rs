@@ -3,7 +3,7 @@
 
 use crate::accounting::AccountingSnapshot;
 use crate::delegation_update::DelegationUpdateNotification;
-use crate::protocol::{ContentBlock, SubagentUpdate};
+use crate::protocol::{ContentBlock, CursorUpdate, SubagentUpdate};
 use crate::runtime_status::SessionRuntimeStatus;
 use crate::session::history::{HistoryInfo, SessionHistorySummary, TruncatedEntry};
 use crate::session::views::AuditView;
@@ -45,6 +45,16 @@ pub struct SessionLoadSnapshot {
     #[serde(default, rename = "subagentUpdates")]
     #[typeshare(serialized_as = "any")]
     pub subagent_updates: Vec<SubagentUpdate>,
+    /// The `cursor_update` of every position the returned events anchor, each
+    /// announced once, with the ids history replay announces. The agent sends
+    /// it only to a client that advertised `session.cursors`.
+    #[serde(
+        default,
+        rename = "cursorUpdates",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[typeshare(serialized_as = "any")]
+    pub cursor_updates: Vec<CursorUpdate>,
     #[serde(
         default,
         rename = "userPrompts",

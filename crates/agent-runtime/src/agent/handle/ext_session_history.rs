@@ -42,6 +42,12 @@ struct SessionHistoryResponse {
     /// sessions; same shape as the load snapshot's `userPrompts`).
     #[serde(rename = "userPrompts", skip_serializing_if = "Option::is_none")]
     user_prompts: Option<Vec<crate::session::load_snapshot::UserPromptRecord>>,
+    /// The `cursor_update` of every position `events` anchor, with the ids a
+    /// load snapshot and history replay announce. The transport drops it for a
+    /// client that did not advertise `session.cursors`.
+    #[serde(rename = "cursorUpdates", skip_serializing_if = "Vec::is_empty")]
+    #[typeshare(serialized_as = "any")]
+    cursor_updates: Vec<crate::acp::protocol::CursorUpdate>,
 }
 
 #[typeshare]
@@ -230,7 +236,11 @@ impl LocalAgentHandle {
             let _ = remote_deadline;
             None
         };
+        // Always with compaction cursors; the transport narrows them to the
+        // connection's capabilities (`acp::shared::scope_cursor_updates`).
+        let cursor_updates = querymt_agent_core::replay::session_cursor_updates(&read.events, true);
         ext_json_response(&SessionHistoryResponse {
+            cursor_updates,
             events: read.events,
             history: read.history,
             truncated: read.truncated,
