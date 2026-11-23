@@ -128,7 +128,7 @@ rusqlite = { version = "0.43", features = ["bundled", "time", "uuid"] }
 rust-embed-utils = { version = "8", default-features = false, features = ["debug-embed", "include-exclude"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
-schemars = { version = "1", features = ["chrono04"] }
+schemars = { version = "1", features = ["chrono04", "indexmap2"] }
 scrypt = { version = "0.12", default-features = false, features = ["phc"] }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
@@ -283,6 +283,7 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 once_cell = { version = "1", default-features = false, features = ["critical-section"] }
 portable-atomic = { version = "1", features = ["serde"] }
@@ -318,6 +319,7 @@ tower-http = { version = "0.6", default-features = false, features = ["decompres
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 once_cell = { version = "1", default-features = false, features = ["critical-section"] }
