@@ -793,13 +793,8 @@ async fn forward_stdio_event(
         let mut translator = translator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let delegation_update = translator.translate_delegation_update(event);
-        let session_updates = if delegation_update.is_none() {
-            translator.translate_updates(event)
-        } else {
-            Vec::new()
-        };
-        (delegation_update, session_updates)
+        let translated = translator.translate_event(event);
+        (translated.delegation, translated.updates)
     };
     let result = if let querymt_agent_core::events::AgentEventKind::RuntimeChanged { runtime } =
         event.kind()
@@ -885,7 +880,7 @@ async fn forward_stdio_event(
         )
         .map(Arc::from)
         .map_err(acp::Error::into_internal_error);
-        match params {
+        let mut result = match params {
             Ok(params) => {
                 bridge
                     .notify_ext(crate::acp::protocol::ExtNotification::new(
@@ -895,13 +890,27 @@ async fn forward_stdio_event(
                     .await
             }
             Err(err) => Err(err),
-        }
-    } else if !session_updates.is_empty() {
-        let mut result = Ok(());
-        for update in session_updates {
+        };
+        // The subagent update follows the extension notification, on the
+        // parent session the delegation belongs to.
+        for (session_id, update) in session_updates {
+            if result.is_err() {
+                break;
+            }
             result = bridge
                 .notify(SessionNotification::new(
-                    SessionId::from(event.session_id().to_owned()),
+                    SessionId::from(session_id),
+                    update,
+                ))
+                .await;
+        }
+        result
+    } else if !session_updates.is_empty() {
+        let mut result = Ok(());
+        for (session_id, update) in session_updates {
+            result = bridge
+                .notify(SessionNotification::new(
+                    SessionId::from(session_id),
                     update,
                 ))
                 .await;

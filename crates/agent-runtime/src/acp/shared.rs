@@ -1216,6 +1216,20 @@ where
         }
     }
 
+    // 4b. The latest subagent state of every child the history delegated
+    // to, one update per child, ahead of the history that references it.
+    let subagents = if capabilities.subagents {
+        crate::control::delegation_notifications::delegation_updates_from_events(&events)
+            .into_iter()
+            .filter(|snapshot| snapshot.child_session_id.is_some())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for update in subagents.iter().filter_map(subagent_update_from_snapshot) {
+        push(SessionUpdate::SubagentUpdate(update), &mut notifications);
+    }
+
     // 5. Historical conversation/tool content in order. A compaction's
     // terminal state (original identity, final summary; chunks and in-progress
     // states are omitted) is sent where its terminal event happened, so a
@@ -1227,6 +1241,10 @@ where
         if let AgentEventKind::RunStarted { run_id, .. } = &event.kind {
             current_run = Some(run_id.clone());
         }
+        let started_tool_call = match &event.kind {
+            AgentEventKind::ToolCallStart { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        };
         let ends_run = matches!(&event.kind, AgentEventKind::RunCompleted { .. });
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
@@ -1265,6 +1283,21 @@ where
                 querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
             }
             push(update, &mut notifications);
+        }
+        // A delegate tool call points at its child right after it starts,
+        // where the live stream sends the reference once the child exists.
+        if let Some(tool_call_id) = started_tool_call {
+            for snapshot in subagents
+                .iter()
+                .filter(|snapshot| snapshot.tool_call_id.as_deref() == Some(&tool_call_id))
+            {
+                if let Some(child) = snapshot.child_session_id.as_deref() {
+                    push(
+                        session_reference_update(&tool_call_id, child),
+                        &mut notifications,
+                    );
+                }
+            }
         }
         if capabilities.compaction {
             for terminal in materialized.compactions.iter().filter(|t| t.seq == seq) {
@@ -1529,6 +1562,11 @@ pub struct AcpSessionUpdateCapabilities {
     pub notices: bool,
     /// Client advertised ID-addressed compaction updates.
     pub compaction: bool,
+    /// Client advertised `session.cursors` (`cursor_update` support).
+    pub cursors: bool,
+    /// Client advertised the top-level `subagents` capability
+    /// (`subagent_update` and tool-call `session` references).
+    pub subagents: bool,
 }
 
 impl AcpSessionUpdateCapabilities {
@@ -1539,6 +1577,8 @@ impl AcpSessionUpdateCapabilities {
             plan_operations: capabilities.plan.is_some(),
             notices: session.is_some_and(|session| session.notices.is_some()),
             compaction: session.is_some_and(|session| session.compaction.is_some()),
+            cursors: session.is_some_and(|session| session.cursors.is_some()),
+            subagents: capabilities.subagents.is_some(),
         }
     }
 }
@@ -1981,6 +2021,107 @@ pub struct AcpLiveEventTranslator {
     /// Current run and blocking waits per session, for run state updates and
     /// the run id stamped on session updates.
     runs: HashMap<String, RunTracking>,
+    /// Delegated child sessions announced to this connection with a
+    /// `subagent_update`, so each child is announced once, before its traffic.
+    announced_children: HashSet<String>,
+}
+
+/// One internal event as translated for a connection: the delegation
+/// extension notification (still sent until it is removed) and the session
+/// updates, each addressed to the session it belongs to. Updates are
+/// addressed because a child's announcement belongs to the parent session
+/// even when a child event triggers it.
+#[derive(Debug, Default)]
+pub struct TranslatedEvent {
+    /// Delegation state for the legacy extension notification.
+    pub delegation: Option<DelegationUpdateNotification>,
+    /// `(session id, update)` in delivery order.
+    pub updates: Vec<(String, SessionUpdate)>,
+}
+
+/// The `_meta.querymt` key on `subagent_update` holding the delegation stage
+/// (`verifying`, `finalizing`, `cancel_requested`) while one is in progress.
+pub const SUBAGENT_STAGE_META_KEY: &str = "stage";
+
+/// The ACP `subagent_update` for a delegation snapshot, `None` while the
+/// delegation has no child session yet.
+///
+/// Running states (forked, executing, verifying, finalizing, cancel
+/// requested) report `running` with the cancel capability; the stage of the
+/// last three goes in `_meta.querymt.stage`. A completed, failed or cancelled
+/// delegation reports `idle`, withdraws cancel and carries no stage. The
+/// confirmed model, provider node, delegation id and timestamps are always in
+/// `_meta.querymt`.
+pub(crate) fn subagent_update_from_snapshot(
+    snapshot: &querymt_agent_services::control::delegation_notifications::SubagentSnapshot,
+) -> Option<crate::acp::protocol::SubagentUpdate> {
+    use crate::acp::protocol::{
+        IdleStateUpdate, RunningStateUpdate, SessionCancelCapabilities, StateUpdate,
+        SubagentSessionCapabilities, SubagentUpdate,
+    };
+    use querymt_agent_core::delegation_update::DelegationStage;
+
+    let child = snapshot.child_session_id.as_deref()?;
+    let running = !snapshot.state.is_terminal();
+
+    let mut namespace = serde_json::Map::new();
+    namespace.insert("delegationId".into(), snapshot.delegation_id.clone().into());
+    if let Some(model) = &snapshot.selected_model_id {
+        namespace.insert("modelId".into(), model.clone().into());
+    }
+    if let Some(node) = &snapshot.selected_provider_node_id {
+        namespace.insert("providerNodeId".into(), node.clone().into());
+    }
+    namespace.insert("requestedAt".into(), snapshot.requested_at.into());
+    if let Some(forked_at) = snapshot.forked_at {
+        namespace.insert("forkedAt".into(), forked_at.into());
+    }
+    if let Some(finished_at) = snapshot.finished_at {
+        namespace.insert("finishedAt".into(), finished_at.into());
+    }
+    namespace.insert("updatedAt".into(), snapshot.updated_at.into());
+    if running
+        && let Some(
+            stage @ (DelegationStage::Verifying
+            | DelegationStage::Finalizing
+            | DelegationStage::CancelRequested),
+        ) = snapshot.stage
+        && let Ok(stage) = serde_json::to_value(stage)
+    {
+        namespace.insert(SUBAGENT_STAGE_META_KEY.into(), stage);
+    }
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert(
+        QUERYMT_META_NAMESPACE.to_owned(),
+        serde_json::Value::Object(namespace),
+    );
+
+    let mut update = SubagentUpdate::new(SessionId::from(child.to_owned()));
+    update.title = MaybeUndefined::Value(snapshot.target_agent_id.clone());
+    update.description = MaybeUndefined::Value(snapshot.objective.clone());
+    update.meta = MaybeUndefined::Value(meta);
+    if running {
+        update.state = MaybeUndefined::Value(StateUpdate::Running(RunningStateUpdate::new()));
+        update.capabilities = MaybeUndefined::Value(
+            SubagentSessionCapabilities::new().cancel(SessionCancelCapabilities::new()),
+        );
+    } else {
+        update.state = MaybeUndefined::Value(StateUpdate::Idle(IdleStateUpdate::new()));
+        update.capabilities = MaybeUndefined::Null;
+    }
+    Some(update)
+}
+
+/// The delegate tool call update that points at its child session.
+fn session_reference_update(tool_call_id: &str, child_session_id: &str) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(tool_call_id.to_owned()),
+        ToolCallUpdateFields::new().content(vec![ToolCallContent::Session(
+            crate::acp::protocol::SessionReference::new(SessionId::from(
+                child_session_id.to_owned(),
+            )),
+        )]),
+    ))
 }
 
 /// Stand-in wait id for a wait a load found pending: its real id is unknown
@@ -2014,6 +2155,7 @@ impl AcpLiveEventTranslator {
             config: HashMap::new(),
             announced_todo_plans: HashSet::new(),
             runs: HashMap::new(),
+            announced_children: HashSet::new(),
         }
     }
 
@@ -2390,17 +2532,78 @@ impl AcpLiveEventTranslator {
         self.config.remove(session_id);
         self.announced_todo_plans.remove(session_id);
         self.runs.remove(session_id);
+        self.announced_children.remove(session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
         self.structured_user_messages
             .retain(|(session, _)| session != session_id);
     }
 
-    pub fn translate_delegation_update(
+    /// The `subagent_update` for `snapshot` and, the first time its child is
+    /// announced, the delegate tool call's session reference. Empty for
+    /// clients without `subagents` and for delegations without a child yet.
+    fn subagent_updates(
         &mut self,
-        event: &EventEnvelope,
-    ) -> Option<crate::control::delegation_notifications::DelegationUpdateNotification> {
-        self.delegation_updates.project_envelope(event)
+        snapshot: &DelegationUpdateNotification,
+    ) -> Vec<(String, SessionUpdate)> {
+        if !self.capabilities.subagents {
+            return Vec::new();
+        }
+        let Some(update) = subagent_update_from_snapshot(snapshot) else {
+            return Vec::new();
+        };
+        let Some(child) = snapshot.child_session_id.as_deref() else {
+            return Vec::new();
+        };
+        let parent = snapshot.session_id.clone();
+        let mut updates = vec![(parent.clone(), SessionUpdate::SubagentUpdate(update))];
+        if self.announced_children.insert(child.to_owned())
+            && let Some(tool_call_id) = snapshot.tool_call_id.as_deref()
+        {
+            updates.push((parent, session_reference_update(tool_call_id, child)));
+        }
+        updates
+    }
+
+    /// Translates one internal event for this connection: the delegation
+    /// state it changes and the session updates it causes, in order.
+    ///
+    /// A delegation event yields its `subagent_update` (then the session
+    /// reference of the delegate tool call). Any other event of a delegated
+    /// child that this connection has not been told about yet is preceded by
+    /// that announcement, so a child never speaks before it is announced.
+    pub fn translate_event(&mut self, event: &EventEnvelope) -> TranslatedEvent {
+        let delegation = self.delegation_updates.project_envelope(event);
+        let mut updates = match &delegation {
+            Some(snapshot) => self.subagent_updates(snapshot),
+            None => {
+                let mut updates = Vec::new();
+                if self.capabilities.subagents
+                    && !self.announced_children.contains(event.session_id())
+                    && let Some(snapshot) = self
+                        .delegation_updates
+                        .snapshot_for_child(event.session_id())
+                {
+                    updates.extend(self.subagent_updates(&snapshot));
+                }
+                let session_id = event.session_id().to_owned();
+                updates.extend(
+                    self.translate_unstamped_updates(event)
+                        .into_iter()
+                        .map(|update| (session_id.clone(), update)),
+                );
+                updates
+            }
+        };
+        for (session_id, update) in &mut updates {
+            if let Some(run_id) = self.current_run_id(session_id) {
+                querymt_agent_core::replay::stamp_run_id(update, run_id);
+            }
+        }
+        TranslatedEvent {
+            delegation,
+            updates,
+        }
     }
 
     #[doc(hidden)]
@@ -2438,9 +2641,6 @@ impl AcpLiveEventTranslator {
                 error.as_deref(),
             )];
         }
-        if let Some(update) = self.translate_delegation_update(event) {
-            return vec![delegation_update_notification(update)];
-        }
         if let Some(notification) = input_state_notification(event) {
             return vec![notification];
         }
@@ -2467,20 +2667,22 @@ impl AcpLiveEventTranslator {
             })];
         }
 
-        let session_id = event.session_id().to_owned();
-        self.translate_updates(event)
-            .into_iter()
-            .map(|update| {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "update": update
-                    }
-                })
+        let translated = self.translate_event(event);
+        let mut notifications = Vec::new();
+        if let Some(update) = translated.delegation {
+            notifications.push(delegation_update_notification(update));
+        }
+        notifications.extend(translated.updates.into_iter().map(|(session_id, update)| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": update
+                }
             })
-            .collect()
+        }));
+        notifications
     }
 
     /// Single-notification adapter over [`Self::translate_notifications`].
@@ -2496,13 +2698,11 @@ impl AcpLiveEventTranslator {
     /// Updates that belong to a run carry its id in `_meta.querymt.runId`: the
     /// run [`Self::translate_state_update`] last observed for the session.
     pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
-        let mut updates = self.translate_unstamped_updates(event);
-        if let Some(run_id) = self.current_run_id(event.session_id()) {
-            for update in &mut updates {
-                querymt_agent_core::replay::stamp_run_id(update, run_id);
-            }
-        }
-        updates
+        self.translate_event(event)
+            .updates
+            .into_iter()
+            .map(|(_, update)| update)
+            .collect()
     }
 
     fn translate_unstamped_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
@@ -6151,6 +6351,7 @@ mod tests {
                 plan_operations: true,
                 notices: true,
                 compaction: true,
+                ..Default::default()
             },
         )
         .await;
@@ -7767,6 +7968,7 @@ mod session_update_tests {
             plan_operations: true,
             notices: true,
             compaction: true,
+            ..Default::default()
         }
     }
 
@@ -7930,6 +8132,149 @@ mod session_update_tests {
         assert!(!null_session.notices && !null_session.compaction);
     }
 
+    fn capabilities_from_json(value: serde_json::Value) -> AcpSessionUpdateCapabilities {
+        let capabilities: crate::acp::protocol::ClientCapabilities =
+            serde_json::from_value(value).expect("client capabilities deserialize");
+        AcpSessionUpdateCapabilities::from_client_capabilities(&capabilities)
+    }
+
+    #[test]
+    fn clients_advertise_different_preview_capabilities() {
+        let cursors_only = capabilities_from_json(serde_json::json!({
+            "session": {"cursors": {}}
+        }));
+        let subagents_only = capabilities_from_json(serde_json::json!({
+            "subagents": {}
+        }));
+        let everything = capabilities_from_json(serde_json::json!({
+            "plan": {},
+            "subagents": {},
+            "session": {"notices": {}, "compaction": {}, "cursors": {}}
+        }));
+
+        // Each capability is parsed independently of the others.
+        assert_eq!(
+            cursors_only,
+            AcpSessionUpdateCapabilities {
+                cursors: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            subagents_only,
+            AcpSessionUpdateCapabilities {
+                subagents: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            everything,
+            AcpSessionUpdateCapabilities {
+                plan_operations: true,
+                notices: true,
+                compaction: true,
+                cursors: true,
+                subagents: true,
+            }
+        );
+
+        // Two translators with different capabilities over the same events:
+        // each receives only the variants it advertised.
+        let mut full = AcpLiveEventTranslator::new();
+        full.set_capabilities(everything);
+        let mut narrow = AcpLiveEventTranslator::new();
+        narrow.set_capabilities(cursors_only);
+        assert_eq!(full.capabilities(), everything);
+        assert_eq!(narrow.capabilities(), cursors_only);
+
+        let notice = envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&notice).as_slice(),
+            [SessionUpdate::Notice(_)]
+        ));
+        assert!(narrow.translate_updates(&notice).is_empty());
+
+        let plan = todo_start(&todo_args(&[("a", "pending")]));
+        assert!(matches!(
+            full.translate_updates(&plan).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        assert!(matches!(
+            narrow.translate_updates(&plan).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+    }
+
+    fn cursor_json(entity: &querymt_agent_core::replay::CursorEntity) -> serde_json::Value {
+        let update = querymt_agent_core::replay::cursor_update(entity);
+        serde_json::to_value(update).expect("cursor update serializes")
+    }
+
+    #[test]
+    fn message_cursors_are_forkable() {
+        use querymt_agent_core::replay::CursorEntity;
+        for (entity, kind) in [
+            (CursorEntity::UserMessage("u1".into()), "user_message"),
+            (CursorEntity::AgentMessage("a1".into()), "agent_message"),
+        ] {
+            let json = cursor_json(&entity);
+            assert_eq!(json["sessionUpdate"], "cursor_update");
+            assert_eq!(json["cursorId"], entity.cursor_id());
+            assert_eq!(json["anchor"]["type"], kind);
+            assert_eq!(json["anchor"]["position"], "after");
+            assert!(
+                json["capabilities"]["fork"].is_object(),
+                "message cursor must advertise fork: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_cursors_are_not_forkable() {
+        use querymt_agent_core::replay::CursorEntity;
+        for (entity, kind) in [
+            (CursorEntity::ToolCall("call-1".into()), "tool_call"),
+            (CursorEntity::AgentThought("m1".into()), "agent_thought"),
+            (CursorEntity::Compaction("k1".into()), "compaction"),
+        ] {
+            let json = cursor_json(&entity);
+            assert_eq!(json["anchor"]["type"], kind);
+            assert!(
+                json.get("capabilities").is_none(),
+                "{kind} cursor must carry no fork capability: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_is_omitted_or_null() {
+        let omitted = capabilities_from_json(serde_json::json!({}));
+        assert!(!omitted.cursors && !omitted.subagents);
+
+        let null = capabilities_from_json(serde_json::json!({
+            "subagents": null,
+            "session": {"cursors": null}
+        }));
+        assert!(!null.cursors && !null.subagents);
+
+        let null_session = capabilities_from_json(serde_json::json!({"session": null}));
+        assert!(!null_session.cursors && !null_session.subagents);
+
+        // An empty object advertises support.
+        let supplied = capabilities_from_json(serde_json::json!({
+            "subagents": {},
+            "session": {"cursors": {}}
+        }));
+        assert!(supplied.cursors && supplied.subagents);
+    }
+
     #[test]
     fn capability_snapshot_matches_documented_client_capabilities_json() {
         // Mirrors the JSON advertised in the ACP documentation.
@@ -7971,6 +8316,7 @@ mod session_update_tests {
             plan_operations: false,
             notices: false,
             compaction: true,
+            ..Default::default()
         });
         let mut legacy = AcpLiveEventTranslator::new();
 

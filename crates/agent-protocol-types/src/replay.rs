@@ -8,10 +8,12 @@
 
 use crate::events::{AgentEventKind, ReasoningPartStored};
 use crate::protocol::{
-    CompactionId, Content, ContentBlock, ContentChunk, MaybeUndefined, MessageId, Meta, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId, PlanUpdate, PlanUpdateContent,
-    SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    CompactionId, Content, ContentBlock, ContentChunk, CursorAnchor, CursorAnchorPosition,
+    CursorCapabilities, CursorCompactionAnchor, CursorForkCapabilities, CursorMessageAnchor,
+    CursorToolCallAnchor, CursorUpdate, MaybeUndefined, MessageId, Meta, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PlanId, PlanUpdate, PlanUpdateContent, SessionUpdate,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 
 /// Deterministic plan identity for QueryMT's todo list within a session.
@@ -531,9 +533,218 @@ impl CompactionIds {
     }
 }
 
+/// Prefix of a cursor id anchored after a user or agent message.
+const CURSOR_MESSAGE_PREFIX: &str = "m:";
+/// Prefix of a cursor id anchored after an agent thought.
+const CURSOR_THOUGHT_PREFIX: &str = "t:";
+/// Prefix of a cursor id anchored after a tool call.
+const CURSOR_TOOL_CALL_PREFIX: &str = "c:";
+/// Prefix of a cursor id anchored after a compaction.
+const CURSOR_COMPACTION_PREFIX: &str = "k:";
+
+/// A timeline entity a session cursor is anchored after, as the agent knows
+/// it when it announces the cursor. Carries the entity kind that the cursor
+/// id alone does not (user and agent messages share one id prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorEntity {
+    /// After a user message.
+    UserMessage(String),
+    /// After an agent message.
+    AgentMessage(String),
+    /// After an agent thought.
+    AgentThought(String),
+    /// After a tool call.
+    ToolCall(String),
+    /// After a compaction.
+    Compaction(String),
+}
+
+impl CursorEntity {
+    /// The cursor this entity's `after` position is announced as.
+    pub fn target(&self) -> CursorTarget {
+        match self {
+            Self::UserMessage(id) | Self::AgentMessage(id) => CursorTarget::Message(id.clone()),
+            Self::AgentThought(id) => CursorTarget::Thought(id.clone()),
+            Self::ToolCall(id) => CursorTarget::ToolCall(id.clone()),
+            Self::Compaction(id) => CursorTarget::Compaction(id.clone()),
+        }
+    }
+
+    /// The cursor id of this entity's `after` position.
+    pub fn cursor_id(&self) -> String {
+        self.target().encode()
+    }
+}
+
+/// What a cursor id identifies: the anchored entity's durable id, without the
+/// message kind. The id is a pure function of the anchor, so replay, live
+/// delivery and a restarted agent derive the same one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorTarget {
+    /// `m:<message_id>`: a user or agent message.
+    Message(String),
+    /// `t:<message_id>`: an agent thought.
+    Thought(String),
+    /// `c:<tool_call_id>`: a tool call.
+    ToolCall(String),
+    /// `k:<compaction_id>`: a compaction.
+    Compaction(String),
+}
+
+impl CursorTarget {
+    /// The wire cursor id.
+    pub fn encode(&self) -> String {
+        let (prefix, id) = match self {
+            Self::Message(id) => (CURSOR_MESSAGE_PREFIX, id),
+            Self::Thought(id) => (CURSOR_THOUGHT_PREFIX, id),
+            Self::ToolCall(id) => (CURSOR_TOOL_CALL_PREFIX, id),
+            Self::Compaction(id) => (CURSOR_COMPACTION_PREFIX, id),
+        };
+        format!("{prefix}{id}")
+    }
+
+    /// Parse a wire cursor id. `None` for an unknown prefix or an empty id.
+    pub fn decode(cursor_id: &str) -> Option<Self> {
+        let parse = |prefix: &str, build: fn(String) -> Self| {
+            cursor_id
+                .strip_prefix(prefix)
+                .filter(|id| !id.is_empty())
+                .map(|id| build(id.to_owned()))
+        };
+        parse(CURSOR_MESSAGE_PREFIX, Self::Message)
+            .or_else(|| parse(CURSOR_THOUGHT_PREFIX, Self::Thought))
+            .or_else(|| parse(CURSOR_TOOL_CALL_PREFIX, Self::ToolCall))
+            .or_else(|| parse(CURSOR_COMPACTION_PREFIX, Self::Compaction))
+    }
+
+    /// Whether `session/fork` may use this cursor: only message anchors.
+    /// Fixed for a cursor's lifetime.
+    pub fn is_forkable(&self) -> bool {
+        matches!(self, Self::Message(_))
+    }
+
+    /// The message a forkable cursor forks after, `None` for the other kinds.
+    pub fn forkable_message_id(&self) -> Option<&str> {
+        match self {
+            Self::Message(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// The `cursor_update` announcing the position right after `entity`.
+///
+/// Carries the anchor (the first update for a cursor must) and
+/// `capabilities.fork` on message cursors only.
+pub fn cursor_update(entity: &CursorEntity) -> SessionUpdate {
+    let position = CursorAnchorPosition::After;
+    let anchor = match entity {
+        CursorEntity::UserMessage(id) => {
+            CursorAnchor::UserMessage(CursorMessageAnchor::new(id.clone(), position))
+        }
+        CursorEntity::AgentMessage(id) => {
+            CursorAnchor::AgentMessage(CursorMessageAnchor::new(id.clone(), position))
+        }
+        CursorEntity::AgentThought(id) => {
+            CursorAnchor::AgentThought(CursorMessageAnchor::new(id.clone(), position))
+        }
+        CursorEntity::ToolCall(id) => {
+            CursorAnchor::ToolCall(CursorToolCallAnchor::new(id.clone(), position))
+        }
+        CursorEntity::Compaction(id) => {
+            CursorAnchor::Compaction(CursorCompactionAnchor::new(id.clone(), position))
+        }
+    };
+    let mut update = CursorUpdate::new(entity.cursor_id()).anchor(anchor);
+    if entity.target().is_forkable() {
+        update = update.capabilities(CursorCapabilities::new().fork(CursorForkCapabilities::new()));
+    }
+    SessionUpdate::CursorUpdate(update)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cursor(entity: &CursorEntity) -> CursorUpdate {
+        match cursor_update(entity) {
+            SessionUpdate::CursorUpdate(update) => update,
+            other => panic!("expected a cursor update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_ids_round_trip_through_the_codec() {
+        for target in [
+            CursorTarget::Message("msg-1".into()),
+            CursorTarget::Thought("msg-1".into()),
+            CursorTarget::ToolCall("call:with:colons".into()),
+            CursorTarget::Compaction("cmp-9".into()),
+        ] {
+            assert_eq!(CursorTarget::decode(&target.encode()), Some(target));
+        }
+        assert_eq!(CursorEntity::UserMessage("a".into()).cursor_id(), "m:a");
+        assert_eq!(CursorEntity::AgentMessage("a".into()).cursor_id(), "m:a");
+        assert_eq!(CursorEntity::AgentThought("a".into()).cursor_id(), "t:a");
+        assert_eq!(CursorEntity::ToolCall("a".into()).cursor_id(), "c:a");
+        assert_eq!(CursorEntity::Compaction("a".into()).cursor_id(), "k:a");
+    }
+
+    #[test]
+    fn malformed_cursor_ids_do_not_decode() {
+        for bad in ["", "m:", "x:abc", "abc", "M:abc"] {
+            assert_eq!(CursorTarget::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn message_cursors_are_forkable() {
+        for entity in [
+            CursorEntity::UserMessage("u1".into()),
+            CursorEntity::AgentMessage("a1".into()),
+        ] {
+            let update = cursor(&entity);
+            let MaybeUndefined::Value(capabilities) = &update.capabilities else {
+                panic!("message cursor must carry capabilities: {update:?}");
+            };
+            assert!(capabilities.fork.is_some());
+            assert!(entity.target().is_forkable());
+            assert!(matches!(
+                update.anchor,
+                Some(CursorAnchor::UserMessage(_) | CursorAnchor::AgentMessage(_))
+            ));
+        }
+        let target = CursorTarget::decode("m:a1").unwrap();
+        assert_eq!(target.forkable_message_id(), Some("a1"));
+    }
+
+    #[test]
+    fn tool_call_cursors_are_not_forkable() {
+        for entity in [
+            CursorEntity::ToolCall("call-1".into()),
+            CursorEntity::AgentThought("m1".into()),
+            CursorEntity::Compaction("k1".into()),
+        ] {
+            let update = cursor(&entity);
+            assert!(
+                matches!(update.capabilities, MaybeUndefined::Undefined),
+                "{entity:?} must carry no fork capability: {update:?}"
+            );
+            assert!(!entity.target().is_forkable());
+            assert_eq!(entity.target().forkable_message_id(), None);
+            assert!(update.anchor.is_some());
+        }
+    }
+
+    #[test]
+    fn cursor_anchors_sit_after_their_entity() {
+        let update = cursor(&CursorEntity::ToolCall("call-1".into()));
+        let Some(CursorAnchor::ToolCall(anchor)) = update.anchor else {
+            panic!("tool call anchor expected");
+        };
+        assert_eq!(&*anchor.tool_call_id.0, "call-1");
+        assert_eq!(anchor.position, CursorAnchorPosition::After);
+    }
 
     #[test]
     fn id_less_start_and_end_are_one_compaction() {

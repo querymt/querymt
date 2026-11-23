@@ -269,6 +269,7 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
             plan_operations: false,
             notices: false,
             compaction: true,
+            ..Default::default()
         });
     translator.lock().unwrap().seed_config_options(
         session_id,

@@ -3,7 +3,7 @@
 
 use crate::accounting::AccountingSnapshot;
 use crate::delegation_update::DelegationUpdateNotification;
-use crate::protocol::ContentBlock;
+use crate::protocol::{ContentBlock, SubagentUpdate};
 use crate::runtime_status::SessionRuntimeStatus;
 use crate::session::history::{HistoryInfo, SessionHistorySummary, TruncatedEntry};
 use crate::session::views::AuditView;
@@ -39,6 +39,12 @@ pub struct SessionLoadSnapshot {
     pub accounting: AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
     pub delegation_updates: Vec<DelegationUpdateNotification>,
+    /// The latest ACP `subagent_update` of every child session the session
+    /// created, including delegations still running. Same state as
+    /// `delegationUpdates`, in the form `session/update` carries.
+    #[serde(default, rename = "subagentUpdates")]
+    #[typeshare(serialized_as = "any")]
+    pub subagent_updates: Vec<SubagentUpdate>,
     #[serde(
         default,
         rename = "userPrompts",
