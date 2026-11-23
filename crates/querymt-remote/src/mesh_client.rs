@@ -33,6 +33,25 @@ type StreamRouters =
     RwLock<HashMap<StreamRouterKey, kameo::actor::ActorRef<ProviderStreamRouterActor>>>;
 static STREAM_ROUTER_CACHE: OnceLock<StreamRouters> = OnceLock::new();
 
+fn provider_host_peer(target_locator: &str) -> Result<PeerId, LLMError> {
+    target_locator
+        .rsplit_once("::provider_host::peer::")
+        .and_then(|(_, peer)| peer.parse().ok())
+        .ok_or_else(|| {
+            LLMError::ProviderError(format!("Invalid provider host locator '{target_locator}'"))
+        })
+}
+
+fn require_provider_host_peer(expected: PeerId, resolved: Option<&PeerId>) -> Result<(), LLMError> {
+    if resolved == Some(&expected) {
+        Ok(())
+    } else {
+        Err(LLMError::ProviderError(format!(
+            "Provider host lookup did not resolve to expected peer '{expected}'"
+        )))
+    }
+}
+
 fn provider_ask_error(error: SharingAskError<crate::RemoteProviderHostError>) -> LLMError {
     match error {
         SharingAskError::Sharing(error) => sharing_error(error),
@@ -117,12 +136,14 @@ impl KameoMeshClientTransport {
         &self,
         target_locator: &str,
     ) -> Result<kameo::actor::RemoteActorRef<ProviderHostActor>, LLMError> {
+        let expected_peer = provider_host_peer(target_locator)?;
         if let Some(cached) = Self::provider_host_cache()
             .read()
             .await
             .get(target_locator)
             .cloned()
         {
+            require_provider_host_peer(expected_peer, cached.id().peer_id())?;
             tracing::Span::current().record("cache_hit", true);
             tracing::Span::current().record("found", true);
             tracing::Span::current().record("lookup_ms", 0_u64);
@@ -146,6 +167,10 @@ impl KameoMeshClientTransport {
                     "MeshChatProvider: provider host '{}' not found (is the node online?)",
                     target_locator
                 ))
+            })
+            .and_then(|actor| {
+                require_provider_host_peer(expected_peer, actor.id().peer_id())?;
+                Ok(actor)
             });
         tracing::Span::current().record("lookup_ms", lookup_start.elapsed().as_millis() as u64);
         tracing::Span::current().record("found", result.is_ok());
@@ -696,10 +721,24 @@ mod tests {
         drop(catalogs);
     }
 
+    #[test]
+    fn provider_host_selection_requires_the_locators_peer() {
+        let selected = PeerId::random();
+        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &selected);
+        let expected = provider_host_peer(&locator).unwrap();
+        assert!(require_provider_host_peer(expected, Some(&selected)).is_ok());
+        assert!(require_provider_host_peer(expected, Some(&PeerId::random())).is_err());
+        assert!(require_provider_host_peer(expected, None).is_err());
+    }
+
     #[tokio::test]
     async fn mesh_chat_uses_the_targets_scope_and_forwards_generation_options() {
         let (mesh, routes) = mesh_fixture();
-        let target = NodeId::from_peer_id(PeerId::random());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: seen.clone(),
+        })));
+        let target = NodeId::from_peer_id(*host.id().peer_id().unwrap());
         let scope = MeshScopeId::Iroh {
             mesh_id: "fixture-mesh".into(),
         };
@@ -710,10 +749,6 @@ mod tests {
             [libp2p::Multiaddr::empty()],
             20,
         );
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
-            seen: seen.clone(),
-        })));
         let locator = scoped_provider_host(&scope, &target.to_string());
         mesh.register_actor(host.clone(), &locator).await;
 
