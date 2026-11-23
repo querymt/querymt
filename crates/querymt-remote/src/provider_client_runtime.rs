@@ -43,6 +43,12 @@ pub trait RemoteProviderClientTransport: Send + Sync {
     async fn local_peer_id_display(&self) -> String;
     async fn target_peer_id_display(&self, target_locator: &str) -> String;
     async fn invalidate_cached_host(&self, target_locator: &str);
+    fn is_stale_host(&self, _error: &LLMError) -> bool {
+        false
+    }
+    fn retry_dispatch(&self, _error: &LLMError, fallback: bool) -> bool {
+        fallback
+    }
     async fn lookup_host(&self, target_locator: &str) -> Result<Self::HostRef, LLMError>;
     async fn get_contract_info(
         &self,
@@ -111,7 +117,7 @@ where
 {
     transport: Arc<TTransport>,
     config: RemoteProviderClientConfig,
-    contract_info: tokio::sync::OnceCell<ProviderContractInfo>,
+    contract_info: Arc<parking_lot::RwLock<Arc<tokio::sync::OnceCell<ProviderContractInfo>>>>,
 }
 
 impl<TTransport> RemoteProviderClientCore<TTransport>
@@ -122,7 +128,7 @@ where
         Self {
             transport,
             config,
-            contract_info: tokio::sync::OnceCell::new(),
+            contract_info: Arc::default(),
         }
     }
 
@@ -144,6 +150,42 @@ where
         self.transport
             .invalidate_cached_host(self.config.target_locator())
             .await;
+        *self.contract_info.write() = Arc::default();
+    }
+
+    async fn refresh_host(
+        &self,
+        required_version: Option<u32>,
+    ) -> Result<TTransport::HostRef, LLMError> {
+        self.invalidate_cached_host().await;
+        let host = self.lookup_host().await?;
+        self.validate_contract(&host, required_version).await?;
+        Ok(host)
+    }
+
+    pub(crate) async fn lookup_validated_host(
+        &self,
+        required_version: Option<u32>,
+    ) -> Result<TTransport::HostRef, LLMError> {
+        let host = self.lookup_host().await?;
+        self.validate_or_refresh_host(host, required_version).await
+    }
+
+    pub(crate) async fn validate_or_refresh_host(
+        &self,
+        host: TTransport::HostRef,
+        required_version: Option<u32>,
+    ) -> Result<TTransport::HostRef, LLMError> {
+        match self.validate_contract(&host, required_version).await {
+            Ok(()) => Ok(host),
+            Err(error) if self.transport.is_stale_host(&error) => {
+                self.refresh_host(required_version).await
+            }
+            Err(error) => {
+                self.invalidate_cached_host().await;
+                Err(error)
+            }
+        }
     }
 
     /// Perform the mesh contract handshake and verify protocol compatibility.
@@ -158,10 +200,19 @@ where
         host: &TTransport::HostRef,
         required_version: Option<u32>,
     ) -> Result<(), LLMError> {
+        self.validated_contract_info(host, required_version)
+            .await
+            .map(|_| ())
+    }
+
+    async fn validated_contract_info(
+        &self,
+        host: &TTransport::HostRef,
+        required_version: Option<u32>,
+    ) -> Result<ProviderContractInfo, LLMError> {
         let started = std::time::Instant::now();
-        let info = match self
-            .contract_info
-            .get_or_try_init(|| async {
+        let cache = self.contract_info.read().clone();
+        let info = match cache.get_or_try_init(|| async {
                 let info = self
                     .transport
                     .get_contract_info(
@@ -219,7 +270,7 @@ where
         };
 
         let Some(required_version) = required_version else {
-            return Ok(());
+            return Ok(info.clone());
         };
         if info.item_aware_chat_version != Some(required_version) {
             let error = LLMError::InvalidRequest(format!(
@@ -236,18 +287,20 @@ where
             );
             return Err(error);
         }
-        Ok(())
+        Ok(info.clone())
     }
 
     /// Negotiate provider facts before a caller snapshots its model profile.
     pub async fn negotiate_contract(&self) -> Result<ProviderContractInfo, LLMError> {
         let host = self.lookup_host().await?;
-        self.validate_contract(&host, None).await?;
-        Ok(self
-            .contract_info
-            .get()
-            .expect("validated contract is cached")
-            .clone())
+        match self.validated_contract_info(&host, None).await {
+            Err(error) if self.transport.is_stale_host(&error) => {
+                self.invalidate_cached_host().await;
+                let host = self.lookup_host().await?;
+                self.validated_contract_info(&host, None).await
+            }
+            result => result,
+        }
     }
 
     pub fn build_chat_request(&self, call: &ChatCall<'_>) -> ProviderChatRequest {
@@ -261,6 +314,7 @@ where
     /// an older or less capable peer would drop.
     pub fn capabilities(&self) -> ChatCapabilities {
         self.contract_info
+            .read()
             .get()
             .map_or(ChatCapabilities::NONE.with_streaming(true), |info| {
                 info.capabilities
@@ -273,14 +327,9 @@ where
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
         let request = self.config.build_chat_request(call);
-        let host = self.lookup_host().await?;
-        if let Err(error) = self
-            .validate_contract(&host, request.item_aware_contract_version)
-            .await
-        {
-            self.invalidate_cached_host().await;
-            return Err(error);
-        }
+        let host = self
+            .lookup_validated_host(request.item_aware_contract_version)
+            .await?;
         self.send_chat_request_with_retry(&host, &request, should_retry)
             .await
     }
@@ -360,9 +409,10 @@ where
     ) -> Result<ProviderChatResponse, LLMError> {
         match self.transport.send_chat_request(host, request).await {
             Ok(response) => Ok(response),
-            Err(error) if should_retry(&error) => {
-                self.invalidate_cached_host().await;
-                let host = self.lookup_host().await?;
+            Err(error) if self.transport.retry_dispatch(&error, should_retry(&error)) => {
+                let host = self
+                    .refresh_host(request.item_aware_contract_version)
+                    .await?;
                 self.transport.send_chat_request(&host, request).await
             }
             Err(error) => Err(error),
@@ -386,17 +436,19 @@ where
         host: &TTransport::HostRef,
         request: ProviderStreamRequest<TTransport::RemoteRouterRef>,
         should_retry: impl Fn(&LLMError) -> bool,
-    ) -> Result<(), LLMError> {
+    ) -> Result<TTransport::HostRef, LLMError> {
         match self
             .transport
             .send_stream_request(host, request.clone())
             .await
         {
-            Ok(()) => Ok(()),
-            Err(error) if should_retry(&error) => {
-                self.invalidate_cached_host().await;
-                let host = self.lookup_host().await?;
-                self.transport.send_stream_request(&host, request).await
+            Ok(()) => Ok(host.clone()),
+            Err(error) if self.transport.retry_dispatch(&error, should_retry(&error)) => {
+                let host = self
+                    .refresh_host(request.item_aware_contract_version)
+                    .await?;
+                self.transport.send_stream_request(&host, request).await?;
+                Ok(host)
             }
             Err(error) => Err(error),
         }
@@ -913,6 +965,51 @@ mod tests {
             }
             assert!(stream.next().await.is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_terminal_wins_when_consumer_polls_after_lease_loss_deadline() {
+        use futures_util::StreamExt as _;
+        use querymt::chat::{ChatProvider as _, FinishReason, StreamChunk};
+        use std::time::Duration;
+
+        let (transport, _) = core_with_contract(ProviderContractInfo {
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE.with_streaming(true),
+            item_aware_chat_version: None,
+            generation: Default::default(),
+        });
+        let core = RemoteProviderClientCore::new(
+            transport.clone(),
+            RemoteProviderClientConfig::new("peer", "fixture", "model").with_stream_controls(10, 3),
+        );
+        let provider = crate::RemoteChatProvider::new(core);
+        let mut stream = provider.chat_stream(&ChatCall::new(&[])).await.unwrap();
+        let sender = transport.consumer.lock().unwrap().as_ref().unwrap().clone();
+        // Poll once after the first renewal is due. The failed renewal arms the
+        // deadline before the ready text is yielded back to this consumer.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        sender
+            .send(StreamRelayMessage::Chunk(StreamChunk::Text("first".into())))
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Text(_)))
+        ));
+        sender
+            .send(StreamRelayMessage::Chunk(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            }))
+            .unwrap();
+        tokio::time::advance(
+            Duration::from_secs(1) + crate::provider_host_actor::STREAM_RELAY_TIMEOUT * 2,
+        )
+        .await;
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Done { .. }))
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

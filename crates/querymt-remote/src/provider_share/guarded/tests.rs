@@ -53,6 +53,7 @@ struct Store {
     settlement_failed: Notify,
     settlement_recorded: Notify,
     pause_reserve: Mutex<Option<PauseReserve>>,
+    pause_settle: Mutex<Option<PauseReserve>>,
     reserve_calls: AtomicUsize,
     released: Notify,
     fail_next_grant_read: AtomicBool,
@@ -71,6 +72,7 @@ impl Default for Store {
             settlement_failed: Default::default(),
             settlement_recorded: Default::default(),
             pause_reserve: Default::default(),
+            pause_settle: Default::default(),
             reserve_calls: Default::default(),
             released: Default::default(),
             fail_next_grant_read: Default::default(),
@@ -231,6 +233,11 @@ impl QuotaStore for Store {
         }
         self.settled.lock().push((id, usage));
         self.settlement_recorded.notify_one();
+        let pause = self.pause_settle.lock().take();
+        if let Some(PauseReserve { committed, resume }) = pause {
+            committed.send(()).unwrap();
+            resume.await.unwrap();
+        }
         Ok(QuotaSettlement::Recorded)
     }
     async fn reconcile_startup(&self, _: &NodeId) -> Result<(), QuotaError> {
@@ -641,13 +648,15 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
         model: "allowed".into(),
         params: None,
     };
+    // Withdraw explicitly so this assertion does not race the shutdown watcher.
+    router.withdraw_actor(provider);
     for request in [
         ask_request::<ProviderHostActor, _>(provider, &contract),
         ask_request::<ProviderHostActor, _>(provider, &chat),
     ] {
         assert!(matches!(
             router.handle_v1(peer, request).await,
-            Ok(SwarmResponse::Ask(Err(_)))
+            Ok(SwarmResponse::Ask(Err(RemoteSendError::ActorNotRunning)))
         ));
     }
     assert_eq!(store.attempts.lock().len(), 1);
@@ -1277,7 +1286,7 @@ async fn dropping_guarded_admission_cancels_an_in_progress_prepare() {
 }
 
 #[tokio::test]
-async fn session_cancellation_continues_after_one_stream_fails_authorization() {
+async fn session_cancellation_reports_policy_failure_and_cancels_other_streams() {
     let mut fixture = StreamFixture::new(StreamEnding::Done).await;
     let first = fixture.request();
     let second = fixture.request();
@@ -1287,7 +1296,7 @@ async fn session_cancellation_continues_after_one_stream_fails_authorization() {
         ack(reply);
     }
     let cancel = CancelProviderStreamRequest {
-        session_id: first.session_id,
+        session_id: first.session_id.clone(),
         request_id: None,
         reason: None,
     };
@@ -1305,7 +1314,25 @@ async fn session_cancellation_continues_after_one_stream_fails_authorization() {
     })
     .await
     .unwrap();
-    assert_eq!(cancelled.unwrap(), 1);
+    assert_eq!(code(cancelled.unwrap_err()), "mesh_access_unavailable");
+    let command = timeout(Duration::from_secs(3), fixture.commands.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SwarmCommand::Sharing {
+        request: SharingRequest::Actor(envelope),
+        tx,
+        ..
+    } = command
+    else {
+        panic!("expected the authorized stream's cancellation callback");
+    };
+    let SwarmRequest::Ask { payload, .. } = *envelope else {
+        panic!("expected callback ask")
+    };
+    let relay: RoutedStreamRelayMessage = rmp_serde::from_slice(&payload).unwrap();
+    assert_transport(relay, TransportErrorKind::ConnectionClosed, "cancelled");
+    ack(tx);
 }
 
 #[tokio::test]
@@ -1485,6 +1512,50 @@ async fn guarded_stream_gets_full_reconnect_grace_after_an_unanswered_callback()
 }
 
 #[tokio::test]
+async fn revoked_disconnected_stream_sends_only_scoped_error_after_grace_expires_in_settlement() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (committed_tx, committed) = oneshot::channel();
+    let (resume, resume_rx) = oneshot::channel();
+    *fixture.store.pause_settle.lock() = Some(PauseReserve {
+        committed: committed_tx,
+        resume: resume_rx,
+    });
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    disconnect(reply);
+    let (notice, unanswered) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+
+    let binding = key(fixture.host, fixture.peer);
+    let revision = fixture.store.grant(&binding).await.unwrap().revision;
+    fixture
+        .store
+        .replace_grant(&binding, revision, PeerGrant::None)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), committed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(request.reconnect_grace_secs)).await;
+    resume.send(()).unwrap();
+    let (terminal, reply) = fixture.relay(&request).await;
+    drop(unanswered);
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected scoped error, not replay")
+    };
+    assert!(
+        matches!(LLMError::from_payload(error), LLMError::ProviderResponseError(failure) if failure.code() == Some("mesh_access_denied"))
+    );
+    ack(reply);
+}
+
+#[tokio::test]
 async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeout() {
     let mut fixture = StreamFixture::new(StreamEnding::Done).await;
     let request = fixture.request();
@@ -1493,21 +1564,14 @@ async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeou
     assert_eq!(initial.seq, Some(0));
     disconnect(reply);
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let (notice, reply) = fixture.relay(&request).await;
-            let settled = !fixture.store.settled.lock().is_empty();
-            assert_eq!(notice.seq, None);
-            assert!(matches!(notice.message, StreamRelayMessage::TransportReconnected { buffered_chunks }
-                if buffered_chunks == usize::from(!settled)));
-            if settled {
-                ack(reply);
-                break;
-            }
-            disconnect(reply);
-        }
-    }).await.expect("reconnect grace did not expire");
+    // Let the reconnect attempt expire without acknowledging it.
+    let (notice, unanswered) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
     let (terminal, reply) = fixture.relay(&request).await;
+    drop(unanswered);
     assert_transport(
         terminal,
         TransportErrorKind::Timeout,

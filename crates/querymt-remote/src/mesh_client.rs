@@ -52,12 +52,48 @@ fn require_provider_host_peer(expected: PeerId, resolved: Option<&PeerId>) -> Re
     }
 }
 
+const STALE_PROVIDER_HOST: &str = "mesh_provider_host_unavailable";
+
+fn provider_dispatch_error<E: std::fmt::Display>(
+    error: kameo::error::RemoteSendError<E>,
+) -> Result<LLMError, E> {
+    use kameo::error::RemoteSendError;
+    use querymt::error::{ProviderErrorKind, ProviderFailure};
+    if matches!(
+        error,
+        RemoteSendError::ActorNotRunning | RemoteSendError::UnknownActor { .. }
+    ) {
+        return Ok(
+            ProviderFailure::new(ProviderErrorKind::UnknownPermanent, error.to_string())
+                .with_code(Some(STALE_PROVIDER_HOST.into()))
+                .into(),
+        );
+    }
+    crate::remote_send_error_base(error)
+}
+
+fn is_stale_host_error(error: &LLMError) -> bool {
+    matches!(error, LLMError::ProviderResponseError(failure) if failure.code() == Some(STALE_PROVIDER_HOST))
+}
+
+fn provider_handler_error(handler: crate::RemoteProviderHostError) -> LLMError {
+    let error = LLMError::from_payload(handler.to_payload());
+    match error {
+        LLMError::ProviderResponseError(failure) if failure.code() == Some(STALE_PROVIDER_HOST) => {
+            // Only the actor transport, not a handler that already ran, can
+            // certify that an attempt missed the old host.
+            LLMError::ProviderResponseError(Box::new((*failure).with_code(None)))
+        }
+        error => error,
+    }
+}
+
 fn provider_ask_error(error: SharingAskError<crate::RemoteProviderHostError>) -> LLMError {
     match error {
         SharingAskError::Sharing(error) => sharing_error(error),
-        SharingAskError::Actor(error) => match crate::remote_send_error_base(error) {
+        SharingAskError::Actor(error) => match provider_dispatch_error(error) {
             Ok(error) => error,
-            Err(handler) => LLMError::from_payload(handler.to_payload()),
+            Err(handler) => provider_handler_error(handler),
         },
     }
 }
@@ -287,6 +323,15 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         self.invalidate_cached_provider_host(target_locator).await;
     }
 
+    fn is_stale_host(&self, error: &LLMError) -> bool {
+        is_stale_host_error(error)
+    }
+
+    fn retry_dispatch(&self, error: &LLMError, _fallback: bool) -> bool {
+        // ConnectionClosed does not prove that a request missed its handler.
+        self.is_stale_host(error)
+    }
+
     async fn lookup_host(&self, target_locator: &str) -> Result<Self::HostRef, LLMError> {
         self.lookup_provider_host(target_locator).await
     }
@@ -384,11 +429,11 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                     .reply_timeout(reply_timeout)
                     .send()
                     .await
-                    .map_err(|e| match crate::remote_send_error_base(e) {
+                    .map_err(|e| match provider_dispatch_error(e) {
                         Ok(err) => {
                             crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes)
                         }
-                        Err(handler) => LLMError::from_payload(handler.to_payload()),
+                        Err(handler) => provider_handler_error(handler),
                     })
             },
         )
@@ -417,7 +462,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
                 host.tell(&request).send_ack().await.map_err(|error| {
                     crate::provider_transport::remap_legacy_oversize_eof(
-                        remote_send_error_to_llm_error_no_handler(error),
+                        provider_dispatch_error(error).unwrap_or_else(|never| match never {}),
                         encoded_bytes,
                     )
                 })
@@ -542,10 +587,10 @@ impl MeshChatProvider {
         session_id: &str,
         request_id: Option<&str>,
         reason: Option<&str>,
-    ) {
+    ) -> Result<(), LLMError> {
         self.inner
             .cancel_remote_stream(session_id, request_id, reason)
-            .await;
+            .await
     }
 
     pub async fn get_remote_stream_status(
@@ -779,6 +824,17 @@ mod tests {
             item_aware_contract_version: None,
             options: None,
         };
+        use kameo::error::RemoteSendError;
+        let actor_error = |error| provider_ask_error(SharingAskError::Actor(error));
+        assert!(transport.retry_dispatch(&actor_error(RemoteSendError::ActorNotRunning), false));
+        assert!(!transport.retry_dispatch(&actor_error(RemoteSendError::ActorStopped), true));
+        assert!(!transport.retry_dispatch(
+            &actor_error(RemoteSendError::UnknownMessage {
+                actor_remote_id: "provider".into(),
+                message_remote_id: "unsupported".into(),
+            }),
+            true
+        ));
         let timeout = || SharingCallError::Transport(OutboundFailure::Timeout);
         let ((), ()) = tokio::join!(
             async {
@@ -889,6 +945,35 @@ mod tests {
                 .await
                 .contains_key(&locator)
         );
+    }
+
+    #[tokio::test]
+    async fn cached_chat_refreshes_and_renegotiates_after_a_host_is_withdrawn() {
+        let (mesh, _) = mesh_fixture();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let spawn = || {
+            ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+                seen: seen.clone(),
+            })))
+        };
+        let withdrawn = spawn();
+        let target = NodeId::from_peer_id(*withdrawn.id().peer_id().unwrap());
+        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &target);
+        mesh.register_actor(withdrawn.clone(), &locator).await;
+        let provider = MeshChatProvider::from_node_id(&mesh, &target, "fixture", "demo");
+        provider.chat(&ChatCall::new(&[])).await.unwrap();
+        withdrawn.stop_gracefully().await.unwrap();
+        withdrawn.wait_for_shutdown().await;
+        let replacement = spawn();
+        mesh.register_actor(replacement.clone(), &locator).await;
+        provider.chat(&ChatCall::new(&[])).await.unwrap();
+        let transport = provider.inner.core().transport();
+        assert_eq!(
+            transport.lookup_provider_host(&locator).await.unwrap().id(),
+            replacement.id()
+        );
+        assert_eq!(seen.lock().len(), 2);
+        transport.invalidate_cached_provider_host(&locator).await;
     }
 
     #[tokio::test]

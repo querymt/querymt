@@ -1,5 +1,4 @@
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
-use futures_util::StreamExt;
 use querymt::LLMProvider;
 use querymt::chat::{
     ChatCall, ChatCapabilities, ChatOutput, ChatOutputProvenance, ChatProvider, ChatStream,
@@ -40,11 +39,10 @@ where
         session_id: &str,
         request_id: Option<&str>,
         reason: Option<&str>,
-    ) {
-        let _ = self
-            .core
+    ) -> Result<(), LLMError> {
+        self.core
             .cancel_stream(session_id, request_id, reason)
-            .await;
+            .await
     }
 
     pub async fn get_remote_stream_status(
@@ -180,8 +178,9 @@ where
             remote_router_ref,
             self.core.transport().stream_reconnect_grace().as_secs(),
         );
-        self.core
-            .validate_contract(&host_ref, stream_request.item_aware_contract_version)
+        let host_ref = self
+            .core
+            .validate_or_refresh_host(host_ref, stream_request.item_aware_contract_version)
             .await?;
 
         tracing::debug!(
@@ -190,7 +189,7 @@ where
             request_id = %request_id,
             "sending remote provider stream request"
         );
-        if let Err(error) = self
+        let host_ref = match self
             .core
             .send_stream_request_with_retry(&host_ref, stream_request, |error| {
                 matches!(
@@ -204,20 +203,23 @@ where
             })
             .await
         {
-            tracing::warn!(
-                target: "querymt_remote::provider::stream",
-                session_id = %session_id,
-                request_id = %request_id,
-                provider = %provider_name,
-                model = %model_name,
-                target_locator = %target_locator,
-                error = %error,
-                error_payload = %serde_json::to_string(&error.to_payload())
-                    .unwrap_or_else(|_| "unavailable".to_string()),
-                "remote provider stream request setup failed"
-            );
-            return Err(error);
-        }
+            Ok(host) => host,
+            Err(error) => {
+                tracing::warn!(
+                    target: "querymt_remote::provider::stream",
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    provider = %provider_name,
+                    model = %model_name,
+                    target_locator = %target_locator,
+                    error = %error,
+                    error_payload = %serde_json::to_string(&error.to_payload())
+                        .unwrap_or_else(|_| "unavailable".to_string()),
+                    "remote provider stream request setup failed"
+                );
+                return Err(error);
+            }
+        };
         tracing::info!(
             target: "querymt_remote::provider::stream",
             session_id = %session_id,
@@ -228,7 +230,7 @@ where
             "remote provider stream request acknowledged"
         );
 
-        let raw_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let raw_stream = rx;
         let session_id_for_stream = session_id.clone();
         let request_id_for_stream = request_id.clone();
         let provider_for_stream = provider_name.clone();
@@ -349,10 +351,18 @@ where
                             lease_lost_at.map(|at| lease_loss_grace.saturating_sub(at.elapsed()));
                         let next = tokio::select! {
                             biased;
-                            _ = sleep_if_set(lost) => return Some((Err(LLMError::Transport {
-                                kind: querymt::error::TransportErrorKind::ConnectionClosed,
-                                message: "remote provider stream lease could not be renewed and no terminal arrived".into(),
-                            }), None)),
+                            _ = sleep_if_set(lost) => {
+                                // Drain only what was already queued, in order. A terminal
+                                // received while this consumer was idle still takes precedence.
+                                raw_stream.close();
+                                match raw_stream.try_recv() {
+                                    Ok(message) => Some(message),
+                                    Err(_) => return Some((Err(LLMError::Transport {
+                                        kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                                        message: "remote provider stream lease could not be renewed and no terminal arrived".into(),
+                                    }), None)),
+                                }
+                            },
                             _ = sleep_if_set(reconnect) => return Some((
                                 Err(RemoteProviderClientCore::<TTransport>::reconnect_timeout_error(reconnect_grace)), None,
                             )),
@@ -367,7 +377,7 @@ where
                                 renew_due = now + if renewed { lease_renew_every } else { lease_renew_every.min(lease_loss_grace / 2) };
                                 continue;
                             }
-                            item = raw_stream.next() => item,
+                            item = raw_stream.recv() => item,
                             _ = tokio::time::sleep_until(renew_due), if renewal.is_none() => continue,
                         };
 

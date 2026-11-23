@@ -8,7 +8,7 @@ use crate::peer_access::{
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,6 +109,7 @@ pub struct MeshStateStore {
     state: MeshState,
     quota_runtime: QuotaRuntime,
     changes: broadcast::Sender<PolicyChange>,
+    peer_changes: Mutex<HashMap<PeerGrantKey, broadcast::Sender<PolicyChange>>>,
     usage_changes: broadcast::Sender<PeerGrantKey>,
 }
 
@@ -173,6 +174,7 @@ impl MeshStateStore {
             state,
             quota_runtime: QuotaRuntime::default(),
             changes: broadcast::channel(64).0,
+            peer_changes: Mutex::default(),
             usage_changes: broadcast::channel(64).0,
         };
         if initialize {
@@ -417,6 +419,13 @@ impl MeshStateStore {
         })
     }
 
+    fn publish_policy_change(&self, change: PolicyChange) {
+        if let Some(sender) = self.peer_changes.lock().get(&change.key) {
+            let _ = sender.send(change.clone());
+        }
+        let _ = self.changes.send(change);
+    }
+
     fn save_access(&mut self, access: PeerAccessState) -> Result<(), GrantStoreError> {
         let before = std::mem::replace(&mut self.state.peer_access, access);
         if let Err(error) = self.save() {
@@ -452,6 +461,19 @@ pub(crate) enum AccessChange {
 }
 
 impl MeshAccessStore {
+    pub(crate) fn peer_policy_history(
+        &self,
+        key: &PeerGrantKey,
+    ) -> broadcast::Receiver<PolicyChange> {
+        let owner = self.owner.read();
+        let mut senders = owner.peer_changes.lock();
+        senders.retain(|_, sender| sender.receiver_count() > 0);
+        senders
+            .entry(key.clone())
+            .or_insert_with(|| broadcast::channel(64).0)
+            .subscribe()
+    }
+
     pub fn new(owner: SharedMeshState) -> Self {
         let (changes, usage_changes) = {
             let state = owner.read();
@@ -531,7 +553,7 @@ impl MeshAccessStore {
             state.quota_runtime = runtime;
             match change {
                 Some(AccessChange::Policy(change)) => {
-                    let _ = state.changes.send(change);
+                    state.publish_policy_change(change);
                 }
                 Some(AccessChange::Usage(peer)) => {
                     let _ = state.usage_changes.send(peer);
@@ -579,7 +601,7 @@ impl GrantStore for MeshAccessStore {
             };
             access.put_grant(&key, next.clone());
             state.save_access(access)?;
-            let _ = state.changes.send(PolicyChange {
+            state.publish_policy_change(PolicyChange {
                 key,
                 effect: PolicyEffect::Grant(next.grant.clone()),
             });
@@ -591,6 +613,13 @@ impl GrantStore for MeshAccessStore {
 
     fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
         Some(self.changes.subscribe())
+    }
+
+    fn subscribe_peer_changes(
+        &self,
+        key: &PeerGrantKey,
+    ) -> Option<broadcast::Receiver<PolicyChange>> {
+        Some(self.peer_policy_history(key))
     }
 
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {

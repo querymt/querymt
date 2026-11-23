@@ -868,8 +868,8 @@ mod ledger {
         }
 
         async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
-            self.reserve_with_policy(attempt, self.changes.subscribe(), false)
-                .await
+            let changes = self.peer_policy_history(&attempt.peer);
+            self.reserve_with_policy(attempt, changes, false).await
         }
 
         async fn reserve_with_policy(
@@ -1578,6 +1578,63 @@ mod ledger {
                 ));
             }
             f.store.release_unused(pending).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn unrelated_policy_burst_preserves_peer_watch_and_pending_quota() {
+            use crate::peer_access::wait_for_policy_loss;
+            use tokio::sync::broadcast::error::TryRecvError;
+
+            let f = Fixture::new().await;
+            let other = PeerGrantKey {
+                host: f.key.host.clone(),
+                peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+            };
+            let mut watch = f.store.subscribe_peer_changes(&f.key).unwrap();
+            let pending = f.store.reserve(f.request("a", 10, TUESDAY)).await.unwrap();
+            let mut revision = Uuid::nil();
+            for i in 0..65 {
+                let grant = if i % 2 == 0 {
+                    PeerGrant::Full
+                } else {
+                    PeerGrant::None
+                };
+                revision = f
+                    .store
+                    .replace_grant(&other, revision, grant)
+                    .await
+                    .unwrap()
+                    .revision;
+            }
+            assert!(matches!(watch.try_recv(), Err(TryRecvError::Empty)));
+            f.store.mark_dispatched(pending).await.unwrap();
+            f.store
+                .settle(pending, AttemptUsage::Observed(10))
+                .await
+                .unwrap();
+
+            let pending = f.store.reserve(f.request("a", 10, TUESDAY)).await.unwrap();
+            f.set_grant(PeerGrant::None).await;
+            f.set_grant(f.custom.clone()).await;
+            assert_eq!(
+                wait_for_policy_loss(
+                    f.store.as_ref(),
+                    &f.key,
+                    Some(watch),
+                    |grant| if *grant == PeerGrant::None {
+                        Err("revoked")
+                    } else {
+                        Ok(())
+                    },
+                    || "history unavailable",
+                )
+                .await,
+                "revoked"
+            );
+            assert!(matches!(
+                f.store.mark_dispatched(pending).await,
+                Err(QuotaError::InvalidAttempt)
+            ));
         }
 
         #[tokio::test]

@@ -59,6 +59,15 @@ pub trait GrantStore: Send + Sync {
         None
     }
 
+    /// Subscribe to one peer's committed policy changes, if supported. Stores
+    /// with only a shared history still fail closed if that history is lost.
+    fn subscribe_peer_changes(
+        &self,
+        _key: &PeerGrantKey,
+    ) -> Option<tokio::sync::broadcast::Receiver<PolicyChange>> {
+        self.subscribe_changes()
+    }
+
     /// List persisted peers, including those not currently connected.
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError>;
 }

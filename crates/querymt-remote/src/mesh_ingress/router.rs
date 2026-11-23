@@ -293,27 +293,34 @@ impl InboundRouter {
             return Ok(Err(RemoteSendError::BadActorType));
         }
         let route_key = (actor_remote_id.as_ref(), message_remote_id.as_ref());
-        let Some(route) = self
-            .routes
-            .read()
-            .get(&actor_id)
-            .and_then(|routes| routes.get(&route_key))
-            .filter(|route| route.delivery.accepts(protocol, delivery))
-            .cloned()
-        else {
+        let route = {
+            let routes = self.routes.read();
+            let actor_routes = routes.get(&actor_id);
+            if actor_routes.is_none()
+                && actor_remote_id == <crate::ProviderHostActor as RemoteActor>::REMOTE_ID
+            {
+                return Ok(Err(RemoteSendError::ActorNotRunning));
+            }
+            actor_routes
+                .and_then(|routes| routes.get(&route_key))
+                .filter(|route| route.delivery.accepts(protocol, delivery))
+                .cloned()
+        };
+        let Some(route) = route else {
             return Ok(Err(RemoteSendError::UnknownMessage {
                 actor_remote_id,
                 message_remote_id,
             }));
         };
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(self.host),
+            peer: NodeId::from_peer_id(peer),
+        };
         let changes = (route.access != InboundAccess::Identity)
-            .then(|| self.store.subscribe_changes())
+            .then(|| self.store.subscribe_peer_changes(&key))
             .flatten();
         let mut origin = PeerRequest {
-            key: PeerGrantKey {
-                host: NodeId::from_peer_id(self.host),
-                peer: NodeId::from_peer_id(peer),
-            },
+            key,
             protocol,
             grant: None,
             policy_changes: Arc::new(Mutex::new(

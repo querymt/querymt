@@ -2216,7 +2216,7 @@ impl SessionActor {
         AgentError,
     > {
         let caller = TurnAuthority::Peer(peer.clone());
-        let caller_changes = peer.store.subscribe_changes();
+        let caller_changes = peer.store.subscribe_peer_changes(&peer.key);
         caller.check().await?;
         let RunSlot::Running(run, authority @ TurnAuthority::Peer(run_peer)) = &self.run else {
             return Ok(None);
@@ -2224,7 +2224,7 @@ impl SessionActor {
         if !caller.can_control(authority) {
             return Ok(None);
         }
-        let run_changes = run_peer.store.subscribe_changes();
+        let run_changes = run_peer.store.subscribe_peer_changes(&run_peer.key);
         authority.check().await?;
 
         let entries = self.config.pending_elicitations.lock().await;

@@ -97,7 +97,7 @@ impl MeteredAccess {
 
     pub(crate) fn revocation(&self) -> Revocation {
         let access = self.clone();
-        let changes = access.store.subscribe_changes();
+        let changes = access.store.subscribe_peer_changes(&access.peer);
         Box::pin(async move {
             wait_for_policy_loss(
                 access.store.as_ref(),
@@ -166,7 +166,13 @@ impl MeteredProvider {
     }
 
     pub(crate) async fn reserve(&self, call: &ChatCall<'_>) -> Result<ReservedAttempt, LLMError> {
-        let hosted = || (Uuid::new_v4(), self.access.store.subscribe_changes(), true);
+        let hosted = || {
+            (
+                Uuid::new_v4(),
+                self.access.store.subscribe_peer_changes(&self.access.peer),
+                true,
+            )
+        };
         #[cfg(feature = "kameo-mesh")]
         let (request_id, history, require_sessions) = match &self.direct_request {
             Some((id, peer)) => (*id, peer.take_policy_changes(), false),

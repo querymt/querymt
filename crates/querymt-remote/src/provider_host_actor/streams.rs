@@ -387,9 +387,17 @@ impl Relay {
         };
         if self.guarded() {
             self.unregister();
-            if delivery.grace_expired {
-                // Data replay is over, but still try to deliver the scoped error.
-                delivery.disconnected_at = None;
+            if delivery.grace_expired
+                || delivery
+                    .disconnected_at
+                    .is_some_and(|at| at.elapsed() >= self.grace)
+            {
+                // Grace may expire while accounting settles. Do not restart
+                // replay; only the scoped error gets one bounded send.
+                if !sequenced {
+                    let _ = self.send(self.frame(terminal, None), true).await;
+                }
+                return;
             }
         } else if delivery.grace_expired {
             return;

@@ -10,6 +10,8 @@ use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use querymt::chat::ChatCall;
+#[cfg(feature = "kameo-mesh")]
+use querymt::error::LLMError;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -434,6 +436,7 @@ guarded_control!(
     msg.request_id.as_deref(),
     |streams, msg| {
         let mut cancelled = 0;
+        let mut failure = None;
         for stream in &streams {
             match stream.authorize().await {
                 Ok(()) => {
@@ -441,10 +444,19 @@ guarded_control!(
                     cancelled += 1;
                 }
                 Err(error) if msg.request_id.is_some() => return Err(error),
-                Err(_) => continue,
+                Err(error) => {
+                    let denied = matches!(
+                        LLMError::from_payload(error.to_payload()),
+                        LLMError::ProviderResponseError(failure)
+                            if failure.code() == Some("mesh_access_denied")
+                    );
+                    if !denied {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
         }
-        Ok(cancelled)
+        failure.map_or(Ok(cancelled), Err)
     }
 );
 
