@@ -34,6 +34,7 @@ pub(super) fn gpui_capabilities() -> AcpSessionUpdateCapabilities {
         plan_operations: true,
         notices: true,
         compaction: true,
+        subagents: true,
         ..Default::default()
     }
 }
@@ -263,12 +264,33 @@ fn without_revisions(value: &mut Value) {
 /// What the three paths must agree on, with no exceptions: turns (ids
 /// included) with their entries (compaction summary blocks included), the
 /// plan (plan id included), context usage, token breakdown, cost, the
-/// accounting detail and the title. The run state is checked on its own, since a replay carries no
-/// state updates.
+/// accounting detail, the title and the subagents (state and stage; the
+/// timestamps in their meta are the journal's own and differ by path). The
+/// run state is checked on its own, since a replay carries no state updates.
 pub(super) fn comparable(core: &SessionCore) -> Value {
     let ids = core.turn_ids();
     let header = core.header();
+    let subagents: Vec<Value> = header
+        .subagents
+        .iter()
+        .map(|child| {
+            let namespace = &child
+                .meta
+                .as_ref()
+                .map_or(Value::Null, |m| m["querymt"].clone());
+            json!({
+                "sessionId": child.session_id,
+                "title": child.title,
+                "description": child.description,
+                "state": child.state,
+                "stage": child.stage,
+                "capabilities": child.capabilities,
+                "delegationId": namespace["delegationId"],
+            })
+        })
+        .collect();
     let mut view = json!({
+        "subagents": subagents,
         "turns": core.turns(&ids),
         "plan": header.plan,
         "context": header.context,
@@ -369,6 +391,13 @@ fn specs() -> Vec<(String, TraceSpec)> {
             },
         ),
         ("small seed 4".to_owned(), TraceSpec::small(4)),
+        (
+            "delegations".to_owned(),
+            TraceSpec {
+                delegations: true,
+                ..TraceSpec::small(5)
+            },
+        ),
         ("scaled".to_owned(), TraceSpec::scaled(9, 3)),
     ]
 }
@@ -483,4 +512,101 @@ async fn snapshot_and_replay_produce_the_same_turns() {
             &comparable(&from_snapshot),
         );
     }
+}
+
+/// The delegate tool calls of a compared view: id, status and child session.
+fn delegate_calls(view: &Value) -> Vec<(String, String, Option<String>)> {
+    let mut calls = Vec::new();
+    for turn in view["turns"].as_array().into_iter().flatten() {
+        for entry in turn["entries"].as_array().into_iter().flatten() {
+            let data = &entry["kind"]["data"];
+            if entry["kind"]["type"] == "tool_call"
+                && data["toolCallId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("del"))
+            {
+                calls.push((
+                    data["toolCallId"].as_str().unwrap_or_default().to_owned(),
+                    data["status"].as_str().unwrap_or_default().to_owned(),
+                    data["childSessionId"].as_str().map(str::to_owned),
+                ));
+            }
+        }
+    }
+    calls
+}
+
+#[tokio::test]
+async fn delegations_agree_live_and_after_a_load() {
+    let spec = TraceSpec {
+        delegations: true,
+        ..TraceSpec::small(11)
+    };
+    let events = journal(spec);
+    let (sid, windowed, unwindowed) = agent_snapshots(&events).await;
+    let from_snapshot = apply_all(&sid, &[SessionInput::SnapshotLoaded { response: windowed }]);
+    let from_unwindowed = apply_all(
+        &sid,
+        &[SessionInput::SnapshotLoaded {
+            response: unwindowed,
+        }],
+    );
+    let live = live_stream(&events);
+    let from_live = apply_all(SESSION, &live);
+    let from_replay = apply_all(SESSION, &replay_stream(&events));
+    let expected = comparable(&from_snapshot);
+
+    // Two children: the completed and the failed delegation, both finished.
+    let subagents = expected["subagents"].as_array().expect("subagents");
+    assert_eq!(subagents.len(), 2, "subagents {subagents:?}");
+    for (index, child) in subagents.iter().enumerate() {
+        assert_eq!(child["sessionId"], format!("child{index}"));
+        assert_eq!(child["delegationId"], format!("d{index}"));
+        assert_eq!(child["state"], "idle", "child {index} is finished");
+    }
+    // Each delegate tool call points at its child; the failed one is failed.
+    assert_eq!(
+        delegate_calls(&expected),
+        vec![
+            (
+                "del0".to_owned(),
+                "completed".to_owned(),
+                Some("child0".to_owned())
+            ),
+            (
+                "del1".to_owned(),
+                "failed".to_owned(),
+                Some("child1".to_owned())
+            ),
+        ]
+    );
+
+    assert_same_view("delegations live", &comparable(&from_live), &expected);
+    assert_same_view(
+        "delegations no window",
+        &comparable(&from_unwindowed),
+        &expected,
+    );
+    assert_same_view("delegations replay", &comparable(&from_replay), &expected);
+
+    // While the first delegation runs, the live view shows its stage; the
+    // journal holds no stage, so only the live stream can.
+    let stage_at = events
+        .iter()
+        .position(|event| matches!(event.kind, AgentEventKind::DelegationStageChanged { .. }))
+        .expect("the trace holds a stage change");
+    let mut translator = AcpLiveEventTranslator::new();
+    translator.set_capabilities(gpui_capabilities());
+    let mut blocked = HashSet::new();
+    let mut inputs = Vec::new();
+    for event in &events[..=stage_at] {
+        inputs.extend(forwarded(
+            &mut translator,
+            &live_envelopes(event, &mut blocked),
+        ));
+    }
+    let midway = apply_all(SESSION, &inputs);
+    let child = &midway.header().subagents[0];
+    assert_eq!(child.state.as_deref(), Some("running"));
+    assert_eq!(child.stage.as_deref(), Some("verifying"));
 }

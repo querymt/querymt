@@ -275,6 +275,114 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "del0",
+                          "tool_name": "delegate",
+                          "arguments": "{\"target_agent_id\":\"coder\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 13,
+                      "session_seq": 13,
+                      "timestamp": 1000013,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_requested",
+                        "data": {
+                          "delegation": {
+                            "public_id": "d0",
+                            "target_agent_id": "coder",
+                            "objective": "lorem d0",
+                            "objective_hash": "0000000000000000",
+                            "context": null,
+                            "constraints": null,
+                            "expected_output": null,
+                            "verification_spec": null,
+                            "planning_summary": null,
+                            "isolation": "inherit",
+                            "status": "requested",
+                            "retry_count": 0,
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "completed_at": null
+                          },
+                          "tool_call_id": "del0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 14,
+                      "session_seq": 14,
+                      "timestamp": 1000014,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "session_forked",
+                        "data": {
+                          "parent_session_id": "s1",
+                          "child_session_id": "child0",
+                          "target_agent_id": "coder",
+                          "origin": "delegation",
+                          "fork_point_type": "progress_entry",
+                          "fork_point_ref": "d0",
+                          "instructions": null
+                        }
+                      }
+                    },
+                    {
+                      "seq": 15,
+                      "session_seq": 15,
+                      "timestamp": 1000015,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_stage_changed",
+                        "data": {
+                          "delegation_id": "d0",
+                          "stage": "verifying",
+                          "source_epoch": "epoch-1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 16,
+                      "session_seq": 16,
+                      "timestamp": 1000016,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_completed",
+                        "data": {
+                          "delegation_id": "d0",
+                          "result": "ipsum dolor"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 17,
+                      "session_seq": 17,
+                      "timestamp": 1000017,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "del0",
+                          "tool_name": "delegate",
+                          "is_error": false,
+                          "result": "ipsum dolor"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 18,
+                      "session_seq": 18,
+                      "timestamp": 1000018,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
                         "type": "run_completed",
                         "data": {
                           "run_id": "r0",
@@ -283,9 +391,9 @@
                       }
                     },
                     {
-                      "seq": 13,
-                      "session_seq": 13,
-                      "timestamp": 1000013,
+                      "seq": 19,
+                      "session_seq": 19,
+                      "timestamp": 1000019,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -297,9 +405,9 @@
                       }
                     },
                     {
-                      "seq": 14,
-                      "session_seq": 14,
-                      "timestamp": 1000014,
+                      "seq": 20,
+                      "session_seq": 20,
+                      "timestamp": 1000020,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -311,9 +419,9 @@
                       }
                     },
                     {
-                      "seq": 15,
-                      "session_seq": 15,
-                      "timestamp": 1000015,
+                      "seq": 21,
+                      "session_seq": 21,
+                      "timestamp": 1000021,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -327,9 +435,9 @@
                       }
                     },
                     {
-                      "seq": 16,
-                      "session_seq": 16,
-                      "timestamp": 1000016,
+                      "seq": 22,
+                      "session_seq": 22,
+                      "timestamp": 1000022,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -344,9 +452,9 @@
                       }
                     },
                     {
-                      "seq": 17,
-                      "session_seq": 17,
-                      "timestamp": 1000017,
+                      "seq": 23,
+                      "session_seq": 23,
+                      "timestamp": 1000023,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -358,9 +466,9 @@
                       }
                     },
                     {
-                      "seq": 18,
-                      "session_seq": 18,
-                      "timestamp": 1000018,
+                      "seq": 24,
+                      "session_seq": 24,
+                      "timestamp": 1000024,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -374,9 +482,9 @@
                       }
                     },
                     {
-                      "seq": 19,
-                      "session_seq": 19,
-                      "timestamp": 1000019,
+                      "seq": 25,
+                      "session_seq": 25,
+                      "timestamp": 1000025,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -406,9 +514,9 @@
                       }
                     },
                     {
-                      "seq": 20,
-                      "session_seq": 20,
-                      "timestamp": 1000020,
+                      "seq": 26,
+                      "session_seq": 26,
+                      "timestamp": 1000026,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -457,9 +565,9 @@
                       }
                     },
                     {
-                      "seq": 21,
-                      "session_seq": 21,
-                      "timestamp": 1000021,
+                      "seq": 27,
+                      "session_seq": 27,
+                      "timestamp": 1000027,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -494,9 +602,9 @@
                       }
                     },
                     {
-                      "seq": 22,
-                      "session_seq": 22,
-                      "timestamp": 1000022,
+                      "seq": 28,
+                      "session_seq": 28,
+                      "timestamp": 1000028,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -514,9 +622,9 @@
                       }
                     },
                     {
-                      "seq": 23,
-                      "session_seq": 23,
-                      "timestamp": 1000023,
+                      "seq": 29,
+                      "session_seq": 29,
+                      "timestamp": 1000029,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -529,9 +637,9 @@
                       }
                     },
                     {
-                      "seq": 24,
-                      "session_seq": 24,
-                      "timestamp": 1000024,
+                      "seq": 30,
+                      "session_seq": 30,
+                      "timestamp": 1000030,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -545,9 +653,9 @@
                       }
                     },
                     {
-                      "seq": 25,
-                      "session_seq": 25,
-                      "timestamp": 1000025,
+                      "seq": 31,
+                      "session_seq": 31,
+                      "timestamp": 1000031,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -560,9 +668,9 @@
                       }
                     },
                     {
-                      "seq": 26,
-                      "session_seq": 26,
-                      "timestamp": 1000026,
+                      "seq": 32,
+                      "session_seq": 32,
+                      "timestamp": 1000032,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -576,9 +684,117 @@
                       }
                     },
                     {
-                      "seq": 27,
-                      "session_seq": 27,
-                      "timestamp": 1000027,
+                      "seq": 33,
+                      "session_seq": 33,
+                      "timestamp": 1000033,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "del1",
+                          "tool_name": "delegate",
+                          "arguments": "{\"target_agent_id\":\"coder\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 34,
+                      "session_seq": 34,
+                      "timestamp": 1000034,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_requested",
+                        "data": {
+                          "delegation": {
+                            "public_id": "d1",
+                            "target_agent_id": "coder",
+                            "objective": "lorem d1",
+                            "objective_hash": "0000000000000000",
+                            "context": null,
+                            "constraints": null,
+                            "expected_output": null,
+                            "verification_spec": null,
+                            "planning_summary": null,
+                            "isolation": "inherit",
+                            "status": "requested",
+                            "retry_count": 0,
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "completed_at": null
+                          },
+                          "tool_call_id": "del1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 35,
+                      "session_seq": 35,
+                      "timestamp": 1000035,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "session_forked",
+                        "data": {
+                          "parent_session_id": "s1",
+                          "child_session_id": "child1",
+                          "target_agent_id": "coder",
+                          "origin": "delegation",
+                          "fork_point_type": "progress_entry",
+                          "fork_point_ref": "d1",
+                          "instructions": null
+                        }
+                      }
+                    },
+                    {
+                      "seq": 36,
+                      "session_seq": 36,
+                      "timestamp": 1000036,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_stage_changed",
+                        "data": {
+                          "delegation_id": "d1",
+                          "stage": "verifying",
+                          "source_epoch": "epoch-1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 37,
+                      "session_seq": 37,
+                      "timestamp": 1000037,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "delegation_failed",
+                        "data": {
+                          "delegation_id": "d1",
+                          "error": "sit amet"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 38,
+                      "session_seq": 38,
+                      "timestamp": 1000038,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "del1",
+                          "tool_name": "delegate",
+                          "is_error": true,
+                          "result": "sit amet"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 39,
+                      "session_seq": 39,
+                      "timestamp": 1000039,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -590,9 +806,9 @@
                       }
                     },
                     {
-                      "seq": 28,
-                      "session_seq": 28,
-                      "timestamp": 1000028,
+                      "seq": 40,
+                      "session_seq": 40,
+                      "timestamp": 1000040,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -604,9 +820,9 @@
                       }
                     },
                     {
-                      "seq": 29,
-                      "session_seq": 29,
-                      "timestamp": 1000029,
+                      "seq": 41,
+                      "session_seq": 41,
+                      "timestamp": 1000041,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -618,9 +834,9 @@
                       }
                     },
                     {
-                      "seq": 30,
-                      "session_seq": 30,
-                      "timestamp": 1000030,
+                      "seq": 42,
+                      "session_seq": 42,
+                      "timestamp": 1000042,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -650,9 +866,9 @@
                       }
                     },
                     {
-                      "seq": 31,
-                      "session_seq": 31,
-                      "timestamp": 1000031,
+                      "seq": 43,
+                      "session_seq": 43,
+                      "timestamp": 1000043,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -701,9 +917,9 @@
                       }
                     },
                     {
-                      "seq": 32,
-                      "session_seq": 32,
-                      "timestamp": 1000032,
+                      "seq": 44,
+                      "session_seq": 44,
+                      "timestamp": 1000044,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -738,9 +954,9 @@
                       }
                     },
                     {
-                      "seq": 33,
-                      "session_seq": 33,
-                      "timestamp": 1000033,
+                      "seq": 45,
+                      "session_seq": 45,
+                      "timestamp": 1000045,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -758,9 +974,9 @@
                       }
                     },
                     {
-                      "seq": 34,
-                      "session_seq": 34,
-                      "timestamp": 1000034,
+                      "seq": 46,
+                      "session_seq": 46,
+                      "timestamp": 1000046,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -773,9 +989,9 @@
                       }
                     },
                     {
-                      "seq": 35,
-                      "session_seq": 35,
-                      "timestamp": 1000035,
+                      "seq": 47,
+                      "session_seq": 47,
+                      "timestamp": 1000047,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -789,9 +1005,9 @@
                       }
                     },
                     {
-                      "seq": 36,
-                      "session_seq": 36,
-                      "timestamp": 1000036,
+                      "seq": 48,
+                      "session_seq": 48,
+                      "timestamp": 1000048,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -804,9 +1020,9 @@
                       }
                     },
                     {
-                      "seq": 37,
-                      "session_seq": 37,
-                      "timestamp": 1000037,
+                      "seq": 49,
+                      "session_seq": 49,
+                      "timestamp": 1000049,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -821,9 +1037,9 @@
                       }
                     },
                     {
-                      "seq": 38,
-                      "session_seq": 38,
-                      "timestamp": 1000038,
+                      "seq": 50,
+                      "session_seq": 50,
+                      "timestamp": 1000050,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -835,9 +1051,9 @@
                       }
                     },
                     {
-                      "seq": 39,
-                      "session_seq": 39,
-                      "timestamp": 1000039,
+                      "seq": 51,
+                      "session_seq": 51,
+                      "timestamp": 1000051,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -851,9 +1067,9 @@
                       }
                     },
                     {
-                      "seq": 40,
-                      "session_seq": 40,
-                      "timestamp": 1000040,
+                      "seq": 52,
+                      "session_seq": 52,
+                      "timestamp": 1000052,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -865,9 +1081,9 @@
                       }
                     },
                     {
-                      "seq": 41,
-                      "session_seq": 41,
-                      "timestamp": 1000041,
+                      "seq": 53,
+                      "session_seq": 53,
+                      "timestamp": 1000053,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -879,9 +1095,9 @@
                       }
                     },
                     {
-                      "seq": 42,
-                      "session_seq": 42,
-                      "timestamp": 1000042,
+                      "seq": 54,
+                      "session_seq": 54,
+                      "timestamp": 1000054,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -893,9 +1109,9 @@
                       }
                     },
                     {
-                      "seq": 43,
-                      "session_seq": 43,
-                      "timestamp": 1000043,
+                      "seq": 55,
+                      "session_seq": 55,
+                      "timestamp": 1000055,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -909,9 +1125,9 @@
                       }
                     },
                     {
-                      "seq": 44,
-                      "session_seq": 44,
-                      "timestamp": 1000044,
+                      "seq": 56,
+                      "session_seq": 56,
+                      "timestamp": 1000056,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -926,9 +1142,9 @@
                       }
                     },
                     {
-                      "seq": 45,
-                      "session_seq": 45,
-                      "timestamp": 1000045,
+                      "seq": 57,
+                      "session_seq": 57,
+                      "timestamp": 1000057,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -940,9 +1156,9 @@
                       }
                     },
                     {
-                      "seq": 46,
-                      "session_seq": 46,
-                      "timestamp": 1000046,
+                      "seq": 58,
+                      "session_seq": 58,
+                      "timestamp": 1000058,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -956,9 +1172,9 @@
                       }
                     },
                     {
-                      "seq": 47,
-                      "session_seq": 47,
-                      "timestamp": 1000047,
+                      "seq": 59,
+                      "session_seq": 59,
+                      "timestamp": 1000059,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -988,9 +1204,9 @@
                       }
                     },
                     {
-                      "seq": 48,
-                      "session_seq": 48,
-                      "timestamp": 1000048,
+                      "seq": 60,
+                      "session_seq": 60,
+                      "timestamp": 1000060,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1039,9 +1255,9 @@
                       }
                     },
                     {
-                      "seq": 49,
-                      "session_seq": 49,
-                      "timestamp": 1000049,
+                      "seq": 61,
+                      "session_seq": 61,
+                      "timestamp": 1000061,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1076,9 +1292,9 @@
                       }
                     },
                     {
-                      "seq": 50,
-                      "session_seq": 50,
-                      "timestamp": 1000050,
+                      "seq": 62,
+                      "session_seq": 62,
+                      "timestamp": 1000062,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1096,9 +1312,9 @@
                       }
                     },
                     {
-                      "seq": 51,
-                      "session_seq": 51,
-                      "timestamp": 1000051,
+                      "seq": 63,
+                      "session_seq": 63,
+                      "timestamp": 1000063,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1111,9 +1327,9 @@
                       }
                     },
                     {
-                      "seq": 52,
-                      "session_seq": 52,
-                      "timestamp": 1000052,
+                      "seq": 64,
+                      "session_seq": 64,
+                      "timestamp": 1000064,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1127,9 +1343,9 @@
                       }
                     },
                     {
-                      "seq": 53,
-                      "session_seq": 53,
-                      "timestamp": 1000053,
+                      "seq": 65,
+                      "session_seq": 65,
+                      "timestamp": 1000065,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1142,9 +1358,9 @@
                       }
                     },
                     {
-                      "seq": 54,
-                      "session_seq": 54,
-                      "timestamp": 1000054,
+                      "seq": 66,
+                      "session_seq": 66,
+                      "timestamp": 1000066,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1158,9 +1374,9 @@
                       }
                     },
                     {
-                      "seq": 55,
-                      "session_seq": 55,
-                      "timestamp": 1000055,
+                      "seq": 67,
+                      "session_seq": 67,
+                      "timestamp": 1000067,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1172,9 +1388,9 @@
                       }
                     },
                     {
-                      "seq": 56,
-                      "session_seq": 56,
-                      "timestamp": 1000056,
+                      "seq": 68,
+                      "session_seq": 68,
+                      "timestamp": 1000068,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1188,9 +1404,9 @@
                       }
                     },
                     {
-                      "seq": 57,
-                      "session_seq": 57,
-                      "timestamp": 1000057,
+                      "seq": 69,
+                      "session_seq": 69,
+                      "timestamp": 1000069,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1202,9 +1418,9 @@
                       }
                     },
                     {
-                      "seq": 58,
-                      "session_seq": 58,
-                      "timestamp": 1000058,
+                      "seq": 70,
+                      "session_seq": 70,
+                      "timestamp": 1000070,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1216,9 +1432,9 @@
                       }
                     },
                     {
-                      "seq": 59,
-                      "session_seq": 59,
-                      "timestamp": 1000059,
+                      "seq": 71,
+                      "session_seq": 71,
+                      "timestamp": 1000071,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1230,9 +1446,9 @@
                       }
                     },
                     {
-                      "seq": 60,
-                      "session_seq": 60,
-                      "timestamp": 1000060,
+                      "seq": 72,
+                      "session_seq": 72,
+                      "timestamp": 1000072,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1262,9 +1478,9 @@
                       }
                     },
                     {
-                      "seq": 61,
-                      "session_seq": 61,
-                      "timestamp": 1000061,
+                      "seq": 73,
+                      "session_seq": 73,
+                      "timestamp": 1000073,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1313,9 +1529,9 @@
                       }
                     },
                     {
-                      "seq": 62,
-                      "session_seq": 62,
-                      "timestamp": 1000062,
+                      "seq": 74,
+                      "session_seq": 74,
+                      "timestamp": 1000074,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1350,9 +1566,9 @@
                       }
                     },
                     {
-                      "seq": 63,
-                      "session_seq": 63,
-                      "timestamp": 1000063,
+                      "seq": 75,
+                      "session_seq": 75,
+                      "timestamp": 1000075,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1370,9 +1586,9 @@
                       }
                     },
                     {
-                      "seq": 64,
-                      "session_seq": 64,
-                      "timestamp": 1000064,
+                      "seq": 76,
+                      "session_seq": 76,
+                      "timestamp": 1000076,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1385,9 +1601,9 @@
                       }
                     },
                     {
-                      "seq": 65,
-                      "session_seq": 65,
-                      "timestamp": 1000065,
+                      "seq": 77,
+                      "session_seq": 77,
+                      "timestamp": 1000077,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1402,9 +1618,9 @@
                       }
                     },
                     {
-                      "seq": 66,
-                      "session_seq": 66,
-                      "timestamp": 1000066,
+                      "seq": 78,
+                      "session_seq": 78,
+                      "timestamp": 1000078,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1416,9 +1632,9 @@
                       }
                     },
                     {
-                      "seq": 67,
-                      "session_seq": 67,
-                      "timestamp": 1000067,
+                      "seq": 79,
+                      "session_seq": 79,
+                      "timestamp": 1000079,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1432,9 +1648,9 @@
                       }
                     },
                     {
-                      "seq": 68,
-                      "session_seq": 68,
-                      "timestamp": 1000068,
+                      "seq": 80,
+                      "session_seq": 80,
+                      "timestamp": 1000080,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1447,9 +1663,9 @@
                       }
                     },
                     {
-                      "seq": 69,
-                      "session_seq": 69,
-                      "timestamp": 1000069,
+                      "seq": 81,
+                      "session_seq": 81,
+                      "timestamp": 1000081,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1463,9 +1679,9 @@
                       }
                     },
                     {
-                      "seq": 70,
-                      "session_seq": 70,
-                      "timestamp": 1000070,
+                      "seq": 82,
+                      "session_seq": 82,
+                      "timestamp": 1000082,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1477,9 +1693,9 @@
                       }
                     },
                     {
-                      "seq": 71,
-                      "session_seq": 71,
-                      "timestamp": 1000071,
+                      "seq": 83,
+                      "session_seq": 83,
+                      "timestamp": 1000083,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1491,9 +1707,9 @@
                       }
                     },
                     {
-                      "seq": 72,
-                      "session_seq": 72,
-                      "timestamp": 1000072,
+                      "seq": 84,
+                      "session_seq": 84,
+                      "timestamp": 1000084,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1505,9 +1721,9 @@
                       }
                     },
                     {
-                      "seq": 73,
-                      "session_seq": 73,
-                      "timestamp": 1000073,
+                      "seq": 85,
+                      "session_seq": 85,
+                      "timestamp": 1000085,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1519,9 +1735,9 @@
                       }
                     },
                     {
-                      "seq": 74,
-                      "session_seq": 74,
-                      "timestamp": 1000074,
+                      "seq": 86,
+                      "session_seq": 86,
+                      "timestamp": 1000086,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1533,9 +1749,9 @@
                       }
                     },
                     {
-                      "seq": 75,
-                      "session_seq": 75,
-                      "timestamp": 1000075,
+                      "seq": 87,
+                      "session_seq": 87,
+                      "timestamp": 1000087,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1547,9 +1763,9 @@
                       }
                     },
                     {
-                      "seq": 76,
-                      "session_seq": 76,
-                      "timestamp": 1000076,
+                      "seq": 88,
+                      "session_seq": 88,
+                      "timestamp": 1000088,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1563,9 +1779,9 @@
                       }
                     },
                     {
-                      "seq": 77,
-                      "session_seq": 77,
-                      "timestamp": 1000077,
+                      "seq": 89,
+                      "session_seq": 89,
+                      "timestamp": 1000089,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1580,9 +1796,9 @@
                       }
                     },
                     {
-                      "seq": 78,
-                      "session_seq": 78,
-                      "timestamp": 1000078,
+                      "seq": 90,
+                      "session_seq": 90,
+                      "timestamp": 1000090,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1594,9 +1810,9 @@
                       }
                     },
                     {
-                      "seq": 79,
-                      "session_seq": 79,
-                      "timestamp": 1000079,
+                      "seq": 91,
+                      "session_seq": 91,
+                      "timestamp": 1000091,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1610,9 +1826,9 @@
                       }
                     },
                     {
-                      "seq": 80,
-                      "session_seq": 80,
-                      "timestamp": 1000080,
+                      "seq": 92,
+                      "session_seq": 92,
+                      "timestamp": 1000092,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1642,9 +1858,9 @@
                       }
                     },
                     {
-                      "seq": 81,
-                      "session_seq": 81,
-                      "timestamp": 1000081,
+                      "seq": 93,
+                      "session_seq": 93,
+                      "timestamp": 1000093,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1693,9 +1909,9 @@
                       }
                     },
                     {
-                      "seq": 82,
-                      "session_seq": 82,
-                      "timestamp": 1000082,
+                      "seq": 94,
+                      "session_seq": 94,
+                      "timestamp": 1000094,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1730,9 +1946,9 @@
                       }
                     },
                     {
-                      "seq": 83,
-                      "session_seq": 83,
-                      "timestamp": 1000083,
+                      "seq": 95,
+                      "session_seq": 95,
+                      "timestamp": 1000095,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1750,9 +1966,9 @@
                       }
                     },
                     {
-                      "seq": 84,
-                      "session_seq": 84,
-                      "timestamp": 1000084,
+                      "seq": 96,
+                      "session_seq": 96,
+                      "timestamp": 1000096,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1765,9 +1981,9 @@
                       }
                     },
                     {
-                      "seq": 85,
-                      "session_seq": 85,
-                      "timestamp": 1000085,
+                      "seq": 97,
+                      "session_seq": 97,
+                      "timestamp": 1000097,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1781,9 +1997,9 @@
                       }
                     },
                     {
-                      "seq": 86,
-                      "session_seq": 86,
-                      "timestamp": 1000086,
+                      "seq": 98,
+                      "session_seq": 98,
+                      "timestamp": 1000098,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1796,9 +2012,9 @@
                       }
                     },
                     {
-                      "seq": 87,
-                      "session_seq": 87,
-                      "timestamp": 1000087,
+                      "seq": 99,
+                      "session_seq": 99,
+                      "timestamp": 1000099,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1812,9 +2028,9 @@
                       }
                     },
                     {
-                      "seq": 88,
-                      "session_seq": 88,
-                      "timestamp": 1000088,
+                      "seq": 100,
+                      "session_seq": 100,
+                      "timestamp": 1000100,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1827,9 +2043,9 @@
                       }
                     },
                     {
-                      "seq": 89,
-                      "session_seq": 89,
-                      "timestamp": 1000089,
+                      "seq": 101,
+                      "session_seq": 101,
+                      "timestamp": 1000101,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1843,9 +2059,9 @@
                       }
                     },
                     {
-                      "seq": 90,
-                      "session_seq": 90,
-                      "timestamp": 1000090,
+                      "seq": 102,
+                      "session_seq": 102,
+                      "timestamp": 1000102,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1887,25 +2103,82 @@
                 },
                 "subagentUpdates": [
                   {
-                    "sessionId": "child-1",
-                    "title": "Verifier",
-                    "state": {
-                      "state": "running"
-                    },
                     "_meta": {
                       "querymt": {
-                        "stage": "verifying"
+                        "delegationId": "d0"
                       }
+                    },
+                    "sessionId": "child0",
+                    "title": "coder",
+                    "description": "lorem d0",
+                    "state": {
+                      "state": "idle"
                     }
                   },
                   {
-                    "sessionId": "child-2",
-                    "title": "Coder",
+                    "_meta": {
+                      "querymt": {
+                        "delegationId": "d1"
+                      }
+                    },
+                    "sessionId": "child1",
+                    "title": "coder",
+                    "description": "lorem d1",
                     "state": {
                       "state": "idle"
                     }
                   }
-                ]
+                ],
+                "summary": {
+                  "usage": {
+                    "latestRequest": null,
+                    "sessionTotals": null,
+                    "partial": false,
+                    "requestCount": 0,
+                    "contextTokens": null,
+                    "contextPosition": null,
+                    "accounting": {
+                      "known_subtotal_usd": 0.0,
+                      "budget_known_subtotal_usd": 0.0,
+                      "components": {
+                        "input_usd": 0.0,
+                        "output_usd": 0.0,
+                        "cache_read_usd": 0.0,
+                        "cache_write_usd": 0.0,
+                        "cache_write_1h_usd": 0.0
+                      },
+                      "tokens": {
+                        "input": 0,
+                        "output": 0,
+                        "reasoning": 0,
+                        "cache_read": 0,
+                        "cache_write": 0
+                      },
+                      "priced_attempts": 0,
+                      "excluded_attempts": 0,
+                      "unresolved_attempts": 0,
+                      "incomplete_attempts": 0,
+                      "budget_incomplete_attempts": 0,
+                      "unaccounted_generations": 0,
+                      "settled_reasons": [],
+                      "budget_settled_reasons": []
+                    }
+                  },
+                  "provider": null,
+                  "pendingInputs": [],
+                  "childSessions": [
+                    {
+                      "childSessionId": "child0",
+                      "delegationId": "d0",
+                      "toolCallId": "del0"
+                    },
+                    {
+                      "childSessionId": "child1",
+                      "delegationId": "d1",
+                      "toolCallId": "del1"
+                    }
+                  ]
+                }
               }
             }
           }
@@ -1920,30 +2193,8 @@
             "sessionId": "s1",
             "update": {
               "sessionUpdate": "subagent_update",
-              "sessionId": "child-1",
-              "state": {
-                "state": "idle"
-              }
-            }
-          },
-          "replayed": false,
-          "at_ms": 0
-        }
-      },
-      {
-        "type": "acp_notification",
-        "data": {
-          "notification": {
-            "sessionId": "s1",
-            "update": {
-              "sessionUpdate": "tool_call_update",
-              "toolCallId": "t0-0",
-              "content": [
-                {
-                  "type": "session",
-                  "sessionId": "child-2"
-                }
-              ]
+              "sessionId": "child0",
+              "title": "reviewer"
             }
           },
           "replayed": false,
@@ -1974,9 +2225,7 @@
       },
       {
         "added": [],
-        "updated": [
-          "run-r0"
-        ],
+        "updated": [],
         "removed": [],
         "headerChanged": true,
         "ignored": 0,
@@ -2016,9 +2265,9 @@
       "pendingInputs": [],
       "subagents": [
         {
-          "sessionId": "child-1",
-          "title": "Verifier",
-          "description": null,
+          "sessionId": "child0",
+          "title": "reviewer",
+          "description": "lorem d0",
           "state": "idle",
           "stage": null,
           "capabilities": null,
@@ -2026,20 +2275,24 @@
           "additionalDirectories": null,
           "meta": {
             "querymt": {
-              "stage": "verifying"
+              "delegationId": "d0"
             }
           }
         },
         {
-          "sessionId": "child-2",
-          "title": "Coder",
-          "description": null,
+          "sessionId": "child1",
+          "title": "coder",
+          "description": "lorem d1",
           "state": "idle",
           "stage": null,
           "capabilities": null,
           "cwd": null,
           "additionalDirectories": null,
-          "meta": null
+          "meta": {
+            "querymt": {
+              "delegationId": "d1"
+            }
+          }
         }
       ],
       "cursors": [],
@@ -2073,7 +2326,7 @@
     "turns": [
       {
         "id": "run-r0",
-        "revision": 47,
+        "revision": 50,
         "entries": [
           {
             "id": "user-u0",
@@ -2120,7 +2373,7 @@
           },
           {
             "id": "tool-t0-0",
-            "revision": 47,
+            "revision": 5,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2134,13 +2387,45 @@
                 "rawOutput": null,
                 "content": [
                   {
-                    "type": "session",
-                    "sessionId": "child-2"
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "et et incididunt labore aliqua elit sed sed elit elit eiusmod sed eiusmod consectetur lorem dolore ut incididunt incididunt ut dolor magna sit sit et lorem ut eiusmod dolore elit amet consectetur ipsum et dolore dolor aliqua eiusmod dolor labore"
+                    }
                   }
                 ],
                 "resultFullBytes": null,
                 "argumentsFullBytes": null,
-                "childSessionId": "child-2"
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-del0",
+            "revision": 50,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "del0",
+                "title": "Run delegate",
+                "kind": "other",
+                "status": "completed",
+                "rawInput": {
+                  "target_agent_id": "coder"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "ipsum dolor"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child0"
               }
             }
           }
@@ -2148,11 +2433,11 @@
       },
       {
         "id": "run-r1",
-        "revision": 13,
+        "revision": 51,
         "entries": [
           {
             "id": "user-u1",
-            "revision": 6,
+            "revision": 8,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2172,7 +2457,7 @@
           },
           {
             "id": "user-s1",
-            "revision": 7,
+            "revision": 9,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2192,7 +2477,7 @@
           },
           {
             "id": "reasoning-a1-a1:summary:0",
-            "revision": 8,
+            "revision": 10,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -2204,7 +2489,7 @@
           },
           {
             "id": "assistant-a1",
-            "revision": 9,
+            "revision": 11,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2215,7 +2500,7 @@
           },
           {
             "id": "tool-t1-0",
-            "revision": 11,
+            "revision": 13,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2244,7 +2529,7 @@
           },
           {
             "id": "tool-t1-1",
-            "revision": 13,
+            "revision": 15,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2270,16 +2555,45 @@
                 "childSessionId": null
               }
             }
+          },
+          {
+            "id": "tool-del1",
+            "revision": 51,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "del1",
+                "title": "Run delegate",
+                "kind": "other",
+                "status": "failed",
+                "rawInput": {
+                  "target_agent_id": "coder"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "sit amet"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child1"
+              }
+            }
           }
         ]
       },
       {
         "id": "run-r2",
-        "revision": 18,
+        "revision": 22,
         "entries": [
           {
             "id": "user-u2",
-            "revision": 14,
+            "revision": 18,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2299,7 +2613,7 @@
           },
           {
             "id": "reasoning-a2-a2:summary:0",
-            "revision": 15,
+            "revision": 19,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -2311,7 +2625,7 @@
           },
           {
             "id": "assistant-a2",
-            "revision": 16,
+            "revision": 20,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2322,7 +2636,7 @@
           },
           {
             "id": "tool-t2-0",
-            "revision": 18,
+            "revision": 22,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2353,11 +2667,11 @@
       },
       {
         "id": "run-r3",
-        "revision": 29,
+        "revision": 33,
         "entries": [
           {
             "id": "user-u3",
-            "revision": 19,
+            "revision": 23,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2377,7 +2691,7 @@
           },
           {
             "id": "user-s3",
-            "revision": 20,
+            "revision": 24,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2397,7 +2711,7 @@
           },
           {
             "id": "reasoning-a3-a3:summary:0",
-            "revision": 21,
+            "revision": 25,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -2409,7 +2723,7 @@
           },
           {
             "id": "assistant-a3",
-            "revision": 22,
+            "revision": 26,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2420,7 +2734,7 @@
           },
           {
             "id": "tool-t3-0",
-            "revision": 24,
+            "revision": 28,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2449,7 +2763,7 @@
           },
           {
             "id": "tool-t3-1",
-            "revision": 26,
+            "revision": 30,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2478,7 +2792,7 @@
           },
           {
             "id": "compaction-c3",
-            "revision": 29,
+            "revision": 33,
             "kind": {
               "type": "compaction",
               "data": {
@@ -2508,11 +2822,11 @@
       },
       {
         "id": "run-r4",
-        "revision": 36,
+        "revision": 40,
         "entries": [
           {
             "id": "user-u4",
-            "revision": 30,
+            "revision": 34,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2532,7 +2846,7 @@
           },
           {
             "id": "reasoning-a4-a4:summary:0",
-            "revision": 31,
+            "revision": 35,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -2544,7 +2858,7 @@
           },
           {
             "id": "assistant-a4",
-            "revision": 32,
+            "revision": 36,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2555,7 +2869,7 @@
           },
           {
             "id": "tool-t4-0",
-            "revision": 34,
+            "revision": 38,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2584,7 +2898,7 @@
           },
           {
             "id": "tool-t4-1",
-            "revision": 36,
+            "revision": 40,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2615,11 +2929,11 @@
       },
       {
         "id": "run-sched4",
-        "revision": 37,
+        "revision": 41,
         "entries": [
           {
             "id": "assistant-sa4",
-            "revision": 37,
+            "revision": 41,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2632,11 +2946,11 @@
       },
       {
         "id": "run-r5",
-        "revision": 45,
+        "revision": 49,
         "entries": [
           {
             "id": "user-u5",
-            "revision": 38,
+            "revision": 42,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2656,7 +2970,7 @@
           },
           {
             "id": "user-s5",
-            "revision": 39,
+            "revision": 43,
             "kind": {
               "type": "user_message",
               "data": {
@@ -2676,7 +2990,7 @@
           },
           {
             "id": "reasoning-a5-a5:summary:0",
-            "revision": 40,
+            "revision": 44,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -2688,7 +3002,7 @@
           },
           {
             "id": "assistant-a5",
-            "revision": 41,
+            "revision": 45,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -2699,7 +3013,7 @@
           },
           {
             "id": "tool-t5-0",
-            "revision": 43,
+            "revision": 47,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -2728,7 +3042,7 @@
           },
           {
             "id": "tool-t5-1",
-            "revision": 45,
+            "revision": 49,
             "kind": {
               "type": "tool_call",
               "data": {
