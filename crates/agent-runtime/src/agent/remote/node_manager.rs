@@ -636,7 +636,9 @@ mod remote_impl {
                 actor,
                 InboundAccess::Sessions,
             );
-            use crate::agent::remote::remote_actor_impl::register_session_read;
+            use crate::agent::remote::remote_actor_impl::{
+                register_session_read, register_session_request,
+            };
             Self::register_peer_ask::<ResumeRemoteSession, _>(
                 router,
                 &store,
