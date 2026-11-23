@@ -6,10 +6,12 @@
 use querymt_agent_protocol_types::accounting::{
     AttemptPurpose, AttemptRef, RequestAccounting, samples,
 };
+use querymt_agent_protocol_types::delegation_update::DelegationStage;
 use querymt_agent_protocol_types::events::{
     AgentEvent, AgentEventKind, EventOrigin, ExecutionMetrics, ReasoningPartStored,
 };
 use querymt_agent_protocol_types::protocol::{ContentBlock, TextContent};
+use querymt_agent_protocol_types::session::domain::{Delegation, ForkOrigin, ForkPointType};
 use serde_json::{Value, json};
 
 const WORDS: &[&str] = &[
@@ -87,6 +89,31 @@ pub struct TraceSpec {
     /// changes halfway, and it changes once more after the last request (its
     /// context measurement is then stale).
     pub usage_gaps: bool,
+    /// The first two turns each delegate to a child session: the first
+    /// delegation completes, the second fails (see [`delegation_ids`]).
+    pub delegations: bool,
+}
+
+/// The ids the generator gives a delegation made in `turn` (0 completes, 1
+/// fails): the delegate tool call, the delegation and the child session.
+/// `None` for any other turn.
+pub fn delegation_ids(turn: usize) -> Option<DelegationIds> {
+    (turn < 2).then(|| DelegationIds {
+        tool_call_id: format!("del{turn}"),
+        delegation_id: format!("d{turn}"),
+        child_session_id: format!("child{turn}"),
+        completes: turn == 0,
+    })
+}
+
+/// See [`delegation_ids`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationIds {
+    pub tool_call_id: String,
+    pub delegation_id: String,
+    pub child_session_id: String,
+    /// Completes, or fails.
+    pub completes: bool,
 }
 
 impl TraceSpec {
@@ -99,6 +126,7 @@ impl TraceSpec {
             result_words: 40,
             model_calls: true,
             usage_gaps: false,
+            delegations: false,
         }
     }
 
@@ -208,6 +236,103 @@ fn model_call(
     );
 }
 
+/// The events of one delegation as the agent journals them: the delegate tool
+/// call, the request, the child's fork, a live-only stage change and the
+/// outcome, with the tool call failed when the delegation failed.
+fn delegation(events: &mut Vec<Value>, seq: &mut i64, ids: &DelegationIds) {
+    let delegation: Delegation = serde_json::from_value(json!({
+        "public_id": ids.delegation_id,
+        "target_agent_id": "coder",
+        "objective": format!("lorem {}", ids.delegation_id),
+        "objective_hash": "0000000000000000",
+        "context": null,
+        "constraints": null,
+        "expected_output": null,
+        "planning_summary": null,
+        "status": "requested",
+        "retry_count": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "completed_at": null,
+    }))
+    .expect("a generated delegation decodes");
+    push(
+        events,
+        seq,
+        AgentEventKind::ToolCallStart {
+            tool_call_id: ids.tool_call_id.clone(),
+            tool_name: "delegate".to_owned(),
+            arguments: "{\"target_agent_id\":\"coder\"}".to_owned(),
+        },
+    );
+    push(
+        events,
+        seq,
+        AgentEventKind::DelegationRequested {
+            delegation,
+            batch_id: None,
+            tool_call_id: Some(ids.tool_call_id.clone()),
+            cycle_id: None,
+        },
+    );
+    push(
+        events,
+        seq,
+        AgentEventKind::SessionForked {
+            parent_session_id: "s1".to_owned(),
+            child_session_id: ids.child_session_id.clone(),
+            target_agent_id: "coder".to_owned(),
+            origin: ForkOrigin::Delegation,
+            fork_point_type: ForkPointType::ProgressEntry,
+            fork_point_ref: ids.delegation_id.clone(),
+            instructions: None,
+            selected_model_id: None,
+            selected_provider_node_id: None,
+        },
+    );
+    push(
+        events,
+        seq,
+        AgentEventKind::DelegationStageChanged {
+            delegation_id: ids.delegation_id.clone(),
+            stage: Some(DelegationStage::Verifying),
+            source_epoch: "epoch-1".to_owned(),
+        },
+    );
+    if ids.completes {
+        push(
+            events,
+            seq,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: ids.delegation_id.clone(),
+                result: Some("ipsum dolor".to_owned()),
+            },
+        );
+    } else {
+        push(
+            events,
+            seq,
+            AgentEventKind::DelegationFailed {
+                delegation_id: ids.delegation_id.clone(),
+                error: "sit amet".to_owned(),
+            },
+        );
+    }
+    push(
+        events,
+        seq,
+        AgentEventKind::ToolCallEnd {
+            tool_call_id: ids.tool_call_id.clone(),
+            tool_name: "delegate".to_owned(),
+            is_error: !ids.completes,
+            result: if ids.completes {
+                "ipsum dolor".to_owned()
+            } else {
+                "sit amet".to_owned()
+            },
+        },
+    );
+}
+
 /// Charge the generated model-call events to `session_id`. The generator
 /// names its own session (`s1`); a rig that journals the events under another
 /// session id calls this on each event kind before journaling it, so the
@@ -220,6 +345,11 @@ pub fn charge_to_session(kind: &mut AgentEventKind, session_id: &str) {
         }
         AgentEventKind::LlmAttemptSettled { settlement } => {
             settlement.attempt.session_id = session_id.to_owned();
+        }
+        AgentEventKind::SessionForked {
+            parent_session_id, ..
+        } => {
+            *parent_session_id = session_id.to_owned();
         }
         _ => {}
     }
@@ -410,6 +540,11 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 },
             );
         }
+        if spec.delegations
+            && let Some(ids) = delegation_ids(turn)
+        {
+            delegation(&mut events, &mut seq, &ids);
+        }
         if spec.compaction_every > 0 && (turn + 1) % spec.compaction_every == 0 {
             let id = format!("c{turn}");
             push(
@@ -589,6 +724,29 @@ fn loaded(spec: TraceSpec) -> SessionInput {
     }
 }
 
+/// The `subagent_update` the agent sends for the delegation of `turn`: with
+/// `finished` false while it runs (stage verifying), true once it ended.
+fn subagent_update_for(ids: &DelegationIds, finished: bool) -> Value {
+    let mut update = json!({
+        "sessionUpdate": "subagent_update",
+        "sessionId": ids.child_session_id,
+        "title": "coder",
+        "description": format!("lorem {}", ids.delegation_id),
+        "state": { "state": if finished { "idle" } else { "running" } },
+        "_meta": { "querymt": { "delegationId": ids.delegation_id } },
+    });
+    if !finished {
+        update["_meta"]["querymt"]["stage"] = json!("verifying");
+    }
+    update
+}
+
+/// The delegate tool call update that points at its child session.
+fn session_reference_for(ids: &DelegationIds) -> Value {
+    json!({ "sessionUpdate": "tool_call_update", "toolCallId": ids.tool_call_id,
+             "content": [{ "type": "session", "sessionId": ids.child_session_id }] })
+}
+
 /// The golden scenarios: small, 1x and 4x sessions; streaming, history page,
 /// optimistic prompt, compaction and delegation (subagent) cases.
 pub fn golden_cases() -> Vec<GoldenCase> {
@@ -644,23 +802,26 @@ pub fn golden_cases() -> Vec<GoldenCase> {
                      "status": "completed" }),
         ),
     ];
-    let delegation = vec![
-        live(
-            json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
-                     "title": "Verifier", "description": "lorem",
-                     "state": { "state": "running" },
-                     "_meta": { "querymt": { "stage": "verifying" } } }),
-        ),
-        live(
-            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "delegate",
-                     "status": "in_progress",
-                     "content": [{ "type": "session", "sessionId": "child-1" }] }),
-        ),
-        live(
-            json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
-                     "state": { "state": "idle" } }),
-        ),
-    ];
+    // The delegations of the generated session, as its live stream tells
+    // them: each delegate tool call starts, its child is announced and the
+    // call is linked to it, then the child finishes and the call ends.
+    let delegation: Vec<SessionInput> = (0..2)
+        .filter_map(delegation_ids)
+        .flat_map(|ids| {
+            let status = if ids.completes { "completed" } else { "failed" };
+            vec![
+                live(
+                    json!({ "sessionUpdate": "tool_call", "toolCallId": ids.tool_call_id,
+                         "title": "delegate", "status": "in_progress" }),
+                ),
+                live(subagent_update_for(&ids, false)),
+                live(session_reference_for(&ids)),
+                live(subagent_update_for(&ids, true)),
+                live(json!({ "sessionUpdate": "tool_call_update",
+                         "toolCallId": ids.tool_call_id, "status": status })),
+            ]
+        })
+        .collect();
     let run_state = vec![
         vec![
             state_update("running", "r1", None),
@@ -687,28 +848,43 @@ pub fn golden_cases() -> Vec<GoldenCase> {
             state_update("idle", "sched-1", Some("end_turn")),
         ],
     ];
+    // A load of the generated session with its delegations: the agent lists
+    // each child as a `subagent_update` and links it to its tool call in the
+    // summary; a live update then patches one child.
+    let delegation_ids: Vec<DelegationIds> = (0..2).filter_map(delegation_ids).collect();
     let subagent = vec![
         vec![SessionInput::SnapshotLoaded {
             response: snapshot_response(
-                &generate(TraceSpec::small(3)).events,
-                json!({ "subagentUpdates": [
-                    { "sessionId": "child-1", "title": "Verifier",
-                      "state": { "state": "running" },
-                      "_meta": { "querymt": { "stage": "verifying" } } },
-                    { "sessionId": "child-2", "title": "Coder", "state": { "state": "idle" } },
-                ] }),
+                &generate(TraceSpec {
+                    delegations: true,
+                    ..TraceSpec::small(3)
+                })
+                .events,
+                json!({
+                    "subagentUpdates": delegation_ids.iter().map(|ids| {
+                        let mut update = subagent_update_for(ids, true);
+                        update.as_object_mut().map(|o| o.remove("sessionUpdate"));
+                        update
+                    }).collect::<Vec<_>>(),
+                    "summary": { "usage": { "latestRequest": null, "sessionTotals": null,
+                            "partial": false, "requestCount": 0, "contextTokens": null,
+                            "contextPosition": null,
+                            "accounting": serde_json::to_value(
+                                querymt_agent_protocol_types::accounting::ScopeTotals::default())
+                                .unwrap_or(Value::Null) },
+                        "provider": null, "pendingInputs": [],
+                        "childSessions": delegation_ids.iter().map(|ids| json!({
+                            "childSessionId": ids.child_session_id,
+                            "delegationId": ids.delegation_id,
+                            "toolCallId": ids.tool_call_id,
+                        })).collect::<Vec<_>>() },
+                }),
             ),
         }],
-        vec![
-            live(
-                json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
-                         "state": { "state": "idle" } }),
-            ),
-            live(
-                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t0-0",
-                         "content": [{ "type": "session", "sessionId": "child-2" }] }),
-            ),
-        ],
+        vec![live(
+            json!({ "sessionUpdate": "subagent_update", "sessionId": "child0",
+                     "title": "reviewer" }),
+        )],
     ];
     let cursor = vec![
         vec![

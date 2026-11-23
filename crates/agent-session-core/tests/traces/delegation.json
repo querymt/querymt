@@ -8,15 +8,32 @@
           "notification": {
             "sessionId": "s1",
             "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "del0",
+              "title": "delegate",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
               "sessionUpdate": "subagent_update",
-              "sessionId": "child-1",
-              "title": "Verifier",
-              "description": "lorem",
+              "sessionId": "child0",
+              "title": "coder",
+              "description": "lorem d0",
               "state": {
                 "state": "running"
               },
               "_meta": {
                 "querymt": {
+                  "delegationId": "d0",
                   "stage": "verifying"
                 }
               }
@@ -32,14 +49,12 @@
           "notification": {
             "sessionId": "s1",
             "update": {
-              "sessionUpdate": "tool_call",
-              "toolCallId": "t1",
-              "title": "delegate",
-              "status": "in_progress",
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del0",
               "content": [
                 {
                   "type": "session",
-                  "sessionId": "child-1"
+                  "sessionId": "child0"
                 }
               ]
             }
@@ -55,10 +70,132 @@
             "sessionId": "s1",
             "update": {
               "sessionUpdate": "subagent_update",
-              "sessionId": "child-1",
+              "sessionId": "child0",
+              "title": "coder",
+              "description": "lorem d0",
               "state": {
                 "state": "idle"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d0"
+                }
               }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del0",
+              "status": "completed"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "del1",
+              "title": "delegate",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child1",
+              "title": "coder",
+              "description": "lorem d1",
+              "state": {
+                "state": "running"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d1",
+                  "stage": "verifying"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del1",
+              "content": [
+                {
+                  "type": "session",
+                  "sessionId": "child1"
+                }
+              ]
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child1",
+              "title": "coder",
+              "description": "lorem d1",
+              "state": {
+                "state": "idle"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d1"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del1",
+              "status": "failed"
             }
           },
           "replayed": false,
@@ -85,9 +222,9 @@
     "header": {
       "sessionId": "s1",
       "schemaVersion": 2,
-      "runState": "tool_running",
+      "runState": "thinking",
       "activeRunId": null,
-      "activeToolCallId": "t1",
+      "activeToolCallId": null,
       "lastStopReason": null,
       "lastError": null,
       "context": null,
@@ -103,9 +240,9 @@
       "pendingInputs": [],
       "subagents": [
         {
-          "sessionId": "child-1",
-          "title": "Verifier",
-          "description": "lorem",
+          "sessionId": "child0",
+          "title": "coder",
+          "description": "lorem d0",
           "state": "idle",
           "stage": null,
           "capabilities": null,
@@ -113,7 +250,22 @@
           "additionalDirectories": null,
           "meta": {
             "querymt": {
-              "stage": "verifying"
+              "delegationId": "d0"
+            }
+          }
+        },
+        {
+          "sessionId": "child1",
+          "title": "coder",
+          "description": "lorem d1",
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": {
+            "querymt": {
+              "delegationId": "d1"
             }
           }
         }
@@ -132,29 +284,53 @@
     "turns": [
       {
         "id": "turn-live-1",
-        "revision": 2,
+        "revision": 8,
         "entries": [
           {
-            "id": "tool-t1",
-            "revision": 2,
+            "id": "tool-del0",
+            "revision": 4,
             "kind": {
               "type": "tool_call",
               "data": {
-                "toolCallId": "t1",
+                "toolCallId": "del0",
                 "title": "delegate",
                 "kind": "other",
-                "status": "in_progress",
+                "status": "completed",
                 "rawInput": null,
                 "rawOutput": null,
                 "content": [
                   {
                     "type": "session",
-                    "sessionId": "child-1"
+                    "sessionId": "child0"
                   }
                 ],
                 "resultFullBytes": null,
                 "argumentsFullBytes": null,
-                "childSessionId": "child-1"
+                "childSessionId": "child0"
+              }
+            }
+          },
+          {
+            "id": "tool-del1",
+            "revision": 8,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "del1",
+                "title": "delegate",
+                "kind": "other",
+                "status": "failed",
+                "rawInput": null,
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "session",
+                    "sessionId": "child1"
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child1"
               }
             }
           }

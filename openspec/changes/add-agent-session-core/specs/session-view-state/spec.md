@@ -100,6 +100,10 @@ Hydrating a snapshot SHALL produce the same turns as applying the session's live
 - **THEN** both views have equal turns with equal ids, entries, tool calls, compactions (summary content included), plan (plan id included), context usage, token breakdown and cost
 - **AND** the snapshot view's run state equals the live view's run state after the last update
 
+#### Scenario: Delegations agree live and after a load
+- **WHEN** a generated session with one completed and one failed delegation is applied once as its live stream, with the subagents capability, and once as a load snapshot
+- **THEN** both views hold the same subagents with the same state and stage, and each delegate tool call is linked to the same child session
+
 #### Scenario: Snapshot and replay produce the same turns
 - **WHEN** the same session is applied once as a load snapshot and once as the agent's history replay before a load response without a snapshot
 - **THEN** both views have equal turns, tool calls, compactions and plan
