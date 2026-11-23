@@ -12559,6 +12559,7 @@ dependencies = [
  "crypto-common 0.1.7",
  "crypto-common 0.2.2",
  "ctutils",
+ "curve25519-dalek 5.0.0",
  "data-encoding",
  "der 0.8.3",
  "deranged",
