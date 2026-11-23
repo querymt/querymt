@@ -259,9 +259,28 @@ pub trait SessionStore: Send + Sync {
         fork_origin: ForkOrigin,
         intent: Option<PendingForkIsolation>,
     ) -> SessionResult<String> {
-        if intent.is_some() {
+        self.fork_session_with_context(
+            source_session_id,
+            target_message_id,
+            fork_origin,
+            intent,
+            None,
+        )
+        .await
+    }
+
+    /// Persist optional fork startup context atomically with the copied conversation.
+    async fn fork_session_with_context(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+        intent: Option<PendingForkIsolation>,
+        peer: Option<super::domain_schedule::ScheduleOrigin>,
+    ) -> SessionResult<String> {
+        if intent.is_some() || peer.is_some() {
             return Err(SessionError::InvalidOperation(
-                "atomic fork isolation intent is unsupported by this store".into(),
+                "atomic fork startup context is unsupported by this store".into(),
             ));
         }
         self.fork_session(source_session_id, target_message_id, fork_origin)
@@ -286,6 +305,41 @@ pub trait SessionStore: Send + Sync {
         }
         self.create_session(name, cwd, parent_session_id, fork_origin)
             .await
+    }
+
+    /// Create a workspace-less session and atomically bind its authenticated peer origin.
+    async fn create_peer_session(
+        &self,
+        _origin: super::domain_schedule::ScheduleOrigin,
+    ) -> SessionResult<Session> {
+        Err(SessionError::InvalidOperation(
+            "peer session origin is unsupported by this store".into(),
+        ))
+    }
+
+    /// Copy stored conversation into a workspace-less session with a fresh peer origin.
+    async fn fork_peer_session(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        origin: super::domain_schedule::ScheduleOrigin,
+    ) -> SessionResult<String> {
+        self.fork_session_with_context(
+            source_session_id,
+            target_message_id,
+            ForkOrigin::User,
+            None,
+            Some(origin),
+        )
+        .await
+    }
+
+    /// Trusted origin of a workspace-less peer-created session, if present.
+    async fn peer_session_origin(
+        &self,
+        _session_id: &str,
+    ) -> SessionResult<Option<super::domain_schedule::ScheduleOrigin>> {
+        Ok(None)
     }
 
     /// Return the pending isolation intent; absent for legacy local sessions.

@@ -24,6 +24,74 @@ use super::event_journal::LAST_UNFINISHED_RUN_SQL;
 use super::migrations::{MIGRATIONS, apply_migrations};
 
 #[tokio::test]
+async fn workspace_less_peer_create_and_fork_keep_their_origins_after_reopen() {
+    use querymt_agent_core::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sessions.db");
+    let storage = SqliteStorage::connect(db.clone()).await.unwrap();
+    let origin = ScheduleOrigin::Peer {
+        host: "owner".into(),
+        peer: "creator".into(),
+        protocol: SchedulePeerProtocol::V1,
+    };
+    let created = storage.create_peer_session(origin.clone()).await.unwrap();
+    let source = storage
+        .create_session(None, Some(dir.path().to_owned()), None, None)
+        .await
+        .unwrap();
+    let point = "saved-message";
+    storage
+        .add_message(
+            &source.public_id,
+            AgentMessage {
+                id: point.into(),
+                session_id: source.public_id.clone(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::Text {
+                    content: "saved history".into(),
+                }],
+                created_at: 1,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        )
+        .await
+        .unwrap();
+    let forked = storage
+        .fork_peer_session(&source.public_id, point, origin.clone())
+        .await
+        .unwrap();
+    drop(storage);
+
+    let storage = SqliteStorage::connect(db).await.unwrap();
+    for id in [&created.public_id, &forked] {
+        assert_eq!(
+            storage.peer_session_origin(id).await.unwrap(),
+            Some(origin.clone())
+        );
+        assert!(
+            storage
+                .get_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cwd
+                .is_none()
+        );
+    }
+    assert_eq!(storage.get_history(&forked).await.unwrap().len(), 1);
+    assert_eq!(
+        storage
+            .peer_session_origin(&source.public_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sessions.db");
