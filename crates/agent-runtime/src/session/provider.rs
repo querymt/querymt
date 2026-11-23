@@ -245,7 +245,7 @@ impl SessionProvider {
         execution_config: &SessionExecutionConfig,
         intent: Option<crate::session::store::PendingForkIsolation>,
     ) -> SessionResult<SessionHandle> {
-        let mut session = self
+        let session = self
             .history_store
             .create_session_with_isolation_intent(
                 None,
@@ -255,12 +255,40 @@ impl SessionProvider {
                 intent,
             )
             .await?;
+        self.configure_new_session(session, cwd.as_deref(), execution_config)
+            .await
+    }
 
+    #[cfg(feature = "remote")]
+    pub(crate) async fn create_peer_session(
+        &self,
+        origin: crate::session::domain_schedule::ScheduleOrigin,
+        execution_config: &SessionExecutionConfig,
+    ) -> SessionResult<SessionHandle> {
+        let session = self.history_store.create_peer_session(origin).await?;
+        let id = session.public_id.clone();
+        let result = self
+            .configure_new_session(session, None, execution_config)
+            .await;
+        if result.is_err()
+            && let Err(error) = self.history_store.delete_session(&id).await
+        {
+            tracing::warn!(session_id = %id, %error, "failed to remove unconfigured peer session");
+        }
+        result
+    }
+
+    async fn configure_new_session(
+        &self,
+        mut session: crate::session::store::Session,
+        cwd: Option<&std::path::Path>,
+        execution_config: &SessionExecutionConfig,
+    ) -> SessionResult<SessionHandle> {
         // Resolve session-specific template variables (cwd, datetime, …) in
         // system prompt strings before writing the config to the database.
         let resolved_config = {
             let mut builder = crate::template::SessionTemplateContext::builder();
-            if let Some(ref p) = cwd {
+            if let Some(p) = cwd {
                 builder = builder.cwd(p);
             }
             if let Some(ref p) = self.initial_config.provider {

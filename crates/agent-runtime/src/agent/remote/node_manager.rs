@@ -356,12 +356,7 @@ mod remote_impl {
         pub schedule_public_id: String,
     }
 
-    enum ScheduleAction {
-        Pause,
-        Resume,
-        Trigger,
-        Delete,
-    }
+    use crate::scheduler::{PeerScheduleMutation, ScheduleAction};
 
     impl ScheduleAction {
         async fn apply(
@@ -609,57 +604,67 @@ mod remote_impl {
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<ListRemoteSchedules, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<PauseRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<ResumeRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<TriggerRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<DeleteRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
-            use crate::agent::remote::remote_actor_impl::{
-                register_session_read, register_session_request,
-            };
+            use crate::agent::remote::remote_actor_impl::register_session_read;
             Self::register_peer_ask::<ResumeRemoteSession, _>(
                 router,
                 &store,
                 actor,
                 InboundAccess::Sessions,
             );
-            register_session_request::<_, CreateRemoteSession>(router, actor, InboundAccess::Full);
             register_session_request::<_, CreateRemoteDelegationSession>(
                 router,
                 actor,
                 InboundAccess::Full,
             );
-            register_session_request::<_, CreateRemoteSessionWithProfile>(
+            Self::register_peer_ask::<CreateRemoteSession, _>(
                 router,
+                &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
+            );
+            Self::register_peer_ask::<CreateRemoteSessionWithProfile, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::Sessions,
+            );
+            Self::register_peer_ask::<ForkRemoteSession, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::Sessions,
             );
             register_session_read::<_, GetRemoteSessionProfile>(router, actor);
             register_session_read::<_, ListRemoteSessions>(router, actor);
@@ -681,7 +686,7 @@ mod remote_impl {
                         .await
                         .map_or(PeerGrant::None, |state| state.grant);
                     info.capabilities.retain(|name| match name.as_str() {
-                        "shell" => grant == PeerGrant::Full,
+                        "shell" => grant.allows_shell(protocol),
                         "filesystem" => grant.allows_filesystem(protocol),
                         _ => false,
                     });
@@ -965,6 +970,7 @@ mod remote_impl {
                 created_at: now,
                 updated_at: now,
             };
+            origin.check_mutation().await?;
             let task = store
                 .create_task(task)
                 .await
@@ -986,7 +992,10 @@ mod remote_impl {
             }
 
             let schedule_public_id = schedule.public_id.clone();
-            match scheduler.add_schedule(schedule).await {
+            match scheduler
+                .peer_mutation(origin, PeerScheduleMutation::Add(Box::new(schedule)))
+                .await
+            {
                 Ok(()) => Ok(CreateRemoteScheduleResponse { schedule_public_id }),
                 Err(e) => {
                     let msg = e.to_string();
@@ -1002,7 +1011,11 @@ mod remote_impl {
                         ),
                     };
 
-                    Err(AgentError::Internal(format!("{msg}{cleanup_suffix}")))
+                    if cleanup_suffix.is_empty() {
+                        Err(e)
+                    } else {
+                        Err(AgentError::Internal(format!("{msg}{cleanup_suffix}")))
+                    }
                 }
             }
         }
@@ -1287,7 +1300,16 @@ mod remote_impl {
             cwd: Option<String>,
             profile_id: Option<String>,
             fork_origin: Option<crate::session::domain::ForkOrigin>,
+            peer: Option<&PeerTurn>,
         ) -> Result<CreateRemoteSessionResponse, AgentError> {
+            let restricted = match peer {
+                Some(peer) => peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full,
+                None => false,
+            };
+            if restricted && cwd.as_ref().is_some_and(|cwd| !cwd.is_empty()) {
+                return Err(AgentError::MeshAccessDenied);
+            }
+            let cwd = if restricted { None } else { cwd };
             let cwd_path = cwd.as_ref().map(PathBuf::from);
             if let Some(ref path) = cwd_path
                 && !path.is_absolute()
@@ -1319,17 +1341,38 @@ mod remote_impl {
                 .as_ref()
                 .map(|runtime| runtime.handle().config.clone())
                 .unwrap_or_else(|| self.config.clone());
-            let session_context = config
-                .provider
-                .create_session_with_isolation_intent(
-                    cwd_path.clone(),
-                    None,
-                    fork_origin,
-                    &config.execution_config_snapshot(),
-                    None,
-                )
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
+            let materializer = owner_runtime.as_ref().map_or_else(
+                || self.session_materializer.clone(),
+                |runtime| runtime.handle().session_materializer.clone(),
+            );
+            if restricted && !materializer.supports_restricted_cold_resume() {
+                return Err(AgentError::MeshAccessDenied);
+            }
+            if let Some(peer) = peer {
+                peer.check_mutation().await?;
+            }
+            let execution = config.execution_config_snapshot();
+            let session_context = match peer.filter(|_| restricted) {
+                Some(peer) => {
+                    config
+                        .provider
+                        .create_peer_session(peer.schedule_origin(), &execution)
+                        .await
+                }
+                None => {
+                    config
+                        .provider
+                        .create_session_with_isolation_intent(
+                            cwd_path.clone(),
+                            None,
+                            fork_origin,
+                            &execution,
+                            None,
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
 
             let session = session_context.session();
             let session_id = session.public_id.clone();
@@ -1368,7 +1411,7 @@ mod remote_impl {
                     cwd.clone(),
                     title.clone(),
                     created_at,
-                    None,
+                    peer,
                 )
                 .await?;
 
@@ -1403,7 +1446,7 @@ mod remote_impl {
             let shared_state = self.shared_state.clone();
 
             // Spawn the work as a background task
-            ctx.spawn(async move { shared_state.create_session(msg.cwd, None, None).await })
+            ctx.spawn(async move { shared_state.create_session(msg.cwd, None, None, None).await })
         }
     }
 
@@ -1427,6 +1470,7 @@ mod remote_impl {
                         msg.cwd,
                         None,
                         Some(crate::session::domain::ForkOrigin::Delegation),
+                        None,
                     )
                     .await
             })
@@ -1451,11 +1495,26 @@ mod remote_impl {
             msg: ForkRemoteSession,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            // Capture shared state for the spawned task
-            let shared_state = self.shared_state.clone();
+            self.handle_fork(msg, None, ctx).await
+        }
+    }
 
-            // Spawn the heavy work as a background task
+    impl RemoteNodeManager {
+        async fn handle_fork(
+            &self,
+            msg: ForkRemoteSession,
+            peer: Option<Arc<PeerTurn>>,
+            ctx: &mut Context<
+                Self,
+                kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>>,
+            >,
+        ) -> kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>> {
+            let shared_state = self.shared_state.clone();
             ctx.spawn(async move {
+                let restricted = match &peer {
+                    Some(peer) => peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full,
+                    None => false,
+                };
                 let profiles = shared_state.profiles.load_full();
                 let source_binding = match profiles.as_ref().as_ref() {
                     Some(profiles) => profiles.session_binding(&msg.source_session_id).await,
@@ -1468,7 +1527,7 @@ mod remote_impl {
                     }),
                     None => None,
                 };
-                let config = match &owner_runtime {
+                let (config, materializer) = match &owner_runtime {
                     Some(runtime) => {
                         let handle = runtime
                             .session_handle(
@@ -1479,10 +1538,13 @@ mod remote_impl {
                             .ok_or_else(|| {
                                 AgentError::Internal("Unknown source session runtime".into())
                             })?;
-                        handle.config.clone()
+                        (handle.config.clone(), handle.session_materializer.clone())
                     }
-                    None => shared_state.config.clone(),
+                    None => (shared_state.config.clone(), shared_state.session_materializer.clone()),
                 };
+                if restricted && !materializer.supports_restricted_cold_resume() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
                 let session = config
                     .provider
                     .history_store()
@@ -1493,16 +1555,14 @@ mod remote_impl {
                         session_id: msg.source_session_id.clone(),
                     })?;
 
-                let forked_session_id = config
-                    .provider
-                    .history_store()
-                    .fork_session(
-                        &msg.source_session_id,
-                        &msg.message_id,
-                        crate::session::domain::ForkOrigin::User,
-                    )
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+                if let Some(peer) = &peer {
+                    peer.check_mutation().await?;
+                }
+                let store = config.provider.history_store();
+                let forked_session_id = match peer.as_ref().filter(|_| restricted) {
+                    Some(peer) => store.fork_peer_session(&msg.source_session_id, &msg.message_id, peer.schedule_origin()).await,
+                    None => store.fork_session(&msg.source_session_id, &msg.message_id, crate::session::domain::ForkOrigin::User).await,
+                }.map_err(|e| AgentError::Internal(e.to_string()))?;
 
                 if let (Some(profiles), Some(runtime)) =
                     (profiles.as_ref().as_ref(), &owner_runtime)
@@ -1551,7 +1611,7 @@ mod remote_impl {
                         cwd.clone(),
                         title.clone(),
                         created_at,
-                        None,
+                        peer.as_deref(),
                     )
                     .await?;
 
@@ -1576,9 +1636,61 @@ mod remote_impl {
             let state = self.shared_state.clone();
             ctx.spawn(async move {
                 state
-                    .create_session(msg.cwd, Some(msg.profile_id), None)
+                    .create_session(msg.cwd, Some(msg.profile_id), None, None)
                     .await
             })
+        }
+    }
+
+    impl Message<PeerNodeRequest<CreateRemoteSession>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<CreateRemoteSession>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .create_session(msg.request.cwd, None, None, Some(&msg.authority))
+                    .await
+            })
+        }
+    }
+
+    impl Message<PeerNodeRequest<CreateRemoteSessionWithProfile>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<CreateRemoteSessionWithProfile>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .create_session(
+                        msg.request.cwd,
+                        Some(msg.request.profile_id),
+                        None,
+                        Some(&msg.authority),
+                    )
+                    .await
+            })
+        }
+    }
+
+    impl Message<PeerNodeRequest<ForkRemoteSession>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<ForkRemoteSession>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            self.handle_fork(msg.request, Some(msg.authority), ctx)
+                .await
         }
     }
 
@@ -2106,26 +2218,19 @@ mod remote_impl {
         ) -> Self::Reply {
             let state = self.shared_state.clone();
             ctx.spawn(async move {
-                let authority = TurnAuthority::Peer(msg.authority);
-                authority.check().await?;
                 let scheduler = state
                     .get_or_start_scheduler()
                     .await
                     .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
-                let id = msg.request.schedule_id();
-                let schedule = scheduler
-                    .get_schedule(id)
+                scheduler
+                    .peer_mutation(
+                        msg.authority,
+                        PeerScheduleMutation::Action(
+                            M::ACTION,
+                            msg.request.schedule_id().to_owned(),
+                        ),
+                    )
                     .await
-                    .map_err(|error| AgentError::Internal(error.to_string()))?
-                    .ok_or(AgentError::MeshAccessDenied)?;
-                if !authority.owns_schedule(&schedule.config.origin) {
-                    return Err(AgentError::MeshAccessDenied);
-                }
-                authority.check().await?;
-                M::ACTION
-                    .apply(&scheduler, id)
-                    .await
-                    .map_err(|error| AgentError::Internal(error.to_string()))
             })
         }
     }
@@ -2377,10 +2482,17 @@ mod remote_impl {
                 .map(|m| NodeId::from_peer_id(*m.peer_id()))
                 .ok_or(AgentError::MeshNotBootstrapped)?;
 
+            let config = &self.shared_state.config;
+            let mut capabilities = vec!["filesystem".to_owned()];
+            if config.tool_config.policy != crate::agent::core::ToolPolicy::ProviderOnly
+                && config.is_tool_allowed(crate::config::ToolRef::builtin("shell"))
+            {
+                capabilities.insert(0, "shell".to_owned());
+            }
             Ok(NodeInfo {
                 node_id,
                 hostname,
-                capabilities: vec!["shell".to_string(), "filesystem".to_string()],
+                capabilities,
                 active_sessions: Some(active_sessions),
             })
         }

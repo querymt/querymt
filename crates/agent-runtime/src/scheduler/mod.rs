@@ -212,6 +212,22 @@ impl SchedulerHandle {
         Ok(schedules)
     }
 
+    #[cfg(feature = "remote")]
+    pub(crate) async fn peer_mutation(
+        &self,
+        peer: Arc<crate::agent::session_actor::PeerTurn>,
+        mutation: PeerScheduleMutation,
+    ) -> Result<(), crate::error::AgentError> {
+        self.actor_ref
+            .ask(ApplyPeerScheduleMutation { peer, mutation })
+            .mailbox_timeout(Self::CONTROL_TIMEOUT)
+            .await
+            .map_err(|error| match error {
+                kameo::error::SendError::HandlerError(error) => error,
+                _ => crate::error::AgentError::Internal(error.to_string()),
+            })
+    }
+
     /// Get a single schedule by public ID.
     pub async fn get_schedule(&self, schedule_public_id: &str) -> SessionResult<Option<Schedule>> {
         let schedule = self
@@ -278,6 +294,8 @@ pub struct SchedulerActor {
     active_cycles: HashMap<String, ActiveCycle>,
     /// Schedules marked for deletion while running. Cleaned up after terminal event.
     pending_deletes: HashSet<String>,
+    #[cfg(feature = "remote")]
+    pending_peer_deletes: HashMap<String, Arc<crate::agent::session_actor::PeerTurn>>,
     /// Set of `(schedule_public_id, turn_id)` pairs that have already been processed.
     /// Prevents double-application of completion/failure from duplicate events.
     processed_terminals: HashSet<(String, Option<String>)>,
@@ -477,18 +495,90 @@ impl Message<ListSchedules> for SchedulerActor {
 // ── GetSchedule (query, uses ask) ─────────────────────────────────────────
 
 impl Message<GetSchedule> for SchedulerActor {
-    type Reply = Result<Option<Schedule>, kameo::error::Infallible>;
+    type Reply = SessionResult<Option<Schedule>>;
 
     async fn handle(
         &mut self,
         msg: GetSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self
-            .schedule_store
+        self.schedule_store
             .get_schedule(&msg.schedule_public_id)
             .await
-            .unwrap_or(None))
+    }
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy)]
+pub(crate) enum ScheduleAction {
+    Pause,
+    Resume,
+    Trigger,
+    Delete,
+}
+
+#[cfg(feature = "remote")]
+pub(crate) enum PeerScheduleMutation {
+    Add(Box<Schedule>),
+    Action(ScheduleAction, String),
+}
+
+#[cfg(feature = "remote")]
+struct ApplyPeerScheduleMutation {
+    peer: Arc<crate::agent::session_actor::PeerTurn>,
+    mutation: PeerScheduleMutation,
+}
+
+#[cfg(feature = "remote")]
+impl Message<ApplyPeerScheduleMutation> for SchedulerActor {
+    type Reply = Result<(), crate::error::AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: ApplyPeerScheduleMutation,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::session_actor::TurnAuthority;
+        use crate::error::AgentError;
+
+        let storage_error =
+            |error: crate::session::error::SessionError| AgentError::Internal(error.to_string());
+        match msg.mutation {
+            PeerScheduleMutation::Add(schedule) => {
+                if schedule.config.origin != msg.peer.schedule_origin() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
+                msg.peer.check_schedule_mutation().await?;
+                self.handle_add_schedule(*schedule)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            PeerScheduleMutation::Action(action, id) => {
+                let schedule = self
+                    .schedule_store
+                    .get_schedule(&id)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or(AgentError::MeshAccessDenied)?;
+                if !TurnAuthority::Peer(msg.peer.clone()).owns_schedule(&schedule.config.origin) {
+                    return Err(AgentError::MeshAccessDenied);
+                }
+                msg.peer.check_schedule_mutation().await?;
+                match action {
+                    ScheduleAction::Pause => self.handle_pause_schedule(&id).await,
+                    ScheduleAction::Resume => self.handle_resume_schedule(&id).await,
+                    ScheduleAction::Trigger => self.fire_loaded_schedule(&id, schedule).await,
+                    ScheduleAction::Delete if self.active_cycles.contains_key(&id) => {
+                        self.pending_peer_deletes.insert(id, msg.peer);
+                        self.update_pending_delete_metrics();
+                    }
+                    ScheduleAction::Delete => {
+                        self.delete_schedule(&id).await.map_err(storage_error)?
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -582,6 +672,8 @@ impl SchedulerActor {
             event_counters: HashMap::new(),
             active_cycles: HashMap::new(),
             pending_deletes: HashSet::new(),
+            #[cfg(feature = "remote")]
+            pending_peer_deletes: HashMap::new(),
             processed_terminals: HashSet::new(),
             self_ref: None,
             timer_scheduler: None,
@@ -1004,12 +1096,33 @@ impl SchedulerActor {
     pub async fn fire_schedule(&mut self, schedule_public_id: &str) {
         let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
             Ok(Some(schedule)) => schedule,
-            Ok(None) => return,
+            Ok(None) => {
+                #[cfg(feature = "remote")]
+                self.waiting_for_policy.remove(schedule_public_id);
+                return;
+            }
             Err(error) => {
                 warn!("SchedulerActor: failed to load {schedule_public_id}: {error}");
                 return;
             }
         };
+        self.fire_loaded_schedule(schedule_public_id, schedule)
+            .await;
+    }
+
+    #[cfg(feature = "remote")]
+    async fn retry_policy_deferred(&mut self) {
+        let deferred: Vec<_> = self.waiting_for_policy.iter().cloned().collect();
+        for id in deferred {
+            self.fire_schedule(&id).await;
+        }
+    }
+
+    async fn fire_loaded_schedule(&mut self, schedule_public_id: &str, schedule: Schedule) {
+        #[cfg(feature = "remote")]
+        if schedule.state != ScheduleState::Armed {
+            self.waiting_for_policy.remove(schedule_public_id);
+        }
 
         // Leave a due peer schedule armed until the host's policy store is ready.
         // No cycle or timeout exists while it waits for reconciliation.
@@ -1049,6 +1162,9 @@ impl SchedulerActor {
                 return;
             }
         };
+
+        #[cfg(feature = "remote")]
+        self.waiting_for_policy.remove(schedule_public_id);
 
         if !cas_ok {
             self.metrics.cas_conflicts_total += 1;
@@ -1318,23 +1434,7 @@ impl SchedulerActor {
             self.enqueue_schedule(&updated).await;
         }
 
-        // Handle pending delete
-        if self.pending_deletes.remove(schedule_public_id) {
-            info!(
-                "SchedulerActor: executing deferred delete for {}",
-                schedule_public_id
-            );
-            if let Err(e) = self
-                .schedule_store
-                .delete_schedule(schedule_public_id)
-                .await
-            {
-                warn!(
-                    "SchedulerActor: deferred delete failed for {}: {}",
-                    schedule_public_id, e
-                );
-            }
-        }
+        self.apply_pending_delete(schedule_public_id).await;
 
         // Emit cycle completed event
         self.config.emit_event(
@@ -1456,23 +1556,7 @@ impl SchedulerActor {
             self.enqueue_schedule(&updated).await;
         }
 
-        // Handle pending delete
-        if self.pending_deletes.remove(schedule_public_id) {
-            info!(
-                "SchedulerActor: executing deferred delete after failure for {}",
-                schedule_public_id
-            );
-            if let Err(e) = self
-                .schedule_store
-                .delete_schedule(schedule_public_id)
-                .await
-            {
-                warn!(
-                    "SchedulerActor: deferred delete failed for {}: {}",
-                    schedule_public_id, e
-                );
-            }
-        }
+        self.apply_pending_delete(schedule_public_id).await;
 
         // Emit cycle failed event
         self.config.emit_event(
@@ -1521,11 +1605,46 @@ impl SchedulerActor {
                 schedule_public_id
             );
             self.pending_deletes.insert(schedule_public_id.to_string());
-            self.metrics.pending_deletes = self.pending_deletes.len() as u64;
+            self.update_pending_delete_metrics();
             return Ok(());
         }
+        self.delete_schedule(schedule_public_id).await
+    }
 
-        // Remove from in-memory queues
+    fn update_pending_delete_metrics(&mut self) {
+        let count = self.pending_deletes.len();
+        #[cfg(feature = "remote")]
+        let count = count
+            + self
+                .pending_peer_deletes
+                .keys()
+                .filter(|id| !self.pending_deletes.contains(*id))
+                .count();
+        self.metrics.pending_deletes = count as u64;
+    }
+
+    async fn apply_pending_delete(&mut self, id: &str) {
+        let local = self.pending_deletes.remove(id);
+        #[cfg(feature = "remote")]
+        let peer = self.pending_peer_deletes.remove(id);
+        self.update_pending_delete_metrics();
+        #[cfg(feature = "remote")]
+        let local = local
+            || match peer {
+                Some(peer) => peer.check_schedule_mutation().await.is_ok(),
+                None => false,
+            };
+        if local && let Err(error) = self.delete_schedule(id).await {
+            warn!("SchedulerActor: deferred delete failed for {id}: {error}");
+        }
+    }
+
+    async fn delete_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
+        self.schedule_store
+            .delete_schedule(schedule_public_id)
+            .await?;
+
+        // Remove from in-memory queues after the durable mutation.
         #[cfg(feature = "remote")]
         self.waiting_for_policy.remove(schedule_public_id);
         self.deadline_queue.remove(schedule_public_id);
@@ -1534,9 +1653,6 @@ impl SchedulerActor {
         self.metrics.armed_event_schedules = self.event_counters.len() as u64;
         self.reschedule_wake().await;
 
-        self.schedule_store
-            .delete_schedule(schedule_public_id)
-            .await?;
         info!("SchedulerActor: removed schedule {}", schedule_public_id);
         Ok(())
     }
@@ -1811,9 +1927,7 @@ impl SchedulerActor {
             .mesh_handle()
             .is_some_and(|mesh| mesh.quota_store().is_some())
         {
-            for id in std::mem::take(&mut self.waiting_for_policy) {
-                self.fire_schedule(&id).await;
-            }
+            self.retry_policy_deferred().await;
         }
 
         // 2. Check for armed schedules that may have been missed
@@ -2105,6 +2219,15 @@ mod unit_tests {
     /// A scheduler (not spawned) over an in-memory store holding one schedule,
     /// `"sched"`, in the `Running` state.
     async fn scheduler_with_running_schedule() -> (SchedulerActor, Arc<dyn ScheduleRepository>) {
+        let (actor, store, _) = scheduler_with_db().await;
+        (actor, store)
+    }
+
+    async fn scheduler_with_db() -> (
+        SchedulerActor,
+        Arc<dyn ScheduleRepository>,
+        Arc<parking_lot::Mutex<rusqlite::Connection>>,
+    ) {
         use crate::session::domain_schedule::ScheduleConfig;
         use crate::session::repo_schedule::SqliteScheduleRepository;
         use crate::session::schema;
@@ -2133,7 +2256,7 @@ mod unit_tests {
             (session_id, conn.last_insert_rowid())
         };
         let db = Arc::new(parking_lot::Mutex::new(conn));
-        let schedule_store = Arc::new(SqliteScheduleRepository::new(db))
+        let schedule_store = Arc::new(SqliteScheduleRepository::new(db.clone()))
             as Arc<dyn crate::session::repository::ScheduleRepository>;
         schedule_store
             .create_schedule(Schedule {
@@ -2190,7 +2313,138 @@ mod unit_tests {
             config,
             SchedulerConfig::default(),
         );
-        (actor, schedule_store)
+        (actor, schedule_store, db)
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn queued_peer_schedule_mutation_rechecks_authority_and_preserves_storage_errors() {
+        use crate::{agent::session_actor::PeerTurn, error::AgentError};
+        use querymt_remote::{
+            NodeId,
+            peer_access::{
+                GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+                PolicyEffect,
+            },
+        };
+        use tokio::sync::broadcast;
+
+        struct Grants(broadcast::Sender<PolicyChange>);
+        #[async_trait::async_trait]
+        impl GrantStore for Grants {
+            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(PeerGrantState {
+                    revision: uuid::Uuid::nil(),
+                    grant: PeerGrant::Full,
+                })
+            }
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: uuid::Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                unreachable!()
+            }
+            async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+                unreachable!()
+            }
+            fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+                Some(self.0.subscribe())
+            }
+        }
+        let (actor, store, db) = scheduler_with_db().await;
+        let (changes, _) = broadcast::channel(8);
+        let grant_store = Arc::new(Grants(changes.clone()));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let admitted = PeerTurn::test_peer(key.clone(), PeerGrant::Full, grant_store.clone());
+        let mut schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        schedule.config.origin = admitted.schedule_origin();
+        store.update_schedule(schedule).await.unwrap();
+        // The current grant is Full again, but the queued request crossed a revocation.
+        changes
+            .send(PolicyChange {
+                key: key.clone(),
+                effect: PolicyEffect::Grant(PeerGrant::None),
+            })
+            .unwrap();
+        let handle = SchedulerHandle::new(kameo::actor::Spawn::spawn(actor));
+        let delete = || PeerScheduleMutation::Action(ScheduleAction::Delete, "sched".into());
+        assert!(matches!(
+            handle.peer_mutation(admitted, delete()).await,
+            Err(AgentError::MeshAccessDenied)
+        ));
+        assert!(store.get_schedule("sched").await.unwrap().is_some());
+
+        db.lock()
+            .execute_batch("ALTER TABLE schedules RENAME TO schedules_unavailable")
+            .unwrap();
+        let fresh = PeerTurn::test_peer(key, PeerGrant::Full, grant_store);
+        assert!(matches!(
+            handle.peer_mutation(fresh, delete()).await,
+            Err(AgentError::Internal(_))
+        ));
+        handle.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn deferred_lookup_failure_preserves_firing_and_reports_storage_error() {
+        let (mut actor, store, db) = scheduler_with_db().await;
+        actor.waiting_for_policy.insert("sched".into());
+        store
+            .update_schedule_state("sched", ScheduleState::Running, ScheduleState::Armed)
+            .await
+            .unwrap();
+        db.lock()
+            .execute_batch("ALTER TABLE schedules RENAME TO schedules_unavailable")
+            .unwrap();
+        actor.retry_policy_deferred().await;
+        assert!(actor.waiting_for_policy.contains("sched"));
+
+        db.lock()
+            .execute_batch("ALTER TABLE schedules_unavailable RENAME TO schedules")
+            .unwrap();
+        actor.retry_policy_deferred().await;
+        assert!(!actor.waiting_for_policy.contains("sched"));
+        assert_eq!(
+            store
+                .get_schedule("sched")
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+
+        db.lock()
+            .execute_batch("ALTER TABLE schedules RENAME TO schedules_unavailable")
+            .unwrap();
+        let handle = SchedulerHandle::new(kameo::actor::Spawn::spawn(actor));
+        assert!(handle.get_schedule("sched").await.is_err());
+        handle.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn a_started_cycle_clears_its_deferred_entry_before_backoff() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        actor.waiting_for_policy.insert("sched".into());
+        store
+            .update_schedule_state("sched", ScheduleState::Running, ScheduleState::Armed)
+            .await
+            .unwrap();
+        actor.fire_schedule("sched").await;
+        let backed_off = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(backed_off.state, ScheduleState::Armed);
+        assert!(backed_off.next_run_at.unwrap() > OffsetDateTime::now_utc());
+        actor.retry_policy_deferred().await;
+        let after_retry = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(after_retry.consecutive_failures, 1);
+        assert_eq!(after_retry.next_run_at, backed_off.next_run_at);
     }
 
     /// Put a cycle of `"sched"` in flight, running as `turn_id`.

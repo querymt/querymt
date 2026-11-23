@@ -471,6 +471,54 @@ impl PeerTurn {
         .await
     }
 
+    /// Check a one-shot mutation at the last boundary before starting its side effect.
+    pub(crate) async fn check_mutation(&self) -> Result<(), AgentError> {
+        self.check_mutation_grants(|grant| self.check_grant(grant, None))
+            .await
+    }
+
+    pub(crate) async fn check_schedule_mutation(&self) -> Result<(), AgentError> {
+        self.check_mutation_grants(|grant| {
+            if grant.allows_sessions(self.protocol) {
+                Ok(())
+            } else {
+                Err(AgentError::MeshAccessDenied)
+            }
+        })
+        .await
+    }
+
+    async fn check_mutation_grants(
+        &self,
+        check: impl Fn(&querymt_remote::peer_access::PeerGrant) -> Result<(), AgentError>,
+    ) -> Result<(), AgentError> {
+        use querymt_remote::peer_access::{PolicyChange, PolicyEffect};
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let state = self
+            .store
+            .grant(&self.key)
+            .await
+            .map_err(|_| AgentError::MeshAccessDenied)?;
+        check(&state.grant)?;
+        if let Some(changes) = self.changes.lock().as_mut() {
+            loop {
+                match changes.try_recv() {
+                    Ok(PolicyChange {
+                        key,
+                        effect: PolicyEffect::Grant(grant),
+                    }) if key == self.key => {
+                        check(&grant)?;
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(_) => return Err(AgentError::MeshAccessDenied),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn schedule_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
         use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
         use querymt_remote::peer_access::SharingProtocol;
@@ -545,10 +593,13 @@ impl TurnAuthority {
         &self,
         origin: &crate::session::domain_schedule::ScheduleOrigin,
     ) -> bool {
-        matches!(
-            origin,
-            crate::session::domain_schedule::ScheduleOrigin::Peer { .. }
-        ) && self.stored_origin() == *origin
+        use crate::session::domain_schedule::ScheduleOrigin;
+        match (self, origin) {
+            (Self::Peer(caller), ScheduleOrigin::Peer { host, peer, .. }) => {
+                caller.key.host.to_string() == *host && caller.key.peer.to_string() == *peer
+            }
+            _ => false,
+        }
     }
 
     pub(crate) async fn check(&self) -> Result<(), AgentError> {

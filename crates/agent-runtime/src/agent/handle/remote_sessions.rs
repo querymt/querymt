@@ -530,17 +530,14 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &ForkRemoteSession {
                 source_session_id,
                 message_id,
             },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to

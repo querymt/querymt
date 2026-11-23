@@ -1272,11 +1272,40 @@ mod node_manager_tests {
         let stored = config
             .provider
             .history_store()
-            .create_session(Some("retained-reference".into()), None, None, None)
+            .create_session(
+                Some("retained-reference".into()),
+                Some(workspace.path().canonicalize().unwrap()),
+                None,
+                None,
+            )
             .await
             .expect("persist fixture session");
         let session_id = stored.public_id;
-        let session = SessionActor::spawn(SessionActor::new(config, session_id.clone(), runtime));
+        let history_store = config.provider.history_store();
+        let fork_point = Uuid::new_v4().to_string();
+        history_store
+            .add_message(
+                &session_id,
+                AgentMessage {
+                    id: fork_point.clone(),
+                    session_id: session_id.clone(),
+                    role: ChatRole::User,
+                    parts: vec![MessagePart::Text {
+                        content: "saved conversation".into(),
+                    }],
+                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .unwrap();
+        let session = SessionActor::spawn(SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            runtime,
+        ));
         let host = *mesh.peer_id();
         let peer = libp2p::PeerId::random();
         let store = Arc::new(Store(
@@ -1404,6 +1433,76 @@ mod node_manager_tests {
                 .iter()
                 .any(|capability| capability == "shell")
         );
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::Custom {
+                sessions: true,
+                filesystem: true,
+                shell: true,
+                providers: vec![],
+            },
+        };
+        assert!(
+            discover_owner()
+                .await
+                .capabilities
+                .iter()
+                .any(|name| name == "shell")
+        );
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                shell: false,
+                providers: vec![],
+            },
+        };
+        let create =
+            || node_ask::<RemoteNodeManager, _>(manager.id(), &CreateRemoteSession { cwd: None });
+        let fork = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &ForkRemoteSession {
+                    source_session_id: session_id.clone(),
+                    message_id: fork_point.clone(),
+                },
+            )
+        };
+        let SwarmResponse::Ask(Ok(created)) = ingress.handle_v1(peer, create()).await.unwrap()
+        else {
+            panic!("Custom Sessions On must permit workspace-less creation");
+        };
+        let created: crate::agent::remote::CreateRemoteSessionResponse =
+            rmp_serde::from_slice(&created).unwrap();
+        let SwarmResponse::Ask(Ok(forked)) = ingress.handle_v1(peer, fork()).await.unwrap() else {
+            panic!("Custom Sessions On must permit workspace-less forks");
+        };
+        let forked: crate::agent::remote::ForkRemoteSessionResponse =
+            rmp_serde::from_slice(&forked).unwrap();
+        assert_eq!(
+            history_store
+                .get_history(&forked.session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        for id in [&created.session_id, &forked.session_id] {
+            assert_eq!(
+                history_store.get_session(id).await.unwrap().unwrap().cwd,
+                None
+            );
+            assert_eq!(
+                history_store.peer_session_origin(id).await.unwrap(),
+                Some(ScheduleOrigin::Peer {
+                    host: host.to_string(),
+                    peer: peer.to_string(),
+                    protocol: SchedulePeerProtocol::V1,
+                })
+            );
+        }
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
                 manager.id(),
@@ -1427,15 +1526,7 @@ mod node_manager_tests {
                 },
             )
         };
-        assert!(matches!(
-            ingress.handle_v1(peer, create_schedule()).await,
-            Err(SharingRejection::Denied)
-        ));
-        let revision = Uuid::now_v7();
-        *store.1.lock() = PeerGrantState {
-            revision,
-            grant: PeerGrant::Full,
-        };
+
         assert!(matches!(
             ingress.handle_v1(peer, create_schedule()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
@@ -1447,7 +1538,6 @@ mod node_manager_tests {
         let schedules = rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
             .unwrap()
             .schedules;
-        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
         assert_eq!(schedules.len(), 1);
         assert_eq!(
             schedules[0].config.origin,
@@ -1469,14 +1559,14 @@ mod node_manager_tests {
             ingress.handle_v1(peer, pause()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
-        // The CAS revision is not the identity of the schedule's owner.
+        // The CAS revision and wire protocol are not the schedule owner's identity.
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
             grant: PeerGrant::Full,
         };
-        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, list_schedules()).await
+        let SwarmResponse::Ask(Ok(bytes)) = ingress.handle_legacy(peer, list_schedules()).await
         else {
-            panic!("peer list after a CAS revision change must succeed");
+            panic!("the same peer must see its schedule on the other wire protocol");
         };
         assert_eq!(
             rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
@@ -1485,9 +1575,15 @@ mod node_manager_tests {
                 .public_id,
             schedules[0].public_id
         );
+        let deletion = node_ask::<RemoteNodeManager, _>(
+            manager.id(),
+            &DeleteRemoteSchedule {
+                schedule_public_id: schedules[0].public_id.clone(),
+            },
+        );
         assert!(matches!(
-            ingress.handle_v1(peer, pause()).await,
-            Ok(SwarmResponse::Ask(Ok(_)))
+            ingress.handle_legacy(peer, deletion).await,
+            SwarmResponse::Ask(Ok(_))
         ));
 
         *store.1.lock() = PeerGrantState {
@@ -1506,6 +1602,12 @@ mod node_manager_tests {
             ingress.handle_v1(peer, resume()).await,
             Err(SharingRejection::Denied)
         ));
+        for request in [create(), fork(), create_schedule()] {
+            assert!(matches!(
+                ingress.handle_v1(peer, request).await,
+                Err(SharingRejection::Denied)
+            ));
+        }
         let denied = discover_owner().await;
         assert_eq!(denied.node_id, shared.node_id);
         assert_eq!(denied.active_sessions, None);

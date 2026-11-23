@@ -895,6 +895,11 @@ impl SessionMaterializer {
             })?;
 
         let request_cwd = acp_cwd_to_optional(&req.cwd)?;
+        self.check_peer_session_start(
+            &session_id,
+            request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
+        )
+        .await?;
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // bound sessions always use their bound execution path, conflicting
         // cwd requests and missing checkouts fail closed.
@@ -993,6 +998,11 @@ impl SessionMaterializer {
             })?;
 
         let request_cwd = acp_cwd_to_optional(&req.cwd)?;
+        self.check_peer_session_start(
+            &session_id,
+            request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
+        )
+        .await?;
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // resume of a bound session always uses the persisted execution
         // path, conflicting cwd requests and missing checkouts fail closed.
@@ -1502,6 +1512,25 @@ impl SessionMaterializer {
     }
 
     #[cfg(feature = "remote")]
+    async fn check_peer_session_start(
+        &self,
+        session_id: &str,
+        has_workspace_or_mcp: bool,
+    ) -> Result<(), Error> {
+        let confined = self
+            .config
+            .provider
+            .history_store()
+            .peer_session_origin(session_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+            .is_some();
+        if confined && (has_workspace_or_mcp || !self.supports_restricted_cold_resume()) {
+            return Err(Error::from(crate::error::AgentError::MeshAccessDenied));
+        }
+        Ok(())
+    }
+
     pub(crate) fn supports_restricted_cold_resume(&self) -> bool {
         !self.config.hooks.is_enabled()
             && self.config.mcp_servers.is_empty()
