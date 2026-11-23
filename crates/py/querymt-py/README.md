@@ -65,10 +65,15 @@ The `share_provider.py` example reads this path from `QMT_PEER_ACCESS_STORE`.
 This option does not change the node's identity. Grants in the file must be for
 this host's `runtime.peer_id` and the authenticated calling peer. A new store
 starts with no grants; a store that cannot be opened fails startup. Peer grants
-can narrow but never expand `allowed_models`. Use the Rust `GrantStore` and
-`QuotaStore` APIs to provision the file while the host is stopped. Do not run
-another process that writes the same store or uses the same mesh identity while
-this runtime is active. This API hosts providers, not agent sessions.
+can narrow but never expand `allowed_models`. To use a Custom grant, a Python
+client must also start with its own store so it can negotiate the grant-aware
+protocol. A client without a store uses the legacy protocol and needs a Full
+grant on a guarded host.
+
+Use the Rust `GrantStore` and `QuotaStore` APIs to provision the host file while
+it is stopped. Do not run another process that writes the same store or uses
+the same mesh identity while this runtime is active. This API hosts providers,
+not agent sessions.
 
 ## Tool Calling
 
