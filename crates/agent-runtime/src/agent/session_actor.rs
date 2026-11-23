@@ -2799,6 +2799,60 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
 }
 
 #[cfg(feature = "remote")]
+pub(crate) struct GetPeerFileIndex;
+
+#[cfg(feature = "remote")]
+impl Message<GetPeerFileIndex> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::GetFileIndexResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        _: GetPeerFileIndex,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::is_shareable_path;
+        match <Self as Message<crate::agent::messages::GetFileIndex>>::handle(
+            self,
+            crate::agent::messages::GetFileIndex,
+            ctx,
+        )
+        .await
+        {
+            Ok(mut index) => {
+                index
+                    .files
+                    .retain(|entry| is_shareable_path(std::path::Path::new(&entry.path)));
+                Ok(index)
+            }
+            #[cfg(target_os = "linux")]
+            Err(crate::agent::file_proxy::FileProxyError::IndexNotReady) => {
+                use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse};
+                let root = self
+                    .runtime
+                    .cwd
+                    .as_deref()
+                    .ok_or(FileProxyError::NoWorkingDirectory)?;
+                let files = crate::tools::builtins::read_shared::list_confined_workspace(root)
+                    .await
+                    .map_err(FileProxyError::ReadError)?;
+                Ok(GetFileIndexResponse {
+                    files,
+                    generated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    workspace_root: root.display().to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
 pub(crate) struct ReadPeerFile(pub(crate) ReadRemoteFile);
 
 #[cfg(feature = "remote")]

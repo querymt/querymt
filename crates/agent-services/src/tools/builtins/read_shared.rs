@@ -174,12 +174,14 @@ pub async fn render_confined_file(
     let relative = relative.to_owned();
     let label = relative.clone();
     let file = tokio::task::spawn_blocking(move || {
+        // Only the host selects this root. Pin its resolved directory before
+        // handling the peer-relative path, which still cannot follow links.
         let root = fs::openat2(
             fs::CWD,
             &root,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::NO_MAGICLINKS,
         )?;
         let target = fs::openat2(
             &root,
@@ -212,6 +214,89 @@ pub async fn render_confined_file(
     _limit: usize,
 ) -> Result<Vec<ToolResultPart>, String> {
     Err("confined workspace reads are not supported on this host".into())
+}
+
+/// List visible entries below an owner-selected root without following links,
+/// crossing mounts, opening file contents, or initializing a workspace watcher.
+#[cfg(target_os = "linux")]
+pub async fn list_confined_workspace(
+    root: &Path,
+) -> Result<Vec<querymt_agent_index::FileIndexEntry>, String> {
+    use querymt_agent_index::FileIndexEntry;
+    use rustix::fs::{self, Dir, FileType, Mode, OFlags, ResolveFlags};
+
+    const MAX_ENTRIES: usize = 10_000;
+    const MAX_DEPTH: usize = 20;
+    if !root.is_absolute() {
+        return Err("workspace path is not absolute".into());
+    }
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<Vec<FileIndexEntry>> {
+        let root = fs::openat2(
+            fs::CWD,
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_MAGICLINKS,
+        )?;
+        let mut stack = vec![(std::path::PathBuf::new(), Dir::read_from(&root)?, 0)];
+        let mut entries = Vec::new();
+        let mut visited = 0;
+        while let Some((parent, dir, depth)) = stack.last_mut() {
+            let Some(entry) = dir.read() else {
+                stack.pop();
+                continue;
+            };
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                break;
+            }
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name.starts_with(b".") {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(name) else {
+                continue;
+            };
+            let relative = parent.join(name);
+            let Ok(target) = fs::openat2(
+                &root,
+                &relative,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+            ) else {
+                continue;
+            };
+            let stat = fs::fstat(&target)?;
+            let is_dir = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => true,
+                FileType::RegularFile if stat.st_nlink == 1 => false,
+                _ => continue,
+            };
+            let path = relative.to_string_lossy().into_owned();
+            if is_dir
+                && *depth < MAX_DEPTH
+                && let Ok(fd) = fs::openat(
+                    &target,
+                    ".",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                && let Ok(dir) = Dir::new(fd)
+            {
+                let child_depth = *depth + 1;
+                stack.push((relative, dir, child_depth));
+            }
+            entries.push(FileIndexEntry { path, is_dir });
+        }
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
+        Ok(entries)
+    })
+    .await
+    .map_err(|error| format!("workspace listing task failed: {error}"))?
+    .map_err(|error| format!("workspace listing unavailable: {error}"))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -252,6 +337,22 @@ mod tests {
                 .contains("not a supported format")
         );
         assert!(read("large.txt", 0, 1).await.contains("File too large"));
+    }
+
+    #[tokio::test]
+    async fn confined_read_accepts_a_host_selected_root_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let alias = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "workspace fixture\n").unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let blocks = render_confined_file(&alias, Path::new("notes.txt"), 0, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&blocks[..], [ToolResultPart::Text { text }] if text.contains("workspace fixture"))
+        );
     }
 
     #[tokio::test]

@@ -240,28 +240,23 @@ fn register_peer_session_ask<M, R>(
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
-    use crate::agent::file_proxy::{FileProxyError, is_shareable_path};
-    use crate::agent::session_actor::ReadPeerFile;
-    use std::path::Path;
+    use crate::agent::file_proxy::FileProxyError;
+    use crate::agent::session_actor::{GetPeerFileIndex, ReadPeerFile};
 
     let weak = actor.downgrade();
-    let index = move |_, message: messages::GetFileIndex| {
+    let index = move |_, _: messages::GetFileIndex| {
         let weak = weak.clone();
         async move {
             let actor = weak.upgrade().ok_or_else(|| {
                 file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
             })?;
-            let mut index = actor
-                .ask(message)
+            actor
+                .ask(GetPeerFileIndex)
                 .mailbox_timeout(Duration::from_secs(3))
                 .reply_timeout(Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(file_proxy_send_error)?;
-            index
-                .files
-                .retain(|entry| is_shareable_path(Path::new(&entry.path)));
-            Ok::<_, FileProxyError>(index)
+                .map_err(file_proxy_send_error)
         }
     };
     let weak = actor.downgrade();
