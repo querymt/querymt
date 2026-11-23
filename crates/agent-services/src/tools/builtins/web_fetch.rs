@@ -19,10 +19,10 @@ impl Default for WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("querymt-agent-web-fetch/0.1")
-            .build()
-            .unwrap();
+        let client = querymt::outbound::build_client(|builder| {
+            builder.user_agent("querymt-agent-web-fetch/0.1")
+        })
+        .expect("failed to build web_fetch HTTP client");
         Self { client }
     }
 }
