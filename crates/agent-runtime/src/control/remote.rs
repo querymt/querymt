@@ -307,7 +307,7 @@ pub async fn attach_remote_session(
                 let stale = if error.owner_unreachable() {
                     agent
                         .stale_remote_snapshot(&request.session_id, window)
-                        .await
+                        .await?
                 } else {
                     None
                 };

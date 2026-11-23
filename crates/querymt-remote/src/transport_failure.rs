@@ -155,6 +155,17 @@ impl RemoteTransportFailure {
         self.delivery == DeliveryCertainty::NotDelivered
     }
 
+    /// The owner did not respond at the network boundary. Actor errors and
+    /// mailbox/reply deadlines do not establish owner unreachability.
+    pub fn owner_unreachable(&self) -> bool {
+        matches!(
+            self.kind,
+            RemoteTransportFailureKind::DialFailure
+                | RemoteTransportFailureKind::ConnectionClosed
+                | RemoteTransportFailureKind::NetworkTimeout
+        )
+    }
+
     /// True when replaying this message after a reconnect could possibly
     /// succeed. Protocol mismatches and serialization failures cannot be
     /// fixed by reconnecting, so they are never retry candidates.

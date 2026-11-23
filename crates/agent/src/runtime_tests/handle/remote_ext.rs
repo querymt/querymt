@@ -1971,8 +1971,12 @@ async fn unreachable_owner_without_local_window_fails_retryably_without_partial_
         .build_remote_attach_snapshot_with_budget(
             "rs-2",
             Some(crate::session::history_window::LoadWindow::default()),
-            Err(crate::error::AgentError::Internal(
-                "owner unreachable".into(),
+            Err(crate::error::AgentError::from_transport_failure(
+                querymt_remote::RemoteTransportFailure::new(
+                    querymt_remote::RemoteTransportFailureKind::DialFailure,
+                    querymt_remote::DeliveryCertainty::NotDelivered,
+                    "owner unreachable",
+                ),
             )),
             std::time::Duration::from_secs(1),
         )
@@ -1992,8 +1996,12 @@ async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
         .build_remote_attach_snapshot_with_budget(
             "rs-3",
             Some(crate::session::history_window::LoadWindow::default()),
-            Err(crate::error::AgentError::Internal(
-                "owner unreachable".into(),
+            Err(crate::error::AgentError::from_transport_failure(
+                querymt_remote::RemoteTransportFailure::new(
+                    querymt_remote::RemoteTransportFailureKind::DialFailure,
+                    querymt_remote::DeliveryCertainty::NotDelivered,
+                    "owner unreachable",
+                ),
             )),
             std::time::Duration::from_secs(1),
         )
@@ -2017,6 +2025,15 @@ async fn confirmed_denial_cannot_fall_back_to_cached_history() {
         )
         .await
         .expect_err("confirmed denial must not return a cached snapshot");
+    assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
+
+    // A separate ACP open has no mesh in this fixture. It must preserve the
+    // owner's last refusal instead of reading the covered local window.
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("rs-denied".to_string()),
+        std::path::PathBuf::new(),
+    );
+    let error = viewer.handle.load_session(request).await.unwrap_err();
     assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
 }
 

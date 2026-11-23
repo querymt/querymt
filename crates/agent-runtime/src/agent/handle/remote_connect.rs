@@ -258,15 +258,18 @@ impl RemoteSessionConnectError {
     /// to the owner (or local state) giving a definite answer. A load may
     /// still be served from a local copy in the former case.
     pub(crate) fn owner_unreachable(&self) -> bool {
-        matches!(
-            self,
-            Self::MeshUnavailable { .. }
-                | Self::NodeUnavailable { .. }
-                | Self::RecoveryFailed { .. }
-                | Self::TimedOut { .. }
-                | Self::HealthCheckFailed { .. }
-                | Self::CoolingDown { .. }
-        )
+        match self {
+            Self::MeshUnavailable { .. } | Self::TimedOut { .. } => true,
+            Self::NodeUnavailable { transport, .. } => transport
+                .as_ref()
+                .is_none_or(RemoteTransportFailure::owner_unreachable),
+            Self::RecoveryFailed { transport, .. } | Self::HealthCheckFailed { transport, .. } => {
+                transport
+                    .as_ref()
+                    .is_some_and(RemoteTransportFailure::owner_unreachable)
+            }
+            _ => false,
+        }
     }
 
     /// Typed transport failure for retry/invalidation decisions (Phase 6).
@@ -801,6 +804,7 @@ impl LocalAgentHandle {
         // ── Bounded recovery.
         let budget = options.reason.connect_budget();
         let prepared_slot: PreparedCandidateSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = self.config.event_sink.remote_sync(session_id, &node_id);
         let recovery = tokio::time::timeout(
             budget,
             self.recover_remote_attachment(
@@ -815,6 +819,10 @@ impl LocalAgentHandle {
         .await;
 
         match recovery {
+            Ok(Err(RemoteSessionConnectError::AccessDenied)) => {
+                state.note_history_denial();
+                Err(RemoteSessionConnectError::AccessDenied)
+            }
             Ok(connected) => connected,
             Err(_) => {
                 // The budget cancelled the recovery future. Any candidate it
@@ -1146,13 +1154,11 @@ impl LocalAgentHandle {
         }
 
         let health_timeout = Self::remote_connect_health_timeout();
-        let health = tokio::time::timeout(health_timeout, async {
-            if session_ref.uses_guarded_mesh() {
-                session_ref.check_history_access().await
-            } else {
-                session_ref.get_mode().await.map(|_| ())
-            }
-        })
+        let state = backfill_sink.remote_sync(session_id, &bookmark.node_id);
+        let health = tokio::time::timeout(
+            health_timeout,
+            Self::authorize_remote_history(&state, &session_ref),
+        )
         .await;
         let saved = if matches!(health, Ok(Ok(_))) {
             self.config
@@ -1321,7 +1327,26 @@ impl LocalAgentHandle {
             });
         }
         state.wait_synced().await;
-        connected.session_ref.check_history_access().await
+        Self::authorize_remote_history(&state, &connected.session_ref).await
+    }
+
+    pub(super) async fn authorize_remote_history(
+        state: &crate::session::remote_sync::RemoteSyncState,
+        session_ref: &crate::agent::remote::SessionActorRef,
+    ) -> Result<(), crate::error::AgentError> {
+        use crate::error::AgentError;
+
+        let generation = state.denial_generation();
+        let result = session_ref.check_history_access().await;
+        match &result {
+            Ok(()) if session_ref.is_remote() => state.note_history_authorization(generation),
+            Err(AgentError::MeshAccessDenied) => state.note_history_denial(),
+            _ => {}
+        }
+        if result.is_ok() && state.history_denied() {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        result
     }
 
     /// Build candidate metadata without mutating durable state. Persistence is

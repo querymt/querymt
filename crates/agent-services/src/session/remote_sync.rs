@@ -59,6 +59,8 @@ struct Inner {
     /// Syncs (attach backfill, reopen increments) currently running.
     syncing: usize,
     version: u64,
+    history_denied: bool,
+    denial_generation: u64,
 }
 
 pub struct RemoteSyncState {
@@ -157,6 +159,29 @@ impl RemoteSyncState {
     /// change between the check and the wait is never missed.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
+    }
+
+    /// A denial remains in force across attachment loss, for this owner/session pair.
+    pub fn note_history_denial(&self) {
+        let mut inner = self.inner.lock();
+        inner.history_denied = true;
+        inner.denial_generation = inner.denial_generation.wrapping_add(1);
+    }
+
+    pub fn history_denied(&self) -> bool {
+        self.inner.lock().history_denied
+    }
+
+    pub fn denial_generation(&self) -> u64 {
+        self.inner.lock().denial_generation
+    }
+
+    /// An authorization started before a newer denial cannot clear it.
+    pub fn note_history_authorization(&self, generation: u64) {
+        let mut inner = self.inner.lock();
+        if inner.denial_generation == generation {
+            inner.history_denied = false;
+        }
     }
 
     pub fn coverage(&self) -> RangeSet {

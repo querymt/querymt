@@ -951,7 +951,7 @@ impl LocalAgentHandle {
                 // stands.
                 Err(error) => {
                     let stale = if error.owner_unreachable() {
-                        self.stale_remote_snapshot(&session_id, load_window).await
+                        self.stale_remote_snapshot(&session_id, load_window).await?
                     } else {
                         None
                     };
