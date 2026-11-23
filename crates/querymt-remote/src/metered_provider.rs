@@ -334,4 +334,8 @@ impl EmbeddingProvider for MeteredProvider {
     }
 }
 
-impl LLMProvider for MeteredProvider {}
+impl LLMProvider for MeteredProvider {
+    fn key_resolver(&self) -> Option<&Arc<dyn querymt::auth::ApiKeyResolver>> {
+        self.inner.key_resolver()
+    }
+}
