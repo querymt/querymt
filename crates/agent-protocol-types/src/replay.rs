@@ -8,13 +8,59 @@
 
 use crate::events::{AgentEventKind, ReasoningPartStored};
 use crate::protocol::{
-    CompactionId, Content, ContentBlock, ContentChunk, MessageId, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    CompactionId, Content, ContentBlock, ContentChunk, MaybeUndefined, MessageId, Meta, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 
 /// QueryMT extension namespace inside ACP's `_meta` escape hatch.
 pub const QUERYMT_META_NAMESPACE: &str = "querymt";
+
+/// `_meta.querymt` key holding the id of the run an update belongs to.
+pub const RUN_ID_META_KEY: &str = "runId";
+
+/// Merge `_meta.querymt.runId` into `meta`, keeping every other key.
+fn merge_run_id(meta: &mut Meta, run_id: &str) {
+    let namespace = meta
+        .entry(QUERYMT_META_NAMESPACE.to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !namespace.is_object() {
+        *namespace = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(namespace) = namespace.as_object_mut() {
+        namespace.insert(RUN_ID_META_KEY.to_owned(), run_id.into());
+    }
+}
+
+/// Stamp the id of the run an update belongs to on the update kinds that
+/// belong to a run: user, assistant and thought chunks, tool calls and their
+/// updates, and compaction updates. Other kinds are left unchanged. The id is
+/// merged into `_meta.querymt` next to existing keys (reasoning part id,
+/// client prompt id).
+pub fn stamp_run_id(update: &mut SessionUpdate, run_id: &str) {
+    match update {
+        SessionUpdate::UserMessageChunk(chunk)
+        | SessionUpdate::AgentMessageChunk(chunk)
+        | SessionUpdate::AgentThoughtChunk(chunk) => {
+            merge_run_id(chunk.meta.get_or_insert_with(Meta::new), run_id)
+        }
+        SessionUpdate::ToolCall(call) => {
+            merge_run_id(call.meta.get_or_insert_with(Meta::new), run_id)
+        }
+        SessionUpdate::ToolCallUpdate(call) => {
+            merge_run_id(call.meta.get_or_insert_with(Meta::new), run_id)
+        }
+        SessionUpdate::CompactionUpdate(compaction) => {
+            let mut meta = match std::mem::take(&mut compaction.meta) {
+                MaybeUndefined::Value(meta) => meta,
+                _ => Meta::new(),
+            };
+            merge_run_id(&mut meta, run_id);
+            compaction.meta = MaybeUndefined::Value(meta);
+        }
+        _ => {}
+    }
+}
 
 /// Tool kind by tool name, as the agent reports it.
 pub fn tool_kind_for_tool(name: &str) -> ToolKind {

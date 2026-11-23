@@ -69,8 +69,9 @@
     ],
     "header": {
       "sessionId": "s1",
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "runState": "idle",
+      "activeRunId": null,
       "activeToolCallId": null,
       "lastStopReason": null,
       "lastError": null,
@@ -84,7 +85,8 @@
       "plan": null,
       "undoStack": [],
       "pendingInputs": [],
-      "delegations": [],
+      "subagents": [],
+      "cursors": [],
       "runtime": null,
       "history": {
         "hasOlder": false,

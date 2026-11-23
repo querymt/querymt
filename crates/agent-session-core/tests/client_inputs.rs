@@ -21,7 +21,7 @@ fn echo(message_id: &str, prompt_id: &str) -> SessionInput {
             "sessionUpdate": "user_message_chunk",
             "messageId": message_id,
             "content": { "type": "text", "text": "hi" },
-            "_meta": { "querymt": { "client_prompt_id": prompt_id } }
+            "_meta": { "querymt": { "client_prompt_id": prompt_id, "runId": "r1" } }
         } }),
         replayed: false,
         at_ms: 6,
@@ -44,13 +44,20 @@ fn users(core: &SessionCore) -> Vec<(String, querymt_agent_session_core::entry::
 fn agent_echo_replaces_the_optimistic_prompt() {
     let mut core = SessionCore::new("s1");
     core.apply(&[optimistic("c1")]);
-    let turn_before = core.turn_ids();
-    core.apply(&[echo("m1", "c1")]);
+    assert_eq!(core.turn_ids(), ["pending-c1"]);
+    let report = core.apply(&[echo("m1", "c1")]);
     let found = users(&core);
-    assert_eq!(found.len(), 1);
+    assert_eq!(found.len(), 1, "one user message, no pending prompt");
     assert_eq!(found[0].1.status, PromptStatus::Sent);
     assert_eq!(found[0].1.message_id.as_deref(), Some("m1"));
-    assert_eq!(core.turn_ids(), turn_before);
+    // The agent's message stands in its run's turn, with an id from the
+    // agent's message id; the pending turn is gone.
+    assert_eq!(found[0].0, "run-r1");
+    assert_eq!(core.turn_ids(), ["run-r1"]);
+    let turn = core.turn("run-r1").expect("turn");
+    assert_eq!(turn.entries[0].id, "user-m1");
+    assert_eq!(report.removed, ["pending-c1"]);
+    assert_eq!(report.added, ["run-r1"]);
 }
 
 #[test]
@@ -72,6 +79,8 @@ fn completed_prompt_returns_to_idle() {
     let mut core = SessionCore::new("s1");
     core.apply(&[optimistic("c1")]);
     core.apply(&[SessionInput::PromptCompleted {
+        client_prompt_id: None,
+        message_id: None,
         stop_reason: StopReason::EndTurn,
         at_ms: 9,
     }]);
@@ -161,32 +170,6 @@ fn input_state_notification_updates_a_pending_input() {
     let pending = &core.header().pending_inputs;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].input_id, "i2");
-}
-
-#[test]
-fn delegation_update_links_a_child_session() {
-    let mut core = SessionCore::new("s1");
-    core.apply(&[SessionInput::AcpNotification {
-        notification: json!({ "sessionId": "s1", "update": {
-            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "delegate"
-        } }),
-        replayed: false,
-        at_ms: 1,
-    }]);
-    core.apply(&[SessionInput::DelegationUpdate {
-        update: serde_json::from_value(json!({
-            "version": 1, "sessionId": "s1", "delegationId": "d1", "toolCallId": "t1",
-            "state": "forked", "targetAgentId": "coder", "objective": "x",
-            "childSessionId": "child-1", "requestedAt": 1, "updatedAt": 2
-        }))
-        .expect("delegation"),
-    }]);
-    let id = core.turn_ids().pop().expect("turn");
-    let linked = core.turn(&id).expect("turn").entries.into_iter().any(|e| {
-        matches!(e.kind, EntryKind::ToolCall(c) if c.child_session_id.as_deref() == Some("child-1"))
-    });
-    assert!(linked);
-    assert_eq!(core.header().delegations.len(), 1);
 }
 
 #[test]

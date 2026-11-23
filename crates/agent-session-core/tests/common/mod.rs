@@ -65,7 +65,7 @@ pub fn load_response(events: Vec<Value>, extra: Value) -> Value {
                    "generated_at": "2026-01-01T00:00:00Z" },
         "cursor": { "local_seq": 0, "remote_seq_by_source": {} },
         "accounting": { "version": 1, "session": scope(true, Some(0.0)), "cycle": null },
-        "delegationUpdates": []
+        "subagentUpdates": []
     });
     if let (Some(base), Some(more)) = (snapshot.as_object_mut(), extra.as_object()) {
         for (k, v) in more {

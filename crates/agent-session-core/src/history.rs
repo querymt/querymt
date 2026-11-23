@@ -53,6 +53,19 @@ impl SessionCore {
         self.header.active_tool_call_id = active_tool;
 
         self.store.prepend(page);
+        // The page's cursors are added to the ones held.
+        let mut cursor_errors = Vec::new();
+        let cursors: Vec<querymt_agent_protocol_types::protocol::CursorUpdate> =
+            crate::snapshot::decode_update_list(
+                response,
+                "cursorUpdates",
+                index,
+                &mut cursor_errors,
+            );
+        report.errors.extend(cursor_errors);
+        for update in &cursors {
+            self.cursor_update(update);
+        }
         for entry in &truncated {
             self.mark_truncated(entry);
         }

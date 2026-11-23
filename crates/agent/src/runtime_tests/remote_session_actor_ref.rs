@@ -845,6 +845,144 @@ mod session_actor_ref_remote_tests {
         .await;
     }
 
+    /// A client loads a remote-hosted session while the host runs a prompt:
+    /// every user message ends up on the client exactly once, either in what
+    /// the load answered with or as a live update after the response, with
+    /// no gap and no duplicate at the cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_session_load_has_no_gap() {
+        use crate::acp::websocket::{ConnectionEventState, WsServerState, spawn_event_forwarders};
+        use crate::session::backend::StorageBackend as _;
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+        use std::sync::{Arc, Mutex};
+
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat_with_tools()
+            .returning(|_, _| Ok(MockChatResponse::text_only("host reply").into()));
+        mock.expect_chat()
+            .returning(|_| Ok(MockChatResponse::text_only("host reply").into()));
+        let host = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let (session_ref, _local, _host_config, session_id) =
+            remote_session_ref_for_config("e11c", host.config.clone(), "mock-model").await;
+
+        // Alpha is the node the client talks to; it knows the session only as
+        // a remote bookmark.
+        let mesh = get_test_mesh().await;
+        let alpha = TestAgent::new().await;
+        alpha.handle.set_mesh(mesh.clone());
+        alpha
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: session_id.clone(),
+                node_id: mesh.peer_id().to_string(),
+                peer_label: "e11c".to_string(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+                fork_origin: None,
+            })
+            .await
+            .expect("save remote bookmark");
+
+        let prompt = |text: &str| {
+            crate::acp::protocol::PromptRequest::new(
+                session_id.clone(),
+                vec![crate::acp::protocol::ContentBlock::from(text)],
+            )
+        };
+        session_ref
+            .prompt_agent(prompt("first"))
+            .await
+            .expect("first prompt");
+
+        // The second prompt runs on the host while the client loads.
+        let second = tokio::spawn({
+            let session_ref = session_ref.clone();
+            let request = prompt("second");
+            async move { session_ref.prompt_agent(request).await }
+        });
+
+        let state = WsServerState::new(alpha.handle.clone());
+        let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<String>(1024);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let delivery = crate::acp::delivery::ConnectionDelivery::new(
+            Some(alpha.handle.config.event_sink.journal().clone()),
+            cancel.clone(),
+        );
+        let translator = Arc::new(Mutex::new(crate::acp::shared::AcpLiveEventTranslator::new()));
+        spawn_event_forwarders(
+            state.clone(),
+            ConnectionEventState {
+                conn_id: "conn".to_string(),
+                tx: wire_tx.clone(),
+                pending_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                forwarded_elicitations: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+                request_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection_cancel: cancel.clone(),
+                delivery: delivery.clone(),
+            },
+            translator.clone(),
+        );
+
+        crate::acp::shared::dispatch_rpc_message_with_context(
+            crate::acp::shared::RpcDispatchState {
+                agent: alpha.handle.clone(),
+                session_owners: state.session_owners.clone(),
+                pending_elicitations: state.pending_elicitations.clone(),
+                conn_id: "conn".to_string(),
+                tx: wire_tx,
+            },
+            crate::acp::shared::RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: "session/load".to_string(),
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": "/",
+                    "mcpServers": [],
+                }),
+                id: Some(serde_json::json!(9)),
+            },
+            crate::acp::shared::RpcDispatchContext {
+                delivery: Some(delivery),
+                translator: Some(translator),
+                ..Default::default()
+            },
+        )
+        .await;
+        second
+            .await
+            .expect("second prompt task")
+            .expect("second prompt");
+
+        // Collect what the client receives until the wire has been quiet.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut load_answered = false;
+        while let Ok(Some(raw)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1500), wire_rx.recv()).await
+        {
+            let message: serde_json::Value = serde_json::from_str(&raw).expect("json-rpc");
+            if message["id"] == serde_json::json!(9) {
+                assert!(message["error"].is_null(), "the load failed: {message}");
+                load_answered = true;
+                continue;
+            }
+            let update = &message["params"]["update"];
+            if message["method"] == "session/update"
+                && update["sessionUpdate"] == "user_message_chunk"
+                && let Some(text) = update["content"]["text"].as_str()
+            {
+                *counts.entry(text.to_string()).or_default() += 1;
+            }
+        }
+        cancel.cancel();
+        assert!(load_answered, "the load response arrived");
+        assert_eq!(counts.get("first"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("second"), Some(&1), "{counts:?}");
+    }
+
     // ── E.13 ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]

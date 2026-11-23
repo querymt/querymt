@@ -28,7 +28,7 @@ fn full_snapshot_hydrates_the_conversation() {
     let report = core.apply(&[loaded(load_response(events, serde_json::json!({})))]);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let ids = core.turn_ids();
-    assert_eq!(ids, vec!["turn-1", "turn-5", "turn-9"]);
+    assert_eq!(ids, vec!["turn-u1", "turn-u2", "turn-u3"]);
     let turns = core.turns(&ids);
     let tools: Vec<usize> = turns
         .iter()
@@ -187,11 +187,13 @@ fn snapshot_replaces_replayed_turns() {
         reply(4, "a2", "r"),
     ];
     let report = core.apply(&[loaded(load_response(events, serde_json::json!({})))]);
-    assert_eq!(core.turn_ids(), vec!["turn-1", "turn-3"]);
-    assert_eq!(
-        report.removed.len(),
-        2,
-        "replayed live-id turns are replaced"
+    assert_eq!(core.turn_ids(), vec!["turn-u1", "turn-u2"]);
+    // The replayed turns carry the agent's message ids, so the snapshot's
+    // turns have the same ids and content: nothing is removed or reported.
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(
+        report.added.is_empty() && report.updated.is_empty(),
+        "{report:?}"
     );
     let texts: Vec<usize> = core
         .turns(&core.turn_ids())

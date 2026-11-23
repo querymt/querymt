@@ -3,7 +3,7 @@
 use crate::decode::{Decoded, Event, decode_event};
 use crate::view::InputError;
 use querymt_agent_protocol_types::accounting::AccountingSnapshot;
-use querymt_agent_protocol_types::delegation_update::DelegationUpdateNotification;
+use querymt_agent_protocol_types::protocol::{CursorUpdate, SubagentUpdate};
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::{
     HistoryInfo, SessionHistorySummary, TruncatedEntry,
@@ -24,7 +24,12 @@ pub(crate) struct ParsedSnapshot {
     pub event_errors: Vec<InputError>,
     pub runtime_status: SessionRuntimeStatus,
     pub accounting: AccountingSnapshot,
-    pub delegation_updates: Vec<DelegationUpdateNotification>,
+    /// The latest `subagent_update` per child. A snapshot without the key
+    /// (an agent that does not report subagents) has none; the old
+    /// `delegationUpdates` key is not read.
+    pub subagent_updates: Vec<SubagentUpdate>,
+    /// The cursors of the returned window (`session.cursors` clients).
+    pub cursor_updates: Vec<CursorUpdate>,
     pub user_prompts: Vec<UserPromptRecord>,
     pub history: Option<HistoryInfo>,
     pub summary: Option<SessionHistorySummary>,
@@ -69,6 +74,40 @@ pub(crate) fn decode_events(raw: &[Value], input_index: u32) -> (Vec<Event>, u32
     (events, unknown, errors)
 }
 
+/// Decode a list of ACP updates under `key` one by one: an element that does
+/// not decode is reported and skipped, the rest is kept. An absent key is an
+/// empty list.
+pub(crate) fn decode_update_list<T: DeserializeOwned>(
+    holder: &Value,
+    key: &str,
+    input_index: u32,
+    errors: &mut Vec<InputError>,
+) -> Vec<T> {
+    let mut error = |message: String| {
+        errors.push(InputError {
+            input_index,
+            seq: None,
+            message,
+        });
+    };
+    let raw = match holder.get(key) {
+        None | Some(Value::Null) => return Vec::new(),
+        Some(Value::Array(raw)) => raw,
+        Some(_) => {
+            error(format!("`{key}` is not an array"));
+            return Vec::new();
+        }
+    };
+    let mut updates = Vec::with_capacity(raw.len());
+    for (index, value) in raw.iter().enumerate() {
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(update) => updates.push(update),
+            Err(failure) => error(format!("`{key}[{index}]`: {failure}")),
+        }
+    }
+    updates
+}
+
 /// The snapshot object of a load response, if it carries one.
 pub(crate) fn snapshot_value(response: &Value) -> Option<&Value> {
     response.get("_meta")?.get(SNAPSHOT_META_KEY)
@@ -81,14 +120,19 @@ pub(crate) fn parse_snapshot(snapshot: &Value, input_index: u32) -> Result<Parse
         .and_then(|audit| audit.get("events"))
         .and_then(Value::as_array)
         .ok_or_else(|| "snapshot `audit.events` is not an array".to_owned())?;
-    let (events, unknown, event_errors) = decode_events(raw_events, input_index);
+    let (events, unknown, mut event_errors) = decode_events(raw_events, input_index);
+    let subagent_updates =
+        decode_update_list(snapshot, "subagentUpdates", input_index, &mut event_errors);
+    let cursor_updates =
+        decode_update_list(snapshot, "cursorUpdates", input_index, &mut event_errors);
     Ok(ParsedSnapshot {
         events,
         unknown,
         event_errors,
         runtime_status: required(snapshot, "runtimeStatus")?,
         accounting: required(snapshot, "accounting")?,
-        delegation_updates: required(snapshot, "delegationUpdates")?,
+        subagent_updates,
+        cursor_updates,
         user_prompts: optional(snapshot, "userPrompts")?.unwrap_or_default(),
         history: optional(snapshot, "history")?,
         summary: optional(snapshot, "summary")?,
@@ -141,11 +185,13 @@ impl SessionCore {
         };
         report.unknown += parsed.unknown;
         report.errors.extend(parsed.event_errors.iter().cloned());
-        let old_ids = self.store.turn_ids();
+        let old_turns = self.store.all_turns();
+        let client_local = self.client_local_prompts();
         self.store = Store::continuing(self.store.revision(), self.store.anon_counter());
         self.seqs.clear();
         self.replay_events(&parsed.events, &parsed.user_prompts);
-        self.store.finish_rebuild(&old_ids);
+        self.restore_client_local_prompts(client_local);
+        self.store.finish_rebuild(&old_turns);
         self.hydrate_header(&parsed);
         self.hydrate_summary(&parsed);
     }
@@ -165,6 +211,10 @@ impl SessionCore {
         for event in events {
             self.store.seq_hint = Some(event.seq);
             self.seqs.insert(event.seq);
+            // Events between a run's start and end belong to that run.
+            if let AgentEventKind::RunStarted { run_id, .. } = &event.kind {
+                self.store.active_run = Some(run_id.clone());
+            }
             let updates = match &event.kind {
                 AgentEventKind::PromptReceived {
                     message_id: Some(id),
@@ -184,22 +234,63 @@ impl SessionCore {
             for update in updates {
                 self.apply_update(update);
             }
+            if matches!(event.kind, AgentEventKind::RunCompleted { .. }) {
+                self.store.active_run = None;
+            }
         }
         self.store.seq_hint = None;
+    }
+
+    /// The pending and failed prompts the client holds: they are local to
+    /// this client and survive a load.
+    fn client_local_prompts(&self) -> Vec<crate::entry::Entry> {
+        self.store
+            .pending_turn_ids()
+            .iter()
+            .filter_map(|id| self.store.turn(id))
+            .flat_map(|turn| turn.entries)
+            .collect()
+    }
+
+    /// Put the client-local prompts back after the rebuilt turns.
+    fn restore_client_local_prompts(&mut self, entries: Vec<crate::entry::Entry>) {
+        for entry in entries {
+            let crate::entry::EntryKind::UserMessage(user) = &entry.kind else {
+                continue;
+            };
+            let Some(prompt_id) = user.client_prompt_id.clone() else {
+                continue;
+            };
+            let key = self.store.push(
+                entry.id,
+                entry.kind,
+                crate::store::TurnHint::Pending(prompt_id.clone()),
+            );
+            self.store.idx.prompt.insert(prompt_id, key);
+        }
     }
 }
 
 impl SessionCore {
     /// Whole-session state from the snapshot: runtime, accounting,
-    /// delegations and, for windowed loads, the summary and paging state.
+    /// subagents and, for windowed loads, the summary and paging state.
     fn hydrate_header(&mut self, parsed: &ParsedSnapshot) {
         // Replayed events may have left a run state behind; the snapshot's
         // runtime status is authoritative.
         self.header.run_state = crate::view::RunState::Idle;
         self.header.active_tool_call_id = None;
-        self.runtime_observed(&parsed.runtime_status);
+        self.header.runtime = Some(parsed.runtime_status.clone());
+        self.apply_runtime_phase(&parsed.runtime_status);
         self.set_accounting(&parsed.accounting);
-        self.header.delegations = parsed.delegation_updates.clone();
+        self.header.subagents.clear();
+        for update in &parsed.subagent_updates {
+            self.subagent_update(update);
+        }
+        // A load discards the cursors held and rebuilds them from its own.
+        self.header.cursors.clear();
+        for update in &parsed.cursor_updates {
+            self.cursor_update(update);
+        }
         self.header.history = match &parsed.history {
             Some(info) => crate::view::HistoryPaging {
                 has_older: !info.complete,

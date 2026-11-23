@@ -6,6 +6,7 @@
 use querymt_agent_protocol_types::events::{
     AgentEvent, AgentEventKind, EventOrigin, ReasoningPartStored,
 };
+use querymt_agent_protocol_types::protocol::{ContentBlock, TextContent};
 use serde_json::{Value, json};
 
 const WORDS: &[&str] = &[
@@ -120,11 +121,22 @@ fn push(events: &mut Vec<Value>, seq: &mut i64, kind: AgentEventKind) {
     events.push(serde_json::to_value(&event).expect("an agent event serializes"));
 }
 
+/// One journal event as JSON, with history position `seq`.
+pub fn event(seq: i64, kind: AgentEventKind) -> Value {
+    let mut events = Vec::new();
+    let mut at = seq - 1;
+    push(&mut events, &mut at, kind);
+    events.remove(0)
+}
+
 /// Generate a session as the agent journals it: per turn a run start (before
 /// the prompt is stored), the prompt, a reply with reasoning, tool calls (one
 /// failing, a todo-list update every third turn), steering, the run end and,
-/// every n-th turn, a compaction. Steering and run events are kinds the
-/// reducer ignores; run state comes from updates.
+/// every n-th turn, a compaction. Every other turn a tool waits for a
+/// permission, every fifth turn a scheduled run without a prompt follows, and
+/// applied steering is stored as a user message of its run. Steering, permission
+/// and run events other than the run boundaries are kinds the reducer ignores;
+/// run state comes from state updates.
 pub fn generate(spec: TraceSpec) -> Trace {
     let mut rng = Rng::new(spec.seed);
     let mut events = Vec::new();
@@ -160,6 +172,27 @@ pub fn generate(spec: TraceSpec) -> Trace {
                     position: 0,
                     blocks: Vec::new(),
                     accepted_at_ms: Some(1),
+                },
+            );
+            // An applied steering prompt becomes a user message of the
+            // running run: its blocks (live only), then the stored prompt.
+            let steer_id = format!("s{turn}");
+            let steer_text = rng.lorem(3);
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::UserPromptBlock {
+                    message_id: steer_id.clone(),
+                    client_prompt_id: None,
+                    block: ContentBlock::Text(TextContent::new(steer_text.clone())),
+                },
+            );
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::PromptReceived {
+                    content: steer_text,
+                    message_id: Some(steer_id),
                 },
             );
             push(
@@ -224,6 +257,30 @@ pub fn generate(spec: TraceSpec) -> Trace {
                     arguments: "{\"cmd\":\"ls\"}".to_owned(),
                 },
             );
+            // Every other turn the first tool waits for a permission decision.
+            if tool == 0 && turn % 2 == 0 {
+                let permission_id = format!("p{turn}");
+                push(
+                    &mut events,
+                    &mut seq,
+                    AgentEventKind::PermissionRequested {
+                        permission_id: permission_id.clone(),
+                        task_id: None,
+                        tool_name: "shell".to_owned(),
+                        reason: "needs approval".to_owned(),
+                        tool_call_id: id.clone(),
+                        request: None,
+                    },
+                );
+                push(
+                    &mut events,
+                    &mut seq,
+                    AgentEventKind::PermissionGranted {
+                        permission_id,
+                        granted: true,
+                    },
+                );
+            }
             let result = rng.lorem(spec.result_words);
             push(
                 &mut events,
@@ -268,6 +325,40 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 reason: None,
             },
         );
+        // Every fifth turn a scheduled run follows: it has output and no prompt.
+        if turn % 5 == 4 {
+            let run_id = format!("sched{turn}");
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::RunStarted {
+                    run_id: run_id.clone(),
+                    origin: format!("scheduled:s1:t{turn}"),
+                },
+            );
+            let words = 8 + rng.below(8);
+            let output = rng.lorem(words);
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::AssistantMessageStored {
+                    content: output,
+                    thinking: None,
+                    reasoning_parts: Vec::new(),
+                    message_id: Some(format!("sa{turn}")),
+                },
+            );
+            push(
+                &mut events,
+                &mut seq,
+                AgentEventKind::RunCompleted {
+                    run_id,
+                    outcome: "completed".to_owned(),
+                    stop_type: None,
+                    reason: None,
+                },
+            );
+        }
     }
     Trace {
         session_id: "s1".to_owned(),
@@ -292,7 +383,7 @@ pub fn snapshot_response(events: &[Value], extra: Value) -> Value {
             "completeTotalUsd": 0.0, "complete": true, "billing": "empty", "reasons": [],
             "pricedAttempts": 0, "excludedAttempts": 0, "unresolvedAttempts": 0,
             "incompleteAttempts": 0, "unaccountedGenerations": 0 }, "cycle": null },
-        "delegationUpdates": []
+        "subagentUpdates": []
     });
     if let (Some(base), Some(more)) = (snapshot.as_object_mut(), extra.as_object()) {
         for (key, value) in more {
@@ -350,6 +441,18 @@ fn case(name: &str, batches: Vec<Vec<SessionInput>>) -> GoldenCase {
     }
 }
 
+/// A `querymt/session/stateUpdate` input.
+fn state_update(state: &str, run_id: &str, stop_reason: Option<&str>) -> SessionInput {
+    let mut notification = json!({ "sessionId": "s1", "state": state, "runId": run_id });
+    if let Some(stop) = stop_reason {
+        notification["stopReason"] = json!(stop);
+    }
+    SessionInput::StateUpdate {
+        notification,
+        at_ms: 0,
+    }
+}
+
 fn loaded(spec: TraceSpec) -> SessionInput {
     let trace = generate(spec);
     SessionInput::SnapshotLoaded {
@@ -358,7 +461,7 @@ fn loaded(spec: TraceSpec) -> SessionInput {
 }
 
 /// The golden scenarios: small, 1x and 4x sessions; streaming, history page,
-/// optimistic prompt, compaction and delegation cases.
+/// optimistic prompt, compaction and delegation (subagent) cases.
 pub fn golden_cases() -> Vec<GoldenCase> {
     let mut rng = Rng::new(99);
     let stream: Vec<SessionInput> = (0..40)
@@ -414,16 +517,96 @@ pub fn golden_cases() -> Vec<GoldenCase> {
     ];
     let delegation = vec![
         live(
-            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "delegate",
-                     "status": "in_progress" }),
+            json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
+                     "title": "Verifier", "description": "lorem",
+                     "state": { "state": "running" },
+                     "_meta": { "querymt": { "stage": "verifying" } } }),
         ),
-        SessionInput::DelegationUpdate {
-            update: serde_json::from_value(json!({
-                "version": 1, "sessionId": "s1", "delegationId": "d1", "toolCallId": "t1",
-                "state": "forked", "targetAgentId": "coder", "objective": "lorem",
-                "childSessionId": "child-1", "requestedAt": 1, "updatedAt": 2 }))
-            .expect("delegation fixture"),
-        },
+        live(
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "delegate",
+                     "status": "in_progress",
+                     "content": [{ "type": "session", "sessionId": "child-1" }] }),
+        ),
+        live(
+            json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
+                     "state": { "state": "idle" } }),
+        ),
+    ];
+    let run_state = vec![
+        vec![
+            state_update("running", "r1", None),
+            live(
+                json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+                         "content": { "type": "text", "text": "lorem" },
+                         "_meta": { "querymt": { "runId": "r1" } } }),
+            ),
+            live(
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "shell",
+                         "status": "in_progress",
+                         "_meta": { "querymt": { "runId": "r1" } } }),
+            ),
+        ],
+        vec![
+            state_update("requires_action", "r1", None),
+            state_update("running", "r1", None),
+            state_update("idle", "r1", Some("end_turn")),
+        ],
+        // A scheduled run: reported by the state, its output carries no run id.
+        vec![
+            state_update("running", "sched-1", None),
+            text_chunk("m-sched", "ipsum"),
+            state_update("idle", "sched-1", Some("end_turn")),
+        ],
+    ];
+    let subagent = vec![
+        vec![SessionInput::SnapshotLoaded {
+            response: snapshot_response(
+                &generate(TraceSpec::small(3)).events,
+                json!({ "subagentUpdates": [
+                    { "sessionId": "child-1", "title": "Verifier",
+                      "state": { "state": "running" },
+                      "_meta": { "querymt": { "stage": "verifying" } } },
+                    { "sessionId": "child-2", "title": "Coder", "state": { "state": "idle" } },
+                ] }),
+            ),
+        }],
+        vec![
+            live(
+                json!({ "sessionUpdate": "subagent_update", "sessionId": "child-1",
+                         "state": { "state": "idle" } }),
+            ),
+            live(
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t0-0",
+                         "content": [{ "type": "session", "sessionId": "child-2" }] }),
+            ),
+        ],
+    ];
+    let cursor = vec![
+        vec![
+            text_chunk("m-cur", "dolor"),
+            live(
+                json!({ "sessionUpdate": "cursor_update", "cursorId": "cur-1",
+                         "anchor": { "type": "agent_message", "messageId": "m-cur",
+                                      "position": "after" },
+                         "capabilities": { "fork": {} } }),
+            ),
+            live(
+                json!({ "sessionUpdate": "cursor_update", "cursorId": "cur-2",
+                         "anchor": { "type": "agent_message", "messageId": "not-here",
+                                      "position": "after" } }),
+            ),
+        ],
+        // A load discards the cursors and rebuilds them from its own.
+        vec![SessionInput::SnapshotLoaded {
+            response: snapshot_response(
+                &generate(TraceSpec::small(4)).events,
+                json!({ "cursorUpdates": [{
+                    "cursorId": "cur-3",
+                    "anchor": { "type": "agent_message", "messageId": "a0", "position": "after" },
+                    "capabilities": { "fork": {} },
+                }] }),
+            ),
+        }],
     ];
     vec![
         case("small_snapshot", vec![vec![loaded(TraceSpec::small(1))]]),
@@ -437,5 +620,8 @@ pub fn golden_cases() -> Vec<GoldenCase> {
         case("optimistic_prompt", vec![vec![optimistic], vec![echo]]),
         case("compaction", vec![compaction]),
         case("delegation", vec![delegation]),
+        case("run_state", run_state),
+        case("subagent", subagent),
+        case("cursor", cursor),
     ]
 }

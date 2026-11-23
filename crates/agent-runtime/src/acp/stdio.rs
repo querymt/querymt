@@ -53,6 +53,9 @@ pub struct AcpSessionLoadOutcome {
     pub response: LoadSessionResponse,
     pub notifications: Vec<SessionNotification>,
     pub event_count: usize,
+    /// The last event the answer (snapshot or replay) contains.
+    #[doc(hidden)]
+    pub cut: Option<crate::acp::delivery::LoadCut>,
 }
 
 fn stored_user_prompt_blocks(
@@ -143,6 +146,25 @@ pub async fn replay_loaded_session(
     session_id: &str,
     capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
 ) -> Result<(Vec<SessionNotification>, usize), acp::Error> {
+    replay_loaded_session_with_cut(agent, session_id, capabilities)
+        .await
+        .map(|(notifications, event_count, _)| (notifications, event_count))
+}
+
+/// [`replay_loaded_session`] that also reports the last event it replays.
+#[doc(hidden)]
+pub async fn replay_loaded_session_with_cut(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
+) -> Result<
+    (
+        Vec<SessionNotification>,
+        usize,
+        crate::acp::delivery::LoadCut,
+    ),
+    acp::Error,
+> {
     // Profile-bound sessions live in their owning runtime's registry.
     let session_ref = agent.owned_session_ref(session_id).await;
     let session_ref_missing = session_ref.is_none();
@@ -202,6 +224,7 @@ pub async fn replay_loaded_session(
     };
     let actorless = session_ref_missing;
     let event_count = events.len();
+    let cut = crate::acp::delivery::LoadCut::from_events(&events);
     let mut notifications = async {
         crate::acp::shared::replay_agent_events_materialized(
             session_id,
@@ -214,7 +237,7 @@ pub async fn replay_loaded_session(
     .await;
     if actorless {
         // No actor means no live configuration to report.
-        return Ok((notifications, event_count));
+        return Ok((notifications, event_count, cut));
     }
     // Historical events do not carry profile selectors. Replay the owner's full
     // current configuration, not a partial historical replacement.
@@ -237,7 +260,7 @@ pub async fn replay_loaded_session(
             )),
         ),
     );
-    Ok((notifications, event_count))
+    Ok((notifications, event_count, cut))
 }
 
 async fn prepare_session_load(
@@ -254,10 +277,16 @@ async fn prepare_session_load(
     // Snapshot-capable clients hydrate history from the load-response snapshot.
     // Skipping replay here also avoids the redundant event-stream and message
     // reads that only exist to produce historical notifications.
-    let (notifications, event_count) = if preferences.replays_history() {
-        replay_loaded_session(agent.as_ref(), &session_id, capabilities).await?
+    let (notifications, event_count, cut) = if preferences.replays_history() {
+        let (notifications, event_count, cut) =
+            replay_loaded_session_with_cut(agent.as_ref(), &session_id, capabilities).await?;
+        (notifications, event_count, Some(cut))
     } else {
-        (Vec::new(), 0)
+        (
+            Vec::new(),
+            0,
+            crate::acp::delivery::LoadCut::from_snapshot_meta(response.meta.as_ref()),
+        )
     };
     tracing::Span::current().record("session.load.event_count", event_count as i64);
     tracing::Span::current().record(
@@ -268,6 +297,7 @@ async fn prepare_session_load(
         response,
         notifications,
         event_count,
+        cut,
     })
 }
 
@@ -306,7 +336,15 @@ async fn load_session_and_enqueue_replay(
     req: LoadSessionRequest,
     translator: &std::sync::Arc<std::sync::Mutex<crate::acp::shared::AcpLiveEventTranslator>>,
     session_load: &std::sync::Arc<std::sync::Mutex<crate::acp::shared::AcpSessionLoadPreferences>>,
-) -> Result<LoadSessionResponse, acp::Error> {
+    delivery: &Arc<crate::acp::delivery::ConnectionDelivery>,
+) -> Result<
+    (
+        LoadSessionResponse,
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    ),
+    acp::Error,
+> {
     let span = session_load_span(&req);
     async {
         let capabilities = {
@@ -321,7 +359,18 @@ async fn load_session_and_enqueue_replay(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
         let session_id = req.session_id.to_string();
+        // Live events of the session wait from here until the response is
+        // out: none is delivered before it, none is lost between the read
+        // and the answer. The caller releases the hold after responding.
+        let hold = delivery.begin_load(&session_id);
         let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
+        crate::acp::shared::seed_loaded_run_state(
+            agent,
+            &session_id,
+            outcome.response.meta.as_ref(),
+            translator,
+        )
+        .await;
         let recovered = {
             let mut translator = translator
                 .lock()
@@ -355,7 +404,15 @@ async fn load_session_and_enqueue_replay(
         }
         .instrument(enqueue_span)
         .await?;
-        Ok(outcome.response)
+        // More live events than the connection can buffer arrived: answering
+        // would leave a gap, so the load fails and can be retried.
+        hold.check().map_err(|_| {
+            acp::Error::internal_error().data(serde_json::json!({
+                "message": "Too many live events arrived while loading the session; retry the load",
+                "sessionId": session_id,
+            }))
+        })?;
+        Ok((outcome.response, hold, outcome.cut))
     }
     .instrument(span)
     .await
@@ -586,6 +643,23 @@ enum StdioFlow {
     Stop,
 }
 
+/// Send one `querymt/session/stateUpdate` notification.
+pub(crate) async fn notify_state_update(
+    bridge: &ClientBridgeSender,
+    update: &crate::acp::shared::SessionStateUpdate,
+) -> Result<(), acp::Error> {
+    let params = serde_json::value::RawValue::from_string(
+        serde_json::to_string(update).map_err(acp::Error::into_internal_error)?,
+    )
+    .map_err(acp::Error::into_internal_error)?;
+    bridge
+        .notify_ext(crate::acp::protocol::ExtNotification::new(
+            crate::acp::shared::SESSION_STATE_UPDATE_METHOD,
+            Arc::from(params),
+        ))
+        .await
+}
+
 /// Handle one live event: elicitations, permissions and session updates.
 async fn forward_stdio_event(
     agent: &Arc<crate::agent::LocalAgentHandle>,
@@ -594,6 +668,19 @@ async fn forward_stdio_event(
     translator: &Arc<Mutex<AcpLiveEventTranslator>>,
     event: &querymt_agent_core::events::EventEnvelope,
 ) -> StdioFlow {
+    // Run state first: it is derived from every event (including the waits
+    // handled below) and orders with the session updates of the same run.
+    let state_update = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .translate_state_update(event);
+    if let Some(update) = state_update
+        && let Err(error) = notify_state_update(bridge, &update).await
+    {
+        log::info!("Bridge closed, stopping forwarder: {}", error);
+        return StdioFlow::Stop;
+    }
+
     if let querymt_agent_core::events::AgentEventKind::ElicitationRequested {
         elicitation_id,
         session_id,
@@ -842,10 +929,16 @@ async fn forward_stdio_admitted(
     bridge: &ClientBridgeSender,
     forwarded_elicitations: &Arc<Mutex<HashSet<(String, String)>>>,
     translator: &Arc<Mutex<AcpLiveEventTranslator>>,
+    delivery: &Arc<crate::acp::delivery::ConnectionDelivery>,
     batch: Vec<crate::acp::delivery::Admitted>,
     forwarded_count: &mut u64,
 ) -> bool {
     for admitted in batch {
+        // A load in progress holds the event; a finished load's answer may
+        // already contain it.
+        let Some(admitted) = delivery.intercept(admitted) else {
+            continue;
+        };
         let crate::acp::delivery::Admitted { event, guard } = admitted;
         let flow =
             forward_stdio_event(agent, bridge, forwarded_elicitations, translator, &event).await;
@@ -861,6 +954,51 @@ async fn forward_stdio_admitted(
                     event.session_id()
                 );
             }
+        }
+    }
+    true
+}
+
+/// Deliver what finished loads held back: the current run state and the
+/// in-flight text first, then the held events the load's answer does not
+/// contain, in order.
+async fn forward_stdio_released(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    bridge: &ClientBridgeSender,
+    forwarded_elicitations: &Arc<Mutex<HashSet<(String, String)>>>,
+    translator: &Arc<Mutex<AcpLiveEventTranslator>>,
+    delivery: &Arc<crate::acp::delivery::ConnectionDelivery>,
+    forwarded_count: &mut u64,
+) -> bool {
+    for released in delivery.take_released() {
+        let (state, updates) = translator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released_load_prelude(&released.session_id, released.inflight.as_ref());
+        if let Some(state) = state
+            && notify_state_update(bridge, &state).await.is_err()
+        {
+            return false;
+        }
+        for update in updates {
+            let notification =
+                SessionNotification::new(SessionId::from(released.session_id.clone()), update);
+            if bridge.notify(notification).await.is_err() {
+                return false;
+            }
+        }
+        if !forward_stdio_admitted(
+            agent,
+            bridge,
+            forwarded_elicitations,
+            translator,
+            delivery,
+            released.events,
+            forwarded_count,
+        )
+        .await
+        {
+            return false;
         }
     }
     true
@@ -891,7 +1029,25 @@ fn spawn_event_bridge_forwarder(
         let mut forwarded_count = 0u64;
 
         loop {
-            match events.recv().await {
+            let received = tokio::select! {
+                _ = delivery.released_load() => {
+                    if forward_stdio_released(
+                        &agent,
+                        &bridge,
+                        &forwarded_elicitations,
+                        &translator,
+                        &delivery,
+                        &mut forwarded_count,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                received = events.recv() => received,
+            };
+            match received {
                 Ok(event) => {
                     let batch = delivery.admit(event).await;
                     if !forward_stdio_admitted(
@@ -899,6 +1055,7 @@ fn spawn_event_bridge_forwarder(
                         &bridge,
                         &forwarded_elicitations,
                         &translator,
+                        &delivery,
                         batch,
                         &mut forwarded_count,
                     )
@@ -932,6 +1089,7 @@ fn spawn_event_bridge_forwarder(
                         &bridge,
                         &forwarded_elicitations,
                         &translator,
+                        &delivery,
                         recovered,
                         &mut forwarded_count,
                     )
@@ -1203,6 +1361,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                 let bridge_sender = bridge_sender.clone();
                 let translator = translator.clone();
                 let session_load = session_load_forwarders.clone();
+                let delivery = delivery.clone();
                 async move |req: LoadSessionRequest, responder, _cx| {
                     let session_id = req.session_id.to_string();
                     let result = load_session_and_enqueue_replay(
@@ -1211,10 +1370,19 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                         req,
                         &translator,
                         &session_load,
+                        &delivery,
                     )
                     .await;
+                    let (result, release) = match result {
+                        Ok((response, hold, cut)) => (Ok(response), Some((hold, cut))),
+                        Err(error) => (Err(error), None),
+                    };
                     let ok = result.is_ok();
                     let send_result = responder.respond_with_result(result);
+                    // The response is queued: the held live events follow it.
+                    if let Some((hold, cut)) = release {
+                        hold.release_with(cut, agent.config.event_sink.fanout());
+                    }
                     if ok {
                         advertise_available_commands(&agent, &bridge_sender, &session_id).await;
                     }
@@ -1798,6 +1966,434 @@ mod stdio_tests {
         );
         let params: serde_json::Value = serde_json::from_str(notification.params.get()).unwrap();
         assert_eq!(params["runtime"]["phase"], "waiting");
+        forwarder.abort();
+    }
+
+    // ── Loads that overlap live traffic ────────────────────────────────────
+
+    /// A connection with a running forwarder, started after the events a
+    /// load is meant to have missed.
+    struct LoadRig {
+        fixture: crate::test_utils::TestAgent,
+        session_id: String,
+        bridge: ClientBridgeSender,
+        bridge_rx: mpsc::Receiver<ClientBridgeMessage>,
+        /// Messages read while serving a load's flush barrier.
+        stashed: std::collections::VecDeque<ClientBridgeMessage>,
+        translator: Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+        session_load: Arc<std::sync::Mutex<crate::acp::shared::AcpSessionLoadPreferences>>,
+        delivery: Arc<crate::acp::delivery::ConnectionDelivery>,
+        forwarder: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl LoadRig {
+        async fn new() -> Self {
+            let fixture = crate::test_utils::TestAgent::new().await;
+            let session_id = fixture.create_session().await;
+            let (bridge_tx, bridge_rx) = mpsc::channel(256);
+            let delivery = crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            );
+            Self {
+                fixture,
+                session_id,
+                bridge: ClientBridgeSender::new(bridge_tx),
+                bridge_rx,
+                stashed: Default::default(),
+                translator: Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+                session_load: Arc::new(std::sync::Mutex::new(Default::default())),
+                delivery,
+                forwarder: None,
+            }
+        }
+
+        fn publish(
+            &self,
+            seq: i64,
+            durable: bool,
+            kind: querymt_agent_core::events::AgentEventKind,
+        ) {
+            use querymt_agent_core::events::{
+                DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
+            };
+            let envelope = if durable {
+                EventEnvelope::Durable(DurableEvent {
+                    session_seq: seq,
+                    event_id: format!("e{seq}"),
+                    stream_seq: 1_000 + seq,
+                    session_id: self.session_id.clone(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind,
+                })
+            } else {
+                EventEnvelope::Ephemeral(EphemeralEvent {
+                    session_seq: seq,
+                    session_id: self.session_id.clone(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind,
+                })
+            };
+            self.fixture.config.event_sink.fanout().publish(envelope);
+        }
+
+        fn delta(&self, seq: i64, message_id: &str, text: &str) {
+            self.publish(
+                seq,
+                false,
+                querymt_agent_core::events::AgentEventKind::AssistantContentDelta {
+                    content: text.to_string(),
+                    message_id: message_id.to_string(),
+                },
+            );
+        }
+
+        fn start_forwarder(&mut self) {
+            let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+            self.forwarder = Some(spawn_event_bridge_forwarder(
+                self.fixture.config.event_sink.fanout().clone(),
+                self.bridge.clone(),
+                self.fixture.handle.clone(),
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                self.translator.clone(),
+                self.delivery.clone(),
+                shutdown_tx,
+            ));
+        }
+
+        /// Everything the client receives until a title update `marker`
+        /// shows up: state updates (as `state:<state>`), message and thought
+        /// chunk texts (as `message:<text>` / `thought:<text>`).
+        async fn received_until(&mut self, marker: &str) -> Vec<String> {
+            let mut seen = Vec::new();
+            loop {
+                let message = match self.stashed.pop_front() {
+                    Some(message) => message,
+                    None => timeout(Duration::from_secs(5), self.bridge_rx.recv())
+                        .await
+                        .expect("the marker should arrive")
+                        .expect("bridge stays open"),
+                };
+                match message {
+                    ClientBridgeMessage::ExtNotification(notification)
+                        if notification.method.as_ref()
+                            == crate::acp::shared::SESSION_STATE_UPDATE_METHOD =>
+                    {
+                        let params: serde_json::Value =
+                            serde_json::from_str(notification.params.get()).unwrap();
+                        seen.push(format!("state:{}", params["state"].as_str().unwrap()));
+                    }
+                    ClientBridgeMessage::Notification(notification) => match notification.update {
+                        SessionUpdate::AgentMessageChunk(chunk) => {
+                            if let ContentBlock::Text(text) = chunk.content {
+                                seen.push(format!("message:{}", text.text));
+                            }
+                        }
+                        SessionUpdate::AgentThoughtChunk(chunk) => {
+                            if let ContentBlock::Text(text) = chunk.content {
+                                seen.push(format!("thought:{}", text.text));
+                            }
+                        }
+                        SessionUpdate::SessionInfoUpdate(info)
+                            if info.title
+                                == crate::acp::protocol::MaybeUndefined::Value(
+                                    marker.to_string(),
+                                ) =>
+                        {
+                            return seen;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        fn marker(&self, seq: i64, title: &str) {
+            self.publish(
+                seq,
+                true,
+                querymt_agent_core::events::AgentEventKind::SessionMetadataUpdated {
+                    title: Some(Some(title.to_string())),
+                    updated_at: None,
+                },
+            );
+        }
+
+        async fn load(
+            &mut self,
+        ) -> (
+            crate::acp::protocol::LoadSessionResponse,
+            crate::acp::delivery::LoadHold,
+            Option<crate::acp::delivery::LoadCut>,
+        ) {
+            let load = super::load_session_and_enqueue_replay(
+                &self.fixture.handle,
+                &self.bridge,
+                crate::acp::protocol::LoadSessionRequest::new(
+                    self.session_id.clone(),
+                    std::path::PathBuf::new(),
+                ),
+                &self.translator,
+                &self.session_load,
+                &self.delivery,
+            );
+            tokio::pin!(load);
+            // The load flushes the bridge before answering: serve the barrier.
+            loop {
+                tokio::select! {
+                    result = &mut load => return result.expect("the load answers"),
+                    message = self.bridge_rx.recv() => match message {
+                        Some(ClientBridgeMessage::Flush { response_tx }) => {
+                            let _ = response_tx.send(Ok(()));
+                        }
+                        Some(other) => self.stashed.push_back(other),
+                        None => {}
+                    },
+                }
+            }
+        }
+    }
+
+    impl Drop for LoadRig {
+        fn drop(&mut self) {
+            if let Some(forwarder) = self.forwarder.take() {
+                forwarder.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn message_streaming_at_the_load_arrives_in_full() {
+        let mut rig = LoadRig::new().await;
+        // 400 characters streamed before this connection looked at the session.
+        for (seq, chunk) in [(2, "a"), (3, "b"), (4, "c"), (5, "d")] {
+            rig.delta(seq, "m1", &chunk.repeat(100));
+        }
+        rig.start_forwarder();
+        tokio::task::yield_now().await;
+
+        let (_response, hold, cut) = rig.load().await;
+        // More text streams while the load is being answered.
+        rig.delta(6, "m1", &"e".repeat(50));
+        hold.release_with(cut, rig.fixture.config.event_sink.fanout());
+        // The rest of the message, then its stored form.
+        rig.delta(7, "m1", &"f".repeat(300));
+        rig.publish(
+            8,
+            true,
+            querymt_agent_core::events::AgentEventKind::AssistantMessageStored {
+                content: format!(
+                    "{}{}{}{}{}{}",
+                    "a".repeat(100),
+                    "b".repeat(100),
+                    "c".repeat(100),
+                    "d".repeat(100),
+                    "e".repeat(50),
+                    "f".repeat(300)
+                ),
+                thinking: None,
+                reasoning_parts: Vec::new(),
+                message_id: Some("m1".into()),
+            },
+        );
+        rig.marker(9, "after-stored");
+
+        let seen = rig.received_until("after-stored").await;
+        let messages: Vec<&str> = seen
+            .iter()
+            .filter_map(|entry| entry.strip_prefix("message:"))
+            .collect();
+        // The text up to the answer is one chunk, the rest follows, and the
+        // stored message adds nothing: the client holds the message once.
+        assert_eq!(messages.len(), 2, "{seen:?}");
+        assert_eq!(messages[0].len(), 450);
+        assert!(messages[0].starts_with(&"a".repeat(100)));
+        assert_eq!(messages[1], "f".repeat(300));
+    }
+
+    #[tokio::test]
+    async fn reasoning_streaming_at_the_load_arrives_in_full() {
+        let mut rig = LoadRig::new().await;
+        rig.publish(
+            2,
+            false,
+            querymt_agent_core::events::AgentEventKind::AssistantThinkingDelta {
+                content: "considering ".into(),
+                message_id: "m1".into(),
+                part_id: Some("p1".into()),
+            },
+        );
+        rig.publish(
+            3,
+            false,
+            querymt_agent_core::events::AgentEventKind::AssistantThinkingDelta {
+                content: "options".into(),
+                message_id: "m1".into(),
+                part_id: Some("p1".into()),
+            },
+        );
+        rig.start_forwarder();
+        tokio::task::yield_now().await;
+
+        let (_response, hold, cut) = rig.load().await;
+        hold.release_with(cut, rig.fixture.config.event_sink.fanout());
+        rig.publish(
+            4,
+            false,
+            querymt_agent_core::events::AgentEventKind::AssistantThinkingDelta {
+                content: " and more".into(),
+                message_id: "m1".into(),
+                part_id: Some("p1".into()),
+            },
+        );
+        rig.marker(5, "after-reasoning");
+
+        let seen = rig.received_until("after-reasoning").await;
+        let thoughts: Vec<&str> = seen
+            .iter()
+            .filter_map(|entry| entry.strip_prefix("thought:"))
+            .collect();
+        assert_eq!(thoughts, ["considering options", " and more"], "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn current_state_after_a_load() {
+        let mut rig = LoadRig::new().await;
+        rig.start_forwarder();
+        tokio::task::yield_now().await;
+
+        // The load finds a run in progress; a delta arrives while it answers.
+        let hold = rig.delivery.begin_load(&rig.session_id);
+        rig.translator
+            .lock()
+            .unwrap()
+            .seed_run_state(&rig.session_id, Some("run-7".into()), false);
+        rig.delta(3, "m1", "live");
+        hold.release(crate::acp::delivery::LoadCut::default(), None);
+        rig.marker(4, "after-load");
+
+        let seen = rig.received_until("after-load").await;
+        // One state update first, then the held update; no historical state.
+        assert_eq!(seen, ["state:running", "message:live"]);
+    }
+
+    #[tokio::test]
+    async fn a_held_event_before_the_cut_is_not_sent() {
+        let mut rig = LoadRig::new().await;
+        rig.start_forwarder();
+        tokio::task::yield_now().await;
+
+        let hold = rig.delivery.begin_load(&rig.session_id);
+        rig.delta(2, "m1", "inside the snapshot");
+        rig.delta(5, "m2", "after the cut");
+        // The answer contains everything up to session_seq 3.
+        hold.release(
+            crate::acp::delivery::LoadCut {
+                session_seq: 3,
+                local_stream_seq: 0,
+            },
+            None,
+        );
+        rig.marker(6, "after-cut");
+
+        let seen = rig.received_until("after-cut").await;
+        assert_eq!(seen, ["message:after the cut"]);
+    }
+
+    #[tokio::test]
+    async fn run_state_updates_arrive_in_order_through_the_bridge() {
+        use querymt_agent_core::events::{
+            AgentEventKind, DurableEvent, EventEnvelope, EventOrigin,
+        };
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(16);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+        let event = |seq: i64, kind: AgentEventKind| {
+            EventEnvelope::Durable(DurableEvent {
+                session_seq: seq,
+                event_id: format!("e{seq}"),
+                stream_seq: seq,
+                session_id: "parent".into(),
+                timestamp: 0,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind,
+            })
+        };
+        // A run that starts and ends back to back, with a wait in between.
+        let fanout = fixture.config.event_sink.fanout();
+        fanout.publish(event(
+            1,
+            AgentEventKind::RunStarted {
+                run_id: "run-1".into(),
+                origin: "interactive".into(),
+            },
+        ));
+        fanout.publish(event(
+            2,
+            AgentEventKind::PermissionRequested {
+                permission_id: "perm-1".into(),
+                task_id: None,
+                tool_name: "shell".into(),
+                reason: "approval".into(),
+                tool_call_id: "call-1".into(),
+                request: None,
+            },
+        ));
+        fanout.publish(event(
+            3,
+            AgentEventKind::PermissionGranted {
+                permission_id: "perm-1".into(),
+                granted: true,
+            },
+        ));
+        fanout.publish(event(
+            4,
+            AgentEventKind::RunCompleted {
+                run_id: "run-1".into(),
+                outcome: "completed".into(),
+                stop_type: None,
+                reason: None,
+            },
+        ));
+
+        let mut seen = Vec::new();
+        while seen.len() < 4 {
+            let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+                .await
+                .expect("state update should arrive")
+                .expect("bridge should remain open");
+            let ClientBridgeMessage::ExtNotification(notification) = message else {
+                continue;
+            };
+            if notification.method.as_ref() != crate::acp::shared::SESSION_STATE_UPDATE_METHOD {
+                continue;
+            }
+            let params: serde_json::Value =
+                serde_json::from_str(notification.params.get()).expect("valid params");
+            assert_eq!(params["sessionId"], "parent");
+            assert_eq!(params["runId"], "run-1");
+            seen.push(params["state"].as_str().unwrap().to_string());
+        }
+        assert_eq!(seen, ["running", "requires_action", "running", "idle"]);
         forwarder.abort();
     }
 

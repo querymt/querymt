@@ -1,0 +1,2021 @@
+{
+  "name": "subagent",
+  "batches": [
+    [
+      {
+        "type": "snapshot_loaded",
+        "data": {
+          "response": {
+            "_meta": {
+              "querymt/sessionLoadSnapshot.v1": {
+                "runtimeStatus": {
+                  "phase": "idle",
+                  "active_run_id": null,
+                  "steerable": false,
+                  "pending_steering_count": 0,
+                  "queued_input_count": 0,
+                  "run_started_at_ms": null,
+                  "observation": {
+                    "availability": "live"
+                  }
+                },
+                "audit": {
+                  "session_id": "s1",
+                  "events": [
+                    {
+                      "seq": 1,
+                      "session_seq": 1,
+                      "timestamp": 1000001,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r0",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 2,
+                      "session_seq": 2,
+                      "timestamp": 1000002,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "et dolor incididunt dolor ipsum amet elit labore",
+                          "message_id": "u0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 3,
+                      "session_seq": 3,
+                      "timestamp": 1000003,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "magna eiusmod ut dolore elit consectetur ut adipiscing do dolore et magna tempor aliqua tempor et aliqua incididunt elit lorem amet dolor do labore dolor sit aliqua dolore adipiscing eiusmod do ipsum incididunt magna lorem tempor do adipiscing tempor magna incididunt consectetur incididunt amet ipsum do labore sit sit tempor eiusmod elit dolor ipsum ipsum eiusmod sed consectetur adipiscing dolor dolor eiusmod eiusmod sit consectetur dolore tempor consectetur sit amet magna adipiscing",
+                          "reasoning_parts": [
+                            {
+                              "id": "a0:summary:0",
+                              "text": "ipsum aliqua dolor eiusmod"
+                            }
+                          ],
+                          "message_id": "a0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 4,
+                      "session_seq": 4,
+                      "timestamp": 1000004,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t0-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 5,
+                      "session_seq": 5,
+                      "timestamp": 1000005,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p0",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t0-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 6,
+                      "session_seq": 6,
+                      "timestamp": 1000006,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p0",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 7,
+                      "session_seq": 7,
+                      "timestamp": 1000007,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t0-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "et et incididunt labore aliqua elit sed sed elit elit eiusmod sed eiusmod consectetur lorem dolore ut incididunt incididunt ut dolor magna sit sit et lorem ut eiusmod dolore elit amet consectetur ipsum et dolore dolor aliqua eiusmod dolor labore"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 8,
+                      "session_seq": 8,
+                      "timestamp": 1000008,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r0",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 9,
+                      "session_seq": 9,
+                      "timestamp": 1000009,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r1",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 10,
+                      "session_seq": 10,
+                      "timestamp": 1000010,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "ipsum ut amet eiusmod adipiscing magna sit",
+                          "message_id": "u1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 11,
+                      "session_seq": 11,
+                      "timestamp": 1000011,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r1",
+                          "input_id": "i1",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 12,
+                      "session_seq": 12,
+                      "timestamp": 1000012,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s1",
+                          "block": {
+                            "type": "text",
+                            "text": "dolore adipiscing consectetur"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 13,
+                      "session_seq": 13,
+                      "timestamp": 1000013,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "dolore adipiscing consectetur",
+                          "message_id": "s1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 14,
+                      "session_seq": 14,
+                      "timestamp": 1000014,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r1",
+                          "input_id": "i1",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 15,
+                      "session_seq": 15,
+                      "timestamp": 1000015,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "lorem magna labore incididunt labore aliqua lorem dolor et eiusmod adipiscing labore consectetur lorem sit dolore ut aliqua do magna ipsum eiusmod adipiscing aliqua lorem ipsum ut consectetur",
+                          "reasoning_parts": [
+                            {
+                              "id": "a1:summary:0",
+                              "text": "sit sed elit eiusmod dolore"
+                            }
+                          ],
+                          "message_id": "a1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 16,
+                      "session_seq": 16,
+                      "timestamp": 1000016,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t1-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 17,
+                      "session_seq": 17,
+                      "timestamp": 1000017,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t1-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "sed et dolore sed elit eiusmod aliqua do dolore adipiscing eiusmod magna ipsum et labore lorem sit amet adipiscing ut dolore dolore lorem incididunt dolore magna adipiscing ipsum et adipiscing aliqua et ipsum dolor labore dolor eiusmod aliqua tempor consectetur"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 18,
+                      "session_seq": 18,
+                      "timestamp": 1000018,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t1-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 19,
+                      "session_seq": 19,
+                      "timestamp": 1000019,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t1-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "labore incididunt magna et aliqua lorem tempor et aliqua et do dolor sit amet dolor incididunt magna et sit elit aliqua consectetur dolore aliqua sit consectetur tempor et aliqua ut et sed dolore do dolor magna labore adipiscing et aliqua"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 20,
+                      "session_seq": 20,
+                      "timestamp": 1000020,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r1",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 21,
+                      "session_seq": 21,
+                      "timestamp": 1000021,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r2",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 22,
+                      "session_seq": 22,
+                      "timestamp": 1000022,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "do do sit",
+                          "message_id": "u2"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 23,
+                      "session_seq": 23,
+                      "timestamp": 1000023,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "sit sed consectetur ut incididunt amet lorem elit labore ipsum ut incididunt do dolore consectetur tempor sit lorem consectetur ut dolore et dolor sit do dolore do ipsum incididunt tempor dolore dolore incididunt dolor lorem do magna sit lorem dolor do incididunt lorem amet sit et",
+                          "reasoning_parts": [
+                            {
+                              "id": "a2:summary:0",
+                              "text": "ipsum sit sed sit"
+                            }
+                          ],
+                          "message_id": "a2"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 24,
+                      "session_seq": 24,
+                      "timestamp": 1000024,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "todo2",
+                          "tool_name": "todowrite",
+                          "arguments": "{\"todos\":[{\"content\":\"lorem\",\"status\":\"in_progress\",\"priority\":\"high\"}]}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 25,
+                      "session_seq": 25,
+                      "timestamp": 1000025,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "todo2",
+                          "tool_name": "todowrite",
+                          "is_error": false,
+                          "result": "ok"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 26,
+                      "session_seq": 26,
+                      "timestamp": 1000026,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t2-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 27,
+                      "session_seq": 27,
+                      "timestamp": 1000027,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p2",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t2-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 28,
+                      "session_seq": 28,
+                      "timestamp": 1000028,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p2",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 29,
+                      "session_seq": 29,
+                      "timestamp": 1000029,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t2-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "ut tempor labore et amet adipiscing incididunt sed ut eiusmod et consectetur amet sit consectetur et sed tempor dolor aliqua et et sed labore ut amet sed et consectetur dolor dolore adipiscing adipiscing ut et magna elit et et aliqua"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 30,
+                      "session_seq": 30,
+                      "timestamp": 1000030,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r2",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 31,
+                      "session_seq": 31,
+                      "timestamp": 1000031,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r3",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 32,
+                      "session_seq": 32,
+                      "timestamp": 1000032,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "dolor aliqua lorem magna ipsum",
+                          "message_id": "u3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 33,
+                      "session_seq": 33,
+                      "timestamp": 1000033,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r3",
+                          "input_id": "i3",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 34,
+                      "session_seq": 34,
+                      "timestamp": 1000034,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s3",
+                          "block": {
+                            "type": "text",
+                            "text": "magna consectetur sit"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 35,
+                      "session_seq": 35,
+                      "timestamp": 1000035,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "magna consectetur sit",
+                          "message_id": "s3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 36,
+                      "session_seq": 36,
+                      "timestamp": 1000036,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r3",
+                          "input_id": "i3",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 37,
+                      "session_seq": 37,
+                      "timestamp": 1000037,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "sed dolor ipsum labore tempor eiusmod dolore sit elit elit sed consectetur sed eiusmod tempor lorem dolore consectetur do sit incididunt et magna labore sit sit consectetur amet ut magna adipiscing do amet amet tempor tempor lorem ut do tempor eiusmod do et dolore lorem dolor et elit incididunt ut do do amet incididunt amet elit amet eiusmod ut lorem elit elit consectetur amet aliqua consectetur dolore consectetur dolore",
+                          "reasoning_parts": [
+                            {
+                              "id": "a3:summary:0",
+                              "text": "dolore ut dolore do dolor elit incididunt adipiscing"
+                            }
+                          ],
+                          "message_id": "a3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 38,
+                      "session_seq": 38,
+                      "timestamp": 1000038,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t3-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 39,
+                      "session_seq": 39,
+                      "timestamp": 1000039,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t3-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "labore aliqua lorem magna dolore do ut lorem tempor do eiusmod dolor amet magna lorem labore elit dolore do incididunt lorem aliqua incididunt do sed dolore labore ut do do et ut consectetur aliqua sit incididunt elit sed magna do"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 40,
+                      "session_seq": 40,
+                      "timestamp": 1000040,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t3-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 41,
+                      "session_seq": 41,
+                      "timestamp": 1000041,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t3-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "sed sit labore labore dolore labore consectetur et labore incididunt sed consectetur sed eiusmod aliqua sit elit elit ipsum dolore et dolor adipiscing consectetur elit magna do dolor do lorem lorem eiusmod consectetur labore consectetur labore dolore incididunt dolore adipiscing"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 42,
+                      "session_seq": 42,
+                      "timestamp": 1000042,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "compaction_start",
+                        "data": {
+                          "token_estimate": 1000,
+                          "compaction_id": "c3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 43,
+                      "session_seq": 43,
+                      "timestamp": 1000043,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "compaction_end",
+                        "data": {
+                          "summary": "incididunt ut do incididunt et ipsum magna magna sit et ut do",
+                          "summary_len": 12,
+                          "compaction_id": "c3",
+                          "context_tokens": 200
+                        }
+                      }
+                    },
+                    {
+                      "seq": 44,
+                      "session_seq": 44,
+                      "timestamp": 1000044,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r3",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 45,
+                      "session_seq": 45,
+                      "timestamp": 1000045,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r4",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 46,
+                      "session_seq": 46,
+                      "timestamp": 1000046,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "lorem incididunt dolore lorem consectetur",
+                          "message_id": "u4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 47,
+                      "session_seq": 47,
+                      "timestamp": 1000047,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "tempor tempor et do amet aliqua ipsum amet ipsum amet sit sit eiusmod sed magna ut tempor dolore labore sed ipsum do dolore ut",
+                          "reasoning_parts": [
+                            {
+                              "id": "a4:summary:0",
+                              "text": "ut magna tempor amet dolor"
+                            }
+                          ],
+                          "message_id": "a4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 48,
+                      "session_seq": 48,
+                      "timestamp": 1000048,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 49,
+                      "session_seq": 49,
+                      "timestamp": 1000049,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p4",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t4-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 50,
+                      "session_seq": 50,
+                      "timestamp": 1000050,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p4",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 51,
+                      "session_seq": 51,
+                      "timestamp": 1000051,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "sed do elit labore consectetur incididunt incididunt adipiscing do eiusmod consectetur labore dolor adipiscing adipiscing sit tempor et et incididunt elit labore consectetur dolore sit adipiscing amet magna magna ut magna eiusmod incididunt incididunt sit elit elit incididunt amet sed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 52,
+                      "session_seq": 52,
+                      "timestamp": 1000052,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 53,
+                      "session_seq": 53,
+                      "timestamp": 1000053,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "dolore ipsum incididunt adipiscing elit amet sed sit tempor magna labore aliqua incididunt tempor et eiusmod sit sit magna lorem aliqua consectetur dolor incididunt et eiusmod incididunt dolore consectetur eiusmod elit sed do sed consectetur labore ipsum magna et elit"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 54,
+                      "session_seq": 54,
+                      "timestamp": 1000054,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r4",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 55,
+                      "session_seq": 55,
+                      "timestamp": 1000055,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "sched4",
+                          "origin": "scheduled:s1:t4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 56,
+                      "session_seq": 56,
+                      "timestamp": 1000056,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "dolore labore elit labore aliqua incididunt et dolore sit labore do tempor sit sed",
+                          "message_id": "sa4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 57,
+                      "session_seq": 57,
+                      "timestamp": 1000057,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "sched4",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 58,
+                      "session_seq": 58,
+                      "timestamp": 1000058,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r5",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 59,
+                      "session_seq": 59,
+                      "timestamp": 1000059,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "magna adipiscing ipsum sed",
+                          "message_id": "u5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 60,
+                      "session_seq": 60,
+                      "timestamp": 1000060,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r5",
+                          "input_id": "i5",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 61,
+                      "session_seq": 61,
+                      "timestamp": 1000061,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s5",
+                          "block": {
+                            "type": "text",
+                            "text": "labore eiusmod aliqua"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 62,
+                      "session_seq": 62,
+                      "timestamp": 1000062,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "labore eiusmod aliqua",
+                          "message_id": "s5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 63,
+                      "session_seq": 63,
+                      "timestamp": 1000063,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r5",
+                          "input_id": "i5",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 64,
+                      "session_seq": 64,
+                      "timestamp": 1000064,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "consectetur aliqua ipsum do magna eiusmod ut amet lorem elit amet ut lorem sit magna lorem ut dolor elit do et ipsum et elit elit et dolor do magna ipsum adipiscing ut lorem dolore adipiscing labore amet amet dolor sed do incididunt aliqua incididunt elit dolore eiusmod et elit do dolore sit sit et magna aliqua dolore labore aliqua tempor ut lorem incididunt dolor labore magna sit amet et labore et labore adipiscing",
+                          "reasoning_parts": [
+                            {
+                              "id": "a5:summary:0",
+                              "text": "dolore labore amet consectetur do"
+                            }
+                          ],
+                          "message_id": "a5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 65,
+                      "session_seq": 65,
+                      "timestamp": 1000065,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "todo5",
+                          "tool_name": "todowrite",
+                          "arguments": "{\"todos\":[{\"content\":\"lorem\",\"status\":\"in_progress\",\"priority\":\"high\"}]}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 66,
+                      "session_seq": 66,
+                      "timestamp": 1000066,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "todo5",
+                          "tool_name": "todowrite",
+                          "is_error": false,
+                          "result": "ok"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 67,
+                      "session_seq": 67,
+                      "timestamp": 1000067,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t5-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 68,
+                      "session_seq": 68,
+                      "timestamp": 1000068,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t5-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "magna tempor consectetur do tempor elit amet magna tempor aliqua consectetur do et ut sit tempor ut sit eiusmod sed tempor ut dolore ipsum sed tempor amet dolor aliqua incididunt et aliqua elit elit amet dolor sit lorem labore elit"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 69,
+                      "session_seq": 69,
+                      "timestamp": 1000069,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t5-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 70,
+                      "session_seq": 70,
+                      "timestamp": 1000070,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t5-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "dolore et eiusmod incididunt et dolor adipiscing magna lorem et amet eiusmod eiusmod sit ipsum consectetur ut tempor lorem incididunt eiusmod sed eiusmod sed et labore dolor et aliqua sit magna amet adipiscing magna lorem magna sit sit dolor do"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 71,
+                      "session_seq": 71,
+                      "timestamp": 1000071,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r5",
+                          "outcome": "completed"
+                        }
+                      }
+                    }
+                  ],
+                  "tasks": [],
+                  "intent_snapshots": [],
+                  "decisions": [],
+                  "progress_entries": [],
+                  "artifacts": [],
+                  "delegations": [],
+                  "generated_at": "2026-01-01T00:00:00Z"
+                },
+                "cursor": {
+                  "local_seq": 0,
+                  "remote_seq_by_source": {}
+                },
+                "accounting": {
+                  "version": 1,
+                  "session": {
+                    "knownSubtotalUsd": 0.0,
+                    "completeTotalUsd": 0.0,
+                    "complete": true,
+                    "billing": "empty",
+                    "reasons": [],
+                    "pricedAttempts": 0,
+                    "excludedAttempts": 0,
+                    "unresolvedAttempts": 0,
+                    "incompleteAttempts": 0,
+                    "unaccountedGenerations": 0
+                  },
+                  "cycle": null
+                },
+                "subagentUpdates": [
+                  {
+                    "sessionId": "child-1",
+                    "title": "Verifier",
+                    "state": {
+                      "state": "running"
+                    },
+                    "_meta": {
+                      "querymt": {
+                        "stage": "verifying"
+                      }
+                    }
+                  },
+                  {
+                    "sessionId": "child-2",
+                    "title": "Coder",
+                    "state": {
+                      "state": "idle"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child-1",
+              "state": {
+                "state": "idle"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "t0-0",
+              "content": [
+                {
+                  "type": "session",
+                  "sessionId": "child-2"
+                }
+              ]
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "run-r0",
+          "run-r1",
+          "run-r2",
+          "run-r3",
+          "run-r4",
+          "run-sched4",
+          "run-r5"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      },
+      {
+        "added": [],
+        "updated": [
+          "run-r0"
+        ],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 2,
+      "runState": "idle",
+      "activeRunId": null,
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": {
+        "amount": 0.0,
+        "currency": "USD",
+        "complete": true
+      },
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "plan": {
+        "planId": null,
+        "entries": [
+          {
+            "content": "lorem",
+            "priority": "high",
+            "status": "in_progress"
+          }
+        ],
+        "markdown": null
+      },
+      "undoStack": [],
+      "pendingInputs": [],
+      "subagents": [
+        {
+          "sessionId": "child-1",
+          "title": "Verifier",
+          "description": null,
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": {
+            "querymt": {
+              "stage": "verifying"
+            }
+          }
+        },
+        {
+          "sessionId": "child-2",
+          "title": "Coder",
+          "description": null,
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": null
+        }
+      ],
+      "cursors": [],
+      "runtime": {
+        "phase": "idle",
+        "active_run_id": null,
+        "steerable": false,
+        "pending_steering_count": 0,
+        "queued_input_count": 0,
+        "run_started_at_ms": null,
+        "observation": {
+          "availability": "live"
+        },
+        "delegation_activity": []
+      },
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "run-r0",
+      "run-r1",
+      "run-r2",
+      "run-r3",
+      "run-r4",
+      "run-sched4",
+      "run-r5"
+    ],
+    "turns": [
+      {
+        "id": "run-r0",
+        "revision": 46,
+        "entries": [
+          {
+            "id": "user-u0",
+            "revision": 1,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u0",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "et dolor incididunt dolor ipsum amet elit labore"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a0-a0:summary:0",
+            "revision": 2,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a0",
+                "partId": "a0:summary:0",
+                "text": "ipsum aliqua dolor eiusmod"
+              }
+            }
+          },
+          {
+            "id": "assistant-a0",
+            "revision": 3,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a0",
+                "text": "magna eiusmod ut dolore elit consectetur ut adipiscing do dolore et magna tempor aliqua tempor et aliqua incididunt elit lorem amet dolor do labore dolor sit aliqua dolore adipiscing eiusmod do ipsum incididunt magna lorem tempor do adipiscing tempor magna incididunt consectetur incididunt amet ipsum do labore sit sit tempor eiusmod elit dolor ipsum ipsum eiusmod sed consectetur adipiscing dolor dolor eiusmod eiusmod sit consectetur dolore tempor consectetur sit amet magna adipiscing"
+              }
+            }
+          },
+          {
+            "id": "tool-t0-0",
+            "revision": 46,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t0-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "session",
+                    "sessionId": "child-2"
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child-2"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r1",
+        "revision": 13,
+        "entries": [
+          {
+            "id": "user-u1",
+            "revision": 6,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u1",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "ipsum ut amet eiusmod adipiscing magna sit"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s1",
+            "revision": 7,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s1",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "dolore adipiscing consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a1-a1:summary:0",
+            "revision": 8,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a1",
+                "partId": "a1:summary:0",
+                "text": "sit sed elit eiusmod dolore"
+              }
+            }
+          },
+          {
+            "id": "assistant-a1",
+            "revision": 9,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a1",
+                "text": "lorem magna labore incididunt labore aliqua lorem dolor et eiusmod adipiscing labore consectetur lorem sit dolore ut aliqua do magna ipsum eiusmod adipiscing aliqua lorem ipsum ut consectetur"
+              }
+            }
+          },
+          {
+            "id": "tool-t1-0",
+            "revision": 11,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t1-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "sed et dolore sed elit eiusmod aliqua do dolore adipiscing eiusmod magna ipsum et labore lorem sit amet adipiscing ut dolore dolore lorem incididunt dolore magna adipiscing ipsum et adipiscing aliqua et ipsum dolor labore dolor eiusmod aliqua tempor consectetur"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-t1-1",
+            "revision": 13,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t1-1",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "failed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "labore incididunt magna et aliqua lorem tempor et aliqua et do dolor sit amet dolor incididunt magna et sit elit aliqua consectetur dolore aliqua sit consectetur tempor et aliqua ut et sed dolore do dolor magna labore adipiscing et aliqua"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r2",
+        "revision": 18,
+        "entries": [
+          {
+            "id": "user-u2",
+            "revision": 14,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u2",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "do do sit"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a2-a2:summary:0",
+            "revision": 15,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a2",
+                "partId": "a2:summary:0",
+                "text": "ipsum sit sed sit"
+              }
+            }
+          },
+          {
+            "id": "assistant-a2",
+            "revision": 16,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a2",
+                "text": "sit sed consectetur ut incididunt amet lorem elit labore ipsum ut incididunt do dolore consectetur tempor sit lorem consectetur ut dolore et dolor sit do dolore do ipsum incididunt tempor dolore dolore incididunt dolor lorem do magna sit lorem dolor do incididunt lorem amet sit et"
+              }
+            }
+          },
+          {
+            "id": "tool-t2-0",
+            "revision": 18,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t2-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "ut tempor labore et amet adipiscing incididunt sed ut eiusmod et consectetur amet sit consectetur et sed tempor dolor aliqua et et sed labore ut amet sed et consectetur dolor dolore adipiscing adipiscing ut et magna elit et et aliqua"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r3",
+        "revision": 28,
+        "entries": [
+          {
+            "id": "user-u3",
+            "revision": 19,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u3",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "dolor aliqua lorem magna ipsum"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s3",
+            "revision": 20,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s3",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "magna consectetur sit"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a3-a3:summary:0",
+            "revision": 21,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a3",
+                "partId": "a3:summary:0",
+                "text": "dolore ut dolore do dolor elit incididunt adipiscing"
+              }
+            }
+          },
+          {
+            "id": "assistant-a3",
+            "revision": 22,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a3",
+                "text": "sed dolor ipsum labore tempor eiusmod dolore sit elit elit sed consectetur sed eiusmod tempor lorem dolore consectetur do sit incididunt et magna labore sit sit consectetur amet ut magna adipiscing do amet amet tempor tempor lorem ut do tempor eiusmod do et dolore lorem dolor et elit incididunt ut do do amet incididunt amet elit amet eiusmod ut lorem elit elit consectetur amet aliqua consectetur dolore consectetur dolore"
+              }
+            }
+          },
+          {
+            "id": "tool-t3-0",
+            "revision": 24,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t3-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "labore aliqua lorem magna dolore do ut lorem tempor do eiusmod dolor amet magna lorem labore elit dolore do incididunt lorem aliqua incididunt do sed dolore labore ut do do et ut consectetur aliqua sit incididunt elit sed magna do"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-t3-1",
+            "revision": 26,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t3-1",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "failed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "sed sit labore labore dolore labore consectetur et labore incididunt sed consectetur sed eiusmod aliqua sit elit elit ipsum dolore et dolor adipiscing consectetur elit magna do dolor do lorem lorem eiusmod consectetur labore consectetur labore dolore incididunt dolore adipiscing"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "compaction-c3",
+            "revision": 28,
+            "kind": {
+              "type": "compaction",
+              "data": {
+                "compactionId": "c3",
+                "state": "completed",
+                "otherStatus": null,
+                "summary": [
+                  {
+                    "type": "text",
+                    "text": "incididunt ut do incididunt et ipsum magna magna sit et ut do"
+                  }
+                ],
+                "error": null,
+                "meta": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r4",
+        "revision": 35,
+        "entries": [
+          {
+            "id": "user-u4",
+            "revision": 29,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u4",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "lorem incididunt dolore lorem consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a4-a4:summary:0",
+            "revision": 30,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a4",
+                "partId": "a4:summary:0",
+                "text": "ut magna tempor amet dolor"
+              }
+            }
+          },
+          {
+            "id": "assistant-a4",
+            "revision": 31,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a4",
+                "text": "tempor tempor et do amet aliqua ipsum amet ipsum amet sit sit eiusmod sed magna ut tempor dolore labore sed ipsum do dolore ut"
+              }
+            }
+          },
+          {
+            "id": "tool-t4-0",
+            "revision": 33,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t4-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "sed do elit labore consectetur incididunt incididunt adipiscing do eiusmod consectetur labore dolor adipiscing adipiscing sit tempor et et incididunt elit labore consectetur dolore sit adipiscing amet magna magna ut magna eiusmod incididunt incididunt sit elit elit incididunt amet sed"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-t4-1",
+            "revision": 35,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t4-1",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "failed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "dolore ipsum incididunt adipiscing elit amet sed sit tempor magna labore aliqua incididunt tempor et eiusmod sit sit magna lorem aliqua consectetur dolor incididunt et eiusmod incididunt dolore consectetur eiusmod elit sed do sed consectetur labore ipsum magna et elit"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-sched4",
+        "revision": 36,
+        "entries": [
+          {
+            "id": "assistant-sa4",
+            "revision": 36,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "sa4",
+                "text": "dolore labore elit labore aliqua incididunt et dolore sit labore do tempor sit sed"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r5",
+        "revision": 44,
+        "entries": [
+          {
+            "id": "user-u5",
+            "revision": 37,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "magna adipiscing ipsum sed"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s5",
+            "revision": 38,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "labore eiusmod aliqua"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a5-a5:summary:0",
+            "revision": 39,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a5",
+                "partId": "a5:summary:0",
+                "text": "dolore labore amet consectetur do"
+              }
+            }
+          },
+          {
+            "id": "assistant-a5",
+            "revision": 40,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a5",
+                "text": "consectetur aliqua ipsum do magna eiusmod ut amet lorem elit amet ut lorem sit magna lorem ut dolor elit do et ipsum et elit elit et dolor do magna ipsum adipiscing ut lorem dolore adipiscing labore amet amet dolor sed do incididunt aliqua incididunt elit dolore eiusmod et elit do dolore sit sit et magna aliqua dolore labore aliqua tempor ut lorem incididunt dolor labore magna sit amet et labore et labore adipiscing"
+              }
+            }
+          },
+          {
+            "id": "tool-t5-0",
+            "revision": 42,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t5-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "magna tempor consectetur do tempor elit amet magna tempor aliqua consectetur do et ut sit tempor ut sit eiusmod sed tempor ut dolore ipsum sed tempor amet dolor aliqua incididunt et aliqua elit elit amet dolor sit lorem labore elit"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-t5-1",
+            "revision": 44,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t5-1",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "failed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "dolore et eiusmod incididunt et dolor adipiscing magna lorem et amet eiusmod eiusmod sit ipsum consectetur ut tempor lorem incididunt eiusmod sed eiusmod sed et labore dolor et aliqua sit magna amet adipiscing magna lorem magna sit sit dolor do"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

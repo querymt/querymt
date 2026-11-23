@@ -8,10 +8,18 @@
           "notification": {
             "sessionId": "s1",
             "update": {
-              "sessionUpdate": "tool_call",
-              "toolCallId": "t1",
-              "title": "delegate",
-              "status": "in_progress"
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child-1",
+              "title": "Verifier",
+              "description": "lorem",
+              "state": {
+                "state": "running"
+              },
+              "_meta": {
+                "querymt": {
+                  "stage": "verifying"
+                }
+              }
             }
           },
           "replayed": false,
@@ -19,21 +27,42 @@
         }
       },
       {
-        "type": "delegation_update",
+        "type": "acp_notification",
         "data": {
-          "update": {
-            "version": 1,
+          "notification": {
             "sessionId": "s1",
-            "delegationId": "d1",
-            "toolCallId": "t1",
-            "state": "forked",
-            "targetAgentId": "coder",
-            "objective": "lorem",
-            "childSessionId": "child-1",
-            "requestedAt": 1,
-            "updatedAt": 2,
-            "activity": "historical"
-          }
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "t1",
+              "title": "delegate",
+              "status": "in_progress",
+              "content": [
+                {
+                  "type": "session",
+                  "sessionId": "child-1"
+                }
+              ]
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child-1",
+              "state": {
+                "state": "idle"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
         }
       }
     ]
@@ -55,8 +84,9 @@
     ],
     "header": {
       "sessionId": "s1",
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "runState": "tool_running",
+      "activeRunId": null,
       "activeToolCallId": "t1",
       "lastStopReason": null,
       "lastError": null,
@@ -70,21 +100,24 @@
       "plan": null,
       "undoStack": [],
       "pendingInputs": [],
-      "delegations": [
+      "subagents": [
         {
-          "version": 1,
-          "sessionId": "s1",
-          "delegationId": "d1",
-          "toolCallId": "t1",
-          "state": "forked",
-          "targetAgentId": "coder",
-          "objective": "lorem",
-          "childSessionId": "child-1",
-          "requestedAt": 1,
-          "updatedAt": 2,
-          "activity": "historical"
+          "sessionId": "child-1",
+          "title": "Verifier",
+          "description": "lorem",
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": {
+            "querymt": {
+              "stage": "verifying"
+            }
+          }
         }
       ],
+      "cursors": [],
       "runtime": null,
       "history": {
         "hasOlder": false,
@@ -112,7 +145,12 @@
                 "status": "in_progress",
                 "rawInput": null,
                 "rawOutput": null,
-                "content": [],
+                "content": [
+                  {
+                    "type": "session",
+                    "sessionId": "child-1"
+                  }
+                ],
                 "resultFullBytes": null,
                 "argumentsFullBytes": null,
                 "childSessionId": "child-1"
