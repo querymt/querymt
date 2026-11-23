@@ -12,7 +12,9 @@ use super::{
 };
 use crate::{
     NodeId,
-    peer_access::{GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange},
+    peer_access::{
+        GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+    },
 };
 
 /// An owner edit guarded by the shared grant/quota revision.
