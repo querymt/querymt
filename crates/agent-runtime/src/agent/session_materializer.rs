@@ -1947,7 +1947,7 @@ impl SessionMaterializer {
     }
 }
 
-fn fork_message_id_from_meta(
+pub(crate) fn fork_message_id_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<&str> {
     let querymt = meta?.get("querymt")?;

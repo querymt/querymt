@@ -114,6 +114,53 @@ impl LocalAgentHandle {
         &self,
         req: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, Error> {
+        #[cfg(feature = "remote")]
+        {
+            let session_id = req.session_id.to_string();
+            let store = self.config.provider.history_store();
+            if let Some(bookmark) = store
+                .get_remote_session_bookmark(&session_id)
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?
+            {
+                if store
+                    .get_session(&session_id)
+                    .await
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(
+                        Error::invalid_params().data("session ID exists both locally and remotely")
+                    );
+                }
+                if !req.mcp_servers.is_empty()
+                    || crate::worktree::fork_creation_options_from_meta(req.meta.as_ref())
+                        .map_err(|error| Error::invalid_params().data(error))?
+                        .is_some_and(|options| options.requests_isolation())
+                {
+                    return Err(Error::invalid_params()
+                        .data("remote forks do not accept MCP servers or workspace provisioning"));
+                }
+                let message = crate::agent::session_materializer::fork_message_id_from_meta(
+                    req.meta.as_ref(),
+                )
+                .unwrap_or_default()
+                .to_owned();
+                let owner = self.find_node_manager(&bookmark.node_id).await?;
+                let fork = self
+                    .fork_remote_session(&owner, session_id, message)
+                    .await?;
+                self.connect_remote_for_ext(
+                    &bookmark.node_id,
+                    &fork.session_id,
+                    Some(fork.handoff),
+                    false,
+                )
+                .await
+                .map_err(|error| error.to_acp_error())?;
+                return Ok(ForkSessionResponse::new(fork.session_id));
+            }
+        }
         self.session_materializer
             .ensure_writable(req.session_id.0.as_ref())
             .await?;

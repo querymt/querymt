@@ -238,6 +238,7 @@ mod remote_impl {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ForkRemoteSession {
         pub source_session_id: String,
+        /// An empty ID selects the latest persisted message on the owner.
         pub message_id: String,
     }
 
@@ -1590,13 +1591,20 @@ mod remote_impl {
                         session_id: msg.source_session_id.clone(),
                     })?;
 
+                let store = config.provider.history_store();
+                let message_id = if msg.message_id.is_empty() {
+                    store.get_history(&msg.source_session_id).await
+                        .map_err(|e| AgentError::Internal(e.to_string()))?
+                        .pop().ok_or(AgentError::EmptySessionFork)?.id
+                } else {
+                    msg.message_id
+                };
                 if let Some(peer) = &peer {
                     peer.check_mutation().await?;
                 }
-                let store = config.provider.history_store();
                 let forked_session_id = match peer.as_ref().filter(|_| restricted) {
-                    Some(peer) => store.fork_peer_session(&msg.source_session_id, &msg.message_id, peer.schedule_origin()).await,
-                    None => store.fork_session(&msg.source_session_id, &msg.message_id, crate::session::domain::ForkOrigin::User).await,
+                    Some(peer) => store.fork_peer_session(&msg.source_session_id, &message_id, peer.schedule_origin()).await,
+                    None => store.fork_session(&msg.source_session_id, &message_id, crate::session::domain::ForkOrigin::User).await,
                 }.map_err(|e| AgentError::Internal(e.to_string()))?;
 
                 if let (Some(profiles), Some(runtime)) =

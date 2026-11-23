@@ -1396,21 +1396,22 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     assert_eq!(reattached["config_options"][0]["currentValue"], "review");
 
     // A fork keeps its source profile even after the owner's active default changes.
-    let forked = node_manager
-        .ask(crate::agent::remote::ForkRemoteSession {
-            source_session_id: created.session_id.clone(),
-            message_id: history_before.last().unwrap().id.clone(),
-        })
+    let forked = f
+        .handle
+        .fork_session(crate::acp::protocol::ForkSessionRequest::new(
+            created.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
         .await
-        .expect("fork in the source runtime");
-    let fork_load = remote
+        .expect("ACP fork routes to the source owner and defaults to the latest message");
+    let fork_load = f
         .handle
         .load_session(crate::acp::protocol::LoadSessionRequest::new(
             forked.session_id.clone(),
             std::path::PathBuf::new(),
         ))
         .await
-        .expect("fork must load directly on its owner");
+        .expect("fork must load through its new remote bookmark");
     assert_eq!(
         config_option_value(&fork_load.config_options.unwrap(), "profile").as_deref(),
         Some("alpha")
@@ -1420,12 +1421,12 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
             .registry
             .lock()
             .await
-            .get(&forked.session_id)
+            .get(forked.session_id.0.as_ref())
             .is_some()
     );
     node_manager
         .ask(crate::agent::remote::StopRemoteSessionRuntime {
-            session_id: forked.session_id,
+            session_id: forked.session_id.to_string(),
         })
         .await
         .unwrap();
