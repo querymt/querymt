@@ -966,7 +966,10 @@ impl LocalAgentHandle {
                 }
             };
             let mut meta = serde_json::Map::new();
-            meta.insert("querymt/sessionLoadSnapshot.v1".into(), snapshot);
+            meta.insert(
+                crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.into(),
+                snapshot,
+            );
             meta.insert("location".into(), serde_json::json!("remote"));
             meta.insert("nodeId".into(), serde_json::json!(bookmark.node_id));
             meta.insert("nodeLabel".into(), serde_json::json!(bookmark.peer_label));
@@ -1226,7 +1229,10 @@ impl LocalAgentHandle {
                 }))
             })?;
             probe.log_finished("local_load", session_id, &snapshot);
-            meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
+            meta.insert(
+                crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.to_string(),
+                snapshot,
+            );
         }
 
         // A read-only session has no attachable binding (its workspace is
