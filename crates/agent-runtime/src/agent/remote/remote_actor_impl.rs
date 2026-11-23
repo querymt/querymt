@@ -240,7 +240,6 @@ fn register_peer_session_ask<M, R>(
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
-    use crate::agent::file_proxy::FileProxyError;
     use crate::agent::session_actor::{GetPeerFileIndex, ReadPeerFile};
 
     let weak = actor.downgrade();
