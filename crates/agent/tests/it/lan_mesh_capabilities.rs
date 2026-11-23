@@ -133,6 +133,13 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     let initial: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
     assert_eq!(initial["outgoing"]["grant"]["mode"], "none");
     let mut updates = handle.subscribe_ext_notifications();
+    let await_quota_hint = |hint: querymt_agent::acp::protocol::ExtNotification| {
+        assert_eq!(hint.method.as_ref(), "querymt/mesh/peerAccessChanged");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(hint.params.get()).unwrap(),
+            serde_json::json!({"version":1,"peer_id":peer,"direction":"outgoing","reason":"quota"})
+        );
+    };
     let mut params = serde_json::json!({"version": 2, "peer_id": peer,
         "expected_revision": initial["outgoing"]["revision"], "scope": {"provider_id":"fixture","model_id":"offline"},
         "operation":"reconfigure", "limit": {"kind":"finite", "limit_tokens":"9007199254740993", "window":"weekly"}});
@@ -237,6 +244,12 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         })
         .await
         .unwrap();
+    await_quota_hint(
+        tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     store.mark_dispatched(reserved).await.unwrap();
     let scope = serde_json::json!({"provider_id":"fixture", "model_id":"offline"});
     let reset = |revision, scope| {
@@ -261,7 +274,14 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         .settle(reserved, AttemptUsage::Observed(12))
         .await
         .unwrap();
+    await_quota_hint(
+        tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let reply = handle.ext_method(reset(revision, scope)).await.unwrap();
+    await_quota_hint(updates.try_recv().unwrap());
     let reset: serde_json::Value = serde_json::from_str(reply.0.get()).unwrap();
     let reset_revision = &reset["outgoing"]["revision"];
     let quota_request = |operation, limit| {
@@ -275,7 +295,6 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         )
     };
     // A rejected amount or window edit must not replace the accounting period.
-    while updates.try_recv().is_ok() {}
     for (amount, window, code) in [
         ("+100", "weekly", "mesh_access_invalid_params"),
         (
