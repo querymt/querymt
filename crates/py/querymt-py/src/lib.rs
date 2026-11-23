@@ -391,9 +391,11 @@ impl PyMeshRuntime {
         let params_json =
             python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let node_id = find_provider_on_mesh(runtime.as_mesh_handle(), &provider)
+            let node_id = find_provider_on_mesh(runtime.as_mesh_handle(), &provider, &model)
                 .await
-                .ok_or_else(|| anyhow!("provider '{}' not found on mesh", provider))
+                .ok_or_else(|| {
+                    anyhow!("provider '{provider}' with model '{model}' not found on mesh")
+                })
                 .map_err(into_py_err)?;
             let provider = Arc::new(
                 MeshChatProvider::from_node_id(

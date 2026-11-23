@@ -122,7 +122,8 @@ mod mesh_provider_tests {
     async fn test_find_provider_on_mesh_returns_none_when_no_peers() {
         let mesh = get_test_mesh().await;
         // "completely-nonexistent-provider-xyz" is never registered anywhere.
-        let result = find_provider_on_mesh(mesh, "completely-nonexistent-provider-xyz-b5").await;
+        let result =
+            find_provider_on_mesh(mesh, "completely-nonexistent-provider-xyz-b5", "demo").await;
         assert!(
             result.is_none(),
             "should return None when no peer advertises the provider"

@@ -84,6 +84,27 @@ fn sharing_error(error: SharingCallError) -> LLMError {
         .into()
 }
 
+fn sharing_probe_error(error: SharingCallError) -> LLMError {
+    use libp2p::request_response::OutboundFailure;
+    use querymt::error::TransportErrorKind;
+
+    let kind = match error {
+        SharingCallError::Transport(OutboundFailure::Timeout) => TransportErrorKind::Timeout,
+        SharingCallError::Transport(OutboundFailure::DialFailure) => {
+            TransportErrorKind::ConnectionRefused
+        }
+        SharingCallError::Transport(OutboundFailure::ConnectionClosed) => {
+            TransportErrorKind::ConnectionClosed
+        }
+        SharingCallError::Transport(OutboundFailure::Io(_)) => TransportErrorKind::Other,
+        _ => return sharing_error(error),
+    };
+    LLMError::Transport {
+        kind,
+        message: error.to_string(),
+    }
+}
+
 #[derive(Clone)]
 pub struct KameoMeshClientTransport {
     mesh: MeshHandle,
@@ -211,7 +232,7 @@ impl KameoMeshClientTransport {
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn get_or_create_stream_router(
@@ -275,9 +296,17 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, LLMError> {
-        ask_with_sharing(&self.mesh, host, &request, Self::PROVIDER_CONTROL_TIMEOUT)
-            .await
-            .map_err(provider_ask_error)
+        let timeout = Self::PROVIDER_CONTROL_TIMEOUT;
+        with_sharing_protocol(
+            &self.mesh,
+            host.id().peer_id().copied(),
+            timeout,
+            ask_sharing_v1(&self.mesh, host, &request, timeout),
+            async { Ok(crate::ask_remote_with_timeout(host, &request, timeout).await?) },
+        )
+        .await
+        .map_err(sharing_probe_error)?
+        .map_err(provider_ask_error)
     }
 
     async fn prepare_stream_router(
@@ -364,7 +393,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn send_stream_request(
@@ -395,7 +424,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn cancel_stream(
@@ -574,7 +603,11 @@ impl LLMProvider for MeshChatProvider {}
         found = tracing::field::Empty,
     )
 )]
-pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Option<NodeId> {
+pub async fn find_provider_on_mesh(
+    mesh: &MeshHandle,
+    provider_name: &str,
+    model: &str,
+) -> Option<NodeId> {
     let mut peers_checked: u32 = 0;
     let mut candidates: Vec<(PeerId, NodeId)> = Vec::new();
 
@@ -610,11 +643,9 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
                 }
             };
 
-            if !snapshot
-                .providers
-                .iter()
-                .any(|entry| entry.provider == provider_name)
-            {
+            if !snapshot.providers.iter().any(|entry| {
+                entry.provider == provider_name && entry.model.as_deref() == Some(model)
+            }) {
                 continue;
             }
 
@@ -658,6 +689,12 @@ mod tests {
 
     fn mesh_fixture() -> (MeshHandle, Arc<RouteTable>) {
         init_local_actor_swarm();
+        mesh_fixture_with_commands(mpsc::unbounded_channel().0)
+    }
+
+    fn mesh_fixture_with_commands(
+        commands: mpsc::UnboundedSender<crate::mesh_runtime_support::SwarmCommand>,
+    ) -> (MeshHandle, Arc<RouteTable>) {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let routes = Arc::new(RouteTable::new(Duration::from_secs(60)));
         let mesh = MeshHandle::new(
@@ -670,7 +707,7 @@ mod tests {
             None,
             None,
             MeshTransportMode::Lan,
-            mpsc::unbounded_channel().0,
+            commands,
             Duration::from_secs(5),
         );
         (mesh, routes)
@@ -682,12 +719,12 @@ mod tests {
         let scope = MeshScopeId::lan_default();
         let preferred = PeerId::random();
         let fallback = PeerId::random();
-        let mismatched = PeerId::random();
+        let other_model = PeerId::random();
         let mut catalogs = Vec::new();
-        for (peer, claimed_peer, priority) in [
-            (preferred, preferred, 20),
-            (fallback, fallback, 10),
-            (mismatched, preferred, 30),
+        for (peer, model, priority) in [
+            (preferred, "demo", 20),
+            (fallback, "demo", 10),
+            (other_model, "other", 30),
         ] {
             routes.upsert_addrs(
                 peer,
@@ -697,12 +734,7 @@ mod tests {
                 priority,
             );
             let catalog = ProviderCatalogActor::spawn(ProviderCatalogActor::new(Arc::new(
-                StaticCatalogBackend::provider_model(
-                    claimed_peer.to_string(),
-                    None,
-                    "fixture",
-                    "demo",
-                ),
+                StaticCatalogBackend::provider_model(peer.to_string(), None, "fixture", model),
             )));
             mesh.register_actor(catalog.clone(), scoped_provider_catalog(&scope, &peer))
                 .await;
@@ -710,15 +742,80 @@ mod tests {
         }
 
         assert_eq!(
-            find_provider_on_mesh(&mesh, "fixture").await,
+            find_provider_on_mesh(&mesh, "fixture", "demo").await,
             Some(NodeId::from_peer_id(preferred))
         );
         assert!(
-            find_provider_on_mesh(&mesh, "never-advertised")
+            find_provider_on_mesh(&mesh, "fixture", "never-advertised")
                 .await
                 .is_none()
         );
         drop(catalogs);
+    }
+
+    #[tokio::test]
+    async fn provider_chat_only_retries_transport_failure_before_dispatch() {
+        use crate::mesh_ingress::{SharingRequest, SharingResponse};
+        use crate::mesh_runtime_support::SwarmCommand;
+        use kameo::actor::{ActorId, RemoteActorRef};
+        use libp2p::request_response::OutboundFailure;
+
+        init_local_actor_swarm();
+        let peer = PeerId::random();
+        let host: RemoteActorRef<ProviderHostActor> = rmp_serde::from_slice(
+            &rmp_serde::to_vec(&(ActorId::new_with_peer_id(1, peer),)).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut commands) = mpsc::unbounded_channel();
+        let (mut mesh, _) = mesh_fixture_with_commands(tx);
+        mesh.sharing_enabled = true;
+        let transport = KameoMeshClientTransport::new(mesh);
+        let request = crate::ProviderChatRequest {
+            provider: "fixture".into(),
+            model: "demo".into(),
+            messages: vec![],
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        };
+        let timeout = || SharingCallError::Transport(OutboundFailure::Timeout);
+        let ((), ()) = tokio::join!(
+            async {
+                let error = transport
+                    .send_chat_request(&host, &request)
+                    .await
+                    .unwrap_err();
+                assert!(error.is_retryable());
+                let error = transport
+                    .send_chat_request(&host, &request)
+                    .await
+                    .unwrap_err();
+                assert!(!error.is_retryable());
+            },
+            async {
+                for result in [Err(timeout()), Ok(SharingResponse::Supported)] {
+                    let Some(SwarmCommand::Sharing {
+                        request: SharingRequest::Probe,
+                        tx,
+                        ..
+                    }) = commands.recv().await
+                    else {
+                        panic!("expected a probe")
+                    };
+                    tx.send(result).unwrap();
+                }
+                let Some(SwarmCommand::Sharing {
+                    request: SharingRequest::Actor(_),
+                    tx,
+                    ..
+                }) = commands.recv().await
+                else {
+                    panic!("expected a dispatch")
+                };
+                tx.send(Err(timeout())).unwrap();
+            },
+        );
     }
 
     #[test]

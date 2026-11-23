@@ -591,7 +591,7 @@ impl SessionProvider {
                         provider_name
                     );
                     if let Some(node_id) =
-                        querymt_remote::find_provider_on_mesh(mesh, provider_name).await
+                        querymt_remote::find_provider_on_mesh(mesh, provider_name, model).await
                     {
                         log::info!(
                             "build_provider: found '{}' on mesh peer '{}', using MeshChatProvider",
