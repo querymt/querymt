@@ -647,6 +647,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_by_qualified_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Geometry.lean");
+        tokio::fs::write(
+            &path,
+            "namespace Geometry\n\ndef dist (a b : Nat) : Nat :=\n  a + b\n\nend Geometry\n",
+        )
+        .await
+        .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
+        let tool = GetSymbolTool::new();
+
+        let result = text_content(
+            tool.call(
+                json!({"requests": [{"path": "Geometry.lean", "symbol": "Geometry.dist"}], "root": dir.path()}),
+                &context,
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert!(result.contains("Geometry.dist kind=function"));
+        assert!(result.contains("00003| def dist (a b : Nat) : Nat :="));
+        assert!(result.contains("00004|   a + b"));
+    }
+
+    #[tokio::test]
     async fn ambiguous_symbols_report_candidates_and_occurrence() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");

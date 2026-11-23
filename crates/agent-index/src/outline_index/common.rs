@@ -126,6 +126,7 @@ pub fn get_language_for_extension(ext: &str) -> Option<&'static str> {
         "php" => Some("php"),
         "kt" | "kts" => Some("kotlin"),
         "swift" => Some("swift"),
+        "lean" => Some("lean"),
         "json" => Some("json"),
         "yaml" | "yml" => Some("yaml"),
         "toml" => Some("toml"),

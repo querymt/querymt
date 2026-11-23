@@ -46,7 +46,7 @@ impl ToolTrait for IndexTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, sections, markup, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, Nix, Lua, Svelte, Bash, PHP, Kotlin, Swift, JSON, YAML, TOML, and Markdown."
+                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, sections, markup, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, Nix, Lua, Svelte, Bash, PHP, Kotlin, Swift, Lean, JSON, YAML, TOML, and Markdown."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -148,7 +148,7 @@ impl ToolTrait for IndexTool {
 
         let sections = index_file(&target, &options).map_err(|e| match e {
             OutlineError::UnsupportedLanguage(ext) => ToolError::InvalidRequest(format!(
-                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua, svelte, sh, bash, php, kt, kts, swift, json, yaml, yml, toml, md, markdown",
+                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua, svelte, sh, bash, php, kt, kts, swift, lean, json, yaml, yml, toml, md, markdown",
                 ext
             )),
             OutlineError::FileTooLarge { size, limit } => ToolError::InvalidRequest(format!(
@@ -314,7 +314,7 @@ def main():
         assert!(err.contains("ex"));
         assert!(err.contains("lua"));
         for extension in [
-            "svelte", "sh", "php", "kt", "swift", "json", "yaml", "toml", "md",
+            "svelte", "sh", "php", "kt", "swift", "lean", "json", "yaml", "toml", "md",
         ] {
             assert!(err.contains(extension), "error missing {extension}");
         }
@@ -379,6 +379,33 @@ end
         assert!(text.contains("{#if count > 0}"));
     }
 
+    #[tokio::test]
+    async fn test_index_lean_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let lean_source = "import Mathlib.Data.Nat.Basic\n\ndef double (n : Nat) : Nat := n + n\n\ntheorem double_zero : double 0 = 0 := rfl\n\nstructure Point where\n  x : Nat\n  y : Nat\n";
+
+        let file_path = temp_dir.path().join("Basic.lean");
+        fs::write(&file_path, lean_source).unwrap();
+
+        let tool = IndexTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+        let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
+
+        assert!(text.contains("language: lean"));
+        assert!(text.contains("imports:"));
+        assert!(text.contains("import Mathlib.Data.Nat.Basic"));
+        assert!(text.contains("functions:"));
+        assert!(text.contains("def double"));
+        assert!(text.contains("theorems:"));
+        assert!(text.contains("theorem double_zero"));
+        assert!(text.contains("types:"));
+        assert!(text.contains("structure Point"));
+    }
+
     #[test]
     fn test_index_description_mentions_lua() {
         let tool = IndexTool::new();
@@ -391,7 +418,7 @@ end
         let tool = IndexTool::new();
         let definition = tool.definition();
         for language in [
-            "Svelte", "Bash", "PHP", "Kotlin", "Swift", "JSON", "YAML", "TOML", "Markdown",
+            "Svelte", "Bash", "PHP", "Kotlin", "Swift", "Lean", "JSON", "YAML", "TOML", "Markdown",
         ] {
             assert!(
                 definition.function.description.contains(language),

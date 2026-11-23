@@ -1105,6 +1105,10 @@ fn extension_mapping_includes_new_languages() {
         Some("swift")
     );
     assert_eq!(
+        super::common::get_language_for_extension("lean"),
+        Some("lean")
+    );
+    assert_eq!(
         super::common::get_language_for_extension("json"),
         Some("json")
     );
@@ -1456,6 +1460,10 @@ fn existing_languages_have_no_sections_or_markup() {
             find_section(&sections, "markup").is_none(),
             "{language} unexpectedly produced a `markup` outline section"
         );
+        assert!(
+            find_section(&sections, "theorems").is_none(),
+            "{language} unexpectedly produced a `theorems` outline section"
+        );
     }
 }
 
@@ -1533,4 +1541,191 @@ fn svelte_template_routes_to_markup_and_script_to_standard_sections() {
     );
     assert!(markup.entries.iter().any(|e| e.label.starts_with("{#if")));
     assert!(find_section(&sections, "sections").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Lean
+// ---------------------------------------------------------------------------
+
+fn labels(section: &super::common::Section) -> Vec<&str> {
+    section.entries.iter().map(|e| e.label.as_str()).collect()
+}
+
+#[test]
+fn top_level_theorem_and_lemma() {
+    let source = "import Mathlib.Data.Nat.Basic\n\ndef f := 1\n\ntheorem add_zero' (n : Nat) : n + 0 = n := rfl\n\n@[simp] private lemma zero_add' (n : Nat) : 0 + n = n := by simp\n\nstructure Point where\n  x : Nat\n";
+    let sections = index_source(source, "lean", &default_opts()).unwrap();
+
+    let theorems = find_section(&sections, "theorems").expect("theorems section");
+    let theorem_labels = labels(theorems);
+    assert_eq!(theorem_labels.len(), 2);
+    assert!(theorem_labels[0].starts_with("theorem add_zero'"));
+    assert!(theorem_labels[1].starts_with("private lemma zero_add'"));
+    // The attributed lemma's range starts on the attribute line.
+    assert_eq!(theorems.entries[1].start_line, 7);
+
+    let functions = find_section(&sections, "functions").expect("functions section");
+    assert_eq!(labels(functions), vec!["def f := 1"]);
+
+    // `theorems` sits directly after `functions`.
+    let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["imports", "types", "functions", "theorems"]);
+}
+
+#[test]
+fn lean_theorem_only_file_has_no_functions_section() {
+    let sections = index_source(
+        "theorem t : 1 = 1 := rfl\nlemma l : 2 = 2 := rfl\n",
+        "lean",
+        &default_opts(),
+    )
+    .unwrap();
+    assert!(find_section(&sections, "functions").is_none());
+    assert_eq!(
+        labels(find_section(&sections, "theorems").unwrap()).len(),
+        2
+    );
+}
+
+#[test]
+fn lean_outline_declarations_nest_under_namespace() {
+    let source = "namespace Geometry\nstructure Point where\n  x : Nat\n\ndef dist (p : Nat) : Nat := p\n\ntheorem dist_self : 1 = 1 := rfl\nend Geometry\n";
+    let sections = index_source(source, "lean", &default_opts()).unwrap();
+
+    let namespaces = find_section(&sections, "namespaces").expect("namespaces section");
+    assert_eq!(namespaces.entries.len(), 1);
+    let ns = &namespaces.entries[0];
+    assert_eq!(ns.label, "namespace Geometry");
+    assert_eq!((ns.start_line, ns.end_line), (1, 8));
+    let children: Vec<_> = ns.children.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(children.len(), 3);
+    assert!(children[0].starts_with("structure Point"));
+    assert!(children[1].starts_with("def dist"));
+    assert!(children[2].starts_with("theorem dist_self"));
+
+    for name in [
+        "types",
+        "functions",
+        "theorems",
+        "classes",
+        "enums",
+        "interfaces",
+    ] {
+        assert!(
+            find_section(&sections, name).is_none(),
+            "namespace member leaked into `{name}`"
+        );
+    }
+}
+
+#[test]
+fn lean_outline_types_and_instances() {
+    let source = "structure Point where\n  x : Nat\n  y : Nat\n\nclass Shape (a : Type) where\n  area : a → Nat\n\ninductive Color where\n  | red\n  | green\n\ninstance : ToString Point where\n  toString p := \"p\"\n";
+    let sections = index_source(source, "lean", &default_opts()).unwrap();
+
+    let types = find_section(&sections, "types").expect("types");
+    let type_labels = labels(types);
+    assert_eq!(type_labels.len(), 2);
+    assert!(type_labels[0].starts_with("structure Point"));
+    assert!(type_labels[1].starts_with("inductive Color"));
+    let point_children: Vec<_> = types.entries[0]
+        .children
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(point_children, vec!["x : Nat", "y : Nat"]);
+    let color_children: Vec<_> = types.entries[1]
+        .children
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(color_children, vec!["| red", "| green"]);
+
+    let traits = find_section(&sections, "traits").expect("traits");
+    assert_eq!(traits.entries.len(), 1);
+    assert!(traits.entries[0].label.starts_with("class Shape"));
+    assert_eq!(traits.entries[0].children.len(), 1);
+
+    let impls = find_section(&sections, "impls").expect("impls");
+    assert_eq!(impls.entries.len(), 1);
+    assert!(
+        impls.entries[0]
+            .label
+            .starts_with("instance : ToString Point")
+    );
+
+    assert!(find_section(&sections, "enums").is_none());
+}
+
+#[test]
+fn lean_examples_are_tests() {
+    let source = "def f := 1\n\nexample : 1 = 1 := rfl\n";
+    let with_tests = index_source(source, "lean", &default_opts()).unwrap();
+    let tests = find_section(&with_tests, "tests").expect("tests section");
+    assert_eq!(tests.entries.len(), 1);
+    assert!(tests.entries[0].label.starts_with("example"));
+
+    let opts = super::common::IndexOptions {
+        include_tests: false,
+        ..default_opts()
+    };
+    let without = index_source(source, "lean", &opts).unwrap();
+    assert!(find_section(&without, "tests").is_none());
+}
+
+#[test]
+fn lean_axioms_constants_and_macros_have_sections() {
+    let source = "axiom ax : 1 = 1\nconstant k : Nat\nmacro \"foo\" : term => `(1)\n";
+    let sections = index_source(source, "lean", &default_opts()).unwrap();
+    assert_eq!(
+        labels(find_section(&sections, "constants").unwrap()).len(),
+        2
+    );
+    assert_eq!(labels(find_section(&sections, "macros").unwrap()).len(), 1);
+}
+
+#[test]
+fn theorems_section_is_lean_only() {
+    // Non-Lean sources that mention theorem/lemma identifiers, plus PHP and
+    // C# namespaces whose members must still be hoisted as before.
+    let cases: [(&str, &str); 5] = [
+        (
+            "rust",
+            "pub fn theorem() {}\npub fn lemma() {}\npub struct Theorem;\n",
+        ),
+        (
+            "php",
+            "<?php\nnamespace App;\nclass Theorem {}\nfunction lemma() {}\n",
+        ),
+        (
+            "csharp",
+            "namespace MyApp {\n    public class Theorem {}\n    public interface ILemma {}\n}\n",
+        ),
+        ("kotlin", "class Theorem\nfun lemma() {}\n"),
+        ("swift", "struct Theorem {}\nfunc lemma() {}\n"),
+    ];
+    for (language, source) in cases {
+        let sections = index_source(source, language, &default_opts()).unwrap();
+        assert!(
+            find_section(&sections, "theorems").is_none(),
+            "{language} unexpectedly produced a `theorems` section"
+        );
+    }
+
+    // Namespace members are still hoisted for C# and PHP.
+    let csharp = index_source(
+        "namespace MyApp {\n    public class Theorem {}\n    public interface ILemma {}\n}\n",
+        "csharp",
+        &default_opts(),
+    )
+    .unwrap();
+    assert!(find_section(&csharp, "classes").is_some());
+    assert!(find_section(&csharp, "interfaces").is_some());
+    let php = index_source(
+        "<?php\nnamespace App;\nclass Theorem {}\n",
+        "php",
+        &default_opts(),
+    )
+    .unwrap();
+    assert!(find_section(&php, "classes").is_some());
 }
