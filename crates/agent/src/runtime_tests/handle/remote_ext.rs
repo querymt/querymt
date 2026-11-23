@@ -1404,14 +1404,21 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         ))
         .await
         .expect("ACP fork routes to the source owner and defaults to the latest message");
-    let fork_load = f
-        .handle
-        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+    let load_fork = || {
+        crate::acp::protocol::LoadSessionRequest::new(
             forked.session_id.clone(),
             std::path::PathBuf::new(),
-        ))
+        )
+    };
+    f.handle
+        .load_session(load_fork())
         .await
         .expect("fork must load through its new remote bookmark");
+    let fork_load = remote
+        .handle
+        .load_session(load_fork())
+        .await
+        .expect("fork must load directly on its owner");
     assert_eq!(
         config_option_value(&fork_load.config_options.unwrap(), "profile").as_deref(),
         Some("alpha")
