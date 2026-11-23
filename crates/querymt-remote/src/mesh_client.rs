@@ -948,35 +948,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_chat_refreshes_and_renegotiates_after_a_host_is_withdrawn() {
-        let (mesh, _) = mesh_fixture();
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let spawn = || {
-            ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
-                seen: seen.clone(),
-            })))
-        };
-        let withdrawn = spawn();
-        let target = NodeId::from_peer_id(*withdrawn.id().peer_id().unwrap());
-        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &target);
-        mesh.register_actor(withdrawn.clone(), &locator).await;
-        let provider = MeshChatProvider::from_node_id(&mesh, &target, "fixture", "demo");
-        provider.chat(&ChatCall::new(&[])).await.unwrap();
-        withdrawn.stop_gracefully().await.unwrap();
-        withdrawn.wait_for_shutdown().await;
-        let replacement = spawn();
-        mesh.register_actor(replacement.clone(), &locator).await;
-        provider.chat(&ChatCall::new(&[])).await.unwrap();
-        let transport = provider.inner.core().transport();
-        assert_eq!(
-            transport.lookup_provider_host(&locator).await.unwrap().id(),
-            replacement.id()
-        );
-        assert_eq!(seen.lock().len(), 2);
-        transport.invalidate_cached_provider_host(&locator).await;
-    }
-
-    #[tokio::test]
     async fn unregistered_provider_host_error_names_the_lan_locator() {
         let (mesh, _) = mesh_fixture();
         let target = NodeId::from_peer_id(PeerId::random());

@@ -705,7 +705,7 @@ mod tests {
 
     #[async_trait]
     impl RemoteProviderClientTransport for TestTransport {
-        type HostRef = ();
+        type HostRef = usize;
         type RouterRef = ();
         type RemoteRouterRef = ();
 
@@ -722,7 +722,7 @@ mod tests {
         }
 
         async fn lookup_host(&self, _target_locator: &str) -> Result<Self::HostRef, LLMError> {
-            Ok(())
+            Ok(self.host_invalidations.load(Ordering::SeqCst))
         }
 
         async fn get_contract_info(
@@ -752,10 +752,15 @@ mod tests {
 
         async fn send_chat_request(
             &self,
-            _host: &Self::HostRef,
+            host: &Self::HostRef,
             _request: &ProviderChatRequest,
         ) -> Result<ProviderChatResponse, LLMError> {
-            unreachable!("not used by contract tests")
+            if *host == 0 {
+                return Err(LLMError::ProviderError("fixture host withdrawn".into()));
+            }
+            Ok(ProviderChatResponse::from(
+                querymt::chat::ChatOutput::default(),
+            ))
         }
 
         async fn send_stream_request(
@@ -820,6 +825,24 @@ mod tests {
         core_with_contract_and_error(contract_info, None)
     }
 
+    #[tokio::test]
+    async fn cached_chat_refreshes_and_renegotiates_after_a_host_is_withdrawn() {
+        let (transport, core) = core_with_contract(ProviderContractInfo {
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE,
+            item_aware_chat_version: None,
+            generation: Default::default(),
+        });
+        core.negotiate_contract().await.unwrap();
+        core.chat(&ChatCall::new(&[]), |error| {
+            matches!(error, LLMError::ProviderError(message) if message == "fixture host withdrawn")
+        })
+        .await
+        .unwrap();
+        assert_eq!(transport.host_invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);
+    }
+
     fn core_with_contract_and_error(
         contract_info: ProviderContractInfo,
         contract_error: Option<TransportErrorKind>,
@@ -880,8 +903,8 @@ mod tests {
             generation: Default::default(),
         });
 
-        core.validate_contract(&(), None).await.unwrap();
-        core.validate_contract(&(), None).await.unwrap();
+        core.validate_contract(&0, None).await.unwrap();
+        core.validate_contract(&0, None).await.unwrap();
 
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
     }
@@ -1021,7 +1044,7 @@ mod tests {
             generation: Default::default(),
         });
 
-        let error = core.validate_contract(&(), None).await.unwrap_err();
+        let error = core.validate_contract(&0, None).await.unwrap_err();
         assert!(matches!(error, LLMError::InvalidRequest(_)));
         assert!(error.to_string().contains("predates protocol versioning"));
         assert!(error.to_string().contains("upgrade both peers"));
@@ -1068,8 +1091,8 @@ mod tests {
             Some(TransportErrorKind::Timeout),
         );
 
-        assert!(core.validate_contract(&(), None).await.is_err());
-        assert!(core.validate_contract(&(), None).await.is_err());
+        assert!(core.validate_contract(&0, None).await.is_err());
+        assert!(core.validate_contract(&0, None).await.is_err());
         assert_eq!(
             transport.contract_calls.load(Ordering::SeqCst),
             2,
@@ -1086,7 +1109,7 @@ mod tests {
             generation: Default::default(),
         });
 
-        let error = core.validate_contract(&(), None).await.unwrap_err();
+        let error = core.validate_contract(&0, None).await.unwrap_err();
         assert!(matches!(error, LLMError::InvalidRequest(_)));
         assert!(error.to_string().contains("upgrade both peers"));
         assert_eq!(
@@ -1103,7 +1126,7 @@ mod tests {
             capabilities: Default::default(),
             generation: Default::default(),
         };
-        core.validate_contract(&(), None).await.unwrap();
+        core.validate_contract(&0, None).await.unwrap();
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);
     }
 }
