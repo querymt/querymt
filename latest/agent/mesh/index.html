@@ -2427,6 +2427,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#peer-sharing-and-quotas" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Peer Sharing and Quotas
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#session-management" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -4621,6 +4632,21 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 - OS hostname is meaningless (e.g., "unknown" on mobile)
 - Multiple nodes on same machine
 - Want descriptive names for peers</p>
+<h2 id="peer-sharing-and-quotas">Peer Sharing and Quotas</h2>
+<p>Joining a mesh authenticates a peer; it does not grant access. Grants are directional and saved on the resource host by peer ID. In <code>qmacp mesh get PEER_ID</code>, <code>outgoing</code> is what this host shares, and <code>incoming</code> is what the peer shares back. An offline peer does not erase its saved outgoing policy.</p>
+<p>Manage grants and quotas through ACP. When the mesh access store is configured, every ACP connection (stdio or WebSocket) can discover the controls, read and change grants and quotas, and receive change notifications. ACP is unauthenticated: qmtcode trusts any connected client. Deployments may run ACP behind a proxy if needed. Built-in ACP authentication is planned separately.</p>
+<ul>
+<li><strong>Custom:</strong> Select session access and the providers and models the peer may use. Sessions On allows creation, forks, and management of schedules the peer creates. Custom create and fork do not accept a caller-selected host path or inherit an existing checkout. Filesystem access requires session access and permits confined file operations. Shell: allows the unsandboxed shell. It defaults to Off and requires Filesystem. Custom does not enable unclassified hooks. Cold resumes and same-host child startup are refused when the host cannot initialize them without unclassified effects.</li>
+<li><strong>Full:</strong> Grants the supported shell, session, filesystem, and provider capabilities. Existing host approvals still apply. Pre-upgrade clients need explicit Full for protected operations on an upgraded host.</li>
+<li><strong>Revocation:</strong> Changing a grant stops further authorized delivery and affected work at the next supported boundary. It does not recall previously delivered content or undo completed effects.</li>
+</ul>
+<p>Provider-wide and model-specific quotas both apply to a Custom inference request. Direct mesh calls and hosted turns share the same balance on the resource host. Quotas default to unlimited, and Full access does not use saved Custom quotas.</p>
+<p>Finite quotas use the same reservation estimate for every provider: estimated prompt tokens, including configured system text and tool definitions, plus the effective output cap. A request's <code>max_tokens</code> overrides the configured cap only if the bound provider supports it. The host caps the estimate at the configured llama.cpp <code>n_ctx</code> when present, or at the model's context limit from models.dev. Only if the model is absent from models.dev and no <code>n_ctx</code> is configured does it use the profile context middleware's <code>fallback_max_tokens</code>, if present. With no applicable ceiling the estimate is uncapped; missing metadata is not a reason to refuse inference. Context overrides do not affect this calculation, media gets no separate allowance, and every token kind counts equally.</p>
+<p>A request can start if every applicable finite quota has capacity left after settled usage and outstanding reservations. The host reserves the entire estimate in all scopes or none. Requests can run in parallel, and the last admitted request can reserve more than is left. The host charges actual usage even when it exceeds the estimate, without treating it as a model fault. If usage is missing or incomplete, it charges the reservation as estimated usage by default; programmatic callers can select the estimated prompt instead, without a user-facing setting.</p>
+<p>Running inference can finish when a quota is exhausted or a cap is lowered; new attempts are denied while any applicable scope has no capacity. Grant revocation still applies. Daily, weekly, and monthly windows reset on UTC boundaries without rollover. Resetting or reconfiguring a scope can be refused while it has an outstanding attempt.</p>
+<p>The host stores grants, quota limits, and settled usage in <code>mesh_state.json</code> version 2. Version 1 files upgrade with empty peer access. A crash forgets the charge of requests in flight. Older builds saving <code>mesh_state.json</code> drop the peer-access section.</p>
+<p>Use <code>qmacp mesh nodes</code>, <code>mesh get</code>, <code>mesh set</code>, <code>mesh set-quota</code>, <code>mesh reset-quota</code>, and <code>mesh watch</code>. For a finite quota, pass <code>--tokens</code> as a positive whole-token count, either as an integer (<code>2500000</code>) or with a decimal <code>k</code> (thousands) or <code>M</code> (millions) suffix (<code>500k</code>, <code>2.5M</code>). Values that represent fractions of a token are rejected, not rounded. Omit <code>--window</code> with <code>--operation update</code> to keep the existing quota cadence.</p>
+<p>Writes require the current <code>outgoing.revision</code>; after a conflict, read the policy again before choosing whether to retry. Notifications are refresh hints, not policy snapshots. The JSON storage format version is separate from the mesh access ACP protocol version. For ACP client integration, <code>scripts/generate-types.sh</code> emits the versioned peer-access types in <code>target/generated/types.ts</code>.</p>
 <h2 id="session-management">Session Management</h2>
 <h3 id="creating-remote-sessions">Creating Remote Sessions</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1"> 1</a></span>
