@@ -328,13 +328,18 @@ fn available_commands_replace_the_list() {
         { "name": "compact", "description": "Compact again" }
     ]))]);
     assert_eq!(command_names(&core), ["compact"]);
-    assert_eq!(core.header().available_commands[0].description, "Compact again");
+    assert_eq!(
+        core.header().available_commands[0].description,
+        "Compact again"
+    );
 }
 
 #[test]
 fn empty_update_clears_commands() {
     let mut core = SessionCore::new("s1");
-    core.apply(&[commands_update(json!([{ "name": "compact", "description": "c" }]))]);
+    core.apply(&[commands_update(
+        json!([{ "name": "compact", "description": "c" }]),
+    )]);
     assert_eq!(command_names(&core), ["compact"]);
     core.apply(&[commands_update(json!([]))]);
     assert!(core.header().available_commands.is_empty());
