@@ -28,11 +28,12 @@ impl StreamMeter {
                         .map_or_else(|| usage.clone(), |current| current.merge_max(usage.clone())),
                 );
             }
-            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal { usage, .. }) => {
+            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                usage: Some(usage),
+                ..
+            }) => {
                 // Unlike in-progress metadata, terminal usage is authoritative.
-                if let Some(usage) = usage {
-                    self.usage = Some(usage.clone());
-                }
+                self.usage = Some(usage.clone());
             }
             _ => {}
         }
