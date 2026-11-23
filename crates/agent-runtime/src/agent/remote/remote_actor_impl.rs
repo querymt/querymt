@@ -200,9 +200,9 @@ pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<Sessi
     let index = move |_, message: messages::GetFileIndex| {
         let weak = weak.clone();
         async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
+            let actor = weak.upgrade().ok_or_else(|| {
+                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+            })?;
             let mut index = actor
                 .ask(message)
                 .mailbox_timeout(Duration::from_secs(3))
@@ -220,9 +220,9 @@ pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<Sessi
     let read = move |_, message| {
         let weak = weak.clone();
         async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
+            let actor = weak.upgrade().ok_or_else(|| {
+                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+            })?;
             actor
                 .ask(ReadPeerFile(message))
                 .mailbox_timeout(Duration::from_secs(3))
@@ -246,12 +246,31 @@ pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<Sessi
     );
 }
 
+fn file_actor_unavailable(
+    delivery: querymt_remote::DeliveryCertainty,
+) -> crate::agent::file_proxy::FileProxyError {
+    crate::agent::file_proxy::FileProxyError::from_transport_failure(
+        querymt_remote::RemoteTransportFailure::new(
+            querymt_remote::RemoteTransportFailureKind::ActorUnavailable,
+            delivery,
+            "session stopped",
+        ),
+    )
+}
+
 fn file_proxy_send_error<M>(
     error: kameo::error::SendError<M, crate::agent::file_proxy::FileProxyError>,
 ) -> crate::agent::file_proxy::FileProxyError {
     use crate::agent::file_proxy::FileProxyError;
     match error {
         kameo::error::SendError::HandlerError(error) => error,
+        kameo::error::SendError::ActorNotRunning(_)
+        | kameo::error::SendError::ActorRestarting(_) => {
+            file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+        }
+        kameo::error::SendError::ActorStopped => {
+            file_actor_unavailable(querymt_remote::DeliveryCertainty::Unknown)
+        }
         other => FileProxyError::ActorSend(other.to_string()),
     }
 }

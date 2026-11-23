@@ -443,6 +443,31 @@ mod remote_paths {
             ));
         }
 
+        assert_selected_line(
+            local
+                .read_remote_file("example.txt".into(), 1, 1)
+                .await
+                .unwrap(),
+        );
+        local.shutdown_with_timeout(TIMEOUT, TIMEOUT).await.unwrap();
+        for request in [index_request(), read_request("example.txt")] {
+            let response = router.handle_v1(peer, request).await;
+            let Ok(SwarmResponse::Ask(Err(kameo::error::RemoteSendError::HandlerError(bytes)))) =
+                response
+            else {
+                panic!("a stopped file actor must return a typed error: {response:?}");
+            };
+            let error: FileProxyError = rmp_serde::from_slice(&bytes).unwrap();
+            let FileProxyError::Transport(failure) = error else {
+                panic!("expected transport typing: {error:?}")
+            };
+            assert_eq!(failure.kind, RemoteTransportFailureKind::ActorUnavailable);
+            assert_eq!(
+                failure.delivery,
+                querymt_remote::DeliveryCertainty::NotDelivered
+            );
+        }
+
         store
             .replace_grant(&key, allowed.revision, grant(false))
             .await
@@ -453,11 +478,5 @@ mod remote_paths {
                 Err(SharingRejection::Denied)
             ));
         }
-        assert_selected_line(
-            local
-                .read_remote_file("example.txt".into(), 1, 1)
-                .await
-                .unwrap(),
-        );
     }
 }
