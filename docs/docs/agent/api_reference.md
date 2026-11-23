@@ -654,6 +654,83 @@ pub struct RpcResponse {
 }
 ```
 
+### Turn usage on `session/prompt`
+
+The `session/prompt` response carries `usage` with the token counts of the execution cycle that answered the prompt:
+
+| Field | Meaning |
+|---|---|
+| `inputTokens` | input tokens of every provider request in the cycle |
+| `outputTokens` | output tokens |
+| `thoughtTokens` | reasoning tokens |
+| `cachedReadTokens` | cache-read tokens |
+| `cachedWriteTokens` | cache-write tokens |
+| `totalTokens` | sum of the five categories above |
+
+- **Per cycle, not per session.** Although the ACP schema describes these counts as "across session", QueryMT reports the usage of the prompt that was just answered. A second prompt in the same session starts from zero. For session totals use the `usage_update` accounting described above.
+- **Omitted when unknown.** When no provider attempt in the cycle reported token usage, `usage` is left out of the response rather than reported as zero. A cycle whose providers genuinely reported zero tokens is indistinguishable from this case and is also omitted.
+- **Every stop reason.** The field is set for end of turn, cancelled, refusal, budget or price limit, and compaction-only (`/compact`) responses, and counts what was incurred up to that point (a cancelled turn reports the requests that had already settled).
+- The counts come from the cycle's settled accounting attempts (the same ledger as the cost accounting above), so they agree with the cycle's recorded spend.
+
+```json
+{
+  "stopReason": "end_turn",
+  "usage": {
+    "totalTokens": 1800,
+    "inputTokens": 1500,
+    "outputTokens": 300,
+    "thoughtTokens": 0,
+    "cachedReadTokens": 0,
+    "cachedWriteTokens": 0
+  }
+}
+```
+
+### Session cursors and fork at a cursor
+
+A client that advertises `clientCapabilities.session.cursors` receives a `cursor_update` for each position it can address in a session's timeline. Clients that omit the capability (or send `null`) receive none, live or replayed.
+
+A `cursor_update` is sent **after** the entity it is anchored to, with `position: "after"`, once the entity's own update has been sent:
+
+| Anchor | Announced when | Forkable |
+|---|---|---|
+| `user_message` | the prompt is stored | yes |
+| `agent_message` | the assistant message is stored | yes |
+| `agent_thought` | the assistant message that holds the thought is stored | no |
+| `tool_call` | the tool call has finished | no |
+| `compaction` | a compaction completes (only to clients that also advertise `compaction`, since it follows that update) | no |
+
+- **Opaque ids.** A cursor id is an opaque string. Clients must only echo ids the agent announced and must not parse or build them. The agent derives each id from the anchored entity, so the same anchor has the same id live, on `session/load` replay, after a reconnect and after an agent restart. Nothing is stored for it.
+- **Forkable cursors** carry `capabilities.fork`. This is fixed for the cursor's lifetime.
+- **Replay.** `session/load` replay announces a cursor for every anchor in the replayed history. A windowed load announces cursors for the returned window only.
+
+`session/fork` accepts `cursorId`. The fork's history is the source history through the anchored message, that message included. This is the same boundary as `_meta.querymt.message_id`:
+
+| Request | Fork boundary |
+|---|---|
+| `cursorId` | through the cursor's message |
+| `cursorId` and `_meta.querymt.message_id` | `cursorId` wins |
+| only `_meta.querymt.message_id` | through that message |
+| neither | the whole session |
+
+A `cursorId` that is unknown, was announced on another session, or is not forkable (thought, tool call, compaction) fails with `-32602`, creates no session and does not fall back to forking the whole session. A `_meta.querymt.message_id` that is not a message of the source session is rejected the same way.
+
+**Remote-hosted sessions.** When the source session is hosted on another mesh node, that node creates the fork (so the fork is hosted there) and the forking node records it as a remote session, so `session/load` works on the returned id. The target rules are the same, and a rejected request creates no session on either node. The owner's refusals keep their error code and data: `-32602` for an invalid target, `-32600` with `code` `owner_transferred` or `workspace_archived` for a read-only source.
+
+Of the request's `_meta`, only `querymt.message_id` is forwarded. Workspace options (`querymt.sessionWorkspace`) are not: such a request fails with `-32602` (`data.code` `remote_fork_workspace_options`) and creates nothing, instead of forking without the requested isolation. The owner applies its own workspace policy, so a source that is managed there stays isolated.
+
+Once the owner has created the fork it is a session there, as a local fork is. If the forking node cannot attach it right away, the request still succeeds and `session/load` connects it from the recorded bookmark.
+
+```json
+{"sessionUpdate": "cursor_update", "cursorId": "<opaque>",
+ "anchor": {"type": "agent_message", "messageId": "…", "position": "after"},
+ "capabilities": {"fork": {}}}
+```
+
+```json
+{"method": "session/fork", "params": {"sessionId": "…", "cwd": "/work", "cursorId": "<opaque>"}}
+```
+
 ## Remote/Mesh API
 
 ### Mesh Configuration

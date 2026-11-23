@@ -46,9 +46,9 @@ The codec and the `cursor_update` builder live in `querymt_agent_protocol_types:
 - **User message:** prompt received.
 - **Agent message and thought:** the assistant message is stored.
 - **Tool call:** tool call result.
-- **Compaction:** terminal compaction.
+- **Compaction:** terminal compaction, only for clients that also advertised `compaction` (the cursor follows a compaction update that client must have received).
 
-The cursor is appended to the update vector after the entity's own update, which gives the ordering scenario. Replay uses the same helper over the materialized events, so live and replayed ids match by construction (D1). The translator remembers which cursors it has announced per session, so live and recovered paths don't send duplicates.
+The cursor is appended to the update vector after the entity's own update, which gives the ordering scenario. Replay uses the same helper over the materialized events, so live and replayed ids match by construction (D1). The translator remembers which cursors it has announced per session, so live and recovered paths don't send duplicates. The memory is bounded (cleared at 4096 entries): forgetting only allows a repeat announcement, and a repeated `cursor_update` is idempotent for the client.
 
 ### D3. Fork resolves the cursor before any other fork work
 `prepare_fork_session` resolves the target in this order:
@@ -56,7 +56,13 @@ The cursor is appended to the update vector after the entity's own update, which
 2. `_meta.querymt.message_id`.
 3. The last message.
 
-An invalid cursor is rejected with `Error::invalid_params()` (`-32602`) before `plan_fork_isolation`, so no row and no worktree are created. This covers a malformed or non-forkable prefix, and a message id that is not in the source session's history, which also catches cursors from other sessions. Remote-hosted sources go through the same materializer path, so the remote scenario needs no separate code.
+An invalid target is rejected with `Error::invalid_params()` (`-32602`) before `plan_fork_isolation`, so no row and no worktree are created. This covers a malformed or non-forkable prefix, and a message id that is not in the source session's history, which also catches cursors from other sessions. The membership check applies to the `message_id` hint too, so a fork can never be cut at another session's message (the store looks messages up across all sessions). One function, `resolve_fork_target`, implements the order and the checks for every fork.
+
+**Remote-hosted sources are forked by the owner.** `handle_fork_session` resolves the source's location first. For a bookmarked source it rejects an undecodable or non-forkable cursor locally (no mesh call needed), then sends `ForkRemoteSession` (now carrying `cursor_id`, with `message_id` optional) to the owning node. The owner's handler runs the same `prepare_fork_session` as a local fork, so the target rules, read-only check and isolation planning are identical. A client-facing refusal comes back as `AgentError::ForkRejected { code, message, data }`, which keeps the owner's ACP code and data (`-32602` for a bad target, `-32600` for a read-only source); only internal failures stay `-32603`. If the owner cannot hand the fork off, it deletes it again. The viewer attaches the returned handoff with `fork_origin` `user`, then writes the bookmark with the owner's `created_at`, `cwd` and `title`, so the fork is hosted remotely and loads like any remote session. After the owner has created the fork, a failed attach is only logged: the fork is durable on the owner, as a local fork is, and `session/load` repairs the connection from the bookmark. Only a failure to write the bookmark is returned (`-32603`, with the forked id in `data`). The viewer does not send the cursor's message id as a `message_id` hint: an older owner that does not know `cursor_id` then fails the request instead of silently forking at an unchecked message. A plain fork keeps the previous wire shape (`cursor_id` is omitted when absent).
+
+Not carried over the mesh: workspace options in the `session/fork` request `_meta` (`querymt.sessionWorkspace`). The viewer rejects such a request with `-32602` (`data.code` `remote_fork_workspace_options`; malformed options keep `invalid_options`) before any mesh call, because dropping them would make an isolated fork of an unmanaged source a shared one, which the local path refuses (`plan_fork_isolation`). A managed source stays isolated by the owner's inheritance rule. `querymt.message_id` is forwarded as `message_id`.
+
+The forking paths that bypassed `resolve_fork_target` (`SessionRegistry::fork_session`, `ForkAtMessage` / `SessionActorRef::fork_at_message`) had no callers and are removed, so every fork goes through `prepare_fork_session`.
 
 ### D4. Subagent updates replace the delegation projector's output type
 `DelegationUpdateProjector` keeps its event folding: lifecycle state, stage, selected model and node, timestamps, and live/historical seeding. Its output changes from `DelegationUpdateNotification` to an internal `SubagentSnapshot`, which a pure function in `shared.rs` maps to `SubagentUpdate`. The mapping is:

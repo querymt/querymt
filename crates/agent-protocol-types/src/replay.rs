@@ -632,6 +632,48 @@ impl CursorTarget {
     }
 }
 
+/// The message, thought and tool-call entities whose terminal update `kind`
+/// produces, in timeline order: the entities a cursor is announced after.
+///
+/// Live delivery and history replay both call this on the same events, so
+/// they announce the same cursors. Compactions are not here: their identity
+/// depends on the event's stream position (see the shared compaction
+/// identity), which the callers hold.
+///
+/// An entity without a message id (legacy events) has no durable anchor and
+/// yields nothing. A thought is anchored only where replay sends one (a
+/// stored reasoning part with text), and an agent message only when it has
+/// text, so every cursor follows an entity the client was actually sent.
+pub fn message_cursor_entities(kind: &AgentEventKind) -> Vec<CursorEntity> {
+    match kind {
+        AgentEventKind::PromptReceived {
+            message_id: Some(message_id),
+            ..
+        } => vec![CursorEntity::UserMessage(message_id.clone())],
+        AgentEventKind::AssistantMessageStored {
+            content,
+            reasoning_parts,
+            message_id: Some(message_id),
+            ..
+        } => {
+            let mut entities = Vec::new();
+            if reasoning_parts.iter().any(|part| !part.text.is_empty()) {
+                entities.push(CursorEntity::AgentThought(message_id.clone()));
+            }
+            if !content.is_empty() {
+                entities.push(CursorEntity::AgentMessage(message_id.clone()));
+            }
+            entities
+        }
+        AgentEventKind::ToolCallEnd {
+            tool_call_id,
+            tool_name,
+            ..
+        } if !is_todo_write_tool(tool_name) => vec![CursorEntity::ToolCall(tool_call_id.clone())],
+        _ => Vec::new(),
+    }
+}
+
 /// The `cursor_update` announcing the position right after `entity`.
 ///
 /// Carries the anchor (the first update for a cursor must) and

@@ -524,7 +524,8 @@ mod remote_session_lifecycle_integration_tests {
                 &beta_ref,
                 &ForkRemoteSession {
                     source_session_id: parent.session_id.clone(),
-                    message_id: message_id.clone(),
+                    message_id: Some(message_id.clone()),
+                    cursor_id: None,
                 },
                 STEP_TIMEOUT,
             )

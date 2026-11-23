@@ -16,6 +16,8 @@ pub mod stdio;
 pub mod trace_context;
 
 #[cfg(test)]
+mod cursor_updates_tests;
+#[cfg(test)]
 mod session_core_conformance;
 #[cfg(test)]
 mod session_load_snapshot_tests;

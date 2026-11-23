@@ -1465,7 +1465,8 @@ mod node_manager_tests {
                 manager.id(),
                 &ForkRemoteSession {
                     source_session_id: session_id.clone(),
-                    message_id: fork_point.clone(),
+                    message_id: Some(fork_point.clone()),
+                    cursor_id: None,
                 },
             )
         };
@@ -4701,7 +4702,8 @@ mod node_manager_tests {
         let resp = nm_ref
             .ask(ForkRemoteSession {
                 source_session_id: parent.session_id.clone(),
-                message_id,
+                message_id: Some(message_id),
+                cursor_id: None,
             })
             .await
             .expect("fork child");

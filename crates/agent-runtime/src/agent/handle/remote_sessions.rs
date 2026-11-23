@@ -478,14 +478,188 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
 
-        self.ask_node_manager(
+        self.fork_remote_session_request(
             node_manager_ref,
-            &ForkRemoteSession {
+            ForkRemoteSession {
                 source_session_id,
-                message_id,
+                message_id: Some(message_id),
+                cursor_id: None,
             },
         )
         .await
+    }
+
+    /// Send a fork request, with its target, to the node that owns the source.
+    ///
+    /// Goes through the sharing protocol so the owner sees this node's peer
+    /// authority and applies its grants.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn fork_remote_session_request(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        request: crate::agent::remote::ForkRemoteSession,
+    ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
+        self.ask_node_manager(node_manager_ref, &request).await
+    }
+
+    /// `session/fork` of a session another node owns: the owner forks (so the
+    /// fork is remote, on the owner) and this node attaches it, which gives it
+    /// a bookmark so `session/load` finds it.
+    ///
+    /// The target follows the local rules; the owner resolves it against its
+    /// own history. An undecodable or non-forkable cursor is rejected here,
+    /// before any mesh call.
+    ///
+    /// Workspace options in the request's `_meta` are rejected with `-32602`
+    /// rather than dropped: they do not travel over the mesh, and a dropped
+    /// isolation request would silently yield a shared checkout, which a local
+    /// fork refuses to do.
+    ///
+    /// Once the owner has created the fork it is a durable session there, as a
+    /// local fork is, so the viewer always records its bookmark. A failed
+    /// attach is then only logged: `session/load` repairs the connection from
+    /// the bookmark.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn fork_remote_hosted_session(
+        &self,
+        node_id: &str,
+        req: crate::acp::protocol::ForkSessionRequest,
+    ) -> Result<crate::acp::protocol::ForkSessionResponse, agent_client_protocol::Error> {
+        use super::remote_connect::{
+            RemoteConnectOptions, RemoteConnectReason, RemoteReplacePolicy,
+        };
+        use crate::agent::session_materializer::{
+            fork_message_id_from_meta, forkable_cursor_message_id,
+        };
+        use crate::session::domain::ForkOrigin;
+        use crate::session::store::RemoteSessionBookmark;
+
+        let cursor_id = req.cursor_id.as_ref().map(|cursor| cursor.0.to_string());
+        if let Some(cursor_id) = &cursor_id {
+            forkable_cursor_message_id(cursor_id)?;
+        }
+        if crate::worktree::fork_creation_options_from_meta(req.meta.as_ref())
+            .map_err(|message| {
+                agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                    "code": "invalid_options",
+                    "message": message,
+                }))
+            })?
+            .is_some()
+        {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                    "code": "remote_fork_workspace_options",
+                    "message": "workspace options are not supported when forking a session \
+                                hosted on another node; the owner applies its own workspace \
+                                policy",
+                })),
+            );
+        }
+        // MCP servers do not travel over the mesh either; dropping them would
+        // fork without the tools the client asked for.
+        if !req.mcp_servers.is_empty() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                    "code": "remote_fork_mcp_servers",
+                    "message": "MCP servers are not supported when forking a session hosted \
+                                on another node",
+                })),
+            );
+        }
+        // A cursor wins on the owner; the hint is sent only without one, and
+        // the cursor's message id is not sent as a hint, so a node that does
+        // not know cursors fails the request rather than forking elsewhere.
+        let message_id = match cursor_id {
+            Some(_) => None,
+            None => fork_message_id_from_meta(req.meta.as_ref()).map(ToOwned::to_owned),
+        };
+        let source_session_id = req.session_id.to_string();
+        let store = self.config.provider.history_store();
+        // The fork lives on the source's node, so the source's label is the
+        // fork's label.
+        let peer_label = store
+            .get_remote_session_bookmark(&source_session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|bookmark| bookmark.peer_label);
+        let node_manager = self.find_node_manager(node_id).await?;
+        let response = self
+            .fork_remote_session_request(
+                &node_manager,
+                crate::agent::remote::ForkRemoteSession {
+                    source_session_id,
+                    message_id,
+                    cursor_id,
+                },
+            )
+            .await?;
+        let crate::agent::remote::ForkRemoteSessionResponse {
+            session_id: forked_session_id,
+            handoff,
+            cwd,
+            title,
+            created_at,
+        } = response;
+
+        let attached = self
+            .connect_remote_session(
+                &forked_session_id,
+                RemoteConnectOptions {
+                    node_hint: Some(node_id),
+                    peer_label: peer_label.as_deref(),
+                    preferred_scope: None,
+                    reason: RemoteConnectReason::ExtensionAttach,
+                    replace: RemoteReplacePolicy::ReuseIfPresent,
+                    handoff: Some(handoff),
+                    windowed: false,
+                    fork_origin: Some(ForkOrigin::User),
+                },
+            )
+            .await;
+        if let Err(error) = attached {
+            log::warn!(
+                "remote fork {forked_session_id} on node {node_id} was created but not attached: \
+                 {error}; recording its bookmark so session/load can connect it"
+            );
+        }
+
+        // Record the fork with the owner's metadata: the attach above writes
+        // a bookmark without cwd or title, and none at all when it failed.
+        let unrecorded = |error: String| {
+            agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                "message": "the fork was created on the owning node but could not be \
+                            recorded on this node",
+                "forkedSessionId": forked_session_id,
+                "nodeId": node_id,
+                "error": error,
+            }))
+        };
+        let mut bookmark = match store.get_remote_session_bookmark(&forked_session_id).await {
+            Ok(Some(bookmark)) => bookmark,
+            Ok(None) => RemoteSessionBookmark {
+                session_id: forked_session_id.clone(),
+                node_id: node_id.to_owned(),
+                peer_label: peer_label.unwrap_or_else(|| node_id.to_owned()),
+                cwd: None,
+                created_at,
+                title: None,
+                fork_origin: None,
+            },
+            Err(error) => return Err(unrecorded(error.to_string())),
+        };
+        bookmark.created_at = created_at;
+        bookmark.cwd = cwd.or(bookmark.cwd);
+        bookmark.title = title.or(bookmark.title);
+        bookmark.fork_origin = Some(ForkOrigin::User);
+        store
+            .save_remote_session_bookmark(&bookmark)
+            .await
+            .map_err(|error| unrecorded(error.to_string()))?;
+        Ok(crate::acp::protocol::ForkSessionResponse::new(
+            forked_session_id,
+        ))
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to

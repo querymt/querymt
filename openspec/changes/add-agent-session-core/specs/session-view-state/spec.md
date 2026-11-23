@@ -261,6 +261,38 @@ The view SHALL report context usage, the token breakdown (latest request and ses
 - **WHEN** a snapshot of a load without a window carries a whole-session summary with context tokens and the model's context limit
 - **THEN** the view reports that context usage
 
+### Requirement: Active time
+The view SHALL report the session's active time: the total time of its ended runs, and the start of the run that is active now, if any. After a load both SHALL come from the snapshot (summary and runtime status); live, each run's time from `running` to `idle` SHALL be added when it ends. Both ends of a run SHALL be measured on the host's clock (`atMs` of the state updates, the snapshot's run start), never one on the host's and one on the client's, and the added time SHALL NOT be negative. A run's start SHALL be set when the run begins and kept by every later `running` or `requires_action` for the same run. Live and after a reload, the total SHALL agree to within one second per run.
+
+#### Scenario: Reload keeps the total
+- **WHEN** a session whose summary carries `activeMs` 120000 is loaded with no run active
+- **THEN** the view reports 120000 ms of active time and no active run start
+
+#### Scenario: Live run adds its time
+- **WHEN** a view reporting 120000 ms receives `running` with `atMs` 10000 and `idle` with `atMs` 15000
+- **THEN** it reports an active run start of 10000 ms while running, and 125000 ms with no active run start after `idle`
+
+#### Scenario: Load during a run
+- **WHEN** a snapshot with summary `activeMs` 120000 is loaded while its runtime status reports a run started at 50000 ms
+- **THEN** the view reports 120000 ms of active time and an active run start of 50000 ms
+
+#### Scenario: Permission wait keeps the run start
+- **WHEN** a view receives `running` (`atMs` 10000), `requires_action`, `running` again for the same run (`atMs` 12000) and `idle` (`atMs` 20000)
+- **THEN** it reports an active run start of 10000 ms throughout, and adds 10000 ms after `idle`
+
+#### Scenario: Load during a run keeps the snapshot's start
+- **WHEN** a snapshot reports a run started at 50000 ms and the current-state sync `running` for the same run follows without `atMs`
+- **THEN** the view's active run start stays 50000 ms
+
+#### Scenario: Client clock skew
+- **WHEN** a snapshot reports a run started at 50000 ms (host time), the client's clock is 10 minutes behind, and `idle` arrives with `atMs` 65000 and client `at_ms` 5000
+- **THEN** the view adds 15000 ms to the total
+- **AND** an `idle` without `atMs` for that run clears the start and adds nothing
+
+#### Scenario: Older history does not change active time
+- **WHEN** an older-history page is applied
+- **THEN** the view's active time is unchanged
+
 ### Requirement: Accounting detail
 The view SHALL hold the session's latest accounting snapshot as the agent sends it (billing scope, known subtotal, complete total, completeness reasons, attempt counts and the active cycle's budget), taken from the load snapshot and from `_meta.querymt.accounting` on usage and session info updates, so a client can explain a cost and not only show it. The cost SHALL be derived from that snapshot. Accounting that covers no model call SHALL leave the snapshot empty, as live.
 
