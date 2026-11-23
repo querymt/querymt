@@ -96,8 +96,7 @@ pub async fn wait_for_policy_loss<E>(
                         }
                         break;
                     }
-                    Err(RecvError::Lagged(_)) => break,
-                    Err(RecvError::Closed) => return unavailable(),
+                    Err(RecvError::Lagged(_) | RecvError::Closed) => return unavailable(),
                 }
             }
         } else {

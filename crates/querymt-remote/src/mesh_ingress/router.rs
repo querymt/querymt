@@ -13,12 +13,15 @@ use kameo::remote::{
     RemoteActor, RemoteMessage, messaging::SwarmRequest, messaging::SwarmResponse,
 };
 use libp2p::PeerId;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{MeshIngress, SharingRejection};
 use crate::NodeId;
-use crate::peer_access::{GrantStore, PeerGrant, PeerGrantKey, PolicyEffect, SharingProtocol};
+use crate::peer_access::{
+    GrantStore, PeerGrant, PeerGrantKey, PolicyChange, PolicyEffect, SharingProtocol,
+};
+use tokio::sync::broadcast;
 
 #[cfg(test)]
 mod tests;
@@ -68,6 +71,7 @@ pub struct PeerRequest {
     key: PeerGrantKey,
     protocol: SharingProtocol,
     grant: Option<PeerGrant>,
+    policy_changes: Arc<Mutex<Option<broadcast::Receiver<PolicyChange>>>>,
 }
 
 impl PeerRequest {
@@ -84,6 +88,12 @@ impl PeerRequest {
     /// Request's sharing contract, not a peer's claimed capability.
     pub fn protocol(&self) -> SharingProtocol {
         self.protocol
+    }
+
+    /// Transfer the admission-time policy history to a resource-specific handler.
+    /// Only one consumer can take it, even when this request is cloned.
+    pub fn take_policy_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+        self.policy_changes.lock().take()
     }
 }
 
@@ -275,6 +285,9 @@ impl InboundRouter {
                 message_remote_id,
             }));
         };
+        let changes = (route.access != InboundAccess::Identity)
+            .then(|| self.store.subscribe_changes())
+            .flatten();
         let mut origin = PeerRequest {
             key: PeerGrantKey {
                 host: NodeId::from_peer_id(self.host),
@@ -282,10 +295,10 @@ impl InboundRouter {
             },
             protocol,
             grant: None,
+            policy_changes: Arc::new(Mutex::new(
+                changes.as_ref().map(broadcast::Receiver::resubscribe),
+            )),
         };
-        let changes = (route.access != InboundAccess::Identity)
-            .then(|| self.store.subscribe_changes())
-            .flatten();
         origin.grant = self.authorize(&origin, route.access).await?;
         let is_current = {
             self.routes
@@ -312,8 +325,11 @@ impl InboundRouter {
                     {
                         return Err(SharingRejection::Changed);
                     }
-                    Ok(_) | Err(TryRecvError::Lagged(_)) => {}
-                    Err(_) => break,
+                    Ok(_) => {}
+                    Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => {
+                        return Err(SharingRejection::Changed);
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
             }
         }

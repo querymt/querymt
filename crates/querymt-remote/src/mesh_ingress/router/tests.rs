@@ -417,6 +417,48 @@ async fn legacy_only_ask_and_mixed_delivery_preserve_their_envelopes() {
 }
 
 #[tokio::test]
+async fn router_refuses_reply_if_admission_policy_history_is_incomplete() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(17, host);
+    let store = Arc::new(TestStore::default());
+    store
+        .replace_grant(&key(host, peer), Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap();
+    let router = InboundRouter::new(host, store.clone());
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        actor,
+        InboundDelivery::V1Ask,
+        InboundAccess::Full,
+        move |origin, _| {
+            let store = store.clone();
+            async move {
+                // Unrelated grants suffice to make the history incomplete;
+                // this request itself remains allowed by the current snapshot.
+                for _ in 0..9 {
+                    store
+                        .replace_grant(&key(host, PeerId::random()), Uuid::nil(), PeerGrant::Full)
+                        .await
+                        .unwrap();
+                }
+                let mut history = origin.take_policy_changes().unwrap();
+                assert!(matches!(
+                    history.try_recv(),
+                    Err(broadcast::error::TryRecvError::Lagged(_))
+                ));
+                assert!(origin.take_policy_changes().is_none());
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(
+        router.handle_v1(peer, request(actor, peer)).await,
+        Err(SharingRejection::Changed)
+    ));
+}
+
+#[tokio::test]
 async fn legacy_router_suppresses_reply_after_grant_changes() {
     let host = PeerId::random();
     let peer = PeerId::random();
