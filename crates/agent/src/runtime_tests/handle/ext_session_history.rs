@@ -108,6 +108,62 @@ async fn paging_to_the_start_returns_every_event_once_in_order() {
     assert_eq!(seqs, total.iter().map(|e| e.stream_seq).collect::<Vec<_>>());
 }
 
+fn tool_call_cursor_ids(events: &serde_json::Value) -> Vec<String> {
+    events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"]["type"] == "tool_call_end")
+        .map(|event| {
+            format!(
+                "c:{}",
+                event["kind"]["data"]["tool_call_id"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn older_page_carries_its_cursors() {
+    let f = RealStorageHandleFixture::new().await;
+    let id = session_with_runs(&f, 7).await;
+    let window = serde_json::json!({"maxTurns": 2, "maxBytes": 4194304, "truncateBytes": 1024});
+    let first = crate::session::load_snapshot::load_session_snapshot_windowed(
+        &f.handle,
+        f.storage.view_store().unwrap(),
+        &id,
+        serde_json::from_value(window.clone()).ok(),
+    )
+    .await
+    .unwrap();
+    let held: Vec<String> = first
+        .cursor_updates
+        .iter()
+        .map(|update| update.cursor_id.to_string())
+        .collect();
+    let token = first.history.unwrap().before.unwrap();
+    let page = call(
+        &f,
+        "querymt/session/history",
+        serde_json::json!({"sessionId": id, "before": token, "loadWindow": window}),
+    )
+    .await
+    .unwrap();
+
+    let expected = tool_call_cursor_ids(&page["events"]);
+    assert!(!expected.is_empty());
+    let got: Vec<String> = page["cursorUpdates"]
+        .as_array()
+        .expect("the page lists its cursors")
+        .iter()
+        .map(|update| update["cursorId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(got, expected);
+    // The page adds cursors; it does not repeat the ones the load holds.
+    assert!(got.iter().all(|cursor| !held.contains(cursor)));
+    assert!(page["cursorUpdates"][0].get("sessionUpdate").is_none());
+}
+
 #[tokio::test]
 async fn undo_invalidates_an_old_history_token() {
     let f = RealStorageHandleFixture::new().await;

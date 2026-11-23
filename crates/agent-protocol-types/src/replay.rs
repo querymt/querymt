@@ -674,11 +674,97 @@ pub fn message_cursor_entities(kind: &AgentEventKind) -> Vec<CursorEntity> {
     }
 }
 
+/// The entities whose terminal update `kind` produces, including the
+/// compaction a `compaction_end` completes.
+///
+/// `compaction` is the identity of the compaction `kind` completes, which
+/// only the caller can resolve (live events carry it, a journal fold derives
+/// it with [`CompactionIds`]). Pass `None` for a client that was not sent
+/// compaction updates, so no cursor follows an update it never received.
+/// Every cursor producer (live, replay, snapshot, history page) goes through
+/// this one rule, so they announce the same cursors.
+pub fn event_cursor_entities(
+    kind: &AgentEventKind,
+    compaction: Option<&CompactionId>,
+) -> Vec<CursorEntity> {
+    let mut entities = message_cursor_entities(kind);
+    if let (AgentEventKind::CompactionEnd { .. }, Some(id)) = (kind, compaction) {
+        entities.push(CursorEntity::Compaction(id.0.to_string()));
+    }
+    entities
+}
+
+/// Derives the cursors of an ordered journal, each announced once.
+///
+/// It owns the compaction identity of the fold, so an id-less (legacy)
+/// compaction keeps one identity from its start to its end. Feed it every
+/// event in order through [`observe`](Self::observe). A window or page is its
+/// own fold: its cursors are the ones of the events it holds.
+#[derive(Debug, Default)]
+pub struct CursorTracker {
+    announce_compactions: bool,
+    compaction_ids: CompactionIds,
+    announced: std::collections::HashSet<String>,
+}
+
+impl CursorTracker {
+    /// `announce_compactions`: the client was sent compaction updates, so
+    /// completed compactions get a cursor too.
+    pub fn new(announce_compactions: bool) -> Self {
+        Self {
+            announce_compactions,
+            ..Self::default()
+        }
+    }
+
+    /// The cursors `kind` (the event at `seq`) announces for the first time.
+    pub fn observe(&mut self, seq: i64, kind: &AgentEventKind) -> Vec<CursorEntity> {
+        let completed = match kind {
+            AgentEventKind::CompactionStart { compaction_id, .. } => {
+                self.compaction_ids.start(compaction_id.as_deref(), seq);
+                None
+            }
+            AgentEventKind::CompactionEnd { compaction_id, .. } => {
+                Some(self.compaction_ids.end(compaction_id.as_deref(), seq))
+            }
+            AgentEventKind::CompactionFailed { .. } => {
+                self.compaction_ids.failed();
+                None
+            }
+            _ => None,
+        };
+        let completed = completed.filter(|_| self.announce_compactions);
+        let mut entities = event_cursor_entities(kind, completed.as_ref());
+        entities.retain(|entity| self.announced.insert(entity.cursor_id()));
+        entities
+    }
+}
+
+/// The `cursor_update`s of a session's events, in order: what a load
+/// snapshot or a history page carries as `cursorUpdates`.
+pub fn session_cursor_updates<'a>(
+    events: impl IntoIterator<Item = &'a crate::events::AgentEvent>,
+    announce_compactions: bool,
+) -> Vec<CursorUpdate> {
+    let mut tracker = CursorTracker::new(announce_compactions);
+    events
+        .into_iter()
+        .flat_map(|event| tracker.observe(event.seq, &event.kind))
+        .map(|entity| cursor_update_body(&entity))
+        .collect()
+}
+
 /// The `cursor_update` announcing the position right after `entity`.
 ///
 /// Carries the anchor (the first update for a cursor must) and
 /// `capabilities.fork` on message cursors only.
 pub fn cursor_update(entity: &CursorEntity) -> SessionUpdate {
+    SessionUpdate::CursorUpdate(cursor_update_body(entity))
+}
+
+/// The payload of [`cursor_update`], without the `session_update` tag: the
+/// shape `cursorUpdates` lists in load snapshots and history pages carry.
+pub fn cursor_update_body(entity: &CursorEntity) -> CursorUpdate {
     let position = CursorAnchorPosition::After;
     let anchor = match entity {
         CursorEntity::UserMessage(id) => {
@@ -701,7 +787,7 @@ pub fn cursor_update(entity: &CursorEntity) -> SessionUpdate {
     if entity.target().is_forkable() {
         update = update.capabilities(CursorCapabilities::new().fork(CursorForkCapabilities::new()));
     }
-    SessionUpdate::CursorUpdate(update)
+    update
 }
 
 #[cfg(test)]
@@ -821,6 +907,94 @@ mod tests {
         ids.start(None, 1);
         ids.failed();
         assert_ne!(ids.end(None, 4), legacy_compaction_id(1));
+    }
+
+    fn prompt(id: &str) -> AgentEventKind {
+        AgentEventKind::PromptReceived {
+            content: "hi".into(),
+            message_id: Some(id.into()),
+        }
+    }
+
+    fn compaction_start(id: Option<&str>) -> AgentEventKind {
+        AgentEventKind::CompactionStart {
+            token_estimate: 10,
+            compaction_id: id.map(str::to_owned),
+        }
+    }
+
+    fn compaction_end(id: Option<&str>) -> AgentEventKind {
+        AgentEventKind::CompactionEnd {
+            summary: "s".into(),
+            summary_len: 1,
+            compaction_id: id.map(str::to_owned),
+            context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn tracker_announces_each_cursor_once() {
+        let mut tracker = CursorTracker::new(true);
+        let first = tracker.observe(1, &prompt("m1"));
+        assert_eq!(first, vec![CursorEntity::UserMessage("m1".into())]);
+        assert!(tracker.observe(2, &prompt("m1")).is_empty());
+    }
+
+    #[test]
+    fn tracker_names_a_completed_compaction() {
+        let mut tracker = CursorTracker::new(true);
+        assert!(tracker.observe(1, &compaction_start(Some("c1"))).is_empty());
+        assert_eq!(
+            tracker.observe(2, &compaction_end(Some("c1"))),
+            vec![CursorEntity::Compaction("c1".into())]
+        );
+    }
+
+    #[test]
+    fn tracker_gives_an_id_less_compaction_its_start_identity() {
+        let mut tracker = CursorTracker::new(true);
+        tracker.observe(5, &compaction_start(None));
+        let ended = tracker.observe(9, &compaction_end(None));
+        assert_eq!(
+            ended,
+            vec![CursorEntity::Compaction(
+                legacy_compaction_id(5).0.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn tracker_without_compaction_updates_announces_no_compaction() {
+        let mut tracker = CursorTracker::new(false);
+        tracker.observe(1, &compaction_start(Some("c1")));
+        assert!(tracker.observe(2, &compaction_end(Some("c1"))).is_empty());
+        assert_eq!(tracker.observe(3, &prompt("m1")).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_compaction_has_no_cursor() {
+        let mut tracker = CursorTracker::new(true);
+        tracker.observe(1, &compaction_start(Some("c1")));
+        let failed = AgentEventKind::CompactionFailed {
+            compaction_id: "c1".into(),
+            reason: "no".into(),
+            cancelled: false,
+        };
+        assert!(tracker.observe(2, &failed).is_empty());
+    }
+
+    #[test]
+    fn cursor_update_body_carries_no_session_update_tag() {
+        let body = cursor_update_body(&CursorEntity::UserMessage("m1".into()));
+        let value = serde_json::to_value(&body).expect("a cursor update serializes");
+        assert_eq!(value["cursorId"], "m:m1");
+        assert!(value.get("sessionUpdate").is_none(), "{value}");
+        let SessionUpdate::CursorUpdate(wrapped) =
+            cursor_update(&CursorEntity::UserMessage("m1".into()))
+        else {
+            panic!("cursor_update wraps a cursor update");
+        };
+        assert_eq!(wrapped, body);
     }
 
     #[test]

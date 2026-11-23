@@ -727,6 +727,8 @@ Once the owner has created the fork it is a session there, as a local fork is. I
  "capabilities": {"fork": {}}}
 ```
 
+**Snapshots and history pages.** The `querymt/sessionLoadSnapshot.v1` object in a `session/load` response and each `querymt/session/history` response carry `cursorUpdates`: the same cursors, with the same ids, that replaying the events they hold announces, each once, in event order. Each element is a `cursor_update` without the `sessionUpdate` tag. A load replaces a client's cursors with its list; a page adds its own. A client that did not advertise `session.cursors` receives no `cursorUpdates`, and one that did not advertise `compaction` receives no compaction cursors (it was never sent the compactions they follow).
+
 ```json
 {"method": "session/fork", "params": {"sessionId": "…", "cwd": "/work", "cursorId": "<opaque>"}}
 ```

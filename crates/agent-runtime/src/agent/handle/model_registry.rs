@@ -362,11 +362,12 @@ impl LocalAgentHandle {
         // Each pass moves the window's lower edge down by one chunk; the
         // absolute deadline is the only bound on the transfer.
         let mut snapshot = loop {
-            let built = crate::session::load_snapshot::load_session_snapshot_windowed(
+            let built = crate::session::load_snapshot::load_session_snapshot_with_bookmark(
                 self,
                 view_store.clone(),
                 session_id,
                 window,
+                Some(bookmark.clone()),
             )
             .await
             .map_err(|error| internal(format!("Failed to build session load snapshot: {error}")))?;

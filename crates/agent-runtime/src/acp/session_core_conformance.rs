@@ -34,8 +34,8 @@ pub(super) fn gpui_capabilities() -> AcpSessionUpdateCapabilities {
         plan_operations: true,
         notices: true,
         compaction: true,
+        cursors: true,
         subagents: true,
-        ..Default::default()
     }
 }
 
@@ -100,7 +100,15 @@ pub(super) async fn agent_snapshots_with_journal(
     let unwindowed = load_session_snapshot(&agent, view_store, &sid)
         .await
         .expect("the snapshot builds");
-    let response = |snapshot: &crate::session::load_snapshot::SessionLoadSnapshot| json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } });
+    // What the transport sends: the snapshot scoped to gpui's capabilities.
+    let response = |snapshot: &crate::session::load_snapshot::SessionLoadSnapshot| {
+        let mut response = json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } });
+        crate::acp::shared::scope_load_cursor_updates(
+            response["_meta"].as_object_mut(),
+            &gpui_capabilities(),
+        );
+        response
+    };
     let stored = crate::session::projection::EventJournal::load_session_stream(
         fixture.storage.as_ref(),
         &sid,
@@ -288,7 +296,8 @@ fn without_revisions(value: &mut Value) {
 /// What the three paths must agree on, with no exceptions: turns (ids
 /// included) with their entries (compaction summary blocks included), the
 /// plan (plan id included), context usage, token breakdown, cost, the
-/// accounting detail, the title and the subagents (state and stage; the
+/// accounting detail, the title, the session cursors (ids, anchors and
+/// placement) and the subagents (state and stage; the
 /// timestamps in their meta are the journal's own and differ by path). The
 /// run state is checked on its own, since a replay carries no state updates.
 pub(super) fn comparable(core: &SessionCore) -> Value {
@@ -322,6 +331,7 @@ pub(super) fn comparable(core: &SessionCore) -> Value {
         "cost": header.cost,
         "accounting": header.accounting,
         "title": header.title,
+        "cursors": header.cursors,
     });
     without_revisions(&mut view);
     view
@@ -596,6 +606,19 @@ async fn snapshot_and_replay_produce_the_same_turns() {
             &name,
             &comparable(&from_replay),
             &comparable(&from_snapshot),
+        );
+        // The comparison above covers the cursors only if there are some.
+        assert!(
+            !from_snapshot.header().cursors.is_empty(),
+            "{name}: the snapshot announced no cursors"
+        );
+        assert!(
+            from_snapshot
+                .header()
+                .cursors
+                .iter()
+                .all(|cursor| cursor.placement.is_some()),
+            "{name}: every announced cursor is placed in the view"
         );
     }
 }
