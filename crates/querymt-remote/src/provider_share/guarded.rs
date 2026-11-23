@@ -257,7 +257,11 @@ impl GuardedProvider {
             result = self.backend.prepare_chat(request, call) => result?,
         };
         Ok(MeteredProvider::direct(
-            provider, access, estimate, request_id,
+            provider,
+            access,
+            estimate,
+            request_id,
+            peer.clone(),
         ))
     }
 }

@@ -50,6 +50,7 @@ struct Store {
     attempts: Mutex<HashMap<(PeerGrantKey, Uuid), ReservationId>>,
     settled: Mutex<Vec<(ReservationId, AttemptUsage)>>,
     pause_reserve: Mutex<Option<PauseReserve>>,
+    reserve_calls: AtomicUsize,
     released: Notify,
     fail_next_grant_read: AtomicBool,
     pause_grant_read: Mutex<Option<(usize, PauseReserve)>>,
@@ -63,6 +64,7 @@ impl Default for Store {
             attempts: Default::default(),
             settled: Default::default(),
             pause_reserve: Default::default(),
+            reserve_calls: Default::default(),
             released: Default::default(),
             fail_next_grant_read: Default::default(),
             pause_grant_read: Default::default(),
@@ -142,6 +144,7 @@ impl QuotaStore for Store {
         unreachable!("fixture has immutable policy")
     }
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
+        self.reserve_calls.fetch_add(1, Ordering::Relaxed);
         if !self.grants.lock()[&attempt.peer].grant.allows_model(
             attempt.protocol,
             &attempt.provider_id,
@@ -167,6 +170,32 @@ impl QuotaStore for Store {
             resume.await.unwrap();
         }
         Ok(id)
+    }
+    async fn reserve_with_policy(
+        &self,
+        attempt: QuotaAttempt,
+        mut history: broadcast::Receiver<crate::peer_access::PolicyChange>,
+        require_sessions: bool,
+    ) -> Result<ReservationId, QuotaError> {
+        loop {
+            match history.try_recv() {
+                Ok(change) if change.key == attempt.peer => {
+                    let crate::peer_access::PolicyEffect::Grant(grant) = change.effect;
+                    if !grant.allows_model(
+                        attempt.protocol,
+                        &attempt.provider_id,
+                        &attempt.model_id,
+                    ) || require_sessions && !grant.allows_sessions(attempt.protocol)
+                    {
+                        return Err(QuotaError::Denied);
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(_) => return Err(QuotaError::Denied),
+            }
+        }
+        self.reserve(attempt).await
     }
     async fn mark_dispatched(&self, id: ReservationId) -> Result<(), QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
@@ -1164,6 +1193,41 @@ async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_con
     );
     assert_eq!(fixture.call::<_, usize>(&cancel).await.unwrap(), 0);
     ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_reservation_keeps_ingress_authority_across_handoff() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let binding = key(fixture.host, fixture.peer);
+    let revision = fixture.store.grant(&binding).await.unwrap().revision;
+    let (arrived, resume) = fixture.store.pause_grant_after(1);
+    let mut call = Box::pin(fixture.router.handle_v1(
+        fixture.peer,
+        ask_request::<ProviderHostActor, _>(fixture.actor, &request),
+    ));
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut call => panic!("provider preparation was not suspended: {result:?}"),
+            result = arrived => result.unwrap(),
+        }
+        let revoked = fixture
+            .store
+            .replace_grant(&binding, revision, PeerGrant::None)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .replace_grant(&binding, revoked.revision, allowed())
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+        assert!(!matches!(call.await, Ok(SwarmResponse::Ask(Ok(_)))));
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.store.reserve_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

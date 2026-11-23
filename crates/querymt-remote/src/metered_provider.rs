@@ -118,7 +118,7 @@ pub struct MeteredProvider {
     inner: Arc<dyn LLMProvider>,
     access: MeteredAccess,
     estimate: Arc<Estimate>,
-    request_id: Option<Uuid>,
+    direct_request: Option<(Uuid, crate::mesh_ingress::PeerRequest)>,
 }
 
 impl MeteredProvider {
@@ -143,7 +143,7 @@ impl MeteredProvider {
                 catalog: None,
             },
             estimate: Arc::new(estimate),
-            request_id: None,
+            direct_request: None,
         }
     }
 
@@ -153,17 +153,23 @@ impl MeteredProvider {
         access: MeteredAccess,
         estimate: QuotaEstimate,
         request_id: Uuid,
+        peer: crate::mesh_ingress::PeerRequest,
     ) -> Self {
         Self {
             inner,
             access,
             estimate: Arc::new(move |_| estimate),
-            request_id: Some(request_id),
+            direct_request: Some((request_id, peer)),
         }
     }
 
     pub(crate) async fn reserve(&self, call: &ChatCall<'_>) -> Result<ReservedAttempt, LLMError> {
-        let request_id = self.request_id.unwrap_or_else(Uuid::new_v4);
+        let (request_id, history, require_sessions) = match &self.direct_request {
+            Some((id, peer)) => (*id, peer.take_policy_changes(), false),
+            None => (Uuid::new_v4(), self.access.store.subscribe_changes(), true),
+        };
+        let history = history.ok_or_else(denied)?;
+        let revoked = self.access.revocation();
         self.access.check().await?;
         let estimate = (self.estimate)(call);
         let now = SystemTime::now()
@@ -171,11 +177,10 @@ impl MeteredProvider {
             .ok()
             .and_then(|time| i64::try_from(time.as_secs()).ok())
             .ok_or_else(|| QuotaError::InvalidTime.into_provider_error())?;
-        let revoked = self.access.revocation();
         tokio::select! {
             biased;
             error = revoked => Err(error),
-            result = ReservedAttempt::reserve(self.access.store.clone(), QuotaAttempt {
+            result = ReservedAttempt::reserve_with_policy(self.access.store.clone(), QuotaAttempt {
                 peer: self.access.peer.clone(),
                 protocol: self.access.protocol,
                 provider_id: self.access.provider.clone(),
@@ -183,7 +188,7 @@ impl MeteredProvider {
                 request_id,
                 estimate,
                 now,
-            }) => result.map_err(QuotaError::into_provider_error),
+            }, history, require_sessions) => result.map_err(QuotaError::into_provider_error),
         }
     }
 

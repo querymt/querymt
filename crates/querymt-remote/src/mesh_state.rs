@@ -488,7 +488,12 @@ impl MeshAccessStore {
 
     pub(crate) async fn transact_with_usage<T, E>(
         &self,
-        f: impl FnOnce(&mut PeerAccessState, &mut QuotaRuntime) -> Result<(T, bool, Option<PeerGrantKey>), E> + Send + 'static,
+        f: impl FnOnce(
+            &mut PeerAccessState,
+            &mut QuotaRuntime,
+        ) -> Result<(T, bool, Option<PeerGrantKey>), E>
+        + Send
+        + 'static,
     ) -> Result<T, E>
     where
         T: Send + 'static,
@@ -497,7 +502,8 @@ impl MeshAccessStore {
         self.transact_access(move |access, runtime| {
             let (value, persist, usage) = f(access, runtime)?;
             Ok((value, persist, usage.map(AccessChange::Usage)))
-        }).await
+        })
+        .await
     }
 
     pub(crate) async fn transact_access<T, E>(
@@ -524,8 +530,12 @@ impl MeshAccessStore {
             }
             state.quota_runtime = runtime;
             match change {
-                Some(AccessChange::Policy(change)) => { let _ = state.changes.send(change); }
-                Some(AccessChange::Usage(peer)) => { let _ = state.usage_changes.send(peer); }
+                Some(AccessChange::Policy(change)) => {
+                    let _ = state.changes.send(change);
+                }
+                Some(AccessChange::Usage(peer)) => {
+                    let _ = state.usage_changes.send(peer);
+                }
                 None => {}
             }
             Ok(value)
