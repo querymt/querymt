@@ -118,6 +118,7 @@ pub struct MeteredProvider {
     inner: Arc<dyn LLMProvider>,
     access: MeteredAccess,
     estimate: Arc<Estimate>,
+    #[cfg(feature = "kameo-mesh")]
     direct_request: Option<(Uuid, crate::mesh_ingress::PeerRequest)>,
 }
 
@@ -143,6 +144,7 @@ impl MeteredProvider {
                 catalog: None,
             },
             estimate: Arc::new(estimate),
+            #[cfg(feature = "kameo-mesh")]
             direct_request: None,
         }
     }
@@ -164,10 +166,14 @@ impl MeteredProvider {
     }
 
     pub(crate) async fn reserve(&self, call: &ChatCall<'_>) -> Result<ReservedAttempt, LLMError> {
+        let hosted = || (Uuid::new_v4(), self.access.store.subscribe_changes(), true);
+        #[cfg(feature = "kameo-mesh")]
         let (request_id, history, require_sessions) = match &self.direct_request {
             Some((id, peer)) => (*id, peer.take_policy_changes(), false),
-            None => (Uuid::new_v4(), self.access.store.subscribe_changes(), true),
+            None => hosted(),
         };
+        #[cfg(not(feature = "kameo-mesh"))]
+        let (request_id, history, require_sessions) = hosted();
         let history = history.ok_or_else(denied)?;
         let revoked = self.access.revocation();
         self.access.check().await?;

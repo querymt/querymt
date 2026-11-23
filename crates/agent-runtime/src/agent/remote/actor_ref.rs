@@ -338,6 +338,7 @@ impl SessionActorRef {
         error: kameo::error::RemoteSendError<AgentError>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
+        #[cfg(feature = "remote")]
         if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
             return AgentError::MeshAccessDenied;
         }
@@ -352,6 +353,7 @@ impl SessionActorRef {
         error: kameo::error::RemoteSendError<kameo::error::Infallible>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
+        #[cfg(feature = "remote")]
         if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
             return AgentError::MeshAccessDenied;
         }

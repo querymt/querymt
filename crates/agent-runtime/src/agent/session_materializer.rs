@@ -1507,7 +1507,6 @@ impl SessionMaterializer {
         self.finalize_session_with_index(prepared, true).await
     }
 
-    #[cfg(feature = "remote")]
     async fn check_peer_session_start(
         &self,
         session_id: &str,
