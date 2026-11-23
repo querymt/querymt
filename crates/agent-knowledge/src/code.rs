@@ -701,6 +701,25 @@ pub fn plain() {}
     }
 
     #[test]
+    fn lean_files_extract_symbols() {
+        let extraction = extract_code(
+            "Foo/Bar.lean",
+            b"namespace Foo\n\ntheorem bar_eq : 1 = 1 := rfl\n\nend Foo\n",
+        );
+        let record = extraction.record;
+        assert_eq!(record.status, CodeStatus::Extracted);
+        assert_eq!(record.language.as_deref(), Some("lean"));
+        assert!(extraction.diagnostic.is_none());
+        let theorem = record
+            .symbols
+            .iter()
+            .find(|s| s.name == "bar_eq")
+            .expect("declared theorem is extracted");
+        assert_eq!(theorem.qualified_name, "Foo.bar_eq");
+        assert_eq!(theorem.parent.as_deref(), Some("Foo"));
+    }
+
+    #[test]
     fn non_utf8_source_fails_visibly_without_symbols() {
         let extraction = extract_code("src/bad.rs", &[0xff, 0xfe, b'f', b'n']);
         assert_eq!(extraction.record.status, CodeStatus::Failed);

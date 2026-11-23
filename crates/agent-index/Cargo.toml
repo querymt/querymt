@@ -53,6 +53,11 @@ tree-sitter-php = "0.25"
 # already in the graph. Master binds via tree-sitter-language only.
 tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
 tree-sitter-swift = "0.7"
+# Lean 4 grammar from upstream, pinned by revision because it is not published
+# on crates.io. The crates.io `tree-sitter-lean4` crate needs tree-sitter 0.25,
+# which conflicts with the 0.26 runtime through the `links = "tree-sitter"` key.
+# This grammar binds via tree-sitter-language only.
+tree-sitter-lean = { git = "https://github.com/Julian/tree-sitter-lean", rev = "fefc2eff9a83eeb72cda44646709e40e33e09175" }
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"

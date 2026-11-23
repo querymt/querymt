@@ -6,6 +6,7 @@ pub mod go;
 pub mod java;
 pub mod json;
 pub mod kotlin;
+pub mod lean;
 pub mod lua;
 pub mod markdown;
 pub mod nix;
@@ -40,6 +41,7 @@ pub fn extract_symbols(source: &str, language: &str) -> Result<Vec<SymbolEntry>,
         "java" => java::extract(source),
         "json" => json::extract(source),
         "kotlin" => kotlin::extract(source),
+        "lean" => lean::extract(source),
         "lua" => lua::extract(source),
         "markdown" => markdown::extract(source),
         "nix" => nix::extract(source),

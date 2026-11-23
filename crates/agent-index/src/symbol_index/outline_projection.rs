@@ -1,7 +1,17 @@
 use crate::outline_index::common::{IndexOptions, Section, SkeletonEntry};
 use crate::symbol_index::{SymbolEntry, SymbolKind};
 
-pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> Vec<Section> {
+/// Projects extracted symbols into outline sections.
+///
+/// `language` selects the few language-specific routing rules (currently only
+/// Lean's namespace nesting and `theorems` section); every other language
+/// follows the shared rules.
+pub fn symbols_to_sections(
+    symbols: &[SymbolEntry],
+    language: &str,
+    options: &IndexOptions,
+) -> Vec<Section> {
+    let is_lean = language == "lean";
     let mut package = Vec::new();
     let mut includes = Vec::new();
     let mut imports = Vec::new();
@@ -16,6 +26,7 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
     let mut impls = Vec::new();
     let mut classes = Vec::new();
     let mut functions = Vec::new();
+    let mut theorems = Vec::new();
     let mut tests = Vec::new();
     let mut macros = Vec::new();
     let mut constants = Vec::new();
@@ -57,14 +68,18 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
             SymbolKind::Module => {
                 if symbol.signature.starts_with("namespace ") {
                     namespaces.push(symbol_to_entry(symbol, options));
-                    split_interface_enum_sections = true;
-                    collect_namespace_members(
-                        symbol,
-                        options,
-                        &mut classes,
-                        &mut interfaces,
-                        &mut enums,
-                    );
+                    // Lean namespaces keep their members nested; hoisting
+                    // them would duplicate entries and drop scope context.
+                    if !is_lean {
+                        split_interface_enum_sections = true;
+                        collect_namespace_members(
+                            symbol,
+                            options,
+                            &mut classes,
+                            &mut interfaces,
+                            &mut enums,
+                        );
+                    }
                 } else if symbol.signature.starts_with("module ")
                     || symbol.signature.starts_with("defmodule ")
                     || is_nix_module_signature(&symbol.signature)
@@ -86,7 +101,11 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
             SymbolKind::Trait => traits.push(symbol_to_entry(symbol, options)),
             SymbolKind::Impl => impls.push(symbol_to_entry(symbol, options)),
             SymbolKind::Function | SymbolKind::Method => {
-                functions.push(symbol_to_entry(symbol, options))
+                if is_lean && is_lean_theorem_signature(&symbol.signature) {
+                    theorems.push(symbol_to_entry(symbol, options));
+                } else {
+                    functions.push(symbol_to_entry(symbol, options));
+                }
             }
             SymbolKind::Macro => macros.push(symbol_to_entry(symbol, options)),
             SymbolKind::Const | SymbolKind::Static => {
@@ -118,6 +137,7 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
     push_section(&mut sections_out, "traits", traits);
     push_section(&mut sections_out, "impls", impls);
     push_section(&mut sections_out, "functions", functions);
+    push_section(&mut sections_out, "theorems", theorems);
     push_section(&mut sections_out, "macros", macros);
     push_section(&mut sections_out, "constants", constants);
     push_section(&mut sections_out, "markup", markup);
@@ -140,6 +160,29 @@ fn collect_namespace_members(
             _ => {}
         }
     }
+}
+
+/// Lean declaration modifiers that may precede `theorem`/`lemma`.
+const LEAN_MODIFIERS: &[&str] = &[
+    "private",
+    "protected",
+    "noncomputable",
+    "partial",
+    "nonrec",
+    "unsafe",
+    "scoped",
+    "local",
+    "public",
+    "meta",
+];
+
+/// True when the first non-modifier token of a Lean header is `theorem` or
+/// `lemma`. Only called for Lean symbols.
+fn is_lean_theorem_signature(signature: &str) -> bool {
+    signature
+        .split_whitespace()
+        .find(|token| !LEAN_MODIFIERS.contains(token))
+        .is_some_and(|token| token == "theorem" || token == "lemma")
 }
 
 fn is_nix_module_signature(signature: &str) -> bool {

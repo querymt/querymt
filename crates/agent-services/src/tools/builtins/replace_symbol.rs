@@ -526,6 +526,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_covers_attributes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Foo.lean");
+        tokio::fs::write(
+            &path,
+            "def keep := 1\n\n@[simp] theorem foo : 1 = 1 := rfl\n\ndef tail := 2\n",
+        )
+        .await
+        .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
+        let tool = ReplaceSymbolTool::new();
+
+        tool.call(
+            json!({
+                "replacements": [{
+                    "path": "Foo.lean",
+                    "symbol": "foo",
+                    "new_text": "theorem foo : 2 = 2 := rfl"
+                }],
+                "root": dir.path()
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !written.contains("@[simp]"),
+            "orphaned attribute: {written}"
+        );
+        assert_eq!(
+            written,
+            "def keep := 1\n\ntheorem foo : 2 = 2 := rfl\n\ndef tail := 2\n"
+        );
+    }
+
+    #[tokio::test]
     async fn replaces_svelte_script_function() {
         // Symbols extracted from embedded `<script>` content must carry
         // whole-file coordinates so replacement hits the right byte range.

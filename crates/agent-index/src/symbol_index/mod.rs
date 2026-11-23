@@ -1561,4 +1561,410 @@ end
                 .any(|child| child.name == "accepts options" && child.kind == SymbolKind::Test)
         );
     }
+
+    fn lean_find<'a>(
+        index: &'a SymbolIndex,
+        name: &str,
+        kind: Option<SymbolKind>,
+    ) -> &'a SymbolEntry {
+        let found = index.find_by_name(name, kind);
+        assert_eq!(found.len(), 1, "expected exactly one match for {name}");
+        found[0]
+    }
+
+    #[test]
+    fn lean_imports_and_opens_are_imports() {
+        let source = "import Mathlib.Data.Nat.Basic\nopen Nat\nexport Foo (bar)\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let imports: Vec<_> = index
+            .symbols
+            .iter()
+            .map(|s| (s.kind, s.signature.as_str(), s.start_line))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                (SymbolKind::Import, "import Mathlib.Data.Nat.Basic", 1),
+                (SymbolKind::Import, "open Nat", 2),
+                (SymbolKind::Import, "export Foo (bar)", 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn lean_definitions_are_functions() {
+        let source = "def a : Nat := 1\n\nabbrev MyNat := Nat\n\nopaque secret : Nat\n\nnoncomputable def bar (x : Nat) : Nat := x\n  where\n    helper (y : Nat) : Nat := y\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        for (name, line) in [("a", 1), ("MyNat", 3), ("secret", 5), ("bar", 7)] {
+            let symbol = lean_find(&index, name, Some(SymbolKind::Function));
+            assert_eq!(symbol.start_line, line);
+        }
+        let bar = lean_find(&index, "bar", None);
+        assert_eq!(bar.signature, "noncomputable def bar (x : Nat) : Nat := x");
+        assert_eq!(bar.children.len(), 1);
+        assert_eq!(bar.children[0].name, "helper");
+        assert_eq!(bar.children[0].kind, SymbolKind::Method);
+        assert_eq!(bar.children[0].qualified_name, "bar.helper");
+        assert_eq!(bar.children[0].parent.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn lean_types_and_instances() {
+        let source = "structure Point where\n  x : Nat\n  y : Nat\n\nclass Shape (a : Type) where\n  area : a → Nat\n\ninductive Color where\n  | red\n  | green : Color\n\ninstance : ToString Point where\n  toString p := \"p\"\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+
+        let point = lean_find(&index, "Point", None);
+        assert_eq!(point.kind, SymbolKind::Struct);
+        let fields: Vec<_> = point
+            .children
+            .iter()
+            .map(|c| (c.name.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("x", SymbolKind::Field), ("y", SymbolKind::Field)]
+        );
+
+        let shape = lean_find(&index, "Shape", None);
+        assert_eq!(shape.kind, SymbolKind::Trait);
+        assert_eq!(shape.children.len(), 1);
+        assert_eq!(shape.children[0].name, "area");
+        assert_eq!(shape.children[0].kind, SymbolKind::Method);
+
+        let color = lean_find(&index, "Color", None);
+        assert_eq!(color.kind, SymbolKind::Enum);
+        let variants: Vec<_> = color
+            .children
+            .iter()
+            .map(|c| (c.name.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            variants,
+            vec![
+                ("red", SymbolKind::EnumVariant),
+                ("green", SymbolKind::EnumVariant)
+            ]
+        );
+
+        let instance = lean_find(&index, "ToString Point", None);
+        assert_eq!(instance.kind, SymbolKind::Impl);
+        assert_eq!(instance.children.len(), 1);
+        assert_eq!(instance.children[0].name, "toString");
+        assert_eq!(instance.children[0].kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn lean_axioms_and_constants() {
+        let source = "axiom ax : 1 = 1\nconstant k : Nat\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(lean_find(&index, "ax", None).kind, SymbolKind::Const);
+        assert_eq!(lean_find(&index, "k", None).kind, SymbolKind::Const);
+    }
+
+    #[test]
+    fn lean_macro_commands_are_macros() {
+        let source = "macro \"foo\" : term => `(1)\nsyntax \"bar\" term : term\nnotation \"⊕\" => Nat.add\nmacro_rules\n  | `(bar $x) => `($x)\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let macros: Vec<_> = index
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Macro)
+            .map(|s| (s.start_line, s.signature.as_str()))
+            .collect();
+        assert_eq!(macros.len(), 4);
+        assert_eq!(macros[0].0, 1);
+        assert!(macros[0].1.starts_with("macro "));
+        assert!(macros[1].1.starts_with("syntax "));
+        assert!(macros[2].1.starts_with("notation "));
+        assert!(macros[3].1.starts_with("macro_rules"));
+    }
+
+    #[test]
+    fn lean_example_is_test() {
+        let index = SymbolIndex::from_source("example : 1 = 1 := rfl\n", "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        assert_eq!(index.symbols[0].kind, SymbolKind::Test);
+    }
+
+    #[test]
+    fn attributed_declaration_label_and_range() {
+        let source = "import Foo\n\n@[simp] private theorem foo : 1 = 1 :=\n  rfl\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let foo = lean_find(&index, "foo", None);
+        assert_eq!(foo.kind, SymbolKind::Function);
+        assert_eq!(foo.start_line, 3);
+        assert_eq!(foo.end_line, 4);
+        assert!(foo.signature.starts_with("private theorem foo"));
+        assert!(!foo.signature.contains("@[simp]"));
+        assert!(source[foo.start_byte..foo.end_byte].starts_with("@[simp]"));
+    }
+
+    #[test]
+    fn declarations_nest_under_namespace() {
+        let source = "namespace Geometry\nstructure Point where\n  x : Nat\n\ndef dist (p : Nat) : Nat := p\n\ntheorem dist_self : 1 = 1 := rfl\nend Geometry\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        let ns = &index.symbols[0];
+        assert_eq!(ns.kind, SymbolKind::Module);
+        assert_eq!(ns.signature, "namespace Geometry");
+        assert_eq!(ns.start_line, 1);
+        assert_eq!(ns.end_line, 8);
+        let children: Vec<_> = ns
+            .children
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.qualified_name.as_str(),
+                    c.parent.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            children,
+            vec![
+                ("Point", "Geometry.Point", Some("Geometry")),
+                ("dist", "Geometry.dist", Some("Geometry")),
+                ("dist_self", "Geometry.dist_self", Some("Geometry")),
+            ]
+        );
+        assert_eq!(
+            ns.children[0].children[0].qualified_name,
+            "Geometry.Point.x"
+        );
+    }
+
+    #[test]
+    fn nested_namespaces_nest_further() {
+        let source = "namespace A\nnamespace B\ndef f := 1\nend B\nend A\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        let a = &index.symbols[0];
+        assert_eq!(a.name, "A");
+        assert_eq!(a.children.len(), 1);
+        let b = &a.children[0];
+        assert_eq!(b.name, "B");
+        assert_eq!(b.kind, SymbolKind::Module);
+        assert_eq!(b.qualified_name, "A.B");
+        assert_eq!(b.parent.as_deref(), Some("A"));
+        assert_eq!((b.start_line, b.end_line), (2, 4));
+        assert_eq!(b.children.len(), 1);
+        assert_eq!(b.children[0].name, "f");
+        assert_eq!(b.children[0].qualified_name, "A.B.f");
+        assert_eq!((a.start_line, a.end_line), (1, 5));
+    }
+
+    #[test]
+    fn unclosed_namespace_runs_to_end_of_file() {
+        let source = "namespace Foo\ndef a := 1\n\ndef b := 2\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        let ns = &index.symbols[0];
+        assert_eq!(ns.name, "Foo");
+        assert_eq!(ns.start_line, 1);
+        assert_eq!(ns.end_line, 4);
+        assert_eq!(ns.end_byte, source.trim_end().len());
+        let names: Vec<_> = ns.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn sections_and_mutual_blocks_are_transparent() {
+        let source = "namespace Foo\nsection Bar\ndef a := 1\nend Bar\n\nmutual\ndef b := 1\ndef c := 2\nend\n\ndef d := 3\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        let ns = &index.symbols[0];
+        assert_eq!(ns.name, "Foo");
+        assert_eq!(ns.end_line, 12);
+        let names: Vec<_> = ns.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
+        assert!(ns.children.iter().all(|c| c.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn reopened_namespace_yields_separate_entries() {
+        let source = "namespace Foo\ndef a := 1\nend Foo\n\nnamespace Foo\ndef b := 2\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let namespaces = index.find_by_name("Foo", Some(SymbolKind::Module));
+        assert_eq!(namespaces.len(), 2);
+        assert_eq!((namespaces[0].start_line, namespaces[0].end_line), (1, 3));
+        assert_eq!((namespaces[1].start_line, namespaces[1].end_line), (5, 7));
+        assert_eq!(namespaces[0].children[0].name, "a");
+        assert_eq!(namespaces[1].children[0].name, "b");
+    }
+
+    #[test]
+    fn dotted_declaration_name_inside_namespace() {
+        let source = "namespace Geometry\ndef Point.norm (p : Nat) : Nat := p\nend Geometry\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let found = index.find_by_name("Geometry.Point.norm", None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Point.norm");
+        assert_eq!(found[0].qualified_name, "Geometry.Point.norm");
+        assert_eq!(
+            lean_find(&index, "Point.norm", None).qualified_name,
+            "Geometry.Point.norm"
+        );
+    }
+
+    #[test]
+    fn stray_named_end_does_not_close_namespace() {
+        let source = "namespace Foo\nend Nope\ndef a := 1\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        assert_eq!(index.symbols[0].children.len(), 1);
+    }
+
+    #[test]
+    fn partial_parse_still_yields_declarations() {
+        let source = "def f (x : Nat) : Nat := x ⊕⊕ ⟦ x ⟧ ⟧\n\ndef g := 1\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let g = lean_find(&index, "g", Some(SymbolKind::Function));
+        assert_eq!((g.start_line, g.end_line), (3, 3));
+        assert_eq!(lean_find(&index, "f", None).start_line, 1);
+    }
+
+    #[test]
+    fn lean_declaration_without_name_yields_no_symbol() {
+        let source = "def a := ) )\ndef b := 3\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert!(index.find_by_name("unknown", None).is_empty());
+        assert_eq!(lean_find(&index, "b", None).start_line, 2);
+    }
+
+    #[test]
+    fn lean_in_prefixes_do_not_hide_declarations() {
+        let source = "set_option maxHeartbeats 400000 in\ntheorem t1 : 1 = 1 := rfl\n\nopen Classical in\ntheorem t2 : 2 = 2 := rfl\n\nvariable (n : Nat) in\ndef f := n\n\nopen Nat\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(
+            lean_find(&index, "t1", Some(SymbolKind::Function)).start_line,
+            2
+        );
+        assert_eq!(
+            lean_find(&index, "t2", Some(SymbolKind::Function)).start_line,
+            5
+        );
+        assert_eq!(
+            lean_find(&index, "f", Some(SymbolKind::Function)).start_line,
+            8
+        );
+        // Only the plain `open` is an import; `open … in` is not one.
+        let imports: Vec<_> = index
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].start_line, 10);
+    }
+
+    #[test]
+    fn lean_in_prefix_inside_namespace_keeps_qualified_name() {
+        let source =
+            "namespace Foo\nset_option pp.all true in\ntheorem t : 1 = 1 := rfl\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let t = lean_find(&index, "Foo.t", Some(SymbolKind::Function));
+        assert_eq!(t.start_line, 3);
+    }
+
+    #[test]
+    fn dotted_namespace_closed_by_components() {
+        // `namespace A.B` opens two scopes; `end B` then `end A` closes both.
+        let source = "namespace A.B\ndef x := 1\nend B\ndef y := 2\nend A\ndef z := 3\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let ns = lean_find(&index, "A.B", Some(SymbolKind::Module));
+        assert_eq!(ns.end_line, 5);
+        assert_eq!(ns.signature, "namespace A.B");
+        assert_eq!(ns.qualified_name, "A.B");
+        let names: Vec<_> = ns
+            .children
+            .iter()
+            .map(|c| c.qualified_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["A.B.x", "A.y"]);
+        assert_eq!(lean_find(&index, "z", None).qualified_name, "z");
+    }
+
+    #[test]
+    fn dotted_end_closes_nested_namespaces() {
+        let source = "namespace A\nnamespace B\ndef x := 1\nend A.B\ndef y := 2\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 2);
+        assert_eq!(index.symbols[0].name, "A");
+        assert_eq!(index.symbols[0].end_line, 4);
+        assert_eq!(index.symbols[0].children[0].name, "B");
+        assert_eq!(lean_find(&index, "y", None).qualified_name, "y");
+
+        let whole = "namespace A.B\ndef x := 1\nend A.B\ndef y := 2\n";
+        let index = SymbolIndex::from_source(whole, "lean").unwrap();
+        assert_eq!(lean_find(&index, "A.B", None).end_line, 3);
+        assert_eq!(lean_find(&index, "y", None).qualified_name, "y");
+    }
+
+    #[test]
+    fn public_section_is_closed_by_end() {
+        let source = "namespace Foo\npublic section\ndef a := 1\nend\ndef b := 2\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(index.symbols.len(), 1);
+        let ns = &index.symbols[0];
+        assert_eq!(ns.end_line, 6);
+        let names: Vec<_> = ns.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn unclosed_public_section_does_not_break_namespace() {
+        let source = "public section\nnamespace Foo\ndef a := 1\nend Foo\ndef b := 2\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(lean_find(&index, "Foo", None).end_line, 4);
+        assert_eq!(lean_find(&index, "b", None).qualified_name, "b");
+    }
+
+    #[test]
+    fn lean_comment_between_attribute_and_declaration_is_not_the_label() {
+        let source = "@[simp] -- note\ntheorem foo : 1 = 1 := rfl\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let foo = lean_find(&index, "foo", None);
+        assert!(
+            foo.signature.starts_with("theorem foo"),
+            "{}",
+            foo.signature
+        );
+    }
+
+    #[test]
+    fn lean_anonymous_instance_name_is_whitespace_normalised() {
+        let source = "instance :   ToString\n    Point where\n  toString p := \"p\"\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(
+            lean_find(&index, "ToString Point", Some(SymbolKind::Impl)).start_line,
+            1
+        );
+    }
+
+    #[test]
+    fn lean_open_inside_namespace_stays_top_level_import() {
+        let source = "namespace Foo\nopen Nat\ndef a := 1\nend Foo\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        let open = index
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Import)
+            .expect("open is a top-level import");
+        assert!(open.parent.is_none());
+        let ns = lean_find(&index, "Foo", Some(SymbolKind::Module));
+        assert_eq!(ns.children.len(), 1);
+    }
+
+    #[test]
+    fn lean_root_prefix_ignores_enclosing_namespace() {
+        let source = "namespace X\ndef _root_.Foo.bar := 1\nend X\n";
+        let index = SymbolIndex::from_source(source, "lean").unwrap();
+        assert_eq!(
+            index
+                .find_by_name("Foo.bar", Some(SymbolKind::Function))
+                .len(),
+            1
+        );
+    }
 }

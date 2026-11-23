@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Lean 4 support in the code index.** `.lean` files are now accepted by
+  `index`, `get_symbol`, `get_function`, `find_symbol_references` and
+  `replace_symbol`, and yield symbol records in the repository knowledge store.
+  Declarations map to the usual kinds (`def`/`theorem` functions, `structure`,
+  `class`, `inductive`, `instance`, `axiom`, `example`, macro commands).
+  Namespaces nest their declarations, symbols are addressable by dotted
+  qualified name (`Geometry.dist`), and a declaration's range covers its
+  attributes. The `index` outline gains a `theorems` section for top-level
+  `theorem`/`lemma` declarations (Lean only; other languages are unchanged).
+  The grammar is `Julian/tree-sitter-lean`, pinned by git revision. API:
+  `querymt_agent_index::symbol_index::outline_projection::symbols_to_sections`
+  takes a new `language: &str` argument (**BREAKING** for direct callers).
 - **`qmacp` and `qmcp` live in this workspace.** The ACP client CLI (`qmacp`,
   `crates/qmacp`) and the MCP-to-ACP bridge (`qmcp`, `crates/qmcp`) moved from
   their separate repositories, follow the workspace version, and are built for

@@ -15,7 +15,7 @@ pub fn extract_outline(
     options: &IndexOptions,
 ) -> Result<Vec<Section>, OutlineError> {
     SymbolIndex::from_source(source, language)
-        .map(|index| symbols_to_sections(&index.symbols, options))
+        .map(|index| symbols_to_sections(&index.symbols, language, options))
         .map_err(symbol_error_to_outline)
 }
 
