@@ -142,6 +142,7 @@ mod remote_impl {
         Policy,
         Quota,
         Catalog,
+        Availability,
     }
 
     impl PeerAccessInvalidated {
@@ -150,6 +151,7 @@ mod remote_impl {
                 Self::Policy => "policy",
                 Self::Quota => "quota",
                 Self::Catalog => "catalog",
+                Self::Availability => "availability",
             }
         }
     }
