@@ -214,6 +214,13 @@ async fn bootstrap_with_ingress(
         _ => unreachable!(),
     };
 
+    let state_owner = if use_mesh_state_policy {
+        Some(crate::mesh_bootstrap::open_mesh_state(
+            config.identity_file.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let ctx = prepare_runtime_bootstrap(
         config.identity_file.as_deref(),
         &config.peers,
@@ -232,15 +239,7 @@ async fn bootstrap_with_ingress(
         mesh_state_store,
     } = ctx;
 
-    // The identity must exist before selecting its state path, so aliases
-    // compare the same way on first startup and on subsequent starts.
-    let mesh_state_store = if use_mesh_state_policy && mesh_state_store.is_none() {
-        Some(crate::mesh_bootstrap::open_mesh_state(
-            config.identity_file.as_deref(),
-        )?)
-    } else {
-        mesh_state_store
-    };
+    let mesh_state_store = state_owner.or(mesh_state_store);
     let policy_store = if use_mesh_state_policy {
         mesh_state_store
             .as_ref()
