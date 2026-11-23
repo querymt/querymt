@@ -473,33 +473,36 @@ impl PeerTurn {
 
     /// Check a one-shot mutation at the last boundary before starting its side effect.
     pub(crate) async fn check_mutation(&self) -> Result<(), AgentError> {
-        self.check_mutation_grants(|grant| self.check_grant(grant, None))
-            .await
+        self.check_mutation_grants(
+            |grant| self.check_grant(grant, None),
+            |_| AgentError::MeshAccessDenied,
+        )
+        .await
     }
 
     pub(crate) async fn check_schedule_mutation(&self) -> Result<(), AgentError> {
-        self.check_mutation_grants(|grant| {
-            if grant.allows_sessions(self.protocol) {
-                Ok(())
-            } else {
-                Err(AgentError::MeshAccessDenied)
-            }
-        })
+        self.check_mutation_grants(
+            |grant| {
+                if grant.allows_sessions(self.protocol) {
+                    Ok(())
+                } else {
+                    Err(AgentError::MeshAccessDenied)
+                }
+            },
+            |_| AgentError::Internal("mesh access store unavailable".into()),
+        )
         .await
     }
 
     async fn check_mutation_grants(
         &self,
         check: impl Fn(&querymt_remote::peer_access::PeerGrant) -> Result<(), AgentError>,
+        store_error: impl FnOnce(querymt_remote::peer_access::GrantStoreError) -> AgentError,
     ) -> Result<(), AgentError> {
         use querymt_remote::peer_access::{PolicyChange, PolicyEffect};
         use tokio::sync::broadcast::error::TryRecvError;
 
-        let state = self
-            .store
-            .grant(&self.key)
-            .await
-            .map_err(|_| AgentError::MeshAccessDenied)?;
+        let state = self.store.grant(&self.key).await.map_err(store_error)?;
         check(&state.grant)?;
         if let Some(changes) = self.changes.lock().as_mut() {
             loop {

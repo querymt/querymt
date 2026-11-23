@@ -357,7 +357,7 @@ mod remote_impl {
         pub schedule_public_id: String,
     }
 
-    use crate::scheduler::{PeerScheduleMutation, ScheduleAction};
+    use crate::scheduler::{PeerScheduleMutation, ScheduleAction, SchedulerHandle};
 
     impl ScheduleAction {
         async fn apply(
@@ -886,6 +886,23 @@ mod remote_impl {
             *self.scheduler_handle.lock() = None;
         }
 
+        fn clear_stopped_scheduler(&self, stopped: &SchedulerHandle) {
+            let mut slot = self.scheduler_handle.lock();
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.is_same_actor(stopped))
+            {
+                *slot = None;
+            }
+        }
+
+        fn schedule_mutation_error(error: kameo::error::SendError<(), AgentError>) -> AgentError {
+            match error {
+                kameo::error::SendError::HandlerError(error) => error,
+                _ => AgentError::Internal(error.to_string()),
+            }
+        }
+
         async fn start_scheduler(&self) -> bool {
             let schedule_repo = match &self.config.schedule_repository {
                 Some(repo) => repo.clone(),
@@ -941,7 +958,7 @@ mod remote_impl {
                 max_cost_usd,
                 max_runs,
             } = request;
-            TurnAuthority::Peer(origin.clone()).check().await?;
+            origin.check_schedule_mutation().await?;
 
             let store = self.config.provider.history_store();
             let session = store
@@ -973,7 +990,7 @@ mod remote_impl {
                 created_at: now,
                 updated_at: now,
             };
-            origin.check_mutation().await?;
+            origin.check_schedule_mutation().await?;
             let task = store
                 .create_task(task)
                 .await
@@ -1000,11 +1017,11 @@ mod remote_impl {
                 .await
             {
                 Ok(()) => Ok(CreateRemoteScheduleResponse { schedule_public_id }),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if Self::is_actor_not_running_error(&msg) {
-                        self.clear_scheduler_handle();
+                Err(error) => {
+                    if matches!(error, kameo::error::SendError::ActorNotRunning(_)) {
+                        self.clear_stopped_scheduler(&scheduler);
                     }
+                    let error = Self::schedule_mutation_error(error);
 
                     let cleanup_suffix = match store.delete_task(&task.public_id).await {
                         Ok(()) => String::new(),
@@ -1015,9 +1032,9 @@ mod remote_impl {
                     };
 
                     if cleanup_suffix.is_empty() {
-                        Err(e)
+                        Err(error)
                     } else {
-                        Err(AgentError::Internal(format!("{msg}{cleanup_suffix}")))
+                        Err(AgentError::Internal(format!("{error}{cleanup_suffix}")))
                     }
                 }
             }
@@ -2260,22 +2277,140 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
+            let id = msg.request.schedule_id().to_owned();
             ctx.spawn(async move {
+                use kameo::error::SendError;
+
                 let scheduler = state
                     .get_or_start_scheduler()
                     .await
                     .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
-                scheduler
-                    .peer_mutation(
-                        msg.authority,
-                        PeerScheduleMutation::Action(
-                            M::ACTION,
-                            msg.request.schedule_id().to_owned(),
-                        ),
-                    )
+                let mutation = PeerScheduleMutation::Action(M::ACTION, id.clone());
+                match scheduler
+                    .peer_mutation(msg.authority.clone(), mutation)
                     .await
+                {
+                    Err(SendError::ActorNotRunning(_)) => {
+                        state.clear_stopped_scheduler(&scheduler);
+                    }
+                    result => {
+                        return result.map_err(RemoteNodeManagerState::schedule_mutation_error);
+                    }
+                }
+                let scheduler = state
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
+                let mutation = PeerScheduleMutation::Action(M::ACTION, id);
+                let result = scheduler.peer_mutation(msg.authority, mutation).await;
+                if matches!(result, Err(SendError::ActorNotRunning(_))) {
+                    state.clear_stopped_scheduler(&scheduler);
+                }
+                result.map_err(RemoteNodeManagerState::schedule_mutation_error)
             })
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn sessions_grant_creates_schedule_and_peer_actions_recover_stopped_scheduler() {
+        use crate::scheduler::SchedulerActor;
+        use crate::session::domain_schedule::ScheduleState;
+        use kameo::actor::Spawn;
+        use querymt_remote::{
+            MeshAccessStore, MeshStateStore,
+            peer_access::{GrantStore, PeerGrant, PeerGrantKey},
+        };
+
+        let (config, _plugins) = crate::agent::remote::tests::test_agent_config().await;
+        let session = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let slot = Arc::new(parking_lot::Mutex::new(None));
+        let manager = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config.clone(),
+            registry,
+            None,
+            slot.clone(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Arc::new(MeshAccessStore::new(
+            MeshStateStore::shared(&dir.path().join("mesh_state.json")).unwrap(),
+        ));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let admitted = PeerGrant::Custom {
+            sessions: true,
+            filesystem: true,
+            shell: true,
+            providers: vec![],
+        };
+        let live = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        let initial = grants
+            .replace_grant(&key, uuid::Uuid::nil(), admitted.clone())
+            .await
+            .unwrap();
+        let authority = PeerTurn::test_peer(key.clone(), admitted, grants.clone());
+        grants
+            .replace_grant(&key, initial.revision, live)
+            .await
+            .unwrap();
+
+        let created = manager
+            .ask(PeerNodeRequest {
+                authority: authority.clone(),
+                request: CreateRemoteSchedule {
+                    session_id: session.public_id,
+                    prompt: "schedule fixture".into(),
+                    trigger: ScheduleTrigger::Interval { seconds: 3600 },
+                    max_steps: None,
+                    max_cost_usd: None,
+                    max_runs: None,
+                },
+            })
+            .await
+            .unwrap();
+        let id = created.schedule_public_id;
+        let repo = config.schedule_repository.as_ref().unwrap();
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().config.origin,
+            authority.schedule_origin()
+        );
+
+        let running = slot.lock().take().unwrap();
+        running.shutdown().await;
+        let stopped = SchedulerActor::prepare();
+        let stale = SchedulerHandle::new(stopped.actor_ref().clone());
+        drop(stopped);
+        *slot.lock() = Some(stale.clone());
+
+        manager
+            .ask(PeerNodeRequest {
+                authority,
+                request: PauseRemoteSchedule {
+                    schedule_public_id: id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let replacement = slot.lock().take().unwrap();
+        assert!(!replacement.is_same_actor(&stale));
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().state,
+            ScheduleState::Paused
+        );
+        replacement.shutdown().await;
     }
 
     impl Message<ListRemoteSchedules> for RemoteNodeManager {

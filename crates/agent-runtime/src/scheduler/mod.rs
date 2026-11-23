@@ -217,15 +217,17 @@ impl SchedulerHandle {
         &self,
         peer: Arc<crate::agent::session_actor::PeerTurn>,
         mutation: PeerScheduleMutation,
-    ) -> Result<(), crate::error::AgentError> {
+    ) -> Result<(), kameo::error::SendError<(), crate::error::AgentError>> {
         self.actor_ref
             .ask(ApplyPeerScheduleMutation { peer, mutation })
             .mailbox_timeout(Self::CONTROL_TIMEOUT)
             .await
-            .map_err(|error| match error {
-                kameo::error::SendError::HandlerError(error) => error,
-                _ => crate::error::AgentError::Internal(error.to_string()),
-            })
+            .map_err(|error| error.map_msg(|_| ()))
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn is_same_actor(&self, other: &Self) -> bool {
+        self.actor_ref.id() == other.actor_ref.id()
     }
 
     /// Get a single schedule by public ID.
@@ -458,7 +460,12 @@ impl Message<PauseSchedule> for SchedulerActor {
         msg: PauseSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_pause_schedule(&msg.schedule_public_id).await;
+        if let Err(error) = self.handle_pause_schedule(&msg.schedule_public_id).await {
+            warn!(
+                "SchedulerActor: pause failed for {}: {error}",
+                msg.schedule_public_id
+            );
+        }
     }
 }
 
@@ -472,7 +479,12 @@ impl Message<ResumeSchedule> for SchedulerActor {
         msg: ResumeSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_resume_schedule(&msg.schedule_public_id).await;
+        if let Err(error) = self.handle_resume_schedule(&msg.schedule_public_id).await {
+            warn!(
+                "SchedulerActor: resume failed for {}: {error}",
+                msg.schedule_public_id
+            );
+        }
     }
 }
 
@@ -565,8 +577,14 @@ impl Message<ApplyPeerScheduleMutation> for SchedulerActor {
                 }
                 msg.peer.check_schedule_mutation().await?;
                 match action {
-                    ScheduleAction::Pause => self.handle_pause_schedule(&id).await,
-                    ScheduleAction::Resume => self.handle_resume_schedule(&id).await,
+                    ScheduleAction::Pause => self
+                        .handle_pause_schedule(&id)
+                        .await
+                        .map_err(storage_error)?,
+                    ScheduleAction::Resume => self
+                        .handle_resume_schedule(&id)
+                        .await
+                        .map_err(storage_error)?,
                     ScheduleAction::Trigger => self.fire_loaded_schedule(&id, schedule).await,
                     ScheduleAction::Delete if self.active_cycles.contains_key(&id) => {
                         self.pending_peer_deletes.insert(id, msg.peer);
@@ -1119,6 +1137,10 @@ impl SchedulerActor {
     }
 
     async fn fire_loaded_schedule(&mut self, schedule_public_id: &str, schedule: Schedule) {
+        if self.has_pending_delete(schedule_public_id) {
+            return;
+        }
+
         #[cfg(feature = "remote")]
         if schedule.state != ScheduleState::Armed {
             self.waiting_for_policy.remove(schedule_public_id);
@@ -1412,6 +1434,12 @@ impl SchedulerActor {
                     schedule_public_id: schedule_public_id.to_string(),
                 },
             );
+        } else if updated.state == ScheduleState::Paused {
+            if let Err(error) = self.schedule_store.update_schedule(updated).await {
+                warn!(
+                    "SchedulerActor: failed to record completion for {schedule_public_id}: {error}"
+                );
+            }
         } else {
             // Compute next_run_at and transition Running -> Armed
             updated.state = ScheduleState::Armed;
@@ -1535,6 +1563,10 @@ impl SchedulerActor {
                     consecutive_failures: schedule.consecutive_failures + 1,
                 },
             );
+        } else if updated.state == ScheduleState::Paused {
+            if let Err(error) = self.schedule_store.update_schedule(updated).await {
+                warn!("SchedulerActor: failed to record failure for {schedule_public_id}: {error}");
+            }
         } else {
             // Backoff and re-arm
             updated.state = ScheduleState::Armed;
@@ -1611,6 +1643,14 @@ impl SchedulerActor {
         self.delete_schedule(schedule_public_id).await
     }
 
+    fn has_pending_delete(&self, id: &str) -> bool {
+        #[cfg(feature = "remote")]
+        if self.pending_peer_deletes.contains_key(id) {
+            return true;
+        }
+        self.pending_deletes.contains(id)
+    }
+
     fn update_pending_delete_metrics(&mut self) {
         let count = self.pending_deletes.len();
         #[cfg(feature = "remote")]
@@ -1624,19 +1664,48 @@ impl SchedulerActor {
     }
 
     async fn apply_pending_delete(&mut self, id: &str) {
-        let local = self.pending_deletes.remove(id);
-        #[cfg(feature = "remote")]
-        let peer = self.pending_peer_deletes.remove(id);
-        self.update_pending_delete_metrics();
-        #[cfg(feature = "remote")]
-        let local = local
-            || match peer {
-                Some(peer) => peer.check_schedule_mutation().await.is_ok(),
-                None => false,
-            };
-        if local && let Err(error) = self.delete_schedule(id).await {
-            warn!("SchedulerActor: deferred delete failed for {id}: {error}");
+        if self.active_cycles.contains_key(id) {
+            return;
         }
+        if !self.pending_deletes.contains(id) {
+            #[cfg(feature = "remote")]
+            {
+                let Some(peer) = self.pending_peer_deletes.get(id) else {
+                    return;
+                };
+                match peer.check_schedule_mutation().await {
+                    Ok(()) => {}
+                    Err(crate::error::AgentError::MeshAccessDenied) => {
+                        self.pending_peer_deletes.remove(id);
+                        self.update_pending_delete_metrics();
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "SchedulerActor: deferred delete authorization failed for {id}: {error}"
+                        );
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(feature = "remote"))]
+            return;
+        }
+        if let Err(error) = self.delete_schedule(id).await {
+            // The schedule may have already disappeared (e.g. its session was deleted).
+            if matches!(self.schedule_store.get_schedule(id).await, Ok(None)) {
+                self.clear_pending_delete(id);
+            } else {
+                warn!("SchedulerActor: deferred delete failed for {id}: {error}");
+            }
+        }
+    }
+
+    fn clear_pending_delete(&mut self, id: &str) {
+        self.pending_deletes.remove(id);
+        #[cfg(feature = "remote")]
+        self.pending_peer_deletes.remove(id);
+        self.update_pending_delete_metrics();
     }
 
     async fn delete_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
@@ -1645,6 +1714,7 @@ impl SchedulerActor {
             .await?;
 
         // Remove from in-memory queues after the durable mutation.
+        self.clear_pending_delete(schedule_public_id);
         #[cfg(feature = "remote")]
         self.waiting_for_policy.remove(schedule_public_id);
         self.deadline_queue.remove(schedule_public_id);
@@ -1658,7 +1728,7 @@ impl SchedulerActor {
     }
 
     /// Pause a schedule.
-    pub async fn handle_pause_schedule(&mut self, schedule_public_id: &str) {
+    pub async fn handle_pause_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
         // Try CAS from Armed -> Paused
         let from_armed = self
             .schedule_store
@@ -1667,8 +1737,7 @@ impl SchedulerActor {
                 ScheduleState::Armed,
                 ScheduleState::Paused,
             )
-            .await
-            .unwrap_or(false);
+            .await?;
 
         if !from_armed {
             // Try CAS from Running -> Paused (pause requested; current turn completes)
@@ -1679,15 +1748,14 @@ impl SchedulerActor {
                     ScheduleState::Running,
                     ScheduleState::Paused,
                 )
-                .await
-                .unwrap_or(false);
+                .await?;
 
             if !from_running {
                 debug!(
                     "SchedulerActor: pause failed for {} (not armed or running)",
                     schedule_public_id
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -1708,10 +1776,11 @@ impl SchedulerActor {
         );
 
         info!("SchedulerActor: paused schedule {}", schedule_public_id);
+        Ok(())
     }
 
     /// Resume a paused schedule.
-    pub async fn handle_resume_schedule(&mut self, schedule_public_id: &str) {
+    pub async fn handle_resume_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
         let cas_ok = self
             .schedule_store
             .update_schedule_state(
@@ -1719,19 +1788,18 @@ impl SchedulerActor {
                 ScheduleState::Paused,
                 ScheduleState::Armed,
             )
-            .await
-            .unwrap_or(false);
+            .await?;
 
         if !cas_ok {
             debug!(
                 "SchedulerActor: resume failed for {} (not paused)",
                 schedule_public_id
             );
-            return;
+            return Ok(());
         }
 
         // Reload and re-enqueue
-        if let Ok(Some(schedule)) = self.schedule_store.get_schedule(schedule_public_id).await {
+        if let Some(schedule) = self.schedule_store.get_schedule(schedule_public_id).await? {
             // Recompute next_run_at for interval schedules
             if let ScheduleTrigger::Interval { seconds } = &schedule.trigger {
                 let mut updated = schedule.clone();
@@ -1741,7 +1809,7 @@ impl SchedulerActor {
                     OffsetDateTime::now_utc(),
                 ));
                 updated.updated_at = OffsetDateTime::now_utc();
-                let _ = self.schedule_store.update_schedule(updated.clone()).await;
+                self.schedule_store.update_schedule(updated.clone()).await?;
                 self.enqueue_schedule(&updated).await;
             } else {
                 self.enqueue_schedule(&schedule).await;
@@ -1756,6 +1824,7 @@ impl SchedulerActor {
         );
 
         info!("SchedulerActor: resumed schedule {}", schedule_public_id);
+        Ok(())
     }
 
     /// Handle an incoming event from EventFanout that may match an event-driven schedule.
@@ -1858,10 +1927,24 @@ impl SchedulerActor {
 
     /// Process a deadline that has been reached.
     pub async fn handle_deadline_reached(&mut self, schedule_public_id: &str) {
-        // Remove from queue (it was the top entry)
+        let schedule = self.schedule_store.get_schedule(schedule_public_id).await;
         self.deadline_queue.remove(schedule_public_id);
+        match schedule {
+            Ok(Some(schedule)) if schedule.state == ScheduleState::Armed => {
+                if let Some(next) = schedule.next_run_at {
+                    if next > OffsetDateTime::now_utc() {
+                        // A queued wake can outlive a trigger or a pause/resume.
+                        self.enqueue_schedule(&schedule).await;
+                        return;
+                    }
+                    self.fire_loaded_schedule(schedule_public_id, schedule)
+                        .await;
+                }
+            }
+            Err(error) => warn!("SchedulerActor: failed to load {schedule_public_id}: {error}"),
+            _ => {}
+        }
         self.reschedule_wake().await;
-        self.fire_schedule(schedule_public_id).await;
     }
 
     /// Handle a TriggerNow request — fire immediately regardless of deadline.
@@ -1920,6 +2003,16 @@ impl SchedulerActor {
             }
         }
 
+        let pending = self.pending_deletes.clone();
+        #[cfg(feature = "remote")]
+        let pending = pending
+            .into_iter()
+            .chain(self.pending_peer_deletes.keys().cloned())
+            .collect::<HashSet<_>>();
+        for id in pending {
+            self.apply_pending_delete(&id).await;
+        }
+
         #[cfg(feature = "remote")]
         if self
             .config
@@ -1936,6 +2029,7 @@ impl SchedulerActor {
             for schedule in armed {
                 if let Some(next_run) = schedule.next_run_at
                     && next_run <= now
+                    && !self.has_pending_delete(&schedule.public_id)
                 {
                     self.metrics.reconciliation_overdue_fires_total += 1;
                     info!(
@@ -2317,55 +2411,89 @@ mod unit_tests {
     }
 
     #[cfg(feature = "remote")]
+    use querymt_remote::{
+        NodeId,
+        peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+            PolicyEffect,
+        },
+    };
+    #[cfg(feature = "remote")]
+    use tokio::sync::broadcast;
+
+    #[cfg(feature = "remote")]
+    struct ScheduleGrants {
+        changes: broadcast::Sender<PolicyChange>,
+        unavailable: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "remote")]
+    #[async_trait::async_trait]
+    impl GrantStore for ScheduleGrants {
+        async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+            if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(GrantStoreError::Backend(
+                    std::io::Error::other("test policy outage").into(),
+                ));
+            }
+            Ok(PeerGrantState {
+                revision: uuid::Uuid::nil(),
+                grant: PeerGrant::Full,
+            })
+        }
+        async fn replace_grant(
+            &self,
+            _: &PeerGrantKey,
+            _: uuid::Uuid,
+            _: PeerGrant,
+        ) -> Result<PeerGrantState, GrantStoreError> {
+            unreachable!()
+        }
+        async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+            unreachable!()
+        }
+        fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+            Some(self.changes.subscribe())
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    async fn grant_schedule(
+        store: &dyn ScheduleRepository,
+    ) -> (
+        Arc<crate::agent::session_actor::PeerTurn>,
+        Arc<ScheduleGrants>,
+    ) {
+        let grants = Arc::new(ScheduleGrants {
+            changes: broadcast::channel(8).0,
+            unavailable: false.into(),
+        });
+        let peer = crate::agent::session_actor::PeerTurn::test_peer(
+            PeerGrantKey {
+                host: NodeId::from_peer_id(libp2p::PeerId::random()),
+                peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+            },
+            PeerGrant::Full,
+            grants.clone(),
+        );
+        let mut schedule = store.get_schedule("sched").await.unwrap().unwrap();
+        schedule.config.origin = peer.schedule_origin();
+        store.update_schedule(schedule).await.unwrap();
+        (peer, grants)
+    }
+
+    #[cfg(feature = "remote")]
     #[tokio::test]
     async fn queued_peer_schedule_mutation_rechecks_authority_and_preserves_storage_errors() {
         use crate::{agent::session_actor::PeerTurn, error::AgentError};
-        use querymt_remote::{
-            NodeId,
-            peer_access::{
-                GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
-                PolicyEffect,
-            },
-        };
-        use tokio::sync::broadcast;
+        use kameo::error::SendError;
 
-        struct Grants(broadcast::Sender<PolicyChange>);
-        #[async_trait::async_trait]
-        impl GrantStore for Grants {
-            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
-                Ok(PeerGrantState {
-                    revision: uuid::Uuid::nil(),
-                    grant: PeerGrant::Full,
-                })
-            }
-            async fn replace_grant(
-                &self,
-                _: &PeerGrantKey,
-                _: uuid::Uuid,
-                _: PeerGrant,
-            ) -> Result<PeerGrantState, GrantStoreError> {
-                unreachable!()
-            }
-            async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
-                unreachable!()
-            }
-            fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
-                Some(self.0.subscribe())
-            }
-        }
         let (actor, store, db) = scheduler_with_db().await;
-        let (changes, _) = broadcast::channel(8);
-        let grant_store = Arc::new(Grants(changes.clone()));
-        let key = PeerGrantKey {
-            host: NodeId::from_peer_id(libp2p::PeerId::random()),
-            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
-        };
-        let admitted = PeerTurn::test_peer(key.clone(), PeerGrant::Full, grant_store.clone());
-        let mut schedule = store.get_schedule("sched").await.unwrap().unwrap();
-        schedule.config.origin = admitted.schedule_origin();
-        store.update_schedule(schedule).await.unwrap();
+        let (admitted, grant_store) = grant_schedule(store.as_ref()).await;
+        let key = admitted.key.clone();
         // The current grant is Full again, but the queued request crossed a revocation.
-        changes
+        grant_store
+            .changes
             .send(PolicyChange {
                 key: key.clone(),
                 effect: PolicyEffect::Grant(PeerGrant::None),
@@ -2375,7 +2503,7 @@ mod unit_tests {
         let delete = || PeerScheduleMutation::Action(ScheduleAction::Delete, "sched".into());
         assert!(matches!(
             handle.peer_mutation(admitted, delete()).await,
-            Err(AgentError::MeshAccessDenied)
+            Err(SendError::HandlerError(AgentError::MeshAccessDenied))
         ));
         assert!(store.get_schedule("sched").await.unwrap().is_some());
 
@@ -2385,7 +2513,7 @@ mod unit_tests {
         let fresh = PeerTurn::test_peer(key, PeerGrant::Full, grant_store);
         assert!(matches!(
             handle.peer_mutation(fresh, delete()).await,
-            Err(AgentError::Internal(_))
+            Err(SendError::HandlerError(AgentError::Internal(_)))
         ));
         handle.shutdown().await;
     }
@@ -2485,6 +2613,169 @@ mod unit_tests {
         assert!(!actor.active_cycles.contains_key("sched"));
         let schedule = store.get_schedule("sched").await.unwrap().unwrap();
         assert_eq!(schedule.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn pause_survives_active_cycle_completion_and_failure_until_resumed() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        start_cycle(&mut actor, "completed");
+        actor.handle_pause_schedule("sched").await.unwrap();
+        actor.handle_cycle_completed("sched", "completed").await;
+        let paused = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(paused.state, ScheduleState::Paused);
+        assert_eq!(paused.run_count, 1);
+        assert!(actor.deadline_queue.peek().is_none());
+
+        actor.handle_resume_schedule("sched").await.unwrap();
+        let resumed = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(resumed.state, ScheduleState::Armed);
+        assert!(resumed.next_run_at.is_some());
+        assert_eq!(actor.deadline_queue.peek().unwrap().1, "sched");
+
+        store
+            .update_schedule_state("sched", ScheduleState::Armed, ScheduleState::Running)
+            .await
+            .unwrap();
+        start_cycle(&mut actor, "failed");
+        actor.handle_pause_schedule("sched").await.unwrap();
+        actor
+            .handle_cycle_failed_inner("sched", Some("failed"), "test failure")
+            .await;
+        let paused = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(paused.state, ScheduleState::Paused);
+        assert_eq!(paused.consecutive_failures, 1);
+        assert!(actor.deadline_queue.peek().is_none());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_pause_and_resume_report_write_errors_without_treating_noops_as_errors() {
+        use crate::error::AgentError;
+        use kameo::error::SendError;
+
+        let (actor, store, db) = scheduler_with_db().await;
+        let (peer, _) = grant_schedule(store.as_ref()).await;
+        let handle = SchedulerHandle::new(kameo::actor::Spawn::spawn(actor));
+        let action = |action| PeerScheduleMutation::Action(action, "sched".into());
+        let fail_write = "CREATE TRIGGER reject_state BEFORE UPDATE OF state ON schedules BEGIN SELECT RAISE(ABORT, 'test write outage'); END;";
+        // The first pause CAS misses (Running); the fallback write must report the error.
+        db.lock().execute_batch(fail_write).unwrap();
+        assert!(matches!(
+            handle
+                .peer_mutation(peer.clone(), action(ScheduleAction::Pause))
+                .await,
+            Err(SendError::HandlerError(AgentError::Internal(_)))
+        ));
+        db.lock()
+            .execute_batch("DROP TRIGGER reject_state;")
+            .unwrap();
+        handle
+            .peer_mutation(peer.clone(), action(ScheduleAction::Pause))
+            .await
+            .unwrap();
+        handle
+            .peer_mutation(peer.clone(), action(ScheduleAction::Pause))
+            .await
+            .unwrap();
+        db.lock().execute_batch(fail_write).unwrap();
+        assert!(matches!(
+            handle
+                .peer_mutation(peer.clone(), action(ScheduleAction::Resume))
+                .await,
+            Err(SendError::HandlerError(AgentError::Internal(_)))
+        ));
+        assert_eq!(
+            store.get_schedule("sched").await.unwrap().unwrap().state,
+            ScheduleState::Paused
+        );
+        db.lock()
+            .execute_batch("DROP TRIGGER reject_state;")
+            .unwrap();
+        handle
+            .peer_mutation(peer, action(ScheduleAction::Resume))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_schedule("sched").await.unwrap().unwrap().state,
+            ScheduleState::Armed
+        );
+        handle.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn deferred_peer_delete_blocks_firing_and_rechecks_authority_on_retry() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        for revoke in [false, true] {
+            let (mut actor, store, db) = scheduler_with_db().await;
+            let (peer, grants) = grant_schedule(store.as_ref()).await;
+            start_cycle(&mut actor, "cycle");
+            let actor_ref = kameo::actor::Spawn::spawn(actor);
+            let handle = SchedulerHandle::new(actor_ref.clone());
+            handle
+                .peer_mutation(
+                    peer.clone(),
+                    PeerScheduleMutation::Action(ScheduleAction::Delete, "sched".into()),
+                )
+                .await
+                .unwrap();
+            db.lock().execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON schedules BEGIN SELECT RAISE(ABORT, 'test delete outage'); END;").unwrap();
+            actor_ref
+                .ask(CycleCompleted {
+                    schedule_public_id: "sched".into(),
+                    turn_id: "cycle".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(handle.metrics().await.pending_deletes, 1);
+
+            let mut schedule = store.get_schedule("sched").await.unwrap().unwrap();
+            schedule.next_run_at = Some(OffsetDateTime::now_utc() - time::Duration::SECOND);
+            store.update_schedule(schedule).await.unwrap();
+            db.lock()
+                .execute_batch("DROP TRIGGER reject_delete;")
+                .unwrap();
+            grants.unavailable.store(true, Relaxed);
+            actor_ref.ask(Reconcile).await.unwrap();
+            let metrics = handle.metrics().await;
+            assert_eq!(metrics.pending_deletes, 1);
+            assert_eq!(metrics.reconciliation_overdue_fires_total, 0);
+
+            if revoke {
+                grants
+                    .changes
+                    .send(PolicyChange {
+                        key: peer.key.clone(),
+                        effect: PolicyEffect::Grant(PeerGrant::None),
+                    })
+                    .unwrap();
+            }
+            grants.unavailable.store(false, Relaxed);
+            actor_ref.ask(Reconcile).await.unwrap();
+            assert_eq!(handle.metrics().await.pending_deletes, 0);
+            assert_eq!(store.get_schedule("sched").await.unwrap().is_some(), revoke);
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_deadline_does_not_fire_before_the_new_deadline() {
+        let (mut actor, store) = scheduler_with_running_schedule().await;
+        start_cycle(&mut actor, "triggered");
+        actor.handle_cycle_completed("sched", "triggered").await;
+        let mut armed = store.get_schedule("sched").await.unwrap().unwrap();
+        actor.handle_deadline_reached("sched").await;
+        let current = store.get_schedule("sched").await.unwrap().unwrap();
+        assert_eq!(current.next_run_at, armed.next_run_at);
+        assert_eq!(current.consecutive_failures, 0);
+        assert_eq!(actor.deadline_queue.peek().unwrap().1, "sched");
+
+        armed.next_run_at = Some(OffsetDateTime::now_utc() - time::Duration::SECOND);
+        store.update_schedule(armed).await.unwrap();
+        actor.handle_deadline_reached("sched").await;
+        // The due cycle attempts to run but the fixture has no live session.
+        assert_eq!(actor.metrics.failures_total, 1);
     }
 
     #[tokio::test]
