@@ -1588,7 +1588,8 @@ mod ledger {
             let f = Fixture::new().await;
             let other = PeerGrantKey {
                 host: f.key.host.clone(),
-                peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+                peer: NodeId::parse("12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv")
+                    .unwrap(),
             };
             let mut watch = f.store.subscribe_peer_changes(&f.key).unwrap();
             let pending = f.store.reserve(f.request("a", 10, TUESDAY)).await.unwrap();
