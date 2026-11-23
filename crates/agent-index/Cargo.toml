@@ -19,7 +19,7 @@ log.workspace = true
 tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
 tokio = { version = "1.0", features = ["full"] }
 ignore = "0.4.25"
-notify = "8"
+notify = "9"
 arc-swap = "1.7"
 grep-searcher = "0.1"
 grep-regex = "0.1"
