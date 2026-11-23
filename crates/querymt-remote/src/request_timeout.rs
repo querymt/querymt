@@ -52,6 +52,23 @@ where
     R: serde::de::DeserializeOwned,
     E: serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display,
 {
+    ask_sharing_v1_with_timeouts(mesh, actor_ref, msg, timeout, timeout).await
+}
+
+/// Send a v1 ask while retaining distinct mailbox and reply timeouts.
+pub async fn ask_sharing_v1_with_timeouts<A, M, R, E>(
+    mesh: &MeshHandle,
+    actor_ref: &RemoteActorRef<A>,
+    msg: &M,
+    mailbox_timeout: Duration,
+    reply_timeout: Duration,
+) -> Result<R, SharingAskError<E>>
+where
+    A: kameo::Actor + RemoteActor + RemoteMessage<M>,
+    M: serde::Serialize + Send + Sync + 'static,
+    R: serde::de::DeserializeOwned,
+    E: serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display,
+{
     let actor_id = actor_ref.id();
     let peer = actor_id
         .peer_id()
@@ -66,12 +83,12 @@ where
             actor_remote_id: <A as RemoteActor>::REMOTE_ID.into(),
             message_remote_id: <A as RemoteMessage<M>>::REMOTE_ID.into(),
             payload,
-            mailbox_timeout: Some(timeout),
-            reply_timeout: Some(timeout),
+            mailbox_timeout: Some(mailbox_timeout),
+            reply_timeout: Some(reply_timeout),
             immediate: false,
         },
     );
-    let response = tokio::time::timeout(timeout, exchange)
+    let response = tokio::time::timeout(reply_timeout, exchange)
         .await
         .map_err(|_| {
             SharingCallError::Transport(libp2p::request_response::OutboundFailure::Timeout)

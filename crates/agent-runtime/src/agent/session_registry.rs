@@ -1085,13 +1085,23 @@ pub(crate) async fn prepare_remote_attachment(
         .as_ref()
         .is_none_or(|mesh| mesh.inbound_router().is_none())
     {
-        if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
-            abort_prepared_remote_attachment(candidate).await;
-            return Err(AgentError::RemoteActor(format!(
-                "failed to link event relay to remote session: {error}"
-            )));
+        match candidate.relay_ref.link_remote(&remote_ref).await {
+            Ok(()) => candidate.linked = true,
+            // The guarded ingress refuses generic links even after accepting
+            // a peer-bound subscription. The coordinator checks that same
+            // session's liveness before installing the attachment.
+            Err(kameo::error::RemoteSendError::BadActorType) => {
+                // Kameo inserts the local link before asking the owner.
+                // Unlink removes it locally even if the owner also refuses Unlink.
+                let _ = candidate.relay_ref.unlink_remote(&remote_ref).await;
+            }
+            Err(error) => {
+                abort_prepared_remote_attachment(candidate).await;
+                return Err(AgentError::RemoteActor(format!(
+                    "failed to link event relay to remote session: {error}"
+                )));
+            }
         }
-        candidate.linked = true;
     }
     // Do not publish the relay until the owner accepts its subscription.
     if let Some(mesh) = candidate.mesh.clone() {

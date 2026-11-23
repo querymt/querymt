@@ -31,14 +31,7 @@ impl LocalAgentHandle {
     fn map_remote_node_manager_error(
         error: kameo::error::RemoteSendError<crate::error::AgentError>,
     ) -> agent_client_protocol::Error {
-        use crate::error::AgentError;
-
-        match querymt_remote::classify_remote_send_error(error) {
-            Ok(failure) => {
-                agent_client_protocol::Error::from(AgentError::from_transport_failure(failure))
-            }
-            Err(handler_error) => agent_client_protocol::Error::from(handler_error),
-        }
+        crate::error::AgentError::from_remote_send(error).into()
     }
 
     #[cfg(feature = "remote")]

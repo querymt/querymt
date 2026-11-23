@@ -38,7 +38,7 @@ mod router;
 mod wire;
 pub use router::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 pub(crate) use wire::{ResponseSender, SharingRequest, SharingResponse, SharingWire};
-pub use wire::{SharingCallError, SharingRejection};
+pub use wire::{SharingCallError, SharingRejection, is_legacy_access_denial};
 
 #[cfg(test)]
 mod tests;

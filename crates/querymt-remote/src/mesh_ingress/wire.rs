@@ -29,6 +29,18 @@ pub enum SharingRejection {
     Changed,
 }
 
+/// Recognize the two access refusals encoded by guarded owners on the
+/// legacy Kameo wire. Match only the exact variant and protocol text, not
+/// arbitrary serialization errors or handler messages.
+pub fn is_legacy_access_denial<E>(error: &kameo::error::RemoteSendError<E>) -> bool {
+    use kameo::error::RemoteSendError;
+    match error {
+        RemoteSendError::DeserializeMessage(message) => message == "mesh access denied",
+        RemoteSendError::SerializeReply(message) => message == "mesh access changed before reply",
+        _ => false,
+    }
+}
+
 /// Failure of an outbound grant-aware exchange.
 #[derive(Debug, Error)]
 pub enum SharingCallError {

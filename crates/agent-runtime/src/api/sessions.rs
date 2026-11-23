@@ -242,6 +242,25 @@ enum AcpRemoteSource {
 
 #[cfg(feature = "remote")]
 impl AcpRemoteCursor {
+    fn next_owner(self, owner_count: usize) -> Option<String> {
+        (self.node + 1 < owner_count).then(|| format!("remote:{}:0", self.node + 1))
+    }
+
+    fn denied_owner_page(
+        self,
+        owner_count: usize,
+        single_owner: bool,
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        if single_owner {
+            return Err(AcpSessionListError::MeshAccessDenied);
+        }
+        Ok(AcpSessionListPage {
+            sessions: Vec::new(),
+            next_cursor: self.next_owner(owner_count),
+            total_count: 0,
+        })
+    }
+
     /// Restart after a source switch or an untagged legacy continuation.
     fn offset_for(self, source: AcpRemoteSource) -> u32 {
         if self.source == Some(source) {
@@ -250,6 +269,27 @@ impl AcpRemoteCursor {
             0
         }
     }
+}
+
+#[cfg(all(test, feature = "remote"))]
+#[test]
+fn denied_acp_owner_page_advances_without_bookmarks_or_an_old_offset() {
+    let cursor = parse_acp_remote_cursor("remote:0:100:bookmarks").unwrap();
+    let page = cursor.denied_owner_page(2, false).unwrap();
+    assert!(page.sessions.is_empty());
+    assert_eq!(page.total_count, 0);
+    assert_eq!(page.next_cursor.as_deref(), Some("remote:1:0"));
+    assert!(
+        cursor
+            .denied_owner_page(1, false)
+            .unwrap()
+            .next_cursor
+            .is_none()
+    );
+    assert!(matches!(
+        cursor.denied_owner_page(1, true),
+        Err(AcpSessionListError::MeshAccessDenied)
+    ));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -891,6 +931,7 @@ impl AgentSessions {
                 remote_scope,
                 lifecycle,
                 cursor,
+                source == AcpSessionSource::Remote && remote_nodes.len() == 1,
             )
             .await?;
             Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
@@ -925,6 +966,7 @@ impl AgentSessions {
                 remote_scope,
                 lifecycle,
                 AcpRemoteCursor::default(),
+                false,
             )
             .await?;
             page.sessions.extend(remote_page.sessions);
@@ -945,6 +987,7 @@ impl AgentSessions {
         scope: SessionScope,
         lifecycle: SessionLifecycleFilter,
         cursor: AcpRemoteCursor,
+        single_owner: bool,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let node_id = nodes
             .get(cursor.node)
@@ -967,14 +1010,7 @@ impl AgentSessions {
         } else {
             (None, SessionScope::All)
         };
-        let access_denied = |error: &agent_client_protocol::Error| {
-            error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(serde_json::Value::as_str)
-                == Some("mesh_access_denied")
-        };
+        let access_denied = crate::error::AgentError::is_acp_mesh_access_denied;
         let owner_page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let manager = agent.find_node_manager(node_id).await?;
             match agent
@@ -1020,7 +1056,7 @@ impl AgentSessions {
                 (entries, next_offset, true, remote_lifecycles)
             }
             Ok(Err(error)) if access_denied(&error) => {
-                return Err(AcpSessionListError::MeshAccessDenied);
+                return cursor.denied_owner_page(nodes.len(), single_owner);
             }
             Ok(Err(error)) if lifecycle.is_filtered() => {
                 return Err(anyhow!(
@@ -1072,9 +1108,7 @@ impl AgentSessions {
         let source = if live { "live" } else { "bookmarks" };
         let next_cursor = next_offset
             .map(|offset| format!("remote:{}:{offset}:{source}", cursor.node))
-            .or_else(|| {
-                (cursor.node + 1 < nodes.len()).then(|| format!("remote:{}:0", cursor.node + 1))
-            });
+            .or_else(|| cursor.next_owner(nodes.len()));
         // Ask the store about just this page's ids instead of scanning every local session:
         // the scan made each remote page cost O(all local sessions).
         let page_ids: Vec<String> = entries

@@ -171,13 +171,9 @@ impl SessionActorRef {
         }
     }
 
-    pub(crate) fn uses_guarded_mesh(&self) -> bool {
-        matches!(self, Self::Remote { mesh: Some(mesh), .. } if mesh.inbound_router().is_some())
-    }
-
     /// Check the current grant without transferring history before serving a cached read.
     pub(crate) async fn check_history_access(&self) -> Result<(), AgentError> {
-        if self.uses_guarded_mesh() {
+        if self.is_remote() {
             self.get_event_stream_since(Some(i64::MAX), 1).await?;
         }
         Ok(())
@@ -214,6 +210,9 @@ impl SessionActorRef {
                 Err(error) => error,
             },
         };
+        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
+            return Err(FileProxyError::AccessDenied);
+        }
         Err(match querymt_remote::classify_remote_send_error(error) {
             Ok(failure) => FileProxyError::from_transport_failure(failure),
             Err(error) => error,
@@ -339,6 +338,9 @@ impl SessionActorRef {
         error: kameo::error::RemoteSendError<AgentError>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
+        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
+            return AgentError::MeshAccessDenied;
+        }
         match classify_remote_send_error_with_timeout_message(error, timeout_message) {
             Ok(failure) => AgentError::from_transport_failure(failure),
             // Handler errors are delivered remote-side and pass through unchanged.
@@ -350,6 +352,9 @@ impl SessionActorRef {
         error: kameo::error::RemoteSendError<kameo::error::Infallible>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
+        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
+            return AgentError::MeshAccessDenied;
+        }
         match classify_remote_send_error_with_timeout_message(error, timeout_message) {
             Ok(failure) => AgentError::from_transport_failure(failure),
             Err(never) => match never {},
@@ -1309,34 +1314,64 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                if let Some(mesh) = mesh
-                    .as_deref()
-                    .filter(|mesh| mesh.inbound_router().is_some())
-                {
-                    return Self::read_remote(
-                        Some(mesh),
-                        actor_ref,
-                        &messages::GetRuntimeStatus,
+                use querymt_remote::request_timeout::{
+                    SharingAskError, ask_sharing_v1_with_timeouts, with_sharing_protocol,
+                };
+
+                let legacy = async {
+                    actor_ref
+                        .ask(&messages::GetRuntimeStatus)
+                        .mailbox_timeout(mailbox_timeout)
+                        .reply_timeout(reply_timeout)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            Self::map_infallible_timeout_remote_send_error(
+                                error,
+                                format!(
+                                    "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
+                                    mailbox_timeout.as_millis(),
+                                    reply_timeout.as_millis()
+                                ),
+                            )
+                        })
+                };
+                if let Some(mesh) = mesh.as_deref() {
+                    with_sharing_protocol(
+                        mesh,
+                        actor_ref.id().peer_id().copied(),
                         reply_timeout,
+                        async {
+                            ask_sharing_v1_with_timeouts(
+                                mesh,
+                                actor_ref,
+                                &messages::GetRuntimeStatus,
+                                mailbox_timeout,
+                                reply_timeout,
+                            )
+                            .await
+                            .map_err(
+                                |error: SharingAskError<kameo::error::Infallible>| {
+                                    AgentError::from_sharing_ask(match error {
+                                        SharingAskError::Actor(error) => {
+                                            SharingAskError::Actor(error.map_err(Into::into))
+                                        }
+                                        SharingAskError::Sharing(error) => {
+                                            SharingAskError::Sharing(error)
+                                        }
+                                    })
+                                },
+                            )
+                        },
+                        legacy,
                     )
-                    .await;
-                }
-                actor_ref
-                    .ask(&messages::GetRuntimeStatus)
-                    .mailbox_timeout(mailbox_timeout)
-                    .reply_timeout(reply_timeout)
-                    .send()
                     .await
-                    .map_err(|e| {
-                        Self::map_infallible_timeout_remote_send_error(
-                            e,
-                            format!(
-                                "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
-                                mailbox_timeout.as_millis(),
-                                reply_timeout.as_millis()
-                            ),
-                        )
-                    })
+                    .map_err(|error| {
+                        AgentError::from_sharing_ask(SharingAskError::Sharing(error))
+                    })?
+                } else {
+                    legacy.await
+                }
             }
         }
     }

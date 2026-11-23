@@ -141,10 +141,11 @@ async fn legacy_router_requires_transport_bound_full_grant() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        router.ask(allowed, request(actor, allowed)).await,
-        Err(RemoteSendError::DeserializeMessage(_))
-    ));
+    let denied = router
+        .ask(allowed, request(actor, allowed))
+        .await
+        .unwrap_err();
+    assert!(super::super::is_legacy_access_denial(&denied));
     let full = store
         .replace_grant(&allowed_key, custom.revision, PeerGrant::Full)
         .await
@@ -173,10 +174,15 @@ async fn legacy_router_requires_transport_bound_full_grant() {
         SwarmResponse::Link(Err(RemoteSendError::BadActorType))
     ));
     store.unavailable.store(true, Ordering::Relaxed);
+    let unavailable = router
+        .ask(allowed, request(actor, allowed))
+        .await
+        .unwrap_err();
     assert!(matches!(
-        router.ask(allowed, request(actor, allowed)).await,
-        Err(RemoteSendError::DeserializeMessage(_))
+        unavailable,
+        RemoteSendError::DeserializeMessage(_)
     ));
+    assert!(!super::super::is_legacy_access_denial(&unavailable));
     store.unavailable.store(false, Ordering::Relaxed);
     store
         .replace_grant(&allowed_key, full.revision, PeerGrant::None)
@@ -454,10 +460,9 @@ async fn legacy_router_suppresses_reply_after_grant_changes() {
             .await
             .unwrap();
         finish.notify_one();
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(RemoteSendError::SerializeReply(_))
-        ));
+        let changed = task.await.unwrap().unwrap_err();
+        assert!(matches!(changed, RemoteSendError::SerializeReply(_)));
+        assert!(super::super::is_legacy_access_denial(&changed));
     })
     .await
     .unwrap();
