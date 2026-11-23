@@ -292,18 +292,22 @@ pub fn compact_inspect(
         } else {
             Value::Array(Vec::new())
         },
-        "delegations": compact_delegations(snapshot),
+        "delegations": compact_delegations(session_id, snapshot),
         "errors": compact_errors(snapshot),
     })
 }
 
-fn compact_delegations(snapshot: Option<&Value>) -> Vec<Value> {
+/// The delegated children of a loaded session: the latest `subagent_update`
+/// of each, from the snapshot's `subagentUpdates`, in the same shape as the
+/// live `delegation` events.
+fn compact_delegations(session_id: &str, snapshot: Option<&Value>) -> Vec<Value> {
+    let parent = json!(session_id);
     snapshot
-        .and_then(|snapshot| snapshot.get("delegationUpdates"))
+        .and_then(|snapshot| snapshot.get("subagentUpdates"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(events::compact_delegation_update)
+        .filter_map(|update| events::compact_subagent_update(Some(&parent), update))
         .collect()
 }
 
@@ -805,6 +809,31 @@ pub fn stop_reason_name(reason: &acp::StopReason) -> String {
         acp::StopReason::Cancelled => "cancelled".to_string(),
         other => format!("{other:?}"),
     }
+}
+
+/// The turn usage a `session/prompt` response reported, for the prompt's
+/// result. A response without `usage` (or a delivery that has no prompt
+/// response) is `{"available": false}`: absent, never zero counts.
+pub fn usage_summary(usage: Option<&acp::Usage>) -> Value {
+    let Some(usage) = usage else {
+        return json!({ "available": false });
+    };
+    let mut summary = json!({
+        "available": true,
+        "totalTokens": usage.total_tokens,
+        "inputTokens": usage.input_tokens,
+        "outputTokens": usage.output_tokens,
+    });
+    for (key, value) in [
+        ("thoughtTokens", usage.thought_tokens),
+        ("cachedReadTokens", usage.cached_read_tokens),
+        ("cachedWriteTokens", usage.cached_write_tokens),
+    ] {
+        if let Some(value) = value {
+            summary[key] = json!(value);
+        }
+    }
+    summary
 }
 
 pub async fn discard_queued(

@@ -59,6 +59,26 @@ enum RpcFailure {
 type RpcResult = Result<Value, RpcFailure>;
 type PendingRequests = Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>;
 type Outbound = (Message, Option<oneshot::Sender<Result<(), String>>>);
+/// The compact `cursor` events announced on this connection, per session.
+type AnnouncedCursors = Arc<Mutex<HashMap<String, Vec<Value>>>>;
+
+/// Remembers an announced cursor once: a replay and a live announcement of the
+/// same anchor carry the same id.
+async fn record_cursor(cursors: &Mutex<HashMap<String, Vec<Value>>>, event: &Value) {
+    let (Some(session_id), Some(cursor_id)) =
+        (event["sessionId"].as_str(), event["cursorId"].as_str())
+    else {
+        return;
+    };
+    let mut cursors = cursors.lock().await;
+    let known = cursors.entry(session_id.to_owned()).or_default();
+    if !known
+        .iter()
+        .any(|known| known["cursorId"].as_str() == Some(cursor_id))
+    {
+        known.push(event.clone());
+    }
+}
 
 #[derive(Default)]
 struct AssistantText {
@@ -119,6 +139,7 @@ pub struct AcpClient {
     next_id: AtomicI64,
     initialized: Mutex<Option<acp::InitializeResponse>>,
     assistant_text: Arc<Mutex<AssistantText>>,
+    cursors: AnnouncedCursors,
     event_sink: EventSink,
     tasks: [tokio::task::JoinHandle<()>; 2],
 }
@@ -214,6 +235,8 @@ impl AcpClient {
             ..Default::default()
         }));
         let assistant_read = assistant_text.clone();
+        let cursors: AnnouncedCursors = Arc::new(Mutex::new(HashMap::new()));
+        let cursors_read = cursors.clone();
         let events_read = event_sink.clone();
         let reader = tokio::spawn(async move {
             while let Some(message) = read.next().await {
@@ -223,6 +246,7 @@ impl AcpClient {
                             &pending_read,
                             &tx_read,
                             &assistant_read,
+                            &cursors_read,
                             text.as_ref(),
                             permission,
                             &events_read,
@@ -254,6 +278,7 @@ impl AcpClient {
             next_id: AtomicI64::new(1),
             initialized: Mutex::new(None),
             assistant_text,
+            cursors,
             event_sink,
             tasks: [writer, reader],
         })
@@ -342,6 +367,32 @@ impl AcpClient {
     ) -> Result<(acp::ResumeSessionResponse, Value)> {
         self.request_json(acp::ResumeSessionRequest::new(session_id, cwd))
             .await
+    }
+
+    /// The cursors the agent announced for `session_id` on this connection
+    /// (live or replayed by a load), in the order they arrived.
+    pub async fn announced_cursors(&self, session_id: &str) -> Vec<Value> {
+        self.cursors
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Fork `session_id`, at `cursor_id` when given (the whole session
+    /// otherwise).
+    pub async fn fork_session(
+        &self,
+        session_id: String,
+        cwd: std::path::PathBuf,
+        cursor_id: Option<String>,
+    ) -> Result<acp::ForkSessionResponse> {
+        let mut request = acp::ForkSessionRequest::new(session_id, cwd);
+        if let Some(cursor_id) = cursor_id {
+            request = request.cursor_id(acp::CursorId::new(cursor_id));
+        }
+        self.request(request).await
     }
 
     pub async fn close_session(&self, session_id: String) -> Result<acp::CloseSessionResponse> {
@@ -549,6 +600,7 @@ async fn handle_inbound(
     pending: &PendingRequests,
     tx: &mpsc::UnboundedSender<Outbound>,
     assistant_text: &Mutex<AssistantText>,
+    cursors: &Mutex<HashMap<String, Vec<Value>>>,
     text: &str,
     permission: PermissionPolicy,
     event_sink: &EventSink,
@@ -582,20 +634,15 @@ async fn handle_inbound(
             if params["_meta"]["querymtReplay"] != true {
                 assistant_text.lock().await.observe(&event);
             }
+            if event["type"] == "cursor" {
+                record_cursor(cursors, &event).await;
+            }
             event_sink.emit(event).await;
         }
     } else if matches!(
         method.as_str(),
         "querymt/session/inputState" | "_querymt/session/inputState"
     ) && let Some(event) = events::compact_input_state(&params)
-    {
-        event_sink.emit(event).await;
-    }
-
-    if matches!(
-        method.as_str(),
-        "querymt/session/delegationUpdate" | "_querymt/session/delegationUpdate"
-    ) && let Some(event) = events::compact_delegation_update(&params)
     {
         event_sink.emit(event).await;
     }
@@ -665,14 +712,38 @@ fn inbound_request_reply(
 }
 
 fn client_capabilities() -> acp::ClientCapabilities {
-    acp::ClientCapabilities::new().terminal(false).elicitation(
-        acp::ElicitationCapabilities::new().form(acp::ElicitationFormCapabilities::new()),
-    )
+    acp::ClientCapabilities::new()
+        .terminal(false)
+        .elicitation(
+            acp::ElicitationCapabilities::new().form(acp::ElicitationFormCapabilities::new()),
+        )
+        // Delegated child sessions arrive as `subagent_update`s, and positions
+        // in a session's timeline as `cursor_update`s (usable by `fork`).
+        .subagents(acp::SubagentCapabilities::new())
+        .session(
+            acp::ClientSessionCapabilities::new().cursors(acp::SessionCursorsCapabilities::new()),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialize_advertises_subagents_and_cursors() {
+        let request = acp::InitializeRequest::new(ProtocolVersion::V1)
+            .client_capabilities(client_capabilities());
+        let wire = serde_json::to_value(&request).unwrap();
+        let capabilities = &wire["clientCapabilities"];
+        assert!(capabilities["subagents"].is_object(), "{capabilities}");
+        assert!(
+            capabilities["session"]["cursors"].is_object(),
+            "{capabilities}"
+        );
+        // What it advertised before is still advertised.
+        assert_eq!(capabilities["terminal"], false);
+        assert!(capabilities["elicitation"]["form"].is_object());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn cancel_write_deadline_is_classified_as_timeout() {
@@ -694,6 +765,7 @@ mod tests {
             next_id: AtomicI64::new(1),
             initialized: Mutex::new(None),
             assistant_text: Arc::new(Mutex::new(AssistantText::default())),
+            cursors: Arc::new(Mutex::new(HashMap::new())),
             event_sink: EventSink::Cli(false),
             tasks: [writer, tokio::spawn(std::future::pending())],
         };

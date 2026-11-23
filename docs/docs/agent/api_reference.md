@@ -731,6 +731,28 @@ Once the owner has created the fork it is a session there, as a local fork is. I
 {"method": "session/fork", "params": {"sessionId": "…", "cwd": "/work", "cursorId": "<opaque>"}}
 ```
 
+### Subagent updates for delegations
+
+A client that advertises the top-level `clientCapabilities.subagents` capability (omitted or `null` means unsupported) receives each delegated child session as a `subagent_update` sent on the **parent** session. See [Delegation](delegation.md#subagents-over-acp) for the lifecycle and the full mapping.
+
+```json
+{"sessionUpdate": "subagent_update", "sessionId": "<child session id>",
+ "title": "coder", "description": "fix the build",
+ "state": {"state": "running"},
+ "capabilities": {"cancel": {}},
+ "_meta": {"querymt": {"delegationId": "…", "stage": "verifying", "modelId": "gpt-5",
+                       "providerNodeId": "gpu-node", "requestedAt": 0, "forkedAt": 0, "updatedAt": 0}}}
+```
+
+- **Ordering.** The announcement arrives before any live event of the child and before any update that references the child. A child event that reaches the connection first is preceded by the announcement.
+- **State.** `running` while the delegation executes, verifies or finalizes, `idle` once it completed, failed or was cancelled. The verifying, finalizing and cancel-requested stages are `running` with `_meta.querymt.stage`; the stage is dropped when the delegation ends.
+- **Metadata.** `_meta.querymt` carries `delegationId`, the confirmed child `modelId` and `providerNodeId` when known, and the `requestedAt`, `forkedAt`, `finishedAt` and `updatedAt` timestamps (unix seconds).
+- **Cancel.** `capabilities.cancel` is advertised while the delegation runs and withdrawn (`capabilities: null`) with the final update. `session/cancel` on a running child cancels that delegation, exactly as a delegation cancel requested by the agent would. A cancel for a child that is no longer running behaves like any other `session/cancel`.
+- **Delegate tool call.** The `delegate` tool call ends `completed` as soon as the delegation is accepted. Once the child is announced, a `tool_call_update` with `content: [{"type": "session", "sessionId": "<child>"}]` follows the announcement. A delegation that later **fails or is cancelled** sends a final `tool_call_update` with status `failed` after the child's final `subagent_update`. A completed delegation leaves the call `completed`.
+- **Load and replay.** `session/load` replays one materialized `subagent_update` per child, before the history that references it, and the failed status at the point where the journal recorded the failure. Load snapshots carry the latest update of every child in `subagentUpdates`, including the live state of delegations that are still running. The snapshot still carries `delegationUpdates` and the `querymt/session/delegationUpdate` notification is still sent alongside, until both are removed in the release that switches the desktop client.
+
+Clients without the capability receive no `subagent_update`, no session reference and no failed status update. They still receive the delegate tool call and the child session's events.
+
 ## Remote/Mesh API
 
 ### Mesh Configuration

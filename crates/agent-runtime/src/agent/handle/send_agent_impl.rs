@@ -51,6 +51,23 @@ impl SendAgent for LocalAgentHandle {
         if self.cancel_admin_operation(&session_id).await {
             return Ok(());
         }
+        // The child of a running delegation is cancelled through its
+        // delegation, exactly as a cancel requested by the agent: that path
+        // stops the child, resolves the delegation as cancelled and reports
+        // the tool call and the child's state.
+        if let Some(delegation) = self
+            .config
+            .event_sink
+            .running_delegation_for_child(&session_id)
+        {
+            self.config.emit_event(
+                &delegation.session_id,
+                querymt_agent_core::events::AgentEventKind::DelegationCancelRequested {
+                    delegation_id: delegation.delegation_id,
+                },
+            );
+            return Ok(());
+        }
         #[cfg(feature = "remote")]
         {
             match self

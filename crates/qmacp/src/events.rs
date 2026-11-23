@@ -54,15 +54,64 @@ pub fn compact_input_state(params: &Value) -> Option<Value> {
     Some(Value::Object(event))
 }
 
-/// Delegation workflow state is independent of its dispatch tool's status.
-pub fn compact_delegation_update(params: &Value) -> Option<Value> {
-    let fields = params.as_object()?;
-    for key in ["sessionId", "delegationId", "state"] {
-        fields.get(key)?.as_str()?;
+/// A delegated child session as the agent reports it in a `subagent_update`,
+/// reported separately from the status of the tool call that dispatched it.
+///
+/// `parent` is the session the update was sent on (a load snapshot's
+/// `subagentUpdates` entries do not carry it, so the caller supplies it).
+/// The update is a patch: a field the agent left out is left out here too,
+/// and `cancellable` is only reported when the update carries `capabilities`.
+pub fn compact_subagent_update(parent: Option<&Value>, update: &Value) -> Option<Value> {
+    let child = update.get("sessionId")?.as_str()?;
+    let mut event = serde_json::Map::from_iter([
+        ("type".to_string(), json!("delegation")),
+        ("childSessionId".to_string(), json!(child)),
+    ]);
+    if let Some(parent) = parent.filter(|parent| !parent.is_null()) {
+        event.insert("sessionId".to_string(), parent.clone());
     }
-    let mut event = fields.clone();
-    event.insert("type".to_string(), json!("delegation"));
+    for key in ["title", "description"] {
+        if let Some(text) = update.get(key).and_then(Value::as_str) {
+            event.insert(key.to_string(), json!(text));
+        }
+    }
+    if let Some(state) = update["state"]["state"].as_str() {
+        event.insert("state".to_string(), json!(state));
+    }
+    if let Some(capabilities) = update.get("capabilities") {
+        event.insert(
+            "cancellable".to_string(),
+            json!(capabilities.get("cancel").is_some_and(Value::is_object)),
+        );
+    }
+    let querymt = &update["_meta"]["querymt"];
+    for (output_key, meta_key) in [
+        ("stage", "stage"),
+        ("delegationId", "delegationId"),
+        ("modelId", "modelId"),
+        ("providerNodeId", "providerNodeId"),
+        ("requestedAt", "requestedAt"),
+        ("forkedAt", "forkedAt"),
+        ("finishedAt", "finishedAt"),
+        ("updatedAt", "updatedAt"),
+    ] {
+        if let Some(value) = querymt.get(meta_key).filter(|value| !value.is_null()) {
+            event.insert(output_key.to_string(), value.clone());
+        }
+    }
     Some(Value::Object(event))
+}
+
+/// The child session a tool call's `session` content points at.
+fn tool_child_session(update: &Value) -> Option<String> {
+    update
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("session"))?
+        .get("sessionId")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 pub fn compact_session_update(session_id: &Value, update: &Value) -> Option<Value> {
@@ -80,18 +129,34 @@ pub fn compact_session_update(session_id: &Value, update: &Value) -> Option<Valu
             "text": content_text(update.get("content").unwrap_or(&Value::Null)),
         })),
         "agent_thought_chunk" => None,
-        "tool_call" | "tool_call_update" => Some(json!({
-            "type": "tool",
+        "tool_call" | "tool_call_update" => {
+            let mut event = json!({
+                "type": "tool",
+                "sessionId": session_id,
+                "id": first_string(update, &["toolCallId", "tool_call_id", "id"]),
+                "name": first_string(update, &["title", "kind", "name"]),
+                "status": first_string(update, &["status"]).unwrap_or_else(|| {
+                    if kind == "tool_call" {
+                        "started".to_string()
+                    } else {
+                        "updated".to_string()
+                    }
+                }),
+            });
+            // A delegate tool call that points at the child it started.
+            if let Some(child) = tool_child_session(update) {
+                event["childSessionId"] = json!(child);
+            }
+            Some(event)
+        }
+        "subagent_update" => compact_subagent_update(Some(&session_id), update),
+        // The id is opaque: it is only echoed back to `fork`.
+        "cursor_update" => Some(json!({
+            "type": "cursor",
             "sessionId": session_id,
-            "id": first_string(update, &["toolCallId", "tool_call_id", "id"]),
-            "name": first_string(update, &["title", "kind", "name"]),
-            "status": first_string(update, &["status"]).unwrap_or_else(|| {
-                if kind == "tool_call" {
-                    "started".to_string()
-                } else {
-                    "updated".to_string()
-                }
-            }),
+            "cursorId": first_string(update, &["cursorId", "cursor_id"]),
+            "anchor": update.get("anchor").cloned().unwrap_or(Value::Null),
+            "forkable": update["capabilities"]["fork"].is_object(),
         })),
         "current_mode_update" => Some(json!({
             "type": "mode",
@@ -229,6 +294,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mode["mode"], "plan");
+    }
+
+    #[test]
+    fn compact_subagent_update_keeps_patch_semantics() {
+        let running = compact_session_update(
+            &json!("parent"),
+            &json!({
+                "sessionUpdate": "subagent_update", "sessionId": "c1",
+                "title": "coder", "description": "fix the build",
+                "state": {"state": "running"}, "capabilities": {"cancel": {}},
+                "_meta": {"querymt": {"stage": "verifying", "modelId": "gpt-5", "delegationId": "d1"}},
+            }),
+        )
+        .unwrap();
+        assert_eq!(running["type"], "delegation");
+        assert_eq!(running["sessionId"], "parent");
+        assert_eq!(running["childSessionId"], "c1");
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["stage"], "verifying");
+        assert_eq!(running["cancellable"], true);
+        assert_eq!(running["modelId"], "gpt-5");
+
+        // A patch that only changes the state leaves the other fields out.
+        let idle = compact_session_update(
+            &json!("parent"),
+            &json!({
+                "sessionUpdate": "subagent_update", "sessionId": "c1",
+                "state": {"state": "idle"}, "capabilities": null,
+            }),
+        )
+        .unwrap();
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["cancellable"], false);
+        assert!(idle.get("title").is_none() && idle.get("stage").is_none());
+    }
+
+    #[test]
+    fn compact_tool_names_the_child_session() {
+        let tool = compact_session_update(
+            &json!("parent"),
+            &json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "content": [{"type": "session", "sessionId": "c1"}],
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool["childSessionId"], "c1");
+        let plain = compact_session_update(
+            &json!("parent"),
+            &json!({"sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "failed"}),
+        )
+        .unwrap();
+        assert!(plain.get("childSessionId").is_none());
+    }
+
+    #[test]
+    fn compact_cursor_update_reports_forkability() {
+        let forkable = compact_session_update(
+            &json!("s"),
+            &json!({
+                "sessionUpdate": "cursor_update", "cursorId": "c-1",
+                "anchor": {"type": "user_message", "messageId": "m1", "position": "after"},
+                "capabilities": {"fork": {}},
+            }),
+        )
+        .unwrap();
+        assert_eq!(forkable["type"], "cursor");
+        assert_eq!(forkable["cursorId"], "c-1");
+        assert_eq!(forkable["forkable"], true);
+        let plain = compact_session_update(
+            &json!("s"),
+            &json!({"sessionUpdate": "cursor_update", "cursorId": "c-2", "anchor": {}}),
+        )
+        .unwrap();
+        assert_eq!(plain["forkable"], false);
     }
 
     #[test]

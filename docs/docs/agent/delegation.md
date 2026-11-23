@@ -660,6 +660,43 @@ The peer is resolved on the first delegation, not at startup:
 
 See [Mesh Networking](mesh.md#remote-agents) for the mesh side.
 
+## Subagents over ACP
+
+A client that advertises `clientCapabilities.subagents` sees every delegation as a subagent of the parent session. Each delegation event updates one folded state per delegation, which maps to a `subagent_update` on the parent session:
+
+| Delegation state | `state` | `_meta.querymt` | `capabilities` |
+|---|---|---|---|
+| Requested (no child yet) | no update | | |
+| Forked, executing | `running` | | `cancel` |
+| Verifying, finalizing, cancel requested | `running` | `stage` | `cancel` |
+| Completed, failed, cancelled | `idle` | stage cleared | `null` (cancel withdrawn) |
+
+The title is the target agent id and the description is the objective. The confirmed model id, provider node id and the lifecycle timestamps always go in `_meta.querymt`.
+
+```mermaid
+sequenceDiagram
+    participant Parent as Parent session
+    participant C as Client (subagents)
+    Parent->>C: tool_call (delegate, completed)
+    Parent->>C: subagent_update(c1, running, cancel)
+    Parent->>C: tool_call_update(content: session c1)
+    Note over C: events of c1 may now flow
+    Parent->>C: subagent_update(c1, running, stage=verifying)
+    alt completed
+        Parent->>C: subagent_update(c1, idle, capabilities=null)
+    else failed or cancelled
+        Parent->>C: subagent_update(c1, idle, capabilities=null)
+        Parent->>C: tool_call_update(status=failed)
+    end
+```
+
+- **Announce first.** The announcement precedes any event of the child. For a child hosted on another mesh node, whose events can arrive before the fork event, the connection announces the child on the first event it sees.
+- **Tool call status.** The delegate call completes when the delegation is accepted, not when the child finishes. A delegation that fails or is cancelled sends a final `failed` update for that call. The child's outcome is otherwise reported through the child's state and the result injected into the parent.
+- **Cancelling.** While the delegation runs, the child advertises `cancel`. `session/cancel` for the child session cancels the delegation (the delegation is cancelled, the call is reported `failed` and the child becomes `idle`). The cancel is routed from the node that observed the delegation; a node that did not observe it treats the request as a plain session cancel.
+- **Load.** `session/load` replays one `subagent_update` per child ahead of the history that references it. Load snapshots carry the same latest updates in `subagentUpdates`, merged with the live state of running delegations.
+
+The wire shape is described in the [API reference](api_reference.md#subagent-updates-for-delegations).
+
 ## Delegation Events
 
 Agents emit events during delegation:

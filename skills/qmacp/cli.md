@@ -48,15 +48,26 @@ qmacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-
   command results, not a global `done`.
 - Exit codes: 0 success, 1 usage, 2 connection, 3 RPC, 4 timeout/cancel.
 
-Stream event types: `session`, `submitted`, `text`, `tool`, `delegation`, `mode`,
-`plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
-`delegation` is a separate lifecycle record from `querymt/session/delegationUpdate`,
-also delivered by the exported `AcpClient::connect_with_events` channel. It retains
-backend identities, state, child/tool links, stage/activity, outcome details and
-`sourceEpoch`/`sessionSeq` when supplied, without inferred defaults. A completed
-`tool` can mean only successful dispatch while its delegation is still verifying
-or later fails. Delegation ordering is separate from self-runtime revisions;
-records are forwarded, not merged into a client-side state cache.
+Stream event types: `session`, `submitted`, `text`, `tool`, `delegation`, `cursor`,
+`mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`,
+`done`.
+`delegation` is a separate lifecycle record built from the agent's
+`subagent_update` (qmacp advertises the `subagents` capability), also delivered by
+the exported `AcpClient::connect_with_events` channel. It carries `sessionId` (the
+parent), `childSessionId`, `title` (target agent), `description` (objective) and
+`state` (`running` or `idle`), plus `stage` (`verifying`, `finalizing`,
+`cancelRequested`), `cancellable`, `delegationId`, `modelId`, `providerNodeId` and
+the timestamps when the update carries them. An update is a patch: a field the
+agent left out is left out here, nothing is defaulted. A `tool` event for the
+delegate call names its child in `childSessionId` once the agent sent the
+`session` reference. A completed `tool` can mean only successful dispatch while
+its delegation is still running; if the delegation then fails or is cancelled the
+agent sends a later `tool` update with status `failed`. Delegation ordering is
+separate from self-runtime revisions; records are forwarded, not merged into a
+client-side state cache.
+`cursor` reports a position the agent announced in the session's timeline
+(`sessionId`, opaque `cursorId`, `anchor`, `forkable`); see
+[session management](sessions.md#fork-at-a-cursor).
 
 Require exit 0 and JSON `ok: true` for command success. For `cancel`,
 `cancellationState: "notification_sent"` confirms only the local notification
@@ -72,6 +83,13 @@ On failure, `recovery` preserves known IDs, the failing `stage`
 or `rejected` differs from `unknown`; `accepted` means a receipt was received,
 not that the task completed. Inspect state before retrying an uncertain or
 accepted submission. A lost creation response cannot provide a session ID.
+
+`done` of a `prompt` carries `usage`, the token counts the agent reported for that
+turn: `{"available": true, "totalTokens", "inputTokens", "outputTokens"}` plus
+`thoughtTokens`, `cachedReadTokens` and `cachedWriteTokens` when reported. The
+counts cover the one execution cycle that answered the prompt, not the session.
+When the agent reports none (and for queue/steer, which have no prompt response)
+it is `{"available": false}`, never zero counts.
 
 Successful prompt `observationState` is `not_waited`, `idle`, or `prompt_returned`;
 follow reports `idle`. None proves task success. Idle results retain `runtime`,
@@ -113,6 +131,7 @@ get-lifecycle "$SESSION_ID"
 set-lifecycle "$SESSION_ID" --resolved false
 sessions --resolution open --archive excluded
 inspect --cwd "$PWD" --messages 20 --tools false "$SESSION_ID"
+fork "$SESSION_ID" --cursor "$CURSOR_ID" --cwd "$PWD"
 EOF
 ```
 
