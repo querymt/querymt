@@ -865,11 +865,11 @@
     "turns": [
       {
         "id": "run-r0",
-        "revision": 27,
+        "revision": 28,
         "entries": [
           {
             "id": "user-u0",
-            "revision": 23,
+            "revision": 24,
             "kind": {
               "type": "user_message",
               "data": {
@@ -889,7 +889,7 @@
           },
           {
             "id": "reasoning-a0-a0:summary:0",
-            "revision": 24,
+            "revision": 25,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -901,7 +901,7 @@
           },
           {
             "id": "assistant-a0",
-            "revision": 25,
+            "revision": 26,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -912,7 +912,7 @@
           },
           {
             "id": "tool-t0-0",
-            "revision": 27,
+            "revision": 28,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1005,7 +1005,7 @@
       },
       {
         "id": "run-r3",
-        "revision": 10,
+        "revision": 11,
         "entries": [
           {
             "id": "user-u3",
@@ -1072,7 +1072,7 @@
           },
           {
             "id": "compaction-c3",
-            "revision": 10,
+            "revision": 11,
             "kind": {
               "type": "compaction",
               "data": {
@@ -1086,7 +1086,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r3"
+                  }
+                }
               }
             }
           }
@@ -1094,11 +1098,11 @@
       },
       {
         "id": "run-r4",
-        "revision": 17,
+        "revision": 18,
         "entries": [
           {
             "id": "user-u4",
-            "revision": 11,
+            "revision": 12,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1118,7 +1122,7 @@
           },
           {
             "id": "reasoning-a4-a4:summary:0",
-            "revision": 12,
+            "revision": 13,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -1130,7 +1134,7 @@
           },
           {
             "id": "assistant-a4",
-            "revision": 13,
+            "revision": 14,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -1141,7 +1145,7 @@
           },
           {
             "id": "tool-t4-0",
-            "revision": 15,
+            "revision": 16,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1170,7 +1174,7 @@
           },
           {
             "id": "tool-t4-1",
-            "revision": 17,
+            "revision": 18,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1201,11 +1205,11 @@
       },
       {
         "id": "run-sched4",
-        "revision": 18,
+        "revision": 19,
         "entries": [
           {
             "id": "assistant-sa4",
-            "revision": 18,
+            "revision": 19,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -1218,11 +1222,11 @@
       },
       {
         "id": "run-r5",
-        "revision": 22,
+        "revision": 23,
         "entries": [
           {
             "id": "user-u5",
-            "revision": 19,
+            "revision": 20,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1242,7 +1246,7 @@
           },
           {
             "id": "user-s5",
-            "revision": 20,
+            "revision": 21,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1262,7 +1266,7 @@
           },
           {
             "id": "reasoning-a5-a5:summary:0",
-            "revision": 21,
+            "revision": 22,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -1274,7 +1278,7 @@
           },
           {
             "id": "assistant-a5",
-            "revision": 22,
+            "revision": 23,
             "kind": {
               "type": "assistant_message",
               "data": {

@@ -88,12 +88,17 @@ Context compaction SHALL be read from the standard ACP `compaction_update` and `
 - **WHEN** a compaction with status `completed` receives a `compaction_update` with status `in_progress` and a new `summary`
 - **THEN** the compaction keeps status `completed` and takes the new summary
 
+#### Scenario: Terminal summary replaces streamed chunks
+- **WHEN** three `compaction_summary_chunk` updates are followed by a `completed` `compaction_update` whose `summary` is one block with the whole text
+- **THEN** the compaction's summary is that one block, equal to the summary a load snapshot of the same session holds
+
 ### Requirement: Snapshot and live stream equivalence
 Hydrating a snapshot SHALL produce the same turns as applying the session's live stream (ACP session updates and state updates as the agent sends them live, including streamed deltas and structured prompt blocks), and the same turns as applying the agent's history replay, ignoring arrival timestamps.
 
 #### Scenario: Snapshot and live stream produce the same turns
 - **WHEN** one generated session is applied once as a load snapshot and once as its live stream
-- **THEN** both views have equal turns with equal ids, entries, tool calls, compactions, plan and usage
+- **THEN** both views have equal turns with equal ids, entries, tool calls, compactions (summary content included), plan (plan id included), context usage, token breakdown and cost
+- **AND** the snapshot view's run state equals the live view's run state after the last update
 
 #### Scenario: Snapshot and replay produce the same turns
 - **WHEN** the same session is applied once as a load snapshot and once as the agent's history replay before a load response without a snapshot
@@ -230,7 +235,7 @@ When the agent sends no state updates, prompt outcomes and runtime observations 
 - **THEN** the run state becomes idle and tools still marked running are no longer reported as active
 
 ### Requirement: Usage and cost
-The view SHALL report context usage, the token breakdown (latest request and session totals, with a partial flag) and cumulative cost from `usage_update` notifications and from the snapshot's accounting and summary, keeping the most recent authoritative value. Cost SHALL be taken only from accounting data, never summed from individual requests.
+The view SHALL report context usage, the token breakdown (latest request and session totals, with a partial flag) and cumulative cost from `usage_update` notifications and from the snapshot's accounting and whole-session summary, whether or not the load was windowed, keeping the most recent authoritative value. Cost SHALL be taken only from accounting data, never summed from individual requests. Accounting that covers no model call SHALL give no cost.
 
 #### Scenario: Usage update replaces context usage
 - **WHEN** a `usage_update` with `used = 12000` and `size = 200000` arrives
@@ -244,12 +249,39 @@ The view SHALL report context usage, the token breakdown (latest request and ses
 - **WHEN** a `usage_update` carries `_meta.querymt.usage` with latest-request and session-total tokens marked partial
 - **THEN** the view reports both token breakdowns and marks the totals as approximate
 
+#### Scenario: Session without model calls has no cost
+- **WHEN** a snapshot whose session accounting has no attempts and no generations is applied
+- **THEN** the view reports no cost, as it does live where no accounting arrives
+
+#### Scenario: Unwindowed snapshot reports context
+- **WHEN** a snapshot of a load without a window carries a whole-session summary with context tokens and the model's context limit
+- **THEN** the view reports that context usage
+
+### Requirement: No stale context after a model change
+A context measurement taken before the session's current model was selected SHALL NOT be reported as the session's context usage. The view SHALL report no context usage from a model change until a measurement for the new model arrives, live and after a load.
+
+#### Scenario: Model change hides stale context live
+- **WHEN** a `usage_update` reports context usage, then the agent reports that the context measurement no longer applies because the model changed
+- **THEN** the view reports no context usage until the next `usage_update`
+
+#### Scenario: Snapshot ignores a measurement older than the model
+- **WHEN** a snapshot's summary holds a context measurement taken before its current model was selected
+- **THEN** the view reports no context usage, as a live view of the same session does
+
+#### Scenario: Measurement after the model change is kept
+- **WHEN** a snapshot's summary holds a context measurement taken after its current model was selected
+- **THEN** the view reports that measurement against the new model's context limit
+
 ### Requirement: Plans and reasoning parts
 The view SHALL hold the session's current plan, replaced by `plan` and `plan_update` and cleared by `plan_removed`. Reasoning SHALL be kept as separate parts when updates carry a reasoning part id (`_meta.querymt.reasoning_part_id`); chunks of the same part SHALL merge.
 
 #### Scenario: Plan update replaces and plan removal clears
 - **WHEN** a `plan_update` with 3 entries arrives, then a `plan_update` with 2 entries, then a `plan_removed` for the same plan
 - **THEN** the view's plan has 3 entries, then the 2 new entries, then no plan
+
+#### Scenario: Todo plan keeps its id after a reload
+- **WHEN** a session whose todo list the agent sent live as a `plan_update` is loaded from a snapshot
+- **THEN** the view's plan has the same plan id and entries as the live view
 
 #### Scenario: Reasoning parts stay separate
 - **WHEN** `agent_thought_chunk` updates for one message arrive with reasoning part ids `p0`, `p0`, `p1`
@@ -358,6 +390,17 @@ The session view reducer SHALL be usable as a native Rust library by clients out
 #### Scenario: Snapshot hydrated on a background thread
 - **WHEN** a native client applies a large snapshot to a view on a background thread and then moves the view to its UI thread
 - **THEN** the view on the UI thread equals a view that applied the same snapshot on the UI thread
+
+### Requirement: Borrowed reads for native clients
+A native client SHALL be able to read the turn order, a turn and its entries, and a single entry by id without copying entry content. Reading SHALL NOT change the view.
+
+#### Scenario: Reading a turn copies no content
+- **WHEN** a native client reads the last turn after each of 100 streamed chunks while that turn holds a 400 KB tool result
+- **THEN** the reads allocate no copy of the tool result or the message text
+
+#### Scenario: Borrowed and owned reads agree
+- **WHEN** a turn is read by reference and through the owned accessor
+- **THEN** both have the same id, revision and entries
 
 ### Requirement: Published WebAssembly module
 Each nightly and stable QueryMT release SHALL publish the session view reducer as a WebAssembly module with JavaScript bindings, TypeScript declarations and a schema version, as `agent-session-core-wasm-<version>.tar.gz` with a `.sha256` file, both listed in `release.json`.

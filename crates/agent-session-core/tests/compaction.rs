@@ -119,3 +119,44 @@ fn settled_compaction_is_not_reopened() {
     assert_eq!(entry.state, CompactionState::Completed);
     assert_eq!(entry.summary.len(), 1);
 }
+
+mod common;
+
+/// The agent's replay stamps the enclosing run on a compaction's `_meta`; a
+/// snapshot builds the same entry, so a reload does not change it.
+#[test]
+fn snapshot_compaction_carries_the_run_id() {
+    use common::{event, load_response, loaded};
+    let mut core = SessionCore::new("s1");
+    core.apply(&[loaded(load_response(
+        vec![
+            event(
+                1,
+                "run_started",
+                json!({ "run_id": "r1", "origin": "interactive" }),
+            ),
+            event(
+                2,
+                "compaction_start",
+                json!({ "token_estimate": 1, "compaction_id": "c1" }),
+            ),
+            event(
+                3,
+                "compaction_end",
+                json!({ "summary": "short", "summary_len": 5, "compaction_id": "c1",
+                        "context_tokens": null }),
+            ),
+            event(
+                4,
+                "run_completed",
+                json!({ "run_id": "r1", "outcome": "completed", "stop_type": null,
+                        "reason": null }),
+            ),
+        ],
+        json!({}),
+    ))]);
+    let found = compactions(&core);
+    assert_eq!(found.len(), 1);
+    let meta = found[0].1.meta.as_ref().expect("the run id is stamped");
+    assert_eq!(meta["querymt"]["runId"], "r1");
+}

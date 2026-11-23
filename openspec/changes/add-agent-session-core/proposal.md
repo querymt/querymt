@@ -25,6 +25,9 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
   - `_meta.querymt.messageId` on the `session/prompt` response: the id of the user message the prompt inserted (v2 returns it as `messageId`).
   - Gap-free loads: on `session/load` the agent holds live updates from before it reads the history until it has answered. It then drops the held updates at or before the load's cut point, sends the text of a message still streaming at the cut, and only then sends the rest (v2's hold-until-`replay_complete` and cut point).
   - Load snapshots and older-history pages carry the `cursor_update`s of the entities they return, for clients that advertise `session.cursors`.
+  - Every load snapshot carries the whole-session summary (usage, context, model), not only windowed ones.
+  - A model change tells live clients that the last context measurement no longer applies (`_meta.querymt.contextInvalidated` on a `session_info_update`), so no path shows a measurement taken for the previous model.
+  - Two fixes where the agent did not meet `acp-session-updates`: the live `completed` compaction update carries its summary, and replay sends the todo plan once as a `plan_update` for plan-operations clients.
 - **Shared replay projection.** The agent's history replay and the reducer project journal events to ACP updates with one function set in `querymt-agent-protocol-types` (`replay`), so a loaded and a replayed session cannot differ. The agent's replay sends each finished compaction where it happened instead of before the whole conversation.
 - **New package `querymt-agent-protocol-types`** (`crates/agent-protocol-types`). It holds the plain wire types clients consume:
   - agent events and their leaf types,
@@ -39,6 +42,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
   - tolerant decoding, per event inside snapshots and history pages,
   - a bounded debug event log (newest 1,000 entries).
   - `SessionCore` is `Send + 'static`, so native clients can hydrate large snapshots off their UI thread.
+  - Native clients read turns and entries by reference: reading a turn copies no entry content, so reading the last turn after every update costs the same however large its tool results are. The owned `turn`/`turns` accessors stay for serialization and the WebAssembly boundary.
 - **New package `querymt-agent-session-core-wasm`** (`crates/agent-session-core-wasm`, `publish = false`). These are wasm-bindgen bindings that keep the state inside the module and exchange JSON batches and change reports.
 - **Native Rust consumers.** A client outside this workspace (querymt-gpui) depends on `querymt-agent-session-core` through a git dependency pinned to a revision. The three new crates are listed under hakari `[final-excludes]`, so they never depend on `querymt-workspace-hack` and their dependency closure is the same inside and outside the workspace.
 - **Release artifacts.** Nightly and stable releases publish `agent-session-core-wasm-<version>.tar.gz` plus its `.sha256`, listed in `release.json`.
@@ -68,7 +72,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 - `session-view-state`: deterministic reduction of agent session output (load snapshot, ACP session updates, history pages and client observations) into a client conversation view and change reports, available as a native Rust library and as a published WebAssembly module.
 
 ### Modified Capabilities
-- `acp-session-updates`: adds run-state notifications, run identity on session updates, the inserted message id on prompt responses, gap-free loads (hold and cut, including a message still streaming at the cut) and cursors in load snapshots and history pages.
+- `acp-session-updates`: adds run-state notifications, run identity on session updates, the inserted message id on prompt responses, gap-free loads (hold and cut, including a message still streaming at the cut), cursors in load snapshots and history pages, a whole-session summary in every load snapshot, and context invalidation on a model change.
 
 ## Impact
 
@@ -85,7 +89,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 | `querymt-agent-runtime` | `SessionLoadSnapshot`, `UserPromptRecord` and input-state notification types move out; ACP translator and load path gain the wire additions above; replay uses the shared projection | none |
 | `querymt-agent`, `querymt-mobile-ffi`, `querymt-agent-py` | Downstream; no source change expected | none |
 
-**ACP wire (additive):** `querymt/session/stateUpdate`, `_meta.querymt.runId` on session updates, `_meta.querymt.messageId` on prompt responses, `cursorUpdates` in load snapshots and history pages. Clients that ignore unknown extension notifications and `_meta` keys see no change, except that a load no longer loses or repeats events and replayed compactions arrive in place.
+**ACP wire (additive):** `querymt/session/stateUpdate`, `_meta.querymt.runId` on session updates, `_meta.querymt.messageId` on prompt responses, `cursorUpdates` in load snapshots and history pages, `summary` in unwindowed load snapshots, `_meta.querymt.contextInvalidated` on `session_info_update`. Clients that ignore unknown extension notifications and `_meta` keys see no change, except that a load no longer loses or repeats events and replayed compactions arrive in place.
 
 **Typeshare:** the set of declarations for existing types is unchanged. New declarations cover the session event, view and change-report types and the state-update notification.
 

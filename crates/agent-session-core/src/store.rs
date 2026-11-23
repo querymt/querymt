@@ -49,6 +49,42 @@ struct TurnState {
     keys: Vec<i64>,
 }
 
+/// A turn read in place: nothing of its entries is copied.
+///
+/// It borrows the view, so it ends before the next [`SessionCore::apply`]
+/// (the borrow checker enforces it). Rust-only: it is not part of the
+/// serialized view.
+///
+/// [`SessionCore::apply`]: crate::SessionCore::apply
+#[derive(Debug, Clone, Copy)]
+pub struct TurnRef<'a> {
+    id: &'a str,
+    revision: u64,
+    keys: &'a [i64],
+    items: &'a BTreeMap<i64, Slot>,
+}
+
+impl<'a> TurnRef<'a> {
+    /// The turn id.
+    pub fn id(self) -> &'a str {
+        self.id
+    }
+
+    /// Grows whenever any entry of the turn changes.
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// The entries in order.
+    pub fn entries(self) -> impl Iterator<Item = &'a Entry> {
+        let items = self.items;
+        self.keys
+            .iter()
+            .filter_map(move |key| items.get(key))
+            .map(|slot| &slot.entry)
+    }
+}
+
 /// Turns and entries touched since the last [`Store::take_changes`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct StoreChanges {
@@ -68,6 +104,8 @@ pub(crate) struct Store {
     hi: i64,
     rev: u64,
     anon: u64,
+    /// Entry id → key, so an entry is read without scanning the turns.
+    by_entry: BTreeMap<String, i64>,
     pub idx: Indexes,
     /// History position of the event being replayed; live hints use it for
     /// turn ids while it is set.
@@ -206,6 +244,7 @@ impl Store {
             turn.revision = self.rev;
             turn.keys.push(key);
         }
+        self.by_entry.insert(id.clone(), key);
         self.items.insert(
             key,
             Slot {
@@ -259,6 +298,9 @@ impl Store {
         let Some(slot) = self.items.remove(&key) else {
             return;
         };
+        if self.by_entry.get(&slot.entry.id) == Some(&key) {
+            self.by_entry.remove(&slot.entry.id);
+        }
         let turn_id = slot.turn;
         let empty = match self.turns.get_mut(&turn_id) {
             Some(turn) => {
@@ -298,22 +340,39 @@ impl Store {
             .collect()
     }
 
-    pub(crate) fn turn_ids(&self) -> Vec<String> {
-        self.order.iter().cloned().collect()
+    /// Turn ids in history order, borrowed.
+    pub(crate) fn turn_order(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.order.iter().map(String::as_str)
     }
 
-    pub(crate) fn turn(&self, id: &str) -> Option<Turn> {
-        let state = self.turns.get(id)?;
-        let entries = state
-            .keys
-            .iter()
-            .filter_map(|key| self.items.get(key))
-            .map(|slot| slot.entry.clone())
-            .collect();
-        Some(Turn {
-            id: id.to_owned(),
+    pub(crate) fn turn_ids(&self) -> Vec<String> {
+        self.turn_order().map(str::to_owned).collect()
+    }
+
+    /// One turn read in place.
+    pub(crate) fn turn_ref(&self, id: &str) -> Option<TurnRef<'_>> {
+        let (id, state) = self.turns.get_key_value(id)?;
+        Some(TurnRef {
+            id,
             revision: state.revision,
-            entries,
+            keys: &state.keys,
+            items: &self.items,
+        })
+    }
+
+    /// One entry by its id.
+    pub(crate) fn entry(&self, id: &str) -> Option<&Entry> {
+        let key = self.by_entry.get(id)?;
+        self.items.get(key).map(|slot| &slot.entry)
+    }
+
+    /// An owned copy of one turn, built on [`Store::turn_ref`].
+    pub(crate) fn turn(&self, id: &str) -> Option<Turn> {
+        let turn = self.turn_ref(id)?;
+        Some(Turn {
+            id: turn.id().to_owned(),
+            revision: turn.revision(),
+            entries: turn.entries().cloned().collect(),
         })
     }
 
@@ -346,6 +405,11 @@ impl Store {
         merge(&mut self.idx.prompt, other.idx.prompt, shift);
         merge(&mut self.idx.compaction, other.idx.compaction, shift);
         merge(&mut self.idx.reasoning, other.idx.reasoning, shift);
+        merge(
+            &mut self.by_entry,
+            std::mem::take(&mut other.by_entry),
+            shift,
+        );
         self.rev = self.rev.max(other.rev);
         self.anon = self.anon.max(other.anon);
         for id in other.added {

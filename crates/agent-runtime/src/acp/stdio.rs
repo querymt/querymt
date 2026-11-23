@@ -2261,6 +2261,166 @@ mod stdio_tests {
         assert_eq!(thoughts, ["considering options", " and more"], "{seen:?}");
     }
 
+    impl LoadRig {
+        /// Publish one generated envelope through the agent's event sink:
+        /// durable events are journaled, ephemeral ones only streamed.
+        async fn emit_envelope(&self, envelope: &querymt_agent_core::events::EventEnvelope) {
+            let kind = envelope.kind().clone();
+            let sink = &self.fixture.config.event_sink;
+            match envelope {
+                querymt_agent_core::events::EventEnvelope::Durable(_) => {
+                    sink.emit_durable(&self.session_id, kind)
+                        .await
+                        .expect("the event is journaled");
+                }
+                querymt_agent_core::events::EventEnvelope::Ephemeral(_) => {
+                    sink.emit_ephemeral(&self.session_id, kind);
+                }
+            }
+        }
+
+        /// What the client received, as reducer inputs, until the session
+        /// reports `idle` for `run_id`.
+        async fn received_inputs_until_idle(
+            &mut self,
+            run_id: &str,
+        ) -> Vec<querymt_agent_session_core::input::SessionInput> {
+            use querymt_agent_session_core::input::SessionInput;
+            let mut inputs = Vec::new();
+            loop {
+                let message = match self.stashed.pop_front() {
+                    Some(message) => message,
+                    None => timeout(Duration::from_secs(5), self.bridge_rx.recv())
+                        .await
+                        .expect("the run should report idle")
+                        .expect("bridge stays open"),
+                };
+                match message {
+                    ClientBridgeMessage::ExtNotification(notification)
+                        if notification.method.as_ref()
+                            == crate::acp::shared::SESSION_STATE_UPDATE_METHOD =>
+                    {
+                        let params: serde_json::Value =
+                            serde_json::from_str(notification.params.get()).unwrap();
+                        let done = params["state"] == "idle" && params["runId"] == run_id;
+                        inputs.push(SessionInput::StateUpdate {
+                            notification: params,
+                            at_ms: 0,
+                        });
+                        if done {
+                            return inputs;
+                        }
+                    }
+                    ClientBridgeMessage::Notification(notification) => {
+                        inputs.push(SessionInput::AcpNotification {
+                            notification: serde_json::to_value(&notification).unwrap(),
+                            replayed: false,
+                            at_ms: 0,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A client attaches while an assistant message is streaming (spec:
+    /// Load during a run). The snapshot holds everything journaled, the
+    /// load hands over the text streamed so far, and the rest arrives live;
+    /// the view must equal the one of a client that saw the whole stream.
+    #[tokio::test]
+    async fn load_during_a_run_continues_seamlessly() {
+        use crate::acp::session_core_conformance::{
+            comparable, gpui_capabilities, journal, live_envelopes, live_stream,
+        };
+        use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+        use querymt_agent_session_core::SessionCore;
+        use querymt_agent_session_core::input::SessionInput;
+        use querymt_agent_session_core::testing::TraceSpec;
+
+        let events = journal(TraceSpec::small(3));
+        let reference = {
+            let mut core = SessionCore::new("s1");
+            let report = core.apply(&live_stream(&events));
+            assert!(report.errors.is_empty(), "{report:?}");
+            comparable(&core)
+        };
+
+        // The envelopes the agent publishes, and the cut: inside the third
+        // reply, after its first streamed piece.
+        let mut blocked = std::collections::HashSet::new();
+        let envelopes: Vec<EventEnvelope> = events
+            .iter()
+            .flat_map(|event| live_envelopes(event, &mut blocked))
+            .collect();
+        let first_piece = envelopes
+            .iter()
+            .position(|envelope| {
+                matches!(
+                    envelope.kind(),
+                    AgentEventKind::AssistantContentDelta { message_id, .. } if message_id == "a2"
+                )
+            })
+            .expect("the third reply streams");
+        let (before_cut, after_cut) = envelopes.split_at(first_piece + 1);
+        let (during_load, rest) = after_cut.split_at(1);
+        assert!(
+            matches!(
+                during_load[0].kind(),
+                AgentEventKind::AssistantContentDelta { .. }
+            ),
+            "the load answers between two pieces of the message"
+        );
+        let last_run = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                AgentEventKind::RunCompleted { run_id, .. } => Some(run_id.clone()),
+                _ => None,
+            })
+            .expect("the trace ends a run");
+
+        let mut rig = LoadRig::new().await;
+        rig.session_load.lock().unwrap().snapshot_history = true;
+        rig.translator
+            .lock()
+            .unwrap()
+            .set_capabilities(gpui_capabilities());
+        for envelope in before_cut {
+            rig.emit_envelope(envelope).await;
+        }
+        rig.start_forwarder();
+        tokio::task::yield_now().await;
+
+        let (response, hold, cut) = rig.load().await;
+        // What the load found: the run in progress (the test agent has no
+        // actor running it, so it is set as the runtime status would).
+        rig.translator
+            .lock()
+            .unwrap()
+            .seed_run_state(&rig.session_id, Some("r2".into()), false);
+        for envelope in during_load {
+            rig.emit_envelope(envelope).await;
+        }
+        hold.release_with(cut, rig.fixture.config.event_sink.fanout());
+        for envelope in rest {
+            rig.emit_envelope(envelope).await;
+        }
+
+        let mut inputs = vec![SessionInput::SnapshotLoaded {
+            response: serde_json::to_value(&response).unwrap(),
+        }];
+        inputs.extend(rig.received_inputs_until_idle(&last_run).await);
+        let mut core = SessionCore::new(rig.session_id.clone());
+        let report = core.apply(&inputs);
+        assert!(report.errors.is_empty(), "{report:?}");
+        crate::acp::session_core_conformance::assert_same_view(
+            "load during a run",
+            &comparable(&core),
+            &reference,
+        );
+    }
+
     #[tokio::test]
     async fn current_state_after_a_load() {
         let mut rig = LoadRig::new().await;

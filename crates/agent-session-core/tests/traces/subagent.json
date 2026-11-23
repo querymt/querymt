@@ -1340,7 +1340,7 @@
     "turns": [
       {
         "id": "run-r0",
-        "revision": 46,
+        "revision": 47,
         "entries": [
           {
             "id": "user-u0",
@@ -1387,7 +1387,7 @@
           },
           {
             "id": "tool-t0-0",
-            "revision": 46,
+            "revision": 47,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1620,7 +1620,7 @@
       },
       {
         "id": "run-r3",
-        "revision": 28,
+        "revision": 29,
         "entries": [
           {
             "id": "user-u3",
@@ -1745,7 +1745,7 @@
           },
           {
             "id": "compaction-c3",
-            "revision": 28,
+            "revision": 29,
             "kind": {
               "type": "compaction",
               "data": {
@@ -1759,7 +1759,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r3"
+                  }
+                }
               }
             }
           }
@@ -1767,11 +1771,11 @@
       },
       {
         "id": "run-r4",
-        "revision": 35,
+        "revision": 36,
         "entries": [
           {
             "id": "user-u4",
-            "revision": 29,
+            "revision": 30,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1791,7 +1795,7 @@
           },
           {
             "id": "reasoning-a4-a4:summary:0",
-            "revision": 30,
+            "revision": 31,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -1803,7 +1807,7 @@
           },
           {
             "id": "assistant-a4",
-            "revision": 31,
+            "revision": 32,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -1814,7 +1818,7 @@
           },
           {
             "id": "tool-t4-0",
-            "revision": 33,
+            "revision": 34,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1843,7 +1847,7 @@
           },
           {
             "id": "tool-t4-1",
-            "revision": 35,
+            "revision": 36,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1874,11 +1878,11 @@
       },
       {
         "id": "run-sched4",
-        "revision": 36,
+        "revision": 37,
         "entries": [
           {
             "id": "assistant-sa4",
-            "revision": 36,
+            "revision": 37,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -1891,11 +1895,11 @@
       },
       {
         "id": "run-r5",
-        "revision": 44,
+        "revision": 45,
         "entries": [
           {
             "id": "user-u5",
-            "revision": 37,
+            "revision": 38,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1915,7 +1919,7 @@
           },
           {
             "id": "user-s5",
-            "revision": 38,
+            "revision": 39,
             "kind": {
               "type": "user_message",
               "data": {
@@ -1935,7 +1939,7 @@
           },
           {
             "id": "reasoning-a5-a5:summary:0",
-            "revision": 39,
+            "revision": 40,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -1947,7 +1951,7 @@
           },
           {
             "id": "assistant-a5",
-            "revision": 40,
+            "revision": 41,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -1958,7 +1962,7 @@
           },
           {
             "id": "tool-t5-0",
-            "revision": 42,
+            "revision": 43,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -1987,7 +1991,7 @@
           },
           {
             "id": "tool-t5-1",
-            "revision": 44,
+            "revision": 45,
             "kind": {
               "type": "tool_call",
               "data": {
