@@ -4,6 +4,7 @@
 use crate::core::SessionCore;
 use crate::view::SubagentView;
 use querymt_agent_protocol_types::protocol::{MaybeUndefined, SubagentUpdate, ToolCallContent};
+use querymt_agent_protocol_types::replay::QUERYMT_META_NAMESPACE;
 
 /// Apply an ACP patch field: omitted keeps the value, `null` clears it.
 fn patch<T, U>(slot: &mut Option<U>, patch: &MaybeUndefined<T>, convert: impl FnOnce(&T) -> U) {
@@ -16,7 +17,7 @@ fn patch<T, U>(slot: &mut Option<U>, patch: &MaybeUndefined<T>, convert: impl Fn
 
 /// `_meta.querymt.stage` of a `_meta` object.
 fn stage_of(meta: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    meta.get("querymt")?
+    meta.get(QUERYMT_META_NAMESPACE)?
         .get("stage")?
         .as_str()
         .map(str::to_owned)

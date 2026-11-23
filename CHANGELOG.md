@@ -59,6 +59,14 @@
   announcement rules are one projection
   (`querymt_agent_protocol_types::replay`) shared with the session reducer.
 
+- **Compaction updates carry their token counts.** Live, in a history replay
+  and in a load snapshot's projection, a `compaction_update` has
+  `_meta.querymt.compaction.tokensBefore` (the last context measurement before
+  the compaction started, or its token estimate when there is none) and, once
+  known, `tokensAfter`. A count that is not known is omitted. The session
+  reducer merges `_meta` key by key, so a later update that adds `tokensAfter`
+  keeps `tokensBefore` and the run id.
+
 - **The replay identity of a stored reply comes from the provider.** The agent
   used to complete the protocol and endpoint a reply is replayed against from
   the latest stored reply of the same provider and model. When the provider

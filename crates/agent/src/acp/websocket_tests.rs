@@ -322,6 +322,22 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
         },
     ));
 
+    // A model change first tells the client its context measurement is stale.
+    let invalidated: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        invalidated["params"]["update"]["sessionUpdate"],
+        "session_info_update"
+    );
+    assert_eq!(
+        invalidated["params"]["update"]["_meta"]["querymt"]["contextInvalidated"],
+        true
+    );
     let model: serde_json::Value = serde_json::from_str(
         &timeout(Duration::from_secs(2), wire_rx.recv())
             .await

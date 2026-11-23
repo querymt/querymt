@@ -257,6 +257,28 @@ The view SHALL report context usage, the token breakdown (latest request and ses
 - **WHEN** a snapshot of a load without a window carries a whole-session summary with context tokens and the model's context limit
 - **THEN** the view reports that context usage
 
+### Requirement: Accounting detail
+The view SHALL hold the session's latest accounting snapshot as the agent sends it (billing scope, known subtotal, complete total, completeness reasons, attempt counts and the active cycle's budget), taken from the load snapshot and from `_meta.querymt.accounting` on usage and session info updates, so a client can explain a cost and not only show it. The cost SHALL be derived from that snapshot. Accounting that covers no model call SHALL leave the snapshot empty, as live.
+
+#### Scenario: Subscription-only accounting
+- **WHEN** a snapshot whose session accounting has only excluded attempts is applied
+- **THEN** the view holds that accounting with billing scope excluded, and reports no dollar amount as complete
+
+#### Scenario: Live accounting replaces the snapshot's
+- **WHEN** a `usage_update` carries newer accounting in `_meta.querymt.accounting` after a load
+- **THEN** the view holds the newer accounting and the cost derived from it
+
+#### Scenario: Budget is kept
+- **WHEN** accounting with an active cycle and budget arrives
+- **THEN** the view holds the cycle's budget subtotal, completeness and best-effort flag
+
+### Requirement: Compaction token counts in the view
+A compaction entry SHALL expose the tokens before and after the compaction from `_meta.querymt.compaction`, and SHALL hold the same counts live, after a replay and after a load snapshot.
+
+#### Scenario: Compaction counts after a reload
+- **WHEN** a compaction is watched live and the session is then loaded from a snapshot
+- **THEN** both views hold the same tokens before and after for that compaction
+
 ### Requirement: No stale context after a model change
 A context measurement taken before the session's current model was selected SHALL NOT be reported as the session's context usage. The view SHALL report no context usage from a model change until a measurement for the new model arrives, live and after a load.
 

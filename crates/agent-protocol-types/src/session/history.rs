@@ -184,6 +184,8 @@ pub struct SummaryProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[typeshare(serialized_as = "Option<number>")]
     pub context_limit: Option<u64>,
+    /// History position of the selection that made this the current model;
+    /// 0 when a live update named the model and no position is known.
     #[typeshare(serialized_as = "number")]
     pub position: i64,
 }

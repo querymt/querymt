@@ -397,6 +397,15 @@ impl SummaryAcc {
                 }
                 self.latest = request;
             }
+            // A finished compaction reports the context the session holds
+            // afterwards; live delivery and replay use it as the measurement,
+            // so the summary must too.
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(tokens),
+                ..
+            } => {
+                self.context = Some((*tokens, position));
+            }
             AgentEventKind::ProviderChanged {
                 provider,
                 model,
@@ -404,6 +413,19 @@ impl SummaryAcc {
                 provider_node_id,
                 ..
             } => {
+                // Selecting the model the session already uses (another
+                // configuration or node) keeps the position: the last
+                // measurement still describes that model.
+                let position = match &self.provider {
+                    Some(current)
+                        if current.provider == *provider
+                            && current.model == *model
+                            && current.context_limit == *context_limit =>
+                    {
+                        current.position
+                    }
+                    _ => position,
+                };
                 self.provider = Some(SummaryProvider {
                     provider: provider.clone(),
                     model: model.clone(),
@@ -503,16 +525,7 @@ pub async fn summarize_history(
     source_node: Option<&str>,
     window_start: Option<i64>,
 ) -> SessionResult<SummaryPass> {
-    let mut prior = window_start.map(|_| PriorAcc {
-        reducer: AccountingReducer::new(session_id),
-        totals: None,
-        partial: false,
-        requests: 0,
-    });
-    let mut reducer = AccountingReducer::new(session_id);
-    let mut projector = DelegationUpdateProjector::default();
-    let mut cursor = StreamCursor::default();
-    let mut acc = SummaryAcc::default();
+    let mut fold = SummaryFold::new(session_id, window_start);
     let mut after = 0i64;
     loop {
         let page = journal
@@ -527,75 +540,134 @@ pub async fn summarize_history(
         let page_len = page.len();
         after = last;
         for (position, durable) in page {
-            let event = AgentEvent::from(durable);
-            observe_cursor(&mut cursor, &event);
-            if let Err(conflict) = reducer.apply(&event.kind) {
-                tracing::warn!(
-                    session.id = %session_id,
-                    attempt.id = %conflict.attempt_id,
-                    detail = conflict.detail,
-                    "skipping conflicting accounting record in snapshot"
-                );
-            }
-            if is_delegation_event(&event.kind) {
-                projector.project_event(&event);
-            }
-            acc.observe(session_id, position, &event);
-            if let (Some(prior), Some(start)) = (prior.as_mut(), window_start)
-                && position < start
-            {
-                let _ = prior.reducer.apply(&event.kind);
-                if let AgentEventKind::LlmRequestEnd { usage, .. } = &event.kind {
-                    prior.requests += 1;
-                    match usage.as_ref().map(UsageBreakdown::from_usage) {
-                        Some(request) => prior
-                            .totals
-                            .get_or_insert_with(UsageBreakdown::default)
-                            .add(&request),
-                        None => prior.partial = true,
-                    }
-                }
-            }
+            fold.observe(position, &AgentEvent::from(durable));
         }
         if page_len < SCAN_PAGE {
             break;
         }
     }
+    Ok(fold.finish())
+}
 
-    for child in &mut acc.children {
-        child.tool_call_id = child
-            .delegation_id
-            .as_ref()
-            .and_then(|id| acc.delegation_tools.get(id))
-            .cloned();
+/// The same pass over events the caller already holds, each with its history
+/// position, in ascending order. A snapshot that read its history once builds
+/// its summary from those events, so both describe one and the same cut.
+pub fn summarize_events<'a>(
+    session_id: &str,
+    events: impl IntoIterator<Item = (i64, &'a AgentEvent)>,
+) -> SummaryPass {
+    let mut fold = SummaryFold::new(session_id, None);
+    for (position, event) in events {
+        fold.observe(position, event);
     }
-    let usage = SummaryUsage {
-        latest_request: acc.latest,
-        session_totals: acc.totals,
-        partial: acc.partial,
-        request_count: acc.requests,
-        context_tokens: acc.context.map(|(tokens, _)| tokens),
-        context_position: acc.context.map(|(_, position)| position),
-        accounting: reducer.session().clone(),
-        before_window: prior.map(|prior| PriorUsage {
+    fold.finish()
+}
+
+/// State of the whole-session pass: fed event by event, in order.
+struct SummaryFold {
+    session_id: String,
+    window_start: Option<i64>,
+    prior: Option<PriorAcc>,
+    reducer: AccountingReducer,
+    projector: DelegationUpdateProjector,
+    cursor: StreamCursor,
+    acc: SummaryAcc,
+}
+
+impl SummaryFold {
+    fn new(session_id: &str, window_start: Option<i64>) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
             window_start,
-            session_totals: prior.totals,
-            partial: prior.partial,
-            request_count: prior.requests,
-            accounting: prior.reducer.session().clone(),
-        }),
-    };
-    Ok(SummaryPass {
-        accounting: crate::accounting::snapshot_from_reducer(&reducer),
-        delegation_updates: projector.snapshots(),
-        cursor,
-        summary: SessionHistorySummary {
-            usage,
-            provider: acc.provider,
-            pending_inputs: acc.pending,
-            child_sessions: acc.children,
-        },
-    })
+            prior: window_start.map(|_| PriorAcc {
+                reducer: AccountingReducer::new(session_id),
+                totals: None,
+                partial: false,
+                requests: 0,
+            }),
+            reducer: AccountingReducer::new(session_id),
+            projector: DelegationUpdateProjector::default(),
+            cursor: StreamCursor::default(),
+            acc: SummaryAcc::default(),
+        }
+    }
+
+    fn observe(&mut self, position: i64, event: &AgentEvent) {
+        observe_cursor(&mut self.cursor, event);
+        if let Err(conflict) = self.reducer.apply(&event.kind) {
+            tracing::warn!(
+                session.id = %self.session_id,
+                attempt.id = %conflict.attempt_id,
+                detail = conflict.detail,
+                "skipping conflicting accounting record in snapshot"
+            );
+        }
+        if is_delegation_event(&event.kind) {
+            self.projector.project_event(event);
+        }
+        self.acc.observe(&self.session_id, position, event);
+        if let (Some(prior), Some(start)) = (self.prior.as_mut(), self.window_start)
+            && position < start
+        {
+            let _ = prior.reducer.apply(&event.kind);
+            if let AgentEventKind::LlmRequestEnd { usage, .. } = &event.kind {
+                prior.requests += 1;
+                match usage.as_ref().map(UsageBreakdown::from_usage) {
+                    Some(request) => prior
+                        .totals
+                        .get_or_insert_with(UsageBreakdown::default)
+                        .add(&request),
+                    None => prior.partial = true,
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> SummaryPass {
+        let Self {
+            window_start,
+            prior,
+            reducer,
+            projector,
+            cursor,
+            mut acc,
+            ..
+        } = self;
+        for child in &mut acc.children {
+            child.tool_call_id = child
+                .delegation_id
+                .as_ref()
+                .and_then(|id| acc.delegation_tools.get(id))
+                .cloned();
+        }
+        let usage = SummaryUsage {
+            latest_request: acc.latest,
+            session_totals: acc.totals,
+            partial: acc.partial,
+            request_count: acc.requests,
+            context_tokens: acc.context.map(|(tokens, _)| tokens),
+            context_position: acc.context.map(|(_, position)| position),
+            accounting: reducer.session().clone(),
+            before_window: prior.map(|prior| PriorUsage {
+                window_start,
+                session_totals: prior.totals,
+                partial: prior.partial,
+                request_count: prior.requests,
+                accounting: prior.reducer.session().clone(),
+            }),
+        };
+        SummaryPass {
+            accounting: crate::accounting::snapshot_from_reducer(&reducer),
+            delegation_updates: projector.snapshots(),
+            cursor,
+            summary: SessionHistorySummary {
+                usage,
+                provider: acc.provider,
+                pending_inputs: acc.pending,
+                child_sessions: acc.children,
+            },
+        }
+    }
 }
 
 // ── full tool content ──────────────────────────────────────────────────────
@@ -995,6 +1067,61 @@ mod tests {
         assert_eq!(prior.session_totals.unwrap().input_tokens, 350);
         assert_eq!(windowed.accounting, full.accounting);
         assert_eq!(windowed.cursor.local_seq, full.cursor.local_seq);
+    }
+
+    #[tokio::test]
+    async fn summary_over_held_events_equals_the_journal_pass() {
+        let s = storage().await;
+        append(
+            &s,
+            AgentEventKind::ProviderChanged {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                config_id: 1,
+                context_limit: Some(1000),
+                provider_node_id: None,
+            },
+        )
+        .await;
+        seed_turns(&s, 6).await;
+        let events: Vec<AgentEvent> = s
+            .load_session_stream(SID, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(AgentEvent::from)
+            .collect();
+        let held = summarize_events(SID, events.iter().map(|event| (event.seq, event)));
+        let journal = summarize_history(&s, SID, None, None).await.unwrap();
+        assert_eq!(held.summary, journal.summary);
+        assert_eq!(held.accounting, journal.accounting);
+        assert_eq!(held.cursor.local_seq, journal.cursor.local_seq);
+        assert_eq!(held.summary.usage.request_count, 6);
+    }
+
+    #[tokio::test]
+    async fn reselecting_the_model_keeps_its_position() {
+        let s = storage().await;
+        let select = |config_id: i64, limit: u64| AgentEventKind::ProviderChanged {
+            provider: "p".into(),
+            model: "m".into(),
+            config_id,
+            context_limit: Some(limit),
+            provider_node_id: None,
+        };
+        let position = |pass: SummaryPass| pass.summary.provider.expect("a model").position;
+        append(&s, select(1, 1000)).await;
+        let first = position(summarize_history(&s, SID, None, None).await.unwrap());
+        // Another configuration of the same model: the measurement taken
+        // since the first selection still describes it.
+        seed_turns(&s, 1).await;
+        append(&s, select(2, 1000)).await;
+        let again = position(summarize_history(&s, SID, None, None).await.unwrap());
+        assert_eq!(again, first);
+        // Another context limit is another model.
+        append(&s, select(3, 2000)).await;
+        let other = position(summarize_history(&s, SID, None, None).await.unwrap());
+        assert!(other > again);
     }
 
     /// 50k-event journal: the window build and the tool-content lookup stay

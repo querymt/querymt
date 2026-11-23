@@ -265,6 +265,54 @@ pub mod samples {
         }
     }
 
+    /// Usage with `input` and `output` tokens and nothing else.
+    pub fn sample_usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            reasoning_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_tiers: None,
+        }
+    }
+
+    /// The start of a metered main-response attempt with the given identity.
+    pub fn start_for(attempt: AttemptRef, provider: &str, model: &str) -> AttemptStart {
+        AttemptStart {
+            attempt,
+            mode: DispatchMode::Streaming,
+            provider: provider.into(),
+            model: model.into(),
+            route: None,
+            billing: BillingClass::Metered,
+            pricing: Some(sample_pricing()),
+            budget_pricing: None,
+        }
+    }
+
+    /// A succeeded attempt: final usage when given, otherwise an attempt
+    /// that reported none (its valuation is incomplete).
+    pub fn settlement_for(attempt: AttemptRef, usage: Option<Usage>) -> AttemptSettlement {
+        let pricing = sample_pricing();
+        AttemptSettlement {
+            attempt,
+            disposition: if usage.is_some() {
+                UsageDisposition::Final
+            } else {
+                UsageDisposition::Unavailable
+            },
+            outcome: AttemptOutcome::Succeeded,
+            valuation: value_usage(Some(&pricing), usage.as_ref()),
+            usage,
+            effective_provider: None,
+            effective_model: None,
+            pricing_applicability: PricingApplicability::Selected,
+            pricing: Some(pricing),
+            budget_valuation: None,
+        }
+    }
+
     pub fn sample_start() -> AttemptStart {
         AttemptStart {
             attempt: sample_ref(),

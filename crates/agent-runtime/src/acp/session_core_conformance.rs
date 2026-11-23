@@ -10,13 +10,15 @@
 use super::shared::{
     AcpLiveEventTranslator, AcpSessionUpdateCapabilities, replay_agent_events_materialized,
 };
-use crate::session::load_snapshot::{SessionLoadSnapshot, cursor_from_events};
+use crate::session::backend::StorageBackend as _;
+use crate::session::history_window::LoadWindow;
+use crate::session::load_snapshot::{load_session_snapshot, load_session_snapshot_windowed};
+use crate::session::store::SessionStore as _;
 use querymt_agent_core::events::{
-    AgentEvent, AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin,
+    AgentEvent, AgentEventKind, Durability, EphemeralEvent, EventEnvelope, EventOrigin,
+    classify_durability,
 };
 use querymt_agent_core::protocol::{ContentBlock, TextContent};
-use querymt_agent_core::runtime_status::SessionRuntimeStatus;
-use querymt_agent_core::session::projection::AuditView;
 use querymt_agent_session_core::SessionCore;
 use querymt_agent_session_core::input::SessionInput;
 use querymt_agent_session_core::testing::{TraceSpec, generate};
@@ -44,33 +46,51 @@ pub(super) fn journal(spec: TraceSpec) -> Vec<AgentEvent> {
         .collect()
 }
 
-/// The `session/load` response of an agent whose snapshot holds `events`.
-pub(super) fn snapshot_response(events: &[AgentEvent]) -> Value {
-    let snapshot = SessionLoadSnapshot {
-        runtime_status: SessionRuntimeStatus::Idle,
-        audit: AuditView {
-            session_id: SESSION.to_owned(),
-            events: events.to_vec(),
-            tasks: Vec::new(),
-            intent_snapshots: Vec::new(),
-            decisions: Vec::new(),
-            progress_entries: Vec::new(),
-            artifacts: Vec::new(),
-            delegations: Vec::new(),
-            generated_at: time::OffsetDateTime::UNIX_EPOCH,
-        },
-        cursor: cursor_from_events(events),
-        accounting: querymt_agent_services::accounting::snapshot_from_events(
-            SESSION,
-            events.iter().map(|event| &event.kind),
-        ),
-        delegation_updates: Vec::new(),
-        user_prompts: None,
-        history: None,
-        summary: None,
-        truncated: None,
-    };
-    json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } })
+/// The `session/load` responses of an agent that journaled `events`, built
+/// by the agent's own snapshot builder from a real session: first the way
+/// gpui receives it (a load window that covers the whole session, so the
+/// summary comes from the agent's summarizer), then without a window. The
+/// session's id is returned with them.
+pub(super) async fn agent_snapshots(events: &[AgentEvent]) -> (String, Value, Value) {
+    let fixture = crate::session::run_reconcile::tests::fixture().await;
+    let sid = fixture
+        .storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("a session")
+        .public_id;
+    for event in events {
+        // Streamed-only events are never journaled.
+        if classify_durability(&event.kind) == Durability::Ephemeral {
+            continue;
+        }
+        let mut kind = event.kind.clone();
+        // Attempts are charged to the session that journals them.
+        querymt_agent_session_core::testing::charge_to_session(&mut kind, &sid);
+        crate::session::run_reconcile::tests::seed(&fixture.storage, &sid, kind).await;
+    }
+    let agent = crate::agent::LocalAgentHandle::from_config(fixture.config.clone());
+    let view_store = fixture.storage.view_store().expect("a view store");
+    let windowed = load_session_snapshot_windowed(
+        &agent,
+        view_store.clone(),
+        &sid,
+        Some(LoadWindow {
+            max_turns: 100,
+            ..LoadWindow::default()
+        }),
+    )
+    .await
+    .expect("the windowed snapshot builds");
+    assert!(
+        windowed.history.as_ref().is_some_and(|h| h.complete),
+        "the window covers the session"
+    );
+    let unwindowed = load_session_snapshot(&agent, view_store, &sid)
+        .await
+        .expect("the snapshot builds");
+    let response = |snapshot: &crate::session::load_snapshot::SessionLoadSnapshot| json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } });
+    (sid, response(&windowed), response(&unwindowed))
 }
 
 fn notification(update: &impl serde::Serialize) -> SessionInput {
@@ -239,54 +259,36 @@ fn without_revisions(value: &mut Value) {
     }
 }
 
-/// What the three paths must agree on: turns (ids included) with their
-/// entries, the plan's items, context usage, token breakdown and the
-/// title. Cost is not compared yet: the generated journals have no LLM
-/// attempts, and then a snapshot reports an incomplete zero cost where the
-/// live stream and a replay send no accounting at all (see tasks.md 6.1).
-///
-/// A compaction's summary is compared as its text: live, the agent streams
-/// it as chunks and the view keeps one block per chunk (as the ACP contract
-/// says), while a snapshot or replay holds the whole summary in one block.
-///
-/// The plan's id is left out: the agent names the todo plan only for clients
-/// that announce plan operations, and a snapshot has no such client. The run
-/// state is checked on its own, since a replay carries no state updates.
+/// What the three paths must agree on, with no exceptions: turns (ids
+/// included) with their entries (compaction summary blocks included), the
+/// plan (plan id included), context usage, token breakdown, cost, the
+/// accounting detail and the title. The run state is checked on its own, since a replay carries no
+/// state updates.
 pub(super) fn comparable(core: &SessionCore) -> Value {
     let ids = core.turn_ids();
     let header = core.header();
     let mut view = json!({
         "turns": core.turns(&ids),
-        "plan": header.plan.as_ref().map(|plan| (&plan.entries, &plan.markdown)),
+        "plan": header.plan,
         "context": header.context,
         "tokens": header.tokens,
+        "cost": header.cost,
+        "accounting": header.accounting,
         "title": header.title,
     });
     without_revisions(&mut view);
-    join_compaction_summaries(&mut view);
     view
 }
 
-fn join_compaction_summaries(view: &mut Value) {
-    let Some(turns) = view["turns"].as_array_mut() else {
-        return;
-    };
-    for entry in turns
-        .iter_mut()
-        .filter_map(|turn| turn["entries"].as_array_mut())
-        .flatten()
-    {
-        if entry["kind"]["type"] != "compaction" {
-            continue;
-        }
-        let text: String = entry["kind"]["data"]["summary"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        entry["kind"]["data"]["summary"] = Value::String(text);
-    }
+/// The session's current model as a header names it: provider, model and
+/// context limit. The journal position and node are not compared: a live
+/// update carries no position. A replay names the model only through its
+/// config option, so only the live stream and the snapshot are compared.
+fn current_model(core: &SessionCore) -> Value {
+    core.header().provider.as_ref().map_or(
+        Value::Null,
+        |p| json!({ "provider": p.provider, "model": p.model, "contextLimit": p.context_limit }),
+    )
 }
 
 /// The JSON paths where two views differ (at most `limit`), with short values.
@@ -338,50 +340,142 @@ pub(super) fn assert_same_view(name: &str, got: &Value, expected: &Value) {
     assert!(out.is_empty(), "{name}: views differ:\n{}", out.join("\n"));
 }
 
-fn apply_all(inputs: &[SessionInput]) -> SessionCore {
-    let mut core = SessionCore::new(SESSION);
+fn apply_all(session: &str, inputs: &[SessionInput]) -> SessionCore {
+    let mut core = SessionCore::new(session);
     let report = core.apply(inputs);
     assert!(report.errors.is_empty(), "inputs were rejected: {report:?}");
     core
 }
 
+/// The generated sessions: plain usage, a request without usage with model
+/// changes (one after the last request), no model call at all, and a scaled
+/// one.
 fn specs() -> Vec<(String, TraceSpec)> {
-    let mut specs = Vec::new();
-    for seed in 1..=4 {
-        specs.push((format!("small seed {seed}"), TraceSpec::small(seed)));
-    }
-    specs.push(("scaled".to_owned(), TraceSpec::scaled(9, 3)));
-    specs
+    vec![
+        ("small seed 1".to_owned(), TraceSpec::small(1)),
+        (
+            "usage gaps".to_owned(),
+            TraceSpec {
+                usage_gaps: true,
+                ..TraceSpec::small(2)
+            },
+        ),
+        (
+            "no model call".to_owned(),
+            TraceSpec {
+                model_calls: false,
+                ..TraceSpec::small(3)
+            },
+        ),
+        ("small seed 4".to_owned(), TraceSpec::small(4)),
+        ("scaled".to_owned(), TraceSpec::scaled(9, 3)),
+    ]
 }
 
-#[test]
-fn snapshot_and_live_stream_produce_the_same_turns() {
+/// What the usage of a trace must look like on every path.
+fn assert_usage_shape(name: &str, spec: &TraceSpec, view: &Value) {
+    let reports_context = spec.model_calls && !spec.usage_gaps;
+    assert_eq!(
+        !view["context"].is_null(),
+        reports_context,
+        "{name}: context usage {}",
+        view["context"]
+    );
+    assert_eq!(
+        !view["cost"].is_null(),
+        spec.model_calls,
+        "{name}: cost {}",
+        view["cost"]
+    );
+    assert_eq!(
+        !view["accounting"].is_null(),
+        spec.model_calls,
+        "{name}: accounting {}",
+        view["accounting"]
+    );
+    // Every compaction reports the context around it (compared with the
+    // rest of the turns): tokens before, and after once known.
+    let mut counted = 0;
+    for turn in view["turns"].as_array().into_iter().flatten() {
+        for entry in turn["entries"].as_array().into_iter().flatten() {
+            if entry["kind"]["type"] == "compaction" {
+                let counts = &entry["kind"]["data"]["meta"]["querymt"]["compaction"];
+                assert!(
+                    counts["tokensBefore"].is_u64() && counts["tokensAfter"].is_u64(),
+                    "{name}: compaction counts {counts}"
+                );
+                counted += 1;
+            }
+        }
+    }
+    assert!(counted > 0, "{name}: the trace should hold a compaction");
+    assert_eq!(
+        !view["tokens"].is_null(),
+        spec.model_calls,
+        "{name}: tokens {}",
+        view["tokens"]
+    );
+}
+
+#[tokio::test]
+async fn snapshot_and_live_stream_produce_the_same_turns() {
     for (name, spec) in specs() {
         let events = journal(spec);
-        let from_snapshot = apply_all(&[SessionInput::SnapshotLoaded {
-            response: snapshot_response(&events),
-        }]);
-        let from_live = apply_all(&live_stream(&events));
+        let (sid, windowed, unwindowed) = agent_snapshots(&events).await;
+        let from_snapshot = apply_all(&sid, &[SessionInput::SnapshotLoaded { response: windowed }]);
+        let from_unwindowed = apply_all(
+            &sid,
+            &[SessionInput::SnapshotLoaded {
+                response: unwindowed,
+            }],
+        );
+        let from_live = apply_all(SESSION, &live_stream(&events));
         let expected = comparable(&from_snapshot);
         assert!(
             expected["turns"].as_array().is_some_and(|t| t.len() > 3),
             "{name}: the trace should have several turns"
         );
+        assert_usage_shape(&name, &spec, &expected);
         assert_same_view(&name, &comparable(&from_live), &expected);
-        // The state updates ended the last run.
+        assert_same_view(
+            &format!("{name} (no window)"),
+            &comparable(&from_unwindowed),
+            &expected,
+        );
+        // The model the header names: the last one selected, live as loaded.
+        let model = current_model(&from_snapshot);
+        assert_eq!(model.is_null(), !spec.model_calls, "{name}: model {model}");
+        assert_eq!(current_model(&from_live), model, "{name}: live model");
+        assert_eq!(
+            current_model(&from_unwindowed),
+            model,
+            "{name}: unwindowed model"
+        );
+        // The state updates ended the last run, and the snapshot says the
+        // same.
         assert_eq!(from_live.header().run_state, RunState::Idle, "{name}");
         assert_eq!(from_live.header().active_run_id, None, "{name}");
+        assert_eq!(
+            from_snapshot.header().run_state,
+            from_live.header().run_state,
+            "{name}"
+        );
+        assert_eq!(
+            from_snapshot.header().active_run_id,
+            from_live.header().active_run_id,
+            "{name}"
+        );
     }
 }
 
-#[test]
-fn snapshot_and_replay_produce_the_same_turns() {
+#[tokio::test]
+async fn snapshot_and_replay_produce_the_same_turns() {
     for (name, spec) in specs() {
         let events = journal(spec);
-        let from_snapshot = apply_all(&[SessionInput::SnapshotLoaded {
-            response: snapshot_response(&events),
-        }]);
-        let from_replay = apply_all(&replay_stream(&events));
+        let (sid, windowed, _) = agent_snapshots(&events).await;
+        let from_snapshot = apply_all(&sid, &[SessionInput::SnapshotLoaded { response: windowed }]);
+        let from_replay = apply_all(SESSION, &replay_stream(&events));
+        assert_usage_shape(&name, &spec, &comparable(&from_replay));
         assert_same_view(
             &name,
             &comparable(&from_replay),

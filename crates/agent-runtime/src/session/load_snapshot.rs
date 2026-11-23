@@ -1,6 +1,8 @@
 use crate::agent::LocalAgentHandle;
 use crate::session::error::{SessionError, SessionResult};
-use crate::session::history_window::{LoadWindow, read_window, summarize_history};
+use crate::session::history_window::{
+    LoadWindow, read_window, summarize_events, summarize_history,
+};
 use crate::session::projection::{AuditView, ViewStore};
 use querymt_agent_core::events::AgentEvent;
 pub use querymt_agent_core::session::prompt_records::UserPromptRecord;
@@ -103,6 +105,15 @@ pub async fn load_session_snapshot_windowed(
             event.seq = position;
         }
     }
+    // The whole-session summary is part of every snapshot, windowed or not.
+    // It is the same pass the windowed path runs (no window start), over the
+    // events this snapshot already holds, each at its history position: one
+    // read, so the summary and the events describe the same cut.
+    let summary = summarize_events(
+        session_id,
+        audit.events.iter().map(|event| (event.seq, event)),
+    )
+    .summary;
     let accounting = querymt_agent_services::accounting::snapshot_from_events(
         session_id,
         audit.events.iter().map(|event| &event.kind),
@@ -155,7 +166,7 @@ pub async fn load_session_snapshot_windowed(
         delegation_updates,
         user_prompts: Some(prompts),
         history: None,
-        summary: None,
+        summary: Some(summary),
         truncated: None,
     })
 }
@@ -828,6 +839,85 @@ mod tests {
             .unwrap();
         let expected: Vec<String> = (0..30).map(|i| format!("prompt-{i}")).collect();
         assert_eq!(prompt_ids(&snapshot), expected);
+    }
+
+    /// Add a model selection and one request with usage to a session.
+    async fn seed_usage(f: &crate::session::run_reconcile::tests::Fixture, sid: &str) {
+        use crate::session::run_reconcile::tests::seed;
+        use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics};
+
+        seed(
+            &f.storage,
+            sid,
+            AgentEventKind::ProviderChanged {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                config_id: 1,
+                context_limit: Some(200_000),
+                provider_node_id: None,
+            },
+        )
+        .await;
+        seed(
+            &f.storage,
+            sid,
+            AgentEventKind::LlmRequestEnd {
+                usage: Some(querymt::Usage {
+                    input_tokens: 1_200,
+                    output_tokens: 80,
+                    reasoning_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_tiers: None,
+                }),
+                tool_calls: 0,
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: 1_280,
+                metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                accounting: None,
+                prefix_change: None,
+                idle_secs: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn load_without_a_window_has_a_summary() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 3, None).await;
+        seed_usage(&f, &sid).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        assert!(snapshot.history.is_none(), "no window was requested");
+        let summary = snapshot.summary.expect("every snapshot has a summary");
+        assert_eq!(summary.usage.request_count, 1);
+        assert_eq!(summary.usage.context_tokens, Some(1_280));
+        let totals = summary.usage.session_totals.expect("token totals");
+        assert_eq!(totals.input_tokens, 1_200);
+        let provider = summary.provider.expect("current model");
+        assert_eq!(provider.model, "mock-model");
+        assert_eq!(provider.context_limit, Some(200_000));
+    }
+
+    #[tokio::test]
+    async fn same_summary_with_and_without_a_window() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 3, None).await;
+        seed_usage(&f, &sid).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let plain = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        // A window that covers the whole session.
+        let windowed = windowed(&f, &sid, 20).await;
+        assert!(windowed.history.as_ref().unwrap().complete);
+        assert_eq!(plain.summary, windowed.summary);
+        assert!(plain.summary.is_some());
     }
 
     #[tokio::test]

@@ -29,6 +29,22 @@
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
+                        "type": "provider_changed",
+                        "data": {
+                          "provider": "mock",
+                          "model": "mock-model",
+                          "config_id": 1,
+                          "context_limit": 200000
+                        }
+                      }
+                    },
+                    {
+                      "seq": 2,
+                      "session_seq": 2,
+                      "timestamp": 1000002,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
                         "type": "run_started",
                         "data": {
                           "run_id": "r0",
@@ -37,9 +53,9 @@
                       }
                     },
                     {
-                      "seq": 2,
-                      "session_seq": 2,
-                      "timestamp": 1000002,
+                      "seq": 3,
+                      "session_seq": 3,
+                      "timestamp": 1000003,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -51,9 +67,129 @@
                       }
                     },
                     {
-                      "seq": 3,
-                      "session_seq": 3,
-                      "timestamp": 1000003,
+                      "seq": 4,
+                      "session_seq": 4,
+                      "timestamp": 1000004,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op0",
+                              "attempt_id": "att0",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle0",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 5,
+                      "session_seq": 5,
+                      "timestamp": 1000005,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op0",
+                              "attempt_id": "att0",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle0",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1000,
+                              "output_tokens": 50,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.003,
+                                "output_usd": 0.00075,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.00375,
+                              "complete_total_usd": 0.00375,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 6,
+                      "session_seq": 6,
+                      "timestamp": 1000006,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 50,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.00375,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1050,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op0",
+                            "attempt_ids": [
+                              "att0"
+                            ],
+                            "known_subtotal_usd": 0.00375,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 7,
+                      "session_seq": 7,
+                      "timestamp": 1000007,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -71,9 +207,9 @@
                       }
                     },
                     {
-                      "seq": 4,
-                      "session_seq": 4,
-                      "timestamp": 1000004,
+                      "seq": 8,
+                      "session_seq": 8,
+                      "timestamp": 1000008,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -86,9 +222,9 @@
                       }
                     },
                     {
-                      "seq": 5,
-                      "session_seq": 5,
-                      "timestamp": 1000005,
+                      "seq": 9,
+                      "session_seq": 9,
+                      "timestamp": 1000009,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -103,9 +239,9 @@
                       }
                     },
                     {
-                      "seq": 6,
-                      "session_seq": 6,
-                      "timestamp": 1000006,
+                      "seq": 10,
+                      "session_seq": 10,
+                      "timestamp": 1000010,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -117,9 +253,9 @@
                       }
                     },
                     {
-                      "seq": 7,
-                      "session_seq": 7,
-                      "timestamp": 1000007,
+                      "seq": 11,
+                      "session_seq": 11,
+                      "timestamp": 1000011,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -133,9 +269,9 @@
                       }
                     },
                     {
-                      "seq": 8,
-                      "session_seq": 8,
-                      "timestamp": 1000008,
+                      "seq": 12,
+                      "session_seq": 12,
+                      "timestamp": 1000012,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -147,9 +283,9 @@
                       }
                     },
                     {
-                      "seq": 9,
-                      "session_seq": 9,
-                      "timestamp": 1000009,
+                      "seq": 13,
+                      "session_seq": 13,
+                      "timestamp": 1000013,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -161,9 +297,9 @@
                       }
                     },
                     {
-                      "seq": 10,
-                      "session_seq": 10,
-                      "timestamp": 1000010,
+                      "seq": 14,
+                      "session_seq": 14,
+                      "timestamp": 1000014,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -175,9 +311,9 @@
                       }
                     },
                     {
-                      "seq": 11,
-                      "session_seq": 11,
-                      "timestamp": 1000011,
+                      "seq": 15,
+                      "session_seq": 15,
+                      "timestamp": 1000015,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -191,9 +327,9 @@
                       }
                     },
                     {
-                      "seq": 12,
-                      "session_seq": 12,
-                      "timestamp": 1000012,
+                      "seq": 16,
+                      "session_seq": 16,
+                      "timestamp": 1000016,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -208,9 +344,9 @@
                       }
                     },
                     {
-                      "seq": 13,
-                      "session_seq": 13,
-                      "timestamp": 1000013,
+                      "seq": 17,
+                      "session_seq": 17,
+                      "timestamp": 1000017,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -222,9 +358,9 @@
                       }
                     },
                     {
-                      "seq": 14,
-                      "session_seq": 14,
-                      "timestamp": 1000014,
+                      "seq": 18,
+                      "session_seq": 18,
+                      "timestamp": 1000018,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -238,9 +374,129 @@
                       }
                     },
                     {
-                      "seq": 15,
-                      "session_seq": 15,
-                      "timestamp": 1000015,
+                      "seq": 19,
+                      "session_seq": 19,
+                      "timestamp": 1000019,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op1",
+                              "attempt_id": "att1",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle1",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 20,
+                      "session_seq": 20,
+                      "timestamp": 1000020,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op1",
+                              "attempt_id": "att1",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle1",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1300,
+                              "output_tokens": 51,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0039000000000000003,
+                                "output_usd": 0.0007650000000000001,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.004665000000000001,
+                              "complete_total_usd": 0.004665000000000001,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 21,
+                      "session_seq": 21,
+                      "timestamp": 1000021,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1300,
+                            "output_tokens": 51,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.004665000000000001,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1351,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op1",
+                            "attempt_ids": [
+                              "att1"
+                            ],
+                            "known_subtotal_usd": 0.004665000000000001,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 22,
+                      "session_seq": 22,
+                      "timestamp": 1000022,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -258,9 +514,9 @@
                       }
                     },
                     {
-                      "seq": 16,
-                      "session_seq": 16,
-                      "timestamp": 1000016,
+                      "seq": 23,
+                      "session_seq": 23,
+                      "timestamp": 1000023,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -272,9 +528,9 @@
                       }
                     },
                     {
-                      "seq": 17,
-                      "session_seq": 17,
-                      "timestamp": 1000017,
+                      "seq": 24,
+                      "session_seq": 24,
+                      "timestamp": 1000024,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -286,9 +542,9 @@
                       }
                     },
                     {
-                      "seq": 18,
-                      "session_seq": 18,
-                      "timestamp": 1000018,
+                      "seq": 25,
+                      "session_seq": 25,
+                      "timestamp": 1000025,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -300,9 +556,129 @@
                       }
                     },
                     {
-                      "seq": 19,
-                      "session_seq": 19,
-                      "timestamp": 1000019,
+                      "seq": 26,
+                      "session_seq": 26,
+                      "timestamp": 1000026,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op2",
+                              "attempt_id": "att2",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle2",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 27,
+                      "session_seq": 27,
+                      "timestamp": 1000027,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op2",
+                              "attempt_id": "att2",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle2",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1600,
+                              "output_tokens": 52,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0048000000000000004,
+                                "output_usd": 0.00078,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.005580000000000001,
+                              "complete_total_usd": 0.005580000000000001,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 28,
+                      "session_seq": 28,
+                      "timestamp": 1000028,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1600,
+                            "output_tokens": 52,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.005580000000000001,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1652,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op2",
+                            "attempt_ids": [
+                              "att2"
+                            ],
+                            "known_subtotal_usd": 0.005580000000000001,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 29,
+                      "session_seq": 29,
+                      "timestamp": 1000029,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -320,9 +696,9 @@
                       }
                     },
                     {
-                      "seq": 20,
-                      "session_seq": 20,
-                      "timestamp": 1000020,
+                      "seq": 30,
+                      "session_seq": 30,
+                      "timestamp": 1000030,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -335,9 +711,9 @@
                       }
                     },
                     {
-                      "seq": 21,
-                      "session_seq": 21,
-                      "timestamp": 1000021,
+                      "seq": 31,
+                      "session_seq": 31,
+                      "timestamp": 1000031,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -351,9 +727,9 @@
                       }
                     },
                     {
-                      "seq": 22,
-                      "session_seq": 22,
-                      "timestamp": 1000022,
+                      "seq": 32,
+                      "session_seq": 32,
+                      "timestamp": 1000032,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -366,9 +742,9 @@
                       }
                     },
                     {
-                      "seq": 23,
-                      "session_seq": 23,
-                      "timestamp": 1000023,
+                      "seq": 33,
+                      "session_seq": 33,
+                      "timestamp": 1000033,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -383,9 +759,9 @@
                       }
                     },
                     {
-                      "seq": 24,
-                      "session_seq": 24,
-                      "timestamp": 1000024,
+                      "seq": 34,
+                      "session_seq": 34,
+                      "timestamp": 1000034,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -397,9 +773,9 @@
                       }
                     },
                     {
-                      "seq": 25,
-                      "session_seq": 25,
-                      "timestamp": 1000025,
+                      "seq": 35,
+                      "session_seq": 35,
+                      "timestamp": 1000035,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -413,9 +789,9 @@
                       }
                     },
                     {
-                      "seq": 26,
-                      "session_seq": 26,
-                      "timestamp": 1000026,
+                      "seq": 36,
+                      "session_seq": 36,
+                      "timestamp": 1000036,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -428,9 +804,9 @@
                       }
                     },
                     {
-                      "seq": 27,
-                      "session_seq": 27,
-                      "timestamp": 1000027,
+                      "seq": 37,
+                      "session_seq": 37,
+                      "timestamp": 1000037,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -444,9 +820,9 @@
                       }
                     },
                     {
-                      "seq": 28,
-                      "session_seq": 28,
-                      "timestamp": 1000028,
+                      "seq": 38,
+                      "session_seq": 38,
+                      "timestamp": 1000038,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -458,9 +834,9 @@
                       }
                     },
                     {
-                      "seq": 29,
-                      "session_seq": 29,
-                      "timestamp": 1000029,
+                      "seq": 39,
+                      "session_seq": 39,
+                      "timestamp": 1000039,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -472,9 +848,9 @@
                       }
                     },
                     {
-                      "seq": 30,
-                      "session_seq": 30,
-                      "timestamp": 1000030,
+                      "seq": 40,
+                      "session_seq": 40,
+                      "timestamp": 1000040,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -486,9 +862,9 @@
                       }
                     },
                     {
-                      "seq": 31,
-                      "session_seq": 31,
-                      "timestamp": 1000031,
+                      "seq": 41,
+                      "session_seq": 41,
+                      "timestamp": 1000041,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -502,9 +878,9 @@
                       }
                     },
                     {
-                      "seq": 32,
-                      "session_seq": 32,
-                      "timestamp": 1000032,
+                      "seq": 42,
+                      "session_seq": 42,
+                      "timestamp": 1000042,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -519,9 +895,9 @@
                       }
                     },
                     {
-                      "seq": 33,
-                      "session_seq": 33,
-                      "timestamp": 1000033,
+                      "seq": 43,
+                      "session_seq": 43,
+                      "timestamp": 1000043,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -533,9 +909,9 @@
                       }
                     },
                     {
-                      "seq": 34,
-                      "session_seq": 34,
-                      "timestamp": 1000034,
+                      "seq": 44,
+                      "session_seq": 44,
+                      "timestamp": 1000044,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -549,9 +925,129 @@
                       }
                     },
                     {
-                      "seq": 35,
-                      "session_seq": 35,
-                      "timestamp": 1000035,
+                      "seq": 45,
+                      "session_seq": 45,
+                      "timestamp": 1000045,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op3",
+                              "attempt_id": "att3",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle3",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 46,
+                      "session_seq": 46,
+                      "timestamp": 1000046,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op3",
+                              "attempt_id": "att3",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle3",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1900,
+                              "output_tokens": 53,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0057,
+                                "output_usd": 0.000795,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.006495,
+                              "complete_total_usd": 0.006495,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 47,
+                      "session_seq": 47,
+                      "timestamp": 1000047,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1900,
+                            "output_tokens": 53,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.006495,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1953,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op3",
+                            "attempt_ids": [
+                              "att3"
+                            ],
+                            "known_subtotal_usd": 0.006495,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 48,
+                      "session_seq": 48,
+                      "timestamp": 1000048,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -569,9 +1065,9 @@
                       }
                     },
                     {
-                      "seq": 36,
-                      "session_seq": 36,
-                      "timestamp": 1000036,
+                      "seq": 49,
+                      "session_seq": 49,
+                      "timestamp": 1000049,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -584,9 +1080,9 @@
                       }
                     },
                     {
-                      "seq": 37,
-                      "session_seq": 37,
-                      "timestamp": 1000037,
+                      "seq": 50,
+                      "session_seq": 50,
+                      "timestamp": 1000050,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -600,23 +1096,23 @@
                       }
                     },
                     {
-                      "seq": 38,
-                      "session_seq": 38,
-                      "timestamp": 1000038,
+                      "seq": 51,
+                      "session_seq": 51,
+                      "timestamp": 1000051,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
                         "type": "compaction_start",
                         "data": {
-                          "token_estimate": 1000,
+                          "token_estimate": 1030,
                           "compaction_id": "c3"
                         }
                       }
                     },
                     {
-                      "seq": 39,
-                      "session_seq": 39,
-                      "timestamp": 1000039,
+                      "seq": 52,
+                      "session_seq": 52,
+                      "timestamp": 1000052,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -625,14 +1121,14 @@
                           "summary": "ipsum eiusmod aliqua ut consectetur tempor sed sed dolor magna tempor sit",
                           "summary_len": 12,
                           "compaction_id": "c3",
-                          "context_tokens": 200
+                          "context_tokens": 203
                         }
                       }
                     },
                     {
-                      "seq": 40,
-                      "session_seq": 40,
-                      "timestamp": 1000040,
+                      "seq": 53,
+                      "session_seq": 53,
+                      "timestamp": 1000053,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -644,9 +1140,9 @@
                       }
                     },
                     {
-                      "seq": 41,
-                      "session_seq": 41,
-                      "timestamp": 1000041,
+                      "seq": 54,
+                      "session_seq": 54,
+                      "timestamp": 1000054,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -658,9 +1154,9 @@
                       }
                     },
                     {
-                      "seq": 42,
-                      "session_seq": 42,
-                      "timestamp": 1000042,
+                      "seq": 55,
+                      "session_seq": 55,
+                      "timestamp": 1000055,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -672,9 +1168,129 @@
                       }
                     },
                     {
-                      "seq": 43,
-                      "session_seq": 43,
-                      "timestamp": 1000043,
+                      "seq": 56,
+                      "session_seq": 56,
+                      "timestamp": 1000056,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op4",
+                              "attempt_id": "att4",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle4",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 57,
+                      "session_seq": 57,
+                      "timestamp": 1000057,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op4",
+                              "attempt_id": "att4",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle4",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 2200,
+                              "output_tokens": 54,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0066,
+                                "output_usd": 0.0008100000000000001,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.00741,
+                              "complete_total_usd": 0.00741,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 58,
+                      "session_seq": 58,
+                      "timestamp": 1000058,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 2200,
+                            "output_tokens": 54,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.00741,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 2254,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op4",
+                            "attempt_ids": [
+                              "att4"
+                            ],
+                            "known_subtotal_usd": 0.00741,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 59,
+                      "session_seq": 59,
+                      "timestamp": 1000059,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -692,9 +1308,9 @@
                       }
                     },
                     {
-                      "seq": 44,
-                      "session_seq": 44,
-                      "timestamp": 1000044,
+                      "seq": 60,
+                      "session_seq": 60,
+                      "timestamp": 1000060,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -707,9 +1323,9 @@
                       }
                     },
                     {
-                      "seq": 45,
-                      "session_seq": 45,
-                      "timestamp": 1000045,
+                      "seq": 61,
+                      "session_seq": 61,
+                      "timestamp": 1000061,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -724,9 +1340,9 @@
                       }
                     },
                     {
-                      "seq": 46,
-                      "session_seq": 46,
-                      "timestamp": 1000046,
+                      "seq": 62,
+                      "session_seq": 62,
+                      "timestamp": 1000062,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -738,9 +1354,9 @@
                       }
                     },
                     {
-                      "seq": 47,
-                      "session_seq": 47,
-                      "timestamp": 1000047,
+                      "seq": 63,
+                      "session_seq": 63,
+                      "timestamp": 1000063,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -754,9 +1370,9 @@
                       }
                     },
                     {
-                      "seq": 48,
-                      "session_seq": 48,
-                      "timestamp": 1000048,
+                      "seq": 64,
+                      "session_seq": 64,
+                      "timestamp": 1000064,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -768,9 +1384,9 @@
                       }
                     },
                     {
-                      "seq": 49,
-                      "session_seq": 49,
-                      "timestamp": 1000049,
+                      "seq": 65,
+                      "session_seq": 65,
+                      "timestamp": 1000065,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -782,9 +1398,9 @@
                       }
                     },
                     {
-                      "seq": 50,
-                      "session_seq": 50,
-                      "timestamp": 1000050,
+                      "seq": 66,
+                      "session_seq": 66,
+                      "timestamp": 1000066,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -796,9 +1412,9 @@
                       }
                     },
                     {
-                      "seq": 51,
-                      "session_seq": 51,
-                      "timestamp": 1000051,
+                      "seq": 67,
+                      "session_seq": 67,
+                      "timestamp": 1000067,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -810,9 +1426,9 @@
                       }
                     },
                     {
-                      "seq": 52,
-                      "session_seq": 52,
-                      "timestamp": 1000052,
+                      "seq": 68,
+                      "session_seq": 68,
+                      "timestamp": 1000068,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -824,9 +1440,9 @@
                       }
                     },
                     {
-                      "seq": 53,
-                      "session_seq": 53,
-                      "timestamp": 1000053,
+                      "seq": 69,
+                      "session_seq": 69,
+                      "timestamp": 1000069,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -838,9 +1454,9 @@
                       }
                     },
                     {
-                      "seq": 54,
-                      "session_seq": 54,
-                      "timestamp": 1000054,
+                      "seq": 70,
+                      "session_seq": 70,
+                      "timestamp": 1000070,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -854,9 +1470,9 @@
                       }
                     },
                     {
-                      "seq": 55,
-                      "session_seq": 55,
-                      "timestamp": 1000055,
+                      "seq": 71,
+                      "session_seq": 71,
+                      "timestamp": 1000071,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -871,9 +1487,9 @@
                       }
                     },
                     {
-                      "seq": 56,
-                      "session_seq": 56,
-                      "timestamp": 1000056,
+                      "seq": 72,
+                      "session_seq": 72,
+                      "timestamp": 1000072,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -885,9 +1501,9 @@
                       }
                     },
                     {
-                      "seq": 57,
-                      "session_seq": 57,
-                      "timestamp": 1000057,
+                      "seq": 73,
+                      "session_seq": 73,
+                      "timestamp": 1000073,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -901,9 +1517,129 @@
                       }
                     },
                     {
-                      "seq": 58,
-                      "session_seq": 58,
-                      "timestamp": 1000058,
+                      "seq": 74,
+                      "session_seq": 74,
+                      "timestamp": 1000074,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op5",
+                              "attempt_id": "att5",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle5",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 75,
+                      "session_seq": 75,
+                      "timestamp": 1000075,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op5",
+                              "attempt_id": "att5",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle5",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 2500,
+                              "output_tokens": 55,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.007500000000000001,
+                                "output_usd": 0.000825,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.008325,
+                              "complete_total_usd": 0.008325,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 76,
+                      "session_seq": 76,
+                      "timestamp": 1000076,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 2500,
+                            "output_tokens": 55,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.008325,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 2555,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op5",
+                            "attempt_ids": [
+                              "att5"
+                            ],
+                            "known_subtotal_usd": 0.008325,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 77,
+                      "session_seq": 77,
+                      "timestamp": 1000077,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -921,9 +1657,9 @@
                       }
                     },
                     {
-                      "seq": 59,
-                      "session_seq": 59,
-                      "timestamp": 1000059,
+                      "seq": 78,
+                      "session_seq": 78,
+                      "timestamp": 1000078,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -936,9 +1672,9 @@
                       }
                     },
                     {
-                      "seq": 60,
-                      "session_seq": 60,
-                      "timestamp": 1000060,
+                      "seq": 79,
+                      "session_seq": 79,
+                      "timestamp": 1000079,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -952,9 +1688,9 @@
                       }
                     },
                     {
-                      "seq": 61,
-                      "session_seq": 61,
-                      "timestamp": 1000061,
+                      "seq": 80,
+                      "session_seq": 80,
+                      "timestamp": 1000080,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -967,9 +1703,9 @@
                       }
                     },
                     {
-                      "seq": 62,
-                      "session_seq": 62,
-                      "timestamp": 1000062,
+                      "seq": 81,
+                      "session_seq": 81,
+                      "timestamp": 1000081,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -983,9 +1719,9 @@
                       }
                     },
                     {
-                      "seq": 63,
-                      "session_seq": 63,
-                      "timestamp": 1000063,
+                      "seq": 82,
+                      "session_seq": 82,
+                      "timestamp": 1000082,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -998,9 +1734,9 @@
                       }
                     },
                     {
-                      "seq": 64,
-                      "session_seq": 64,
-                      "timestamp": 1000064,
+                      "seq": 83,
+                      "session_seq": 83,
+                      "timestamp": 1000083,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1014,9 +1750,9 @@
                       }
                     },
                     {
-                      "seq": 65,
-                      "session_seq": 65,
-                      "timestamp": 1000065,
+                      "seq": 84,
+                      "session_seq": 84,
+                      "timestamp": 1000084,
                       "session_id": "s1",
                       "origin": "local",
                       "kind": {
@@ -1095,17 +1831,14 @@
       "lastError": null,
       "context": null,
       "tokens": null,
-      "cost": {
-        "amount": 0.0,
-        "currency": "USD",
-        "complete": true
-      },
+      "cost": null,
+      "accounting": null,
       "provider": null,
       "title": null,
       "currentMode": null,
       "configOptions": [],
       "plan": {
-        "planId": null,
+        "planId": "querymt-todos",
         "entries": [
           {
             "content": "lorem",
@@ -1515,6 +2248,10 @@
                 "error": null,
                 "meta": {
                   "querymt": {
+                    "compaction": {
+                      "tokensBefore": 1953,
+                      "tokensAfter": 203
+                    },
                     "runId": "r3"
                   }
                 }

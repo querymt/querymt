@@ -98,7 +98,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 **Coordination:**
 - `split-agent-crate` has landed (archived 2026-11-15), so moved modules re-export through the final facade paths.
 - `restructure-agent-turn-state` and `unify-model-call-path` (archived 2026-11-22) changed run start ordering, scheduled runs and the runtime phase channel; this change builds on them.
-- `adopt-acp-subagents-cursors-usage` supplies `subagent_update`, `subagentUpdates` and `cursor_update`. The reducer reads only those, so the gpui pin needs that change's groups 3 (cursors) and 4 (subagents) on the agent it talks to.
+- `adopt-acp-subagents-cursors-usage` supplies `subagent_update`, `subagentUpdates` and `cursor_update`. The reducer reads only those. The gpui pin needs that change's additive subagent support (tasks 1.1, 4.1, 4.2 and 4.5) on the agent it talks to; cursors are not needed for gpui, only this change's task 4.5b waits for that change's cursor helper (3.1).
 
 **querymt-desktop follow-up (UI, not planned here):** the desktop change `adopt-agent-session-core` vendors the WASM artifact, regenerates `src/lib/querymt/generated/types.ts`, and replaces its TypeScript reducer and conversation builder with this module. Its `history_page` mapping passes the raw older-history response.
 

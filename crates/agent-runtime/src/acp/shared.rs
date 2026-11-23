@@ -10,10 +10,10 @@ use crate::acp::protocol::{
     ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined,
-    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanId, PlanRemoved, PlanUpdate,
-    PlanUpdateContent, RequestPermissionOutcome, SessionId, SessionInfoUpdate, SessionModeId,
-    SessionUpdate, TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, UsageUpdate,
+    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanId, PlanRemoved,
+    RequestPermissionOutcome, SessionId, SessionInfoUpdate, SessionModeId, SessionUpdate,
+    TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    UsageUpdate,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::delegation_notifications::DelegationUpdateNotification;
@@ -1208,10 +1208,7 @@ where
     {
         if capabilities.plan_operations {
             push(
-                SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
-                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
-                    entries,
-                ))),
+                querymt_agent_core::replay::todo_plan_update(entries),
                 &mut notifications,
             );
         } else {
@@ -1247,10 +1244,22 @@ where
             _ => None,
         };
         let seq = event.seq;
-        let updates = structured_updates.unwrap_or_else(|| {
-            let envelope = EventEnvelope::from(event);
-            translate_replay_event_to_updates(&envelope)
-        });
+        // A plan-operations client already received the materialized
+        // `plan_update` (step 4); the history pass must not follow it with a
+        // legacy `plan` from the same todowrite.
+        let repeats_materialized_plan = capabilities.plan_operations
+            && matches!(
+                &event.kind,
+                AgentEventKind::ToolCallStart { tool_name, .. } if is_todo_write_tool(tool_name)
+            );
+        let updates = if repeats_materialized_plan {
+            Vec::new()
+        } else {
+            structured_updates.unwrap_or_else(|| {
+                let envelope = EventEnvelope::from(event);
+                translate_replay_event_to_updates(&envelope)
+            })
+        };
         for mut update in updates {
             if let Some(run_id) = &current_run {
                 querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
@@ -1270,6 +1279,11 @@ where
                     update = update.error(error.clone());
                 }
                 let mut update = SessionUpdate::CompactionUpdate(update);
+                querymt_agent_core::replay::stamp_compaction_tokens(
+                    &mut update,
+                    terminal.tokens_before,
+                    terminal.tokens_after,
+                );
                 if let Some(run_id) = &current_run {
                     querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
                 }
@@ -1292,6 +1306,9 @@ struct ReplayCompactionTerminal {
     status: CompactionStatus,
     summary: Option<String>,
     error: Option<String>,
+    /// `_meta.querymt.compaction` counts, as the live updates carry them.
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
 }
 
 /// Folds durable events into the current session-update state for replay.
@@ -1304,6 +1321,7 @@ fn materialize_replay_state(
     let mut compaction_ids = CompactionIds::default();
 
     for event in events {
+        let switches_model = state.usage.selects_other_model(&event.kind);
         state
             .usage
             .observe(&event.session_id, event.seq, &event.kind);
@@ -1328,8 +1346,10 @@ fn materialize_replay_state(
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 state.usage.context_limit = context_limit;
                 // A measurement taken for the previous model is not validated
-                // for this one; live delivery invalidates it the same way.
-                state.usage_used = None;
+                // for another one; live delivery invalidates it the same way.
+                if switches_model {
+                    state.usage_used = None;
+                }
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 // Money comes from the shared reducer (observed above), never
@@ -1340,8 +1360,12 @@ fn materialize_replay_state(
                     state.usage_used = None;
                 }
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => {
-                compaction_ids.start(compaction_id.as_deref(), envelope.seq());
+            AgentEventKind::CompactionStart {
+                compaction_id,
+                token_estimate,
+            } => {
+                let id = compaction_ids.start(compaction_id.as_deref(), envelope.seq());
+                compaction_ids.start_tokens(&id, token_estimate);
             }
             AgentEventKind::CompactionEnd {
                 compaction_id,
@@ -1350,6 +1374,7 @@ fn materialize_replay_state(
                 ..
             } => {
                 let id = compaction_ids.end(compaction_id.as_deref(), envelope.seq());
+                let tokens_before = compaction_ids.take_tokens_before(&id);
                 state
                     .compactions
                     .retain(|c: &ReplayCompactionTerminal| c.id != id);
@@ -1359,6 +1384,8 @@ fn materialize_replay_state(
                     status: CompactionStatus::Completed,
                     summary: (!summary.trim().is_empty()).then_some(summary),
                     error: None,
+                    tokens_before,
+                    tokens_after: context_tokens,
                 });
                 if let Some(tokens) = context_tokens {
                     state.usage_used = Some(tokens);
@@ -1371,6 +1398,7 @@ fn materialize_replay_state(
             } => {
                 compaction_ids.failed();
                 let id = CompactionId::from(compaction_id);
+                let tokens_before = compaction_ids.take_tokens_before(&id);
                 state.compactions.retain(|c| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
                     id,
@@ -1382,6 +1410,8 @@ fn materialize_replay_state(
                     },
                     summary: None,
                     error: (!cancelled).then_some(reason),
+                    tokens_before,
+                    tokens_after: None,
                 });
             }
             AgentEventKind::CompactionSummaryChunk { .. }
@@ -1403,6 +1433,8 @@ fn materialize_replay_state(
             }
             _ => {}
         }
+        // The measurement this event took counts for the compactions after it.
+        compaction_ids.observe(&event.kind);
     }
 
     state
@@ -1423,7 +1455,7 @@ struct MaterializedReplayState {
 }
 
 /// Deterministic plan identity for QueryMT's todo list within a session.
-pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+pub use querymt_agent_core::replay::QUERYMT_TODO_PLAN_ID;
 
 pub use querymt_agent_core::meta::QUERYMT_META_NAMESPACE;
 
@@ -1511,8 +1543,43 @@ impl AcpSessionUpdateCapabilities {
     }
 }
 
-/// `_meta.querymt.accounting` key carrying the replacement accounting DTO.
-pub const QUERYMT_ACCOUNTING_META_KEY: &str = "accounting";
+// The `_meta.querymt` keys are defined with the shared replay projection, so
+// the agent and every client name one value: the accounting DTO, the signal
+// that the last context measurement no longer applies, and the model the
+// session switched to.
+pub use querymt_agent_core::replay::{
+    ACCOUNTING_META_KEY as QUERYMT_ACCOUNTING_META_KEY,
+    CONTEXT_INVALIDATED_META_KEY as QUERYMT_CONTEXT_INVALIDATED_META_KEY,
+    MODEL_META_KEY as QUERYMT_MODEL_META_KEY,
+};
+
+/// The model-change signal: a `session_info_update` that changes neither the
+/// title nor the timestamp and carries `_meta.querymt.contextInvalidated: true`
+/// with the model the session switched to (`_meta.querymt.model`).
+fn model_changed_update(
+    provider: &str,
+    model: &str,
+    node: Option<&str>,
+    context_limit: Option<u64>,
+) -> SessionUpdate {
+    let mut selected = serde_json::Map::new();
+    selected.insert("provider".to_owned(), provider.into());
+    selected.insert("model".to_owned(), model.into());
+    if let Some(node) = node {
+        selected.insert("node".to_owned(), node.into());
+    }
+    if let Some(limit) = context_limit {
+        selected.insert("contextLimit".to_owned(), limit.into());
+    }
+    let meta = serde_json::Map::from_iter([(
+        QUERYMT_META_NAMESPACE.to_string(),
+        serde_json::json!({
+            QUERYMT_CONTEXT_INVALIDATED_META_KEY: true,
+            QUERYMT_MODEL_META_KEY: selected,
+        }),
+    )]);
+    SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta))
+}
 
 /// The whole-session summary of a windowed load snapshot, when the snapshot
 /// does not contain the complete history.
@@ -1526,6 +1593,16 @@ fn windowed_summary(
     serde_json::from_value(snapshot.get("summary")?.clone()).ok()
 }
 
+/// The model a session uses, as far as its context measurement is concerned.
+/// Selecting the same provider, model and limit again (another configuration
+/// or node) does not make a measurement stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelIdentity {
+    provider: String,
+    model: String,
+    context_limit: Option<u64>,
+}
+
 /// Per-session usage projection state for the live context meter.
 ///
 /// Token telemetry (`_meta.querymt.usage` v1) is derived from main-request
@@ -1537,6 +1614,9 @@ struct SessionUsageProjection {
     /// Shared reducer over attempt records; created on first accounting
     /// evidence so a session with none publishes no accounting payload.
     accounting: Option<querymt_agent_services::accounting::AccountingReducer>,
+    /// `tokensBefore` of the compactions that started and did not settle,
+    /// by compaction id.
+    open_compactions: HashMap<String, u64>,
     /// Last main-context occupancy and the journal sequence that reported it.
     context_used: Option<u64>,
     used_seq: Option<i64>,
@@ -1548,6 +1628,8 @@ struct SessionUsageProjection {
     request_seqs: HashMap<i64, Option<TokenUsageBreakdown>>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
+    /// The model `provider_seq` selected; see [`ModelIdentity`].
+    model: Option<ModelIdentity>,
     history_loaded: bool,
     /// Main requests that happened before a windowed load's first event.
     prior_requests: u64,
@@ -1635,6 +1717,25 @@ impl SessionUsageProjection {
             .flatten()
     }
 
+    /// Whether `kind` is a model selection that switches this session to a
+    /// different model (or the first one this projection sees).
+    fn selects_other_model(&self, kind: &AgentEventKind) -> bool {
+        let AgentEventKind::ProviderChanged {
+            provider,
+            model,
+            context_limit,
+            ..
+        } = kind
+        else {
+            return false;
+        };
+        self.model.as_ref().is_none_or(|current| {
+            current.provider != *provider
+                || current.model != *model
+                || current.context_limit != *context_limit
+        })
+    }
+
     fn accounting_snapshot(
         &self,
     ) -> Option<querymt_agent_services::accounting::AccountingSnapshot> {
@@ -1660,11 +1761,34 @@ impl SessionUsageProjection {
             AgentEventKind::LlmAttemptSettled { .. } => {
                 self.apply_accounting(session_id, seq, kind)
             }
-            AgentEventKind::ProviderChanged { context_limit, .. } => {
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                context_limit,
+                ..
+            } => {
                 if self.provider_seq.is_none_or(|previous| seq > previous) {
                     self.context_limit = *context_limit;
-                    self.provider_seq = Some(seq);
+                    // Only another model makes the last measurement stale.
+                    if self.selects_other_model(kind) {
+                        self.model = Some(ModelIdentity {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            context_limit: *context_limit,
+                        });
+                        self.provider_seq = Some(seq);
+                    }
                 }
+                false
+            }
+            // A finished compaction reports the context the session holds
+            // afterwards: a measurement like a request end, on every path
+            // (live, seeding from a load, replay).
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(tokens),
+                ..
+            } => {
+                self.observe_context_used(seq, *tokens);
                 false
             }
             AgentEventKind::LlmRequestEnd {
@@ -1758,7 +1882,9 @@ impl SessionUsageProjection {
     /// measurement/limit pair exists. It never changes the title or the
     /// activity timestamp and fabricates no context numbers.
     fn accounting_only_update(&self) -> Option<SessionUpdate> {
-        let meta = self.querymt_meta(false)?;
+        // The token breakdown is session-wide and stays valid after a model
+        // change, so it travels with the accounting.
+        let meta = self.querymt_meta(true)?;
         meta.get(QUERYMT_META_NAMESPACE)?
             .get(QUERYMT_ACCOUNTING_META_KEY)?;
         let update = SessionInfoUpdate::new();
@@ -2105,6 +2231,7 @@ impl AcpLiveEventTranslator {
                 event["kind"]["type"].as_str(),
                 Some(
                     "llm_request_end"
+                        | "compaction_end"
                         | "provider_changed"
                         | "llm_attempt_started"
                         | "llm_attempt_settled"
@@ -2219,6 +2346,11 @@ impl AcpLiveEventTranslator {
         {
             usage.context_limit = provider.context_limit;
             usage.provider_seq = Some(provider.position);
+            usage.model = Some(ModelIdentity {
+                provider: provider.provider.clone(),
+                model: provider.model.clone(),
+                context_limit: provider.context_limit,
+            });
         }
         if let (Some(tokens), Some(position)) =
             (summary.usage.context_tokens, summary.usage.context_position)
@@ -2482,22 +2614,40 @@ impl AcpLiveEventTranslator {
                 }
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
-            AgentEventKind::ProviderChanged { .. } => {
-                self.usage.entry(session_id.clone()).or_default().observe(
-                    &session_id,
-                    event.seq(),
-                    event.kind(),
-                );
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                context_limit,
+                provider_node_id,
+                ..
+            } => {
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                let switched = usage.selects_other_model(event.kind());
+                usage.observe(&session_id, event.seq(), event.kind());
                 let config = self.config.entry(session_id).or_default();
                 config.observe(event.kind());
-                config
-                    .snapshot()
-                    .map(|options| {
-                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                            options,
-                        ))]
-                    })
-                    .unwrap_or_default()
+                // The last context measurement does not describe a different
+                // model. A metadata-only `session_info_update` (no title, no
+                // timestamp) tells every client, with or without notice
+                // support; replay does not repeat it. Selecting the model the
+                // session already uses (another configuration or node) keeps
+                // the measurement and sends no signal. A translator that has
+                // not seen a model yet cannot tell, and sends it.
+                let mut updates = Vec::new();
+                if switched {
+                    updates.push(model_changed_update(
+                        provider,
+                        model,
+                        provider_node_id.as_deref(),
+                        *context_limit,
+                    ));
+                }
+                if let Some(options) = config.snapshot() {
+                    updates.push(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                        options,
+                    )));
+                }
+                updates
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 let usage = self.usage.entry(session_id.clone()).or_default();
@@ -2587,14 +2737,32 @@ impl AcpLiveEventTranslator {
             } if is_todo_write_tool(tool_name) => {
                 self.translate_todo_updates(&session_id, arguments)
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => {
+            AgentEventKind::CompactionStart {
+                compaction_id,
+                token_estimate,
+            } => {
                 if !self.capabilities.compaction {
                     return Vec::new();
                 }
-                vec![SessionUpdate::CompactionUpdate(CompactionUpdate::new(
-                    compaction_identity(compaction_id.as_deref(), event),
+                let id = compaction_identity(compaction_id.as_deref(), event);
+                // The last context measurement this session's usage
+                // projection holds, or the compaction's own estimate.
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                let before = querymt_agent_core::replay::compaction_tokens_before(
+                    usage.context_used,
+                    *token_estimate,
+                );
+                usage.open_compactions.insert(id.0.to_string(), before);
+                let mut update = SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                    id,
                     CompactionStatus::InProgress,
-                ))]
+                ));
+                querymt_agent_core::replay::stamp_compaction_tokens(
+                    &mut update,
+                    Some(before),
+                    None,
+                );
+                vec![update]
             }
             AgentEventKind::CompactionSummaryChunk {
                 compaction_id,
@@ -2612,21 +2780,41 @@ impl AcpLiveEventTranslator {
             }
             AgentEventKind::CompactionEnd {
                 compaction_id,
+                summary,
                 context_tokens,
                 ..
             } => {
                 let mut updates = Vec::new();
                 if self.capabilities.compaction {
-                    updates.push(SessionUpdate::CompactionUpdate(CompactionUpdate::new(
-                        compaction_identity(compaction_id.as_deref(), event),
-                        CompactionStatus::Completed,
-                    )));
+                    let id = compaction_identity(compaction_id.as_deref(), event);
+                    let before = self
+                        .usage
+                        .entry(session_id.clone())
+                        .or_default()
+                        .open_compactions
+                        .remove(&*id.0);
+                    let mut update = CompactionUpdate::new(id, CompactionStatus::Completed);
+                    // The whole final summary, as one block, so a client that
+                    // received chunks holds what a loaded session holds.
+                    if !summary.trim().is_empty() {
+                        update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                            summary.clone(),
+                        ))]));
+                    }
+                    let mut update = SessionUpdate::CompactionUpdate(update);
+                    querymt_agent_core::replay::stamp_compaction_tokens(
+                        &mut update,
+                        before,
+                        *context_tokens,
+                    );
+                    updates.push(update);
                 }
                 // Post-compaction usage snapshots are stable, ungated updates.
-                if let Some(tokens) = context_tokens
-                    && let Some(usage) = self.usage.get_mut(&session_id)
-                {
-                    usage.observe_context_used(event.seq(), *tokens);
+                if let Some(tokens) = context_tokens {
+                    // The same rule as seeding and replay, whether or not
+                    // this translator has seen the session's model yet.
+                    let usage = self.usage.entry(session_id.clone()).or_default();
+                    usage.observe(&session_id, event.seq(), event.kind());
                     if let Some(update) = usage.usage_update(*tokens) {
                         updates.push(SessionUpdate::UsageUpdate(update));
                     }
@@ -2641,6 +2829,12 @@ impl AcpLiveEventTranslator {
                 if !self.capabilities.compaction {
                     return Vec::new();
                 }
+                let before = self
+                    .usage
+                    .entry(session_id.clone())
+                    .or_default()
+                    .open_compactions
+                    .remove(compaction_id.as_str());
                 let mut update = CompactionUpdate::new(
                     CompactionId::from(compaction_id.clone()),
                     if *cancelled {
@@ -2652,7 +2846,9 @@ impl AcpLiveEventTranslator {
                 if !*cancelled {
                     update = update.error(reason.clone());
                 }
-                vec![SessionUpdate::CompactionUpdate(update)]
+                let mut update = SessionUpdate::CompactionUpdate(update);
+                querymt_agent_core::replay::stamp_compaction_tokens(&mut update, before, None);
+                vec![update]
             }
             AgentEventKind::ToolCallProgress {
                 tool_call_id,
@@ -2694,9 +2890,7 @@ impl AcpLiveEventTranslator {
                 return Vec::new();
             }
             self.announced_todo_plans.insert(session_id.to_owned());
-            return vec![SessionUpdate::PlanUpdate(PlanUpdate::new(
-                PlanUpdateContent::items(PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()), entries),
-            ))];
+            return vec![querymt_agent_core::replay::todo_plan_update(entries)];
         }
         vec![SessionUpdate::Plan(Plan::new(entries))]
     }
@@ -7536,6 +7730,7 @@ mod tests {
 #[cfg(test)]
 mod session_update_tests {
     use super::*;
+    use crate::acp::protocol::PlanUpdateContent;
     use crate::agent::core::AgentMode;
     use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use std::collections::HashMap;
@@ -7841,6 +8036,165 @@ mod session_update_tests {
     }
 
     #[test]
+    fn model_change_after_a_request() {
+        // Every client, with or without notice support.
+        for capabilities in [plan_ops(), AcpSessionUpdateCapabilities::default()] {
+            let mut translator = AcpLiveEventTranslator::new();
+            translator.set_capabilities(capabilities);
+            translator.translate_updates(&provider_changed(1, Some(200_000)));
+            translator.translate_updates(&accounted_end(2, 12_000));
+            let updates = translator.translate_updates(&provider_changed(3, Some(100_000)));
+            let Some(SessionUpdate::SessionInfoUpdate(info)) = updates.first() else {
+                panic!("expected a session_info_update first: {updates:?}");
+            };
+            assert!(matches!(info.title, MaybeUndefined::Undefined));
+            assert!(matches!(info.updated_at, MaybeUndefined::Undefined));
+            let meta = info.meta.as_ref().expect("meta");
+            assert_eq!(
+                meta[QUERYMT_META_NAMESPACE][QUERYMT_CONTEXT_INVALIDATED_META_KEY],
+                true
+            );
+            assert_eq!(meta.len(), 1);
+            // The signal and the model the session switched to, nothing else.
+            assert_eq!(meta[QUERYMT_META_NAMESPACE].as_object().unwrap().len(), 2);
+            let model = &meta[QUERYMT_META_NAMESPACE][QUERYMT_MODEL_META_KEY];
+            assert_eq!(model["provider"], "local");
+            assert_eq!(model["model"], "m");
+            assert_eq!(model["contextLimit"], 100_000);
+        }
+    }
+
+    #[test]
+    fn selecting_the_same_model_again_keeps_the_measurement() {
+        // Another configuration of the model the session already uses: the
+        // last measurement still describes it, so no signal is sent.
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(200_000)));
+        translator.translate_updates(&accounted_end(2, 12_000));
+        let updates = translator.translate_updates(&provider_changed(3, Some(200_000)));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::SessionInfoUpdate(_))),
+            "no signal for the same model: {updates:?}"
+        );
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(12_000));
+
+        // Another model, or the same one with another limit, is a switch.
+        let other = translator.translate_updates(&provider_changed(5, Some(100_000)));
+        assert!(matches!(
+            other.first(),
+            Some(SessionUpdate::SessionInfoUpdate(_))
+        ));
+        assert_eq!(translator.usage["s-1"].reliable_used(), None);
+    }
+
+    #[test]
+    fn replay_keeps_the_measurement_across_the_same_model() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 12_000).kind().clone()),
+            agent_event(3, provider_changed(3, Some(200_000)).kind().clone()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let used: Vec<u64> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UsageUpdate(usage) => Some(usage.used),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(used, [12_000]);
+    }
+
+    fn compaction_end(seq: i64, context_tokens: Option<u64>) -> AgentEvent {
+        agent_event(
+            seq,
+            AgentEventKind::CompactionEnd {
+                summary: "summary".to_string(),
+                summary_len: 7,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens,
+            },
+        )
+    }
+
+    #[test]
+    fn seeded_history_keeps_the_context_a_compaction_reported() {
+        let history = [
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 150_000).kind().clone()),
+            compaction_end(3, Some(20_000)),
+        ];
+        // The events of a whole-history load or an attach.
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.seed_history("s-1", &history);
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(20_000));
+
+        // The same events inside a load snapshot's audit, windowed or not.
+        let meta = serde_json::json!({
+            "querymt/sessionLoadSnapshot.v1": {
+                "audit": { "events": history },
+            }
+        });
+        let meta = meta.as_object().cloned().unwrap();
+        let mut from_load = AcpLiveEventTranslator::new();
+        from_load.seed_history_from_meta("s-1", Some(&meta));
+        assert_eq!(from_load.usage["s-1"].reliable_used(), Some(20_000));
+
+        // A later accounting change reports the post-compaction context, not
+        // the measurement from before it.
+        let carrier = from_load.usage["s-1"]
+            .accounting_update()
+            .expect("a usage carrier");
+        let SessionUpdate::UsageUpdate(update) = carrier else {
+            panic!("expected a usage_update: {carrier:?}");
+        };
+        assert_eq!(update.used, 20_000);
+    }
+
+    #[test]
+    fn live_compaction_end_is_a_measurement_without_a_prior_usage_entry() {
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(!translator.usage.contains_key("s-1"));
+        translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "s".to_string(),
+                summary_len: 1,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(20_000),
+            },
+        ));
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(20_000));
+    }
+
+    #[test]
+    fn replay_does_not_repeat_the_signal() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 12_000).kind().clone()),
+            agent_event(3, provider_changed(3, Some(100_000)).kind().clone()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        assert!(updates.iter().all(|update| match update {
+            SessionUpdate::SessionInfoUpdate(info) => info.meta.as_ref().is_none_or(|meta| {
+                meta.get(QUERYMT_META_NAMESPACE)
+                    .and_then(|q| q.get(QUERYMT_CONTEXT_INVALIDATED_META_KEY))
+                    .is_none()
+            }),
+            _ => true,
+        }));
+        // No context measurement taken before the change is reported.
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::UsageUpdate(_)))
+        );
+    }
+
+    #[test]
     fn provider_change_projects_model_identity_to_all_clients() {
         let event = envelope(
             1,
@@ -7862,7 +8216,9 @@ mod session_update_tests {
         );
         translator.translate_updates(&config);
         let updates = translator.translate_updates(&event);
-        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+        // The model change first invalidates the last context measurement.
+        assert!(matches!(updates[0], SessionUpdate::SessionInfoUpdate(_)));
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[1] else {
             panic!("model update");
         };
         let json = serde_json::to_value(update).unwrap();
@@ -7931,7 +8287,7 @@ mod session_update_tests {
         ));
         seeded.seed_config_options("s-1", &options);
         let updates = seeded.translate_updates(&event);
-        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[1] else {
             panic!("seeded snapshot");
         };
         assert_eq!(
@@ -7961,6 +8317,66 @@ mod session_update_tests {
         ));
         assert!(matches!(updates[0], SessionUpdate::CompactionUpdate(_)));
         assert!(matches!(updates[1], SessionUpdate::UsageUpdate(_)));
+    }
+
+    #[test]
+    fn live_terminal_compaction_carries_its_summary() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 10,
+                compaction_id: Some("c-1".to_string()),
+            },
+        ));
+        let chunk = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id: "c-1".to_string(),
+                content: "part".to_string(),
+            },
+        ));
+        assert!(matches!(
+            chunk.as_slice(),
+            [SessionUpdate::CompactionSummaryChunk(_)]
+        ));
+        let end = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::CompactionEnd {
+                summary: "the whole final summary".to_string(),
+                summary_len: 23,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let [SessionUpdate::CompactionUpdate(update)] = end.as_slice() else {
+            panic!("expected one terminal compaction update: {end:?}");
+        };
+        assert_eq!(update.status, CompactionStatus::Completed);
+        let MaybeUndefined::Value(blocks) = &update.summary else {
+            panic!("terminal update carries no summary: {update:?}");
+        };
+        assert_eq!(blocks.len(), 1, "the summary is one block");
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(text.text, "the whole final summary");
+
+        // An empty summary sends none (omitted leaves the stored value).
+        let empty = translator.translate_updates(&envelope(
+            4,
+            AgentEventKind::CompactionEnd {
+                summary: "  ".to_string(),
+                summary_len: 2,
+                compaction_id: Some("c-2".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let [SessionUpdate::CompactionUpdate(update)] = empty.as_slice() else {
+            panic!("expected one terminal compaction update");
+        };
+        assert!(matches!(update.summary, MaybeUndefined::Undefined));
     }
 
     #[test]
@@ -9337,7 +9753,8 @@ mod session_update_tests {
             panic!("expected compaction update");
         };
         assert_eq!(update.status, CompactionStatus::Completed);
-        assert!(!matches!(update.summary, MaybeUndefined::Value(_)));
+        // The terminal update carries the final summary as one block.
+        assert!(matches!(&update.summary, MaybeUndefined::Value(blocks) if blocks.len() == 1));
     }
 
     #[test]
@@ -9634,6 +10051,41 @@ mod session_update_tests {
     }
 
     #[test]
+    fn replay_sends_the_todo_plan_once() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t2".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "completed"), ("b", "pending")]),
+                },
+            ),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let plan_updates: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::PlanUpdate(_) | SessionUpdate::Plan(_)))
+            .collect();
+        let [SessionUpdate::PlanUpdate(update)] = plan_updates.as_slice() else {
+            panic!("expected exactly one plan_update and no legacy plan: {plan_updates:?}");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected an item-based plan");
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+        assert_eq!(items.entries.len(), 2, "the current, complete content");
+    }
+
+    #[test]
     fn replay_excludes_unsupported_preview_variants() {
         let events = vec![
             agent_event(0, provider_changed(0, None).kind().clone()),
@@ -9823,6 +10275,119 @@ mod session_update_tests {
             .collect();
         // The compaction sits between the prompts around it, not before both.
         assert_eq!(order, ["user", "compaction", "user"]);
+    }
+
+    /// `_meta.querymt.compaction` of a compaction update, by status.
+    fn compaction_counts(updates: &[SessionUpdate], status: CompactionStatus) -> serde_json::Value {
+        updates
+            .iter()
+            .find_map(|update| match update {
+                SessionUpdate::CompactionUpdate(c) if c.status == status => Some(c),
+                _ => None,
+            })
+            .and_then(|c| match &c.meta {
+                MaybeUndefined::Value(meta) => meta
+                    .get(QUERYMT_META_NAMESPACE)
+                    .and_then(|querymt| querymt.get("compaction"))
+                    .cloned(),
+                _ => None,
+            })
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A request reporting 150000 context tokens, then a compaction that
+    /// ends at 20000.
+    fn counted_compaction_events() -> Vec<AgentEvent> {
+        vec![
+            agent_event(1, accounted_end_kind(150_000)),
+            agent_event(
+                2,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 90_000,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: Some(20_000),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn live_compaction_reports_its_counts() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let mut updates = Vec::new();
+        for event in counted_compaction_events() {
+            updates.extend(translator.translate_updates(&EventEnvelope::from(event)));
+        }
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::InProgress),
+            serde_json::json!({ "tokensBefore": 150_000 })
+        );
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::Completed),
+            serde_json::json!({ "tokensBefore": 150_000, "tokensAfter": 20_000 })
+        );
+    }
+
+    #[test]
+    fn replay_reports_the_same_counts() {
+        let updates = replay_updates(counted_compaction_events(), plan_ops());
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::Completed),
+            serde_json::json!({ "tokensBefore": 150_000, "tokensAfter": 20_000 })
+        );
+    }
+
+    #[test]
+    fn no_measurement_before_the_compaction() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 90_000,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+        ];
+        // The estimate stands in; `tokensAfter` is unknown and omitted.
+        let expected = serde_json::json!({ "tokensBefore": 90_000 });
+
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let mut live = Vec::new();
+        for event in events.clone() {
+            live.extend(translator.translate_updates(&EventEnvelope::from(event)));
+        }
+        assert_eq!(
+            compaction_counts(&live, CompactionStatus::InProgress),
+            expected
+        );
+        assert_eq!(
+            compaction_counts(&live, CompactionStatus::Completed),
+            expected
+        );
+        let replayed = replay_updates(events, plan_ops());
+        assert_eq!(
+            compaction_counts(&replayed, CompactionStatus::Completed),
+            expected
+        );
     }
 
     #[test]
