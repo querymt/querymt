@@ -155,7 +155,7 @@ pub struct QuotaStatus {
 #[derive(Debug, Clone)]
 pub struct QuotaAttempt {
     pub peer: PeerGrantKey,
-    /// Revision captured when the host authorized the initiating peer.
+    /// Sharing protocol used to authorize the initiating peer.
     pub protocol: SharingProtocol,
     pub provider_id: String,
     pub model_id: String,
@@ -170,6 +170,7 @@ pub struct QuotaAttempt {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuotaEstimate {
     pub reserved_tokens: i64,
+    /// Stored host estimate; zero is a valid estimate, not an absent value.
     pub prompt_tokens: i64,
 }
 
@@ -218,7 +219,7 @@ pub enum UnknownUsageCharge {
     /// Charge the full reservation.
     #[default]
     Reserved,
-    /// Charge the estimated prompt, or the reservation if no prompt estimate was stored.
+    /// Charge the stored prompt estimate, including zero if estimated as zero.
     EstimatedPrompt,
 }
 
@@ -322,14 +323,16 @@ pub(crate) use ledger::{QuotaLedger, QuotaRuntime};
 
 mod ledger {
     use std::collections::{BTreeSet, HashMap, VecDeque};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use time::{Date, Duration, Month, OffsetDateTime};
     use tokio::sync::broadcast;
 
     use super::*;
     use crate::NodeId;
-    use crate::mesh_state::{MeshAccessStore, PeerAccessState};
+    use crate::mesh_state::{AccessChange, MeshAccessStore, PeerAccessState};
     use crate::peer_access::{PeerGrant, PeerGrantState, PolicyChange, PolicyEffect};
 
     /// Durable allowances, settled usage and replay keys. No open attempt is serialized.
@@ -373,6 +376,39 @@ mod ledger {
         request: QuotaAttempt,
         dispatched: bool,
         reservations: Vec<Reservation>,
+        policy: Arc<Mutex<AttemptPolicy>>,
+    }
+
+    #[derive(Debug)]
+    struct AttemptPolicy {
+        changes: broadcast::Receiver<PolicyChange>,
+        require_sessions: bool,
+        lost: bool,
+    }
+
+    impl AttemptPolicy {
+        fn permits(&mut self, request: &QuotaAttempt, grant: &PeerGrant) -> bool {
+            use broadcast::error::TryRecvError;
+
+            let require_sessions = self.require_sessions;
+            let allows = |grant: &PeerGrant| {
+                grant.allows_model(request.protocol, &request.provider_id, &request.model_id)
+                    && (!require_sessions || grant.allows_sessions(request.protocol))
+            };
+            self.lost |= !allows(grant);
+            while !self.lost {
+                match self.changes.try_recv() {
+                    Ok(change) if change.key == request.peer => {
+                        let PolicyEffect::Grant(grant) = change.effect;
+                        self.lost = !allows(&grant);
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => self.lost = true,
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            !self.lost
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -594,7 +630,14 @@ mod ledger {
                 && period.next_reset_at.is_some_and(|reset| now >= reset)
                 && let Some((start, end)) = boundaries(window, now)?
             {
-                self.open_period(period.limit, start, Some(end))?;
+                let limit = period.limit;
+                if period.next_reset_at.is_some_and(|reset| reset < start) {
+                    // The last stored period predates the previous calendar window.
+                    if let Some((previous, _)) = boundaries(window, start - 1)? {
+                        self.open_period(limit, previous, Some(start))?;
+                    }
+                }
+                self.open_period(limit, start, Some(end))?;
                 changed = true;
             }
             Ok(changed | self.prune(runtime, slot))
@@ -802,10 +845,10 @@ mod ledger {
                 let (edited, rolled_target) = match edit {
                     AccessEdit::Grant(next) if next == grant.grant => (false, false),
                     AccessEdit::Grant(next) => {
-                        change = Some(PolicyChange {
+                        change = Some(AccessChange::Policy(PolicyChange {
                             key: key.clone(),
                             effect: PolicyEffect::Grant(next.clone()),
-                        });
+                        }));
                         grant.grant = next;
                         (true, false)
                     }
@@ -824,6 +867,16 @@ mod ledger {
         }
 
         async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
+            self.reserve_with_policy(attempt, self.changes.subscribe(), false)
+                .await
+        }
+
+        async fn reserve_with_policy(
+            &self,
+            attempt: QuotaAttempt,
+            changes: broadcast::Receiver<PolicyChange>,
+            require_sessions: bool,
+        ) -> Result<ReservationId, QuotaError> {
             utc_date(attempt.now)?;
             let model = QuotaScope {
                 provider_id: attempt.provider_id.clone(),
@@ -834,26 +887,37 @@ mod ledger {
                 provider_id: attempt.provider_id.clone(),
                 model_id: None,
             };
-            self.transact::<_, QuotaError>(move |state, runtime| {
+            self.transact_with_usage::<_, QuotaError>(move |state, runtime| {
                 let grant = state.grant(&attempt.peer).grant;
-                if !grant.allows_model(attempt.protocol, &attempt.provider_id, &attempt.model_id) {
+                let mut policy = AttemptPolicy {
+                    changes,
+                    require_sessions,
+                    lost: false,
+                };
+                if !policy.permits(&attempt, &grant) {
                     return Err(QuotaError::Denied);
+                }
+                let mut persist = false;
+                // Request IDs are peer-scoped, not binding-scoped. Age every
+                // scope that could have retained this request before checking replay.
+                for (slot, entry) in state.quotas.scopes.iter_mut().enumerate() {
+                    if entry.belongs_to(&attempt.peer) {
+                        persist |= entry.roll_forward(runtime, slot, attempt.now)?;
+                    }
                 }
                 if runtime.contains_request(&attempt.peer, attempt.request_id)
                     || state
                         .quotas
                         .contains_request(&attempt.peer, attempt.request_id)
                 {
-                    return Err(QuotaError::DuplicateAttempt);
+                    return Ok((Err(QuotaError::DuplicateAttempt), persist, None));
                 }
                 let mut reservations = Vec::new();
                 let mut limiting = Vec::new();
-                let mut persist = false;
                 if grant != PeerGrant::Full {
                     for scope in [provider, model] {
                         let slot = state.quotas.ensure_slot(&attempt.peer, scope);
                         let entry = &mut state.quotas.scopes[slot];
-                        persist |= entry.roll_forward(runtime, slot, attempt.now)?;
                         if entry.periods.is_empty() {
                             entry.open_period(QuotaLimit::Unlimited, attempt.now, None)?;
                             persist = true;
@@ -880,13 +944,15 @@ mod ledger {
                 }
                 if !limiting.is_empty() {
                     // Commit any observed rollover without recording either reservation.
-                    return Ok((Err(QuotaError::Exhausted(limiting)), persist));
+                    return Ok((Err(QuotaError::Exhausted(limiting)), persist, None));
                 }
-                if reservations.iter().any(|r| r.reserved.is_some())
+                let finite = reservations.iter().any(|r| r.reserved.is_some());
+                if finite
                     && (attempt.estimate.prompt_tokens < 0 || attempt.estimate.reserved_tokens <= 0)
                 {
                     return Err(QuotaError::InvalidTokens);
                 }
+                let notify = finite.then(|| attempt.peer.clone());
                 let id = Uuid::now_v7();
                 runtime.open.insert(
                     id,
@@ -894,9 +960,10 @@ mod ledger {
                         request: attempt,
                         dispatched: false,
                         reservations,
+                        policy: Arc::new(Mutex::new(policy)),
                     },
                 );
-                Ok((Ok(ReservationId(id)), persist))
+                Ok((Ok(ReservationId(id)), persist, notify))
             })
             .await?
         }
@@ -911,7 +978,7 @@ mod ledger {
                 let req = &open.request;
                 let grant = state.grant(&req.peer).grant;
                 // An attempt admitted as Full cannot start under a subsequent Custom grant.
-                if !grant.allows_model(req.protocol, &req.provider_id, &req.model_id)
+                if !open.policy.lock().permits(req, &grant)
                     || (open.reservations.is_empty() && grant != PeerGrant::Full)
                 {
                     return Err(QuotaError::InvalidAttempt);
@@ -924,21 +991,39 @@ mod ledger {
 
         async fn release_unused(&self, attempt: ReservationId) -> Result<(), QuotaError> {
             let charge = self.unknown_usage_charge;
-            self.transact(move |state, runtime| {
+            self.transact_with_usage(move |state, runtime| {
                 if runtime
                     .finalized(attempt.0)
                     .is_some_and(|entry| entry.released)
                 {
-                    return Ok(((), false));
+                    return Ok(((), false, None));
                 }
                 let open = runtime
                     .open
                     .remove(&attempt.0)
                     .filter(|open| !open.dispatched)
                     .ok_or(QuotaError::InvalidAttempt)?;
+                let notify = open
+                    .reservations
+                    .iter()
+                    .any(|reservation| {
+                        reservation.reserved.is_some()
+                            && state
+                                .quotas
+                                .scopes
+                                .get(reservation.slot)
+                                .and_then(|entry| entry.periods.first())
+                                .is_some_and(|p| p.generation == reservation.generation)
+                            && runtime
+                                .reservations(reservation.slot, reservation.generation)
+                                .filter_map(|r| r.reserved)
+                                .fold(0_i64, i64::saturating_add)
+                                < i64::MAX
+                    })
+                    .then(|| open.request.peer.clone());
                 let persist = state.quotas.record(&open, None, charge)?;
                 runtime.finalize(attempt.0, open, true);
-                Ok(((), persist))
+                Ok(((), persist, notify))
             })
             .await
         }
@@ -953,34 +1038,39 @@ mod ledger {
             usage: AttemptUsage,
         ) -> Result<QuotaSettlement, QuotaError> {
             let charge = self.unknown_usage_charge;
-            let (result, notify) = self
-                .transact::<_, QuotaError>(move |state, runtime| {
-                    if runtime.finalized(attempt.0).is_some() {
-                        return Ok(((QuotaSettlement::AlreadyFinal, None), false));
-                    }
-                    let open = runtime
-                        .open
-                        .remove(&attempt.0)
-                        .filter(|open| open.dispatched)
-                        .ok_or(QuotaError::InvalidAttempt)?;
-                    if matches!(usage, AttemptUsage::Observed(actual) if actual < 0) {
-                        return Err(QuotaError::InvalidTokens);
-                    }
-                    let persist = state.quotas.record(&open, Some(usage), charge)?;
-                    let notify = persist.then(|| open.request.peer.clone());
-                    runtime.finalize(attempt.0, open, false);
-                    Ok(((QuotaSettlement::Recorded, notify), persist))
-                })
-                .await?;
-            if let Some(peer) = notify {
-                let _ = self.usage_changes.send(peer);
-            }
-            Ok(result)
+            self.transact_with_usage(move |state, runtime| {
+                if runtime.finalized(attempt.0).is_some() {
+                    return Ok((QuotaSettlement::AlreadyFinal, false, None));
+                }
+                let open = runtime
+                    .open
+                    .remove(&attempt.0)
+                    .filter(|open| open.dispatched)
+                    .ok_or(QuotaError::InvalidAttempt)?;
+                if matches!(usage, AttemptUsage::Observed(actual) if actual < 0) {
+                    return Err(QuotaError::InvalidTokens);
+                }
+                let persist = state.quotas.record(&open, Some(usage), charge)?;
+                let notify = persist.then(|| open.request.peer.clone());
+                runtime.finalize(attempt.0, open, false);
+                Ok((QuotaSettlement::Recorded, persist, notify))
+            })
+            .await
         }
 
-        async fn reconcile_startup(&self, _host: &NodeId) -> Result<(), QuotaError> {
-            // A new owner has no active attempts to reconcile.
-            Ok(())
+        async fn reconcile_startup(&self, host: &NodeId) -> Result<(), QuotaError> {
+            let host = host.clone();
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            self.transact(move |state, runtime| {
+                let mut persist = false;
+                for (slot, entry) in state.quotas.scopes.iter_mut().enumerate() {
+                    if entry.host == host {
+                        persist |= entry.roll_forward(runtime, slot, now)?;
+                    }
+                }
+                Ok(((), persist))
+            })
+            .await
         }
     }
 
@@ -1303,7 +1393,8 @@ mod ledger {
                 Err(QuotaError::DuplicateAttempt)
             ));
             let next_monday = MONDAY + 7 * 86400;
-            f.quota(&provider, next_monday).await;
+            // Admission, not a snapshot, must expire replay history for every binding.
+            req.model_id = "b".into();
             req.now = next_monday;
             f.store
                 .reserve(req)
@@ -1319,6 +1410,7 @@ mod ledger {
             let mut hints = f.store.subscribe_usage_changes().unwrap();
             let req = f.request("a", 10, TUESDAY);
             let id = f.store.reserve(req.clone()).await.unwrap();
+            assert_eq!(hints.try_recv().unwrap(), f.key);
             assert!(matches!(
                 f.store.reserve(req).await,
                 Err(QuotaError::DuplicateAttempt)
@@ -1367,22 +1459,150 @@ mod ledger {
                 .await
                 .unwrap();
             assert_eq!(f.quota(&provider, TUESDAY).await.reserved_tokens, 15);
-            drop(reserved);
-            drop(dispatched);
-            let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    let status = f.quota(&provider, TUESDAY).await;
-                    if status.reserved_tokens == 0 {
-                        break status;
-                    }
-                    tokio::task::yield_now().await;
-                }
+            let mut hints = f.store.subscribe_usage_changes().unwrap();
+            std::thread::spawn(move || drop((reserved, dispatched)))
+                .join()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                assert_eq!(hints.recv().await.unwrap(), f.key);
+                assert_eq!(hints.recv().await.unwrap(), f.key);
             })
             .await
             .unwrap();
+            let status = f.quota(&provider, TUESDAY).await;
+            assert_eq!(status.reserved_tokens, 0);
             assert_eq!(status.known_tokens, 0);
             assert_eq!(status.estimated_tokens, 10);
             assert_eq!(status.available_tokens, Some(10));
+        }
+
+        #[tokio::test]
+        async fn cleanup_retries_the_exact_settlement_after_a_failed_save() {
+            let f = Fixture::new().await;
+            let provider = scope(None);
+            f.limit(&provider, 20, QuotaWindow::Weekly).await;
+            let mut reserved =
+                ReservedAttempt::reserve(f.store.clone(), f.request("a", 10, TUESDAY))
+                    .await
+                    .unwrap();
+            let done = reserved.completion();
+            let dispatched = reserved.begin().await.unwrap();
+            let mut hints = f.store.subscribe_usage_changes().unwrap();
+            std::fs::remove_file(&f.path).unwrap();
+            std::fs::create_dir(&f.path).unwrap();
+            assert!(matches!(
+                dispatched.settle(AttemptUsage::Observed(7)).await,
+                Err(QuotaError::Store(GrantStoreError::Backend(_)))
+            ));
+            assert!(matches!(hints.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(f.quota(&provider, TUESDAY).await.reserved_tokens, 10);
+            std::fs::remove_dir(&f.path).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), done)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hints.try_recv().unwrap(), f.key);
+            assert!(matches!(hints.try_recv(), Err(TryRecvError::Empty)));
+            let status = f.quota(&provider, TUESDAY).await;
+            assert_eq!(
+                (
+                    status.known_tokens,
+                    status.estimated_tokens,
+                    status.reserved_tokens
+                ),
+                (7, 0, 0)
+            );
+        }
+
+        #[tokio::test]
+        async fn startup_prunes_history_retained_for_pre_restart_reservations() {
+            let f = Fixture::new().await;
+            let (provider, model) = (scope(None), scope(Some("a")));
+            f.limit(&provider, 50, QuotaWindow::Manual).await;
+            f.limit(&model, 50, QuotaWindow::Daily).await;
+            let charged = f.dispatch(f.request("a", 5, TUESDAY)).await;
+            f.store
+                .settle(charged, AttemptUsage::Observed(5))
+                .await
+                .unwrap();
+            f.dispatch(f.request("a", 3, TUESDAY)).await;
+            f.quota(&model, FRIDAY).await;
+            assert_eq!(f.history(&model).await, [0, 0, 5]);
+            let f = f.restart();
+            f.store.reconcile_startup(&f.key.host).await.unwrap();
+            let f = f.restart();
+            assert_eq!(f.history(&model).await, [0, 0]);
+            assert_eq!(f.history(&provider).await, [5]);
+        }
+
+        #[tokio::test]
+        async fn deferred_quota_admission_uses_binding_history_not_the_edit_revision() {
+            let f = Fixture::new().await;
+            let provider = scope(None);
+            let req = f.request("a", 10, TUESDAY);
+            let uninterrupted = f.store.subscribe_changes().unwrap();
+            f.limit(&provider, 20, QuotaWindow::Manual).await;
+            // Both grants allow this binding; changing mode is not a revocation.
+            f.set_grant(PeerGrant::Full).await;
+            let id = f
+                .store
+                .reserve_with_policy(req.clone(), uninterrupted, false)
+                .await
+                .unwrap();
+            f.store.mark_dispatched(id).await.unwrap();
+            f.store
+                .settle(id, AttemptUsage::Observed(10))
+                .await
+                .unwrap();
+            assert_eq!(f.quota(&provider, TUESDAY).await.available_tokens, Some(20));
+
+            let deferred = f.store.subscribe_changes().unwrap();
+            f.set_grant(PeerGrant::None).await;
+            f.set_grant(f.custom.clone()).await;
+            assert!(matches!(
+                f.store
+                    .reserve_with_policy(f.request("a", 10, TUESDAY), deferred, false)
+                    .await,
+                Err(QuotaError::Denied)
+            ));
+            assert_eq!(f.quota(&provider, TUESDAY).await.available_tokens, Some(20));
+
+            let pending = f.store.reserve(f.request("a", 10, TUESDAY)).await.unwrap();
+            f.set_grant(PeerGrant::None).await;
+            f.set_grant(f.custom.clone()).await;
+            for _ in 0..2 {
+                assert!(matches!(
+                    f.store.mark_dispatched(pending).await,
+                    Err(QuotaError::InvalidAttempt)
+                ));
+            }
+            f.store.release_unused(pending).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn release_hints_only_for_committed_active_finite_reservations() {
+            let f = Fixture::new().await;
+            let provider = scope(None);
+            let rev = f.limit(&provider, 20, QuotaWindow::Manual).await;
+            let mut hints = f.store.subscribe_usage_changes().unwrap();
+            let id = f.store.reserve(f.request("a", 10, TUESDAY)).await.unwrap();
+            assert_eq!(hints.try_recv().unwrap(), f.key);
+            assert_eq!(f.quota(&provider, TUESDAY).await.available_tokens, Some(10));
+            std::fs::remove_file(&f.path).unwrap();
+            std::fs::create_dir(&f.path).unwrap();
+            assert!(matches!(
+                f.store.release_unused(id).await,
+                Err(QuotaError::Store(_))
+            ));
+            assert!(matches!(hints.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(f.quota(&provider, TUESDAY).await.available_tokens, Some(10));
+            std::fs::remove_dir(&f.path).unwrap();
+            f.store.release_unused(id).await.unwrap();
+            assert_eq!(hints.try_recv().unwrap(), f.key);
+            assert_eq!(f.quota(&provider, TUESDAY).await.available_tokens, Some(20));
+            f.store.release_unused(id).await.unwrap();
+            assert!(matches!(hints.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(f.revision().await, rev);
         }
 
         #[tokio::test]

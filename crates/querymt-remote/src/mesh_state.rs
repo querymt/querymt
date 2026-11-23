@@ -446,6 +446,11 @@ pub struct MeshAccessStore {
     pub(crate) unknown_usage_charge: UnknownUsageCharge,
 }
 
+pub(crate) enum AccessChange {
+    Policy(PolicyChange),
+    Usage(PeerGrantKey),
+}
+
 impl MeshAccessStore {
     pub fn new(owner: SharedMeshState) -> Self {
         let (changes, usage_changes) = {
@@ -481,12 +486,26 @@ impl MeshAccessStore {
         .await
     }
 
+    pub(crate) async fn transact_with_usage<T, E>(
+        &self,
+        f: impl FnOnce(&mut PeerAccessState, &mut QuotaRuntime) -> Result<(T, bool, Option<PeerGrantKey>), E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<GrantStoreError> + Send + 'static,
+    {
+        self.transact_access(move |access, runtime| {
+            let (value, persist, usage) = f(access, runtime)?;
+            Ok((value, persist, usage.map(AccessChange::Usage)))
+        }).await
+    }
+
     pub(crate) async fn transact_access<T, E>(
         &self,
         f: impl FnOnce(
             &mut PeerAccessState,
             &mut QuotaRuntime,
-        ) -> Result<(T, bool, Option<PolicyChange>), E>
+        ) -> Result<(T, bool, Option<AccessChange>), E>
         + Send
         + 'static,
     ) -> Result<T, E>
@@ -504,8 +523,10 @@ impl MeshAccessStore {
                 state.save_access(access)?;
             }
             state.quota_runtime = runtime;
-            if let Some(change) = change {
-                let _ = state.changes.send(change);
+            match change {
+                Some(AccessChange::Policy(change)) => { let _ = state.changes.send(change); }
+                Some(AccessChange::Usage(peer)) => { let _ = state.usage_changes.send(peer); }
+                None => {}
             }
             Ok(value)
         })

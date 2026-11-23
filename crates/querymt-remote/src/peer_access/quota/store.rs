@@ -1,6 +1,9 @@
 //! Storage operations for atomic quota admission and settlement.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use super::{
@@ -9,7 +12,7 @@ use super::{
 };
 use crate::{
     NodeId,
-    peer_access::{GrantStore, PeerGrant, PeerGrantKey, PeerGrantState},
+    peer_access::{GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange},
 };
 
 /// An owner edit guarded by the shared grant/quota revision.
@@ -21,7 +24,7 @@ pub enum AccessEdit {
 /// Durable quota operations. All implementations must serialize admission and edits.
 #[async_trait]
 pub trait QuotaStore: GrantStore {
-    /// Receive a refresh hint when committed usage changes, without advancing the grant revision.
+    /// Receive a refresh hint when committed usage or reservations change, without advancing the grant revision.
     fn subscribe_usage_changes(&self) -> Option<tokio::sync::broadcast::Receiver<PeerGrantKey>> {
         None
     }
@@ -59,8 +62,19 @@ pub trait QuotaStore: GrantStore {
         Ok(grant.revision)
     }
 
-    /// Require the initiating grant revision and atomically reserve all applicable finite scopes.
+    /// Check current policy and atomically reserve all applicable finite scopes.
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError>;
+
+    /// Reserve for deferred work, checking admission-time history atomically
+    /// with quota admission and retaining it until dispatch.
+    async fn reserve_with_policy(
+        &self,
+        _attempt: QuotaAttempt,
+        _changes: tokio::sync::broadcast::Receiver<PolicyChange>,
+        _require_sessions: bool,
+    ) -> Result<ReservationId, QuotaError> {
+        Err(QuotaError::Denied)
+    }
 
     /// Mark the attempt may-have-dispatched before issuing any upstream request.
     async fn mark_dispatched(&self, attempt: ReservationId) -> Result<(), QuotaError>;
@@ -75,7 +89,7 @@ pub trait QuotaStore: GrantStore {
         usage: AttemptUsage,
     ) -> Result<QuotaSettlement, QuotaError>;
 
-    /// Reconcile unfinished attempts only during exclusive startup for this host.
+    /// Advance quota windows and prune expired history at startup for this host.
     /// The caller must ensure no other process is serving this host identity.
     async fn reconcile_startup(&self, host: &NodeId) -> Result<(), QuotaError>;
 }
@@ -93,6 +107,7 @@ pub struct DispatchedAttempt(AttemptLease);
 struct AttemptLease {
     store: std::sync::Arc<dyn QuotaStore>,
     id: ReservationId,
+    runtime: Handle,
     state: Option<AttemptPhase>,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -100,7 +115,7 @@ struct AttemptLease {
 #[derive(Clone, Copy)]
 enum AttemptPhase {
     Reserved,
-    Dispatched,
+    Dispatched(AttemptUsage),
 }
 
 impl AttemptLease {
@@ -114,6 +129,10 @@ impl AttemptLease {
     }
 
     async fn settle(&mut self, usage: AttemptUsage) -> Result<QuotaSettlement, QuotaError> {
+        if matches!(usage, AttemptUsage::Observed(tokens) if tokens < 0) {
+            return Err(QuotaError::InvalidTokens);
+        }
+        self.state = Some(AttemptPhase::Dispatched(usage));
         let result = self.store.settle(self.id, usage).await?;
         self.state = None;
         if let Some(done) = self.completion.take() {
@@ -128,23 +147,36 @@ impl Drop for AttemptLease {
         let Some(phase) = self.state.take() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(?self.id, "mesh quota attempt requires startup reconciliation");
-            return;
-        };
-        let mut cleanup = AttemptLease {
-            store: self.store.clone(),
-            id: self.id,
-            state: None,
-            completion: self.completion.take(),
-        };
-        runtime.spawn(async move {
-            let result = match phase {
-                AttemptPhase::Reserved => cleanup.release().await,
-                AttemptPhase::Dispatched => cleanup.settle(AttemptUsage::Unknown).await.map(|_| ()),
-            };
-            if let Err(error) = result {
-                tracing::warn!(?cleanup.id, %error, "mesh quota attempt requires reconciliation");
+        let store = self.store.clone();
+        let id = self.id;
+        let completion = self.completion.take();
+        self.runtime.spawn(async move {
+            let initial_delay = Duration::from_millis(50);
+            let mut delay = initial_delay;
+            loop {
+                let result = match phase {
+                    AttemptPhase::Reserved => store.release_unused(id).await,
+                    AttemptPhase::Dispatched(usage) => store.settle(id, usage).await.map(|_| ()),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(done) = completion {
+                            let _ = done.send(());
+                        }
+                        break;
+                    }
+                    Err(error @ QuotaError::Store(GrantStoreError::Backend(_))) => {
+                        if delay == initial_delay {
+                            tracing::warn!(?id, %error, "retrying mesh quota cleanup");
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(error) => {
+                        tracing::warn!(?id, %error, "mesh quota cleanup failed permanently");
+                        break;
+                    }
+                }
             }
         });
     }
@@ -157,25 +189,52 @@ fn task_failed(error: tokio::task::JoinError) -> QuotaError {
 impl ReservedAttempt {
     // A relay can drop a blocked upstream read and still wait for accounting
     // before reporting the terminal failure.
-    #[cfg(feature = "kameo-mesh")]
+    #[cfg(any(feature = "kameo-mesh", test))]
     pub(crate) fn completion(&mut self) -> tokio::sync::oneshot::Receiver<()> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.0.completion = Some(sender);
         receiver
     }
 
-    /// Reserve under the initiating grant. Cancellation cannot orphan the committed reservation.
+    /// Reserve under the current grant. Cancellation cannot orphan the committed reservation.
     pub async fn reserve(
         store: std::sync::Arc<dyn QuotaStore>,
         attempt: QuotaAttempt,
     ) -> Result<Self, QuotaError> {
-        // SQLite may commit even when the waiting future is dropped. Keep ownership
+        Self::reserve_inner(store, attempt, None).await
+    }
+
+    /// Reserve under an admission-time policy watch. The watch must come from
+    /// the same store and predate the initiating authorization.
+    pub async fn reserve_with_policy(
+        store: std::sync::Arc<dyn QuotaStore>,
+        attempt: QuotaAttempt,
+        changes: tokio::sync::broadcast::Receiver<PolicyChange>,
+        require_sessions: bool,
+    ) -> Result<Self, QuotaError> {
+        Self::reserve_inner(store, attempt, Some((changes, require_sessions))).await
+    }
+
+    async fn reserve_inner(
+        store: std::sync::Arc<dyn QuotaStore>,
+        attempt: QuotaAttempt,
+        policy: Option<(tokio::sync::broadcast::Receiver<PolicyChange>, bool)>,
+    ) -> Result<Self, QuotaError> {
+        // The store may commit even when the waiting future is dropped. Keep ownership
         // inside the task until a guard can release the committed reservation.
         tokio::spawn(async move {
-            let id = store.reserve(attempt).await?;
+            let id = match policy {
+                Some((changes, require_sessions)) => {
+                    store
+                        .reserve_with_policy(attempt, changes, require_sessions)
+                        .await?
+                }
+                None => store.reserve(attempt).await?,
+            };
             Ok(Self(AttemptLease {
                 store,
                 id,
+                runtime: Handle::current(),
                 state: Some(AttemptPhase::Reserved),
                 completion: None,
             }))
@@ -189,7 +248,7 @@ impl ReservedAttempt {
         let Self(mut lease) = self;
         tokio::spawn(async move {
             lease.store.mark_dispatched(lease.id).await?;
-            lease.state = Some(AttemptPhase::Dispatched);
+            lease.state = Some(AttemptPhase::Dispatched(AttemptUsage::Unknown));
             Ok(DispatchedAttempt(lease))
         })
         .await
