@@ -832,8 +832,8 @@ mod event_relay_mesh_tests {
             &crate::agent::remote::scope::MeshScopeId::lan_default(),
             &session_id,
         );
-        mesh.register_actor(local_ref, session_dht.clone()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        mesh.register_actor(local_ref.clone(), session_dht.clone())
+            .await;
         let remote_ref = mesh
             .lookup_actor::<SessionActor>(&session_dht)
             .await

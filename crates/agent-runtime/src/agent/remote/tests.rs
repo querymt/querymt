@@ -2769,6 +2769,7 @@ mod node_manager_tests {
         let (config, dir) = test_agent_config().await;
         let mesh = bootstrap_guarded_lan(&dir).await;
         let handle = crate::agent::LocalAgentHandle::from_config(config.clone());
+        handle.set_mesh(mesh.clone());
         let refs = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
             &handle, &mesh,
         )
@@ -3258,14 +3259,17 @@ mod node_manager_tests {
             .settle(attempt, AttemptUsage::Observed(12))
             .await
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(event.params.get()).unwrap(),
-            json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
-        );
+        // Both reservation and settlement change the peer-visible balance.
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(event.params.get()).unwrap(),
+                json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
+            );
+        }
         assert_eq!(
             get(recipient).await["quotas"][0]["usage"]["available_tokens"],
             "18"
