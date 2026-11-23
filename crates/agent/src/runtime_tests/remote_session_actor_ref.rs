@@ -1765,7 +1765,7 @@ mod session_actor_ref_remote_tests {
 
         let local_names = names(&alpha.handle.slash_command_catalog(&session_id).await);
         assert!(
-            local_names.contains(&"/deploy".to_string()),
+            local_names.contains(&"deploy".to_string()),
             "{local_names:?}"
         );
 
@@ -1776,7 +1776,7 @@ mod session_actor_ref_remote_tests {
             .await
             .insert(session_id.clone(), session_ref);
         let remote_names = names(&alpha.handle.slash_command_catalog(&session_id).await);
-        assert_eq!(remote_names, vec!["/compact".to_string()]);
+        assert_eq!(remote_names, vec!["compact".to_string()]);
     }
 
     fn prompt_record_message(

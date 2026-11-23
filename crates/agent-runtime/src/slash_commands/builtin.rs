@@ -91,11 +91,20 @@ impl Builtin {
         }
     }
 
+    /// Command name without the slash, as ACP advertises it. The slash is
+    /// prompt syntax: clients show and send `/` followed by this name.
+    pub const fn command_name(self) -> &'static str {
+        match self {
+            Builtin::Compact => "compact",
+            Builtin::Worktree => "worktree",
+        }
+    }
+
     /// ACP catalog entry advertising this command.
     pub fn entry(self) -> AvailableCommand {
         match self {
             Builtin::Compact => AvailableCommand::new(
-                self.name(),
+                self.command_name(),
                 "Summarize the conversation now to free up context",
             )
             .input(AvailableCommandInput::Unstructured(
@@ -104,7 +113,7 @@ impl Builtin {
                 ),
             )),
             Builtin::Worktree => AvailableCommand::new(
-                self.name(),
+                self.command_name(),
                 "Create, hand off, archive and inspect isolated sessions; conservative removal, no automatic integration",
             )
             .input(AvailableCommandInput::Unstructured(
@@ -148,7 +157,7 @@ impl Builtin {
     pub fn is_reserved(name: &str) -> bool {
         Self::ALL
             .iter()
-            .any(|builtin| builtin.name().trim_start_matches('/') == name)
+            .any(|builtin| builtin.command_name() == name)
     }
 
     /// Recognise a built-in invocation.
@@ -352,7 +361,9 @@ mod tests {
     #[test]
     fn every_builtin_has_a_matching_catalog_entry_and_is_reserved() {
         for builtin in Builtin::ALL {
-            assert_eq!(builtin.entry().name, builtin.name());
+            assert_eq!(builtin.entry().name, builtin.command_name());
+            assert!(!builtin.command_name().starts_with('/'));
+            assert_eq!(builtin.name(), format!("/{}", builtin.command_name()));
             assert!(builtin.name().starts_with('/'));
             assert!(Builtin::is_reserved(builtin.name().trim_start_matches('/')));
         }

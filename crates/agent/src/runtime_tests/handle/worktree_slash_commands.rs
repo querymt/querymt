@@ -246,10 +246,10 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
 
     let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
-    assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
-    assert!(names.contains(&"/worktree".to_string()), "names: {names:?}");
+    assert!(names.contains(&"deploy".to_string()), "names: {names:?}");
+    assert!(names.contains(&"worktree".to_string()), "names: {names:?}");
     assert!(
-        !names.contains(&"/agent-only".to_string()),
+        !names.contains(&"agent-only".to_string()),
         "agent-level commands are not advertised for managed sessions: {names:?}"
     );
 
@@ -288,7 +288,7 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
     let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
     assert!(
-        names.contains(&"/isolated-only".to_string()),
+        names.contains(&"isolated-only".to_string()),
         "the catalog advertises the isolated-only command: {names:?}"
     );
 
@@ -395,9 +395,9 @@ async fn shared_child_in_a_managed_checkout_uses_the_checkout_commands() {
 
     let catalog = f.handle.slash_command_catalog(&shared_id).await;
     let names = advertised_names(&catalog);
-    assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
+    assert!(names.contains(&"deploy".to_string()), "names: {names:?}");
     assert!(
-        !names.contains(&"/agent-only".to_string()),
+        !names.contains(&"agent-only".to_string()),
         "agent-level commands are not advertised inside a managed checkout: {names:?}"
     );
 
@@ -475,9 +475,10 @@ async fn active_session_catalog_and_invocation_share_one_registry() {
     for session_id in [&owner_id, &shared_id] {
         let catalog = f.handle.slash_command_catalog(session_id).await;
         let names = advertised_names(&catalog);
-        assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
+        assert!(names.contains(&"deploy".to_string()), "names: {names:?}");
+
         assert!(
-            !names.contains(&"/late".to_string()),
+            !names.contains(&"late".to_string()),
             "the catalog must not advertise a command the running session cannot \
              expand: {names:?}"
         );
@@ -499,7 +500,7 @@ async fn active_session_catalog_and_invocation_share_one_registry() {
         .await
         .unwrap();
     let catalog = f.handle.slash_command_catalog(&owner_id).await;
-    assert!(advertised_names(&catalog).contains(&"/late".to_string()));
+    assert!(advertised_names(&catalog).contains(&"late".to_string()));
     prompt(&f.handle, &owner_id, "/late again").await.unwrap();
     assert!(
         stored_user_text(&f, &owner_id)
@@ -584,12 +585,12 @@ async fn native_worktree_interception_and_command_policy_are_preserved() {
     let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
     assert_eq!(
-        names.iter().filter(|name| *name == "/worktree").count(),
+        names.iter().filter(|name| *name == "worktree").count(),
         1,
         "the native /worktree entry is advertised exactly once: {names:?}"
     );
     assert!(
-        !names.contains(&"/scripted".to_string()),
+        !names.contains(&"scripted".to_string()),
         "script-required commands stay hidden while scripts are disabled: {names:?}"
     );
 
