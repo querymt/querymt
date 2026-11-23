@@ -112,7 +112,7 @@ pub(crate) enum Operation {
 }
 
 pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Value, CliError> {
-    let (method, params) = match command {
+    let (method, mut params) = match command {
         MeshCommand::Nodes => (NODES, json!({})),
         MeshCommand::Get { peer_id } => {
             nonempty(&peer_id, "peer ID")?;
@@ -176,6 +176,12 @@ pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Valu
         }
     };
     require_capability(client, "methods", method, method != NODES).await?;
+    if method == SET_QUOTA && params["operation"] == "update" && params["limit"]["window"].is_null()
+    {
+        require_capability(client, "methods", GET, true).await?;
+        let window = stored_quota_window(client, &params).await?;
+        params["limit"]["window"] = json!(window);
+    }
     let response = client
         .extension(method, params.clone())
         .await
@@ -222,6 +228,36 @@ pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Valu
         return Err(error);
     }
     Ok(result)
+}
+
+async fn stored_quota_window(client: &AcpClient, params: &Value) -> Result<String, CliError> {
+    let read = client
+        .extension(
+            GET,
+            json!({"version": VERSION, "peer_id": &params["peer_id"]}),
+        )
+        .await
+        .map_err(CliError::from_request)?;
+    let read = extension_payload(&read);
+    if read["version"].as_u64() != Some(VERSION) || read["peer_id"] != params["peer_id"] {
+        return Err(CliError::rpc("invalid mesh access response"));
+    }
+    let quota = read["outgoing"]["quotas"].as_array().and_then(|quotas| {
+        quotas.iter().find(|quota| {
+            quota["scope"]["provider_id"] == params["scope"]["provider_id"]
+                && quota["scope"]["model_id"] == params["scope"]["model_id"]
+        })
+    });
+    let limit = quota.map(|quota| &quota["limit"]);
+    let window = limit
+        .filter(|limit| limit["kind"] == "finite")
+        .and_then(|limit| limit["window"].as_str())
+        .filter(|window| matches!(*window, "manual" | "daily" | "weekly" | "monthly"))
+        .ok_or_else(|| CliError::Usage(
+            "cannot infer the existing quota window; specify --window, or use --operation reconfigure to create a finite quota".into(),
+        ))?;
+    // Never adopt a newer revision from this read; the original write's CAS still applies.
+    Ok(window.to_owned())
 }
 
 pub(crate) async fn watch(
