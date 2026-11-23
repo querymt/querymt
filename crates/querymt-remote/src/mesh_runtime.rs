@@ -141,6 +141,11 @@ async fn finish_swarm_shutdown<F, T>(
     }
 }
 
+/// Start a standalone mesh without a peer grant or quota store.
+///
+/// Connected peers can use providers published with [`crate::ProviderShare`],
+/// subject to the host's global model allowlist. Use
+/// [`bootstrap_mesh_runtime_with_policy`] to enforce directional grants and quotas.
 pub async fn bootstrap_mesh_runtime(
     config: &MeshRuntimeConfig,
 ) -> Result<MeshRuntimeHandle, MeshError> {
@@ -148,6 +153,7 @@ pub async fn bootstrap_mesh_runtime(
     Ok(MeshRuntimeHandle::new(handle))
 }
 
+/// Like [`bootstrap_mesh_runtime`], but returns the underlying mesh handle.
 pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHandle, MeshError> {
     bootstrap_with_ingress(config, None, None, false).await
 }

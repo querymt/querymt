@@ -47,6 +47,29 @@ asyncio.run(main())
 - `crates/py/querymt-py/examples/share_provider.py`
 - `crates/py/querymt-py/examples/remote_chat.py`
 
+## LAN Provider Sharing
+
+`MeshRuntime.lan()` without a peer access store lets any connected peer use
+models listed in `share_provider(..., allowed_models=[...])`. It does not apply
+directional peer grants or per-peer quotas. Use this mode only on a mesh whose
+connected peers you trust to consume those models.
+
+To apply the same provider grants and quotas as an agent host, pass the path to
+a host-managed mesh state file:
+
+```python
+runtime = await querymt.MeshRuntime.lan(peer_access_store="/path/to/mesh_state.json")
+```
+
+The `share_provider.py` example reads this path from `QMT_PEER_ACCESS_STORE`.
+This option does not change the node's identity. Grants in the file must be for
+this host's `runtime.peer_id` and the authenticated calling peer. A new store
+starts with no grants; a store that cannot be opened fails startup. Peer grants
+can narrow but never expand `allowed_models`. Use the Rust `GrantStore` and
+`QuotaStore` APIs to provision the file while the host is stopped. Do not run
+another process that writes the same store or uses the same mesh identity while
+this runtime is active. This API hosts providers, not agent sessions.
+
 ## Tool Calling
 
 You can pass tool definitions as plain Python dictionaries matching QueryMT's `Tool` schema:

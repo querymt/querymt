@@ -1,5 +1,13 @@
 ## ADDED Requirements
 
+### Requirement: Standalone provider hosts can opt into peer policy
+
+A standalone provider host started with a grant and quota store SHALL enforce the same provider policy as an agent host, in addition to the global model allowlist. If a supplied store cannot be opened, startup SHALL fail. Without a store, any connected peer MAY consume globally shared models, without per-peer grants or quotas.
+
+#### Scenario: Standalone sharing respects its configured mode
+- **WHEN** a standalone host shares the same global model allowlist with and without a peer access store
+- **THEN** in store-backed mode a peer needs a matching grant and available quota; in no-store mode connected peers may use the allowlisted models without per-peer checks; neither mode exposes a model outside the global allowlist
+
 ### Requirement: Provider grants filter discovery and execution
 
 A Custom grant SHALL allow selected host providers, each with all currently and subsequently available models or a non-empty list of canonical model IDs. Quota configuration SHALL NOT grant model access. The host SHALL enforce selection on catalogs, contract queries, direct inference, and session-triggered inference. It SHALL use host-owned bindings and credentials and SHALL NOT silently fall back on policy denial.
