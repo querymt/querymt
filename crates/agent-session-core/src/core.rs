@@ -3,9 +3,9 @@
 use crate::SCHEMA_VERSION;
 use crate::bounded::{DebugEntry, DebugLog, DebugRing, SeenLive};
 use crate::decode::{Decoded, decode_notification};
-use crate::entry::Turn;
+use crate::entry::{Entry, Turn};
 use crate::input::SessionInput;
-use crate::store::Store;
+use crate::store::{Store, TurnRef};
 use crate::view::{ChangeReport, InputError, SessionHeader};
 
 /// The session view and the state needed to keep it current.
@@ -154,6 +154,22 @@ impl SessionCore {
     /// Turn ids in history order.
     pub fn turn_ids(&self) -> Vec<String> {
         self.store.turn_ids()
+    }
+
+    /// Turn ids in history order, borrowed. Copies nothing.
+    pub fn turn_order(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.store.turn_order()
+    }
+
+    /// One turn read in place, or `None` for an unknown id. Copies no entry
+    /// content; the borrow ends before the next `apply`.
+    pub fn turn_ref(&self, id: &str) -> Option<TurnRef<'_>> {
+        self.store.turn_ref(id)
+    }
+
+    /// One entry by id, or `None` for an unknown id.
+    pub fn entry(&self, id: &str) -> Option<&Entry> {
+        self.store.entry(id)
     }
 
     /// One turn, or `None` for an unknown id.

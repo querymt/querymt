@@ -231,7 +231,12 @@ impl SessionCore {
                     .collect(),
                 _ => event_updates(event, &mut compaction_ids),
             };
-            for update in updates {
+            for mut update in updates {
+                // The agent's replay stamps the enclosing run on its updates
+                // with this same function; a snapshot builds the same entries.
+                if let Some(run_id) = &self.store.active_run {
+                    querymt_agent_protocol_types::replay::stamp_run_id(&mut update, run_id);
+                }
                 self.apply_update(update);
             }
             if matches!(event.kind, AgentEventKind::RunCompleted { .. }) {

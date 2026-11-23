@@ -110,6 +110,7 @@ rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
+querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
 rmcp = { version = "3.11", features = ["server", "transport-streamable-http-server"] }
 mockall.workspace = true
 env_logger = "0.11"

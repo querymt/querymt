@@ -26,6 +26,7 @@ mod updates;
 mod usage;
 
 pub use crate::core::SessionCore;
+pub use crate::store::TurnRef;
 
 /// Version of the input and output shapes. Bumped whenever a shape changes in a
 /// way old clients cannot read.

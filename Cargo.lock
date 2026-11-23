@@ -12252,6 +12252,7 @@ dependencies = [
  "querymt-agent-knowledge",
  "querymt-agent-protocol-types",
  "querymt-agent-services",
+ "querymt-agent-session-core",
  "querymt-agent-sqlite",
  "querymt-provider-common",
  "querymt-remote",

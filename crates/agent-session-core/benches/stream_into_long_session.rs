@@ -22,6 +22,25 @@ fn stream_into_long_session(c: &mut Criterion) {
         let chunk = [text_chunk("m-bench", "lorem ")];
         group.bench_function(name, |b| b.iter(|| black_box(core.apply(&chunk))));
     }
+    // The same update, then the last turn read by reference as a native
+    // client does after each change report (every entry visited, none copied).
+    for (name, factor) in [("1x_read_after_update", 4), ("4x_read_after_update", 16)] {
+        let mut core = long_session(factor);
+        let chunk = [text_chunk("m-bench", "lorem ")];
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(core.apply(&chunk));
+                let revisions = core
+                    .turn_order()
+                    .last()
+                    .and_then(|id| core.turn_ref(id))
+                    .map_or(0, |turn| {
+                        turn.entries().map(|entry| entry.revision).sum::<u64>()
+                    });
+                black_box(revisions)
+            });
+        });
+    }
     group.finish();
 }
 

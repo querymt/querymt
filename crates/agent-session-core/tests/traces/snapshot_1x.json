@@ -4026,7 +4026,7 @@
       },
       {
         "id": "run-r3",
-        "revision": 22,
+        "revision": 23,
         "entries": [
           {
             "id": "user-u3",
@@ -4122,7 +4122,7 @@
           },
           {
             "id": "compaction-c3",
-            "revision": 22,
+            "revision": 23,
             "kind": {
               "type": "compaction",
               "data": {
@@ -4136,7 +4136,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r3"
+                  }
+                }
               }
             }
           }
@@ -4144,11 +4148,11 @@
       },
       {
         "id": "run-r4",
-        "revision": 27,
+        "revision": 28,
         "entries": [
           {
             "id": "user-u4",
-            "revision": 23,
+            "revision": 24,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4168,7 +4172,7 @@
           },
           {
             "id": "reasoning-a4-a4:summary:0",
-            "revision": 24,
+            "revision": 25,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4180,7 +4184,7 @@
           },
           {
             "id": "assistant-a4",
-            "revision": 25,
+            "revision": 26,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4191,7 +4195,7 @@
           },
           {
             "id": "tool-t4-0",
-            "revision": 27,
+            "revision": 28,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4222,11 +4226,11 @@
       },
       {
         "id": "run-sched4",
-        "revision": 28,
+        "revision": 29,
         "entries": [
           {
             "id": "assistant-sa4",
-            "revision": 28,
+            "revision": 29,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4239,11 +4243,11 @@
       },
       {
         "id": "run-r5",
-        "revision": 32,
+        "revision": 33,
         "entries": [
           {
             "id": "user-u5",
-            "revision": 29,
+            "revision": 30,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4263,7 +4267,7 @@
           },
           {
             "id": "user-s5",
-            "revision": 30,
+            "revision": 31,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4283,7 +4287,7 @@
           },
           {
             "id": "reasoning-a5-a5:summary:0",
-            "revision": 31,
+            "revision": 32,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4295,7 +4299,7 @@
           },
           {
             "id": "assistant-a5",
-            "revision": 32,
+            "revision": 33,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4308,11 +4312,11 @@
       },
       {
         "id": "run-r6",
-        "revision": 35,
+        "revision": 36,
         "entries": [
           {
             "id": "user-u6",
-            "revision": 33,
+            "revision": 34,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4332,7 +4336,7 @@
           },
           {
             "id": "reasoning-a6-a6:summary:0",
-            "revision": 34,
+            "revision": 35,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4344,7 +4348,7 @@
           },
           {
             "id": "assistant-a6",
-            "revision": 35,
+            "revision": 36,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4357,11 +4361,11 @@
       },
       {
         "id": "run-r7",
-        "revision": 43,
+        "revision": 45,
         "entries": [
           {
             "id": "user-u7",
-            "revision": 36,
+            "revision": 37,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4381,7 +4385,7 @@
           },
           {
             "id": "user-s7",
-            "revision": 37,
+            "revision": 38,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4401,7 +4405,7 @@
           },
           {
             "id": "reasoning-a7-a7:summary:0",
-            "revision": 38,
+            "revision": 39,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4413,7 +4417,7 @@
           },
           {
             "id": "assistant-a7",
-            "revision": 39,
+            "revision": 40,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4424,7 +4428,7 @@
           },
           {
             "id": "tool-t7-0",
-            "revision": 41,
+            "revision": 42,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4453,7 +4457,7 @@
           },
           {
             "id": "compaction-c7",
-            "revision": 43,
+            "revision": 45,
             "kind": {
               "type": "compaction",
               "data": {
@@ -4467,7 +4471,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r7"
+                  }
+                }
               }
             }
           }
@@ -4475,11 +4483,11 @@
       },
       {
         "id": "run-r8",
-        "revision": 46,
+        "revision": 48,
         "entries": [
           {
             "id": "user-u8",
-            "revision": 44,
+            "revision": 46,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4499,7 +4507,7 @@
           },
           {
             "id": "reasoning-a8-a8:summary:0",
-            "revision": 45,
+            "revision": 47,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4511,7 +4519,7 @@
           },
           {
             "id": "assistant-a8",
-            "revision": 46,
+            "revision": 48,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4524,11 +4532,11 @@
       },
       {
         "id": "run-r9",
-        "revision": 52,
+        "revision": 54,
         "entries": [
           {
             "id": "user-u9",
-            "revision": 47,
+            "revision": 49,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4548,7 +4556,7 @@
           },
           {
             "id": "user-s9",
-            "revision": 48,
+            "revision": 50,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4568,7 +4576,7 @@
           },
           {
             "id": "reasoning-a9-a9:summary:0",
-            "revision": 49,
+            "revision": 51,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4580,7 +4588,7 @@
           },
           {
             "id": "assistant-a9",
-            "revision": 50,
+            "revision": 52,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4591,7 +4599,7 @@
           },
           {
             "id": "tool-t9-0",
-            "revision": 52,
+            "revision": 54,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4622,11 +4630,11 @@
       },
       {
         "id": "run-sched9",
-        "revision": 53,
+        "revision": 55,
         "entries": [
           {
             "id": "assistant-sa9",
-            "revision": 53,
+            "revision": 55,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4639,11 +4647,11 @@
       },
       {
         "id": "run-r10",
-        "revision": 60,
+        "revision": 62,
         "entries": [
           {
             "id": "user-u10",
-            "revision": 54,
+            "revision": 56,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4663,7 +4671,7 @@
           },
           {
             "id": "reasoning-a10-a10:summary:0",
-            "revision": 55,
+            "revision": 57,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4675,7 +4683,7 @@
           },
           {
             "id": "assistant-a10",
-            "revision": 56,
+            "revision": 58,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4686,7 +4694,7 @@
           },
           {
             "id": "tool-t10-0",
-            "revision": 58,
+            "revision": 60,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4715,7 +4723,7 @@
           },
           {
             "id": "tool-t10-1",
-            "revision": 60,
+            "revision": 62,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4746,11 +4754,11 @@
       },
       {
         "id": "run-r11",
-        "revision": 66,
+        "revision": 69,
         "entries": [
           {
             "id": "user-u11",
-            "revision": 61,
+            "revision": 63,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4770,7 +4778,7 @@
           },
           {
             "id": "user-s11",
-            "revision": 62,
+            "revision": 64,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4790,7 +4798,7 @@
           },
           {
             "id": "reasoning-a11-a11:summary:0",
-            "revision": 63,
+            "revision": 65,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4802,7 +4810,7 @@
           },
           {
             "id": "assistant-a11",
-            "revision": 64,
+            "revision": 66,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4813,7 +4821,7 @@
           },
           {
             "id": "compaction-c11",
-            "revision": 66,
+            "revision": 69,
             "kind": {
               "type": "compaction",
               "data": {
@@ -4827,7 +4835,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r11"
+                  }
+                }
               }
             }
           }
@@ -4835,11 +4847,11 @@
       },
       {
         "id": "run-r12",
-        "revision": 73,
+        "revision": 76,
         "entries": [
           {
             "id": "user-u12",
-            "revision": 67,
+            "revision": 70,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4859,7 +4871,7 @@
           },
           {
             "id": "reasoning-a12-a12:summary:0",
-            "revision": 68,
+            "revision": 71,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4871,7 +4883,7 @@
           },
           {
             "id": "assistant-a12",
-            "revision": 69,
+            "revision": 72,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -4882,7 +4894,7 @@
           },
           {
             "id": "tool-t12-0",
-            "revision": 71,
+            "revision": 74,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4911,7 +4923,7 @@
           },
           {
             "id": "tool-t12-1",
-            "revision": 73,
+            "revision": 76,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -4942,11 +4954,11 @@
       },
       {
         "id": "run-r13",
-        "revision": 79,
+        "revision": 82,
         "entries": [
           {
             "id": "user-u13",
-            "revision": 74,
+            "revision": 77,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4966,7 +4978,7 @@
           },
           {
             "id": "user-s13",
-            "revision": 75,
+            "revision": 78,
             "kind": {
               "type": "user_message",
               "data": {
@@ -4986,7 +4998,7 @@
           },
           {
             "id": "reasoning-a13-a13:summary:0",
-            "revision": 76,
+            "revision": 79,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -4998,7 +5010,7 @@
           },
           {
             "id": "assistant-a13",
-            "revision": 77,
+            "revision": 80,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5009,7 +5021,7 @@
           },
           {
             "id": "tool-t13-0",
-            "revision": 79,
+            "revision": 82,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5040,11 +5052,11 @@
       },
       {
         "id": "run-r14",
-        "revision": 82,
+        "revision": 85,
         "entries": [
           {
             "id": "user-u14",
-            "revision": 80,
+            "revision": 83,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5064,7 +5076,7 @@
           },
           {
             "id": "reasoning-a14-a14:summary:0",
-            "revision": 81,
+            "revision": 84,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5076,7 +5088,7 @@
           },
           {
             "id": "assistant-a14",
-            "revision": 82,
+            "revision": 85,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5089,11 +5101,11 @@
       },
       {
         "id": "run-sched14",
-        "revision": 83,
+        "revision": 86,
         "entries": [
           {
             "id": "assistant-sa14",
-            "revision": 83,
+            "revision": 86,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5106,11 +5118,11 @@
       },
       {
         "id": "run-r15",
-        "revision": 91,
+        "revision": 95,
         "entries": [
           {
             "id": "user-u15",
-            "revision": 84,
+            "revision": 87,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5130,7 +5142,7 @@
           },
           {
             "id": "user-s15",
-            "revision": 85,
+            "revision": 88,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5150,7 +5162,7 @@
           },
           {
             "id": "reasoning-a15-a15:summary:0",
-            "revision": 86,
+            "revision": 89,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5162,7 +5174,7 @@
           },
           {
             "id": "assistant-a15",
-            "revision": 87,
+            "revision": 90,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5173,7 +5185,7 @@
           },
           {
             "id": "tool-t15-0",
-            "revision": 89,
+            "revision": 92,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5202,7 +5214,7 @@
           },
           {
             "id": "compaction-c15",
-            "revision": 91,
+            "revision": 95,
             "kind": {
               "type": "compaction",
               "data": {
@@ -5216,7 +5228,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r15"
+                  }
+                }
               }
             }
           }
@@ -5224,11 +5240,11 @@
       },
       {
         "id": "run-r16",
-        "revision": 94,
+        "revision": 98,
         "entries": [
           {
             "id": "user-u16",
-            "revision": 92,
+            "revision": 96,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5248,7 +5264,7 @@
           },
           {
             "id": "reasoning-a16-a16:summary:0",
-            "revision": 93,
+            "revision": 97,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5260,7 +5276,7 @@
           },
           {
             "id": "assistant-a16",
-            "revision": 94,
+            "revision": 98,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5273,11 +5289,11 @@
       },
       {
         "id": "run-r17",
-        "revision": 98,
+        "revision": 102,
         "entries": [
           {
             "id": "user-u17",
-            "revision": 95,
+            "revision": 99,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5297,7 +5313,7 @@
           },
           {
             "id": "user-s17",
-            "revision": 96,
+            "revision": 100,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5317,7 +5333,7 @@
           },
           {
             "id": "reasoning-a17-a17:summary:0",
-            "revision": 97,
+            "revision": 101,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5329,7 +5345,7 @@
           },
           {
             "id": "assistant-a17",
-            "revision": 98,
+            "revision": 102,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5342,11 +5358,11 @@
       },
       {
         "id": "run-r18",
-        "revision": 103,
+        "revision": 107,
         "entries": [
           {
             "id": "user-u18",
-            "revision": 99,
+            "revision": 103,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5366,7 +5382,7 @@
           },
           {
             "id": "reasoning-a18-a18:summary:0",
-            "revision": 100,
+            "revision": 104,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5378,7 +5394,7 @@
           },
           {
             "id": "assistant-a18",
-            "revision": 101,
+            "revision": 105,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5389,7 +5405,7 @@
           },
           {
             "id": "tool-t18-0",
-            "revision": 103,
+            "revision": 107,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5420,11 +5436,11 @@
       },
       {
         "id": "run-r19",
-        "revision": 111,
+        "revision": 116,
         "entries": [
           {
             "id": "user-u19",
-            "revision": 104,
+            "revision": 108,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5444,7 +5460,7 @@
           },
           {
             "id": "user-s19",
-            "revision": 105,
+            "revision": 109,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5464,7 +5480,7 @@
           },
           {
             "id": "reasoning-a19-a19:summary:0",
-            "revision": 106,
+            "revision": 110,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5476,7 +5492,7 @@
           },
           {
             "id": "assistant-a19",
-            "revision": 107,
+            "revision": 111,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5487,7 +5503,7 @@
           },
           {
             "id": "tool-t19-0",
-            "revision": 109,
+            "revision": 113,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5516,7 +5532,7 @@
           },
           {
             "id": "compaction-c19",
-            "revision": 111,
+            "revision": 116,
             "kind": {
               "type": "compaction",
               "data": {
@@ -5530,7 +5546,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r19"
+                  }
+                }
               }
             }
           }
@@ -5538,11 +5558,11 @@
       },
       {
         "id": "run-sched19",
-        "revision": 112,
+        "revision": 117,
         "entries": [
           {
             "id": "assistant-sa19",
-            "revision": 112,
+            "revision": 117,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5555,11 +5575,11 @@
       },
       {
         "id": "run-r20",
-        "revision": 117,
+        "revision": 122,
         "entries": [
           {
             "id": "user-u20",
-            "revision": 113,
+            "revision": 118,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5579,7 +5599,7 @@
           },
           {
             "id": "reasoning-a20-a20:summary:0",
-            "revision": 114,
+            "revision": 119,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5591,7 +5611,7 @@
           },
           {
             "id": "assistant-a20",
-            "revision": 115,
+            "revision": 120,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5602,7 +5622,7 @@
           },
           {
             "id": "tool-t20-0",
-            "revision": 117,
+            "revision": 122,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5633,11 +5653,11 @@
       },
       {
         "id": "run-r21",
-        "revision": 123,
+        "revision": 128,
         "entries": [
           {
             "id": "user-u21",
-            "revision": 118,
+            "revision": 123,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5657,7 +5677,7 @@
           },
           {
             "id": "user-s21",
-            "revision": 119,
+            "revision": 124,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5677,7 +5697,7 @@
           },
           {
             "id": "reasoning-a21-a21:summary:0",
-            "revision": 120,
+            "revision": 125,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5689,7 +5709,7 @@
           },
           {
             "id": "assistant-a21",
-            "revision": 121,
+            "revision": 126,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5700,7 +5720,7 @@
           },
           {
             "id": "tool-t21-0",
-            "revision": 123,
+            "revision": 128,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5731,11 +5751,11 @@
       },
       {
         "id": "run-r22",
-        "revision": 128,
+        "revision": 133,
         "entries": [
           {
             "id": "user-u22",
-            "revision": 124,
+            "revision": 129,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5755,7 +5775,7 @@
           },
           {
             "id": "reasoning-a22-a22:summary:0",
-            "revision": 125,
+            "revision": 130,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5767,7 +5787,7 @@
           },
           {
             "id": "assistant-a22",
-            "revision": 126,
+            "revision": 131,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5778,7 +5798,7 @@
           },
           {
             "id": "tool-t22-0",
-            "revision": 128,
+            "revision": 133,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5809,11 +5829,11 @@
       },
       {
         "id": "run-r23",
-        "revision": 136,
+        "revision": 142,
         "entries": [
           {
             "id": "user-u23",
-            "revision": 129,
+            "revision": 134,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5833,7 +5853,7 @@
           },
           {
             "id": "user-s23",
-            "revision": 130,
+            "revision": 135,
             "kind": {
               "type": "user_message",
               "data": {
@@ -5853,7 +5873,7 @@
           },
           {
             "id": "reasoning-a23-a23:summary:0",
-            "revision": 131,
+            "revision": 136,
             "kind": {
               "type": "reasoning",
               "data": {
@@ -5865,7 +5885,7 @@
           },
           {
             "id": "assistant-a23",
-            "revision": 132,
+            "revision": 137,
             "kind": {
               "type": "assistant_message",
               "data": {
@@ -5876,7 +5896,7 @@
           },
           {
             "id": "tool-t23-0",
-            "revision": 134,
+            "revision": 139,
             "kind": {
               "type": "tool_call",
               "data": {
@@ -5905,7 +5925,7 @@
           },
           {
             "id": "compaction-c23",
-            "revision": 136,
+            "revision": 142,
             "kind": {
               "type": "compaction",
               "data": {
@@ -5919,7 +5939,11 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": {
+                  "querymt": {
+                    "runId": "r23"
+                  }
+                }
               }
             }
           }
