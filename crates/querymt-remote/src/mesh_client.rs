@@ -894,10 +894,12 @@ mod tests {
     #[tokio::test]
     async fn unregistered_provider_host_error_names_the_lan_locator() {
         let (mesh, _) = mesh_fixture();
-        let provider = MeshChatProvider::new(&mesh, "unregistered-fixture-host", "fixture", "demo");
+        let target = NodeId::from_peer_id(PeerId::random());
+        let provider = MeshChatProvider::from_node_id(&mesh, &target, "fixture", "demo");
+        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &target);
         let error = provider.chat(&ChatCall::new(&[])).await.unwrap_err();
         assert!(
-            matches!(error, LLMError::ProviderError(message) if message.contains("scope::lan::default::provider_host::peer::unregistered-fixture-host"))
+            matches!(error, LLMError::ProviderError(message) if message.contains(&locator) && message.contains("not found"))
         );
     }
 }
