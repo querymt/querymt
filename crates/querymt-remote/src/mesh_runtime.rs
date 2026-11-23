@@ -214,13 +214,6 @@ async fn bootstrap_with_ingress(
         _ => unreachable!(),
     };
 
-    let state_owner = if use_mesh_state_policy {
-        Some(crate::mesh_bootstrap::open_mesh_state(
-            config.identity_file.as_deref(),
-        )?)
-    } else {
-        None
-    };
     let ctx = prepare_runtime_bootstrap(
         config.identity_file.as_deref(),
         &config.peers,
@@ -239,7 +232,15 @@ async fn bootstrap_with_ingress(
         mesh_state_store,
     } = ctx;
 
-    let mesh_state_store = state_owner.or(mesh_state_store);
+    // The identity must exist before selecting its state path, so aliases
+    // compare the same way on first startup and on subsequent starts.
+    let mesh_state_store = if use_mesh_state_policy && mesh_state_store.is_none() {
+        Some(crate::mesh_bootstrap::open_mesh_state(
+            config.identity_file.as_deref(),
+        )?)
+    } else {
+        mesh_state_store
+    };
     let policy_store = if use_mesh_state_policy {
         mesh_state_store
             .as_ref()
@@ -1055,6 +1056,81 @@ mod tests {
 
     impl remote::RemoteActor for RegistrationActor {
         const REMOTE_ID: &'static str = "test::RegistrationActor";
+    }
+
+    #[tokio::test]
+    async fn guarded_startup_uses_default_state_for_new_identity_alias() {
+        const CHILD: &str = "QMT_IDENTITY_ALIAS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let dirs = [
+                ("HOME", "home"),
+                ("QMT_HOME", "qmt"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_RUNTIME_DIR", "runtime"),
+            ];
+            for (_, name) in dirs {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+            }
+            std::fs::create_dir(dir.path().join("qmt-config")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mesh_runtime::tests::guarded_startup_uses_default_state_for_new_identity_alias",
+                ])
+                .current_dir(dir.path())
+                .env(CHILD, "1")
+                .env_remove("QMT_SESSIONS_DB")
+                .env("QMT_CONFIG_DIR", "qmt-config")
+                .envs(dirs.map(|(key, name)| (key, dir.path().join(name))))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(dir.path().join("qmt-config/mesh_state.json").is_file());
+            return;
+        }
+
+        let identity = std::env::current_dir()
+            .unwrap()
+            .join(crate::default_identity_path().unwrap());
+        assert!(!identity.exists());
+        let runtime = bootstrap_mesh_runtime_guarded(&MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(crate::LanMeshConfig {
+                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                discovery: LanDiscovery::None,
+                directory: Default::default(),
+            }),
+            identity_file: Some(identity.clone()),
+            iroh_enabled: false,
+            iroh_gso: false,
+            iroh_dns: None,
+            iroh_scopes: vec![],
+            request_timeout: std::time::Duration::from_secs(2),
+            stream_reconnect_grace: std::time::Duration::from_secs(2),
+            node_name: None,
+            peers: vec![],
+            auto_fallback: false,
+        })
+        .await
+        .unwrap();
+        let mesh = runtime.as_mesh_handle();
+        mesh.mesh_state_store()
+            .unwrap()
+            .write()
+            .upsert_hosted_mesh("fixture".into(), None, None)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), mesh.shutdown())
+            .await
+            .unwrap();
+        drop(runtime);
+
+        // Reopen using the state selection that an existing identity will take.
+        let state = crate::mesh_bootstrap::open_mesh_state(Some(&identity)).unwrap();
+        assert_eq!(state.read().active_mesh_ids(), ["fixture"]);
     }
 
     #[tokio::test]
