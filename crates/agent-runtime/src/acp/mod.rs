@@ -19,6 +19,8 @@ pub mod trace_context;
 mod session_core_conformance;
 #[cfg(test)]
 mod session_load_snapshot_tests;
+#[cfg(test)]
+mod subagent_updates_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;

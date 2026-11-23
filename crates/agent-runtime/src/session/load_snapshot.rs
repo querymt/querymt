@@ -15,6 +15,16 @@ use time::OffsetDateTime;
 
 pub use querymt_agent_protocol_types::session::load_snapshot::SessionLoadSnapshot;
 
+/// The ACP `subagent_update` of each delegation that has a child session.
+fn subagent_updates(
+    delegation_updates: &[crate::control::delegation_notifications::DelegationUpdateNotification],
+) -> Vec<crate::acp::protocol::SubagentUpdate> {
+    delegation_updates
+        .iter()
+        .filter_map(crate::acp::shared::subagent_update_from_snapshot)
+        .collect()
+}
+
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     let mut cursor = StreamCursor::default();
     for event in events {
@@ -163,6 +173,7 @@ pub async fn load_session_snapshot_windowed(
         audit,
         cursor,
         accounting,
+        subagent_updates: subagent_updates(&delegation_updates),
         delegation_updates,
         user_prompts: Some(prompts),
         history: None,
@@ -275,6 +286,7 @@ async fn windowed_snapshot(
         audit,
         cursor: pass.cursor,
         accounting: pass.accounting,
+        subagent_updates: subagent_updates(&delegation_updates),
         delegation_updates,
         user_prompts: Some(prompts),
         history: Some(read.history),

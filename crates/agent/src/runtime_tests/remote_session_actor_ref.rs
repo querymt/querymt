@@ -983,6 +983,210 @@ mod session_actor_ref_remote_tests {
         assert_eq!(counts.get("second"), Some(&1), "{counts:?}");
     }
 
+    /// A delegated child hosted on another mesh node is announced to the
+    /// parent's client before any of its events reach that client, even when
+    /// the child's events are relayed to the root node before the fork event.
+    ///
+    /// Node B hosts the child session, node A (the root, where the client is
+    /// connected) is attached to it through the event relay. B's events for
+    /// the child reach A's fanout before A emits the fork event; the client
+    /// must see the `subagent_update` before any traffic of the child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_member_child_is_announced() {
+        use crate::acp::websocket::{ConnectionEventState, WsServerState, spawn_event_forwarders};
+        use crate::session::backend::StorageBackend as _;
+        use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt_agent_core::events::AgentEventKind;
+        use std::sync::{Arc, Mutex};
+
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat_with_tools()
+            .returning(|_, _| Ok(MockChatResponse::text_only("child reply").into()));
+        mock.expect_chat()
+            .returning(|_| Ok(MockChatResponse::text_only("child reply").into()));
+        let host = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let (session_ref, _local, _host_config, child_id) =
+            remote_session_ref_for_config("e11d", host.config.clone(), "mock-model").await;
+
+        // The root node knows the child only as a remote session; attaching
+        // subscribes it to the host's event relay.
+        let mesh = get_test_mesh().await;
+        let root = TestAgent::new().await;
+        root.handle.set_mesh(mesh.clone());
+        let node_id = mesh.peer_id().to_string();
+        root.storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: child_id.clone(),
+                node_id: node_id.clone(),
+                peer_label: "e11d".to_string(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+                fork_origin: None,
+            })
+            .await
+            .expect("save remote bookmark");
+        let attach_params = serde_json::json!({"node_id": node_id, "session_id": child_id});
+        {
+            use crate::send_agent::SendAgent as _;
+            root.handle
+                .ext_method(crate::acp::protocol::ExtRequest::new(
+                    "querymt/remote/attachSession",
+                    Arc::from(serde_json::value::to_raw_value(&attach_params).unwrap()),
+                ))
+                .await
+                .expect("the root attaches to the remote child");
+        }
+
+        // The client's connection on the root: it owns the parent only.
+        let parent_id = "parent-remote".to_string();
+        let state = WsServerState::new(root.handle.clone());
+        state.session_owners.lock().await.insert(
+            parent_id.clone(),
+            std::collections::HashSet::from(["conn".to_string()]),
+        );
+        let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<String>(1024);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let delivery = crate::acp::delivery::ConnectionDelivery::new(
+            Some(root.handle.config.event_sink.journal().clone()),
+            cancel.clone(),
+        );
+        let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+        translator.set_capabilities(crate::acp::shared::AcpSessionUpdateCapabilities {
+            subagents: true,
+            ..Default::default()
+        });
+        spawn_event_forwarders(
+            state.clone(),
+            ConnectionEventState {
+                conn_id: "conn".to_string(),
+                tx: wire_tx,
+                pending_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                forwarded_elicitations: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+                request_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection_cancel: cancel.clone(),
+                delivery,
+            },
+            Arc::new(Mutex::new(translator)),
+        );
+
+        let prompt = |text: &str| {
+            crate::acp::protocol::PromptRequest::new(
+                child_id.clone(),
+                vec![crate::acp::protocol::ContentBlock::from(text)],
+            )
+        };
+        let mut root_events = root.handle.config.subscribe_events();
+
+        // 1. The child runs on its host and its events reach the root before
+        //    the root has emitted the fork event.
+        session_ref
+            .prompt_agent(prompt("before the fork"))
+            .await
+            .expect("first child prompt");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = root_events.recv().await.expect("root fanout stays open");
+                if event.session_id() == child_id {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the child's events are relayed to the root node");
+
+        // 2. The delegation is requested and forks the child.
+        let delegation = Delegation {
+            isolation: Default::default(),
+            id: 0,
+            public_id: "delegation-remote".into(),
+            session_id: 0,
+            task_id: None,
+            target_agent_id: "coder".into(),
+            objective: "fix the build".into(),
+            objective_hash: querymt_agent_core::hash::RapidHash::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+        };
+        let sink = &root.handle.config.event_sink;
+        sink.emit_durable(
+            &parent_id,
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: Some("call-remote".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        sink.emit_durable(
+            &parent_id,
+            AgentEventKind::SessionForked {
+                parent_session_id: parent_id.clone(),
+                child_session_id: child_id.clone(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::ProgressEntry,
+                fork_point_ref: "delegation-remote".into(),
+                instructions: None,
+                selected_model_id: Some("mock-model".into()),
+                selected_provider_node_id: Some(node_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 3. The child keeps working after it was announced.
+        session_ref
+            .prompt_agent(prompt("after the fork"))
+            .await
+            .expect("second child prompt");
+
+        let mut wire: Vec<serde_json::Value> = Vec::new();
+        while let Ok(Some(raw)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1500), wire_rx.recv()).await
+        {
+            wire.push(serde_json::from_str(&raw).expect("json-rpc"));
+        }
+        cancel.cancel();
+
+        let announced = wire
+            .iter()
+            .position(|message| {
+                message["method"] == "session/update"
+                    && message["params"]["sessionId"] == parent_id
+                    && message["params"]["update"]["sessionUpdate"] == "subagent_update"
+                    && message["params"]["update"]["sessionId"] == child_id
+            })
+            .unwrap_or_else(|| panic!("the child is announced on the parent session: {wire:#?}"));
+        let first_child_traffic = wire
+            .iter()
+            .position(|message| {
+                message["method"] == "session/update" && message["params"]["sessionId"] == child_id
+            })
+            .unwrap_or_else(|| panic!("the child's events reach the client: {wire:#?}"));
+        assert!(
+            announced < first_child_traffic,
+            "announced at {announced}, first child event at {first_child_traffic}: {wire:#?}"
+        );
+        let announcement = &wire[announced]["params"]["update"];
+        assert_eq!(announcement["title"], "coder");
+        assert_eq!(announcement["description"], "fix the build");
+        assert_eq!(announcement["_meta"]["querymt"]["providerNodeId"], node_id);
+    }
+
     // ── E.13 ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]

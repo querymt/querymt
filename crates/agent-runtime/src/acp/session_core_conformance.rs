@@ -34,6 +34,7 @@ pub(super) fn gpui_capabilities() -> AcpSessionUpdateCapabilities {
         plan_operations: true,
         notices: true,
         compaction: true,
+        ..Default::default()
     }
 }
 
