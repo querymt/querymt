@@ -50,14 +50,26 @@ impl LocalAgentHandle {
             serde_json::Map::from_iter([("parent_session_id".into(), parent_session_id.into())]),
         );
         let prepared = self.session_materializer.prepare_new_session(req).await?;
-        let session_ref = self
-            .registry_lock()
-            .await
-            .register_prepared_session(&prepared)
-            .await;
-        self.session_materializer
+        if let Err(error) = self
+            .session_materializer
             .finalize_session_with_index(&prepared, false)
-            .await?;
+            .await
+        {
+            prepared.actor_ref.kill();
+            if let Err(rollback_error) = self
+                .config
+                .provider
+                .history_store()
+                .delete_session(&prepared.session_id)
+                .await
+            {
+                tracing::warn!(session_id = %prepared.session_id, %rollback_error, "failed to roll back unregistered delegation session");
+            }
+            return Err(error);
+        }
+        let session_ref =
+            crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)
+                .await;
         Ok((prepared.session_id, session_ref))
     }
 
@@ -91,14 +103,13 @@ impl LocalAgentHandle {
                 .prepare_new_session_with_workspace(req, Some(workspace)),
         )
         .await?;
-        let session_ref = self
-            .registry_lock()
-            .await
-            .register_prepared_session(&prepared)
-            .await;
-        self.session_materializer
-            .finalize_session(&prepared)
-            .await?;
+        if let Err(error) = self.session_materializer.finalize_session(&prepared).await {
+            prepared.actor_ref.kill();
+            return Err(error);
+        }
+        let session_ref =
+            crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)
+                .await;
         Ok((prepared.session_id, session_ref))
     }
 
@@ -117,6 +128,45 @@ mod tests {
         NodeId,
         peer_access::{GrantStore, PeerGrant, PeerGrantKey},
     };
+
+    #[tokio::test]
+    async fn confined_child_finalization_failure_rolls_back_before_export() {
+        let (plugins, _plugins_dir) = crate::test_utils::empty_plugin_registry().unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let path = storage_dir.path().join("test.sqlite");
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(path.clone())
+                .await
+                .unwrap(),
+        );
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::new(
+                Arc::new(plugins),
+                storage,
+                querymt::LLMParams::new().provider("mock").model("mock"),
+            )
+            .build(),
+        );
+        let parent = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let handle = LocalAgentHandle::from_config(config);
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_child_setup BEFORE INSERT ON event_journal BEGIN SELECT RAISE(ABORT, 'fixture journal failure'); END;").unwrap();
+        let result = handle
+            .create_confined_delegation_session(parent.public_id, &TurnAuthority::Local)
+            .await;
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.err().unwrap()).contains("fixture journal failure"));
+        assert!(handle.registry.lock().await.is_empty());
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
 
     #[tokio::test]
     async fn confined_child_creates_no_workspace_and_refuses_stale_origin() {
@@ -153,7 +203,7 @@ mod tests {
         ));
         let (env, _) = fixture.turn().await;
         let parent = env.session_id;
-        let (child, _) = fixture
+        let (child, session_ref) = fixture
             .handle
             .create_confined_delegation_session(parent.clone(), &authority)
             .await
@@ -167,6 +217,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.cwd.is_none());
+        let SessionActorRef::Local(actor) = session_ref else {
+            panic!("expected local child");
+        };
+        actor.kill();
+        actor.wait_for_shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if fixture.handle.registry.lock().await.get(&child).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confined child evicted on shutdown");
         store
             .replace_grant(&key, initial.revision, PeerGrant::None)
             .await

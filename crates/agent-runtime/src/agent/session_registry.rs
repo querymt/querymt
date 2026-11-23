@@ -283,6 +283,128 @@ pub(crate) struct RemoteAttachmentPrepareContext {
     pub(crate) disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
 }
 
+#[cfg(feature = "remote")]
+#[derive(Default)]
+pub(crate) struct SessionExports {
+    mesh: Option<crate::agent::remote::MeshHandle>,
+    actors: HashMap<String, LocalSessionExport>,
+}
+
+#[cfg(feature = "remote")]
+struct LocalSessionExport {
+    actor: kameo::actor::WeakActorRef<SessionActor>,
+    routed: bool,
+    scopes: std::collections::HashSet<MeshScopeId>,
+}
+
+#[cfg(feature = "remote")]
+impl LocalSessionExport {
+    fn publish(
+        &mut self,
+        mesh: &crate::agent::remote::MeshHandle,
+        id: &str,
+        scopes: &[MeshScopeId],
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let Some(actor) = self.actor.upgrade().filter(|actor| actor.is_alive()) else {
+            return Vec::new();
+        };
+        if !self.routed {
+            crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor);
+            self.routed = true;
+        }
+        scopes
+            .iter()
+            .filter_map(|scope| {
+                let name = scoped_session(scope, id);
+                // Leaving a scope can remove its callbacks without changing the export runtime.
+                (self.scopes.insert(scope.clone()) || !mesh.has_re_register_fn(&name))
+                    .then(|| mesh.start_register_actor(actor.clone(), name))
+            })
+            .collect()
+    }
+
+    fn withdraw(&mut self, mesh: &crate::agent::remote::MeshHandle, id: &str) {
+        if self.routed
+            && let Some(router) = mesh.inbound_router()
+        {
+            router.withdraw_actor(self.actor.id());
+        }
+        self.routed = false;
+        for scope in self.scopes.drain() {
+            mesh.deregister_actor(&scoped_session(&scope, id));
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl SessionExports {
+    pub(crate) fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
+        if let Some(old) = &self.mesh
+            && mesh
+                .as_ref()
+                .is_none_or(|new| !old.same_export_runtime(new))
+        {
+            for (id, export) in &mut self.actors {
+                export.withdraw(old, id);
+            }
+        }
+        self.mesh = mesh;
+        if let Some(mesh) = &self.mesh {
+            let scopes = MeshRuntimeHandle::from(mesh.clone()).active_scopes();
+            for (id, export) in &mut self.actors {
+                export.publish(mesh, id, &scopes);
+            }
+        }
+    }
+
+    pub(crate) fn publish_scope(
+        &mut self,
+        runtime: &MeshRuntimeHandle,
+        scope: &MeshScopeId,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let Some(mesh) = self
+            .mesh
+            .as_ref()
+            .filter(|mesh| mesh.same_export_runtime(runtime.as_mesh_handle()))
+        else {
+            return Vec::new();
+        };
+        self.actors
+            .iter_mut()
+            .flat_map(|(id, export)| export.publish(mesh, id, std::slice::from_ref(scope)))
+            .collect()
+    }
+
+    fn insert(&mut self, id: &str, actor: &ActorRef<SessionActor>) {
+        if self
+            .actors
+            .get(id)
+            .is_some_and(|export| export.actor.id() == actor.id())
+        {
+            return;
+        }
+        self.remove(id);
+        let mut export = LocalSessionExport {
+            actor: actor.downgrade(),
+            routed: false,
+            scopes: Default::default(),
+        };
+        if let Some(mesh) = &self.mesh {
+            let scopes = MeshRuntimeHandle::from(mesh.clone()).active_scopes();
+            export.publish(mesh, id, &scopes);
+        }
+        self.actors.insert(id.to_owned(), export);
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(mut export) = self.actors.remove(id)
+            && let Some(mesh) = &self.mesh
+        {
+            export.withdraw(mesh, id);
+        }
+    }
+}
+
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
     sessions: HashMap<String, SessionActorRef>,
@@ -291,10 +413,9 @@ pub struct SessionRegistry {
     /// event forwarding and remote actor links together.
     #[cfg(feature = "remote")]
     relay_actor_ids: HashMap<String, RemoteRelayRegistration>,
-    /// Mesh handle for cleaning up re-registration closures when sessions
-    /// are removed (Phase 4 of Bug 1 fix).
+    // Export ownership is synchronous; it never holds a lock over DHT I/O.
     #[cfg(feature = "remote")]
-    mesh: Option<crate::agent::remote::MeshHandle>,
+    pub(crate) exports: Arc<parking_lot::Mutex<SessionExports>>,
     #[cfg(feature = "remote")]
     remote_disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
 }
@@ -308,7 +429,7 @@ impl SessionRegistry {
             #[cfg(feature = "remote")]
             relay_actor_ids: HashMap::new(),
             #[cfg(feature = "remote")]
-            mesh: None,
+            exports: Default::default(),
             #[cfg(feature = "remote")]
             remote_disconnect_tx: None,
         }
@@ -338,23 +459,7 @@ impl SessionRegistry {
     /// and attach to them.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
-        // Register all existing local sessions in each active scope so remote peers can attach.
-        if let Some(ref mesh) = mesh {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            let scopes = runtime.active_scopes();
-            for (session_id, actor_ref) in &self.local_actor_refs {
-                crate::agent::remote::remote_actor_impl::register_session_routes(mesh, actor_ref);
-                for scope in &scopes {
-                    let dht_name = scoped_session(scope, session_id);
-                    let runtime = runtime.clone();
-                    let actor_ref = actor_ref.clone();
-                    tokio::spawn(async move {
-                        runtime.register_actor(actor_ref, dht_name).await;
-                    });
-                }
-            }
-        }
-        self.mesh = mesh;
+        self.exports.lock().set_mesh(mesh);
     }
 
     /// Merge MCP servers from the agent config with any client-supplied servers.
@@ -414,8 +519,8 @@ impl SessionRegistry {
     /// Accepts anything that converts into a `SessionActorRef`, including
     /// a bare `ActorRef<SessionActor>` (via the `From` impl).
     pub fn insert(&mut self, session_id: String, actor_ref: impl Into<SessionActorRef>) {
-        self.sessions.insert(session_id.clone(), actor_ref.into());
-        self.local_actor_refs.remove(&session_id);
+        self.remove(&session_id);
+        self.sessions.insert(session_id, actor_ref.into());
     }
 
     /// Register a prepared session actor into the registry (fast, map-only operation).
@@ -443,11 +548,15 @@ impl SessionRegistry {
         prepared: &crate::agent::session_materializer::PreparedSession,
     ) -> SessionActorRef {
         let session_ref = SessionActorRef::from(prepared.actor_ref.clone());
-
-        // Insert into in-memory maps (microseconds)
-        // This is the ONLY operation that should happen under the lock.
-        // Bridge setup is deferred to finalize_session to avoid holding
-        // the lock during an async actor call.
+        #[cfg(feature = "remote")]
+        {
+            let mut exports = self.exports.lock();
+            if prepared.register_in_dht {
+                exports.insert(&prepared.session_id, &prepared.actor_ref);
+            } else {
+                exports.remove(&prepared.session_id);
+            }
+        }
         self.sessions
             .insert(prepared.session_id.clone(), session_ref.clone());
         self.local_actor_refs
@@ -513,7 +622,7 @@ impl SessionRegistry {
         #[cfg(feature = "remote")]
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
             .with_mesh(if options.attach_mesh_handle {
-                self.mesh.clone()
+                self.exports.lock().mesh.clone()
             } else {
                 None
             });
@@ -528,18 +637,12 @@ impl SessionRegistry {
             .insert(session_id.clone(), actor_ref.clone());
 
         #[cfg(feature = "remote")]
-        if options.register_in_dht
-            && let Some(ref mesh) = self.mesh
         {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor_ref);
-            for scope in runtime.active_scopes() {
-                let dht_name = scoped_session(&scope, &session_id);
-                let runtime = runtime.clone();
-                let actor_ref = actor_ref.clone();
-                tokio::spawn(async move {
-                    runtime.register_actor(actor_ref, dht_name).await;
-                });
+            let mut exports = self.exports.lock();
+            if options.register_in_dht {
+                exports.insert(&session_id, &actor_ref);
+            } else {
+                exports.remove(&session_id);
             }
         }
 
@@ -552,18 +655,7 @@ impl SessionRegistry {
     /// (if available) so dead actors don't accumulate (Phase 4 of Bug 1 fix).
     pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
         #[cfg(feature = "remote")]
-        if let Some(ref mesh) = self.mesh {
-            if let (Some(router), Some(actor)) =
-                (mesh.inbound_router(), self.local_actor_refs.get(session_id))
-            {
-                router.withdraw_actor(actor.id());
-            }
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            for scope in runtime.active_scopes() {
-                let session_dht_name = scoped_session(&scope, session_id);
-                runtime.deregister_actor(&session_dht_name);
-            }
-        }
+        self.exports.lock().remove(session_id);
         self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
     }
@@ -1085,13 +1177,23 @@ pub(crate) async fn prepare_remote_attachment(
         .as_ref()
         .is_none_or(|mesh| mesh.inbound_router().is_none())
     {
-        if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
-            abort_prepared_remote_attachment(candidate).await;
-            return Err(AgentError::RemoteActor(format!(
-                "failed to link event relay to remote session: {error}"
-            )));
+        match candidate.relay_ref.link_remote(&remote_ref).await {
+            Ok(()) => candidate.linked = true,
+            // The guarded ingress refuses generic links even after accepting
+            // a peer-bound subscription. The coordinator checks that same
+            // session's liveness before installing the attachment.
+            Err(kameo::error::RemoteSendError::BadActorType) => {
+                // Kameo inserts the local link before asking the owner.
+                // Unlink removes it locally even if the owner also refuses Unlink.
+                let _ = candidate.relay_ref.unlink_remote(&remote_ref).await;
+            }
+            Err(error) => {
+                abort_prepared_remote_attachment(candidate).await;
+                return Err(AgentError::RemoteActor(format!(
+                    "failed to link event relay to remote session: {error}"
+                )));
+            }
         }
-        candidate.linked = true;
     }
     // Do not publish the relay until the owner accepts its subscription.
     if let Some(mesh) = candidate.mesh.clone() {
@@ -1344,6 +1446,82 @@ mod tests {
     }
 
     // ── Unit tests ───────────────────────────────────────────────────────────
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn registry_withdraws_current_names_and_late_finalization_cannot_republish() {
+        let f = RegistryFixture::new().await;
+        let handle = crate::agent::LocalAgentHandle::from_config(f.registry.config.clone());
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        let prepared = handle
+            .session_materializer
+            .prepare_new_session(crate::acp::protocol::NewSessionRequest::new(PathBuf::new()))
+            .await
+            .unwrap();
+        let id = &prepared.session_id;
+        let name = scoped_session(&MeshScopeId::lan_default(), id);
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "registry-export-fixture".into(),
+        };
+        let extra = scoped_session(&scope, id);
+        handle.set_mesh(mesh.clone());
+        register_prepared_session(&handle.registry, &prepared).await;
+        assert!(mesh.has_re_register_fn(&name));
+        let mut registry = handle.registry.lock().await;
+        registry.exports.lock().publish_scope(&runtime, &scope);
+        assert!(mesh.has_re_register_fn(&extra));
+        handle.clear_mesh(); // Works even while the registry is contended.
+        assert!(!mesh.has_re_register_fn(&name));
+        assert!(!mesh.has_re_register_fn(&extra));
+        handle.set_mesh(mesh.clone());
+        assert!(mesh.has_re_register_fn(&name));
+        assert!(registry.remove_local_if_same_actor(id, prepared.actor_ref.id()));
+        registry.exports.lock().publish_scope(&runtime, &scope);
+        drop(registry);
+        handle
+            .session_materializer
+            .finalize_session(&prepared)
+            .await
+            .unwrap();
+        assert!(!mesh.has_re_register_fn(&name));
+        assert!(!mesh.has_re_register_fn(&extra));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn registry_republishes_existing_session_after_scope_rejoin() {
+        let f = RegistryFixture::new().await;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        let mesh_id = "registry-rejoin-fixture";
+        let scope = MeshScopeId::Iroh {
+            mesh_id: mesh_id.into(),
+        };
+        let state = mesh.mesh_state_store().unwrap();
+        state
+            .write()
+            .upsert_hosted_mesh(mesh_id.into(), None, None)
+            .unwrap();
+
+        let actor = f.spawn_actor();
+        let id = "registry-rejoin-session";
+        let name = scoped_session(&scope, id);
+        let mut exports = f.registry.exports.lock();
+        exports.set_mesh(Some(mesh.clone()));
+        exports.insert(id, &actor);
+        assert!(mesh.has_re_register_fn(&name));
+        assert!(mesh.leave_iroh_scope(mesh_id).unwrap());
+        assert!(!mesh.has_re_register_fn(&name));
+
+        mesh.join_iroh_scope(mesh_id, Vec::new());
+        assert!(mesh.active_scopes().contains(&scope));
+        assert_eq!(exports.publish_scope(&runtime, &scope).len(), 1);
+        assert!(mesh.has_re_register_fn(&name));
+        assert!(exports.publish_scope(&runtime, &scope).is_empty());
+        assert!(mesh.leave_iroh_scope(mesh_id).unwrap());
+        exports.remove(id);
+    }
 
     #[tokio::test]
     async fn stopped_actor_cleanup_does_not_evict_replacement() {

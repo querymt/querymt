@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kameo::actor::ActorId;
+use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use querymt::chat::{ChatCall, ChatProvider, ReasoningEffort};
 use querymt::error::{LLMError, ProviderErrorKind, ProviderFailure};
 use querymt::params::SystemPrompt;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use crate::metered_provider::{MeteredAccess, MeteredProvider};
 use crate::peer_access::quota::{QuotaError, QuotaStore};
-use crate::peer_access::{PeerGrant, PeerGrantState};
+use crate::peer_access::{PeerGrant, PeerGrantState, SharingProtocol};
 use crate::provider_host_actor::validate_item_aware_request;
 use crate::{
     GetProviderCatalog, GetProviderContractInfo, ProviderBuildRequest, ProviderCatalogActor,
@@ -72,45 +72,61 @@ enum SystemInput {
 impl GuardedProvider {
     pub(super) fn install(
         self: Arc<Self>,
-        router: &InboundRouter,
+        router: &Arc<InboundRouter>,
         catalog: ActorId,
-        host: ActorId,
+        host_id: ActorId,
+        host: &ActorRef<ProviderHostActor>,
     ) {
-        macro_rules! register {
-            ($actor:ty, $message:ty, $id:expr, $handle:ident) => {{
+        let service = self.clone();
+        router.register_checked::<ProviderCatalogActor, GetProviderCatalog, _, _, _, _>(
+            catalog,
+            InboundDelivery::Ask,
+            InboundAccess::Providers,
+            move |peer, msg| {
+                let service = service.clone();
+                async move { service.catalog(&peer, msg).await }
+            },
+            Some(catalog_reply_allowed),
+        );
+        let host = host.downgrade();
+        macro_rules! host_route {
+            ($message:ty, $delivery:ident, $access:ident, |$service:ident, $peer:ident, $msg:ident| $call:expr) => {{
                 let service = self.clone();
-                router.register::<$actor, $message, _, _, _, _>(
-                    $id,
-                    InboundDelivery::Ask,
-                    InboundAccess::Providers,
-                    move |peer, msg| {
-                        let service = service.clone();
-                        async move { service.$handle(&peer, msg).await }
+                let host = host.clone();
+                router.register::<ProviderHostActor, $message, _, _, _, _>(
+                    host_id,
+                    InboundDelivery::$delivery,
+                    InboundAccess::$access,
+                    move |$peer, $msg| {
+                        let $service = service.clone();
+                        let host = host.clone();
+                        async move { while_host_alive(&host, $call).await }
                     },
                 );
             }};
         }
-        register!(ProviderCatalogActor, GetProviderCatalog, catalog, catalog);
-        register!(ProviderHostActor, GetProviderContractInfo, host, contract);
-        let service = self.clone();
-        router.register::<ProviderHostActor, ProviderChatRequest, _, _, _, _>(
-            host,
-            InboundDelivery::LegacyAsk,
-            InboundAccess::Full,
-            move |peer, msg| {
-                let service = service.clone();
-                async move { service.chat(&peer, msg, Uuid::now_v7()).await }
-            },
+        host_route!(
+            GetProviderContractInfo,
+            Ask,
+            Providers,
+            |service, peer, msg| service.contract(&peer, msg)
         );
-        router.register::<ProviderHostActor, MeteredChat, _, _, _, _>(
-            host,
-            InboundDelivery::V1Ask,
-            InboundAccess::Providers,
-            move |peer, msg| {
-                let service = self.clone();
-                async move { service.chat(&peer, msg.request, msg.request_id).await }
-            },
+        host_route!(
+            ProviderChatRequest,
+            LegacyAsk,
+            Full,
+            |service, peer, msg| service.chat(&peer, msg, Uuid::now_v7())
         );
+        host_route!(MeteredChat, V1Ask, Providers, |service, peer, msg| service
+            .chat(&peer, msg.request, msg.request_id));
+
+        let router = Arc::downgrade(router);
+        tokio::spawn(async move {
+            host.wait_for_shutdown().await;
+            if let Some(router) = router.upgrade() {
+                router.withdraw_actor(host_id);
+            }
+        });
     }
 
     async fn grant(&self, peer: &PeerRequest) -> Result<PeerGrantState, RemoteProviderHostError> {
@@ -141,12 +157,14 @@ impl GuardedProvider {
             .map_err(|error| error.to_string())?
             .grant;
         let mut snapshot = self.catalog.snapshot();
-        snapshot
-            .providers
-            .retain(|entry| match entry.model.as_deref() {
-                Some(model) => grant.allows_model(peer.protocol(), &entry.provider, model),
-                None => grant == PeerGrant::Full,
-            });
+        snapshot.providers.retain(|entry| {
+            catalog_entry_allowed(
+                &grant,
+                peer.protocol(),
+                &entry.provider,
+                entry.model.as_deref(),
+            )
+        });
         // Discovery of provider sharing is not evidence of session or shell access.
         snapshot.node.capabilities.clear();
         Ok(snapshot)
@@ -239,9 +257,49 @@ impl GuardedProvider {
             result = self.backend.prepare_chat(request, call) => result?,
         };
         Ok(MeteredProvider::direct(
-            provider, access, estimate, request_id,
+            provider,
+            access,
+            estimate,
+            request_id,
+            peer.clone(),
         ))
     }
+}
+
+async fn while_host_alive<R>(
+    host: &WeakActorRef<ProviderHostActor>,
+    operation: impl std::future::Future<Output = Result<R, RemoteProviderHostError>>,
+) -> Result<R, RemoteProviderHostError> {
+    let stopped = || RemoteProviderHostError::Internal("provider host stopped".into());
+    let alive = || host.upgrade().is_some_and(|host| host.is_alive());
+    if !alive() {
+        return Err(stopped());
+    }
+    tokio::select! {
+        biased;
+        _ = host.wait_for_shutdown() => Err(stopped()),
+        result = operation => if alive() { result } else { Err(stopped()) },
+    }
+}
+
+fn catalog_entry_allowed(
+    grant: &PeerGrant,
+    protocol: SharingProtocol,
+    provider: &str,
+    model: Option<&str>,
+) -> bool {
+    match model {
+        Some(model) => grant.allows_model(protocol, provider, model),
+        None => *grant == PeerGrant::Full,
+    }
+}
+
+fn catalog_reply_allowed(reply: &[u8], grant: &PeerGrant, protocol: SharingProtocol) -> bool {
+    rmp_serde::from_slice::<ProviderCatalogSnapshot>(reply).is_ok_and(|snapshot| {
+        snapshot.providers.iter().all(|entry| {
+            catalog_entry_allowed(grant, protocol, &entry.provider, entry.model.as_deref())
+        })
+    })
 }
 
 pub(crate) fn policy_error(error: LLMError) -> RemoteProviderHostError {

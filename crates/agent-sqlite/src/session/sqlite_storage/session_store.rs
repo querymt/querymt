@@ -251,6 +251,18 @@ fn map_task_lifecycle_error(error: SessionError) -> SessionError {
     }
 }
 
+fn encode_peer_session_origin(
+    origin: querymt_agent_core::session::domain_schedule::ScheduleOrigin,
+) -> SessionResult<String> {
+    use querymt_agent_core::session::domain_schedule::ScheduleOrigin;
+    if !matches!(origin, ScheduleOrigin::Peer { .. }) {
+        return Err(SessionError::InvalidOperation(
+            "authenticated peer origin required".into(),
+        ));
+    }
+    serde_json::to_string(&origin).map_err(|err| SessionError::InvalidOperation(err.to_string()))
+}
+
 #[async_trait]
 impl SessionStore for SqliteStorage {
     async fn create_session(
@@ -845,8 +857,46 @@ impl SessionStore for SqliteStorage {
         intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
     ) -> SessionResult<Session> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
-        repo.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, intent)
+        repo.create_session_with_isolation_intent(
+            name,
+            cwd,
+            parent_session_id,
+            fork_origin,
+            intent,
+            None,
+        )
+        .await
+    }
+
+    async fn create_peer_session(
+        &self,
+        origin: querymt_agent_core::session::domain_schedule::ScheduleOrigin,
+    ) -> SessionResult<Session> {
+        let origin = encode_peer_session_origin(origin)?;
+        SqliteSessionRepository::new(self.conn.clone())
+            .create_session_with_isolation_intent(None, None, None, None, None, Some(origin))
             .await
+    }
+
+    async fn peer_session_origin(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<querymt_agent_core::session::domain_schedule::ScheduleOrigin>> {
+        let session_id = session_id.to_owned();
+        let json: Option<String> = self
+            .run_blocking(move |conn| {
+                conn.query_row(
+                    "SELECT peer_origin_json FROM sessions WHERE public_id = ?",
+                    [session_id],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        json.map(|origin| {
+            serde_json::from_str(&origin)
+                .map_err(|err| SessionError::InvalidOperation(err.to_string()))
+        })
+        .transpose()
     }
 
     async fn fork_session(
@@ -915,13 +965,15 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
-    async fn fork_session_with_isolation_intent(
+    async fn fork_session_with_context(
         &self,
         source_session_id: &str,
         target_message_id: &str,
         fork_origin: ForkOrigin,
         intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
+        peer: Option<querymt_agent_core::session::domain_schedule::ScheduleOrigin>,
     ) -> SessionResult<String> {
+        let peer_origin_json = peer.map(encode_peer_session_origin).transpose()?;
         let intent_json = intent
             .map(|intent| serde_json::to_string(&intent))
             .transpose()
@@ -938,6 +990,11 @@ impl SessionStore for SqliteStorage {
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
 
+            // A restricted fork point must belong to the source conversation.
+            if peer_origin_json.is_some() {
+                tx.query_row("SELECT id FROM messages WHERE id = ? AND session_id = ?", params![target_message_internal_id, source_session_internal_id], |_| Ok(()))?;
+            }
+
             // 1. Create New Session with UUID v7 public_id
             let new_session_public_id = Uuid::now_v7().to_string();
             let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
@@ -952,12 +1009,13 @@ impl SessionStore for SqliteStorage {
                 .optional()?
                 .unwrap_or((None, None));
 
+            let cwd = if peer_origin_json.is_some() { None } else { parent_cwd.as_deref() };
             tx.execute(
-                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, peer_origin_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_session_public_id.clone(),
                     "Fork of session", // Temporary name
-                    parent_cwd,
+                    cwd,
                     now.clone(),
                     now,
                     parent_llm_config_id,
@@ -965,6 +1023,7 @@ impl SessionStore for SqliteStorage {
                     fork_origin.to_string(),
                     ForkPointType::MessageIndex.to_string(),
                     target_message_internal_id,
+                    peer_origin_json,
                 ],
             )?;
 

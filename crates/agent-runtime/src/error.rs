@@ -364,12 +364,7 @@ impl AgentError {
         use querymt_remote::request_timeout::SharingAskError;
 
         match error {
-            SharingAskError::Actor(error) => {
-                match querymt_remote::classify_remote_send_error(error) {
-                    Ok(failure) => Self::from_transport_failure(failure),
-                    Err(error) => error,
-                }
-            }
+            SharingAskError::Actor(error) => Self::from_remote_send(error),
             SharingAskError::Sharing(SharingCallError::Rejected(
                 SharingRejection::Denied | SharingRejection::Changed,
             )) => Self::MeshAccessDenied,
@@ -377,6 +372,17 @@ impl AgentError {
                 Self::from_sharing_ask(SharingAskError::Actor(error.into()))
             }
             SharingAskError::Sharing(error) => Self::RemoteActor(error.to_string()),
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn from_remote_send(error: kameo::error::RemoteSendError<Self>) -> Self {
+        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
+            return Self::MeshAccessDenied;
+        }
+        match querymt_remote::classify_remote_send_error(error) {
+            Ok(failure) => Self::from_transport_failure(failure),
+            Err(error) => error,
         }
     }
 

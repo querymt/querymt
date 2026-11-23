@@ -110,6 +110,45 @@ fn key(host: PeerId, peer: PeerId) -> PeerGrantKey {
 }
 
 #[tokio::test]
+async fn session_handler_receives_policy_watch_started_at_admission() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(1, host);
+    let store = Arc::new(TestStore::default());
+    let key = key(host, peer);
+    let revision = store
+        .replace_grant(&key, Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap()
+        .revision;
+    let router = InboundRouter::new(host, store.clone());
+    router.register::<FixtureActor, Echo, _, (), _, _>(
+        actor,
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        move |origin, _| {
+            let store = store.clone();
+            let key = key.clone();
+            async move {
+                // An uninterrupted grant should stay authorized; the handler
+                // still needs to observe changes before it took ownership.
+                store
+                    .replace_grant(&key, revision, PeerGrant::Full)
+                    .await
+                    .unwrap();
+                let mut changes = origin.take_policy_changes().unwrap();
+                assert!(matches!(changes.try_recv(), Ok(change) if change.key == key));
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(
+        router.handle_v1(peer, request(actor, peer)).await,
+        Ok(SwarmResponse::Ask(Ok(_)))
+    ));
+}
+
+#[tokio::test]
 async fn legacy_router_requires_transport_bound_full_grant() {
     let host = PeerId::random();
     let allowed = PeerId::random();
@@ -141,10 +180,11 @@ async fn legacy_router_requires_transport_bound_full_grant() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        router.ask(allowed, request(actor, allowed)).await,
-        Err(RemoteSendError::DeserializeMessage(_))
-    ));
+    let denied = router
+        .ask(allowed, request(actor, allowed))
+        .await
+        .unwrap_err();
+    assert!(super::super::is_legacy_access_denial(&denied));
     let full = store
         .replace_grant(&allowed_key, custom.revision, PeerGrant::Full)
         .await
@@ -173,10 +213,15 @@ async fn legacy_router_requires_transport_bound_full_grant() {
         SwarmResponse::Link(Err(RemoteSendError::BadActorType))
     ));
     store.unavailable.store(true, Ordering::Relaxed);
+    let unavailable = router
+        .ask(allowed, request(actor, allowed))
+        .await
+        .unwrap_err();
     assert!(matches!(
-        router.ask(allowed, request(actor, allowed)).await,
-        Err(RemoteSendError::DeserializeMessage(_))
+        unavailable,
+        RemoteSendError::DeserializeMessage(_)
     ));
+    assert!(!super::super::is_legacy_access_denial(&unavailable));
     store.unavailable.store(false, Ordering::Relaxed);
     store
         .replace_grant(&allowed_key, full.revision, PeerGrant::None)
@@ -305,6 +350,44 @@ async fn provider_relay_requires_expected_host_and_active_request_without_revers
     assert!(
         matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "legacy data")
     );
+
+    let ask = |request_id: &str| {
+        let SwarmRequest::Tell {
+            actor_id,
+            actor_remote_id,
+            message_remote_id,
+            payload,
+            ..
+        } = relay(request_id, "V1 data")
+        else {
+            unreachable!()
+        };
+        SwarmRequest::Ask {
+            actor_id,
+            actor_remote_id,
+            message_remote_id,
+            payload,
+            mailbox_timeout: None,
+            reply_timeout: None,
+            immediate: false,
+        }
+    };
+    assert!(matches!(
+        ingress.handle_v1(PeerId::random(), ask("active")).await,
+        Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+    ));
+    assert!(matches!(
+        ingress.handle_v1(host, ask("missing")).await,
+        Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+    ));
+    assert!(rx.try_recv().is_err());
+    assert!(matches!(
+        ingress.handle_v1(host, ask("active")).await,
+        Ok(SwarmResponse::Ask(Ok(_)))
+    ));
+    assert!(
+        matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "V1 data")
+    );
 }
 
 #[tokio::test]
@@ -411,6 +494,48 @@ async fn legacy_only_ask_and_mixed_delivery_preserve_their_envelopes() {
 }
 
 #[tokio::test]
+async fn router_refuses_reply_if_admission_policy_history_is_incomplete() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(17, host);
+    let store = Arc::new(TestStore::default());
+    store
+        .replace_grant(&key(host, peer), Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap();
+    let router = InboundRouter::new(host, store.clone());
+    router.register::<FixtureActor, Echo, _, String, _, _>(
+        actor,
+        InboundDelivery::V1Ask,
+        InboundAccess::Full,
+        move |origin, _| {
+            let store = store.clone();
+            async move {
+                // Unrelated grants suffice to make the history incomplete;
+                // this request itself remains allowed by the current snapshot.
+                for _ in 0..9 {
+                    store
+                        .replace_grant(&key(host, PeerId::random()), Uuid::nil(), PeerGrant::Full)
+                        .await
+                        .unwrap();
+                }
+                let mut history = origin.take_policy_changes().unwrap();
+                assert!(matches!(
+                    history.try_recv(),
+                    Err(broadcast::error::TryRecvError::Lagged(_))
+                ));
+                assert!(origin.take_policy_changes().is_none());
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(
+        router.handle_v1(peer, request(actor, peer)).await,
+        Err(SharingRejection::Changed)
+    ));
+}
+
+#[tokio::test]
 async fn legacy_router_suppresses_reply_after_grant_changes() {
     let host = PeerId::random();
     let peer = PeerId::random();
@@ -454,10 +579,9 @@ async fn legacy_router_suppresses_reply_after_grant_changes() {
             .await
             .unwrap();
         finish.notify_one();
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(RemoteSendError::SerializeReply(_))
-        ));
+        let changed = task.await.unwrap().unwrap_err();
+        assert!(matches!(changed, RemoteSendError::SerializeReply(_)));
+        assert!(super::super::is_legacy_access_denial(&changed));
     })
     .await
     .unwrap();

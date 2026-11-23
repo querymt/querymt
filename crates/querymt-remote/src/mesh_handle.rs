@@ -267,6 +267,19 @@ impl MeshHandle {
     ) where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
+        let _ = self.start_register_actor(actor_ref, name).await;
+    }
+
+    /// Install the registration before returning, then publish in the background.
+    /// Owners can serialize this call with deregistration without awaiting DHT I/O.
+    pub fn start_register_actor<A>(
+        &self,
+        actor_ref: kameo::actor::ActorRef<A>,
+        name: impl Into<String>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
         let name = name.into();
         let re_register = {
             let mut states = self.registration_states.lock();
@@ -321,9 +334,22 @@ impl MeshHandle {
             callbacks.insert(name, register.clone());
             register
         };
-        // Let publication finish its compensating withdrawal even if an
-        // attachment deadline cancels the caller while Kameo is publishing.
-        let _ = tokio::spawn(re_register()).await;
+        // Keep the actor alive for initial publication, without making the
+        // long-lived re-registration callback own it.
+        tokio::spawn(async move {
+            let _keep_alive = actor_ref;
+            re_register().await;
+        })
+    }
+
+    /// Whether these handles use the same local registration owner.
+    pub fn same_export_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registration_states, &other.registration_states)
+            && match (self.inbound_router(), other.inbound_router()) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub async fn lookup_actor<A>(
@@ -1063,6 +1089,35 @@ mod tests {
         let (_dir, mesh, _events_rx, _swarm_cmd_rx) =
             test_mesh_with_stores(MeshTransportMode::Iroh);
         assert_eq!(mesh.active_scopes(), Vec::<MeshScopeId>::new());
+    }
+
+    #[tokio::test]
+    async fn initial_publication_owns_the_last_actor_reference() {
+        use crate::ProviderHostActor;
+        use crate::provider_host_actor::tests::{RecordingBackend, init_local_actor_swarm};
+        use kameo::actor::Spawn;
+
+        init_local_actor_swarm();
+        let (_dir, mesh, _, _) = test_mesh_with_stores(MeshTransportMode::Lan);
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: Default::default(),
+        })));
+        let id = actor.id();
+        let weak = actor.downgrade();
+        let publication = mesh.start_register_actor(actor, "owned-publication-fixture");
+        assert!(
+            weak.upgrade().is_some(),
+            "publication dropped the last reference"
+        );
+        publication.await.unwrap();
+        assert_eq!(
+            mesh.lookup_actor_no_retry::<ProviderHostActor>("owned-publication-fixture")
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            id,
+        );
     }
 
     #[test]

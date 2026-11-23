@@ -44,15 +44,14 @@ impl AnthropicStreamParser {
         }
     }
 
-    /// Usage for the terminal: the overlaid final value when `message_delta`
-    /// reported usage, otherwise the start usage (output count withheld).
+    /// Only report authoritative totals at the terminal. Start usage remains
+    /// available in metadata even when the final counters did not arrive.
     pub(crate) fn terminal_usage(&self) -> Option<Usage> {
-        let usage = self.usage.clone()?;
-        Some(if self.final_usage {
-            Usage::from(usage)
-        } else {
-            usage.into_start_usage()
-        })
+        self.usage
+            .as_ref()
+            .filter(|usage| self.final_usage && usage.input_tokens.is_some())
+            .cloned()
+            .map(Usage::from)
     }
 }
 
@@ -145,6 +144,7 @@ impl ChatStreamParser for AnthropicStreamParser {
                     }
                     "message_delta" => {
                         if let Some(usage) = stream_resp.usage {
+                            self.final_usage |= usage.output_tokens.is_some();
                             // Overlay onto the start event so fields this delta
                             // omits (input, cache) keep their start values.
                             self.usage = Some(match self.usage.take() {
@@ -154,7 +154,6 @@ impl ChatStreamParser for AnthropicStreamParser {
                                 }
                                 None => usage,
                             });
-                            self.final_usage = true;
                         }
 
                         if let Some(delta) = stream_resp.delta

@@ -366,6 +366,66 @@ mod remote_paths {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_proxy_lists_visible_files_without_a_warm_index() {
+        let host = *get_test_mesh().await.peer_id();
+        let peer = libp2p::PeerId::random();
+        let fixture = AgentConfigFixture::new().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let cwd = workspace.path().to_owned();
+        std::fs::create_dir(cwd.join("nested")).unwrap();
+        std::fs::write(cwd.join("nested/notes.txt"), "notes").unwrap();
+        std::fs::write(cwd.join(".local-note"), "local note").unwrap();
+        let runtime = SessionRuntime::new(Some(cwd.clone()), HashMap::new(), McpToolState::empty());
+        let actor = SessionActor::spawn(SessionActor::new(
+            fixture.config.clone(),
+            "cold-index".into(),
+            runtime.clone(),
+        ));
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &fixture._tempdir.path().join("mesh_state.json"),
+            )
+            .unwrap(),
+        ));
+        store
+            .replace_grant(
+                &PeerGrantKey {
+                    host: NodeId::from_peer_id(host),
+                    peer: NodeId::from_peer_id(peer),
+                },
+                Uuid::nil(),
+                PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: true,
+                    shell: false,
+                    providers: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let router = InboundRouter::new(host, store);
+        register_file_proxy(&router, &actor);
+        let reply = router
+            .handle_v1(peer, session_ask(actor.id(), &messages::GetFileIndex))
+            .await;
+        let Ok(SwarmResponse::Ask(Ok(bytes))) = reply else {
+            panic!("expected the confined index: {reply:?}")
+        };
+        let response: GetFileIndexResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(response.workspace_root, cwd.display().to_string());
+        assert_eq!(
+            response
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["nested", "nested/notes.txt"]
+        );
+        assert!(runtime.workspace_handle.get().is_none());
+    }
+
     #[tokio::test]
     async fn file_proxy_filters_index_and_rechecks_filesystem_grant() {
         let host = *get_test_mesh().await.peer_id();
@@ -443,6 +503,31 @@ mod remote_paths {
             ));
         }
 
+        assert_selected_line(
+            local
+                .read_remote_file("example.txt".into(), 1, 1)
+                .await
+                .unwrap(),
+        );
+        local.shutdown_with_timeout(TIMEOUT, TIMEOUT).await.unwrap();
+        for request in [index_request(), read_request("example.txt")] {
+            let response = router.handle_v1(peer, request).await;
+            let Ok(SwarmResponse::Ask(Err(kameo::error::RemoteSendError::HandlerError(bytes)))) =
+                response
+            else {
+                panic!("a stopped file actor must return a typed error: {response:?}");
+            };
+            let error: FileProxyError = rmp_serde::from_slice(&bytes).unwrap();
+            let FileProxyError::Transport(failure) = error else {
+                panic!("expected transport typing: {error:?}")
+            };
+            assert_eq!(failure.kind, RemoteTransportFailureKind::ActorUnavailable);
+            assert_eq!(
+                failure.delivery,
+                querymt_remote::DeliveryCertainty::NotDelivered
+            );
+        }
+
         store
             .replace_grant(&key, allowed.revision, grant(false))
             .await
@@ -453,11 +538,5 @@ mod remote_paths {
                 Err(SharingRejection::Denied)
             ));
         }
-        assert_selected_line(
-            local
-                .read_remote_file("example.txt".into(), 1, 1)
-                .await
-                .unwrap(),
-        );
     }
 }

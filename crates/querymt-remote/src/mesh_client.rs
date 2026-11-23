@@ -33,12 +33,67 @@ type StreamRouters =
     RwLock<HashMap<StreamRouterKey, kameo::actor::ActorRef<ProviderStreamRouterActor>>>;
 static STREAM_ROUTER_CACHE: OnceLock<StreamRouters> = OnceLock::new();
 
+fn provider_host_peer(target_locator: &str) -> Result<PeerId, LLMError> {
+    target_locator
+        .rsplit_once("::provider_host::peer::")
+        .and_then(|(_, peer)| peer.parse().ok())
+        .ok_or_else(|| {
+            LLMError::ProviderError(format!("Invalid provider host locator '{target_locator}'"))
+        })
+}
+
+fn require_provider_host_peer(expected: PeerId, resolved: Option<&PeerId>) -> Result<(), LLMError> {
+    if resolved == Some(&expected) {
+        Ok(())
+    } else {
+        Err(LLMError::ProviderError(format!(
+            "Provider host lookup did not resolve to expected peer '{expected}'"
+        )))
+    }
+}
+
+const STALE_PROVIDER_HOST: &str = "mesh_provider_host_unavailable";
+
+fn provider_dispatch_error<E: std::fmt::Display>(
+    error: kameo::error::RemoteSendError<E>,
+) -> Result<LLMError, E> {
+    use kameo::error::RemoteSendError;
+    use querymt::error::{ProviderErrorKind, ProviderFailure};
+    if matches!(
+        error,
+        RemoteSendError::ActorNotRunning | RemoteSendError::UnknownActor { .. }
+    ) {
+        return Ok(
+            ProviderFailure::new(ProviderErrorKind::UnknownPermanent, error.to_string())
+                .with_code(Some(STALE_PROVIDER_HOST.into()))
+                .into(),
+        );
+    }
+    crate::remote_send_error_base(error)
+}
+
+fn is_stale_host_error(error: &LLMError) -> bool {
+    matches!(error, LLMError::ProviderResponseError(failure) if failure.code() == Some(STALE_PROVIDER_HOST))
+}
+
+fn provider_handler_error(handler: crate::RemoteProviderHostError) -> LLMError {
+    let error = LLMError::from_payload(handler.to_payload());
+    match error {
+        LLMError::ProviderResponseError(failure) if failure.code() == Some(STALE_PROVIDER_HOST) => {
+            // Only the actor transport, not a handler that already ran, can
+            // certify that an attempt missed the old host.
+            LLMError::ProviderResponseError(Box::new((*failure).with_code(None)))
+        }
+        error => error,
+    }
+}
+
 fn provider_ask_error(error: SharingAskError<crate::RemoteProviderHostError>) -> LLMError {
     match error {
         SharingAskError::Sharing(error) => sharing_error(error),
-        SharingAskError::Actor(error) => match crate::remote_send_error_base(error) {
+        SharingAskError::Actor(error) => match provider_dispatch_error(error) {
             Ok(error) => error,
-            Err(handler) => LLMError::from_payload(handler.to_payload()),
+            Err(handler) => provider_handler_error(handler),
         },
     }
 }
@@ -63,6 +118,27 @@ fn sharing_error(error: SharingCallError) -> LLMError {
     ProviderFailure::new(kind, error.to_string())
         .with_code(Some(code.into()))
         .into()
+}
+
+fn sharing_probe_error(error: SharingCallError) -> LLMError {
+    use libp2p::request_response::OutboundFailure;
+    use querymt::error::TransportErrorKind;
+
+    let kind = match error {
+        SharingCallError::Transport(OutboundFailure::Timeout) => TransportErrorKind::Timeout,
+        SharingCallError::Transport(OutboundFailure::DialFailure) => {
+            TransportErrorKind::ConnectionRefused
+        }
+        SharingCallError::Transport(OutboundFailure::ConnectionClosed) => {
+            TransportErrorKind::ConnectionClosed
+        }
+        SharingCallError::Transport(OutboundFailure::Io(_)) => TransportErrorKind::Other,
+        _ => return sharing_error(error),
+    };
+    LLMError::Transport {
+        kind,
+        message: error.to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -117,12 +193,14 @@ impl KameoMeshClientTransport {
         &self,
         target_locator: &str,
     ) -> Result<kameo::actor::RemoteActorRef<ProviderHostActor>, LLMError> {
+        let expected_peer = provider_host_peer(target_locator)?;
         if let Some(cached) = Self::provider_host_cache()
             .read()
             .await
             .get(target_locator)
             .cloned()
         {
+            require_provider_host_peer(expected_peer, cached.id().peer_id())?;
             tracing::Span::current().record("cache_hit", true);
             tracing::Span::current().record("found", true);
             tracing::Span::current().record("lookup_ms", 0_u64);
@@ -146,6 +224,10 @@ impl KameoMeshClientTransport {
                     "MeshChatProvider: provider host '{}' not found (is the node online?)",
                     target_locator
                 ))
+            })
+            .and_then(|actor| {
+                require_provider_host_peer(expected_peer, actor.id().peer_id())?;
+                Ok(actor)
             });
         tracing::Span::current().record("lookup_ms", lookup_start.elapsed().as_millis() as u64);
         tracing::Span::current().record("found", result.is_ok());
@@ -186,7 +268,7 @@ impl KameoMeshClientTransport {
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn get_or_create_stream_router(
@@ -241,6 +323,15 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         self.invalidate_cached_provider_host(target_locator).await;
     }
 
+    fn is_stale_host(&self, error: &LLMError) -> bool {
+        is_stale_host_error(error)
+    }
+
+    fn retry_dispatch(&self, error: &LLMError, _fallback: bool) -> bool {
+        // ConnectionClosed does not prove that a request missed its handler.
+        self.is_stale_host(error)
+    }
+
     async fn lookup_host(&self, target_locator: &str) -> Result<Self::HostRef, LLMError> {
         self.lookup_provider_host(target_locator).await
     }
@@ -250,9 +341,17 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, LLMError> {
-        ask_with_sharing(&self.mesh, host, &request, Self::PROVIDER_CONTROL_TIMEOUT)
-            .await
-            .map_err(provider_ask_error)
+        let timeout = Self::PROVIDER_CONTROL_TIMEOUT;
+        with_sharing_protocol(
+            &self.mesh,
+            host.id().peer_id().copied(),
+            timeout,
+            ask_sharing_v1(&self.mesh, host, &request, timeout),
+            async { Ok(crate::ask_remote_with_timeout(host, &request, timeout).await?) },
+        )
+        .await
+        .map_err(sharing_probe_error)?
+        .map_err(provider_ask_error)
     }
 
     async fn prepare_stream_router(
@@ -330,16 +429,16 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                     .reply_timeout(reply_timeout)
                     .send()
                     .await
-                    .map_err(|e| match crate::remote_send_error_base(e) {
+                    .map_err(|e| match provider_dispatch_error(e) {
                         Ok(err) => {
                             crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes)
                         }
-                        Err(handler) => LLMError::from_payload(handler.to_payload()),
+                        Err(handler) => provider_handler_error(handler),
                     })
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn send_stream_request(
@@ -363,14 +462,14 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
                 host.tell(&request).send_ack().await.map_err(|error| {
                     crate::provider_transport::remap_legacy_oversize_eof(
-                        remote_send_error_to_llm_error_no_handler(error),
+                        provider_dispatch_error(error).unwrap_or_else(|never| match never {}),
                         encoded_bytes,
                     )
                 })
             },
         )
         .await
-        .map_err(sharing_error)?
+        .map_err(sharing_probe_error)?
     }
 
     async fn cancel_stream(
@@ -488,10 +587,10 @@ impl MeshChatProvider {
         session_id: &str,
         request_id: Option<&str>,
         reason: Option<&str>,
-    ) {
+    ) -> Result<(), LLMError> {
         self.inner
             .cancel_remote_stream(session_id, request_id, reason)
-            .await;
+            .await
     }
 
     pub async fn get_remote_stream_status(
@@ -549,7 +648,11 @@ impl LLMProvider for MeshChatProvider {}
         found = tracing::field::Empty,
     )
 )]
-pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Option<NodeId> {
+pub async fn find_provider_on_mesh(
+    mesh: &MeshHandle,
+    provider_name: &str,
+    model: &str,
+) -> Option<NodeId> {
     let mut peers_checked: u32 = 0;
     let mut candidates: Vec<(PeerId, NodeId)> = Vec::new();
 
@@ -585,11 +688,9 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
                 }
             };
 
-            if !snapshot
-                .providers
-                .iter()
-                .any(|entry| entry.provider == provider_name)
-            {
+            if !snapshot.providers.iter().any(|entry| {
+                entry.provider == provider_name && entry.model.as_deref() == Some(model)
+            }) {
                 continue;
             }
 
@@ -633,6 +734,12 @@ mod tests {
 
     fn mesh_fixture() -> (MeshHandle, Arc<RouteTable>) {
         init_local_actor_swarm();
+        mesh_fixture_with_commands(mpsc::unbounded_channel().0)
+    }
+
+    fn mesh_fixture_with_commands(
+        commands: mpsc::UnboundedSender<crate::mesh_runtime_support::SwarmCommand>,
+    ) -> (MeshHandle, Arc<RouteTable>) {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let routes = Arc::new(RouteTable::new(Duration::from_secs(60)));
         let mesh = MeshHandle::new(
@@ -645,7 +752,7 @@ mod tests {
             None,
             None,
             MeshTransportMode::Lan,
-            mpsc::unbounded_channel().0,
+            commands,
             Duration::from_secs(5),
         );
         (mesh, routes)
@@ -657,12 +764,12 @@ mod tests {
         let scope = MeshScopeId::lan_default();
         let preferred = PeerId::random();
         let fallback = PeerId::random();
-        let mismatched = PeerId::random();
+        let other_model = PeerId::random();
         let mut catalogs = Vec::new();
-        for (peer, claimed_peer, priority) in [
-            (preferred, preferred, 20),
-            (fallback, fallback, 10),
-            (mismatched, preferred, 30),
+        for (peer, model, priority) in [
+            (preferred, "demo", 20),
+            (fallback, "demo", 10),
+            (other_model, "other", 30),
         ] {
             routes.upsert_addrs(
                 peer,
@@ -672,12 +779,7 @@ mod tests {
                 priority,
             );
             let catalog = ProviderCatalogActor::spawn(ProviderCatalogActor::new(Arc::new(
-                StaticCatalogBackend::provider_model(
-                    claimed_peer.to_string(),
-                    None,
-                    "fixture",
-                    "demo",
-                ),
+                StaticCatalogBackend::provider_model(peer.to_string(), None, "fixture", model),
             )));
             mesh.register_actor(catalog.clone(), scoped_provider_catalog(&scope, &peer))
                 .await;
@@ -685,11 +787,11 @@ mod tests {
         }
 
         assert_eq!(
-            find_provider_on_mesh(&mesh, "fixture").await,
+            find_provider_on_mesh(&mesh, "fixture", "demo").await,
             Some(NodeId::from_peer_id(preferred))
         );
         assert!(
-            find_provider_on_mesh(&mesh, "never-advertised")
+            find_provider_on_mesh(&mesh, "fixture", "never-advertised")
                 .await
                 .is_none()
         );
@@ -697,9 +799,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_chat_only_retries_transport_failure_before_dispatch() {
+        use crate::mesh_ingress::{SharingRequest, SharingResponse};
+        use crate::mesh_runtime_support::SwarmCommand;
+        use kameo::actor::{ActorId, RemoteActorRef};
+        use libp2p::request_response::OutboundFailure;
+
+        init_local_actor_swarm();
+        let peer = PeerId::random();
+        let host: RemoteActorRef<ProviderHostActor> = rmp_serde::from_slice(
+            &rmp_serde::to_vec(&(ActorId::new_with_peer_id(1, peer),)).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut commands) = mpsc::unbounded_channel();
+        let (mut mesh, _) = mesh_fixture_with_commands(tx);
+        mesh.sharing_enabled = true;
+        let transport = KameoMeshClientTransport::new(mesh);
+        let request = crate::ProviderChatRequest {
+            provider: "fixture".into(),
+            model: "demo".into(),
+            messages: vec![],
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        };
+        use kameo::error::RemoteSendError;
+        let actor_error = |error| provider_ask_error(SharingAskError::Actor(error));
+        assert!(transport.retry_dispatch(&actor_error(RemoteSendError::ActorNotRunning), false));
+        assert!(!transport.retry_dispatch(&actor_error(RemoteSendError::ActorStopped), true));
+        assert!(!transport.retry_dispatch(
+            &actor_error(RemoteSendError::UnknownMessage {
+                actor_remote_id: "provider".into(),
+                message_remote_id: "unsupported".into(),
+            }),
+            true
+        ));
+        let timeout = || SharingCallError::Transport(OutboundFailure::Timeout);
+        let ((), ()) = tokio::join!(
+            async {
+                let error = transport
+                    .send_chat_request(&host, &request)
+                    .await
+                    .unwrap_err();
+                assert!(error.is_retryable());
+                let error = transport
+                    .send_chat_request(&host, &request)
+                    .await
+                    .unwrap_err();
+                assert!(!error.is_retryable());
+            },
+            async {
+                for result in [Err(timeout()), Ok(SharingResponse::Supported)] {
+                    let Some(SwarmCommand::Sharing {
+                        request: SharingRequest::Probe,
+                        tx,
+                        ..
+                    }) = commands.recv().await
+                    else {
+                        panic!("expected a probe")
+                    };
+                    tx.send(result).unwrap();
+                }
+                let Some(SwarmCommand::Sharing {
+                    request: SharingRequest::Actor(_),
+                    tx,
+                    ..
+                }) = commands.recv().await
+                else {
+                    panic!("expected a dispatch")
+                };
+                tx.send(Err(timeout())).unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn provider_host_selection_requires_the_locators_peer() {
+        let selected = PeerId::random();
+        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &selected);
+        let expected = provider_host_peer(&locator).unwrap();
+        assert!(require_provider_host_peer(expected, Some(&selected)).is_ok());
+        assert!(require_provider_host_peer(expected, Some(&PeerId::random())).is_err());
+        assert!(require_provider_host_peer(expected, None).is_err());
+    }
+
+    #[tokio::test]
     async fn mesh_chat_uses_the_targets_scope_and_forwards_generation_options() {
         let (mesh, routes) = mesh_fixture();
-        let target = NodeId::from_peer_id(PeerId::random());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: seen.clone(),
+        })));
+        let target = NodeId::from_peer_id(*host.id().peer_id().unwrap());
         let scope = MeshScopeId::Iroh {
             mesh_id: "fixture-mesh".into(),
         };
@@ -710,10 +902,6 @@ mod tests {
             [libp2p::Multiaddr::empty()],
             20,
         );
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let host = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
-            seen: seen.clone(),
-        })));
         let locator = scoped_provider_host(&scope, &target.to_string());
         mesh.register_actor(host.clone(), &locator).await;
 
@@ -762,10 +950,12 @@ mod tests {
     #[tokio::test]
     async fn unregistered_provider_host_error_names_the_lan_locator() {
         let (mesh, _) = mesh_fixture();
-        let provider = MeshChatProvider::new(&mesh, "unregistered-fixture-host", "fixture", "demo");
+        let target = NodeId::from_peer_id(PeerId::random());
+        let provider = MeshChatProvider::from_node_id(&mesh, &target, "fixture", "demo");
+        let locator = scoped_provider_host(&MeshScopeId::lan_default(), &target);
         let error = provider.chat(&ChatCall::new(&[])).await.unwrap_err();
         assert!(
-            matches!(error, LLMError::ProviderError(message) if message.contains("scope::lan::default::provider_host::peer::unregistered-fixture-host"))
+            matches!(error, LLMError::ProviderError(message) if message.contains(&locator) && message.contains("not found"))
         );
     }
 }

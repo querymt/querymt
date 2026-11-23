@@ -193,6 +193,20 @@ impl RemoteSync {
         &self.state
     }
 
+    async fn request_history_chunk(
+        &self,
+        request: GetEventStreamChunk,
+    ) -> Result<crate::agent::messages::EventStreamChunk, crate::error::AgentError> {
+        self.session_ref
+            .get_event_stream_chunk(request)
+            .await
+            .inspect_err(|error| {
+                if matches!(error, crate::error::AgentError::MeshAccessDenied) {
+                    self.state.note_history_denial();
+                }
+            })
+    }
+
     /// Request one chunk, then (under the apply lock) check the epoch, persist
     /// without publishing, and record the covered range.
     ///
@@ -203,7 +217,7 @@ impl RemoteSync {
         req: GetEventStreamChunk,
     ) -> Result<Option<Applied>, crate::error::AgentError> {
         for _ in 0..3 {
-            let chunk = self.session_ref.get_event_stream_chunk(req.clone()).await?;
+            let chunk = self.request_history_chunk(req.clone()).await?;
             self.state.record_request(chunk.events.len());
             let _apply = self.state.lock_apply().await;
             match self.state.check_epoch(chunk.history_epoch).await? {
@@ -340,7 +354,7 @@ impl RemoteSync {
         let mut after = 0;
         let tip = loop {
             let req = chunk_request(Some(after), None, false, MAX_EVENT_STREAM_CHUNK_EVENTS);
-            let chunk = self.session_ref.get_event_stream_chunk(req).await?;
+            let chunk = self.request_history_chunk(req).await?;
             self.state.record_request(chunk.events.len());
             let last = chunk.events.last().map(|e| e.seq);
             let (has_more, latest) = (chunk.has_more, chunk.latest_source_seq);

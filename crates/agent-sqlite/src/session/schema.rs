@@ -39,6 +39,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             fork_point_ref TEXT,
             fork_instructions TEXT,
             provider_node_id TEXT,
+            peer_origin_json TEXT,
             FOREIGN KEY(parent_session_id) REFERENCES sessions(id) ON DELETE SET NULL,
             FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE SET NULL,
             FOREIGN KEY(current_intent_snapshot_id) REFERENCES intent_snapshots(id) ON DELETE SET NULL,

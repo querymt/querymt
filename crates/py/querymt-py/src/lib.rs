@@ -11,12 +11,14 @@ use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySequence};
 use querymt_remote::{
-    LanDiscovery, LanMeshConfig, MeshChatProvider, MeshRuntimeConfig, MeshRuntimeHandle,
-    ModelAllowlistBackend, ProviderShare, RegistryProviderBackend, StaticCatalogBackend,
-    bootstrap_mesh_runtime, find_provider_on_mesh,
+    LanDiscovery, LanMeshConfig, MeshAccessStore, MeshChatProvider, MeshRuntimeConfig,
+    MeshRuntimeHandle, MeshStateStore, ModelAllowlistBackend, ProviderShare,
+    RegistryProviderBackend, StaticCatalogBackend, bootstrap_mesh_runtime,
+    bootstrap_mesh_runtime_with_policy, find_provider_on_mesh,
 };
 use serde_json::{Map, Number, Value};
 use std::future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -275,17 +277,20 @@ impl PyProvider {
 
 #[pymethods]
 impl PyMeshRuntime {
+    /// Start a LAN runtime. Pass a mesh state path to enforce peer grants and quotas.
+    /// Without it, connected peers can use shared providers within the global model allowlist.
     #[staticmethod]
-    #[pyo3(signature = (node_name=None, listen=None, request_timeout_secs=300, stream_reconnect_grace_secs=120))]
+    #[pyo3(signature = (node_name=None, listen=None, request_timeout_secs=300, stream_reconnect_grace_secs=120, *, peer_access_store=None))]
     fn lan<'py>(
         py: Python<'py>,
         node_name: Option<String>,
         listen: Option<String>,
         request_timeout_secs: u64,
         stream_reconnect_grace_secs: u64,
+        peer_access_store: Option<PathBuf>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let runtime = bootstrap_mesh_runtime(&MeshRuntimeConfig {
+            let config = MeshRuntimeConfig {
                 enabled: true,
                 lan: Some(LanMeshConfig {
                     listen: Some(listen.unwrap_or_else(|| "/ip4/0.0.0.0/tcp/0".to_string())),
@@ -302,8 +307,17 @@ impl PyMeshRuntime {
                 node_name,
                 peers: Vec::new(),
                 auto_fallback: false,
-            })
-            .await
+            };
+            let runtime = if let Some(path) = peer_access_store {
+                let owner = tokio::task::spawn_blocking(move || MeshStateStore::shared(&path))
+                    .await
+                    .map_err(into_py_err)?
+                    .map_err(into_py_err)?;
+                bootstrap_mesh_runtime_with_policy(&config, Arc::new(MeshAccessStore::new(owner)))
+                    .await
+            } else {
+                bootstrap_mesh_runtime(&config).await
+            }
             .map_err(into_py_err)?;
             Python::attach(|py| Py::new(py, PyMeshRuntime { inner: runtime }))
         })
@@ -377,9 +391,11 @@ impl PyMeshRuntime {
         let params_json =
             python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let node_id = find_provider_on_mesh(runtime.as_mesh_handle(), &provider)
+            let node_id = find_provider_on_mesh(runtime.as_mesh_handle(), &provider, &model)
                 .await
-                .ok_or_else(|| anyhow!("provider '{}' not found on mesh", provider))
+                .ok_or_else(|| {
+                    anyhow!("provider '{provider}' with model '{model}' not found on mesh")
+                })
                 .map_err(into_py_err)?;
             let provider = Arc::new(
                 MeshChatProvider::from_node_id(
@@ -1243,6 +1259,39 @@ mod tests {
         static INIT: Once = Once::new();
         INIT.call_once(Python::initialize);
         Python::attach(f);
+    }
+
+    #[test]
+    fn lan_rejects_invalid_peer_access_store() {
+        with_python(|py| {
+            let globals = PyDict::new(py);
+            let module = PyModule::new(py, "querymt").unwrap();
+            querymt(py, &module).unwrap();
+            globals.set_item("querymt", module).unwrap();
+            py.run(
+                c"
+import asyncio
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+async def start():
+    with TemporaryDirectory() as tmp:
+        store = Path(tmp) / 'mesh_state.json'
+        store.write_text('not json', encoding='utf-8')
+        try:
+            await querymt.MeshRuntime.lan(peer_access_store=store)
+        except RuntimeError as error:
+            assert 'failed to parse' in str(error), str(error)
+        else:
+            raise AssertionError('invalid peer access store must prevent startup')
+
+asyncio.run(start())
+",
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
     }
 
     #[test]

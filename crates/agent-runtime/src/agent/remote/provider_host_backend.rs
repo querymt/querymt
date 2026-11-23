@@ -226,6 +226,8 @@ mod tests {
 
     struct HttpFixture {
         url: String,
+        supports_max_tokens: bool,
+        key_resolver: Arc<dyn querymt::auth::ApiKeyResolver>,
     }
 
     impl querymt::plugin::LLMProviderFactory for HttpFixture {
@@ -234,12 +236,15 @@ mod tests {
         }
 
         fn config_schema(&self) -> String {
-            r#"{"type":"object","properties":{"model":{},"max_tokens":{}}}"#.into()
+            r#"{"type":"object","properties":{"model":{},"max_tokens":{},"system":{}}}"#.into()
         }
 
-        fn from_config(&self, _: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+        fn from_config(&self, config: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+            let config: serde_json::Value = serde_json::from_str(config)?;
             Ok(Box::new(Self {
                 url: self.url.clone(),
+                supports_max_tokens: config["model"] == "known",
+                key_resolver: self.key_resolver.clone(),
             }))
         }
 
@@ -253,8 +258,15 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for HttpFixture {
+        fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+            let mut caps = querymt::chat::ChatCapabilities::default();
+            caps.options.max_tokens = self.supports_max_tokens;
+            caps
+        }
+
         async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
-            let body = serde_json::to_vec(&call.options)?;
+            let body =
+                serde_json::to_vec(&self.capabilities().options.retain_supported(call.options))?;
             let response = reqwest::Client::builder()
                 .no_proxy()
                 .build()?
@@ -286,7 +298,11 @@ mod tests {
         }
     }
 
-    impl LLMProvider for HttpFixture {}
+    impl LLMProvider for HttpFixture {
+        fn key_resolver(&self) -> Option<&Arc<dyn querymt::auth::ApiKeyResolver>> {
+            Some(&self.key_resolver)
+        }
+    }
 
     #[tokio::test]
     async fn finite_http_chat_reserves_with_known_and_missing_model_metadata() {
@@ -370,7 +386,11 @@ mod tests {
         });
 
         let registry = Arc::new(PluginRegistry::empty());
-        registry.register_static(Arc::new(HttpFixture { url }));
+        registry.register_static(Arc::new(HttpFixture {
+            url,
+            supports_max_tokens: false,
+            key_resolver: Arc::new(querymt::auth::StaticKeyResolver::new("fixture")),
+        }));
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let peer = PeerTurn::test_peer(
             key.clone(),
@@ -378,13 +398,16 @@ mod tests {
             store.clone(),
         );
         let messages = [ChatMessage::user().text("Count this prompt").build()];
-        let call = ChatCall::new(&messages).options(GenerationOptions::NONE.with_max_tokens(100));
+        let call =
+            |cap| ChatCall::new(&messages).options(GenerationOptions::NONE.with_max_tokens(cap));
 
         for (model, fallback, expected_ceiling) in [
             ("known", Some(17), Some(64)),
             ("missing", Some(17), Some(17)),
             ("missing", None, None),
         ] {
+            let supports_override = model == "known";
+            let call = call(if supports_override { 56 } else { 1 });
             let builder = AgentConfigBuilder::new(
                 registry.clone(),
                 storage.clone(),
@@ -401,24 +424,26 @@ mod tests {
             let config = Arc::new(builder.build());
             assert_eq!(config.fallback_context_tokens(), fallback);
             let backend = provider_backend_from_config(config.clone());
-            let params = serde_json::json!({"max_tokens": 8});
+            let params = serde_json::json!({"max_tokens": 32, "system": "Be brief"});
             let request = ProviderBuildRequest {
                 provider_name: "fixture".into(),
                 model: model.into(),
                 params: Some(params.clone()),
             };
             let (_, direct) = backend.prepare_chat(request.clone(), &call).await.unwrap();
-            assert!(direct.prompt_tokens > 0);
+            let prompt = 11; // 5 user text tokens, 4 message framing, 2 configured system.
+            let cap = if supports_override { 56 } else { 32 };
+            assert_eq!(direct.prompt_tokens, prompt);
             assert_eq!(
                 direct.reserved_tokens,
-                expected_ceiling.unwrap_or(direct.prompt_tokens + 100)
+                expected_ceiling.map_or(prompt + cap, |limit| limit.min(prompt + cap))
             );
             if fallback.is_none() {
                 let (_, default_cap) = backend
                     .prepare_chat(request, &ChatCall::new(&messages))
                     .await
                     .unwrap();
-                assert_eq!(default_cap.reserved_tokens, default_cap.prompt_tokens + 8);
+                assert_eq!(default_cap.reserved_tokens, default_cap.prompt_tokens + 32);
             }
 
             let snapshot = config
@@ -436,12 +461,19 @@ mod tests {
                 ("fixture".into(), model.into()),
                 inputs,
             );
+            let basis = querymt_agent_services::accounting::resolve_billing_basis(
+                "fixture",
+                model,
+                hosted.key_resolver().is_some(),
+            );
+            assert_eq!(basis.billing, querymt::providers::BillingClass::Excluded);
+            assert!(basis.pricing.is_none());
             let output = hosted.chat(&call).await.unwrap();
             assert_eq!(output.text().as_deref(), Some("hello"));
             assert_eq!(output.finish_reason, Some(FinishReason::Stop));
             assert_eq!(
                 seen.try_recv().unwrap(),
-                (Some(100), direct.reserved_tokens)
+                (supports_override.then_some(56), direct.reserved_tokens)
             );
             let status = scope_status(store.as_ref(), &key, &scope, now).await;
             assert_eq!(

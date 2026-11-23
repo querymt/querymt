@@ -31,14 +31,7 @@ impl LocalAgentHandle {
     fn map_remote_node_manager_error(
         error: kameo::error::RemoteSendError<crate::error::AgentError>,
     ) -> agent_client_protocol::Error {
-        use crate::error::AgentError;
-
-        match querymt_remote::classify_remote_send_error(error) {
-            Ok(failure) => {
-                agent_client_protocol::Error::from(AgentError::from_transport_failure(failure))
-            }
-            Err(handler_error) => agent_client_protocol::Error::from(handler_error),
-        }
+        crate::error::AgentError::from_remote_send(error).into()
     }
 
     #[cfg(feature = "remote")]
@@ -60,13 +53,16 @@ impl LocalAgentHandle {
         cwd: Option<String>,
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
-        querymt_remote::ask_remote_with_timeout(
+        use crate::error::AgentError;
+        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
+        querymt_remote::request_timeout::ask_with_sharing(
+            &mesh,
             node_manager_ref,
             &crate::agent::remote::CreateRemoteDelegationSession { cwd },
             Self::remote_request_timeout(),
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
+        .map_err(|error| AgentError::from_sharing_ask(error).into())
     }
 
     #[cfg(feature = "remote")]
@@ -534,17 +530,14 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &ForkRemoteSession {
                 source_session_id,
                 message_id,
             },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to

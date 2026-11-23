@@ -13,17 +13,21 @@ use kameo::remote::{
     RemoteActor, RemoteMessage, messaging::SwarmRequest, messaging::SwarmResponse,
 };
 use libp2p::PeerId;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{MeshIngress, SharingRejection};
 use crate::NodeId;
-use crate::peer_access::{GrantStore, PeerGrant, PeerGrantKey, PolicyEffect, SharingProtocol};
+use crate::peer_access::{
+    GrantStore, PeerGrant, PeerGrantKey, PolicyChange, PolicyEffect, SharingProtocol,
+};
+use tokio::sync::broadcast;
 
 #[cfg(test)]
 mod tests;
 
 type AskResult = Result<Vec<u8>, RemoteSendError<Vec<u8>>>;
+type ReplyCheck = fn(&[u8], &PeerGrant, SharingProtocol) -> bool;
 type Handler =
     dyn Fn(PeerRequest, Vec<u8>) -> Pin<Box<dyn Future<Output = AskResult> + Send>> + Send + Sync;
 type RouteKey = (&'static str, &'static str);
@@ -68,6 +72,7 @@ pub struct PeerRequest {
     key: PeerGrantKey,
     protocol: SharingProtocol,
     grant: Option<PeerGrant>,
+    policy_changes: Arc<Mutex<Option<broadcast::Receiver<PolicyChange>>>>,
 }
 
 impl PeerRequest {
@@ -84,6 +89,12 @@ impl PeerRequest {
     /// Request's sharing contract, not a peer's claimed capability.
     pub fn protocol(&self) -> SharingProtocol {
         self.protocol
+    }
+
+    /// Transfer the admission-time policy history to a resource-specific handler.
+    /// Only one consumer can take it, even when this request is cloned.
+    pub fn take_policy_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+        self.policy_changes.lock().take()
     }
 }
 
@@ -131,6 +142,7 @@ struct Route {
     delivery: InboundDelivery,
     access: InboundAccess,
     handler: Box<Handler>,
+    reply_check: Option<ReplyCheck>,
 }
 
 /// Host-bound registry for explicitly supported guarded messages. Unknown routes
@@ -169,6 +181,24 @@ impl InboundRouter {
         F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
+        self.register_checked::<A, M, R, E, F, Fut>(actor_id, delivery, access, handler, None);
+    }
+
+    pub(crate) fn register_checked<A, M, R, E, F, Fut>(
+        &self,
+        actor_id: ActorId,
+        delivery: InboundDelivery,
+        access: InboundAccess,
+        handler: F,
+        reply_check: Option<ReplyCheck>,
+    ) where
+        A: RemoteActor + RemoteMessage<M>,
+        M: DeserializeOwned + Send + 'static,
+        R: Serialize + Send,
+        E: Serialize + Send,
+        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let handler: Box<Handler> = Box::new(move |peer, bytes| {
             let handler = Arc::clone(&handler);
@@ -196,6 +226,7 @@ impl InboundRouter {
                 delivery,
                 access,
                 handler,
+                reply_check,
             }),
         );
     }
@@ -262,30 +293,40 @@ impl InboundRouter {
             return Ok(Err(RemoteSendError::BadActorType));
         }
         let route_key = (actor_remote_id.as_ref(), message_remote_id.as_ref());
-        let Some(route) = self
-            .routes
-            .read()
-            .get(&actor_id)
-            .and_then(|routes| routes.get(&route_key))
-            .filter(|route| route.delivery.accepts(protocol, delivery))
-            .cloned()
-        else {
+        let route = {
+            let routes = self.routes.read();
+            let actor_routes = routes.get(&actor_id);
+            if actor_routes.is_none()
+                && actor_remote_id == <crate::ProviderHostActor as RemoteActor>::REMOTE_ID
+            {
+                return Ok(Err(RemoteSendError::ActorNotRunning));
+            }
+            actor_routes
+                .and_then(|routes| routes.get(&route_key))
+                .filter(|route| route.delivery.accepts(protocol, delivery))
+                .cloned()
+        };
+        let Some(route) = route else {
             return Ok(Err(RemoteSendError::UnknownMessage {
                 actor_remote_id,
                 message_remote_id,
             }));
         };
-        let mut origin = PeerRequest {
-            key: PeerGrantKey {
-                host: NodeId::from_peer_id(self.host),
-                peer: NodeId::from_peer_id(peer),
-            },
-            protocol,
-            grant: None,
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(self.host),
+            peer: NodeId::from_peer_id(peer),
         };
         let changes = (route.access != InboundAccess::Identity)
-            .then(|| self.store.subscribe_changes())
+            .then(|| self.store.subscribe_peer_changes(&key))
             .flatten();
+        let mut origin = PeerRequest {
+            key,
+            protocol,
+            grant: None,
+            policy_changes: Arc::new(Mutex::new(
+                changes.as_ref().map(broadcast::Receiver::resubscribe),
+            )),
+        };
         origin.grant = self.authorize(&origin, route.access).await?;
         let is_current = {
             self.routes
@@ -298,8 +339,18 @@ impl InboundRouter {
             return Ok(Err(RemoteSendError::ActorNotRunning));
         }
         let result = (route.handler)(origin.clone(), payload).await;
-        if origin.grant.is_some() && self.authorize(&origin, route.access).await.is_err() {
-            return Err(SharingRejection::Changed);
+        let permits_reply = |grant: &PeerGrant| match (route.reply_check, &result) {
+            (Some(check), Ok(reply)) => check(reply, grant, protocol),
+            _ => true,
+        };
+        if origin.grant.is_some() {
+            let grant = self
+                .authorize(&origin, route.access)
+                .await
+                .map_err(|_| SharingRejection::Changed)?;
+            if grant.as_ref().is_some_and(|grant| !permits_reply(grant)) {
+                return Err(SharingRejection::Changed);
+            }
         }
         // Restoring a grant must not resume delivery of a revoked request.
         if let Some(mut changes) = changes {
@@ -308,12 +359,15 @@ impl InboundRouter {
                 match changes.try_recv() {
                     Ok(change)
                         if change.key == origin.key
-                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol)) =>
+                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol) || !permits_reply(grant)) =>
                     {
                         return Err(SharingRejection::Changed);
                     }
-                    Ok(_) | Err(TryRecvError::Lagged(_)) => {}
-                    Err(_) => break,
+                    Ok(_) => {}
+                    Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => {
+                        return Err(SharingRejection::Changed);
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
             }
         }

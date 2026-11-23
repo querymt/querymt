@@ -133,8 +133,8 @@ mod provider_routing_integration_tests {
         let test_id = Uuid::now_v7().to_string();
         let f = ProviderRoutingFixture::new(&test_id).await;
 
-        let node_name = format!("alpha-{}", test_id);
-        let provider = MeshChatProvider::new(f.mesh, &node_name, "nonexistent", "no-model");
+        let node_id = f.mesh.peer_id().to_string();
+        let provider = MeshChatProvider::new(f.mesh, &node_id, "nonexistent", "no-model");
 
         let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         assert!(

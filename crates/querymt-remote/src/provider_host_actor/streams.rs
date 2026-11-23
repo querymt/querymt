@@ -26,7 +26,7 @@ use crate::{
 
 pub(super) type StreamRequest = ProviderStreamRequest<RemoteActorRef<ProviderStreamRouterActor>>;
 pub(super) type LiveStreams = Arc<Mutex<HashMap<StreamKey, Arc<ActiveStream>>>>;
-const RELAY_TIMEOUT: Duration = Duration::from_secs(3);
+use super::STREAM_RELAY_TIMEOUT as RELAY_TIMEOUT;
 const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_BATCH_SIZE: usize = 16;
 
@@ -154,35 +154,35 @@ impl ActiveStream {
         Ok(())
     }
 
-    async fn interrupted(&self) -> LLMError {
-        let lease = async {
-            loop {
-                let deadline = self.progress.lock().lease_expires;
-                if Instant::now() >= deadline {
-                    if !self.key.owner.guarded() {
-                        let mut progress = self.progress.lock();
-                        // Renew and expiry must agree on which deadline won.
-                        if Instant::now() < progress.lease_expires {
-                            continue;
-                        }
-                        progress.phase = ProviderStreamPhase::LeaseExpired;
-                        progress.last_error = Some("stream lease expired".into());
+    async fn lease_expired(&self) -> LLMError {
+        loop {
+            let deadline = {
+                // Observe and decide expiration under the same lock as renewal.
+                let mut progress = self.progress.lock();
+                if Instant::now() >= progress.lease_expires {
+                    if self.key.owner.guarded() {
                         return transport(
-                            TransportErrorKind::ConnectionClosed,
-                            "provider stream cancelled",
+                            TransportErrorKind::Timeout,
+                            "provider stream lease or deadline expired",
                         );
                     }
+                    progress.phase = ProviderStreamPhase::LeaseExpired;
+                    progress.last_error = Some("stream lease expired".into());
                     return transport(
-                        TransportErrorKind::Timeout,
-                        "provider stream lease or deadline expired",
+                        TransportErrorKind::ConnectionClosed,
+                        "provider stream cancelled",
                     );
                 }
-                tokio::select! {
-                    _ = time::sleep_until(deadline) => {},
-                    _ = self.lease_changed.notified() => {},
-                }
+                progress.lease_expires
+            };
+            tokio::select! {
+                _ = time::sleep_until(deadline) => {},
+                _ = self.lease_changed.notified() => {},
             }
-        };
+        }
+    }
+
+    async fn interrupted(&self) -> LLMError {
         let revoked = async {
             #[cfg(feature = "kameo-mesh")]
             if let Some(access) = &self.access {
@@ -194,7 +194,7 @@ impl ActiveStream {
             biased;
             _ = self.cancel.cancelled() => transport(TransportErrorKind::ConnectionClosed, "provider stream cancelled"),
             error = revoked => error,
-            error = lease => error,
+            error = self.lease_expired() => error,
         }
     }
 }
@@ -345,11 +345,16 @@ impl Relay {
                 self.forward(stream, &mut delivery).await.map_err(|error| (error, false))
             } => result,
         };
-        // If an interruption dropped the upstream read, the quota guard still
-        // owns the accounting. Wait for it before sending the terminal.
+        // The quota guard owns accounting even after the relay lease expires.
+        // Wait for confirmation only while the lease still permits the relay.
         let outcome = if let Some(settled) = settled {
-            match (outcome, settled.await) {
-                (Ok(_), Err(error)) => Err((host_error(&crate_quota_error(error)), false)),
+            let result = tokio::select! {
+                biased;
+                result = settled => result.map_err(crate_quota_error),
+                error = self.active.lease_expired() => Err(error),
+            };
+            match (outcome, result) {
+                (Ok(_), Err(error)) => Err((host_error(&error), false)),
                 (outcome, _) => outcome,
             }
         } else {
@@ -382,37 +387,22 @@ impl Relay {
         };
         if self.guarded() {
             self.unregister();
-        }
-        let delivered = if self.guarded() {
-            matches!(
-                time::timeout(
-                    RELAY_TIMEOUT.saturating_add(self.grace),
-                    self.deliver(&mut delivery, terminal, sequenced)
-                )
-                .await,
-                Ok(Ok(()))
-            )
+            if delivery.grace_expired
+                || delivery
+                    .disconnected_at
+                    .is_some_and(|at| at.elapsed() >= self.grace)
+            {
+                // Grace may expire while accounting settles. Do not restart
+                // replay; only the scoped error gets one bounded send.
+                if !sequenced {
+                    let _ = self.send(self.frame(terminal, None), true).await;
+                }
+                return;
+            }
         } else if delivery.grace_expired {
-            false
-        } else {
-            self.deliver(&mut delivery, terminal, sequenced)
-                .await
-                .is_ok()
-        };
-        if !delivered && let Err(error) = self.active.authorize().await {
-            // Denials must pass a held gap without leaking data from the binding.
-            let _ = self
-                .send(
-                    self.frame(
-                        StreamRelayMessage::ProviderError {
-                            error: error.to_payload(),
-                        },
-                        None,
-                    ),
-                    true,
-                )
-                .await;
+            return;
         }
+        let _ = self.deliver(&mut delivery, terminal, sequenced).await;
     }
 
     async fn forward(
@@ -515,28 +505,69 @@ impl Relay {
         seq: Option<u64>,
         message: &StreamRelayMessage,
     ) -> Result<(), RemoteProviderHostError> {
-        let started = Instant::now();
+        let mut authorization_error = None;
         loop {
+            let remaining = delivery
+                .disconnected_at
+                .map(|at| self.grace.saturating_sub(at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                delivery.grace_expired = true;
+                if !self.guarded() {
+                    self.active.progress.lock().phase = ProviderStreamPhase::GraceExpired;
+                }
+                return Err(host_error(&transport(
+                    TransportErrorKind::Timeout,
+                    "provider stream reconnect grace expired",
+                )));
+            }
             let connected = self.active.progress.lock().connected;
             let mut ready = connected;
             if !connected {
                 let notice = StreamRelayMessage::TransportReconnected {
                     buffered_chunks: if self.guarded() {
-                        usize::from(seq.is_some())
+                        usize::from(seq.is_some() && authorization_error.is_none())
                     } else {
                         delivery.queue.replayable_count()
                     },
                 };
-                if self.send(self.frame(notice, None), true).await.is_ok() {
+                if self
+                    .send_with_grace(delivery, self.frame(notice, None), true)
+                    .await
+                    .is_ok()
+                {
                     delivery.acknowledged();
                     ready = true;
                 }
             }
             if ready {
                 // The final batch is sent after the forwarder's revocation select ends.
-                if self.guarded() && crate::relay_message_is_terminal(message) && seq.is_some() {
-                    self.active.authorize().await?;
+                if self.guarded()
+                    && crate::relay_message_is_terminal(message)
+                    && seq.is_some()
+                    && authorization_error.is_none()
+                {
+                    let budget = delivery.disconnected_at.map_or(RELAY_TIMEOUT, |at| {
+                        RELAY_TIMEOUT.min(self.grace.saturating_sub(at.elapsed()))
+                    });
+                    let result = time::timeout(budget, self.active.authorize())
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(host_error(&transport(
+                                TransportErrorKind::Timeout,
+                                "provider stream authorization timed out",
+                            )))
+                        });
+                    if let Err(error) = result {
+                        // Latch the first failure. Retrying delivery must never
+                        // replay the protected terminal, even if policy recovers.
+                        authorization_error = Some(StreamRelayMessage::ProviderError {
+                            error: error.to_payload(),
+                        });
+                    }
                 }
+                let (seq, message) = authorization_error
+                    .as_ref()
+                    .map_or((seq, message), |error| (None, error));
                 let ack = should_ack_relay_message(
                     message,
                     delivery.unacked,
@@ -544,7 +575,10 @@ impl Relay {
                     8,
                     Duration::from_millis(40),
                 );
-                match self.send(self.frame(message.clone(), seq), ack).await {
+                match self
+                    .send_with_grace(delivery, self.frame(message.clone(), seq), ack)
+                    .await
+                {
                     Ok(()) => {
                         if ack
                             || !matches!(
@@ -587,22 +621,10 @@ impl Relay {
             }
             self.active.progress.lock().connected = false;
             let disconnected = *delivery.disconnected_at.get_or_insert_with(Instant::now);
-            let grace_start = if self.guarded() {
-                started
-            } else {
-                disconnected
-            };
-            if grace_start.elapsed() >= self.grace {
-                delivery.grace_expired = true;
-                if !self.guarded() {
-                    self.active.progress.lock().phase = ProviderStreamPhase::GraceExpired;
-                }
-                return Err(host_error(&transport(
-                    TransportErrorKind::Timeout,
-                    "provider stream reconnect grace expired",
-                )));
-            }
-            time::sleep(Duration::from_millis(250)).await;
+            time::sleep(
+                Duration::from_millis(250).min(self.grace.saturating_sub(disconnected.elapsed())),
+            )
+            .await;
         }
     }
 
@@ -612,6 +634,26 @@ impl Relay {
             message,
             seq,
         }
+    }
+
+    async fn send_with_grace(
+        &self,
+        delivery: &Delivery,
+        frame: RoutedStreamRelayMessage,
+        ack: bool,
+    ) -> Result<(), String> {
+        if self.guarded()
+            && let Some(at) = delivery.disconnected_at
+        {
+            let remaining = self.grace.saturating_sub(at.elapsed());
+            if remaining.is_zero() {
+                return Err("provider stream reconnect grace expired".into());
+            }
+            return time::timeout(remaining, self.send(frame, ack))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        self.send(frame, ack).await
     }
 
     async fn send(&self, frame: RoutedStreamRelayMessage, ack: bool) -> Result<(), String> {

@@ -187,7 +187,7 @@ impl LocalAgentHandle {
         }
         let window = parsed.load_window.unwrap_or_default().clamped();
 
-        let read = match source.bookmark.as_ref() {
+        let (read, remote_deadline) = match source.bookmark.as_ref() {
             #[cfg(feature = "remote")]
             Some(bookmark) => {
                 self.read_remote_history_page(
@@ -195,35 +195,41 @@ impl LocalAgentHandle {
                 )
                 .await?
             }
-            _ => read_window(
-                source.journal.as_ref(),
-                session_id,
-                source.node(),
-                Some(position),
-                epoch,
-                &window,
-            )
-            .await
-            .map_err(|error| internal(session_id, error))?,
+            _ => (
+                read_window(
+                    source.journal.as_ref(),
+                    session_id,
+                    source.node(),
+                    Some(position),
+                    epoch,
+                    &window,
+                )
+                .await
+                .map_err(|error| internal(session_id, error))?,
+                None::<tokio::time::Instant>,
+            ),
         };
         // A rewrite while the range was being transferred invalidates it.
         if self.history_epoch_of(session_id, &source).await? != token_epoch {
             return Err(history_changed(session_id));
         }
         #[cfg(feature = "remote")]
-        let user_prompts = match source.bookmark.as_ref() {
-            Some(_) => Some(
+        let user_prompts = match remote_deadline {
+            Some(deadline) if tokio::time::Instant::now() < deadline => Some(
                 self.remote_prompt_records_for(
                     session_id,
                     &read.events,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(10)),
                 )
                 .await?,
             ),
-            None => None,
+            _ => None,
         };
         #[cfg(not(feature = "remote"))]
-        let user_prompts = None;
+        let user_prompts = {
+            let _ = remote_deadline;
+            None
+        };
         ext_json_response(&SessionHistoryResponse {
             events: read.events,
             history: read.history,
@@ -243,12 +249,16 @@ impl LocalAgentHandle {
         position: i64,
         epoch: u64,
         window: &LoadWindow,
-    ) -> Result<crate::session::history_window::WindowRead, Error> {
+    ) -> Result<
+        (
+            crate::session::history_window::WindowRead,
+            Option<tokio::time::Instant>,
+        ),
+        Error,
+    > {
         use crate::agent::remote::event_backfill::WINDOW_CHUNK_EVENTS;
-        let sync = self.remote_history_sync(session_id, bookmark).await?;
+        let (sync, deadline) = self.remote_history_sync(session_id, bookmark).await?;
         let state = sync.state().clone();
-        let deadline =
-            tokio::time::Instant::now() + super::model_registry::remote_transfer_budget();
         let mut span = WINDOW_CHUNK_EVENTS as i64;
         loop {
             let read = read_window(
@@ -268,13 +278,17 @@ impl LocalAgentHandle {
                 read.events.first().map_or(position, |event| event.seq)
             };
             if end < 1 || needed_start > end || state.is_covered(needed_start, end) {
-                return Ok(read);
+                if state.history_denied() {
+                    return Err(crate::error::AgentError::MeshAccessDenied.into());
+                }
+                return Ok((read, Some(deadline)));
             }
             let start = (position - span).max(1);
             let fetched = tokio::time::timeout_at(deadline, sync.ensure_covered(start, end)).await;
             match fetched {
                 Ok(Ok(())) => {}
                 Ok(Err(crate::error::AgentError::MeshAccessDenied)) => {
+                    state.note_history_denial();
                     return Err(crate::error::AgentError::MeshAccessDenied.into());
                 }
                 Ok(Err(error)) => {
@@ -300,7 +314,13 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
         bookmark: &RemoteSessionBookmark,
-    ) -> Result<crate::agent::remote::event_backfill::RemoteSync, Error> {
+    ) -> Result<
+        (
+            crate::agent::remote::event_backfill::RemoteSync,
+            tokio::time::Instant,
+        ),
+        Error,
+    > {
         use super::remote_connect::RemoteConnectReason;
         let connected = self
             .ensure_remote_session_connected(
@@ -310,19 +330,20 @@ impl LocalAgentHandle {
             )
             .await
             .map_err(|error| error.to_acp_error())?;
-        tokio::time::timeout(
-            super::model_registry::remote_transfer_budget(),
-            connected.session_ref.check_history_access(),
-        )
-        .await
-        .map_err(|_| transfer_failed(session_id, "history authorization timed out".into()))??;
-        Ok(crate::agent::remote::event_backfill::RemoteSync::new(
+        let sync = crate::agent::remote::event_backfill::RemoteSync::new(
             self.config.event_sink.clone(),
-            connected.session_ref,
+            connected.session_ref.clone(),
             session_id,
             &bookmark.node_id,
             &bookmark.peer_label,
-        ))
+        );
+        let deadline = authorize_before_history_transfer(
+            session_id,
+            super::model_registry::remote_transfer_budget(),
+            Self::authorize_remote_history(sync.state(), &connected.session_ref),
+        )
+        .await?;
+        Ok((sync, deadline))
     }
 
     /// Make a remote session's whole history local (tool calls may sit
@@ -333,14 +354,12 @@ impl LocalAgentHandle {
         session_id: &str,
         bookmark: &RemoteSessionBookmark,
     ) -> Result<(), Error> {
-        let sync = self.remote_history_sync(session_id, bookmark).await?;
+        let (sync, deadline) = self.remote_history_sync(session_id, bookmark).await?;
         let state = sync.state().clone();
         state
             .hydrate()
             .await
             .map_err(|error| internal(session_id, error))?;
-        let deadline =
-            tokio::time::Instant::now() + super::model_registry::remote_transfer_budget();
         let work = async {
             if state.tip() == 0 && !state.has_data() {
                 sync.open(false).await?;
@@ -352,8 +371,10 @@ impl LocalAgentHandle {
             Ok::<(), crate::error::AgentError>(())
         };
         match tokio::time::timeout_at(deadline, work).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) if !state.history_denied() => Ok(()),
+            Ok(Ok(())) => Err(crate::error::AgentError::MeshAccessDenied.into()),
             Ok(Err(crate::error::AgentError::MeshAccessDenied)) => {
+                state.note_history_denial();
                 Err(crate::error::AgentError::MeshAccessDenied.into())
             }
             Ok(Err(error)) => Err(transfer_failed(session_id, error.to_string())),
@@ -403,6 +424,40 @@ impl LocalAgentHandle {
             content,
         })
     }
+}
+
+#[cfg(feature = "remote")]
+async fn authorize_before_history_transfer(
+    session_id: &str,
+    budget: std::time::Duration,
+    authorization: impl Future<Output = Result<(), crate::error::AgentError>>,
+) -> Result<tokio::time::Instant, Error> {
+    let deadline = tokio::time::Instant::now() + budget;
+    tokio::time::timeout_at(deadline, authorization)
+        .await
+        .map_err(|_| transfer_failed(session_id, "history authorization timed out".into()))??;
+    Ok(deadline)
+}
+
+#[cfg(all(test, feature = "remote"))]
+#[tokio::test(start_paused = true)]
+async fn history_transfer_deadline_includes_authorization_time() {
+    use std::time::Duration;
+    use tokio::time::{Instant, sleep, timeout_at};
+
+    let start = Instant::now();
+    let deadline = authorize_before_history_transfer("session", Duration::from_secs(10), async {
+        sleep(Duration::from_secs(6)).await;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        timeout_at(deadline, sleep(Duration::from_secs(5)))
+            .await
+            .is_err()
+    );
+    assert_eq!(Instant::now(), start + Duration::from_secs(10));
 }
 
 #[cfg(feature = "remote")]

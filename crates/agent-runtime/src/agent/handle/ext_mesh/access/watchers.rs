@@ -1,10 +1,10 @@
-//! Catalog and quota usage invalidations for peer access views.
+//! Catalog, quota usage, and availability invalidations for peer access views.
 
 use std::sync::Arc;
 
 use kameo::actor::ActorRef;
 use querymt_remote::{
-    MeshHandle, NodeId,
+    MeshEvent, MeshHandle, NodeId,
     peer_access::{PeerGrant, PeerGrantKey, SharingProtocol, quota::QuotaStore},
 };
 use tokio::sync::broadcast;
@@ -23,6 +23,17 @@ pub(super) fn spawn(
     notifications: &broadcast::Sender<ExtNotification>,
     mesh: &MeshHandle,
 ) {
+    tokio::spawn({
+        let events = mesh.subscribe_peer_events();
+        let actor = actor.downgrade();
+        let notifications = notifications.clone();
+        async move {
+            tokio::select! {
+                () = actor.wait_for_shutdown() => {},
+                () = watch_availability(events, notifications) => {},
+            }
+        }
+    });
     let mut catalog_updates = inventory.subscribe_updates();
     let mut previous_catalog = local_catalog(inventory);
     tokio::spawn({
@@ -105,6 +116,24 @@ pub(super) fn spawn(
     }
 }
 
+async fn watch_availability(
+    mut events: broadcast::Receiver<MeshEvent>,
+    notifications: broadcast::Sender<ExtNotification>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(MeshEvent::Discovered(peer) | MeshEvent::Expired(peer)) => notify(
+                &notifications,
+                &NodeId::from_peer_id(peer),
+                "incoming",
+                PeerAccessInvalidated::Availability,
+            ),
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 fn peer_catalog_changed(grant: &PeerGrant, previous: &Catalog, current: &Catalog) -> bool {
     previous.iter().chain(current).any(|(provider, _)| {
         let before = previous.get(provider);
@@ -124,6 +153,36 @@ fn peer_catalog_changed(grant: &PeerGrant, previous: &Catalog, current: &Catalog
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn availability_hints_track_peer_discovery_and_expiry() {
+        let (events, rx) = broadcast::channel(4);
+        let (notifications, mut view) = broadcast::channel(4);
+        let peer = libp2p::PeerId::random();
+        events.send(MeshEvent::Discovered(peer)).unwrap();
+        events.send(MeshEvent::Expired(peer)).unwrap();
+        drop(events);
+        watch_availability(rx, notifications).await;
+
+        let expected = serde_json::json!({
+            "version": 1,
+            "peer_id": peer.to_string(),
+            "direction": "incoming",
+            "reason": "availability",
+        });
+        for _ in 0..2 {
+            let hint = view.try_recv().unwrap();
+            assert_eq!(hint.method.as_ref(), "querymt/mesh/peerAccessChanged");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(hint.params.get()).unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            view.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+    }
 
     #[test]
     fn catalog_hints_only_disclose_changes_visible_to_the_recipient() {

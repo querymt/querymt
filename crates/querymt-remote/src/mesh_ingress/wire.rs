@@ -1,6 +1,7 @@
 //! Grant-aware request/response protocol. It never negotiates the legacy protocol.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use kameo::remote::messaging::{SwarmRequest, SwarmResponse};
 use libp2p::request_response::{self as rpc, ProtocolSupport};
@@ -27,6 +28,18 @@ pub enum SharingRejection {
     Busy,
     #[error("mesh access changed before reply")]
     Changed,
+}
+
+/// Recognize the two access refusals encoded by guarded owners on the
+/// legacy Kameo wire. Match only the exact variant and protocol text, not
+/// arbitrary serialization errors or handler messages.
+pub fn is_legacy_access_denial<E>(error: &kameo::error::RemoteSendError<E>) -> bool {
+    use kameo::error::RemoteSendError;
+    match error {
+        RemoteSendError::DeserializeMessage(message) => message == "mesh access denied",
+        RemoteSendError::SerializeReply(message) => message == "mesh access changed before reply",
+        _ => false,
+    }
 }
 
 /// Failure of an outbound grant-aware exchange.
@@ -104,6 +117,18 @@ impl InboundProtocol for Sharing {
 
     fn overloaded(_: Self::ActorRequest) -> SharingResponse {
         SharingResponse::Actor(Err(SharingRejection::Busy))
+    }
+
+    fn dispatch_budget(request: &Self::ActorRequest, wire_budget: Duration) -> Duration {
+        // V1 callers advertise their whole exchange budget as the reply timeout.
+        // A peer can shorten, but never extend, the host's wire budget.
+        match request.as_ref() {
+            SwarmRequest::Ask {
+                reply_timeout: Some(timeout),
+                ..
+            } => wire_budget.min(*timeout),
+            _ => wire_budget,
+        }
     }
 
     fn outbound_result(

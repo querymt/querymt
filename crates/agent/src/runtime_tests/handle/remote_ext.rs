@@ -1396,19 +1396,27 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     assert_eq!(reattached["config_options"][0]["currentValue"], "review");
 
     // A fork keeps its source profile even after the owner's active default changes.
-    let forked = node_manager
-        .ask(crate::agent::remote::ForkRemoteSession {
-            source_session_id: created.session_id.clone(),
-            message_id: history_before.last().unwrap().id.clone(),
-        })
-        .await
-        .expect("fork in the source runtime");
-    let fork_load = remote
+    let forked = f
         .handle
-        .load_session(crate::acp::protocol::LoadSessionRequest::new(
-            forked.session_id.clone(),
+        .fork_session(crate::acp::protocol::ForkSessionRequest::new(
+            created.session_id.clone(),
             std::path::PathBuf::new(),
         ))
+        .await
+        .expect("ACP fork routes to the source owner and defaults to the latest message");
+    let load_fork = || {
+        crate::acp::protocol::LoadSessionRequest::new(
+            forked.session_id.clone(),
+            std::path::PathBuf::new(),
+        )
+    };
+    f.handle
+        .load_session(load_fork())
+        .await
+        .expect("fork must load through its new remote bookmark");
+    let fork_load = remote
+        .handle
+        .load_session(load_fork())
         .await
         .expect("fork must load directly on its owner");
     assert_eq!(
@@ -1420,12 +1428,12 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
             .registry
             .lock()
             .await
-            .get(&forked.session_id)
+            .get(forked.session_id.0.as_ref())
             .is_some()
     );
     node_manager
         .ask(crate::agent::remote::StopRemoteSessionRuntime {
-            session_id: forked.session_id,
+            session_id: forked.session_id.to_string(),
         })
         .await
         .unwrap();
@@ -1971,8 +1979,12 @@ async fn unreachable_owner_without_local_window_fails_retryably_without_partial_
         .build_remote_attach_snapshot_with_budget(
             "rs-2",
             Some(crate::session::history_window::LoadWindow::default()),
-            Err(crate::error::AgentError::Internal(
-                "owner unreachable".into(),
+            Err(crate::error::AgentError::from_transport_failure(
+                querymt_remote::RemoteTransportFailure::new(
+                    querymt_remote::RemoteTransportFailureKind::DialFailure,
+                    querymt_remote::DeliveryCertainty::NotDelivered,
+                    "owner unreachable",
+                ),
             )),
             std::time::Duration::from_secs(1),
         )
@@ -1992,8 +2004,12 @@ async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
         .build_remote_attach_snapshot_with_budget(
             "rs-3",
             Some(crate::session::history_window::LoadWindow::default()),
-            Err(crate::error::AgentError::Internal(
-                "owner unreachable".into(),
+            Err(crate::error::AgentError::from_transport_failure(
+                querymt_remote::RemoteTransportFailure::new(
+                    querymt_remote::RemoteTransportFailureKind::DialFailure,
+                    querymt_remote::DeliveryCertainty::NotDelivered,
+                    "owner unreachable",
+                ),
             )),
             std::time::Duration::from_secs(1),
         )
@@ -2017,6 +2033,15 @@ async fn confirmed_denial_cannot_fall_back_to_cached_history() {
         )
         .await
         .expect_err("confirmed denial must not return a cached snapshot");
+    assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
+
+    // A separate ACP open has no mesh in this fixture. It must preserve the
+    // owner's last refusal instead of reading the covered local window.
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("rs-denied".to_string()),
+        std::path::PathBuf::new(),
+    );
+    let error = viewer.handle.load_session(request).await.unwrap_err();
     assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
 }
 

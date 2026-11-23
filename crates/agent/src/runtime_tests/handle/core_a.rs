@@ -449,8 +449,8 @@ async fn test_acp_set_model_routes_local_provider_back_to_caller() {
     .with_mesh(Some(mesh.clone()));
     let local_ref = SessionActor::spawn(actor);
     let dht_name = scoped_session(&MeshScopeId::lan_default(), &session.public_id);
-    mesh.register_actor(local_ref, dht_name.clone()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    mesh.register_actor(local_ref.clone(), dht_name.clone())
+        .await;
     let remote_ref = mesh
         .lookup_actor::<SessionActor>(&dht_name)
         .await
@@ -521,8 +521,8 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
     .with_mesh(Some(mesh.clone()));
     let local_ref = SessionActor::spawn(actor);
     let dht_name = scoped_session(&MeshScopeId::lan_default(), &session_id);
-    mesh.register_actor(local_ref, dht_name.clone()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    mesh.register_actor(local_ref.clone(), dht_name.clone())
+        .await;
 
     let remote_ref = mesh
         .lookup_actor::<SessionActor>(&dht_name)

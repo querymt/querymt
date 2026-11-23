@@ -189,7 +189,11 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
                 let catalog_count = models.len();
 
                 if factory.supports_custom_models() {
-                    let cached = fetch_cached_gguf_models(&provider_name).await;
+                    let cached = fetch_cached_gguf_models(
+                        &provider_name,
+                        factory.name(),
+                        querymt_provider_common::list_cached_hf_gguf_models,
+                    );
                     let cached_count = cached.len();
                     models.extend(cached);
 
@@ -290,16 +294,21 @@ async fn fetch_catalog_models(config: &AgentConfig, provider_name: &str) -> Vec<
     }
 }
 
-async fn fetch_cached_gguf_models(provider: &str) -> Vec<ModelEntry> {
-    use querymt_provider_common::{
-        canonical_id_from_hf, list_cached_hf_gguf_models, parse_gguf_metadata,
-    };
+fn fetch_cached_gguf_models(
+    provider: &str,
+    factory_name: &str,
+    list_cached: impl FnOnce() -> Result<
+        Vec<querymt_provider_common::CachedGgufModel>,
+        querymt_provider_common::ModelRefError,
+    >,
+) -> Vec<ModelEntry> {
+    use querymt_provider_common::{canonical_id_from_hf, parse_gguf_metadata};
 
-    if provider != "llama_cpp" && provider != "mistralrs" {
+    if !matches!(factory_name, "llama_cpp" | "mistralrs") {
         return Vec::new();
     }
 
-    let cached = match list_cached_hf_gguf_models() {
+    let cached = match list_cached() {
         Ok(cached) => cached,
         Err(err) => {
             log::warn!(
@@ -474,6 +483,30 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_gguf_uses_factory_eligibility_and_binding_identity() {
+        let cached = fetch_cached_gguf_models("local-vision", "llama_cpp", || {
+            Ok(vec![querymt_provider_common::CachedGgufModel {
+                repo: "fixture/demo-GGUF".into(),
+                filename: "demo-Q4_K_M.gguf".into(),
+                path: "demo-Q4_K_M.gguf".into(),
+                size_bytes: 0,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            }])
+        });
+        let [entry] = cached.as_slice() else {
+            panic!("expected one cached model")
+        };
+        assert_eq!(entry.provider, "local-vision");
+        assert_eq!(entry.id, format!("local-vision/{}", entry.model));
+        assert!(
+            fetch_cached_gguf_models("llama_cpp", "unrelated", || {
+                panic!("ineligible factory should not scan cache")
+            })
+            .is_empty()
+        );
+    }
 
     #[test]
     fn dedupe_models_source_priority() {

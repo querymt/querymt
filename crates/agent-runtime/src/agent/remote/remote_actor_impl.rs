@@ -96,10 +96,58 @@ pub(crate) fn register_session_routes(
     register_session_read::<_, messages::SessionDeliveryBarrier>(router, actor);
     register_session_read::<_, messages::GetSessionControl>(router, actor);
     register_session_read::<_, messages::GetMode>(router, actor);
+    register_session_request::<_, messages::SetMode>(router, actor, InboundAccess::Full);
     register_session_read::<_, messages::GetSessionLimits>(router, actor);
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
     register_session_turns(router, store.clone(), actor);
+    register_session_interactions(router, store.clone(), actor);
+}
+
+fn register_session_interactions(
+    router: &InboundRouter,
+    store: Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) {
+    register_peer_interaction::<messages::ListPendingInteractions, _>(router, &store, actor);
+    register_peer_interaction::<messages::ClaimInteractionDelivery, _>(router, &store, actor);
+    register_peer_interaction::<messages::ResolveInteraction, _>(router, &store, actor);
+}
+
+fn register_peer_interaction<M, R>(
+    router: &InboundRouter,
+    store: &Arc<dyn GrantStore>,
+    actor: &ActorRef<SessionActor>,
+) where
+    SessionActor: RemoteMessage<M>
+        + Message<crate::agent::session_actor::PeerInteraction<M>, Reply = Result<R, AgentError>>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    R: serde::Serialize + Send + 'static,
+{
+    let weak = actor.downgrade();
+    let store = store.clone();
+    router.register::<SessionActor, M, _, _, _, _>(
+        actor.id(),
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        move |request, message| {
+            let weak = weak.clone();
+            let store = store.clone();
+            async move {
+                let actor = weak
+                    .upgrade()
+                    .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+                let peer = Arc::new(PeerTurn::from_request(&request, store)?);
+                actor
+                    .ask(crate::agent::session_actor::PeerInteraction { peer, message })
+                    .mailbox_timeout(Duration::from_secs(10))
+                    .reply_timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(local_session_error)
+            }
+        },
+    );
 }
 
 pub(super) fn register_session_turns(
@@ -192,37 +240,31 @@ fn register_peer_session_ask<M, R>(
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
-    use crate::agent::file_proxy::{FileProxyError, is_shareable_path};
-    use crate::agent::session_actor::ReadPeerFile;
-    use std::path::Path;
+    use crate::agent::session_actor::{GetPeerFileIndex, ReadPeerFile};
 
     let weak = actor.downgrade();
-    let index = move |_, message: messages::GetFileIndex| {
+    let index = move |_, _: messages::GetFileIndex| {
         let weak = weak.clone();
         async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
-            let mut index = actor
-                .ask(message)
+            let actor = weak.upgrade().ok_or_else(|| {
+                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+            })?;
+            actor
+                .ask(GetPeerFileIndex)
                 .mailbox_timeout(Duration::from_secs(3))
                 .reply_timeout(Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(file_proxy_send_error)?;
-            index
-                .files
-                .retain(|entry| is_shareable_path(Path::new(&entry.path)));
-            Ok::<_, FileProxyError>(index)
+                .map_err(file_proxy_send_error)
         }
     };
     let weak = actor.downgrade();
     let read = move |_, message| {
         let weak = weak.clone();
         async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
+            let actor = weak.upgrade().ok_or_else(|| {
+                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+            })?;
             actor
                 .ask(ReadPeerFile(message))
                 .mailbox_timeout(Duration::from_secs(3))
@@ -246,12 +288,31 @@ pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<Sessi
     );
 }
 
+fn file_actor_unavailable(
+    delivery: querymt_remote::DeliveryCertainty,
+) -> crate::agent::file_proxy::FileProxyError {
+    crate::agent::file_proxy::FileProxyError::from_transport_failure(
+        querymt_remote::RemoteTransportFailure::new(
+            querymt_remote::RemoteTransportFailureKind::ActorUnavailable,
+            delivery,
+            "session stopped",
+        ),
+    )
+}
+
 fn file_proxy_send_error<M>(
     error: kameo::error::SendError<M, crate::agent::file_proxy::FileProxyError>,
 ) -> crate::agent::file_proxy::FileProxyError {
     use crate::agent::file_proxy::FileProxyError;
     match error {
         kameo::error::SendError::HandlerError(error) => error,
+        kameo::error::SendError::ActorNotRunning(_)
+        | kameo::error::SendError::ActorRestarting(_) => {
+            file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
+        }
+        kameo::error::SendError::ActorStopped => {
+            file_actor_unavailable(querymt_remote::DeliveryCertainty::Unknown)
+        }
         other => FileProxyError::ActorSend(other.to_string()),
     }
 }
@@ -264,11 +325,12 @@ pub(super) fn register_session_subscriptions(
 ) {
     let weak = actor.downgrade();
     let egress = mesh.sharing_egress();
-    let subscribe = move |origin, message| {
+    let subscribe = move |origin: PeerRequest, message| {
         let weak = weak.clone();
         let subscriber = PeerSubscription {
             egress: egress.clone(),
             store: store.clone(),
+            changes: origin.take_policy_changes(),
             origin,
         };
         async move {

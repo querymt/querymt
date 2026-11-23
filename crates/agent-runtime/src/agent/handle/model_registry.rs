@@ -98,9 +98,9 @@ impl LocalAgentHandle {
     /// snapshot from the local journal (the same builder local sessions use).
     ///
     /// The whole transfer shares one budget (60 s by default). A failed or
-    /// timed-out transfer is served from the local copy, marked stale, only
-    /// when the requested window is already local; otherwise the load fails
-    /// with a retryable `remote_transfer_failed` error.
+    /// unreachable owner may be served from a complete local copy, marked
+    /// stale, unless access is known to be denied. A transfer that exceeds
+    /// its budget fails with a retryable `remote_transfer_failed` error.
     #[cfg(feature = "remote")]
     pub(crate) async fn load_remote_snapshot(
         &self,
@@ -117,9 +117,10 @@ impl LocalAgentHandle {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(crate::error::AgentError::Internal(
-                "history transfer timed out".into(),
-            )),
+            Err(_) => Err(crate::error::AgentError::RemoteTransferFailed {
+                session_id: session_id.to_owned(),
+                message: "history transfer timed out".into(),
+            }),
         };
         if let Err(error) = &sync {
             log::warn!("remote history sync before load failed: session_id={session_id}: {error}");
@@ -157,6 +158,9 @@ impl LocalAgentHandle {
         };
         let sink = self.config.event_sink.clone();
         let state = sink.remote_sync(session_id, &bookmark.node_id);
+        if state.history_denied() {
+            return Err(crate::error::AgentError::MeshAccessDenied);
+        }
         let internal = |error: crate::session::error::SessionError| {
             crate::error::AgentError::Internal(error.to_string())
         };
@@ -186,6 +190,9 @@ impl LocalAgentHandle {
             .load_remote_history(session_id, &bookmark.node_id)
             .await
             .map_err(internal)?;
+        if state.history_denied() {
+            return Err(crate::error::AgentError::MeshAccessDenied);
+        }
         // Nothing synced and nothing local: let the caller use its own source.
         if tip == 0 && history.is_empty() {
             return Ok(None);
@@ -204,9 +211,8 @@ impl LocalAgentHandle {
 
     /// Structured prompt records for the prompts among `events` of a remote
     /// session, fetched from the owner (attached and reachable before
-    /// `deadline`). Nothing is stored locally. Never fails: an unreachable
-    /// owner, an error or a timeout yields no records, leaving the prompts as
-    /// their `PromptReceived` text.
+    /// `deadline`). Nothing is stored locally. An access denial is returned;
+    /// other errors or timeouts leave the prompts as `PromptReceived` text.
     #[cfg(feature = "remote")]
     pub(crate) async fn remote_prompt_records_for(
         &self,
@@ -230,7 +236,15 @@ impl LocalAgentHandle {
         };
         match tokio::time::timeout_at(deadline, session_ref.get_user_prompts(Some(ids))).await {
             Ok(Ok(fetched)) => Ok(fetched),
-            Ok(Err(AgentError::MeshAccessDenied)) => Err(AgentError::MeshAccessDenied),
+            Ok(Err(AgentError::MeshAccessDenied)) => {
+                if let Some(node_id) = session_ref.remote_node_id() {
+                    self.config
+                        .event_sink
+                        .remote_sync(session_id, node_id)
+                        .note_history_denial();
+                }
+                Err(AgentError::MeshAccessDenied)
+            }
             Ok(Err(error)) => {
                 tracing::warn!(session_id, %error, "failed to fetch prompt records from owner");
                 Ok(Vec::new())
@@ -249,17 +263,27 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
         window: Option<crate::session::history_window::LoadWindow>,
-    ) -> Option<serde_json::Value> {
-        self.build_remote_attach_snapshot_with_budget(
-            session_id,
-            window,
-            Err(crate::error::AgentError::Internal(
-                "owner unreachable".into(),
-            )),
-            remote_transfer_budget(),
-        )
-        .await
-        .ok()
+    ) -> Result<Option<serde_json::Value>, agent_client_protocol::Error> {
+        use crate::error::AgentError;
+        let offline =
+            AgentError::from_transport_failure(querymt_remote::RemoteTransportFailure::new(
+                querymt_remote::RemoteTransportFailureKind::DialFailure,
+                querymt_remote::DeliveryCertainty::NotDelivered,
+                "owner unreachable",
+            ));
+        match self
+            .build_remote_attach_snapshot_with_budget(
+                session_id,
+                window,
+                Err(offline),
+                remote_transfer_budget(),
+            )
+            .await
+        {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error) if AgentError::is_acp_mesh_access_denied(&error) => Err(error),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Build the load snapshot of a remote session from the local journal,
@@ -274,9 +298,6 @@ impl LocalAgentHandle {
         budget: std::time::Duration,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
         use crate::error::AgentError;
-        if matches!(&sync, Err(AgentError::MeshAccessDenied)) {
-            return Err(AgentError::MeshAccessDenied.into());
-        }
         let transfer_failed = |message: String| {
             agent_client_protocol::Error::from(AgentError::RemoteTransferFailed {
                 session_id: session_id.to_string(),
@@ -301,17 +322,30 @@ impl LocalAgentHandle {
                     session_id: session_id.to_string(),
                 })
             })?;
+        let sink = self.config.event_sink.clone();
+        let state = sink.remote_sync(session_id, &bookmark.node_id);
+        if matches!(&sync, Err(AgentError::MeshAccessDenied)) {
+            state.note_history_denial();
+        }
+        if state.history_denied() {
+            return Err(AgentError::MeshAccessDenied.into());
+        }
+        if let Err(error) = &sync
+            && !error
+                .transport_failure()
+                .is_some_and(|failure| failure.owner_unreachable())
+        {
+            return Err(transfer_failed(error.to_string()));
+        }
         let view_store = self
             .config
             .storage
             .view_store()
             .ok_or_else(|| internal("view store unavailable".into()))?;
-        let sink = self.config.event_sink.clone();
-        let state = sink.remote_sync(session_id, &bookmark.node_id);
         let deadline = tokio::time::Instant::now() + budget;
 
         // Barrier: whatever sync is running (or just ran) must finish first.
-        let mut stale = sync.is_err();
+        let stale = sync.is_err();
         state
             .hydrate()
             .await
@@ -321,7 +355,7 @@ impl LocalAgentHandle {
                 .await
                 .is_err()
         {
-            stale = true;
+            return Err(transfer_failed("history transfer timed out".into()));
         }
 
         let probe = crate::agent::load_telemetry::LoadProbe::start();
@@ -367,6 +401,7 @@ impl LocalAgentHandle {
             match tokio::time::timeout_at(deadline, fetch.ensure_covered(start, end)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(AgentError::MeshAccessDenied)) => {
+                    state.note_history_denial();
                     return Err(AgentError::MeshAccessDenied.into());
                 }
                 Ok(Err(error)) => return Err(transfer_failed(error.to_string())),
@@ -403,6 +438,9 @@ impl LocalAgentHandle {
                 snapshot.user_prompts.get_or_insert_with(Vec::new),
                 prompts,
             );
+        }
+        if state.history_denied() {
+            return Err(AgentError::MeshAccessDenied.into());
         }
         if stale {
             match snapshot.history.as_mut() {

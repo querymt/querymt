@@ -5,7 +5,7 @@ use crate::mesh_ingress::{
 };
 use crate::mesh_runtime_support::SwarmCommand;
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaEdit, QuotaEstimate, QuotaScope, QuotaSettlement,
+    AccessEdit, AttemptUsage, QuotaAttempt, QuotaEstimate, QuotaSettlement, QuotaStatus,
     ReservationId, ReservedAttempt,
 };
 use crate::peer_access::{
@@ -49,10 +49,17 @@ struct Store {
     grants: Mutex<HashMap<PeerGrantKey, PeerGrantState>>,
     attempts: Mutex<HashMap<(PeerGrantKey, Uuid), ReservationId>>,
     settled: Mutex<Vec<(ReservationId, AttemptUsage)>>,
+    fail_settlement: AtomicBool,
+    settlement_failed: Notify,
+    settlement_recorded: Notify,
     pause_reserve: Mutex<Option<PauseReserve>>,
+    pause_settle: Mutex<Option<PauseReserve>>,
+    reserve_calls: AtomicUsize,
     released: Notify,
     fail_next_grant_read: AtomicBool,
+    pause_grant_read: Mutex<Option<(usize, PauseReserve)>>,
     changes: broadcast::Sender<crate::peer_access::PolicyChange>,
+    watchless: bool,
 }
 
 impl Default for Store {
@@ -61,10 +68,17 @@ impl Default for Store {
             grants: Default::default(),
             attempts: Default::default(),
             settled: Default::default(),
+            fail_settlement: Default::default(),
+            settlement_failed: Default::default(),
+            settlement_recorded: Default::default(),
             pause_reserve: Default::default(),
+            pause_settle: Default::default(),
+            reserve_calls: Default::default(),
             released: Default::default(),
             fail_next_grant_read: Default::default(),
+            pause_grant_read: Default::default(),
             changes: broadcast::channel(16).0,
+            watchless: false,
         }
     }
 }
@@ -72,6 +86,21 @@ impl Default for Store {
 #[async_trait]
 impl GrantStore for Store {
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+        let pause = {
+            let mut slot = self.pause_grant_read.lock();
+            match slot.as_mut() {
+                Some((0, _)) => slot.take().map(|(_, pause)| pause),
+                Some((remaining, _)) => {
+                    *remaining -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(pause) = pause {
+            pause.committed.send(()).unwrap();
+            let _ = pause.resume.await;
+        }
         if self.fail_next_grant_read.swap(false, Ordering::Relaxed) {
             return Err(GrantStoreError::Backend(Box::new(std::io::Error::other(
                 "fixture grant read failed",
@@ -106,7 +135,7 @@ impl GrantStore for Store {
         Ok(state)
     }
     fn subscribe_changes(&self) -> Option<broadcast::Receiver<crate::peer_access::PolicyChange>> {
-        Some(self.changes.subscribe())
+        (!self.watchless).then(|| self.changes.subscribe())
     }
     async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
         unreachable!("not needed for provider requests")
@@ -115,17 +144,17 @@ impl GrantStore for Store {
 
 #[async_trait]
 impl QuotaStore for Store {
-    async fn edit_quota(
+    async fn edit_access(
         &self,
         _: &PeerGrantKey,
         _: Uuid,
-        _: &QuotaScope,
-        _: QuotaEdit,
+        _: AccessEdit,
         _: i64,
-    ) -> Result<Uuid, QuotaError> {
-        unreachable!("fixture has immutable caps")
+    ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError> {
+        unreachable!("fixture has immutable policy")
     }
     async fn reserve(&self, attempt: QuotaAttempt) -> Result<ReservationId, QuotaError> {
+        self.reserve_calls.fetch_add(1, Ordering::Relaxed);
         if !self.grants.lock()[&attempt.peer].grant.allows_model(
             attempt.protocol,
             &attempt.provider_id,
@@ -152,6 +181,32 @@ impl QuotaStore for Store {
         }
         Ok(id)
     }
+    async fn reserve_with_policy(
+        &self,
+        attempt: QuotaAttempt,
+        mut history: broadcast::Receiver<crate::peer_access::PolicyChange>,
+        require_sessions: bool,
+    ) -> Result<ReservationId, QuotaError> {
+        loop {
+            match history.try_recv() {
+                Ok(change) if change.key == attempt.peer => {
+                    let crate::peer_access::PolicyEffect::Grant(grant) = change.effect;
+                    if !grant.allows_model(
+                        attempt.protocol,
+                        &attempt.provider_id,
+                        &attempt.model_id,
+                    ) || require_sessions && !grant.allows_sessions(attempt.protocol)
+                    {
+                        return Err(QuotaError::Denied);
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(_) => return Err(QuotaError::Denied),
+            }
+        }
+        self.reserve(attempt).await
+    }
     async fn mark_dispatched(&self, id: ReservationId) -> Result<(), QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
         Ok(())
@@ -170,7 +225,19 @@ impl QuotaStore for Store {
         usage: AttemptUsage,
     ) -> Result<QuotaSettlement, QuotaError> {
         assert!(self.attempts.lock().values().any(|attempt| *attempt == id));
+        if self.fail_settlement.load(Ordering::Relaxed) {
+            self.settlement_failed.notify_one();
+            return Err(QuotaError::Store(GrantStoreError::Backend(Box::new(
+                std::io::Error::other("fixture settlement unavailable"),
+            ))));
+        }
         self.settled.lock().push((id, usage));
+        self.settlement_recorded.notify_one();
+        let pause = self.pause_settle.lock().take();
+        if let Some(PauseReserve { committed, resume }) = pause {
+            committed.send(()).unwrap();
+            resume.await.unwrap();
+        }
         Ok(QuotaSettlement::Recorded)
     }
     async fn reconcile_startup(&self, _: &NodeId) -> Result<(), QuotaError> {
@@ -185,6 +252,19 @@ struct PauseReserve {
 }
 
 impl Store {
+    fn pause_grant_after(&self, reads: usize) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, read) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        *self.pause_grant_read.lock() = Some((
+            reads,
+            PauseReserve {
+                committed: arrived,
+                resume: wait,
+            },
+        ));
+        (read, resume)
+    }
+
     fn pause_reserve(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (committed_tx, committed) = oneshot::channel();
         let (resume, resume_rx) = oneshot::channel();
@@ -434,30 +514,39 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
     };
 
     let cache = tempfile::tempdir().unwrap();
+    let identity = cache.path().join("identity");
+    let config = MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: Default::default(),
+        }),
+        identity_file: Some(identity.clone()),
+        iroh_enabled: false,
+        iroh_gso: false,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        request_timeout: Duration::from_secs(3),
+        stream_reconnect_grace: Duration::from_secs(3),
+        node_name: Some("catalog-fixture".into()),
+        peers: vec![],
+        auto_fallback: false,
+    };
+    let watchless = Arc::new(Store {
+        watchless: true,
+        ..Store::default()
+    });
+    let Err(error) = bootstrap_mesh_runtime_with_policy(&config, watchless).await else {
+        panic!("guarded mesh started without policy change tracking");
+    };
+    assert!(error.to_string().contains("GrantStore::subscribe_changes"));
+    assert!(!identity.exists());
+
     let store = Arc::new(Store::default());
-    let runtime = bootstrap_mesh_runtime_with_policy(
-        &MeshRuntimeConfig {
-            enabled: true,
-            lan: Some(LanMeshConfig {
-                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
-                discovery: LanDiscovery::None,
-                directory: Default::default(),
-            }),
-            identity_file: Some(cache.path().join("identity")),
-            iroh_enabled: false,
-            iroh_gso: false,
-            iroh_dns: None,
-            iroh_scopes: vec![],
-            request_timeout: Duration::from_secs(3),
-            stream_reconnect_grace: Duration::from_secs(3),
-            node_name: Some("catalog-fixture".into()),
-            peers: vec![],
-            auto_fallback: false,
-        },
-        store.clone(),
-    )
-    .await
-    .unwrap();
+    let runtime = bootstrap_mesh_runtime_with_policy(&config, store.clone())
+        .await
+        .unwrap();
     let host = *runtime.peer_id();
     let peer = PeerId::random();
     let backend = Arc::new(Backend::default());
@@ -543,6 +632,34 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
         ));
     }
     assert_eq!(store.attempts.lock().len(), 1);
+
+    store
+        .replace_grant(
+            &binding,
+            store.grant(&binding).await.unwrap().revision,
+            PeerGrant::Full,
+        )
+        .await
+        .unwrap();
+    share.provider_host().stop_gracefully().await.unwrap();
+    share.provider_host().wait_for_shutdown().await;
+    let contract = GetProviderContractInfo {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        params: None,
+    };
+    // Withdraw explicitly so this assertion does not race the shutdown watcher.
+    router.withdraw_actor(provider);
+    for request in [
+        ask_request::<ProviderHostActor, _>(provider, &contract),
+        ask_request::<ProviderHostActor, _>(provider, &chat),
+    ] {
+        assert!(matches!(
+            router.handle_v1(peer, request).await,
+            Ok(SwarmResponse::Ask(Err(RemoteSendError::ActorNotRunning)))
+        ));
+    }
+    assert_eq!(store.attempts.lock().len(), 1);
     mesh.shutdown().await;
 }
 
@@ -564,13 +681,44 @@ async fn guarded_catalog_and_chat_enforce_grants_host_binding_and_attempt_identi
         "fixture",
         ["allowed".into(), "denied".into()],
     ));
-    let router = InboundRouter::new(host, store.clone());
+    let router = Arc::new(InboundRouter::new(host, store.clone()));
+    let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
     Arc::new(GuardedProvider {
         backend: backend.clone(),
         catalog,
         store: store.clone(),
     })
-    .install(&router, catalog_id, provider_id);
+    .install(&router, catalog_id, provider_id, &host_actor);
+    let binding = key(host, peer);
+    let narrowed = store
+        .replace_grant(
+            &binding,
+            store.grant(&binding).await.unwrap().revision,
+            PeerGrant::Full,
+        )
+        .await
+        .unwrap();
+    let (reading, resume) = store.pause_grant_after(2);
+    let (stale, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            router.handle_v1(
+                peer,
+                ask_request::<ProviderCatalogActor, _>(catalog_id, &GetProviderCatalog)
+            ),
+            async {
+                reading.await.unwrap();
+                store
+                    .replace_grant(&binding, narrowed.revision, allowed())
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+            }
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(stale, Err(SharingRejection::Changed)));
+
     let snapshot = ask::<ProviderCatalogActor, _, ProviderCatalogSnapshot, String>(
         &router,
         peer,
@@ -1081,6 +1229,41 @@ async fn guarded_stream_lifecycle_operations_are_inert_except_for_the_owning_con
 }
 
 #[tokio::test]
+async fn guarded_stream_reservation_keeps_ingress_authority_across_handoff() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let binding = key(fixture.host, fixture.peer);
+    let revision = fixture.store.grant(&binding).await.unwrap().revision;
+    let (arrived, resume) = fixture.store.pause_grant_after(1);
+    let mut call = Box::pin(fixture.router.handle_v1(
+        fixture.peer,
+        ask_request::<ProviderHostActor, _>(fixture.actor, &request),
+    ));
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut call => panic!("provider preparation was not suspended: {result:?}"),
+            result = arrived => result.unwrap(),
+        }
+        let revoked = fixture
+            .store
+            .replace_grant(&binding, revision, PeerGrant::None)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .replace_grant(&binding, revoked.revision, allowed())
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+        assert!(!matches!(call.await, Ok(SwarmResponse::Ask(Ok(_)))));
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.store.reserve_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn dropping_guarded_admission_cancels_an_in_progress_prepare() {
     let fixture = StreamFixture::new(StreamEnding::Done).await;
     let request = fixture.request();
@@ -1098,6 +1281,79 @@ async fn dropping_guarded_admission_cancels_an_in_progress_prepare() {
     })
     .await
     .expect("dropping ingress must cancel preparation");
+    assert!(fixture.store.attempts.lock().is_empty());
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn session_cancellation_reports_policy_failure_and_cancels_other_streams() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let first = fixture.request();
+    let second = fixture.request();
+    for request in [&first, &second] {
+        fixture.call::<_, ()>(request).await.unwrap();
+        let (_, reply) = fixture.relay(request).await;
+        ack(reply);
+    }
+    let cancel = CancelProviderStreamRequest {
+        session_id: first.session_id.clone(),
+        request_id: None,
+        reason: None,
+    };
+    // The router's admission read succeeds; the first per-stream check fails.
+    let (reading, resume) = fixture.store.pause_grant_after(1);
+    let (cancelled, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(fixture.call::<_, usize>(&cancel), async {
+            reading.await.unwrap();
+            fixture
+                .store
+                .fail_next_grant_read
+                .store(true, Ordering::Relaxed);
+            resume.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(code(cancelled.unwrap_err()), "mesh_access_unavailable");
+    let command = timeout(Duration::from_secs(3), fixture.commands.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SwarmCommand::Sharing {
+        request: SharingRequest::Actor(envelope),
+        tx,
+        ..
+    } = command
+    else {
+        panic!("expected the authorized stream's cancellation callback");
+    };
+    let SwarmRequest::Ask { payload, .. } = *envelope else {
+        panic!("expected callback ask")
+    };
+    let relay: RoutedStreamRelayMessage = rmp_serde::from_slice(&payload).unwrap();
+    assert_transport(relay, TransportErrorKind::ConnectionClosed, "cancelled");
+    ack(tx);
+}
+
+#[tokio::test]
+async fn dropping_admission_during_final_policy_read_releases_quota() {
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (committed, resume_reserve) = fixture.store.pause_reserve();
+    let mut admission = Box::pin(fixture.call::<_, ()>(&request));
+    timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            _ = &mut admission => panic!("admission returned before reservation was released"),
+            ready = committed => ready.unwrap(),
+        }
+        let (reading, _hold_read) = fixture.store.pause_grant_after(0);
+        resume_reserve.send(()).unwrap();
+        reading.await.unwrap();
+        drop(admission);
+        fixture.store.released.notified().await;
+    })
+    .await
+    .unwrap();
     assert!(fixture.store.attempts.lock().is_empty());
     assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
 }
@@ -1189,6 +1445,117 @@ async fn guarded_stream_reconnect_retries_data_and_terminal_without_restarting_i
 }
 
 #[tokio::test]
+async fn guarded_terminal_preserves_a_transient_final_policy_error() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    ack(reply);
+    let store = fixture.store.clone();
+    // The metered stream checks once after settlement, before relay delivery.
+    let (reading, resume) = store.pause_grant_after(1);
+    fixture.backend.finish_stream.notify_one();
+    let ((terminal, reply), ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(fixture.relay(&request), async {
+            reading.await.unwrap();
+            store.fail_next_grant_read.store(true, Ordering::Relaxed);
+            resume.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected scoped error")
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected typed policy failure")
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    disconnect(reply);
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 0 }
+    ));
+    ack(reply);
+    let (retry, reply) = fixture.relay(&request).await;
+    assert_eq!(retry.seq, None);
+    let StreamRelayMessage::ProviderError { error } = retry.message else {
+        panic!("retried a protected terminal")
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected typed policy failure")
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    ack(reply);
+}
+
+#[tokio::test]
+async fn guarded_stream_gets_full_reconnect_grace_after_an_unanswered_callback() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, unanswered) = fixture.relay(&request).await;
+    // V1's first callback can consume more than the configured reconnect grace.
+    let (notice, reply) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+    assert!(fixture.store.settled.lock().is_empty());
+    ack(reply);
+    let (retried, reply) = fixture.relay(&request).await;
+    assert_eq!(retried.seq, initial.seq);
+    ack(reply);
+    drop(unanswered);
+}
+
+#[tokio::test]
+async fn revoked_disconnected_stream_sends_only_scoped_error_after_grace_expires_in_settlement() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let request = fixture.request();
+    let (committed_tx, committed) = oneshot::channel();
+    let (resume, resume_rx) = oneshot::channel();
+    *fixture.store.pause_settle.lock() = Some(PauseReserve {
+        committed: committed_tx,
+        resume: resume_rx,
+    });
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    disconnect(reply);
+    let (notice, unanswered) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
+
+    let binding = key(fixture.host, fixture.peer);
+    let revision = fixture.store.grant(&binding).await.unwrap().revision;
+    fixture
+        .store
+        .replace_grant(&binding, revision, PeerGrant::None)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), committed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(request.reconnect_grace_secs)).await;
+    resume.send(()).unwrap();
+    let (terminal, reply) = fixture.relay(&request).await;
+    drop(unanswered);
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected scoped error, not replay")
+    };
+    assert!(
+        matches!(LLMError::from_payload(error), LLMError::ProviderResponseError(failure) if failure.code() == Some("mesh_access_denied"))
+    );
+    ack(reply);
+}
+
+#[tokio::test]
 async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeout() {
     let mut fixture = StreamFixture::new(StreamEnding::Done).await;
     let request = fixture.request();
@@ -1197,21 +1564,14 @@ async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeou
     assert_eq!(initial.seq, Some(0));
     disconnect(reply);
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let (notice, reply) = fixture.relay(&request).await;
-            let settled = !fixture.store.settled.lock().is_empty();
-            assert_eq!(notice.seq, None);
-            assert!(matches!(notice.message, StreamRelayMessage::TransportReconnected { buffered_chunks }
-                if buffered_chunks == usize::from(!settled)));
-            if settled {
-                ack(reply);
-                break;
-            }
-            disconnect(reply);
-        }
-    }).await.expect("reconnect grace did not expire");
+    // Let the reconnect attempt expire without acknowledging it.
+    let (notice, unanswered) = fixture.relay(&request).await;
+    assert!(matches!(
+        notice.message,
+        StreamRelayMessage::TransportReconnected { buffered_chunks: 1 }
+    ));
     let (terminal, reply) = fixture.relay(&request).await;
+    drop(unanswered);
     assert_transport(
         terminal,
         TransportErrorKind::Timeout,
@@ -1225,6 +1585,34 @@ async fn guarded_stream_grace_expiration_settles_before_delivering_scoped_timeou
             .unwrap()
             .is_none()
     );
+    ack(reply);
+}
+
+#[tokio::test]
+async fn renewal_keeps_the_guarded_stream_live_past_its_old_deadline() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    request.lease_ttl_secs = 1;
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (_, reply) = fixture.relay(&request).await;
+    ack(reply);
+    let renew = RenewProviderStreamLease {
+        session_id: request.session_id.clone(),
+        request_id: request.request_id.clone(),
+        lease_ttl_secs: 60,
+    };
+    assert!(fixture.call::<_, bool>(&renew).await.unwrap());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fixture.backend.finish_stream.notify_one();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert!(terminal.seq.is_some() && crate::relay_message_is_terminal(&terminal.message));
     ack(reply);
 }
 
@@ -1261,13 +1649,68 @@ async fn guarded_stream_heartbeat_does_not_renew_the_lease() {
                 TransportErrorKind::Timeout,
                 "lease or deadline expired",
             );
-            fixture.assert_settled(&request, AttemptUsage::Unknown);
             ack(reply);
+            fixture.store.settlement_recorded.notified().await;
+            fixture.assert_settled(&request, AttemptUsage::Unknown);
             break;
         }
     })
     .await
     .expect("stream lease did not expire");
+}
+
+#[tokio::test]
+async fn guarded_stream_stops_waiting_for_settlement_at_lease_expiry() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let mut request = fixture.request();
+    request.lease_ttl_secs = 2;
+    fixture.store.fail_settlement.store(true, Ordering::Relaxed);
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+    fixture.backend.finish_stream.notify_one();
+    timeout(
+        Duration::from_secs(3),
+        fixture.store.settlement_failed.notified(),
+    )
+    .await
+    .unwrap();
+    // The final usage batch already entered the relay before settlement failed.
+    let (usage, reply) = fixture.relay(&request).await;
+    assert_eq!(usage.seq, Some(1));
+    ack(reply);
+
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert_eq!(terminal.seq, None);
+    let StreamRelayMessage::ProviderError { error } = terminal.message else {
+        panic!("expected a terminal provider error");
+    };
+    let LLMError::ProviderResponseError(failure) = LLMError::from_payload(error) else {
+        panic!("expected a structured provider error");
+    };
+    assert_eq!(failure.code(), Some("mesh_access_unavailable"));
+    ack(reply);
+    assert!(fixture.store.settled.lock().is_empty());
+    assert!(
+        fixture
+            .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    fixture
+        .store
+        .fail_settlement
+        .store(false, Ordering::Relaxed);
+    timeout(
+        Duration::from_secs(3),
+        fixture.store.settlement_recorded.notified(),
+    )
+    .await
+    .unwrap();
+    fixture.assert_settled(&request, AttemptUsage::Observed(18));
 }
 
 #[tokio::test]
@@ -1326,7 +1769,8 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
             .unwrap();
     }
     let backend = Arc::new(Backend::default());
-    let router = InboundRouter::new(host, store.clone());
+    let router = Arc::new(InboundRouter::new(host, store.clone()));
+    let host_actor = ProviderHostActor::spawn(ProviderHostActor::new(backend.clone()));
     Arc::new(GuardedProvider {
         backend: backend.clone(),
         catalog: Arc::new(StaticCatalogBackend::provider(
@@ -1336,7 +1780,7 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
         )),
         store: store.clone(),
     })
-    .install(&router, catalog_id, actor);
+    .install(&router, catalog_id, actor, &host_actor);
 
     let browse_catalog = |peer| {
         ask::<ProviderCatalogActor, _, ProviderCatalogSnapshot, String>(

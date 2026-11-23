@@ -22,6 +22,10 @@ Finite quotas SHALL use `--tokens` with a plain integer or a number with a `k` o
 - **WHEN** the owner submits a model limit of `--tokens 2.000001M` and a daily window, then requests a reset for that scope and revision
 - **THEN** the client sends `2000001` whole tokens and a model scope, and the reset targets only that scope
 
+#### Scenario: Amount-only edits keep the existing quota window
+- **WHEN** the owner updates an existing finite quota without passing `--window`
+- **THEN** qmacp reads the cadence of that scope and sends it with the original expected revision; qmacp does not adopt a newer revision or retry a rejected write
+
 #### Scenario: Mesh mutation rejection is not automatically retried
 - **WHEN** the server rejects a write or disconnects without a reply
 - **THEN** qmacp returns nonzero with JSON error and peer/revision context, reporting a known server rejection or an unknown outcome without retrying the write

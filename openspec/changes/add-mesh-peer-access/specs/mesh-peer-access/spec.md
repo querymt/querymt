@@ -48,6 +48,11 @@ Sessions **Off** SHALL block all remote session operations, even through prior r
 - **WHEN** a peer with both toggles On uses a supported workspace file operation against an in-workspace path and a path outside that workspace
 - **THEN** the in-workspace operation proceeds subject to normal host rules and the out-of-workspace operation is refused
 
+#### Scenario: A Custom peer creates or forks a session
+- **WHEN** a Custom peer with Sessions On uses the grant-aware protocol to create a new session or fork saved history at a message in that session
+- **THEN** the host SHALL create a session without a workspace, reject a caller-selected cwd, and commit the authenticated origin with the new session and any copied history
+- **AND** the host SHALL NOT inherit the source checkout, allocate a workspace, or start integrations it cannot confine; a later load SHALL NOT substitute a workspace or attach such integrations
+
 ### Requirement: Custom grants have an explicit Shell control
 
 Shell: allows the unsandboxed shell. In Custom grants, Shell SHALL default to Off. Shell **On** SHALL require Filesystem **On**. Shell **Off** SHALL refuse shell execution through the session.
@@ -83,6 +88,11 @@ Each protected operation, including deferred work after restart, SHALL use the c
 ### Requirement: Scheduled work keeps its origin across restart
 
 A host SHALL record authenticated peer origin before accepting a new remote schedule, and SHALL reject a new remote schedule request with no authenticated origin. Schedules without a stored origin SHALL run as Local for compatibility. When a peer schedule becomes due before the host policy store is initialized, the host SHALL wait or retry without counting this as a denied run.
+
+#### Scenario: Custom session sharing enables peer-owned schedules
+- **WHEN** a peer with Sessions On uses the grant-aware protocol to create, list, pause, resume, trigger, or delete a schedule
+- **THEN** it can schedule work on a shared session and manage only schedules owned by its authenticated host/peer pair, regardless of the protocol used at creation
+- **AND** the scheduler SHALL check the requesting authority before applying a queued mutation, without replacing the schedule's stored execution origin
 
 #### Scenario: Origin-less schedules still run after restart
 - **WHEN** a host restarts with an existing schedule that has no stored origin

@@ -36,14 +36,12 @@ impl LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     pub(crate) fn set_mesh_local(&self, mesh: crate::agent::remote::MeshHandle) {
-        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh.clone());
-        self.config.provider.set_mesh(Some(mesh.clone()));
-
-        // Propagate to the session registry so remove/detach can clean up
-        // re-registration closures (Phase 4 of Bug 1 fix).
-        if let Ok(mut registry) = self.registry.try_lock() {
-            registry.set_mesh(Some(mesh.clone()));
+        {
+            let mut current = self.mesh.lock().unwrap_or_else(|e| e.into_inner());
+            self.session_exports.lock().set_mesh(Some(mesh.clone()));
+            *current = Some(mesh.clone());
         }
+        self.config.provider.set_mesh(Some(mesh.clone()));
 
         // Propagate to the session materializer for mesh-aware session creation
         self.session_materializer.set_mesh(mesh.clone());
@@ -66,11 +64,12 @@ impl LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     fn clear_mesh_local(&self) {
-        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.config.provider.set_mesh(None);
-        if let Ok(mut registry) = self.registry.try_lock() {
-            registry.set_mesh(None);
+        {
+            let mut current = self.mesh.lock().unwrap_or_else(|e| e.into_inner());
+            self.session_exports.lock().set_mesh(None);
+            *current = None;
         }
+        self.config.provider.set_mesh(None);
         self.session_materializer.clear_mesh();
         self.model_inventory.clear_mesh();
     }
@@ -131,26 +130,9 @@ impl LocalAgentHandle {
             .await;
         }
 
-        let local_sessions = {
-            let registry = self.registry.lock().await;
-            registry
-                .session_ids()
-                .into_iter()
-                .filter_map(|session_id| {
-                    registry
-                        .local_actor_ref(&session_id)
-                        .cloned()
-                        .map(|actor| (session_id, actor))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (session_id, actor_ref) in local_sessions {
-            crate::agent::remote::remote_actor_impl::register_session_routes(
-                runtime.as_mesh_handle(),
-                &actor_ref,
-            );
-            let dht_name = crate::agent::remote::scope::scoped_session(scope, &session_id);
-            runtime.register_actor(actor_ref, dht_name).await;
+        let registrations = self.session_exports.lock().publish_scope(runtime, scope);
+        for registration in registrations {
+            let _ = registration.await;
         }
         Ok(())
     }

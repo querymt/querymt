@@ -245,7 +245,7 @@ impl SessionProvider {
         execution_config: &SessionExecutionConfig,
         intent: Option<crate::session::store::PendingForkIsolation>,
     ) -> SessionResult<SessionHandle> {
-        let mut session = self
+        let session = self
             .history_store
             .create_session_with_isolation_intent(
                 None,
@@ -255,12 +255,40 @@ impl SessionProvider {
                 intent,
             )
             .await?;
+        self.configure_new_session(session, cwd.as_deref(), execution_config)
+            .await
+    }
 
+    #[cfg(feature = "remote")]
+    pub(crate) async fn create_peer_session(
+        &self,
+        origin: crate::session::domain_schedule::ScheduleOrigin,
+        execution_config: &SessionExecutionConfig,
+    ) -> SessionResult<SessionHandle> {
+        let session = self.history_store.create_peer_session(origin).await?;
+        let id = session.public_id.clone();
+        let result = self
+            .configure_new_session(session, None, execution_config)
+            .await;
+        if result.is_err()
+            && let Err(error) = self.history_store.delete_session(&id).await
+        {
+            tracing::warn!(session_id = %id, %error, "failed to remove unconfigured peer session");
+        }
+        result
+    }
+
+    async fn configure_new_session(
+        &self,
+        mut session: crate::session::store::Session,
+        cwd: Option<&std::path::Path>,
+        execution_config: &SessionExecutionConfig,
+    ) -> SessionResult<SessionHandle> {
         // Resolve session-specific template variables (cwd, datetime, …) in
         // system prompt strings before writing the config to the database.
         let resolved_config = {
             let mut builder = crate::template::SessionTemplateContext::builder();
-            if let Some(ref p) = cwd {
+            if let Some(p) = cwd {
                 builder = builder.cwd(p);
             }
             if let Some(ref p) = self.initial_config.provider {
@@ -591,7 +619,7 @@ impl SessionProvider {
                         provider_name
                     );
                     if let Some(node_id) =
-                        querymt_remote::find_provider_on_mesh(mesh, provider_name).await
+                        querymt_remote::find_provider_on_mesh(mesh, provider_name, model).await
                     {
                         log::info!(
                             "build_provider: found '{}' on mesh peer '{}', using MeshChatProvider",
@@ -657,6 +685,10 @@ impl SessionProvider {
         )?;
         #[cfg(feature = "remote")]
         let llama_cpp_n_ctx = llama_cpp_context_limit(factory.name(), &pruned_config_str);
+        #[cfg(feature = "remote")]
+        let system_tokens = querymt_remote::provider_backend::configured_system_tokens(
+            serde_json::from_str(&pruned_config_str).ok().as_ref(),
+        );
         let pruned_keys = resolved_cfg.pruned_keys;
         let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
@@ -720,6 +752,8 @@ impl SessionProvider {
                     reasoning_effort,
                     #[cfg(feature = "remote")]
                     llama_cpp_n_ctx,
+                    #[cfg(feature = "remote")]
+                    system_tokens,
                 });
             }
 
@@ -744,6 +778,8 @@ impl SessionProvider {
                     reasoning_effort,
                     #[cfg(feature = "remote")]
                     llama_cpp_n_ctx,
+                    #[cfg(feature = "remote")]
+                    system_tokens,
                 });
             }
 
@@ -760,6 +796,8 @@ impl SessionProvider {
                 reasoning_effort,
                 #[cfg(feature = "remote")]
                 llama_cpp_n_ctx,
+                #[cfg(feature = "remote")]
+                system_tokens,
             });
         }
 
@@ -774,6 +812,8 @@ impl SessionProvider {
             reasoning_effort,
             #[cfg(feature = "remote")]
             llama_cpp_n_ctx,
+            #[cfg(feature = "remote")]
+            system_tokens,
         })
     }
 }
@@ -976,6 +1016,8 @@ pub(crate) struct ProviderSnapshot {
     pub(crate) provider: Arc<dyn LLMProvider>,
     #[cfg(feature = "remote")]
     llama_cpp_n_ctx: Option<u64>,
+    #[cfg(feature = "remote")]
+    system_tokens: usize,
     settings: crate::agent::utils::genai::GenerationSettings,
     /// Output caps resolved with the provider; `None` when unknown.
     output_caps: Option<OutputCaps>,
@@ -998,8 +1040,10 @@ fn llama_cpp_context_limit(factory_name: &str, resolved_config: &str) -> Option<
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderQuotaInputs {
     initial_max_tokens: Option<u32>,
+    options: querymt::chat::GenerationOptionSupport,
     llama_cpp_n_ctx: Option<u64>,
     context_fallback: Option<usize>,
+    system_tokens: usize,
 }
 
 #[cfg(feature = "remote")]
@@ -1010,13 +1054,19 @@ impl ProviderQuotaInputs {
         model: &str,
         call: &querymt::chat::ChatCall<'_>,
     ) -> querymt_remote::peer_access::quota::QuotaEstimate {
+        let output_cap = self
+            .options
+            .retain_supported(call.options)
+            .max_tokens
+            .or(self.initial_max_tokens);
         querymt_remote::peer_access::quota::QuotaEstimate::for_chat(
             provider,
             model,
             call,
-            self.initial_max_tokens,
+            output_cap,
             self.llama_cpp_n_ctx,
             self.context_fallback,
+            self.system_tokens,
         )
     }
 }
@@ -1026,8 +1076,10 @@ impl ProviderSnapshot {
     pub(crate) fn quota_inputs(&self, context_fallback: Option<usize>) -> ProviderQuotaInputs {
         ProviderQuotaInputs {
             initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+            options: self.provider.capabilities().options,
             llama_cpp_n_ctx: self.llama_cpp_n_ctx,
             context_fallback,
+            system_tokens: self.system_tokens,
         }
     }
 
@@ -1052,6 +1104,7 @@ impl ProviderSnapshot {
                 .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
             reasoning_effort: info.generation.reasoning_effort,
             llama_cpp_n_ctx: None,
+            system_tokens: 0,
         }
     }
 
@@ -2102,6 +2155,7 @@ pub mod tests {
                 output_caps: Some(caps),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
                 llama_cpp_n_ctx: None,
+                system_tokens: 0,
             };
             assert_eq!(
                 host.quota_inputs(None).initial_max_tokens,

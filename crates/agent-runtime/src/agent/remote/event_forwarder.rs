@@ -18,22 +18,70 @@ use kameo::error::RemoteSendError;
 #[cfg(feature = "remote")]
 use super::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 #[cfg(feature = "remote")]
-use querymt_remote::{MeshHandle, mesh_ingress::PeerRequest, peer_access::SharingProtocol};
+use querymt_remote::{
+    MeshHandle,
+    mesh_ingress::PeerRequest,
+    peer_access::{GrantStore, PolicyChange, PolicyEffect, SharingProtocol},
+};
 
 #[cfg(feature = "remote")]
-#[derive(Clone)]
 pub(crate) struct PeerSubscription {
     pub(crate) egress: MeshHandle,
-    pub(crate) store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    pub(crate) store: Arc<dyn GrantStore>,
     pub(crate) origin: PeerRequest,
+    pub(crate) changes: Option<tokio::sync::broadcast::Receiver<PolicyChange>>,
 }
 
 #[cfg(feature = "remote")]
 impl PeerSubscription {
-    pub(crate) async fn is_current(&self) -> bool {
+    pub(crate) async fn is_current(&mut self) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        if !self.has_sessions().await {
+            return false;
+        }
+        let Some(changes) = &mut self.changes else {
+            return true;
+        };
+        loop {
+            match changes.try_recv() {
+                Ok(change) if lost_sessions(&self.origin, &change) => return false,
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => return false,
+            }
+        }
+    }
+
+    async fn has_sessions(&self) -> bool {
         matches!(self.store.grant(self.origin.key()).await, Ok(state)
             if state.grant.allows_sessions(self.origin.protocol()))
     }
+
+    async fn wait_for_loss(
+        &self,
+        mut changes: Option<tokio::sync::broadcast::Receiver<PolicyChange>>,
+    ) {
+        if let Some(changes) = &mut changes {
+            // The actor already checked the current grant and drained this
+            // receiver. Consume later changes before attempting delivery.
+            while let Ok(change) = changes.recv().await {
+                if lost_sessions(&self.origin, &change) {
+                    break;
+                }
+            }
+        } else {
+            while self.has_sessions().await {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+fn lost_sessions(origin: &PeerRequest, change: &PolicyChange) -> bool {
+    &change.key == origin.key()
+        && matches!(&change.effect, PolicyEffect::Grant(grant) if !grant.allows_sessions(origin.protocol()))
 }
 
 #[cfg(feature = "remote")]
@@ -136,29 +184,17 @@ impl EventForwarder {
         relay_ref: RemoteActorRef<EventRelayActor>,
         source_label: String,
         filter_session_id: String,
-        subscriber: Option<PeerSubscription>,
+        mut subscriber: Option<PeerSubscription>,
     ) -> EventForwarderHandle {
         let mut rx = fanout.subscribe();
         let relay_actor_id = relay_ref.id();
         let changes = subscriber
-            .as_ref()
-            .and_then(|subscriber| subscriber.store.subscribe_changes());
+            .as_mut()
+            .and_then(|subscriber| subscriber.changes.take());
         let task = tokio::spawn(async move {
             let revoked = async {
                 if let Some(subscriber) = &subscriber {
-                    querymt_remote::peer_access::wait_for_policy_loss(
-                        subscriber.store.as_ref(),
-                        subscriber.origin.key(),
-                        changes,
-                        |grant| {
-                            grant
-                                .allows_sessions(subscriber.origin.protocol())
-                                .then_some(())
-                                .ok_or(())
-                        },
-                        || (),
-                    )
-                    .await;
+                    subscriber.wait_for_loss(changes).await;
                 } else {
                     std::future::pending::<()>().await;
                 }

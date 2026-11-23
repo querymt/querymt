@@ -649,6 +649,35 @@ impl WorkspaceService {
         delegation_id: &str,
         delegation_batch_id: Option<String>,
     ) -> WorktreeResult<WorkspaceBinding> {
+        self.allocate_for_delegation_checked(
+            parent_session_id,
+            parent_record,
+            parent_cwd,
+            parent_gate,
+            delegation_id,
+            delegation_batch_id,
+            || async { Ok(()) },
+        )
+        .await
+    }
+
+    /// Check whether delegation may still allocate after waiting for the batch lock
+    /// and immediately before starting provisioning.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn allocate_for_delegation_checked<F>(
+        &self,
+        parent_session_id: &str,
+        parent_record: Option<&WorkspaceRecord>,
+        parent_cwd: &Path,
+        parent_gate: Option<&CheckoutMutationGate>,
+        delegation_id: &str,
+        delegation_batch_id: Option<String>,
+        check: impl Fn() -> F + Send + Sync,
+    ) -> WorktreeResult<WorkspaceBinding>
+    where
+        F: std::future::Future<Output = WorktreeResult<()>> + Send,
+    {
+        check().await?;
         // Placement: isolated delegation executes on the local filesystem
         // host in this version; anything else fails before any dispatch.
         crate::worktree::placement::ensure_local_filesystem_execution(parent_cwd)?;
@@ -691,6 +720,7 @@ impl WorkspaceService {
                     // Repository-wide capture runs from the resolved checkout
                     // root; the parent's relative cwd only affects where the
                     // delegate executes.
+                    check().await?;
                     self.capture_batch_baseline(
                         &resolved.checkout.root,
                         BaselineMode::CurrentWorkingTree,
@@ -707,6 +737,7 @@ impl WorkspaceService {
                         .await?
                 }
             };
+            check().await?;
             let record = self
                 .allocator
                 .allocate_with(AllocationRequest {
@@ -882,6 +913,53 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn delegation_cancellation_before_provisioning_creates_no_workspace() {
+        use crate::session::backend::StorageBackend;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "fixture")]);
+        materialize(repo.path(), &[("file.txt", "fixture")]);
+        let data = TempDir::new().unwrap();
+        let storage = querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(
+            data.path().join("sessions.db"),
+        )
+        .await
+        .unwrap();
+        let svc = WorkspaceService::new(
+            Arc::new(GixRepoOps::new()),
+            storage.workspace_repository().unwrap(),
+            data.path().join("worktrees"),
+        );
+        let checks = AtomicUsize::new(0);
+        let result = svc
+            .allocate_for_delegation_checked(
+                "parent",
+                None,
+                repo.path(),
+                None,
+                "delegate",
+                Some("batch".into()),
+                || async {
+                    if checks.fetch_add(1, Ordering::Relaxed) >= 2 {
+                        return Err(WorktreeError::InvalidOperation("fixture cancelled".into()));
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(WorktreeError::InvalidOperation(message)) if message == "fixture cancelled")
+        );
+        assert!(
+            svc.registry()
+                .list_workspaces_by_batch("batch")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn real_git_cross_feature_acceptance_retains_independent_work_and_resume() {

@@ -1139,12 +1139,15 @@ pub(super) fn restricted_mesh_tool(
     env: &TurnEnv,
     name: &str,
 ) -> Option<(Arc<dyn Tool>, querymt::chat::Tool)> {
+    if env.tool_config.policy == crate::agent::core::ToolPolicy::ProviderOnly {
+        return None;
+    }
     let builtin = env.tool_set().find(name)?;
     if !env.tool_config.allows(ToolRef::builtin(name)) {
         return None;
     }
     match name {
-        "shell" if env.tool_config.policy != crate::agent::core::ToolPolicy::ProviderOnly => {
+        "shell" => {
             let definition = builtin.definition();
             Some((builtin, definition))
         }
@@ -1190,6 +1193,21 @@ fn confined_read_definition() -> querymt::chat::Tool {
     definition
 }
 
+#[cfg(feature = "remote")]
+fn confined_read_range(args: &serde_json::Value, field: &str, default: usize) -> Option<usize> {
+    let Some(value) = args.get(field) else {
+        return Some(default);
+    };
+    if let Some(value) = value.as_u64() {
+        return usize::try_from(value).ok();
+    }
+    let value = value.as_f64()?;
+    // JSON numeric arguments may arrive as whole-number floats. Use an
+    // exclusive upper bound so rounding cannot turn overflow into a cast.
+    let exclusive_max = (usize::MAX as u128 + 1) as f64;
+    (value >= 0.0 && value < exclusive_max && value.fract() == 0.0).then_some(value as usize)
+}
+
 async fn dispatch_confined_read(exec: &TurnEnv, args: &serde_json::Value) -> ToolOutcome {
     #[cfg(feature = "remote")]
     if let Some(cwd) = exec.cwd()
@@ -1201,18 +1219,12 @@ async fn dispatch_confined_read(exec: &TurnEnv, args: &serde_json::Value) -> Too
         && crate::agent::file_proxy::is_shareable_path(relative)
     {
         use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_confined_file};
-        let offset = args
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or_default();
-        let limit = args
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(DEFAULT_READ_LIMIT)
-            .min(DEFAULT_READ_LIMIT);
-        if let Ok(parts) = render_confined_file(cwd, relative, offset, limit).await {
+        if let (Some(offset), Some(limit)) = (
+            confined_read_range(args, "offset", 0),
+            confined_read_range(args, "limit", DEFAULT_READ_LIMIT),
+        ) && let Ok(parts) =
+            render_confined_file(cwd, relative, offset, limit.min(DEFAULT_READ_LIMIT)).await
+        {
             return ToolOutcome::new(parts, false, ToolSource::Builtin, Execution::Executed);
         }
     }
@@ -3696,7 +3708,11 @@ mod prepared_call_tests {
         registry.add(Arc::new(crate::tools::builtins::ReadTool::new()));
         config.tool_registry = Arc::new(registry);
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("visible.txt"), "safe fixture").unwrap();
+        std::fs::write(
+            workspace.path().join("visible.txt"),
+            "first line\nsafe fixture\nlast line",
+        )
+        .unwrap();
         std::fs::write(workspace.path().join(".secret"), "must not read").unwrap();
         let (exec, turn) = fx.agent.turn().await;
         let mut exec = exec.tools_from(&config);
@@ -3707,12 +3723,17 @@ mod prepared_call_tests {
             std::collections::HashMap::new(),
             crate::agent::core::McpToolState::empty(),
         );
-        let call = mock_tool_call("read", "read_tool", r#"{"path":"visible.txt"}"#);
+        let call = mock_tool_call(
+            "read",
+            "read_tool",
+            r#"{"path":"visible.txt","offset":1.0,"limit":1.0}"#,
+        );
         let result = execute_tool_call(&config, &call, &exec, &turn)
             .await
             .unwrap();
         assert!(!result.is_error, "{}", text(&result));
         assert!(text(&result).contains("safe fixture"));
+        assert!(!text(&result).contains("first line") && !text(&result).contains("last line"));
         for (tool, args) in [
             ("read_tool", r#"{"path":".secret"}"#),
             ("read_tool", r#"{"path":"../visible.txt"}"#),
@@ -3725,6 +3746,12 @@ mod prepared_call_tests {
             assert!(result.is_error, "unexpected success for {tool}: {args}");
         }
         exec.confined_mesh_read = false;
+        let result = execute_tool_call(&config, &call, &exec, &turn)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        exec.confined_mesh_read = true;
+        exec.tool_config.policy = crate::agent::core::ToolPolicy::ProviderOnly;
         let result = execute_tool_call(&config, &call, &exec, &turn)
             .await
             .unwrap();

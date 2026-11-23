@@ -221,6 +221,7 @@ pub(crate) enum RemoteSessionConnectError {
     CoolingDown {
         session_id: String,
         retry_after_ms: u64,
+        owner_unreachable: bool,
     },
 }
 
@@ -258,15 +259,21 @@ impl RemoteSessionConnectError {
     /// to the owner (or local state) giving a definite answer. A load may
     /// still be served from a local copy in the former case.
     pub(crate) fn owner_unreachable(&self) -> bool {
-        matches!(
-            self,
-            Self::MeshUnavailable { .. }
-                | Self::NodeUnavailable { .. }
-                | Self::RecoveryFailed { .. }
-                | Self::TimedOut { .. }
-                | Self::HealthCheckFailed { .. }
-                | Self::CoolingDown { .. }
-        )
+        match self {
+            Self::MeshUnavailable { .. } | Self::TimedOut { .. } => true,
+            Self::NodeUnavailable { transport, .. } => transport
+                .as_ref()
+                .is_none_or(RemoteTransportFailure::owner_unreachable),
+            Self::RecoveryFailed { transport, .. } | Self::HealthCheckFailed { transport, .. } => {
+                transport
+                    .as_ref()
+                    .is_some_and(RemoteTransportFailure::owner_unreachable)
+            }
+            Self::CoolingDown {
+                owner_unreachable, ..
+            } => *owner_unreachable,
+            _ => false,
+        }
     }
 
     /// Typed transport failure for retry/invalidation decisions (Phase 6).
@@ -335,6 +342,7 @@ impl RemoteSessionConnectError {
             Self::CoolingDown {
                 session_id,
                 retry_after_ms,
+                ..
             } => {
                 data["session_id"] = serde_json::Value::String(session_id.clone());
                 data["retry_after_ms"] = serde_json::Value::from(*retry_after_ms);
@@ -407,6 +415,7 @@ impl std::fmt::Display for RemoteSessionConnectError {
             Self::CoolingDown {
                 session_id,
                 retry_after_ms,
+                ..
             } => write!(
                 f,
                 "remote session '{session_id}' recently failed to connect; retry in {retry_after_ms}ms"
@@ -459,6 +468,7 @@ pub(crate) struct ConnectCooldown {
     failures: u32,
     failed_at: Instant,
     wait: Duration,
+    owner_unreachable: bool,
 }
 
 /// Per-session retry cooldowns, independent of the single-flight gates.
@@ -638,6 +648,7 @@ impl LocalAgentHandle {
         Err(RemoteSessionConnectError::CoolingDown {
             session_id: session_id.to_string(),
             retry_after_ms,
+            owner_unreachable: state.owner_unreachable,
         })
     }
 
@@ -662,6 +673,7 @@ impl LocalAgentHandle {
                         failures,
                         failed_at: Instant::now(),
                         wait: connect_cooldown_wait(failures),
+                        owner_unreachable: error.owner_unreachable(),
                     },
                 );
             }
@@ -801,6 +813,7 @@ impl LocalAgentHandle {
         // ── Bounded recovery.
         let budget = options.reason.connect_budget();
         let prepared_slot: PreparedCandidateSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = self.config.event_sink.remote_sync(session_id, &node_id);
         let recovery = tokio::time::timeout(
             budget,
             self.recover_remote_attachment(
@@ -815,6 +828,10 @@ impl LocalAgentHandle {
         .await;
 
         match recovery {
+            Ok(Err(RemoteSessionConnectError::AccessDenied)) => {
+                state.note_history_denial();
+                Err(RemoteSessionConnectError::AccessDenied)
+            }
             Ok(connected) => connected,
             Err(_) => {
                 // The budget cancelled the recovery future. Any candidate it
@@ -1146,13 +1163,11 @@ impl LocalAgentHandle {
         }
 
         let health_timeout = Self::remote_connect_health_timeout();
-        let health = tokio::time::timeout(health_timeout, async {
-            if session_ref.uses_guarded_mesh() {
-                session_ref.check_history_access().await
-            } else {
-                session_ref.get_mode().await.map(|_| ())
-            }
-        })
+        let state = backfill_sink.remote_sync(session_id, &bookmark.node_id);
+        let health = tokio::time::timeout(
+            health_timeout,
+            Self::authorize_remote_history(&state, &session_ref),
+        )
         .await;
         let saved = if matches!(health, Ok(Ok(_))) {
             self.config
@@ -1321,7 +1336,26 @@ impl LocalAgentHandle {
             });
         }
         state.wait_synced().await;
-        connected.session_ref.check_history_access().await
+        Self::authorize_remote_history(&state, &connected.session_ref).await
+    }
+
+    pub(super) async fn authorize_remote_history(
+        state: &crate::session::remote_sync::RemoteSyncState,
+        session_ref: &crate::agent::remote::SessionActorRef,
+    ) -> Result<(), crate::error::AgentError> {
+        use crate::error::AgentError;
+
+        let generation = state.denial_generation();
+        let result = session_ref.check_history_access().await;
+        match &result {
+            Ok(()) if session_ref.is_remote() => state.note_history_authorization(generation),
+            Err(AgentError::MeshAccessDenied) => state.note_history_denial(),
+            _ => {}
+        }
+        if result.is_ok() && state.history_denied() {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        result
     }
 
     /// Build candidate metadata without mutating durable state. Persistence is
@@ -1692,6 +1726,7 @@ mod tests {
         let err = RemoteSessionConnectError::CoolingDown {
             session_id: "s".into(),
             retry_after_ms: 1_500,
+            owner_unreachable: true,
         };
         assert_eq!(err.code(), "remote_connect_cooling_down");
         assert!(err.is_retriable());
@@ -1703,7 +1738,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_connect_starts_cooldown_and_blocks_hot_retries() {
+    async fn cooldown_blocks_hot_retries_and_preserves_fallback_eligibility() {
         let (handle, _storage, _tmp) = handle_with_real_storage().await;
         assert!(
             handle
@@ -1716,6 +1751,19 @@ mod tests {
             .check_connect_cooldown("s1", RemoteConnectReason::Open)
             .unwrap_err();
         assert_eq!(err.code(), "remote_connect_cooling_down");
+        assert!(err.owner_unreachable());
+
+        handle.record_connect_outcome(
+            "s1",
+            &Err(RemoteSessionConnectError::RecoveryFailed {
+                transport: None,
+                message: "owner rejected resume".into(),
+            }),
+        );
+        let err = handle
+            .check_connect_cooldown("s1", RemoteConnectReason::Open)
+            .unwrap_err();
+        assert!(!err.owner_unreachable());
 
         // Other sessions are unaffected.
         assert!(
@@ -1760,6 +1808,7 @@ mod tests {
                 failed_at: Instant::now()
                     - Duration::from_millis(EXPLICIT_RECONNECT_COOLDOWN_MAX_MS + 100),
                 wait: Duration::from_millis(CONNECT_COOLDOWN_MAX_MS),
+                owner_unreachable: true,
             },
         );
         // A background retry is still blocked; the user's explicit reconnect is not.
@@ -1826,6 +1875,7 @@ mod tests {
                 failures: 2,
                 failed_at: Instant::now() - Duration::from_secs(120),
                 wait: Duration::from_secs(4),
+                owner_unreachable: true,
             },
         );
         assert!(
@@ -2372,6 +2422,46 @@ mod tests {
     }
 
     // ── Coordinator error-path tests (no mesh) ──────────────────────────
+
+    #[tokio::test]
+    async fn owner_acp_loads_cold_peer_session_with_local_cwd() {
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+
+        let (handle, storage, tmp) = handle_with_real_storage().await;
+        let origin = ScheduleOrigin::Peer {
+            host: "owner".into(),
+            peer: "creator".into(),
+            protocol: SchedulePeerProtocol::V1,
+        };
+        let session = handle
+            .config
+            .provider
+            .create_peer_session(origin.clone(), &handle.config.execution_config_snapshot())
+            .await
+            .unwrap();
+        let session_id = &session.session().public_id;
+        let request = || {
+            crate::acp::protocol::LoadSessionRequest::new(session_id.clone(), tmp.path().to_owned())
+        };
+        let Err(error) = handle
+            .session_materializer
+            .prepare_peer_load_session(request(), &handle.registry)
+            .await
+        else {
+            panic!("a peer cannot cold-load a confined session with a workspace");
+        };
+        assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
+
+        handle.load_session(request()).await.unwrap();
+        assert_eq!(
+            storage
+                .session_store()
+                .peer_session_origin(session_id)
+                .await
+                .unwrap(),
+            Some(origin),
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_without_hint_or_bookmark_is_bookmark_missing() {

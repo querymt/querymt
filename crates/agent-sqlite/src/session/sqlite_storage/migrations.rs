@@ -193,7 +193,23 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0039_delegation_origin",
         apply: migration_0039_delegation_origin,
     },
+    Migration {
+        version: "0040_peer_session_origin",
+        apply: migration_0040_peer_session_origin,
+    },
 ];
+
+fn migration_0040_peer_session_origin(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<HashSet<_>, _>>()?
+    };
+    if !columns.contains("peer_origin_json") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN peer_origin_json TEXT", [])?;
+    }
+    Ok(())
+}
 
 fn migration_0039_delegation_origin(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let columns = {

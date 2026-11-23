@@ -80,6 +80,7 @@ impl SqliteSessionRepository {
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
         intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
+        peer_origin_json: Option<String>,
     ) -> SessionResult<Session> {
         let cwd = cwd.map(|cwd| normalize_session_cwd(&cwd)).transpose()?;
         let now = OffsetDateTime::now_utc();
@@ -124,7 +125,7 @@ impl SqliteSessionRepository {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 tx.execute(
-                    "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions, peer_origin_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         public_id_for_insert,
                         name_for_insert,
@@ -140,6 +141,7 @@ impl SqliteSessionRepository {
                         Option::<String>::None,
                         Option::<String>::None,
                         Option::<String>::None,
+                        peer_origin_json,
                     ],
                 )?;
                 let inserted = tx.last_insert_rowid();
@@ -186,8 +188,15 @@ impl SessionRepository for SqliteSessionRepository {
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session> {
-        self.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, None)
-            .await
+        self.create_session_with_isolation_intent(
+            name,
+            cwd,
+            parent_session_id,
+            fork_origin,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {

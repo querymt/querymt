@@ -82,7 +82,8 @@ qmacp --quiet mesh watch "$PEER_ID" --timeout 30
 `--tokens` takes a positive whole-token count up to `9223372036854775807`. Use a bare
 integer (`2500000`) or decimal notation with `k` (thousands) or `M` (millions),
 for example `500k` or `2.5M`. A value that represents a fraction of a token is
-rejected rather than rounded.
+rejected rather than rounded. For `--operation update`, omit `--window` to keep
+the existing quota's cadence. The write still uses your `--expected-revision`.
 
 Full includes shell access. A Custom grant accepts an optional boolean `shell`
 (default `false`). Setting `shell` to `true` requires `filesystem: true`, and

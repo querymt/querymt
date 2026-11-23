@@ -1272,11 +1272,40 @@ mod node_manager_tests {
         let stored = config
             .provider
             .history_store()
-            .create_session(Some("retained-reference".into()), None, None, None)
+            .create_session(
+                Some("retained-reference".into()),
+                Some(workspace.path().canonicalize().unwrap()),
+                None,
+                None,
+            )
             .await
             .expect("persist fixture session");
         let session_id = stored.public_id;
-        let session = SessionActor::spawn(SessionActor::new(config, session_id.clone(), runtime));
+        let history_store = config.provider.history_store();
+        let fork_point = Uuid::new_v4().to_string();
+        history_store
+            .add_message(
+                &session_id,
+                AgentMessage {
+                    id: fork_point.clone(),
+                    session_id: session_id.clone(),
+                    role: ChatRole::User,
+                    parts: vec![MessagePart::Text {
+                        content: "saved conversation".into(),
+                    }],
+                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .unwrap();
+        let session = SessionActor::spawn(SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            runtime,
+        ));
         let host = *mesh.peer_id();
         let peer = libp2p::PeerId::random();
         let store = Arc::new(Store(
@@ -1404,6 +1433,76 @@ mod node_manager_tests {
                 .iter()
                 .any(|capability| capability == "shell")
         );
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::Custom {
+                sessions: true,
+                filesystem: true,
+                shell: true,
+                providers: vec![],
+            },
+        };
+        assert!(
+            discover_owner()
+                .await
+                .capabilities
+                .iter()
+                .any(|name| name == "shell")
+        );
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                shell: false,
+                providers: vec![],
+            },
+        };
+        let create =
+            || node_ask::<RemoteNodeManager, _>(manager.id(), &CreateRemoteSession { cwd: None });
+        let fork = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &ForkRemoteSession {
+                    source_session_id: session_id.clone(),
+                    message_id: fork_point.clone(),
+                },
+            )
+        };
+        let SwarmResponse::Ask(Ok(created)) = ingress.handle_v1(peer, create()).await.unwrap()
+        else {
+            panic!("Custom Sessions On must permit workspace-less creation");
+        };
+        let created: crate::agent::remote::CreateRemoteSessionResponse =
+            rmp_serde::from_slice(&created).unwrap();
+        let SwarmResponse::Ask(Ok(forked)) = ingress.handle_v1(peer, fork()).await.unwrap() else {
+            panic!("Custom Sessions On must permit workspace-less forks");
+        };
+        let forked: crate::agent::remote::ForkRemoteSessionResponse =
+            rmp_serde::from_slice(&forked).unwrap();
+        assert_eq!(
+            history_store
+                .get_history(&forked.session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        for id in [&created.session_id, &forked.session_id] {
+            assert_eq!(
+                history_store.get_session(id).await.unwrap().unwrap().cwd,
+                None
+            );
+            assert_eq!(
+                history_store.peer_session_origin(id).await.unwrap(),
+                Some(ScheduleOrigin::Peer {
+                    host: host.to_string(),
+                    peer: peer.to_string(),
+                    protocol: SchedulePeerProtocol::V1,
+                })
+            );
+        }
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
                 manager.id(),
@@ -1427,15 +1526,7 @@ mod node_manager_tests {
                 },
             )
         };
-        assert!(matches!(
-            ingress.handle_v1(peer, create_schedule()).await,
-            Err(SharingRejection::Denied)
-        ));
-        let revision = Uuid::now_v7();
-        *store.1.lock() = PeerGrantState {
-            revision,
-            grant: PeerGrant::Full,
-        };
+
         assert!(matches!(
             ingress.handle_v1(peer, create_schedule()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
@@ -1447,7 +1538,6 @@ mod node_manager_tests {
         let schedules = rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
             .unwrap()
             .schedules;
-        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
         assert_eq!(schedules.len(), 1);
         assert_eq!(
             schedules[0].config.origin,
@@ -1469,14 +1559,14 @@ mod node_manager_tests {
             ingress.handle_v1(peer, pause()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
-        // The CAS revision is not the identity of the schedule's owner.
+        // The CAS revision and wire protocol are not the schedule owner's identity.
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
             grant: PeerGrant::Full,
         };
-        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, list_schedules()).await
+        let SwarmResponse::Ask(Ok(bytes)) = ingress.handle_legacy(peer, list_schedules()).await
         else {
-            panic!("peer list after a CAS revision change must succeed");
+            panic!("the same peer must see its schedule on the other wire protocol");
         };
         assert_eq!(
             rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
@@ -1485,9 +1575,15 @@ mod node_manager_tests {
                 .public_id,
             schedules[0].public_id
         );
+        let deletion = node_ask::<RemoteNodeManager, _>(
+            manager.id(),
+            &DeleteRemoteSchedule {
+                schedule_public_id: schedules[0].public_id.clone(),
+            },
+        );
         assert!(matches!(
-            ingress.handle_v1(peer, pause()).await,
-            Ok(SwarmResponse::Ask(Ok(_)))
+            ingress.handle_legacy(peer, deletion).await,
+            SwarmResponse::Ask(Ok(_))
         ));
 
         *store.1.lock() = PeerGrantState {
@@ -1506,6 +1602,12 @@ mod node_manager_tests {
             ingress.handle_v1(peer, resume()).await,
             Err(SharingRejection::Denied)
         ));
+        for request in [create(), fork(), create_schedule()] {
+            assert!(matches!(
+                ingress.handle_v1(peer, request).await,
+                Err(SharingRejection::Denied)
+            ));
+        }
         let denied = discover_owner().await;
         assert_eq!(denied.node_id, shared.node_id);
         assert_eq!(denied.active_sessions, None);
@@ -2485,6 +2587,264 @@ mod node_manager_tests {
             .clone()
     }
 
+    fn successful_ask<R: serde::de::DeserializeOwned>(
+        reply: Result<
+            kameo::remote::messaging::SwarmResponse,
+            querymt_remote::mesh_ingress::SharingRejection,
+        >,
+    ) -> R {
+        let Ok(kameo::remote::messaging::SwarmResponse::Ask(Ok(bytes))) = reply else {
+            panic!("expected successful guarded ask, got {reply:?}");
+        };
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn guarded_full_peer_can_recover_and_resolve_its_own_remote_approval() {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionKind, RequestPermissionRequest, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+        use crate::agent::messages::{
+            ClaimInteractionDelivery, InputDelivery, ListPendingInteractions, ResolveInteraction,
+            SubmitInput, SubmitInputResult, SubmitSessionInput,
+        };
+        use crate::elicitation::{
+            ClaimedElicitationDelivery, ElicitationResolution, ElicitationResponse,
+            PendingElicitationSnapshot,
+        };
+        use querymt_remote::mesh_ingress::{MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(peer),
+        };
+        let grant = store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                PeerGrant::Full,
+            )
+            .await
+            .unwrap();
+        let id = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let _permit = runtime
+            .execution_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let session = SessionActor::spawn(SessionActor::new(config.clone(), id.clone(), runtime));
+        crate::agent::remote::remote_actor_impl::register_session_routes(&mesh, &session);
+        let input = SubmitSessionInput::new(SubmitInput {
+            session_id: id.clone(),
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec!["remote approval fixture".into()],
+        });
+        let SubmitInputResult::Started { run_id, .. } = successful_ask(
+            router
+                .handle_v1(peer, node_ask::<SessionActor, _>(session.id(), &input))
+                .await,
+        ) else {
+            panic!("expected the peer to start a run");
+        };
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let interaction_id = "approval-fixture".to_string();
+        let permission = RequestPermissionRequest::new(
+            id.clone(),
+            ToolCallUpdate::new("tool-fixture", ToolCallUpdateFields::new()),
+            vec![PermissionOption::new(
+                "allow_once",
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        crate::elicitation::register_pending_permission(
+            &config.pending_elicitations,
+            interaction_id.clone(),
+            id,
+            permission,
+            Some(run_id),
+            Some("tool-fixture".into()),
+            tx,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let list = node_ask::<SessionActor, _>(
+            session.id(),
+            &ListPendingInteractions {
+                assign_authority: Some("recovery-verifier".into()),
+            },
+        );
+        let pending: Vec<PendingElicitationSnapshot> =
+            successful_ask(router.handle_v1(peer, list).await);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].owner_authority.as_deref(),
+            Some("recovery-verifier")
+        );
+        let claim = node_ask::<SessionActor, _>(
+            session.id(),
+            &ClaimInteractionDelivery {
+                interaction_id: None,
+                connection_id: "connection".into(),
+                authority: Some("recovery-verifier".into()),
+            },
+        );
+        let deliveries: Vec<ClaimedElicitationDelivery> =
+            successful_ask(router.handle_v1(peer, claim).await);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].elicitation_id, interaction_id);
+        let resolve = || {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &ResolveInteraction {
+                    interaction_id: interaction_id.clone(),
+                    connection_id: "connection".into(),
+                    delivery_generation: Some(deliveries[0].delivery_generation),
+                    response: ElicitationResponse::permission_selected("allow_once"),
+                },
+            )
+        };
+        assert!(matches!(
+            router.handle_v1(libp2p::PeerId::random(), resolve()).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let resolution: ElicitationResolution =
+            successful_ask(router.handle_v1(peer, resolve()).await);
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.try_recv().unwrap().selected_permission_option(),
+            Some("allow_once")
+        );
+
+        store
+            .replace_grant(&key, grant.revision, PeerGrant::None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            router.handle_v1(peer, resolve()).await,
+            Err(SharingRejection::Denied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guarded_full_peer_can_create_delegation_and_change_mode() {
+        use crate::agent::core::AgentMode;
+        use crate::agent::messages::SetMode;
+        use crate::agent::remote::{CreateRemoteDelegationSession, CreateRemoteSessionResponse};
+        use crate::agent::session_control::SessionControlTransition;
+        use crate::session::domain::ForkOrigin;
+        use querymt_remote::mesh_ingress::{MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let handle = crate::agent::LocalAgentHandle::from_config(config.clone());
+        handle.set_mesh(mesh.clone());
+        let refs = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+            &handle, &mesh,
+        )
+        .await;
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: querymt_remote::NodeId::from_peer_id(*mesh.peer_id()),
+            peer: querymt_remote::NodeId::from_peer_id(peer),
+        };
+        let custom = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        let grant = store
+            .replace_grant(
+                &key,
+                store.grant(&key).await.unwrap().revision,
+                custom.clone(),
+            )
+            .await
+            .unwrap();
+        let create = || {
+            node_ask::<RemoteNodeManager, _>(
+                refs.node_manager.id(),
+                &CreateRemoteDelegationSession { cwd: None },
+            )
+        };
+        assert!(matches!(
+            router.handle_v1(peer, create()).await,
+            Err(SharingRejection::Denied)
+        ));
+        let full = store
+            .replace_grant(&key, grant.revision, PeerGrant::Full)
+            .await
+            .unwrap();
+        let created: CreateRemoteSessionResponse =
+            successful_ask(router.handle_v1(peer, create()).await);
+        assert_eq!(
+            config
+                .provider
+                .get_session(&created.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .fork_origin,
+            Some(ForkOrigin::Delegation),
+        );
+        let session = handle
+            .registry
+            .lock()
+            .await
+            .get(&created.session_id)
+            .unwrap()
+            .clone();
+        let crate::agent::SessionActorRef::Local(session) = session else {
+            panic!("expected a local owner actor");
+        };
+        let set_mode = |mode| node_ask::<SessionActor, _>(session.id(), &SetMode { mode });
+        let transition: SessionControlTransition =
+            successful_ask(router.handle_v1(peer, set_mode(AgentMode::Plan)).await);
+        assert_eq!(transition.current.active_mode, AgentMode::Plan);
+        store
+            .replace_grant(&key, full.revision, custom)
+            .await
+            .unwrap();
+        assert!(matches!(
+            router.handle_v1(peer, set_mode(AgentMode::Build)).await,
+            Err(SharingRejection::Denied)
+        ));
+    }
+
     #[tokio::test]
     async fn due_peer_schedule_waits_for_mesh_after_scheduler_restart() {
         verify_schedule_after_scheduler_restart(true).await;
@@ -2899,14 +3259,17 @@ mod node_manager_tests {
             .settle(attempt, AttemptUsage::Observed(12))
             .await
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(event.params.get()).unwrap(),
-            json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
-        );
+        // Both reservation and settlement change the peer-visible balance.
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(event.params.get()).unwrap(),
+                json!({"version":1,"peer_id":recipient.to_string(),"direction":"outgoing","reason":"quota"})
+            );
+        }
         assert_eq!(
             get(recipient).await["quotas"][0]["usage"]["available_tokens"],
             "18"

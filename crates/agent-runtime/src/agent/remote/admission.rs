@@ -18,7 +18,10 @@ use super::node_manager::{
 };
 use super::scope::{MeshScopeId, scoped_node_manager_for_peer};
 use kameo::error::RemoteSendError;
-use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+use querymt_remote::mesh_ingress::SharingCallError;
+use querymt_remote::peer_access::SharingProtocol;
+use querymt_remote::request_timeout::{SharingAskError, ask_remote_with_timeout, ask_sharing_v1};
+use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionPolicy {
@@ -81,6 +84,9 @@ pub(crate) enum AdmissionError {
         last_error: String,
     },
 
+    #[error("admission protocol selection failed before dispatch: {0}")]
+    BeforeDispatch(#[source] querymt_remote::mesh_ingress::SharingCallError),
+
     #[error("admission transport error: {0}")]
     Transport(String),
 
@@ -118,6 +124,7 @@ pub(crate) trait AdmissionTransport {
         &self,
         target: Self::Target,
         request: AdmissionRequest,
+        deadline: Instant,
     ) -> Result<AdmissionResponse, AdmissionError>;
 }
 
@@ -158,15 +165,45 @@ impl AdmissionTransport for MeshAdmissionTransport {
         &self,
         target: Self::Target,
         request: AdmissionRequest,
+        deadline: Instant,
     ) -> Result<AdmissionResponse, AdmissionError> {
-        ask_with_sharing(&self.mesh, &target, &request, Duration::from_secs(10))
+        let cap = Duration::from_secs(10);
+        let peer = target
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or(AdmissionError::BeforeDispatch(
+                SharingCallError::Unavailable,
+            ))?;
+        let remaining = || deadline.saturating_duration_since(Instant::now()).min(cap);
+        let protocol = self
+            .mesh
+            .select_sharing_protocol(peer, remaining())
             .await
-            .map_err(|error| match error {
-                SharingAskError::Actor(RemoteSendError::HandlerError(rejection)) => {
-                    AdmissionError::from(rejection)
+            .map_err(AdmissionError::BeforeDispatch)?;
+        let timeout = remaining();
+        if timeout.is_zero() {
+            return Err(AdmissionError::BeforeDispatch(SharingCallError::Transport(
+                libp2p::request_response::OutboundFailure::Timeout,
+            )));
+        }
+        // A timeout after selection may be an unanswered, committed admission.
+        tokio::time::timeout_at(deadline, async {
+            match protocol {
+                SharingProtocol::V1 => ask_sharing_v1(&self.mesh, &target, &request, timeout).await,
+                SharingProtocol::Legacy => {
+                    Ok(ask_remote_with_timeout(&target, &request, timeout).await?)
                 }
-                other => AdmissionError::transport(other),
-            })
+            }
+        })
+        .await
+        .map_err(AdmissionError::transport)?
+        .map_err(|error| match error {
+            SharingAskError::Actor(RemoteSendError::HandlerError(rejection)) => {
+                AdmissionError::from(rejection)
+            }
+            other => AdmissionError::transport(other),
+        })
     }
 }
 
@@ -194,12 +231,12 @@ where
         request: AdmissionRequest,
     ) -> Result<AdmissionResponse, AdmissionError> {
         let candidates = admission_candidates(inviter_peer_id, fallback_peers)?;
-        let started = tokio::time::Instant::now();
+        let deadline = Instant::now() + self.policy.max_elapsed;
         let mut attempts = 0u32;
         let mut delay = self.policy.initial_delay;
         let mut last_error = String::from("no lookup attempts completed");
 
-        loop {
+        'retry: while Instant::now() < deadline {
             attempts = attempts.saturating_add(1);
 
             for candidate in &candidates {
@@ -209,48 +246,63 @@ where
             }
 
             for candidate in &candidates {
-                match self
-                    .transport
-                    .lookup_node_manager(candidate.peer_id, &scope)
-                    .await
-                {
-                    Ok(Some(target)) => {
-                        let response = self
+                if Instant::now() >= deadline {
+                    break 'retry;
+                }
+                let lookup = tokio::time::timeout_at(
+                    deadline,
+                    self.transport
+                        .lookup_node_manager(candidate.peer_id, &scope),
+                )
+                .await;
+                match lookup {
+                    Err(error) => {
+                        last_error = error.to_string();
+                        break 'retry;
+                    }
+                    Ok(Ok(Some(target))) => {
+                        if Instant::now() >= deadline {
+                            break 'retry;
+                        }
+                        let response = match self
                             .transport
-                            .send_admission(target, request.clone())
-                            .await?;
+                            .send_admission(target, request.clone(), deadline)
+                            .await
+                        {
+                            Err(error @ AdmissionError::BeforeDispatch(_)) => {
+                                last_error = error.to_string();
+                                continue;
+                            }
+                            result => result?,
+                        };
                         if let AdmissionResponse::Rejected { reason } = response {
                             return Err(AdmissionError::Rejected { reason });
                         }
                         return Ok(response);
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         last_error = format!(
                             "no node manager for {} in scope {}",
                             candidate.peer_id, scope
                         );
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         last_error = error.to_string();
                     }
                 }
             }
 
-            let elapsed = started.elapsed();
-            if elapsed >= self.policy.max_elapsed {
-                return Err(AdmissionError::NoReachablePeer {
-                    inviter_peer_id: inviter_peer_id.to_string(),
-                    mesh_id: mesh_id.to_string(),
-                    candidate_count: candidates.len(),
-                    attempts,
-                    timeout: self.policy.max_elapsed,
-                    last_error,
-                });
-            }
-
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay.saturating_mul(2), self.policy.max_delay);
+            tokio::time::sleep_until(deadline.min(Instant::now() + delay)).await;
+            delay = delay.saturating_mul(2).min(self.policy.max_delay);
         }
+        Err(AdmissionError::NoReachablePeer {
+            inviter_peer_id: inviter_peer_id.to_string(),
+            mesh_id: mesh_id.to_string(),
+            candidate_count: candidates.len(),
+            attempts,
+            timeout: self.policy.max_elapsed,
+            last_error,
+        })
     }
 }
 
@@ -356,6 +408,9 @@ mod tests {
         lookup_after_attempt: HashMap<PeerId, u32>,
         lookup_attempts: HashMap<PeerId, u32>,
         responses: HashMap<PeerId, AdmissionResponse>,
+        unavailable_before_dispatch: HashSet<PeerId>,
+        probe_delay: Duration,
+        uncertain_after_dispatch: HashSet<PeerId>,
         dials: Vec<(PeerId, MeshScopeId)>,
         lookups: Vec<(PeerId, MeshScopeId)>,
         admissions: VecDeque<PeerId>,
@@ -419,9 +474,22 @@ mod tests {
             &self,
             target: Self::Target,
             _request: AdmissionRequest,
+            deadline: Instant,
         ) -> Result<AdmissionResponse, AdmissionError> {
+            let delay = self.inner.lock().probe_delay;
+            if !delay.is_zero() {
+                tokio::time::sleep_until(deadline.min(Instant::now() + delay)).await;
+            }
             let mut inner = self.inner.lock();
+            if inner.unavailable_before_dispatch.contains(&target.0) {
+                return Err(AdmissionError::BeforeDispatch(
+                    querymt_remote::mesh_ingress::SharingCallError::Unavailable,
+                ));
+            }
             inner.admissions.push_back(target.0);
+            if inner.uncertain_after_dispatch.contains(&target.0) {
+                return Err(AdmissionError::transport("reply lost"));
+            }
             Ok(inner
                 .responses
                 .get(&target.0)
@@ -506,6 +574,92 @@ mod tests {
             .expect("fallback admission should succeed");
 
         assert_eq!(transport.admissions(), vec![fallback]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_only_tries_another_owner_before_dispatch() {
+        let inviter = peer();
+        let fallback = peer();
+        for probe_failed in [true, false] {
+            let scope = MeshScopeId::Iroh {
+                mesh_id: "mesh-a".into(),
+            };
+            let transport = FakeAdmissionTransport::default()
+                .make_visible_after(inviter, 1)
+                .make_visible_after(fallback, 1);
+            if probe_failed {
+                transport
+                    .inner
+                    .lock()
+                    .unavailable_before_dispatch
+                    .insert(inviter);
+            } else {
+                transport
+                    .inner
+                    .lock()
+                    .uncertain_after_dispatch
+                    .insert(inviter);
+            }
+            let service = AdmissionService::new(transport.clone(), AdmissionPolicy::test_fast());
+            let result = service
+                .admit(
+                    "mesh-a",
+                    scope,
+                    &inviter.to_string(),
+                    &[PeerEntry {
+                        peer_id: fallback.to_string(),
+                        addrs: vec![],
+                    }],
+                    request(peer()),
+                )
+                .await;
+            if probe_failed {
+                assert!(matches!(result, Ok(AdmissionResponse::Readmitted { .. })));
+                assert_eq!(transport.admissions(), vec![fallback]);
+            } else {
+                assert!(matches!(result, Err(AdmissionError::Transport(_))));
+                assert_eq!(transport.admissions(), vec![inviter]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_probe_stops_at_budget_without_trying_another_candidate() {
+        let inviter = peer();
+        let fallback = peer();
+        let transport = FakeAdmissionTransport::default()
+            .make_visible_after(inviter, 1)
+            .make_visible_after(fallback, 1);
+        let policy = AdmissionPolicy::test_fast();
+        let budget = policy.max_elapsed;
+        {
+            let mut inner = transport.inner.lock();
+            inner.unavailable_before_dispatch.insert(inviter);
+            inner.probe_delay = budget * 2;
+        }
+        let service = AdmissionService::new(transport.clone(), policy);
+        let started = Instant::now();
+        let result = service
+            .admit(
+                "mesh-a",
+                MeshScopeId::Iroh {
+                    mesh_id: "mesh-a".into(),
+                },
+                &inviter.to_string(),
+                &[PeerEntry {
+                    peer_id: fallback.to_string(),
+                    addrs: vec![],
+                }],
+                request(peer()),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AdmissionError::NoReachablePeer { .. })
+        ));
+        assert_eq!(started.elapsed(), budget);
+        assert_eq!(transport.inner.lock().lookups.len(), 1);
+        assert!(transport.admissions().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

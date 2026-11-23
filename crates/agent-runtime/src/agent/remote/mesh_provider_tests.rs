@@ -17,7 +17,6 @@ mod mesh_provider_tests {
     use querymt::error::LLMError;
     use querymt_remote::should_retry_remote_send;
     use querymt_remote::{MeshChatProvider, find_provider_on_mesh};
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn mesh_chat_provider_reports_no_output_provenance() {
@@ -123,7 +122,8 @@ mod mesh_provider_tests {
     async fn test_find_provider_on_mesh_returns_none_when_no_peers() {
         let mesh = get_test_mesh().await;
         // "completely-nonexistent-provider-xyz" is never registered anywhere.
-        let result = find_provider_on_mesh(mesh, "completely-nonexistent-provider-xyz-b5").await;
+        let result =
+            find_provider_on_mesh(mesh, "completely-nonexistent-provider-xyz-b5", "demo").await;
         assert!(
             result.is_none(),
             "should return None when no peer advertises the provider"
@@ -158,17 +158,10 @@ mod mesh_provider_tests {
 
     #[tokio::test]
     async fn test_mesh_chat_provider_chat_with_tools_local_host() {
-        let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
-        // Register a ProviderHostActor under a unique peer-id keyed DHT name.
-        let f = ProviderHostFixture::new().await;
-        let node_id = format!("test-node-b8-{}", test_id);
-        let dht_name = crate::agent::remote::scope::scoped_provider_host(
-            &crate::agent::remote::scope::MeshScopeId::lan_default(),
-            &node_id,
-        );
-        mesh.register_actor(f.actor_ref, dht_name.clone()).await;
+        ProviderHostFixture::registered(mesh).await;
+        let node_id = mesh.peer_id().to_string();
 
         let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");
 

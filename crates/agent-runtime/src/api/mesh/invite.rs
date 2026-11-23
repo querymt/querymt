@@ -203,7 +203,7 @@ mod tests {
             },
             &mesh.peer_id().to_string(),
         );
-        mesh.register_actor(actor, actor_name.clone()).await;
+        mesh.register_actor(actor.clone(), actor_name.clone()).await;
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             admit_via_invite_on_runtime(&mut mesh, &invite),

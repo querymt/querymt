@@ -305,6 +305,70 @@ async fn mesh_quota_requests_retain_exact_scoped_limits() {
 }
 
 #[tokio::test]
+async fn mesh_amount_only_update_uses_the_scoped_window_and_original_revision() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+        Some("_querymt/mesh/getPeerAccess") => {
+            assert_eq!(request["params"], json!({"version": 1, "peer_id": "peer"}));
+            Reply::Result(json!({"version": 1, "peer_id": "peer", "outgoing": {
+                "revision": "newer",
+                "quotas": [
+                    {"scope": {"provider_id": "test"}, "limit": {"kind": "finite", "window": "weekly"}},
+                    {"scope": {"provider_id": "test", "model_id": "model"}, "limit": {"kind": "finite", "window": "daily"}},
+                ]
+            }}))
+        }
+        Some("_querymt/mesh/setPeerQuota") => {
+            assert_eq!(request["params"], json!({
+                "version": 1, "peer_id": "peer", "expected_revision": "original",
+                "scope": {"provider_id": "test", "model_id": "model"},
+                "operation": "update", "limit": {"kind": "finite", "limit_tokens": "100", "window": "daily"},
+            }));
+            Reply::ErrorWithData(json!({"code": "mesh_access_conflict"}))
+        }
+        _ => unexpected(request),
+    }).await;
+    let out = invoke(
+        cli().args([
+            "--quiet",
+            "--url",
+            &server.url,
+            "mesh",
+            "set-quota",
+            "peer",
+            "--expected-revision",
+            "original",
+            "--provider",
+            "test",
+            "--model",
+            "model",
+            "--tokens",
+            "100",
+            "--operation",
+            "update",
+        ]),
+        None,
+    )
+    .await;
+    assert!(!out.status.success());
+    let requests = server.finish().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "_querymt/mesh/getPeerAccess")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "_querymt/mesh/setPeerQuota")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn mesh_invalid_token_count_is_a_usage_error_without_a_quota_write() {
     for input in ["0.0001k", "9223372036854.775808M"] {
         let server = MockServer::start(unexpected).await;

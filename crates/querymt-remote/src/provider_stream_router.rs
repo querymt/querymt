@@ -443,7 +443,9 @@ impl ProviderStreamRouterActor {
             if req.is_terminal() {
                 return req.last_message_at.elapsed() < self.request_ttl;
             }
-            if req.consumer_tx.is_none() && req.last_message_at.elapsed() > self.request_ttl * 2 {
+            if req.consumer_tx.as_ref().is_none_or(|tx| tx.is_closed())
+                && req.last_message_at.elapsed() > self.request_ttl * 2
+            {
                 tracing::warn!(
                     target: "querymt_remote::provider::router",
                     request_id = %req.request_id,
@@ -1022,6 +1024,45 @@ mod tests {
         let status = router.get_status(Some(&request_id));
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].phase, RequestPhase::AwaitingStream);
+    }
+
+    #[tokio::test]
+    async fn attaching_a_consumer_prunes_idle_requests_with_closed_consumers() {
+        let router = ProviderStreamRouterActor::new(None, Some(1));
+        let requests = router.requests.clone();
+        let router = ProviderStreamRouterActor::spawn(router);
+        let (tx, rx) = mpsc::unbounded_channel();
+        router
+            .ask(RegisterRequest {
+                request_id: "old".into(),
+            })
+            .await
+            .unwrap();
+        router
+            .ask(AttachStreamConsumer {
+                request_id: "old".into(),
+                consumer_tx: tx,
+            })
+            .await
+            .unwrap();
+        drop(rx);
+        requests.lock().get_mut("old").unwrap().last_message_at =
+            Instant::now() - Duration::from_secs(3);
+        router
+            .ask(RegisterRequest {
+                request_id: "new".into(),
+            })
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        router
+            .ask(AttachStreamConsumer {
+                request_id: "new".into(),
+                consumer_tx: tx,
+            })
+            .await
+            .unwrap();
+        assert!(!requests.lock().contains_key("old"));
     }
 
     #[tokio::test]

@@ -54,10 +54,23 @@ pub(crate) fn finalize_bootstrap(
 }
 
 fn same_identity_path(a: &std::path::Path, b: &std::path::Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+    use std::path::{Path, PathBuf};
+
+    fn normalize(path: &Path) -> std::io::Result<PathBuf> {
+        std::fs::canonicalize(path).or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            let path = std::path::absolute(path)?;
+            Ok(match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => {
+                    std::fs::canonicalize(parent).map_or(path.clone(), |parent| parent.join(name))
+                }
+                _ => path,
+            })
+        })
     }
+    a == b || matches!((normalize(a), normalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 // Preserve the existing default identity's files; custom identities get private sidecars.

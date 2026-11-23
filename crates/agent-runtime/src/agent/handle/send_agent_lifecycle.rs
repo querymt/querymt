@@ -1,5 +1,39 @@
 use super::*;
 
+#[cfg(feature = "remote")]
+fn committed_fork_attach_error(
+    error: super::remote_connect::RemoteSessionConnectError,
+    node_id: &str,
+    session_id: &str,
+) -> Error {
+    let mut response = error.to_acp_error();
+    if let Some(data) = response.data.as_mut() {
+        data["session_id"] = serde_json::json!(session_id);
+        data["node_id"] = serde_json::json!(node_id);
+        data["fork_committed"] = serde_json::json!(true);
+        data["retriable"] = serde_json::json!(false);
+        data["message"] = serde_json::json!(format!(
+            "Remote fork committed; retry querymt/remote/attachSession with the child ID, not session/fork: {error}"
+        ));
+    }
+    response
+}
+
+#[cfg(all(test, feature = "remote"))]
+#[test]
+fn failed_attachment_reports_committed_remote_fork_for_recovery() {
+    let error = committed_fork_attach_error(
+        super::remote_connect::RemoteSessionConnectError::TimedOut { budget_ms: 500 },
+        "owner",
+        "child",
+    );
+    let data = error.data.unwrap();
+    assert_eq!(data["session_id"], "child");
+    assert_eq!(data["node_id"], "owner");
+    assert_eq!(data["fork_committed"], true);
+    assert_eq!(data["retriable"], false);
+}
+
 impl LocalAgentHandle {
     pub(super) async fn handle_initialize(
         &self,
@@ -114,6 +148,55 @@ impl LocalAgentHandle {
         &self,
         req: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, Error> {
+        #[cfg(feature = "remote")]
+        {
+            let session_id = req.session_id.to_string();
+            let store = self.config.provider.history_store();
+            if let Some(bookmark) = store
+                .get_remote_session_bookmark(&session_id)
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?
+            {
+                if store
+                    .get_session(&session_id)
+                    .await
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(
+                        Error::invalid_params().data("session ID exists both locally and remotely")
+                    );
+                }
+                if !req.mcp_servers.is_empty()
+                    || crate::worktree::fork_creation_options_from_meta(req.meta.as_ref())
+                        .map_err(|error| Error::invalid_params().data(error))?
+                        .is_some_and(|options| options.requests_isolation())
+                {
+                    return Err(Error::invalid_params()
+                        .data("remote forks do not accept MCP servers or workspace provisioning"));
+                }
+                let message = crate::agent::session_materializer::fork_message_id_from_meta(
+                    req.meta.as_ref(),
+                )
+                .unwrap_or_default()
+                .to_owned();
+                let owner = self.find_node_manager(&bookmark.node_id).await?;
+                let fork = self
+                    .fork_remote_session(&owner, session_id, message)
+                    .await?;
+                self.connect_remote_for_ext(
+                    &bookmark.node_id,
+                    &fork.session_id,
+                    Some(fork.handoff),
+                    false,
+                )
+                .await
+                .map_err(|error| {
+                    committed_fork_attach_error(error, &bookmark.node_id, &fork.session_id)
+                })?;
+                return Ok(ForkSessionResponse::new(fork.session_id));
+            }
+        }
         self.session_materializer
             .ensure_writable(req.session_id.0.as_ref())
             .await?;

@@ -25,8 +25,6 @@ use crate::acp::protocol::{
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
-#[cfg(feature = "remote")]
-use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_mcp::{
     ConnectedMcpPeer, SessionMaterializationKind, SessionMcpAttachmentContext,
@@ -37,8 +35,6 @@ use crate::agent::session_registry::{
 use crate::worktree::{WorkspaceBinding, WorkspaceService};
 use kameo::actor::{ActorRef, Spawn};
 use querymt_agent_core::events::AgentEventKind;
-#[cfg(feature = "remote")]
-use querymt_remote::MeshRuntimeHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -868,6 +864,25 @@ impl SessionMaterializer {
         req: LoadSessionRequest,
         registry: Option<&Mutex<SessionRegistry>>,
     ) -> Result<PreparedSessionResult, Error> {
+        self.prepare_load_session_inner(req, registry, false).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn prepare_peer_load_session(
+        &self,
+        req: LoadSessionRequest,
+        registry: &Mutex<SessionRegistry>,
+    ) -> Result<PreparedSessionResult, Error> {
+        self.prepare_load_session_inner(req, Some(registry), true)
+            .await
+    }
+
+    async fn prepare_load_session_inner(
+        &self,
+        req: LoadSessionRequest,
+        registry: Option<&Mutex<SessionRegistry>>,
+        peer_request: bool,
+    ) -> Result<PreparedSessionResult, Error> {
         let session_id = req.session_id.to_string();
 
         let single_flight_guard = self.acquire_session_lock(&session_id).await;
@@ -895,6 +910,13 @@ impl SessionMaterializer {
             })?;
 
         let request_cwd = acp_cwd_to_optional(&req.cwd)?;
+        if peer_request {
+            self.check_peer_session_start(
+                &session_id,
+                request_cwd.is_some() || session.cwd.is_some() || !req.mcp_servers.is_empty(),
+            )
+            .await?;
+        }
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // bound sessions always use their bound execution path, conflicting
         // cwd requests and missing checkouts fail closed.
@@ -1501,7 +1523,25 @@ impl SessionMaterializer {
         self.finalize_session_with_index(prepared, true).await
     }
 
-    #[cfg(feature = "remote")]
+    async fn check_peer_session_start(
+        &self,
+        session_id: &str,
+        has_workspace_or_mcp: bool,
+    ) -> Result<(), Error> {
+        let confined = self
+            .config
+            .provider
+            .history_store()
+            .peer_session_origin(session_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+            .is_some();
+        if confined && (has_workspace_or_mcp || !self.supports_restricted_cold_resume()) {
+            return Err(Error::from(crate::error::AgentError::MeshAccessDenied));
+        }
+        Ok(())
+    }
+
     pub(crate) fn supports_restricted_cold_resume(&self) -> bool {
         !self.config.hooks.is_enabled()
             && self.config.mcp_servers.is_empty()
@@ -1517,26 +1557,6 @@ impl SessionMaterializer {
         prepared: &PreparedSession,
         initialize_workspace_index: bool,
     ) -> Result<(), Error> {
-        // Register in DHT if requested (for remote sessions)
-        #[cfg(feature = "remote")]
-        if prepared.register_in_dht
-            && let Some(mesh) = self.mesh()
-        {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            crate::agent::remote::remote_actor_impl::register_session_routes(
-                &mesh,
-                &prepared.actor_ref,
-            );
-            for scope in runtime.active_scopes() {
-                let dht_name = scoped_session(&scope, &prepared.session_id);
-                let runtime = runtime.clone();
-                let actor_ref = prepared.actor_ref.clone();
-                tokio::spawn(async move {
-                    runtime.register_actor(actor_ref, dht_name).await;
-                });
-            }
-        }
-
         // Emit SessionCreated before later setup events so callers that await finalization
         // can observe session creation deterministically.
         self.config
@@ -1942,7 +1962,7 @@ impl SessionMaterializer {
     }
 }
 
-fn fork_message_id_from_meta(
+pub(crate) fn fork_message_id_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<&str> {
     let querymt = meta?.get("querymt")?;

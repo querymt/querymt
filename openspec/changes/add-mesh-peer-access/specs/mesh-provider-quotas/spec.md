@@ -1,5 +1,13 @@
 ## ADDED Requirements
 
+### Requirement: Standalone provider hosts can opt into peer policy
+
+A standalone provider host started with a grant and quota store SHALL enforce the same provider policy as an agent host, in addition to the global model allowlist. If a supplied store cannot be opened, startup SHALL fail. Without a store, any connected peer MAY consume globally shared models, without per-peer grants or quotas.
+
+#### Scenario: Standalone sharing respects its configured mode
+- **WHEN** a standalone host shares the same global model allowlist with and without a peer access store
+- **THEN** in store-backed mode a peer needs a matching grant and available quota; in no-store mode connected peers may use the allowlisted models without per-peer checks; neither mode exposes a model outside the global allowlist
+
 ### Requirement: Provider grants filter discovery and execution
 
 A Custom grant SHALL allow selected host providers, each with all currently and subsequently available models or a non-empty list of canonical model IDs. Quota configuration SHALL NOT grant model access. The host SHALL enforce selection on catalogs, contract queries, direct inference, and session-triggered inference. It SHALL use host-owned bindings and credentials and SHALL NOT silently fall back on policy denial.
@@ -58,11 +66,11 @@ Before dispatch, the host SHALL atomically reserve the full token estimate in ea
 
 ### Requirement: All providers use the same reservation estimate
 
-For all providers and request forms, the estimate SHALL be prompt tokens plus the effective output cap, limited by configured llama.cpp `n_ctx` or the models.dev context window. If there is no configured `n_ctx` and the model is absent from models.dev, the host SHALL use the profile context middleware's `fallback_max_tokens` if available. With no applicable ceiling the estimate SHALL be uncapped. The host SHALL NOT use profile context overrides or add a separate media allowance.
+The estimate SHALL add the prepared prompt (including configured system text and tool definitions) to the effective output cap. The host SHALL clamp the sum to llama.cpp `n_ctx` if configured, otherwise to the models.dev context window. If neither applies and the model is absent from models.dev, the host SHALL use `fallback_max_tokens` when configured. With no applicable ceiling, the sum SHALL be uncapped. The host SHALL NOT add a media allowance or use profile context overrides.
 
 #### Scenario: One reservation estimate applies to every provider and request form
 - **WHEN** otherwise authorized requests with finite quotas use one-shot or streaming inference, including requests containing media, and some supply an explicit `max_tokens`
-- **THEN** each reservation is the estimated prompt plus the effective output cap, using the explicit cap when supplied and clamping the sum to models.dev context or configured llama.cpp `n_ctx` as applicable, without separate media rules or use of a context override
+- **THEN** each reservation is the estimated prompt plus the effective output cap, using the explicit cap when the bound provider supports the override and clamping the sum to models.dev context or configured llama.cpp `n_ctx` as applicable, without separate media rules or use of a context override
 
 #### Scenario: Absent model metadata does not prevent admission
 - **WHEN** the model is absent from models.dev, no llama.cpp `n_ctx` is configured, and each applicable finite scope has capacity

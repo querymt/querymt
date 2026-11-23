@@ -471,6 +471,57 @@ impl PeerTurn {
         .await
     }
 
+    /// Check a one-shot mutation at the last boundary before starting its side effect.
+    pub(crate) async fn check_mutation(&self) -> Result<(), AgentError> {
+        self.check_mutation_grants(
+            |grant| self.check_grant(grant, None),
+            |_| AgentError::MeshAccessDenied,
+        )
+        .await
+    }
+
+    pub(crate) async fn check_schedule_mutation(&self) -> Result<(), AgentError> {
+        self.check_mutation_grants(
+            |grant| {
+                if grant.allows_sessions(self.protocol) {
+                    Ok(())
+                } else {
+                    Err(AgentError::MeshAccessDenied)
+                }
+            },
+            |_| AgentError::Internal("mesh access store unavailable".into()),
+        )
+        .await
+    }
+
+    async fn check_mutation_grants(
+        &self,
+        check: impl Fn(&querymt_remote::peer_access::PeerGrant) -> Result<(), AgentError>,
+        store_error: impl FnOnce(querymt_remote::peer_access::GrantStoreError) -> AgentError,
+    ) -> Result<(), AgentError> {
+        use querymt_remote::peer_access::{PolicyChange, PolicyEffect};
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let state = self.store.grant(&self.key).await.map_err(store_error)?;
+        check(&state.grant)?;
+        if let Some(changes) = self.changes.lock().as_mut() {
+            loop {
+                match changes.try_recv() {
+                    Ok(PolicyChange {
+                        key,
+                        effect: PolicyEffect::Grant(grant),
+                    }) if key == self.key => {
+                        check(&grant)?;
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(_) => return Err(AgentError::MeshAccessDenied),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn schedule_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
         use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
         use querymt_remote::peer_access::SharingProtocol;
@@ -545,10 +596,13 @@ impl TurnAuthority {
         &self,
         origin: &crate::session::domain_schedule::ScheduleOrigin,
     ) -> bool {
-        matches!(
-            origin,
-            crate::session::domain_schedule::ScheduleOrigin::Peer { .. }
-        ) && self.stored_origin() == *origin
+        use crate::session::domain_schedule::ScheduleOrigin;
+        match (self, origin) {
+            (Self::Peer(caller), ScheduleOrigin::Peer { host, peer, .. }) => {
+                caller.key.host.to_string() == *host && caller.key.peer.to_string() == *peer
+            }
+            _ => false,
+        }
     }
 
     pub(crate) async fn check(&self) -> Result<(), AgentError> {
@@ -2071,12 +2125,219 @@ impl Message<ResolveInteraction> for SessionActor {
             msg.response,
         )
         .await
-        .map_err(|error| AgentError::InvalidInteractionResponse {
-            detail: match error.data {
-                Some(serde_json::Value::String(data)) => data,
-                _ => error.message,
+        .map_err(interaction_response_error)
+    }
+}
+
+fn interaction_response_error(error: crate::acp::protocol::Error) -> AgentError {
+    AgentError::InvalidInteractionResponse {
+        detail: match error.data {
+            Some(serde_json::Value::String(data)) => data,
+            _ => error.message,
+        },
+    }
+}
+
+// Only the authenticated ingress adapter constructs this mailbox message.
+#[cfg(feature = "remote")]
+pub(crate) struct PeerInteraction<M> {
+    pub(crate) peer: Arc<PeerTurn>,
+    pub(crate) message: M,
+}
+
+#[cfg(feature = "remote")]
+struct PeerInteractionScope<'a> {
+    session_id: &'a str,
+    run_id: String,
+    prefix: String,
+}
+
+#[cfg(feature = "remote")]
+impl PeerInteractionScope<'_> {
+    fn matches(&self, entry: &crate::elicitation::PendingElicitation) -> bool {
+        entry.session_id == self.session_id
+            && entry.run_id.as_deref() == Some(self.run_id.as_str())
+            && entry
+                .owner_authority
+                .as_deref()
+                .is_none_or(|id| id.starts_with(&self.prefix))
+            && entry
+                .delivery_connection
+                .as_deref()
+                .is_none_or(|id| id.starts_with(&self.prefix))
+    }
+
+    fn bind(&self, id: &str) -> String {
+        format!("{}{id}", self.prefix)
+    }
+
+    fn unbind(&self, id: Option<String>) -> Option<String> {
+        id.and_then(|id| id.strip_prefix(&self.prefix).map(str::to_owned))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl PeerTurn {
+    fn check_interaction_changes(
+        &self,
+        changes: Option<
+            tokio::sync::broadcast::Receiver<querymt_remote::peer_access::PolicyChange>,
+        >,
+    ) -> Result<(), AgentError> {
+        use querymt_remote::peer_access::{PolicyChange, PolicyEffect};
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let Some(mut changes) = changes else {
+            return Ok(());
+        };
+        loop {
+            match changes.try_recv() {
+                Ok(PolicyChange {
+                    key,
+                    effect: PolicyEffect::Grant(grant),
+                }) if key == self.key => {
+                    self.check_grant(&grant, None)?;
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(_) => return Err(AgentError::MeshAccessDenied),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl SessionActor {
+    async fn lock_peer_interactions(
+        &self,
+        peer: Arc<PeerTurn>,
+    ) -> Result<
+        Option<(
+            PeerInteractionScope<'_>,
+            tokio::sync::MutexGuard<'_, HashMap<String, crate::elicitation::PendingElicitation>>,
+        )>,
+        AgentError,
+    > {
+        let caller = TurnAuthority::Peer(peer.clone());
+        let caller_changes = peer.store.subscribe_peer_changes(&peer.key);
+        caller.check().await?;
+        let RunSlot::Running(run, authority @ TurnAuthority::Peer(run_peer)) = &self.run else {
+            return Ok(None);
+        };
+        if !caller.can_control(authority) {
+            return Ok(None);
+        }
+        let run_changes = run_peer.store.subscribe_peer_changes(&run_peer.key);
+        authority.check().await?;
+
+        let entries = self.config.pending_elicitations.lock().await;
+        // Recheck changes during authorization and lock contention without store I/O.
+        peer.check_interaction_changes(caller_changes)?;
+        run_peer.check_interaction_changes(run_changes)?;
+        if run.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some((
+            PeerInteractionScope {
+                session_id: &self.session_id,
+                run_id: run.run_id.to_string(),
+                // ACP verifiers and connection IDs are scoped to the sending peer.
+                prefix: format!("mesh:{}:", peer.key.peer),
             },
-        })
+            entries,
+        )))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ListPendingInteractions>> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::PendingElicitationSnapshot>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ListPendingInteractions>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let Some((scope, mut entries)) = self.lock_peer_interactions(peer).await? else {
+            return Ok(Vec::new());
+        };
+        if let Some(verifier) = message.assign_authority.as_deref() {
+            let bound = scope.bind(verifier);
+            for entry in entries.values_mut().filter(|entry| scope.matches(entry)) {
+                if entry.owner_authority.is_none() {
+                    entry.owner_authority = Some(bound.clone());
+                }
+            }
+        }
+        let mut snapshots =
+            crate::elicitation::snapshot_matching(&entries, |entry| scope.matches(entry));
+        for snapshot in &mut snapshots {
+            snapshot.owner_authority = scope.unbind(snapshot.owner_authority.take());
+            snapshot.delivery_connection = scope.unbind(snapshot.delivery_connection.take());
+        }
+        Ok(snapshots)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ClaimInteractionDelivery>> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::ClaimedElicitationDelivery>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ClaimInteractionDelivery>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if message.authority.is_none() && message.interaction_id.is_none() {
+            return Err(AgentError::InvalidInteractionResponse {
+                detail: "claim requires an interaction id or an authority".to_string(),
+            });
+        }
+        let Some((scope, mut entries)) = self.lock_peer_interactions(peer).await? else {
+            return Ok(Vec::new());
+        };
+        let verifier = message.authority.as_deref().map(|id| scope.bind(id));
+        Ok(crate::elicitation::claim_matching(
+            &mut entries,
+            &scope.bind(&message.connection_id),
+            |id, entry| {
+                scope.matches(entry)
+                    && message
+                        .interaction_id
+                        .as_deref()
+                        .is_none_or(|expected| id == expected)
+                    && verifier
+                        .as_ref()
+                        .is_none_or(|verifier| entry.owner_authority.as_ref() == Some(verifier))
+            },
+        ))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerInteraction<ResolveInteraction>> for SessionActor {
+    type Reply = Result<crate::elicitation::ElicitationResolution, AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerInteraction { peer, message }: PeerInteraction<ResolveInteraction>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::elicitation::ElicitationResolution;
+
+        let Some((scope, mut entries)) = self.lock_peer_interactions(peer).await? else {
+            return Ok(ElicitationResolution::NotFound);
+        };
+        let connection = scope.bind(&message.connection_id);
+        crate::elicitation::resolve_matching(
+            &mut entries,
+            &message.interaction_id,
+            &connection,
+            message.delivery_generation,
+            message.response,
+            |entry| scope.matches(entry) && entry.delivery_connection.is_some(),
+        )
+        .map_err(interaction_response_error)
     }
 }
 
@@ -2300,7 +2561,7 @@ impl SessionActor {
     async fn install_event_subscription(
         &mut self,
         msg: SubscribeEvents,
-        subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
+        mut subscriber: Option<crate::agent::remote::event_forwarder::PeerSubscription>,
     ) -> Result<(), AgentError> {
         use crate::agent::remote::event_forwarder::EventForwarder;
         use crate::agent::remote::event_relay::EventRelayActor;
@@ -2341,7 +2602,7 @@ impl SessionActor {
         };
 
         let relay_id = relay_ref.id();
-        if let Some(subscriber) = &subscriber
+        if let Some(subscriber) = &mut subscriber
             && (relay_id.sequence_id() != msg.relay_actor_id
                 || relay_id.peer_id() != Some(subscriber.origin.key().peer.as_peer_id())
                 || !subscriber.is_current().await)
@@ -2579,6 +2840,60 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .map_err(FileProxyError::ReadError)?;
 
         Ok(ReadRemoteFileResponse::from_blocks(blocks))
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct GetPeerFileIndex;
+
+#[cfg(feature = "remote")]
+impl Message<GetPeerFileIndex> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::GetFileIndexResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        _: GetPeerFileIndex,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::is_shareable_path;
+        match <Self as Message<crate::agent::messages::GetFileIndex>>::handle(
+            self,
+            crate::agent::messages::GetFileIndex,
+            ctx,
+        )
+        .await
+        {
+            Ok(mut index) => {
+                index
+                    .files
+                    .retain(|entry| is_shareable_path(std::path::Path::new(&entry.path)));
+                Ok(index)
+            }
+            #[cfg(target_os = "linux")]
+            Err(crate::agent::file_proxy::FileProxyError::IndexNotReady) => {
+                use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse};
+                let root = self
+                    .runtime
+                    .cwd
+                    .as_deref()
+                    .ok_or(FileProxyError::NoWorkingDirectory)?;
+                let files = crate::tools::builtins::read_shared::list_confined_workspace(root)
+                    .await
+                    .map_err(FileProxyError::ReadError)?;
+                Ok(GetFileIndexResponse {
+                    files,
+                    generated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    workspace_root: root.display().to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -4338,7 +4653,17 @@ mod tests {
     use kameo::actor::Spawn;
     use querymt::LLMParams;
     use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
+    #[cfg(feature = "remote")]
+    use querymt_remote::{
+        NodeId,
+        peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
+            PolicyEffect,
+        },
+    };
     use tokio::sync::Mutex;
+    #[cfg(feature = "remote")]
+    use tokio::sync::{Semaphore, broadcast};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -7321,6 +7646,108 @@ mod tests {
             action: crate::elicitation::ElicitationAction::Accept,
             content: Some(content),
         }
+    }
+
+    #[cfg(feature = "remote")]
+    struct PausedInteractionGrantStore {
+        started: Semaphore,
+        resume: Semaphore,
+        changes: broadcast::Sender<PolicyChange>,
+    }
+
+    #[cfg(feature = "remote")]
+    #[async_trait::async_trait]
+    impl GrantStore for PausedInteractionGrantStore {
+        async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+            self.started.add_permits(1);
+            self.resume.acquire().await.unwrap().forget();
+            Ok(PeerGrantState {
+                grant: PeerGrant::Full,
+                ..Default::default()
+            })
+        }
+
+        fn subscribe_changes(&self) -> Option<broadcast::Receiver<PolicyChange>> {
+            Some(self.changes.subscribe())
+        }
+
+        async fn replace_grant(
+            &self,
+            _: &PeerGrantKey,
+            _: Uuid,
+            _: PeerGrant,
+        ) -> Result<PeerGrantState, GrantStoreError> {
+            unreachable!("test delivers a policy effect directly")
+        }
+
+        async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+            unreachable!("interaction handling does not list peers")
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_interaction_policy_reads_leave_map_free_and_revocation_blocks_use() {
+        let f = ActorFixture::new().await;
+        let store = Arc::new(PausedInteractionGrantStore {
+            started: Semaphore::new(0),
+            resume: Semaphore::new(0),
+            changes: broadcast::channel(1).0,
+        });
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let peer = PeerTurn::test_peer(key.clone(), PeerGrant::Full, store.clone());
+        let mut actor = SessionActor::new(
+            f.config.clone(),
+            "peer-session".into(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        let run_id = querymt_agent_core::model::TurnId::new();
+        actor.run = RunSlot::Running(
+            ActiveRun::new(run_id, 1, CancellationToken::new()),
+            TurnAuthority::Peer(peer.clone()),
+        );
+        let actor_ref = SessionActor::spawn(actor);
+        let ask = tokio::spawn(async move {
+            actor_ref
+                .ask(PeerInteraction {
+                    peer,
+                    message: ListPendingInteractions {
+                        assign_authority: Some("verifier".into()),
+                    },
+                })
+                .await
+        });
+
+        store.started.acquire().await.unwrap().forget();
+        let entries = f
+            .config
+            .pending_elicitations
+            .try_lock()
+            .expect("another session can access the map during grant I/O");
+        store.resume.add_permits(2);
+        store.started.acquire().await.unwrap().forget();
+        // Both reads report the earlier Full policy. Its revocation is observed at use.
+        store
+            .changes
+            .send(PolicyChange {
+                key,
+                effect: PolicyEffect::Grant(PeerGrant::None),
+            })
+            .unwrap();
+        drop(entries);
+        assert!(matches!(
+            ask.await.unwrap(),
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshAccessDenied
+            ))
+        ));
     }
 
     #[tokio::test]

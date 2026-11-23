@@ -124,7 +124,7 @@ mod remote_impl {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
     use tokio::sync::Mutex;
 
     // ── Messages ──────────────────────────────────────────────────────────────
@@ -142,6 +142,7 @@ mod remote_impl {
         Policy,
         Quota,
         Catalog,
+        Availability,
     }
 
     impl PeerAccessInvalidated {
@@ -150,6 +151,7 @@ mod remote_impl {
                 Self::Policy => "policy",
                 Self::Quota => "quota",
                 Self::Catalog => "catalog",
+                Self::Availability => "availability",
             }
         }
     }
@@ -236,6 +238,7 @@ mod remote_impl {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ForkRemoteSession {
         pub source_session_id: String,
+        /// An empty ID selects the latest persisted message on the owner.
         pub message_id: String,
     }
 
@@ -354,12 +357,7 @@ mod remote_impl {
         pub schedule_public_id: String,
     }
 
-    enum ScheduleAction {
-        Pause,
-        Resume,
-        Trigger,
-        Delete,
-    }
+    use crate::scheduler::{PeerScheduleMutation, ScheduleAction, SchedulerHandle};
 
     impl ScheduleAction {
         async fn apply(
@@ -513,7 +511,7 @@ mod remote_impl {
         pub mesh: Option<MeshHandle>,
         /// Per-session async locks preventing concurrent materialization of the
         /// same `session_id`.  Different sessions are independent.
-        pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+        materialization_locks: Arc<MaterializationLocks>,
         /// Shared scheduler owner borrowed from the local agent handle.
         pub scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
         /// Serializes first-start attempts so concurrent requests converge on one result.
@@ -568,7 +566,7 @@ mod remote_impl {
                 session_materializer,
                 session_meta: Arc::new(Mutex::new(HashMap::new())),
                 mesh,
-                materialization_locks: Arc::new(Mutex::new(HashMap::new())),
+                materialization_locks: Default::default(),
                 scheduler_handle,
                 scheduler_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
@@ -607,37 +605,37 @@ mod remote_impl {
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<ListRemoteSchedules, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<PauseRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<ResumeRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<TriggerRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             Self::register_peer_ask::<DeleteRemoteSchedule, _>(
                 router,
                 &store,
                 actor,
-                InboundAccess::Full,
+                InboundAccess::Sessions,
             );
             use crate::agent::remote::remote_actor_impl::{
                 register_session_read, register_session_request,
@@ -648,11 +646,28 @@ mod remote_impl {
                 actor,
                 InboundAccess::Sessions,
             );
-            register_session_request::<_, CreateRemoteSession>(router, actor, InboundAccess::Full);
-            register_session_request::<_, CreateRemoteSessionWithProfile>(
+            register_session_request::<_, CreateRemoteDelegationSession>(
                 router,
                 actor,
                 InboundAccess::Full,
+            );
+            Self::register_peer_ask::<CreateRemoteSession, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::Sessions,
+            );
+            Self::register_peer_ask::<CreateRemoteSessionWithProfile, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::Sessions,
+            );
+            Self::register_peer_ask::<ForkRemoteSession, _>(
+                router,
+                &store,
+                actor,
+                InboundAccess::Sessions,
             );
             register_session_read::<_, GetRemoteSessionProfile>(router, actor);
             register_session_read::<_, ListRemoteSessions>(router, actor);
@@ -674,7 +689,7 @@ mod remote_impl {
                         .await
                         .map_or(PeerGrant::None, |state| state.grant);
                     info.capabilities.retain(|name| match name.as_str() {
-                        "shell" => grant == PeerGrant::Full,
+                        "shell" => grant.allows_shell(protocol),
                         "filesystem" => grant.allows_filesystem(protocol),
                         _ => false,
                     });
@@ -871,6 +886,23 @@ mod remote_impl {
             *self.scheduler_handle.lock() = None;
         }
 
+        fn clear_stopped_scheduler(&self, stopped: &SchedulerHandle) {
+            let mut slot = self.scheduler_handle.lock();
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.is_same_actor(stopped))
+            {
+                *slot = None;
+            }
+        }
+
+        fn schedule_mutation_error(error: kameo::error::SendError<(), AgentError>) -> AgentError {
+            match error {
+                kameo::error::SendError::HandlerError(error) => error,
+                _ => AgentError::Internal(error.to_string()),
+            }
+        }
+
         async fn start_scheduler(&self) -> bool {
             let schedule_repo = match &self.config.schedule_repository {
                 Some(repo) => repo.clone(),
@@ -926,7 +958,7 @@ mod remote_impl {
                 max_cost_usd,
                 max_runs,
             } = request;
-            TurnAuthority::Peer(origin.clone()).check().await?;
+            origin.check_schedule_mutation().await?;
 
             let store = self.config.provider.history_store();
             let session = store
@@ -958,6 +990,7 @@ mod remote_impl {
                 created_at: now,
                 updated_at: now,
             };
+            origin.check_schedule_mutation().await?;
             let task = store
                 .create_task(task)
                 .await
@@ -979,13 +1012,16 @@ mod remote_impl {
             }
 
             let schedule_public_id = schedule.public_id.clone();
-            match scheduler.add_schedule(schedule).await {
+            match scheduler
+                .peer_mutation(origin, PeerScheduleMutation::Add(Box::new(schedule)))
+                .await
+            {
                 Ok(()) => Ok(CreateRemoteScheduleResponse { schedule_public_id }),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if Self::is_actor_not_running_error(&msg) {
-                        self.clear_scheduler_handle();
+                Err(error) => {
+                    if matches!(error, kameo::error::SendError::ActorNotRunning(_)) {
+                        self.clear_stopped_scheduler(&scheduler);
                     }
+                    let error = Self::schedule_mutation_error(error);
 
                     let cleanup_suffix = match store.delete_task(&task.public_id).await {
                         Ok(()) => String::new(),
@@ -995,7 +1031,11 @@ mod remote_impl {
                         ),
                     };
 
-                    Err(AgentError::Internal(format!("{msg}{cleanup_suffix}")))
+                    if cleanup_suffix.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(AgentError::Internal(format!("{error}{cleanup_suffix}")))
+                    }
                 }
             }
         }
@@ -1088,9 +1128,6 @@ mod remote_impl {
                 return SessionHandoff::no_attach_path();
             }
 
-            if let Some(mesh) = &self.mesh {
-                crate::agent::remote::remote_actor_impl::register_session_routes(mesh, &actor_ref);
-            }
             match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
                 .catch_unwind()
                 .await
@@ -1129,14 +1166,8 @@ mod remote_impl {
             // Prevents two concurrent callers from materializing the same
             // session_id into separate SessionActor instances.  Different
             // session IDs proceed independently.
-            let session_lock = {
-                let mut locks = self.materialization_locks.lock().await;
-                locks
-                    .entry(session_id.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .clone()
-            };
-            let _guard = session_lock.lock().await;
+            let session_lock = MaterializationTicket::new(&self.materialization_locks, &session_id);
+            let _guard = session_lock.lock.lock().await;
 
             let (registry, materializer) = self
                 .bound_session_runtime(&session_id)
@@ -1149,10 +1180,7 @@ mod remote_impl {
             if let Some(crate::agent::remote::SessionActorRef::Local(existing)) =
                 crate::agent::session_registry::live_session(&registry, &session_id).await
             {
-                let handoff = self.handoff_for_local_actor(&session_id, existing).await;
-                self.cleanup_materialization_lock(&session_id, &session_lock)
-                    .await;
-                return Ok(handoff);
+                return Ok(self.handoff_for_local_actor(&session_id, existing).await);
             }
 
             let restricted = match peer {
@@ -1172,7 +1200,7 @@ mod remote_impl {
             );
 
             let (prepared, actor_ref) = match materializer
-                .prepare_load_session(req, Some(&registry))
+                .prepare_peer_load_session(req, &registry)
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?
             {
@@ -1231,25 +1259,70 @@ mod remote_impl {
                 title
             );
 
-            drop(_guard);
-            self.cleanup_materialization_lock(&session_id, &session_lock)
-                .await;
-
             Ok(handoff)
         }
+    }
 
-        /// Best-effort cleanup of a per-session lock map entry when no other
-        /// task is waiting on it.
-        async fn cleanup_materialization_lock(
-            &self,
-            session_id: &str,
-            lock: &Arc<tokio::sync::Mutex<()>>,
-        ) {
-            let mut locks = self.materialization_locks.lock().await;
-            if Arc::strong_count(lock) == 2 {
-                locks.remove(session_id);
+    type MaterializationLocks = parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>;
+
+    struct MaterializationTicket<'a> {
+        id: String,
+        lock: Arc<Mutex<()>>,
+        locks: &'a MaterializationLocks,
+    }
+
+    impl<'a> MaterializationTicket<'a> {
+        fn new(locks: &'a MaterializationLocks, id: &str) -> Self {
+            use std::collections::hash_map::Entry;
+            let lock = match locks.lock().entry(id.to_owned()) {
+                Entry::Occupied(entry) => {
+                    entry.get().upgrade().expect("live materialization ticket")
+                }
+                Entry::Vacant(entry) => {
+                    let lock = Arc::new(Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            };
+            Self {
+                id: id.to_owned(),
+                lock,
+                locks,
             }
         }
+    }
+
+    impl Drop for MaterializationTicket<'_> {
+        fn drop(&mut self) {
+            let mut locks = self.locks.lock();
+            // Release the ticket's strong reference under the same lock used
+            // to admit waiters, including when an awaiting caller is dropped.
+            if Arc::strong_count(&self.lock) == 1 {
+                locks.remove(&self.id);
+            } else {
+                // Drop before releasing the map lock so concurrent drops
+                // cannot both count each other and leave an expired entry.
+                drop(std::mem::take(&mut self.lock));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_materialization_waiter_retires_its_ticket() {
+        let locks = MaterializationLocks::default();
+        let owner = MaterializationTicket::new(&locks, "session");
+        let hold = owner.lock.lock().await;
+        let waiter = MaterializationTicket::new(&locks, "session");
+        assert!(Arc::ptr_eq(&owner.lock, &waiter.lock));
+        let mut acquire = Box::pin(async move {
+            let _guard = waiter.lock.lock().await;
+        });
+        assert!(futures_util::poll!(&mut acquire).is_pending());
+        drop(acquire);
+        assert!(locks.lock().contains_key("session"));
+        drop(hold);
+        drop(owner);
+        assert!(locks.lock().is_empty());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1280,7 +1353,16 @@ mod remote_impl {
             cwd: Option<String>,
             profile_id: Option<String>,
             fork_origin: Option<crate::session::domain::ForkOrigin>,
+            peer: Option<&PeerTurn>,
         ) -> Result<CreateRemoteSessionResponse, AgentError> {
+            let restricted = match peer {
+                Some(peer) => peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full,
+                None => false,
+            };
+            if restricted && cwd.as_ref().is_some_and(|cwd| !cwd.is_empty()) {
+                return Err(AgentError::MeshAccessDenied);
+            }
+            let cwd = if restricted { None } else { cwd };
             let cwd_path = cwd.as_ref().map(PathBuf::from);
             if let Some(ref path) = cwd_path
                 && !path.is_absolute()
@@ -1312,17 +1394,38 @@ mod remote_impl {
                 .as_ref()
                 .map(|runtime| runtime.handle().config.clone())
                 .unwrap_or_else(|| self.config.clone());
-            let session_context = config
-                .provider
-                .create_session_with_isolation_intent(
-                    cwd_path.clone(),
-                    None,
-                    fork_origin,
-                    &config.execution_config_snapshot(),
-                    None,
-                )
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
+            let materializer = owner_runtime.as_ref().map_or_else(
+                || self.session_materializer.clone(),
+                |runtime| runtime.handle().session_materializer.clone(),
+            );
+            if restricted && !materializer.supports_restricted_cold_resume() {
+                return Err(AgentError::MeshAccessDenied);
+            }
+            if let Some(peer) = peer {
+                peer.check_mutation().await?;
+            }
+            let execution = config.execution_config_snapshot();
+            let session_context = match peer.filter(|_| restricted) {
+                Some(peer) => {
+                    config
+                        .provider
+                        .create_peer_session(peer.schedule_origin(), &execution)
+                        .await
+                }
+                None => {
+                    config
+                        .provider
+                        .create_session_with_isolation_intent(
+                            cwd_path.clone(),
+                            None,
+                            fork_origin,
+                            &execution,
+                            None,
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
 
             let session = session_context.session();
             let session_id = session.public_id.clone();
@@ -1361,7 +1464,7 @@ mod remote_impl {
                     cwd.clone(),
                     title.clone(),
                     created_at,
-                    None,
+                    peer,
                 )
                 .await?;
 
@@ -1396,7 +1499,7 @@ mod remote_impl {
             let shared_state = self.shared_state.clone();
 
             // Spawn the work as a background task
-            ctx.spawn(async move { shared_state.create_session(msg.cwd, None, None).await })
+            ctx.spawn(async move { shared_state.create_session(msg.cwd, None, None, None).await })
         }
     }
 
@@ -1420,6 +1523,7 @@ mod remote_impl {
                         msg.cwd,
                         None,
                         Some(crate::session::domain::ForkOrigin::Delegation),
+                        None,
                     )
                     .await
             })
@@ -1444,11 +1548,26 @@ mod remote_impl {
             msg: ForkRemoteSession,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            // Capture shared state for the spawned task
-            let shared_state = self.shared_state.clone();
+            self.handle_fork(msg, None, ctx).await
+        }
+    }
 
-            // Spawn the heavy work as a background task
+    impl RemoteNodeManager {
+        async fn handle_fork(
+            &self,
+            msg: ForkRemoteSession,
+            peer: Option<Arc<PeerTurn>>,
+            ctx: &mut Context<
+                Self,
+                kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>>,
+            >,
+        ) -> kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>> {
+            let shared_state = self.shared_state.clone();
             ctx.spawn(async move {
+                let restricted = match &peer {
+                    Some(peer) => peer.grant().await? != querymt_remote::peer_access::PeerGrant::Full,
+                    None => false,
+                };
                 let profiles = shared_state.profiles.load_full();
                 let source_binding = match profiles.as_ref().as_ref() {
                     Some(profiles) => profiles.session_binding(&msg.source_session_id).await,
@@ -1461,7 +1580,7 @@ mod remote_impl {
                     }),
                     None => None,
                 };
-                let config = match &owner_runtime {
+                let (config, materializer) = match &owner_runtime {
                     Some(runtime) => {
                         let handle = runtime
                             .session_handle(
@@ -1472,10 +1591,13 @@ mod remote_impl {
                             .ok_or_else(|| {
                                 AgentError::Internal("Unknown source session runtime".into())
                             })?;
-                        handle.config.clone()
+                        (handle.config.clone(), handle.session_materializer.clone())
                     }
-                    None => shared_state.config.clone(),
+                    None => (shared_state.config.clone(), shared_state.session_materializer.clone()),
                 };
+                if restricted && !materializer.supports_restricted_cold_resume() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
                 let session = config
                     .provider
                     .history_store()
@@ -1486,16 +1608,21 @@ mod remote_impl {
                         session_id: msg.source_session_id.clone(),
                     })?;
 
-                let forked_session_id = config
-                    .provider
-                    .history_store()
-                    .fork_session(
-                        &msg.source_session_id,
-                        &msg.message_id,
-                        crate::session::domain::ForkOrigin::User,
-                    )
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+                let store = config.provider.history_store();
+                let message_id = if msg.message_id.is_empty() {
+                    store.get_history(&msg.source_session_id).await
+                        .map_err(|e| AgentError::Internal(e.to_string()))?
+                        .pop().ok_or(AgentError::EmptySessionFork)?.id
+                } else {
+                    msg.message_id
+                };
+                if let Some(peer) = &peer {
+                    peer.check_mutation().await?;
+                }
+                let forked_session_id = match peer.as_ref().filter(|_| restricted) {
+                    Some(peer) => store.fork_peer_session(&msg.source_session_id, &message_id, peer.schedule_origin()).await,
+                    None => store.fork_session(&msg.source_session_id, &message_id, crate::session::domain::ForkOrigin::User).await,
+                }.map_err(|e| AgentError::Internal(e.to_string()))?;
 
                 if let (Some(profiles), Some(runtime)) =
                     (profiles.as_ref().as_ref(), &owner_runtime)
@@ -1544,7 +1671,7 @@ mod remote_impl {
                         cwd.clone(),
                         title.clone(),
                         created_at,
-                        None,
+                        peer.as_deref(),
                     )
                     .await?;
 
@@ -1569,9 +1696,61 @@ mod remote_impl {
             let state = self.shared_state.clone();
             ctx.spawn(async move {
                 state
-                    .create_session(msg.cwd, Some(msg.profile_id), None)
+                    .create_session(msg.cwd, Some(msg.profile_id), None, None)
                     .await
             })
+        }
+    }
+
+    impl Message<PeerNodeRequest<CreateRemoteSession>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<CreateRemoteSession>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .create_session(msg.request.cwd, None, None, Some(&msg.authority))
+                    .await
+            })
+        }
+    }
+
+    impl Message<PeerNodeRequest<CreateRemoteSessionWithProfile>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<CreateRemoteSessionWithProfile>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .create_session(
+                        msg.request.cwd,
+                        Some(msg.request.profile_id),
+                        None,
+                        Some(&msg.authority),
+                    )
+                    .await
+            })
+        }
+    }
+
+    impl Message<PeerNodeRequest<ForkRemoteSession>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<ForkRemoteSession>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            self.handle_fork(msg.request, Some(msg.authority), ctx)
+                .await
         }
     }
 
@@ -2098,29 +2277,140 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
+            let id = msg.request.schedule_id().to_owned();
             ctx.spawn(async move {
-                let authority = TurnAuthority::Peer(msg.authority);
-                authority.check().await?;
+                use kameo::error::SendError;
+
                 let scheduler = state
                     .get_or_start_scheduler()
                     .await
                     .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
-                let id = msg.request.schedule_id();
-                let schedule = scheduler
-                    .get_schedule(id)
+                let mutation = PeerScheduleMutation::Action(M::ACTION, id.clone());
+                match scheduler
+                    .peer_mutation(msg.authority.clone(), mutation)
                     .await
-                    .map_err(|error| AgentError::Internal(error.to_string()))?
-                    .ok_or(AgentError::MeshAccessDenied)?;
-                if !authority.owns_schedule(&schedule.config.origin) {
-                    return Err(AgentError::MeshAccessDenied);
+                {
+                    Err(SendError::ActorNotRunning(_)) => {
+                        state.clear_stopped_scheduler(&scheduler);
+                    }
+                    result => {
+                        return result.map_err(RemoteNodeManagerState::schedule_mutation_error);
+                    }
                 }
-                authority.check().await?;
-                M::ACTION
-                    .apply(&scheduler, id)
+                let scheduler = state
+                    .get_or_start_scheduler()
                     .await
-                    .map_err(|error| AgentError::Internal(error.to_string()))
+                    .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
+                let mutation = PeerScheduleMutation::Action(M::ACTION, id);
+                let result = scheduler.peer_mutation(msg.authority, mutation).await;
+                if matches!(result, Err(SendError::ActorNotRunning(_))) {
+                    state.clear_stopped_scheduler(&scheduler);
+                }
+                result.map_err(RemoteNodeManagerState::schedule_mutation_error)
             })
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn sessions_grant_creates_schedule_and_peer_actions_recover_stopped_scheduler() {
+        use crate::scheduler::SchedulerActor;
+        use crate::session::domain_schedule::ScheduleState;
+        use kameo::actor::Spawn;
+        use querymt_remote::{
+            MeshAccessStore, MeshStateStore,
+            peer_access::{GrantStore, PeerGrant, PeerGrantKey},
+        };
+
+        let (config, _plugins) = crate::agent::remote::tests::test_agent_config().await;
+        let session = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let slot = Arc::new(parking_lot::Mutex::new(None));
+        let manager = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config.clone(),
+            registry,
+            None,
+            slot.clone(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Arc::new(MeshAccessStore::new(
+            MeshStateStore::shared(&dir.path().join("mesh_state.json")).unwrap(),
+        ));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let admitted = PeerGrant::Custom {
+            sessions: true,
+            filesystem: true,
+            shell: true,
+            providers: vec![],
+        };
+        let live = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        let initial = grants
+            .replace_grant(&key, uuid::Uuid::nil(), admitted.clone())
+            .await
+            .unwrap();
+        let authority = PeerTurn::test_peer(key.clone(), admitted, grants.clone());
+        grants
+            .replace_grant(&key, initial.revision, live)
+            .await
+            .unwrap();
+
+        let created = manager
+            .ask(PeerNodeRequest {
+                authority: authority.clone(),
+                request: CreateRemoteSchedule {
+                    session_id: session.public_id,
+                    prompt: "schedule fixture".into(),
+                    trigger: ScheduleTrigger::Interval { seconds: 3600 },
+                    max_steps: None,
+                    max_cost_usd: None,
+                    max_runs: None,
+                },
+            })
+            .await
+            .unwrap();
+        let id = created.schedule_public_id;
+        let repo = config.schedule_repository.as_ref().unwrap();
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().config.origin,
+            authority.schedule_origin()
+        );
+
+        let running = slot.lock().take().unwrap();
+        running.shutdown().await;
+        let stopped = SchedulerActor::prepare();
+        let stale = SchedulerHandle::new(stopped.actor_ref().clone());
+        drop(stopped);
+        *slot.lock() = Some(stale.clone());
+
+        manager
+            .ask(PeerNodeRequest {
+                authority,
+                request: PauseRemoteSchedule {
+                    schedule_public_id: id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let replacement = slot.lock().take().unwrap();
+        assert!(!replacement.is_same_actor(&stale));
+        assert_eq!(
+            repo.get_schedule(&id).await.unwrap().unwrap().state,
+            ScheduleState::Paused
+        );
+        replacement.shutdown().await;
     }
 
     impl Message<ListRemoteSchedules> for RemoteNodeManager {
@@ -2370,10 +2660,17 @@ mod remote_impl {
                 .map(|m| NodeId::from_peer_id(*m.peer_id()))
                 .ok_or(AgentError::MeshNotBootstrapped)?;
 
+            let config = &self.shared_state.config;
+            let mut capabilities = vec!["filesystem".to_owned()];
+            if config.tool_config.policy != crate::agent::core::ToolPolicy::ProviderOnly
+                && config.is_tool_allowed(crate::config::ToolRef::builtin("shell"))
+            {
+                capabilities.insert(0, "shell".to_owned());
+            }
             Ok(NodeInfo {
                 node_id,
                 hostname,
-                capabilities: vec!["shell".to_string(), "filesystem".to_string()],
+                capabilities,
                 active_sessions: Some(active_sessions),
             })
         }
