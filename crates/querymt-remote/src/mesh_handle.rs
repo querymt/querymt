@@ -888,6 +888,99 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn guarded_ask_preserves_typed_replies_and_uses_the_selected_peer() {
+        use crate::mesh_state::MeshAccessStore;
+        use crate::request_timeout::{SharingAskError, ask_sharing_v1};
+        use crate::{DirectoryMode, LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
+        use kameo::actor::{RemoteActorRef, Spawn};
+        use kameo::error::RemoteSendError;
+        use kameo::remote::{RemoteActor, RemoteMessage};
+
+        #[derive(kameo::Actor)]
+        struct ReplyFixture;
+        impl RemoteActor for ReplyFixture {
+            const REMOTE_ID: &'static str = "test::reply_fixture";
+        }
+        impl RemoteMessage<String> for ReplyFixture {
+            const REMOTE_ID: &'static str = "test::reply_fixture::ask";
+        }
+
+        let (dir, mesh, _, mut commands) = test_mesh_with_stores(MeshTransportMode::Lan);
+        let timeout = Duration::from_secs(5);
+        let config = MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(LanMeshConfig {
+                listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                discovery: LanDiscovery::None,
+                directory: DirectoryMode::Kademlia,
+            }),
+            iroh_enabled: false,
+            iroh_gso: false,
+            iroh_dns: None,
+            iroh_scopes: vec![],
+            identity_file: Some(dir.path().join("identity")),
+            request_timeout: timeout,
+            stream_reconnect_grace: timeout,
+            node_name: None,
+            peers: vec![],
+            auto_fallback: false,
+        };
+        let policy = Arc::new(MeshAccessStore::new(Arc::clone(
+            mesh.mesh_state_store().unwrap(),
+        )));
+        let runtime = crate::bootstrap_mesh_runtime_with_policy(&config, policy)
+            .await
+            .unwrap();
+        tokio::time::timeout(timeout, async {
+            let actor = ReplyFixture::spawn(ReplyFixture);
+            actor.register("reply-fixture").await.unwrap();
+            let remote = RemoteActorRef::<ReplyFixture>::lookup("reply-fixture")
+                .await
+                .unwrap()
+                .unwrap();
+            let expected_id = actor.id();
+            let expected_peer = *runtime.peer_id();
+            let exchange = tokio::spawn(async move {
+                for reply in [
+                    Ok(rmp_serde::to_vec(&42_u32).unwrap()),
+                    Err(RemoteSendError::HandlerError(rmp_serde::to_vec(&"rejected").unwrap())),
+                    Err(RemoteSendError::HandlerError(rmp_serde::to_vec(&42_u32).unwrap())),
+                    Ok(rmp_serde::to_vec(&"not a number").unwrap()),
+                ] {
+                    let Some(SwarmCommand::Sharing {
+                        peer,
+                        request: SharingRequest::Actor(request),
+                        tx,
+                    }) = commands.recv().await
+                    else {
+                        panic!("expected an ask over the guarded protocol");
+                    };
+                    let SwarmRequest::Ask { actor_id, payload, mailbox_timeout, reply_timeout, .. } = *request else {
+                        panic!("expected an ask");
+                    };
+                    assert_eq!(peer, expected_peer);
+                    assert_eq!(actor_id, expected_id);
+                    assert_eq!(mailbox_timeout, Some(timeout));
+                    assert_eq!(reply_timeout, Some(timeout));
+                    assert_eq!(rmp_serde::from_slice::<String>(&payload).unwrap(), "request");
+                    tx.send(Ok(SharingResponse::Actor(Ok(SwarmResponse::Ask(reply)))))
+                        .unwrap();
+                }
+            });
+            let msg = "request".to_owned();
+            let ask = || ask_sharing_v1::<_, _, u32, String>(&mesh, &remote, &msg, timeout);
+            assert_eq!(ask().await.unwrap(), 42);
+            assert!(matches!(ask().await, Err(SharingAskError::Actor(RemoteSendError::HandlerError(error))) if error == "rejected"));
+            assert!(matches!(ask().await, Err(SharingAskError::Actor(RemoteSendError::DeserializeHandlerError(_)))));
+            assert!(matches!(ask().await, Err(SharingAskError::Sharing(SharingCallError::UnexpectedReply))));
+            exchange.await.unwrap();
+            runtime.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn leave_iroh_scope_removes_membership_emits_event_and_notifies_swarm() {
         let (_dir, mesh, mut events_rx, mut swarm_cmd_rx) =
