@@ -417,6 +417,40 @@ async fn load_session_and_enqueue_replay(
     .await
 }
 
+/// Run one client extension request against the agent and return its JSON
+/// result.
+///
+/// ACP keeps the leading `_` of an extension method (`_querymt/models`), while
+/// the agent's `ext_method` handler matches the bare name (`querymt/models`):
+/// normalize first, as the WebSocket dispatcher does, or every QueryMT
+/// extension method fails with "Method not found".
+///
+/// Question recovery needs the per-connection registry that only the
+/// WebSocket server keeps, so it is denied here exactly as a WebSocket
+/// connection without a registry would.
+#[doc(hidden)]
+pub async fn call_ext_method<A: SendAgent + ?Sized>(
+    agent: &A,
+    req: ExtRequest,
+) -> Result<serde_json::Value, acp::Error> {
+    use crate::control::elicitation_recovery::{
+        ELICITATION_RECOVERY_ATTACH_METHOD, ELICITATION_RECOVERY_LIST_PENDING_METHOD,
+        ElicitationRecoveryDenialReason, elicitation_recovery_denied,
+    };
+    let req = crate::acp::shared::normalize_querymt_ext_request(req);
+    if matches!(
+        req.method.as_ref(),
+        ELICITATION_RECOVERY_LIST_PENDING_METHOD | ELICITATION_RECOVERY_ATTACH_METHOD
+    ) {
+        return Err(elicitation_recovery_denied(
+            ElicitationRecoveryDenialReason::InsecureTransport,
+        ));
+    }
+    let response = agent.ext_method(req).await?;
+    serde_json::from_str(response.0.get())
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
 fn agent_ext_request(
     method: &'static str,
     params: impl serde::Serialize,
@@ -1498,11 +1532,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                             let params: serde_json::Value =
                                 serde_json::from_str(req.params.get()).unwrap_or_default();
                             let mut ext_value: Result<serde_json::Value, acp::Error> =
-                                agent.ext_method(req).await.and_then(|resp| {
-                                    serde_json::from_str(resp.0.get()).map_err(|e| {
-                                        acp::Error::internal_error().data(e.to_string())
-                                    })
-                                });
+                                call_ext_method(agent.as_ref(), req).await;
                             if let Ok(value) = ext_value.as_mut() {
                                 let capabilities = translator
                                     .lock()

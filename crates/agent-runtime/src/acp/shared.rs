@@ -1011,8 +1011,26 @@ pub fn input_state_notification(event: &EventEnvelope) -> Option<serde_json::Val
     ))
 }
 
-fn normalize_querymt_ext_method(method: &str) -> &str {
+/// The QueryMT extension method name as the agent's `ext_method` handler
+/// matches it: without the leading `_` that ACP puts on extension methods.
+///
+/// ACP clients send `_querymt/...` and the SDK hands the extension request to
+/// the agent with that underscore intact, so every transport has to normalize
+/// before it calls `ext_method`.
+pub(crate) fn normalize_querymt_ext_method(method: &str) -> &str {
     method.strip_prefix('_').unwrap_or(method)
+}
+
+/// `req` with a `_querymt/...` method renamed to the name the agent's
+/// `ext_method` handler matches. Other extension namespaces pass through.
+pub(crate) fn normalize_querymt_ext_request(
+    mut req: crate::acp::protocol::ExtRequest,
+) -> crate::acp::protocol::ExtRequest {
+    let normalized = normalize_querymt_ext_method(&req.method);
+    if normalized.starts_with("querymt/") && normalized.len() != req.method.len() {
+        req.method = std::sync::Arc::from(normalized);
+    }
+    req
 }
 
 fn attach_before_querymt_ext_method(method: &str) -> bool {
@@ -4044,8 +4062,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 }
 
                 // Forward QueryMT extension methods to the agent's ext_method handler.
-                // SDK ACP strips the leading underscore for extension requests;
-                // WebSocket clients may send either shape, so normalize here.
+                // ACP extension methods carry a leading underscore on the wire and
+                // the SDK keeps it; WebSocket clients may send either shape, so
+                // normalize here (stdio does the same via
+                // `normalize_querymt_ext_request`).
                 m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
                     let ext_method = normalize_querymt_ext_method(m);
                     let session_id_for_owner =
@@ -7156,6 +7176,44 @@ mod tests {
             })
             .expect("remote attach advertises the command catalog");
         assert_eq!(advertised["params"]["sessionId"], "s-remote");
+    }
+
+    #[test]
+    fn querymt_ext_request_drops_the_wire_underscore_only_for_querymt() {
+        let request = |method: &str| {
+            crate::acp::protocol::ExtRequest::new(
+                method,
+                Arc::from(serde_json::value::RawValue::from_string("{}".to_string()).unwrap()),
+            )
+        };
+        let method = |method: &str| {
+            normalize_querymt_ext_request(request(method))
+                .method
+                .to_string()
+        };
+
+        assert_eq!(method("_querymt/models"), "querymt/models");
+        assert_eq!(method("querymt/models"), "querymt/models");
+        assert_eq!(
+            method("_querymt/session/history"),
+            "querymt/session/history"
+        );
+        // Other extension namespaces keep their wire name.
+        assert_eq!(method("_workspace/query"), "_workspace/query");
+    }
+
+    #[test]
+    fn querymt_ext_request_keeps_params() {
+        let params = Arc::from(
+            serde_json::value::RawValue::from_string(r#"{"session_id":"s-1"}"#.to_string())
+                .unwrap(),
+        );
+        let normalized = normalize_querymt_ext_request(crate::acp::protocol::ExtRequest::new(
+            "_querymt/session/history",
+            params,
+        ));
+
+        assert_eq!(normalized.params.get(), r#"{"session_id":"s-1"}"#);
     }
 
     #[test]
