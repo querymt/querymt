@@ -1939,7 +1939,7 @@ paths = ["{}"]
     let unbound = fixture.handle.slash_command_catalog("unbound").await;
     assert_eq!(
         advertised_command_names(&unbound),
-        vec!["/root".to_string(), "/compact".to_string()]
+        vec!["root".to_string(), "compact".to_string()]
     );
 
     profiles
@@ -1949,7 +1949,7 @@ paths = ["{}"]
     let bound = fixture.handle.slash_command_catalog("bound").await;
     assert_eq!(
         advertised_command_names(&bound),
-        vec!["/docs".to_string(), "/compact".to_string()]
+        vec!["docs".to_string(), "compact".to_string()]
     );
 
     profiles
@@ -1964,7 +1964,7 @@ paths = ["{}"]
     let ghost = fixture.handle.slash_command_catalog("ghost").await;
     assert_eq!(
         advertised_command_names(&ghost),
-        vec!["/compact".to_string()],
+        vec!["compact".to_string()],
         "failed profile lookup must not fall back to this handle's registry"
     );
 }
@@ -1981,7 +1981,7 @@ async fn catalog_without_workspace_service_lists_compact_but_not_worktree() {
     let catalog = fixture.handle.slash_command_catalog("any-session").await;
     assert_eq!(
         advertised_command_names(&catalog),
-        vec!["/deploy".to_string(), "/compact".to_string()]
+        vec!["deploy".to_string(), "compact".to_string()]
     );
 }
 

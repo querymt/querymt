@@ -4,12 +4,14 @@ use crate::acp::protocol::{
 };
 use crate::slash_commands::registry::SlashCommandRegistry;
 
-/// Convert the registry into an ACP `AvailableCommandsUpdate`.
+/// Convert the registry into an ACP `AvailableCommandsUpdate`. Names are
+/// advertised without the leading `/`, as ACP specifies; clients add it when
+/// they show or send the command.
 pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableCommandsUpdate {
     let commands: Vec<AvailableCommand> = registry
         .all()
         .map(|cmd| {
-            let mut acp_cmd = AvailableCommand::new(format!("/{}", cmd.name), &cmd.description);
+            let mut acp_cmd = AvailableCommand::new(cmd.name.clone(), &cmd.description);
 
             if cmd.argument_hint.is_some() || cmd.template.contains("$ARGUMENTS") {
                 acp_cmd = acp_cmd.input(AvailableCommandInput::Unstructured(
@@ -76,7 +78,7 @@ mod tests {
         assert_eq!(update.available_commands.len(), 1);
 
         let cmd = &update.available_commands[0];
-        assert_eq!(cmd.name, "/review");
+        assert_eq!(cmd.name, "review");
         assert_eq!(cmd.description, "Review changes");
         assert!(cmd.input.is_some());
     }
@@ -88,7 +90,7 @@ mod tests {
 
         let update = registry_to_acp_update(&registry);
         assert_eq!(update.available_commands.len(), 1);
-        assert_eq!(update.available_commands[0].name, "/help");
+        assert_eq!(update.available_commands[0].name, "help");
         // No argument hint and no $ARGUMENTS in template
         assert!(update.available_commands[0].input.is_none());
     }

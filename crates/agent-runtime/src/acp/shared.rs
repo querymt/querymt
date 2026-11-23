@@ -6519,7 +6519,7 @@ mod tests {
         );
         assert_eq!(
             notification["params"]["update"]["availableCommands"][0]["name"],
-            "/docs"
+            "docs"
         );
     }
 
@@ -7134,7 +7134,7 @@ mod tests {
                     session_id.to_owned(),
                     crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(
                         crate::acp::protocol::AvailableCommandsUpdate::new(vec![
-                            crate::acp::protocol::AvailableCommand::new("/compact", "Compact"),
+                            crate::acp::protocol::AvailableCommand::new("compact", "Compact"),
                         ]),
                     ),
                 ))
