@@ -250,6 +250,12 @@ async fn bootstrap_with_ingress(
     } else {
         policy_store
     };
+    if use_mesh_state_policy && let Some(store) = &policy_store {
+        let host = crate::NodeId::from_peer_id(keypair.public().to_peer_id());
+        store.reconcile_startup(&host).await.map_err(|error| {
+            MeshError::SwarmError(format!("failed to reconcile mesh quotas: {error}"))
+        })?;
+    }
     let policy = policy_store.map(|store| MeshPolicy {
         router: Arc::new(InboundRouter::new(
             keypair.public().to_peer_id(),
