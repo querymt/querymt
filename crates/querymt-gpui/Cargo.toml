@@ -20,7 +20,7 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 # (branch feat/agent-session-core). Bumping it means: change `rev` here and in
 # [dev-dependencies], refresh `cargoLock.outputHashes` in flake.nix, and run
 # the tests (they read the core's golden cases from the pinned rev).
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "512686a568163a4cbd8e1dc1f9a0155068e97345" }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "485919a804807671e7ad404703783eb4b70c97ba" }
 async-channel = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -68,7 +68,7 @@ web-sys = { version = "0.3", features = [
 gpui-kit = { version = "0.9.1", features = ["test-support"] }
 # Same rev as above: tests replay the core's seeded golden cases
 # (`testing::golden_cases()`) instead of storing trace files.
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "512686a568163a4cbd8e1dc1f9a0155068e97345", features = ["test-support"] }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "485919a804807671e7ad404703783eb4b70c97ba", features = ["test-support"] }
 
 [build-dependencies]
 dirs = "6"

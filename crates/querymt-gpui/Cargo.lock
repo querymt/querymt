@@ -5884,7 +5884,7 @@ checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 [[package]]
 name = "querymt"
 version = "0.6.0"
-source = "git+https://github.com/querymt/querymt?rev=512686a568163a4cbd8e1dc1f9a0155068e97345#512686a568163a4cbd8e1dc1f9a0155068e97345"
+source = "git+https://github.com/querymt/querymt?rev=485919a804807671e7ad404703783eb4b70c97ba#485919a804807671e7ad404703783eb4b70c97ba"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5906,7 +5906,7 @@ dependencies = [
 [[package]]
 name = "querymt-agent-protocol-types"
 version = "0.6.0"
-source = "git+https://github.com/querymt/querymt?rev=512686a568163a4cbd8e1dc1f9a0155068e97345#512686a568163a4cbd8e1dc1f9a0155068e97345"
+source = "git+https://github.com/querymt/querymt?rev=485919a804807671e7ad404703783eb4b70c97ba#485919a804807671e7ad404703783eb4b70c97ba"
 dependencies = [
  "agent-client-protocol-schema",
  "querymt",
@@ -5921,7 +5921,7 @@ dependencies = [
 [[package]]
 name = "querymt-agent-session-core"
 version = "0.6.0"
-source = "git+https://github.com/querymt/querymt?rev=512686a568163a4cbd8e1dc1f9a0155068e97345#512686a568163a4cbd8e1dc1f9a0155068e97345"
+source = "git+https://github.com/querymt/querymt?rev=485919a804807671e7ad404703783eb4b70c97ba#485919a804807671e7ad404703783eb4b70c97ba"
 dependencies = [
  "querymt-agent-protocol-types",
  "serde",
