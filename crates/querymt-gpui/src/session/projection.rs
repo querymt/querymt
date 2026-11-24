@@ -16,14 +16,15 @@ use querymt_agent_session_core::entry::{
     CompactionEntry, CompactionState, Entry, EntryKind, PromptStatus, ToolCallEntry,
 };
 use querymt_agent_session_core::input::{SessionInput, UndoFrame as CoreUndoFrame};
-use querymt_agent_session_core::view::{ChangeReport, RunState, SessionHeader};
+use querymt_agent_session_core::view::{ChangeReport, RunState, SessionHeader, SlashCommandView};
 use querymt_agent_session_core::{SessionCore, TurnRef};
 use serde_json::Value;
 
 use super::overlay::{Notice, Overlay};
 use super::{
-    Compaction, CompactionStatus, ContentFetch, Diff, Item, ItemKind, PendingInput, PlanEntry, Thought, ToolCall,
-    UndoFrame, WorkEntry, content_text, diff_stats, prompt_parts, synthesized_diffs,
+    Compaction, CompactionStatus, ContentFetch, Diff, Item, ItemKind, PendingInput, PlanEntry,
+    Thought, ToolCall, UndoFrame, WorkEntry, content_text, diff_stats, prompt_parts,
+    synthesized_diffs,
 };
 use crate::usage::{Accounting, Breakdown, TokenUsage};
 
@@ -54,6 +55,8 @@ pub struct HeaderFields {
     pub title: Option<String>,
     pub mode: Option<String>,
     pub options: Vec<Value>,
+    /// The agent's latest `available_commands_update`, names without `/`.
+    pub slash_commands: Vec<SlashCommandView>,
     pub history_more: bool,
     pub history_before: Option<String>,
     pub undo_stack: Vec<UndoFrame>,
@@ -382,9 +385,9 @@ impl Projection {
 
     /// Start of the newest turn's rows (0 without turns).
     pub fn last_turn_start(&self) -> usize {
-        self.slices
-            .last()
-            .map_or(0, |s| self.lead + self.slices.iter().map(|s| s.len).sum::<usize>() - s.len)
+        self.slices.last().map_or(0, |s| {
+            self.lead + self.slices.iter().map(|s| s.len).sum::<usize>() - s.len
+        })
     }
 
     /// The current tool call `tool_call_id` as the rows show it.
@@ -874,7 +877,10 @@ fn map_header(header: &SessionHeader) -> HeaderFields {
         usage: header.context.as_ref().map(|c| (c.used, c.size)),
         breakdown,
         accounting,
-        active_ms: header.active_time.as_ref().map_or(0., |t| t.total_ms as f64),
+        active_ms: header
+            .active_time
+            .as_ref()
+            .map_or(0., |t| t.total_ms as f64),
         active_since_ms: header
             .active_time
             .as_ref()
@@ -883,6 +889,7 @@ fn map_header(header: &SessionHeader) -> HeaderFields {
         title: header.title.clone(),
         mode: header.current_mode.clone(),
         options: header.config_options.clone(),
+        slash_commands: header.available_commands.clone(),
         history_more: header.history.has_older,
         history_before: header.history.before.clone(),
         undo_stack: header

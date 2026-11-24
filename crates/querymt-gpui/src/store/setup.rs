@@ -313,6 +313,7 @@ mod tests {
             runtime: HashMap::from([("a".to_string(), AgentRuntime { state, ..runtime })]),
             first_run: false,
             sidebar: Default::default(),
+            early_commands: Default::default(),
             _launch_task: None,
         }
     }

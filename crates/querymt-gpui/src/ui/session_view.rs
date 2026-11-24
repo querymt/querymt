@@ -3531,9 +3531,10 @@ fn segmented(
                     .flex_1()
                     .label(label.clone())
                     .inactive(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.store
-                            .update(cx, |s, cx| s.set_session_option(&config_id, &value, cx))
+                            .update(cx, |s, cx| s.set_session_option(&config_id, &value, cx));
+                        this.restore_focus(window, cx);
                     }))
             }),
     )
@@ -3740,22 +3741,28 @@ impl QmtApp {
             .update(cx, |s, cx| s.set_session_option(&option.id, &value, cx));
     }
 
-    pub(super) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.session_prompt.read(cx).value().trim().to_string();
+    /// The open session can take a prompt now: its agent is connected, it
+    /// has loaded without error, and a running turn can be steered or queued.
+    /// Typed prompts and palette commands share this check.
+    pub(super) fn session_ready(&self, cx: &App) -> bool {
         let store = self.store.read(cx);
         let Some(view) = store.session.as_ref() else {
-            return;
+            return false;
         };
         // Without a connection the prompt would be dropped: keep it in the
         // composer until the agent is back.
         let connected = store
             .runtime(&view.agent_id)
             .is_some_and(|rt| rt.is_connected());
-        let ready = connected
+        connected
             && !view.loading
             && view.error.is_none()
-            && (!view.running() || store.session_can_control_run());
-        if (text.is_empty() && self.session_attachments.is_empty()) || !ready {
+            && (!view.running() || store.session_can_control_run())
+    }
+
+    pub(super) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.session_prompt.read(cx).value().trim().to_string();
+        if (text.is_empty() && self.session_attachments.is_empty()) || !self.session_ready(cx) {
             return;
         }
         let attachments = std::mem::take(&mut self.session_attachments);
@@ -4645,9 +4652,10 @@ impl QmtApp {
             .border_color(p.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 this.dismissed.record("session-options", ev);
                 this.session_options_open = false;
+                this.restore_focus(window, cx);
                 cx.notify();
             }))
             .child(div().text_sm().font_semibold().child("Session options"))
@@ -4675,8 +4683,9 @@ impl QmtApp {
                                     .flex_1()
                                     .icon(IconName::Navigation)
                                     .label("Steer")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.delivery = "steer";
+                                        this.restore_focus(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -4685,8 +4694,9 @@ impl QmtApp {
                                     .flex_1()
                                     .icon(IconName::Plus)
                                     .label("Queue")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.delivery = "queue";
+                                        this.restore_focus(window, cx);
                                         cx.notify();
                                     })),
                             ),
@@ -4726,8 +4736,15 @@ impl QmtApp {
         view: &SessionView,
         control: bool,
         p: &Palette,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let slash_list = self
+            .slash_list(window, cx)
+            .map(|list| self.render_slash_list(&list, p, cx));
+        let slash_hint = self
+            .slash_hint(cx)
+            .map(|(name, hint)| self.render_slash_hint(name, hint, p));
         let running = view.running();
         let loading = view.loading;
         let has_text = !self.session_prompt.read(cx).value().trim().is_empty();
@@ -4756,11 +4773,14 @@ impl QmtApp {
             .child(kit::icon(IconName::Settings2, 14., p.muted))
             .child("Options")
             .child(kit::icon(IconName::ChevronDown, 13., p.dim))
-            .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+            .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                 if this.dismissed.closed_by("session-options", ev) {
                     return;
                 }
                 this.session_options_open = !this.session_options_open;
+                if !this.session_options_open {
+                    this.restore_focus(window, cx);
+                }
                 cx.notify();
             }));
         let options_button: AnyElement =
@@ -4868,11 +4888,12 @@ impl QmtApp {
                         ),
                 )
             })
+            .children(slash_hint)
             // Tab cycles modes instead of indenting (captured before the textarea).
+            // While the command list shows, its keys come first (`slash_keys`).
             .child(
-                div()
-                    .px_1()
-                    .min_h(px(64.))
+                self.slash_keys(div().relative().px_1().min_h(px(64.)), cx)
+                    .children(slash_list.map(|list| deferred(list).with_priority(1)))
                     .capture_action(cx.listener(|this, a: &Enter, window, cx| {
                         let send = this.store.read(cx).prefs.send_shortcut;
                         if send.submits(a.shift, a.secondary) {
@@ -5590,7 +5611,7 @@ impl QmtApp {
                 .text_color(p.muted)
                 .child(kit::icon(IconName::Lock, 14., p.muted))
                 .child(div().flex_1().min_w_0().child(text)),
-            None => self.session_composer(&view_snapshot, control, &p, cx),
+            None => self.session_composer(&view_snapshot, control, &p, window, cx),
         };
         // A soft halo in the page background color around the composer: text
         // scrolling under it dissolves instead of meeting a hard edge.

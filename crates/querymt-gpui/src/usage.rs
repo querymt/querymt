@@ -108,8 +108,7 @@ pub struct Breakdown {
     pub partial: bool,
 }
 
-impl Breakdown {
-}
+impl Breakdown {}
 
 // ---- charts -----------------------------------------------------------------
 

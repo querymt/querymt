@@ -14,7 +14,6 @@ use super::{QmtApp, kit};
 use crate::store::launch::OWNER_DEFAULT_PROFILE;
 use crate::store::{DEFAULT_PROFILE, Profile};
 use crate::theme::Palette;
-use crate::util::fuzzy_score;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileItem {
@@ -128,12 +127,17 @@ fn peer_profile_items(profiles: &[Profile]) -> Vec<ProfileItem> {
 
 /// Items matching `query`, best first; equal scores keep the list order.
 fn search(items: Vec<ProfileItem>, query: &str) -> Vec<ProfileItem> {
-    let mut scored: Vec<(u32, ProfileItem)> = items
+    let ranked = crate::search::rank_tiered(
+        query,
+        &items,
+        |p| vec![p.name.clone()],
+        |p| vec![p.id.clone(), p.description.clone()],
+    );
+    let mut slots: Vec<Option<ProfileItem>> = items.into_iter().map(Some).collect();
+    ranked
         .into_iter()
-        .filter_map(|p| Some((fuzzy_score(query, &[&p.name, &p.id, &p.description])?, p)))
-        .collect();
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    scored.into_iter().map(|(_, p)| p).collect()
+        .filter_map(|(i, _)| slots[i].take())
+        .collect()
 }
 
 /// Gap between the menu and the window edge.

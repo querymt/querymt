@@ -622,7 +622,10 @@ mod tests {
             for (at, batch) in batches.iter().enumerate() {
                 let report = p.feed(batch);
                 if !report.errors.is_empty() {
-                    failures.push(format!("{name}: batch {at}: core errors {:?}", report.errors));
+                    failures.push(format!(
+                        "{name}: batch {at}: core errors {:?}",
+                        report.errors
+                    ));
                 }
             }
             for (turn, rows) in p.turn_bounds() {
@@ -649,7 +652,9 @@ mod tests {
             "compaction-a-failed-compaction-shows-its-reason"
         );
         assert_eq!(
-            slug("snapshot: transcript from the load snapshot (legacy steering prompt without an event)"),
+            slug(
+                "snapshot: transcript from the load snapshot (legacy steering prompt without an event)"
+            ),
             "snapshot-transcript-from-the-load-snapshot-legacy-steering-prompt-without-an-event"
         );
     }

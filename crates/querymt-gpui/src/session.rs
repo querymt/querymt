@@ -615,7 +615,6 @@ impl Compaction {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct Item {
     pub key: String,
@@ -643,7 +642,6 @@ pub struct PendingInput {
     pub attachments: usize,
     pub discard_pending: bool,
 }
-
 
 /// The open session as the UI reads it: a projection of the session core
 /// (`Projection`: the reducer, the rows and their caches) plus the header
@@ -689,6 +687,9 @@ pub struct SessionView {
     pub model_node: Option<String>,
     /// Session config options, kept current through the core.
     pub options: Vec<Value>,
+    /// Slash commands the agent advertises for this session, from the core's
+    /// header. Set on every header refresh, so an empty update clears them.
+    pub slash_commands: Vec<querymt_agent_session_core::view::SlashCommandView>,
     /// `availableModes` from `session/load`, for agents without a `mode` config option.
     pub modes: Vec<(String, String)>,
     /// Config option ids with a change in flight.
@@ -872,7 +873,6 @@ impl SelectOption {
     }
 }
 
-
 /// Text and attachments of a user prompt's content blocks.
 fn prompt_parts(blocks: &[Value]) -> (String, Vec<UserAttachment>) {
     let mut text = String::new();
@@ -902,7 +902,6 @@ fn content_text(content: &Value) -> String {
         _ => String::new(),
     }
 }
-
 
 #[cfg(test)]
 mod diff_tests {

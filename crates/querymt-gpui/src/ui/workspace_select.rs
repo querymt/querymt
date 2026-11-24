@@ -18,7 +18,7 @@ use super::kit;
 use super::smooth_scroll::SmoothScroll;
 use crate::store::{AgentsStore, Endpoint};
 use crate::theme::palette;
-use crate::util::{fuzzy_score, workspace_name};
+use crate::util::workspace_name;
 
 /// Known workspaces shown at most (they come before folders).
 const MAX_WORKSPACES: usize = 8;
@@ -73,16 +73,23 @@ fn suggestions(
 ) -> Vec<Suggestion> {
     let query = expand(input, home);
     let typed = query.trim_end_matches('/');
-    let mut ws: Vec<(u32, &String)> = workspaces
+    let candidates: Vec<&String> = workspaces
         .iter()
         .filter(|w| w.trim_end_matches('/') != typed)
-        .filter_map(|w| Some((fuzzy_score(&query, &[&workspace_name(w), w])?, w)))
         .collect();
-    ws.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    let ws: Vec<&String> = crate::search::rank_tiered(
+        &query,
+        &candidates,
+        |w| vec![workspace_name(w)],
+        |w| vec![w.to_string()],
+    )
+    .into_iter()
+    .map(|(i, _)| candidates[i])
+    .collect();
     let mut out: Vec<Suggestion> = ws
         .into_iter()
         .take(MAX_WORKSPACES)
-        .map(|(_, w)| Suggestion {
+        .map(|w| Suggestion {
             path: w.clone(),
             workspace: true,
         })
@@ -92,11 +99,17 @@ fn suggestions(
         && listed == base
     {
         let hidden = partial.starts_with('.');
-        let mut dirs: Vec<(u32, &String)> = names
+        let candidates: Vec<&String> = names
             .iter()
-            .filter(|n| hidden || !n.starts_with('.'))
-            .filter_map(|n| Some((fuzzy_score(&partial, &[n])?, n)))
+            // The matcher reads `.` as a separator, so a leading dot is
+            // applied here: it selects hidden folders.
+            .filter(|n| n.starts_with('.') == hidden)
             .collect();
+        let mut dirs: Vec<(u32, &String)> =
+            crate::search::rank(&partial, &candidates, |n| vec![n.to_string()])
+                .into_iter()
+                .map(|(i, score)| (score, candidates[i]))
+                .collect();
         dirs.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
