@@ -58,6 +58,12 @@ impl MeteredAccess {
         Ok(access)
     }
 
+    /// The peer whose grant and quotas apply to this access.
+    #[cfg(feature = "kameo-mesh")]
+    pub(crate) fn authority(&self) -> &PeerGrantKey {
+        &self.peer
+    }
+
     pub(crate) async fn check(&self) -> Result<(), LLMError> {
         let state = self.store.grant(&self.peer).await.map_err(|error| {
             if self.catalog.is_none() {

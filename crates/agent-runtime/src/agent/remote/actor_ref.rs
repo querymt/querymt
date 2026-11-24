@@ -49,6 +49,43 @@ pub enum SessionActorRef {
 
 // ── Constructors ─────────────────────────────────────────────────────────
 
+/// The node of a session model that is neither the session host nor this node.
+/// Only such a model needs a model pass: the host reaches the others directly.
+#[cfg(feature = "remote")]
+pub(crate) fn third_node(
+    host: &libp2p::PeerId,
+    own: &libp2p::PeerId,
+    binding: &querymt_agent_core::session_control::SessionModelBinding,
+) -> Option<querymt_remote::NodeId> {
+    let node = querymt_remote::NodeId::parse(binding.provider_node_id.as_deref()?).ok()?;
+    (node.as_peer_id() != host && node.as_peer_id() != own).then_some(node)
+}
+
+/// Sign the pass for the session `session_id` hosted by `host`, whose model is
+/// on `node`, with this node's mesh identity.
+#[cfg(feature = "remote")]
+pub(crate) fn sign_owner_pass(
+    keypair: &libp2p::identity::Keypair,
+    host: &libp2p::PeerId,
+    node: &querymt_remote::NodeId,
+    binding: &querymt_agent_core::session_control::SessionModelBinding,
+    session_id: &str,
+) -> Option<querymt_remote::ModelPass> {
+    let (audience, model_node) = (host.to_string(), node.to_string());
+    querymt_remote::ModelPass::issue_now(
+        keypair,
+        querymt_remote::ModelPassClaim {
+            audience: &audience,
+            model_node: &model_node,
+            provider: &binding.provider,
+            model: &binding.model,
+            session_id,
+        },
+    )
+    .inspect_err(|error| tracing::warn!(%error, "cannot sign a model pass"))
+    .ok()
+}
+
 /// An owner without a route for an interaction message runs an agent without
 /// the session-interaction contract. Surface that as an explicit
 /// upgrade-required error instead of any fallback.
@@ -258,6 +295,8 @@ impl SessionActorRef {
         )
     )]
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
+        #[cfg(feature = "remote")]
+        let pass = self.pass_for_owner_turn(&req.session_id.to_string()).await;
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::Prompt::new(req))
@@ -270,21 +309,55 @@ impl SessionActorRef {
             } => {
                 // Reply loss stays ambiguous (`delivery=unknown`); a prompt must
                 // never be auto-replayed after such a failure.
-                ask_remote(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &messages::Prompt::new(req),
-                    Self::PROMPT,
-                )
-                .await
-                .inspect_err(|error: &AgentError| {
-                    let timed_out = error.transport_failure().is_some_and(|failure| {
-                        failure.kind == querymt_remote::RemoteTransportFailureKind::ReplyTimeout
-                    });
-                    tracing::Span::current().record("timed_out", timed_out);
-                })
+                let mut message = messages::Prompt::new(req);
+                message.pass = pass;
+                ask_remote(mesh.as_deref(), actor_ref, &message, Self::PROMPT)
+                    .await
+                    .inspect_err(|error: &AgentError| {
+                        let timed_out = error.transport_failure().is_some_and(|failure| {
+                            failure.kind == querymt_remote::RemoteTransportFailureKind::ReplyTimeout
+                        });
+                        tracing::Span::current().record("timed_out", timed_out);
+                    })
             }
         }
+    }
+
+    /// Sign a model pass for a turn this node's own owner submits to a remote
+    /// session whose model is on a third node, when that node reports that it
+    /// shares the model with this node. Returns `None` for every other case, so
+    /// the session host falls back to the submitter's grant on the host alone.
+    ///
+    /// This is only reachable from the owner's prompt and input paths. A turn
+    /// that runs under a peer's authority is refused before it reaches a remote
+    /// session (`prompt_with_authority`), so a node issues no pass for a peer.
+    #[cfg(feature = "remote")]
+    async fn pass_for_owner_turn(&self, session_id: &str) -> Option<querymt_remote::ModelPass> {
+        let Self::Remote {
+            actor_ref,
+            mesh: Some(mesh),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let actor_id = actor_ref.id();
+        let host = actor_id.peer_id()?;
+        let binding = self.get_session_control().await.ok()?.effective_model;
+        let node = third_node(host, mesh.peer_id(), &binding)?;
+        // Attach a pass only when the model node reports access to the model,
+        // decided before sending and never after a denial.
+        if !crate::agent::handle::ext_mesh::model_node_reports_access(
+            mesh,
+            &node,
+            &binding.provider,
+            &binding.model,
+        )
+        .await
+        {
+            return None;
+        }
+        sign_owner_pass(mesh.keypair(), host, &node, &binding, session_id)
     }
 
     pub(crate) async fn prompt_with_authority(
@@ -317,7 +390,14 @@ impl SessionActorRef {
         &self,
         input: messages::SubmitInput,
     ) -> Result<messages::SubmitInputResult, AgentError> {
-        let message = messages::SubmitSessionInput::new(input);
+        #[cfg(feature = "remote")]
+        let pass = self.pass_for_owner_turn(&input.session_id).await;
+        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
+        let mut message = messages::SubmitSessionInput::new(input);
+        #[cfg(feature = "remote")]
+        {
+            message.pass = pass;
+        }
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(message)

@@ -567,6 +567,14 @@ impl MeshChatProvider {
         self
     }
 
+    /// Lend the pass issuer's access on the target node to this node for these
+    /// requests. See [`crate::ModelPass`].
+    pub fn with_pass(mut self, pass: Option<crate::ModelPass>) -> Self {
+        let config = self.inner.core().config().clone().with_pass(pass);
+        self.rebuild_with_config(config);
+        self
+    }
+
     pub fn with_stream_controls(
         mut self,
         heartbeat_interval_secs: u64,
@@ -823,6 +831,7 @@ mod tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
         use kameo::error::RemoteSendError;
         let actor_error = |error| provider_ask_error(SharingAskError::Actor(error));

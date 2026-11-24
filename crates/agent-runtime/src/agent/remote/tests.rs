@@ -3377,7 +3377,7 @@ mod node_manager_tests {
                 Err(AgentError::MeshAccessDenied)
             ));
         }
-        // A third node is never reachable through a hosted turn.
+        // Below Full access, a third node's model needs the peer's model pass.
         assert!(matches!(
             prepare(Some(third.clone()), custom).await,
             Err(AgentError::MeshAccessDenied)
@@ -3406,16 +3406,414 @@ mod node_manager_tests {
         prepare(Some(caller), full.clone())
             .await
             .expect("full access may run the peer's own model");
-        assert!(matches!(
-            prepare(Some(third), full).await,
-            Err(AgentError::MeshAccessDenied)
-        ));
+        // Full access may use the host's own access on a third node.
+        let third_turn = prepare(Some(third), full)
+            .await
+            .expect("full access may use the host's own access on a third node");
+        assert!(third_turn.uses_explicit_mesh_provider());
         mesh.shutdown().await;
     }
 
-    /// `SetSessionModel` below full access may only pin the caller's own node.
+    /// A hosted session bound to a third node's model: the prompting peer lends
+    /// its own access with a model pass, Full access may use the host's, and
+    /// nothing else leaves the host.
+    struct ThirdNode {
+        mesh: querymt_remote::MeshHandle,
+        config: Arc<AgentConfig>,
+        sid: String,
+        key: querymt_remote::peer_access::PeerGrantKey,
+        issuer: libp2p::identity::Keypair,
+        node: String,
+        _dir: TempDir,
+    }
+
+    impl ThirdNode {
+        async fn new(name: &str) -> Self {
+            use querymt_remote::NodeId;
+            use querymt_remote::peer_access::PeerGrantKey;
+
+            let (config, dir) = test_agent_config().await;
+            let mesh = bootstrap_guarded_lan(&dir).await;
+            config.provider.set_mesh(Some(mesh.clone()));
+            let issuer = libp2p::identity::Keypair::generate_ed25519();
+            let (_, sid) = spawn_test_session_with_id(config.clone(), name).await;
+            let node = libp2p::PeerId::random().to_string();
+            config
+                .provider
+                .history_store()
+                .set_session_provider_node_id(&sid, Some(&node))
+                .await
+                .unwrap();
+            Self {
+                key: PeerGrantKey {
+                    host: NodeId::from_peer_id(*mesh.peer_id()),
+                    peer: NodeId::from_peer_id(issuer.public().to_peer_id()),
+                },
+                mesh,
+                config,
+                sid,
+                issuer,
+                node,
+                _dir: dir,
+            }
+        }
+
+        fn sessions_only() -> querymt_remote::peer_access::PeerGrant {
+            querymt_remote::peer_access::PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                shell: false,
+                providers: vec![],
+            }
+        }
+
+        async fn grant(&self, grant: querymt_remote::peer_access::PeerGrant) {
+            let store = self.mesh.quota_store().unwrap();
+            let current = store.grant(&self.key).await.unwrap();
+            store
+                .replace_grant(&self.key, current.revision, grant)
+                .await
+                .unwrap();
+        }
+
+        /// The pass the prompter signs for this session, with `edit` applied to
+        /// what it names before signing.
+        async fn pass(
+            &self,
+            edit: impl FnOnce(&mut [String; 5]),
+            issued_at: Option<u64>,
+        ) -> querymt_remote::ModelPass {
+            let session = self.config.provider.with_session(&self.sid).await.unwrap();
+            let llm = session.llm_config().unwrap();
+            let mut names = [
+                self.key.host.to_string(),
+                self.node.clone(),
+                llm.provider.clone(),
+                llm.model.clone(),
+                self.sid.clone(),
+            ];
+            edit(&mut names);
+            let claim = querymt_remote::ModelPassClaim {
+                audience: &names[0],
+                model_node: &names[1],
+                provider: &names[2],
+                model: &names[3],
+                session_id: &names[4],
+            };
+            match issued_at {
+                Some(at) => querymt_remote::ModelPass::issue(&self.issuer, claim, at, 3600),
+                None => querymt_remote::ModelPass::issue_now(&self.issuer, claim),
+            }
+            .unwrap()
+        }
+
+        /// What the host does when this turn starts.
+        async fn start(
+            &self,
+            pass: Option<querymt_remote::ModelPass>,
+        ) -> Result<crate::session::provider::SessionHandle, crate::error::AgentError> {
+            use crate::agent::session_actor::PeerTurn;
+
+            let store = self.mesh.quota_store().unwrap();
+            let peer = PeerTurn::test_peer_with_pass(
+                self.key.clone(),
+                store.grant(&self.key).await.unwrap().grant,
+                store.clone(),
+                pass,
+            );
+            let session = self.config.provider.with_session(&self.sid).await.unwrap();
+            let binding = peer
+                .host_binding(&session)
+                .map(|(provider, model)| (provider.to_string(), model.to_string()));
+            let grant = peer
+                .grant_for(binding.as_ref().map(|(p, m)| (p.as_str(), m.as_str())))
+                .await?;
+            session.for_mesh_turn(&peer, &grant, None)
+        }
+    }
+
     #[tokio::test]
-    async fn session_grant_may_select_only_a_model_on_the_callers_node() {
+    async fn a_prompter_lends_its_model_access_to_a_hosted_session() {
+        let fixture = ThirdNode::new("third-node-pass").await;
+        // The host gives this peer sessions and no model at all.
+        fixture.grant(ThirdNode::sessions_only()).await;
+        let pass = fixture.pass(|_| {}, None).await;
+        let turn = fixture
+            .start(Some(pass))
+            .await
+            .expect("a pass lends the peer's own access on the model node");
+        assert!(
+            turn.uses_explicit_mesh_provider(),
+            "the turn must be dispatched to the model node, not to this host's providers"
+        );
+        // The pass reaches the model node: the unreachable fixture node fails
+        // the contract handshake instead of this host's mock provider answering.
+        let Err(error) = turn.provider().await else {
+            panic!("the model must not be built from this node's providers");
+        };
+        let error = error.to_string();
+        assert!(
+            !error.contains("profile-locked") && !error.contains("mesh access"),
+            "the turn must be routed to the model node, got: {error}"
+        );
+        fixture.mesh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_host_forwards_only_the_prompters_pass() {
+        use crate::error::AgentError;
+
+        let fixture = ThirdNode::new("third-node-other-pass").await;
+        fixture.grant(ThirdNode::sessions_only()).await;
+        let other = libp2p::PeerId::random().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut refused = vec![
+            (
+                "another host",
+                fixture.pass(|n| n[0] = other.clone(), None).await,
+            ),
+            (
+                "another model node",
+                fixture.pass(|n| n[1] = other.clone(), None).await,
+            ),
+            (
+                "another provider",
+                fixture.pass(|n| n[2] = "other".into(), None).await,
+            ),
+            (
+                "another model",
+                fixture.pass(|n| n[3] = "other".into(), None).await,
+            ),
+            (
+                "another session",
+                fixture.pass(|n| n[4] = other.clone(), None).await,
+            ),
+            (
+                "an expired pass",
+                fixture.pass(|_| {}, Some(now - 7200)).await,
+            ),
+        ];
+        // A pass signed by another peer than the submitter.
+        let stranger = libp2p::identity::Keypair::generate_ed25519();
+        let claim_names = fixture.pass(|_| {}, None).await;
+        let stranger_pass = querymt_remote::ModelPass::issue_now(
+            &stranger,
+            querymt_remote::ModelPassClaim {
+                audience: &claim_names.audience,
+                model_node: &claim_names.model_node,
+                provider: &claim_names.provider,
+                model: &claim_names.model,
+                session_id: &claim_names.session_id,
+            },
+        )
+        .unwrap();
+        refused.push(("another peer's pass", stranger_pass));
+        // An altered pass.
+        let mut altered = fixture.pass(|_| {}, None).await;
+        altered.model_node = other.clone();
+        refused.push(("an altered pass", altered));
+
+        for (name, pass) in refused {
+            assert!(
+                matches!(
+                    fixture.start(Some(pass)).await,
+                    Err(AgentError::MeshAccessDenied)
+                ),
+                "{name} must refuse the turn"
+            );
+        }
+
+        // A pass for a session bound to this host's own model is refused too:
+        // the pass names a third node.
+        let own = fixture.pass(|_| {}, None).await;
+        fixture
+            .config
+            .provider
+            .history_store()
+            .set_session_provider_node_id(&fixture.sid, Some(&fixture.key.host.to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.start(Some(own)).await,
+            Err(AgentError::MeshAccessDenied)
+        ));
+        fixture.mesh.shutdown().await;
+    }
+
+    /// Full access lets a turn without a pass use the host's own access, but a
+    /// pass that is present and invalid refuses the turn: it never falls back.
+    #[tokio::test]
+    async fn a_pass_that_does_not_verify_refuses_the_turn_even_with_full_access() {
+        use crate::error::AgentError;
+
+        let fixture = ThirdNode::new("third-node-full-bad-pass").await;
+        fixture
+            .grant(querymt_remote::peer_access::PeerGrant::Full)
+            .await;
+        let other = libp2p::PeerId::random().to_string();
+
+        let mut bad_signature = fixture.pass(|_| {}, None).await;
+        let first = bad_signature.signature.remove(0);
+        bad_signature
+            .signature
+            .insert(0, if first == '0' { '1' } else { '0' });
+        let mut altered = fixture.pass(|_| {}, None).await;
+        altered.model_node = other.clone();
+        let cases = [
+            ("a bad signature", bad_signature),
+            ("an altered pass", altered),
+            (
+                "another model node",
+                fixture.pass(|n| n[1] = other.clone(), None).await,
+            ),
+            (
+                "an expired pass",
+                fixture
+                    .pass(
+                        |_| {},
+                        Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                - 7200,
+                        ),
+                    )
+                    .await,
+            ),
+        ];
+        for (name, pass) in cases {
+            assert!(
+                matches!(
+                    fixture.start(Some(pass)).await,
+                    Err(AgentError::MeshAccessDenied)
+                ),
+                "{name} must refuse the turn under Full access"
+            );
+        }
+
+        // Without a pass, and with a valid one, Full access still runs the turn.
+        fixture
+            .start(None)
+            .await
+            .expect("Full access without a pass uses the host's access");
+        let valid = fixture.pass(|_| {}, None).await;
+        fixture
+            .start(Some(valid))
+            .await
+            .expect("a valid pass is accepted under Full access");
+        fixture.mesh.shutdown().await;
+    }
+
+    /// The pass the owner's node signs is the pass the session host accepts, and
+    /// only a model on a third node gets one.
+    #[tokio::test]
+    async fn an_owner_issued_pass_is_accepted_by_the_session_host() {
+        use crate::agent::remote::actor_ref::{sign_owner_pass, third_node};
+        use querymt_agent_core::session_control::SessionModelBinding;
+
+        let fixture = ThirdNode::new("third-node-owner-pass").await;
+        fixture.grant(ThirdNode::sessions_only()).await;
+        let session = fixture
+            .config
+            .provider
+            .with_session(&fixture.sid)
+            .await
+            .unwrap();
+        let llm = session.llm_config().unwrap();
+        let binding = |node: Option<String>| SessionModelBinding {
+            model_id: format!("{}/{}", llm.provider, llm.model),
+            provider: llm.provider.clone(),
+            model: llm.model.clone(),
+            llm_config_id: llm.id,
+            provider_node_id: node,
+        };
+        let host = *fixture.mesh.peer_id();
+        let own = fixture.issuer.public().to_peer_id();
+
+        let third = binding(Some(fixture.node.clone()));
+        let node = third_node(&host, &own, &third).expect("a third node's model needs a pass");
+        let pass = sign_owner_pass(&fixture.issuer, &host, &node, &third, &fixture.sid)
+            .expect("the owner signs a pass");
+        fixture
+            .start(Some(pass))
+            .await
+            .expect("the session host accepts the pass its prompter signed");
+
+        // The host's own model, this node's own model and no model need none.
+        for node in [
+            Some(host.to_string()),
+            Some(own.to_string()),
+            Some("local".to_string()),
+            None,
+        ] {
+            assert!(third_node(&host, &own, &binding(node)).is_none());
+        }
+        fixture.mesh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_access_may_use_the_hosts_own_access() {
+        let fixture = ThirdNode::new("third-node-full").await;
+        fixture
+            .grant(querymt_remote::peer_access::PeerGrant::Full)
+            .await;
+        let turn = fixture
+            .start(None)
+            .await
+            .expect("Full access may use the host's own access on a third node");
+        assert!(turn.uses_explicit_mesh_provider());
+        fixture.mesh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn below_full_a_third_node_needs_a_pass() {
+        use crate::agent::session_actor::TurnAuthority;
+        use crate::error::AgentError;
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+
+        let fixture = ThirdNode::new("third-node-no-pass").await;
+        fixture.grant(ThirdNode::sessions_only()).await;
+        assert!(matches!(
+            fixture.start(None).await,
+            Err(AgentError::MeshAccessDenied)
+        ));
+
+        // A scheduled turn carries no pass.
+        let TurnAuthority::Peer(peer) = TurnAuthority::from_stored_origin(
+            ScheduleOrigin::Peer {
+                host: fixture.key.host.to_string(),
+                peer: fixture.key.peer.to_string(),
+                protocol: SchedulePeerProtocol::V1,
+            },
+            Some(&fixture.mesh),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected a peer turn");
+        };
+        assert!(peer.pass().is_none());
+        let session = fixture
+            .config
+            .provider
+            .with_session(&fixture.sid)
+            .await
+            .unwrap();
+        let grant = peer.grant_for(None).await.unwrap();
+        assert!(matches!(
+            session.for_mesh_turn(&peer, &grant, None),
+            Err(AgentError::MeshAccessDenied)
+        ));
+        fixture.mesh.shutdown().await;
+    }
+
+    /// `SetSessionModel` below full access may pin another node, never this host.
+    #[tokio::test]
+    async fn selecting_a_host_model_needs_full_access() {
         use crate::agent::remote::remote_actor_impl::register_session_routes;
         use crate::agent::session_control::SessionModelSelection;
         use crate::error::AgentError;
@@ -3470,11 +3868,23 @@ mod node_manager_tests {
         else {
             panic!("a session grant may pin the caller's own node");
         };
-        for node in [None, Some(libp2p::PeerId::random().to_string())] {
+        // A third node's model is selectable too: using it needs the peer's pass.
+        let Ok(SwarmResponse::Ask(Ok(_))) = router
+            .handle_v1(peer, select(Some(libp2p::PeerId::random().to_string())))
+            .await
+        else {
+            panic!("a session grant may pin a third node");
+        };
+        for node in [
+            None,
+            Some("local".to_string()),
+            Some(mesh.peer_id().to_string()),
+            Some("not-a-node".to_string()),
+        ] {
             let Ok(SwarmResponse::Ask(Err(kameo::error::RemoteSendError::HandlerError(error)))) =
                 router.handle_v1(peer, select(node)).await
             else {
-                panic!("a session grant must not select another node's model");
+                panic!("a session grant must not select one of the host's own models");
             };
             assert!(matches!(
                 rmp_serde::from_slice::<AgentError>(&error).unwrap(),

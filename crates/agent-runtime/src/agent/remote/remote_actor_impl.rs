@@ -259,9 +259,12 @@ fn register_session_controls(router: &InboundRouter, actor: &ActorRef<SessionAct
         messages::Undo,
         messages::Redo,
     );
-    // Selecting a model on the caller's own node spends nothing on this host:
-    // that node authorizes and meters the calls, so the session grant is
-    // enough. Any other selection still needs full access.
+    // Selecting a model on another node spends nothing on this host: that node
+    // authorizes and meters the calls, under the caller's own node (a model on
+    // the caller's node), or under the caller's model pass or, for Full
+    // access, this host's access (a third node). The binding alone confers no
+    // use of the model, so the session grant is enough. Selecting one of this
+    // host's own models still needs full access.
     route::<_, messages::SetSessionModel, _, _>(
         router,
         actor,
@@ -273,7 +276,7 @@ fn register_session_controls(router: &InboundRouter, actor: &ActorRef<SessionAct
                 origin.grant(),
                 Some(querymt_remote::peer_access::PeerGrant::Full)
             );
-            if full || selects_caller_node(&origin, &message.selection) {
+            if full || selects_remote_node(&origin, &message.selection) {
                 Ok(message)
             } else {
                 tracing::warn!(
@@ -288,8 +291,8 @@ fn register_session_controls(router: &InboundRouter, actor: &ActorRef<SessionAct
     );
 }
 
-/// Whether `selection` pins the session's model to the requesting peer's node.
-fn selects_caller_node(
+/// Whether `selection` pins the session's model to a node other than this host.
+fn selects_remote_node(
     origin: &PeerRequest,
     selection: &crate::agent::session_control::SessionModelSelection,
 ) -> bool {
@@ -297,7 +300,7 @@ fn selects_caller_node(
         .provider_node_id
         .as_deref()
         .and_then(|node| querymt_remote::NodeId::parse(node).ok())
-        .is_some_and(|node| node == origin.key().peer)
+        .is_some_and(|node| node != origin.key().host)
 }
 
 fn register_session_interactions(
@@ -344,6 +347,7 @@ pub(super) fn register_session_turns(
         actor: &ActorRef<SessionActor>,
         timeouts: CallTimeouts,
         authority: fn(&mut M) -> &mut TurnAuthority,
+        pass: fn(&mut M) -> Option<querymt_remote::ModelPass>,
     ) where
         SessionActor: RemoteMessage<M> + Message<M>,
         <SessionActor as Message<M>>::Reply: Reply<Ok: serde::Serialize + Send>,
@@ -358,17 +362,54 @@ pub(super) fn register_session_turns(
             InboundAccess::Sessions,
             timeouts,
             move |origin, mut message| {
-                *authority(&mut message) =
-                    TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store.clone())?));
+                let pass = pass(&mut message);
+                *authority(&mut message) = TurnAuthority::Peer(Arc::new(
+                    PeerTurn::from_request(&origin, store.clone())?.with_pass(pass),
+                ));
                 Ok(message)
             },
         );
     }
-    turn::<messages::Prompt>(router, &store, actor, TURN, |msg| &mut msg.authority);
-    turn::<messages::SubmitSessionInput>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
-    turn::<messages::DiscardQueuedInput>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
-    turn::<messages::GetRuntimeStatus>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
-    turn::<messages::Cancel>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
+    turn::<messages::Prompt>(
+        router,
+        &store,
+        actor,
+        TURN,
+        |msg| &mut msg.authority,
+        |msg| msg.pass.take(),
+    );
+    turn::<messages::SubmitSessionInput>(
+        router,
+        &store,
+        actor,
+        CONTROL,
+        |msg| &mut msg.authority,
+        |msg| msg.pass.take(),
+    );
+    turn::<messages::DiscardQueuedInput>(
+        router,
+        &store,
+        actor,
+        CONTROL,
+        |msg| &mut msg.authority,
+        |_| None,
+    );
+    turn::<messages::GetRuntimeStatus>(
+        router,
+        &store,
+        actor,
+        CONTROL,
+        |msg| &mut msg.authority,
+        |_| None,
+    );
+    turn::<messages::Cancel>(
+        router,
+        &store,
+        actor,
+        CONTROL,
+        |msg| &mut msg.authority,
+        |_| None,
+    );
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {

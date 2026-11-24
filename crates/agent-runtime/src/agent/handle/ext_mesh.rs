@@ -99,7 +99,7 @@ impl LocalAgentHandle {
 }
 
 #[cfg(feature = "remote")]
-pub(crate) use access::register_peer_access_read;
+pub(crate) use access::{model_node_reports_access, register_peer_access_read};
 
 #[cfg(feature = "remote")]
 mod access {
@@ -644,6 +644,125 @@ mod access {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(Unavailable)
+    }
+
+    /// Whether an incoming-access report includes `provider`/`model`.
+    fn includes_model(access: &MeshPeerIncomingAccess, provider: &str, model: &str) -> bool {
+        let MeshPeerIncomingAccess::Granted { effective, .. } = access else {
+            return false;
+        };
+        match effective.mode {
+            MeshPeerAccessMode::Full => true,
+            MeshPeerAccessMode::Custom => effective.providers.iter().any(|grant| {
+                grant.provider_id == provider
+                    && match &grant.models {
+                        ModelSelection::All => true,
+                        ModelSelection::Selected { model_ids } => {
+                            model_ids.iter().any(|id| id == model)
+                        }
+                    }
+            }),
+        }
+    }
+
+    /// Ask `node` what it shares with this node, and whether that includes the
+    /// model. An unreachable, legacy or denying node reports no access.
+    pub(crate) async fn model_node_reports_access(
+        mesh: &querymt_remote::MeshHandle,
+        node: &NodeId,
+        provider: &str,
+        model: &str,
+    ) -> bool {
+        use crate::agent::remote::node_manager::GetPeerSharing;
+        use crate::agent::remote::{
+            MeshRuntimeHandle, RemoteNodeManager, scope::scoped_node_manager_for_peer,
+        };
+        use crate::error::AgentError;
+        use querymt_remote::request_timeout::ask_sharing_v1;
+
+        let timeout = std::time::Duration::from_secs(3);
+        tokio::time::timeout(timeout, async {
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let name = scoped_node_manager_for_peer(&scope, node.as_peer_id());
+                if let Ok(Some(manager)) = runtime
+                    .lookup_actor_no_retry::<RemoteNodeManager>(name)
+                    .await
+                    && manager.id().peer_id() == Some(node.as_peer_id())
+                {
+                    return ask_sharing_v1::<_, _, MeshPeerIncomingAccess, AgentError>(
+                        mesh,
+                        &manager,
+                        &GetPeerSharing,
+                        timeout,
+                    )
+                    .await
+                    .is_ok_and(|access| includes_model(&access, provider, model));
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    mod pass_tests {
+        use super::*;
+
+        fn granted(
+            mode: MeshPeerAccessMode,
+            providers: Vec<ProviderGrant>,
+        ) -> MeshPeerIncomingAccess {
+            MeshPeerIncomingAccess::Granted {
+                effective: MeshPeerEffectiveAccess {
+                    mode,
+                    sessions: false,
+                    filesystem: false,
+                    shell: false,
+                    providers,
+                },
+                quotas: vec![],
+            }
+        }
+
+        #[test]
+        fn a_model_node_report_includes_only_models_it_grants() {
+            let selected = granted(
+                MeshPeerAccessMode::Custom,
+                vec![ProviderGrant {
+                    provider_id: "p".into(),
+                    models: ModelSelection::Selected {
+                        model_ids: vec!["m".into()],
+                    },
+                }],
+            );
+            assert!(includes_model(&selected, "p", "m"));
+            assert!(!includes_model(&selected, "p", "other"));
+            assert!(!includes_model(&selected, "q", "m"));
+            let all = granted(
+                MeshPeerAccessMode::Custom,
+                vec![ProviderGrant {
+                    provider_id: "p".into(),
+                    models: ModelSelection::All,
+                }],
+            );
+            assert!(includes_model(&all, "p", "anything"));
+            assert!(!includes_model(&all, "q", "anything"));
+            assert!(includes_model(
+                &granted(MeshPeerAccessMode::Full, vec![]),
+                "p",
+                "m"
+            ));
+            for report in [
+                MeshPeerIncomingAccess::Denied,
+                MeshPeerIncomingAccess::Legacy,
+                MeshPeerIncomingAccess::Unavailable,
+                MeshPeerIncomingAccess::Incompatible,
+            ] {
+                assert!(!includes_model(&report, "p", "m"));
+            }
+        }
     }
 
     pub(super) async fn dispatch(

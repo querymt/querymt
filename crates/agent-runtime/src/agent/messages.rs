@@ -39,6 +39,11 @@ pub struct Prompt {
     pub req: PromptRequest,
     #[serde(skip)]
     pub(crate) authority: TurnAuthority,
+    /// A model pass the submitting node signed for a session bound to a third
+    /// node's model. The session host honors it only for a remote caller.
+    #[cfg(feature = "remote")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<querymt_remote::ModelPass>,
 }
 
 impl Prompt {
@@ -46,6 +51,8 @@ impl Prompt {
         Self {
             req,
             authority: TurnAuthority::Local,
+            #[cfg(feature = "remote")]
+            pass: None,
         }
     }
 }
@@ -56,6 +63,10 @@ pub struct SubmitSessionInput {
     pub input: SubmitInput,
     #[serde(skip)]
     pub(crate) authority: TurnAuthority,
+    /// A model pass for the turn this input starts. See [`Prompt::pass`].
+    #[cfg(feature = "remote")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<querymt_remote::ModelPass>,
 }
 
 impl SubmitSessionInput {
@@ -63,6 +74,8 @@ impl SubmitSessionInput {
         Self {
             input,
             authority: TurnAuthority::Local,
+            #[cfg(feature = "remote")]
+            pass: None,
         }
     }
 }
@@ -690,6 +703,51 @@ mod tests {
             rt.selection.provider_node_id.as_deref(),
             Some(peer_id.as_str())
         );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_pass_is_optional_on_prompt_and_input_and_omitted_when_absent() {
+        let pass = querymt_remote::ModelPass {
+            version: 1,
+            issuer: "issuer".into(),
+            audience: "host".into(),
+            model_node: "node".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            session_id: "s".into(),
+            issued_at: 1,
+            expires_at: 2,
+            signature: "00".into(),
+        };
+        let prompt = Prompt::new(PromptRequest::new("s".to_string(), vec![]));
+        let json = serde_json::to_value(&prompt).unwrap();
+        assert!(json.get("pass").is_none(), "an absent pass is not sent");
+        // Older senders omit the field.
+        let decoded: Prompt = serde_json::from_value(json).unwrap();
+        assert!(decoded.pass.is_none());
+
+        let mut with_pass = prompt;
+        with_pass.pass = Some(pass.clone());
+        let json = serde_json::to_value(&with_pass).unwrap();
+        let decoded: Prompt = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.pass, Some(pass.clone()));
+        // The turn authority never travels with the message.
+        assert!(matches!(decoded.authority, TurnAuthority::Local));
+
+        let input = SubmitInput {
+            session_id: "s".into(),
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec![],
+        };
+        let mut submit = SubmitSessionInput::new(input);
+        assert!(serde_json::to_value(&submit).unwrap().get("pass").is_none());
+        submit.pass = Some(pass.clone());
+        let decoded: SubmitSessionInput =
+            serde_json::from_value(serde_json::to_value(&submit).unwrap()).unwrap();
+        assert_eq!(decoded.pass, Some(pass));
     }
 
     #[test]

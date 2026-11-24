@@ -88,6 +88,7 @@ pub trait RemoteProviderBackend: Send + Sync {
             protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
             capabilities: provider.capabilities(),
             generation: Default::default(),
+            charged_peer: None,
         })
     }
 }

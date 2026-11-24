@@ -1,3 +1,4 @@
+use crate::model_pass::ModelPass;
 use querymt::ToolCall;
 use querymt::Usage;
 use querymt::chat::{
@@ -16,6 +17,10 @@ pub struct GetProviderContractInfo {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// A model pass lending the issuer's access to the sending host. Peers that
+    /// predate passes ignore it, and name no charged peer in their reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<ModelPass>,
 }
 
 /// Wire-protocol generation advertised by mesh provider hosts.
@@ -49,6 +54,11 @@ pub struct ProviderContractInfo {
     pub capabilities: ChatCapabilities,
     #[serde(default)]
     pub generation: ProviderGenerationProfile,
+    /// The peer this node charges for requests like the one that was asked
+    /// about: the pass issuer when a pass was sent, otherwise the sender. A
+    /// node that predates model passes omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charged_peer: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +205,9 @@ pub struct ProviderChatRequest {
     /// ignored by peers that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<GenerationOptions>,
+    /// A model pass lending the issuer's access to the sending host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<ModelPass>,
 }
 
 pub type GenericProviderStreamRequest<TRouterRef> = ProviderStreamRequest<TRouterRef>;
@@ -221,6 +234,9 @@ pub struct ProviderStreamRequest<TRouterRef> {
     /// ignored by peers that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<GenerationOptions>,
+    /// A model pass lending the issuer's access to the sending host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<ModelPass>,
 }
 
 pub fn default_stream_heartbeat_secs() -> u64 {
@@ -701,6 +717,7 @@ mod rmp_wire_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         }
     }
 
@@ -788,6 +805,7 @@ mod rmp_wire_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
         assert_rmp_round_trip_equal(&request);
     }
@@ -803,6 +821,7 @@ mod rmp_wire_tests {
                 output_ceiling: Some(128_000),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
             },
+            charged_peer: None,
         };
         assert_rmp_round_trip_equal(&current);
 

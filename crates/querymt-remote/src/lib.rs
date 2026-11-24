@@ -25,6 +25,8 @@ pub mod mesh_runtime_support;
 pub mod mesh_state;
 mod metered_provider;
 pub use metered_provider::MeteredProvider;
+pub mod model_pass;
+pub use model_pass::{ModelPass, ModelPassClaim, ModelPassError, ModelPassExpectation};
 pub mod names;
 pub mod node_id;
 pub mod peer_access;

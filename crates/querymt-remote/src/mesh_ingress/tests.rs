@@ -465,7 +465,7 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
             let key_for = |peer| PeerGrantKey { host: NodeId::from_peer_id(peer), peer: NodeId::from_peer_id(*mesh.peer_id()) };
             let request = ProviderChatRequest {
                 provider: "fixture".into(), model: "echo-model".into(), messages: vec![],
-                tools: None, params: None, item_aware_contract_version: None, options: None,
+                tools: None, params: None, item_aware_contract_version: None, options: None, pass: None,
             };
             grants.replace_grant(&key_for(legacy_peer), uuid::Uuid::nil(), PeerGrant::Full).await.unwrap();
             let legacy_reply = transport.send_chat_request(&host_ref(legacy_peer), &request).await.unwrap();
@@ -486,7 +486,7 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
                 provider: request.provider, model: request.model, messages: vec![], tools: None,
                 session_id: session.into(), request_id: id.into(), stream_router_ref: callback,
                 reconnect_grace_secs: 3, heartbeat_interval_secs: 5, lease_ttl_secs: 30,
-                params: None, item_aware_contract_version: None, options: None,
+                params: None, item_aware_contract_version: None, options: None, pass: None,
             };
             let legacy_host = host_ref(legacy_peer);
             transport.send_stream_request(&legacy_host, stream_request.clone()).await.unwrap();

@@ -10,8 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
+use crate::NodeId;
+use crate::mesh_ingress::{
+    InboundAccess, InboundDelivery, InboundRouter, PeerRequest, SharingRejection,
+};
 use crate::metered_provider::{MeteredAccess, MeteredProvider};
+use crate::model_pass::{ModelPass, ModelPassExpectation};
 use crate::peer_access::quota::{QuotaError, QuotaStore};
 use crate::peer_access::{PeerGrant, PeerGrantState, SharingProtocol};
 use crate::provider_host_actor::validate_item_aware_request;
@@ -108,17 +112,38 @@ impl GuardedProvider {
         host_route!(
             GetProviderContractInfo,
             Ask,
-            Providers,
+            Handler,
             |service, peer, msg| service.contract(&peer, msg)
         );
         host_route!(
             ProviderChatRequest,
             LegacyAsk,
             Full,
-            |service, peer, msg| service.chat(&peer, msg, Uuid::now_v7())
+            |service, peer, msg| async move {
+                // This route serves the sender's own access. A request that
+                // carries a pass must never be charged to the sender instead.
+                if msg.pass.is_some() {
+                    return Err(quota_error(QuotaError::Denied));
+                }
+                service.chat(&peer, msg, Uuid::now_v7()).await
+            }
         );
-        host_route!(MeteredChat, V1Ask, Providers, |service, peer, msg| service
-            .chat(&peer, msg.request, msg.request_id));
+        host_route!(
+            MeteredChat,
+            V1Ask,
+            Handler,
+            |service, peer, msg| async move {
+                let peer = service
+                    .authorize(
+                        &peer,
+                        msg.request.pass.as_ref(),
+                        &msg.request.provider,
+                        &msg.request.model,
+                    )
+                    .await?;
+                service.chat(&peer, msg.request, msg.request_id).await
+            }
+        );
 
         let router = Arc::downgrade(router);
         tokio::spawn(async move {
@@ -127,6 +152,56 @@ impl GuardedProvider {
                 router.withdraw_actor(host_id);
             }
         });
+    }
+
+    /// Choose the authority of a request on a `Handler` route: the issuer of a
+    /// valid model pass, otherwise the sender. A refused pass is never a reason
+    /// to evaluate the sender's own grant.
+    pub(crate) async fn authorize(
+        &self,
+        peer: &PeerRequest,
+        pass: Option<&ModelPass>,
+        provider: &str,
+        model: &str,
+    ) -> Result<PeerRequest, RemoteProviderHostError> {
+        let issuer = match pass {
+            None => None,
+            Some(pass) => {
+                let sender = peer.sender().as_str();
+                let host = peer.key().host.as_str();
+                let expect = ModelPassExpectation {
+                    issuer: None,
+                    audience: Some(&sender),
+                    model_node: Some(&host),
+                    provider: Some(provider),
+                    model: Some(model),
+                    session_id: None,
+                };
+                let issuer = pass
+                    .verify_now(&expect)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| NodeId::parse(&pass.issuer))
+                    // A node never lends itself its own access.
+                    .and_then(|issuer| {
+                        if issuer == peer.key().host {
+                            Err("issuer is the model node".to_string())
+                        } else {
+                            Ok(issuer)
+                        }
+                    });
+                match issuer {
+                    Ok(issuer) => Some(issuer),
+                    Err(error) => {
+                        tracing::info!(%error, %sender, "model pass refused");
+                        peer.refuse(SharingRejection::Denied);
+                        return Err(rejection_error(SharingRejection::Denied));
+                    }
+                }
+            }
+        };
+        peer.authorize_as(issuer.as_ref(), InboundAccess::Providers)
+            .await
+            .map_err(rejection_error)
     }
 
     async fn grant(&self, peer: &PeerRequest) -> Result<PeerGrantState, RemoteProviderHostError> {
@@ -215,11 +290,17 @@ impl GuardedProvider {
         peer: &PeerRequest,
         msg: GetProviderContractInfo,
     ) -> Result<ProviderContractInfo, RemoteProviderHostError> {
+        let peer = &self
+            .authorize(peer, msg.pass.as_ref(), &msg.provider, &msg.model)
+            .await?;
         let access = self.access(peer, &msg.provider, &msg.model)?;
         access.check().await.map_err(policy_error)?;
         let request = self.build_request(&msg.provider, &msg.model, msg.params)?;
-        let contract = self.backend.contract_info(request).await?;
+        let mut contract = self.backend.contract_info(request).await?;
         access.check().await.map_err(policy_error)?;
+        // Tell the caller whom this node charges, so that a host holding a pass
+        // can tell that the pass was understood.
+        contract.charged_peer = Some(peer.key().peer.as_str());
         Ok(contract)
     }
 
@@ -300,6 +381,17 @@ fn catalog_reply_allowed(reply: &[u8], grant: &PeerGrant, protocol: SharingProto
             catalog_entry_allowed(grant, protocol, &entry.provider, entry.model.as_deref())
         })
     })
+}
+
+pub(crate) fn rejection_error(rejection: SharingRejection) -> RemoteProviderHostError {
+    match rejection {
+        SharingRejection::Unavailable => failure(
+            ProviderErrorKind::UnknownPermanent,
+            "mesh_access_unavailable",
+            "mesh policy unavailable",
+        ),
+        _ => quota_error(QuotaError::Denied),
+    }
 }
 
 pub(crate) fn policy_error(error: LLMError) -> RemoteProviderHostError {

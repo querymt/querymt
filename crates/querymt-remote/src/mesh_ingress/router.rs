@@ -66,16 +66,128 @@ impl InboundDelivery {
     }
 }
 
+/// What a `Handler` route's handler chose as the authority of its request.
+#[derive(Debug, Default)]
+enum Selection {
+    /// The handler has not authorized anything; the request is refused.
+    #[default]
+    Unset,
+    Refused(SharingRejection),
+    Chosen {
+        key: PeerGrantKey,
+        access: InboundAccess,
+        changes: Option<broadcast::Receiver<PolicyChange>>,
+    },
+}
+
+struct StoreRef(Arc<dyn GrantStore>);
+
+impl std::fmt::Debug for StoreRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantStore")
+    }
+}
+
 /// Trusted local metadata captured at the network boundary. It is not wire data.
 #[derive(Debug, Clone)]
 pub struct PeerRequest {
+    /// The peer whose grant applies: the sender, or the issuer of a model pass.
     key: PeerGrantKey,
+    /// The transport-authenticated sender of the request.
+    sender: NodeId,
     protocol: SharingProtocol,
     grant: Option<PeerGrant>,
     policy_changes: Arc<Mutex<Option<broadcast::Receiver<PolicyChange>>>>,
+    store: Arc<StoreRef>,
+    selection: Arc<Mutex<Selection>>,
 }
 
 impl PeerRequest {
+    /// The transport-authenticated sender, which owns callbacks and streams of
+    /// this request even when [`Self::key`] names a model pass issuer.
+    pub fn sender(&self) -> &NodeId {
+        &self.sender
+    }
+
+    /// Host and sender in the direction of stream and callback ownership.
+    pub fn sender_key(&self) -> PeerGrantKey {
+        PeerGrantKey {
+            host: self.key.host.clone(),
+            peer: self.sender.clone(),
+        }
+    }
+
+    /// Refuse a request on a `Handler` route before any authority is chosen.
+    pub(crate) fn refuse(&self, rejection: SharingRejection) {
+        let mut selection = self.selection.lock();
+        if !matches!(&*selection, Selection::Chosen { .. }) {
+            *selection = Selection::Refused(rejection);
+        }
+    }
+
+    /// Authorize this request for `access` and make the result its authority.
+    /// Only for `InboundAccess::Handler` routes, and at most once per request.
+    /// `authority` names the peer whose grant applies: `None` for the sender, or
+    /// the issuer of a model pass the handler has verified. A pass requires the
+    /// grant-aware contract. A refusal is final for the request, never a reason
+    /// to evaluate another peer's grant.
+    pub(crate) async fn authorize_as(
+        &self,
+        authority: Option<&NodeId>,
+        access: InboundAccess,
+    ) -> Result<PeerRequest, SharingRejection> {
+        match self.select(authority, access).await {
+            Ok(request) => Ok(request),
+            Err(rejection) => {
+                let mut selection = self.selection.lock();
+                if !matches!(&*selection, Selection::Chosen { .. }) {
+                    *selection = Selection::Refused(rejection);
+                }
+                Err(rejection)
+            }
+        }
+    }
+
+    async fn select(
+        &self,
+        authority: Option<&NodeId>,
+        access: InboundAccess,
+    ) -> Result<PeerRequest, SharingRejection> {
+        let key = match authority {
+            None => self.sender_key(),
+            Some(_) if self.protocol != SharingProtocol::V1 => {
+                return Err(SharingRejection::Denied);
+            }
+            Some(issuer) => PeerGrantKey {
+                host: self.key.host.clone(),
+                peer: issuer.clone(),
+            },
+        };
+        let changes = self.store.0.subscribe_peer_changes(&key);
+        // The router's receiver must start before the grant read suspends: a
+        // `resubscribe` afterwards would skip a revoke and restore that happen
+        // during the read, and the router's final check would miss them.
+        let router_changes = changes.as_ref().map(broadcast::Receiver::resubscribe);
+        let state = self.store.0.grant(&key).await.map_err(|error| {
+            tracing::warn!(%error, "cannot authorize mesh request");
+            SharingRejection::Unavailable
+        })?;
+        if !access.permits(&state.grant, self.protocol) {
+            return Err(SharingRejection::Denied);
+        }
+        *self.selection.lock() = Selection::Chosen {
+            key: key.clone(),
+            access,
+            changes: router_changes,
+        };
+        Ok(PeerRequest {
+            key,
+            grant: Some(state.grant),
+            policy_changes: Arc::new(Mutex::new(changes)),
+            ..self.clone()
+        })
+    }
+
     /// Grant authorized at ingress, absent for identity-only routes.
     pub fn grant(&self) -> Option<&PeerGrant> {
         self.grant.as_ref()
@@ -114,18 +226,23 @@ pub enum InboundAccess {
     Filesystem,
     /// At least one provider is shared. The handler must check the actual binding.
     Providers,
+    /// The handler picks the authority of the request with
+    /// [`PeerRequest::authorize_as`], for routes that accept a model pass. The
+    /// router refuses a request whose handler authorized nothing, and rechecks
+    /// the chosen authority after the handler as it does for other routes.
+    Handler,
 }
 
 impl InboundAccess {
     fn permits(self, grant: &PeerGrant, protocol: SharingProtocol) -> bool {
-        if self == Self::Identity {
+        if matches!(self, Self::Identity | Self::Handler) {
             return true;
         }
         if protocol == SharingProtocol::Legacy {
             return grant == &PeerGrant::Full;
         }
         match self {
-            Self::Identity | Self::PeerAccess => true,
+            Self::Identity | Self::Handler | Self::PeerAccess => true,
             Self::Full => grant == &PeerGrant::Full,
             Self::Sessions => grant.allows_sessions(protocol),
             Self::Filesystem => grant.allows_filesystem(protocol),
@@ -253,14 +370,15 @@ impl InboundRouter {
 
     async fn authorize(
         &self,
-        peer: &PeerRequest,
+        key: &PeerGrantKey,
+        protocol: SharingProtocol,
         access: InboundAccess,
     ) -> Result<Option<PeerGrant>, SharingRejection> {
-        if access == InboundAccess::Identity {
+        if matches!(access, InboundAccess::Identity | InboundAccess::Handler) {
             return Ok(None);
         }
-        match self.store.grant(peer.key()).await {
-            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state.grant)),
+        match self.store.grant(key).await {
+            Ok(state) if access.permits(&state.grant, protocol) => Ok(Some(state.grant)),
             Ok(_) => Err(SharingRejection::Denied),
             Err(error) => {
                 tracing::warn!(%error, "cannot authorize mesh request");
@@ -347,18 +465,24 @@ impl InboundRouter {
             host: NodeId::from_peer_id(self.host),
             peer: NodeId::from_peer_id(peer),
         };
-        let changes = (route.access != InboundAccess::Identity)
-            .then(|| self.store.subscribe_peer_changes(&key))
-            .flatten();
+        let changes = (!matches!(
+            route.access,
+            InboundAccess::Identity | InboundAccess::Handler
+        ))
+        .then(|| self.store.subscribe_peer_changes(&key))
+        .flatten();
         let mut origin = PeerRequest {
+            sender: key.peer.clone(),
             key,
             protocol,
             grant: None,
             policy_changes: Arc::new(Mutex::new(
                 changes.as_ref().map(broadcast::Receiver::resubscribe),
             )),
+            store: Arc::new(StoreRef(self.store.clone())),
+            selection: Arc::default(),
         };
-        origin.grant = match self.authorize(&origin, route.access).await {
+        origin.grant = match self.authorize(&origin.key, protocol, route.access).await {
             Ok(grant) => grant,
             Err(rejection) => {
                 tracing::info!(
@@ -388,9 +512,47 @@ impl InboundRouter {
             (Some(check), Ok(reply)) => check(reply, grant, protocol),
             _ => true,
         };
-        if origin.grant.is_some() {
+        // The authority checked after the handler is the one it chose.
+        let (auth_key, auth_access, authorized, mut changes) =
+            if route.access == InboundAccess::Handler {
+                match std::mem::take(&mut *origin.selection.lock()) {
+                    Selection::Chosen {
+                        key,
+                        access,
+                        changes,
+                    } => (key, access, true, changes),
+                    Selection::Refused(rejection) => {
+                        tracing::info!(
+                            %peer,
+                            actor = %actor_remote_id,
+                            message_id = %message_remote_id,
+                            ?protocol,
+                            ?rejection,
+                            "mesh request refused"
+                        );
+                        return Err(rejection);
+                    }
+                    Selection::Unset => {
+                        tracing::warn!(
+                            %peer,
+                            actor = %actor_remote_id,
+                            message_id = %message_remote_id,
+                            "mesh handler route authorized nothing"
+                        );
+                        return Err(SharingRejection::Denied);
+                    }
+                }
+            } else {
+                (
+                    origin.key.clone(),
+                    route.access,
+                    origin.grant.is_some(),
+                    changes,
+                )
+            };
+        if authorized {
             let grant = self
-                .authorize(&origin, route.access)
+                .authorize(&auth_key, protocol, auth_access)
                 .await
                 .map_err(|_| SharingRejection::Changed)?;
             if grant.as_ref().is_some_and(|grant| !permits_reply(grant)) {
@@ -398,13 +560,13 @@ impl InboundRouter {
             }
         }
         // Restoring a grant must not resume delivery of a revoked request.
-        if let Some(mut changes) = changes {
+        if let Some(changes) = changes.as_mut() {
             use tokio::sync::broadcast::error::TryRecvError;
             loop {
                 match changes.try_recv() {
                     Ok(change)
-                        if change.key == origin.key
-                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !route.access.permits(grant, protocol) || !permits_reply(grant)) =>
+                        if change.key == auth_key
+                            && matches!(&change.effect, PolicyEffect::Grant(grant) if !auth_access.permits(grant, protocol) || !permits_reply(grant)) =>
                     {
                         return Err(SharingRejection::Changed);
                     }

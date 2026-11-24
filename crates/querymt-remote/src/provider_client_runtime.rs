@@ -222,6 +222,7 @@ where
                             provider: self.config.provider_name.clone(),
                             model: self.config.model.clone(),
                             params: self.config.params.clone(),
+                            pass: self.config.pass.clone(),
                         },
                     )
                     .await?;
@@ -230,7 +231,16 @@ where
                 // re-fetches and can succeed once the peer is upgraded.
                 match info.protocol_version {
                     Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {
-                        Ok(info)
+                        // A node that predates model passes ignores the field and
+                        // would serve the request under this node's own access.
+                        match (&self.config.pass, &info.charged_peer) {
+                            (Some(pass), charged) if charged.as_deref() != Some(pass.issuer.as_str()) => {
+                                Err(LLMError::InvalidRequest(
+                                    "the model node does not confirm that it charges the model pass issuer".to_string(),
+                                ))
+                            }
+                            _ => Ok(info),
+                        }
                     }
                     other => {
                         let error = LLMError::InvalidRequest(format!(
@@ -858,6 +868,7 @@ mod tests {
             capabilities: ChatCapabilities::NONE,
             item_aware_chat_version: None,
             generation: Default::default(),
+            charged_peer: None,
         });
         core.negotiate_contract().await.unwrap();
         core.chat(&ChatCall::new(&[]), |error| {
@@ -886,6 +897,69 @@ mod tests {
             RemoteProviderClientConfig::new("peer", "llama_cpp", "model"),
         );
         (transport, core)
+    }
+
+    #[tokio::test]
+    async fn a_model_node_without_pass_support_is_not_used() {
+        // The client does not verify the signature: the model node does.
+        let pass = crate::ModelPass {
+            version: 1,
+            issuer: "issuer".into(),
+            audience: "host".into(),
+            model_node: "node".into(),
+            provider: "llama_cpp".into(),
+            model: "model".into(),
+            session_id: "session".into(),
+            issued_at: 1,
+            expires_at: 2,
+            signature: String::new(),
+        };
+        let contract = |charged_peer: Option<&str>| ProviderContractInfo {
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE,
+            item_aware_chat_version: None,
+            generation: Default::default(),
+            charged_peer: charged_peer.map(str::to_owned),
+        };
+        let with_pass = |info| {
+            let (transport, core) = core_with_contract(info);
+            let config = core.config().clone().with_pass(Some(pass.clone()));
+            (
+                transport.clone(),
+                RemoteProviderClientCore::new(transport, config),
+            )
+        };
+
+        // A node that predates passes omits the charged peer, and one that
+        // charges someone else is not the issuer's node either.
+        for charged in [None, Some("host")] {
+            let (transport, core) = with_pass(contract(charged));
+            let error = core.negotiate_contract().await.unwrap_err();
+            assert!(
+                error.to_string().contains("charges the model pass issuer"),
+                "{error}"
+            );
+            // The refusal is not cached, so an upgraded node can be used later.
+            assert!(core.negotiate_contract().await.is_err());
+            assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);
+        }
+
+        // A node that confirms the issuer is used, and every request carries the pass.
+        let (_, core) = with_pass(contract(Some("issuer")));
+        core.negotiate_contract().await.unwrap();
+        let call = ChatCall::new(&[]);
+        assert_eq!(core.build_chat_request(&call).pass, Some(pass.clone()));
+        assert_eq!(
+            core.config()
+                .build_stream_request(&call, "s".into(), "r".into(), (), 1)
+                .pass,
+            Some(pass)
+        );
+
+        // Without a pass, the node is not asked to name anyone.
+        let (_, core) = core_with_contract(contract(None));
+        core.negotiate_contract().await.unwrap();
+        assert!(core.build_chat_request(&call).pass.is_none());
     }
 
     #[test]
@@ -927,6 +1001,7 @@ mod tests {
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: Default::default(),
             generation: Default::default(),
+            charged_peer: None,
         });
 
         core.validate_contract(&0, None).await.unwrap();
@@ -948,6 +1023,7 @@ mod tests {
                 output_ceiling: Some(128_000),
                 reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
             },
+            charged_peer: None,
         };
         let (transport, core) = core_with_contract(expected.clone());
         assert!(!core.capabilities().options.max_tokens);
@@ -966,6 +1042,7 @@ mod tests {
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: ChatCapabilities::NONE.with_streaming(true),
             generation: Default::default(),
+            charged_peer: None,
         });
         let provider = crate::RemoteChatProvider::new(core);
         // Before and after the handshake: the contract carries capabilities,
@@ -986,6 +1063,7 @@ mod tests {
                 capabilities: ChatCapabilities::NONE.with_streaming(true),
                 item_aware_chat_version: None,
                 generation: Default::default(),
+                charged_peer: None,
             });
             transport
                 .terminal_on_renewal
@@ -1027,6 +1105,7 @@ mod tests {
             capabilities: ChatCapabilities::NONE.with_streaming(true),
             item_aware_chat_version: None,
             generation: Default::default(),
+            charged_peer: None,
         });
         let core = RemoteProviderClientCore::new(
             transport.clone(),
@@ -1068,6 +1147,7 @@ mod tests {
             protocol_version: None,
             capabilities: Default::default(),
             generation: Default::default(),
+            charged_peer: None,
         });
 
         let error = core.validate_contract(&0, None).await.unwrap_err();
@@ -1088,6 +1168,7 @@ mod tests {
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
                 capabilities: Default::default(),
                 generation: Default::default(),
+                charged_peer: None,
             },
             Some(transport_error),
         );
@@ -1113,6 +1194,7 @@ mod tests {
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
                 capabilities: Default::default(),
                 generation: Default::default(),
+                charged_peer: None,
             },
             Some(TransportErrorKind::Timeout),
         );
@@ -1133,6 +1215,7 @@ mod tests {
             protocol_version: Some(MESH_PROTOCOL_VERSION + 1),
             capabilities: Default::default(),
             generation: Default::default(),
+            charged_peer: None,
         });
 
         let error = core.validate_contract(&0, None).await.unwrap_err();
@@ -1151,6 +1234,7 @@ mod tests {
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: Default::default(),
             generation: Default::default(),
+            charged_peer: None,
         };
         core.validate_contract(&0, None).await.unwrap();
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);

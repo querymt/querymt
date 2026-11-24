@@ -1,7 +1,7 @@
 //! Protected ingress adapters; the host actor owns the stream and its relay.
 
-use super::GuardedProvider;
-use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter};
+use super::{GuardedProvider, rejection_error};
+use crate::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use crate::provider_host_actor::{GuardedStreamControl, GuardedStreamStart};
 use crate::{
     CancelProviderStreamRequest, GetProviderStreamStatus, MeshHandle, ProviderHostActor,
@@ -25,11 +25,14 @@ pub(in crate::provider_share) fn install(
     let start = {
         let egress = mesh.sharing_egress();
         let host = host.clone();
-        move |peer, msg| {
+        move |peer, msg: StreamRequest| {
             let host = host.clone();
             let provider = provider.clone();
             let egress = egress.clone();
             async move {
+                let peer = provider
+                    .authorize(&peer, msg.pass.as_ref(), &msg.provider, &msg.model)
+                    .await?;
                 let host = host.upgrade().ok_or_else(stopped)?;
                 let admission = tokio_util::sync::CancellationToken::new();
                 // Detaching from the mailbox must not detach preparation from
@@ -44,25 +47,39 @@ pub(in crate::provider_share) fn install(
     router.register::<ProviderHostActor, StreamRequest, _, _, _, _>(
         id,
         InboundDelivery::LegacyTellV1Ask,
-        InboundAccess::Providers,
+        InboundAccess::Handler,
         start,
     );
     macro_rules! control {
         ($message:ty) => {{
             let host = host.clone();
-            let handler = move |peer, msg| {
+            let handler = move |peer: PeerRequest, msg: $message| {
                 let host = host.clone();
                 async move {
-                    let host = host.upgrade().ok_or_else(stopped)?;
-                    host.ask(GuardedStreamControl(peer, msg))
-                        .await
-                        .map_err(actor_error)
+                    let Some(host) = host.upgrade() else {
+                        // A stopped host is reported only to a caller that has access.
+                        peer.authorize_as(None, InboundAccess::Providers)
+                            .await
+                            .map_err(rejection_error)?;
+                        return Err(stopped());
+                    };
+                    match host.ask(GuardedStreamControl(peer.clone(), msg)).await {
+                        Ok(reply) => Ok(reply),
+                        Err(SendError::HandlerError(error)) => Err(error),
+                        Err(_) => {
+                            // The host stopped before it could authorize the caller.
+                            peer.authorize_as(None, InboundAccess::Providers)
+                                .await
+                                .map_err(rejection_error)?;
+                            Err(stopped())
+                        }
+                    }
                 }
             };
             router.register::<ProviderHostActor, $message, _, _, _, _>(
                 id,
                 InboundDelivery::Ask,
-                InboundAccess::Providers,
+                InboundAccess::Handler,
                 handler,
             );
         }};

@@ -587,7 +587,8 @@ impl SessionProvider {
                     provider_name,
                     model,
                 )
-                .with_params(remote_params),
+                .with_params(remote_params)
+                .with_pass(req.model_pass.clone()),
             )
             .await;
         }
@@ -1119,6 +1120,7 @@ impl ProviderSnapshot {
                 output_ceiling: self.output_caps.map(|caps| caps.ceiling),
                 reasoning_effort: self.reasoning_effort,
             },
+            charged_peer: None,
         }
     }
 }
@@ -1223,16 +1225,43 @@ impl SessionHandle {
             return Err(self.mesh_turn_denied(peer, "the session has no model"));
         };
         let node = self.provider_node_id.as_deref();
+        let host = peer.key.host.to_string();
+        let third_node = node.is_some_and(|node| {
+            node != LOCAL_PROVIDER_NODE && node != host && !peer.is_peer_node(Some(node))
+        });
+        // A pass lends the submitter's own access on a third node for this one
+        // session and binding. It must name exactly what this turn runs, so a
+        // pass that matches anything else refuses the turn: it never falls
+        // back to this host's access.
+        if let Some(pass) = peer.pass() {
+            let expect = querymt_remote::ModelPassExpectation {
+                issuer: Some(&peer.key.peer.to_string()),
+                audience: Some(&host),
+                model_node: node,
+                provider: Some(&config.provider),
+                model: Some(&config.model),
+                session_id: Some(&self.session.public_id),
+            };
+            if !third_node
+                || peer.protocol != querymt_remote::peer_access::SharingProtocol::V1
+                || pass.verify_now(&expect).is_err()
+            {
+                return Err(self.mesh_turn_denied(peer, "the model pass does not match this turn"));
+            }
+        }
         // A model on the prompting peer's own node runs under the grant that
         // node gives this host, not under this host's model grant.
         if !peer.is_peer_node(node) {
-            if node.is_some_and(|node| {
-                node != LOCAL_PROVIDER_NODE && node != peer.key.host.to_string()
-            }) {
-                // Never route a peer's spend onward to a third node.
-                return Err(self.mesh_turn_denied(peer, "the model is on a third node"));
-            }
-            if !grant.allows_model(peer.protocol, &config.provider, &config.model) {
+            if third_node {
+                // Below Full access, a third node's model needs the submitter's
+                // pass. Full access may use this host's own access there.
+                if peer.pass().is_none() && *grant != querymt_remote::peer_access::PeerGrant::Full {
+                    return Err(self.mesh_turn_denied(
+                        peer,
+                        "a third node's model needs a model pass or Full access",
+                    ));
+                }
+            } else if !grant.allows_model(peer.protocol, &config.provider, &config.model) {
                 return Err(self.mesh_turn_denied(peer, "the grant does not include the model"));
             }
         }
@@ -1269,13 +1298,18 @@ impl SessionHandle {
         self.provider_node_id.as_deref()
     }
 
-    /// Whether this peer turn's model runs on the prompting peer's own node.
-    /// That node meters and authorizes the calls, so the host does neither.
+    /// Whether this peer turn's model runs on another node: the prompting
+    /// peer's own node, or a third node under the peer's pass or Full access.
+    /// That node authorizes and meters the calls, so the host does neither.
     #[cfg(feature = "remote")]
     fn routes_to_peer_node(&self) -> bool {
-        self.mesh_turn
-            .as_ref()
-            .is_some_and(|(peer, _)| peer.is_peer_node(self.provider_node_id.as_deref()))
+        // `for_mesh_turn` admits only the combinations that may leave this host:
+        // the peer's own node, or a third node under a pass or Full access.
+        self.mesh_turn.as_ref().is_some_and(|(peer, _)| {
+            self.provider_node_id.as_deref().is_some_and(|node| {
+                node != LOCAL_PROVIDER_NODE && node != peer.key.host.to_string()
+            })
+        })
     }
 
     /// Get the session information
@@ -1369,7 +1403,14 @@ impl SessionHandle {
                     .with_params(config.params.as_ref())
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
-                let request = request.with_provider_node_id(self.provider_node_id.as_deref());
+                let request = request
+                    .with_provider_node_id(self.provider_node_id.as_deref())
+                    // Only this peer's own turn carries its pass, and only to the node it names.
+                    .with_model_pass(
+                        self.mesh_turn
+                            .as_ref()
+                            .and_then(|(peer, _)| peer.pass().cloned()),
+                    );
                 // A hosted turn runs on this node's providers under the peer's
                 // grant and quotas. A turn on the peer's own model is routed
                 // back to that node, which authorizes and meters it there.
@@ -1994,6 +2035,10 @@ pub struct ProviderRequest<'a> {
     /// `None` (default) or `"local"` means local provider resolution.
     #[cfg(feature = "remote")]
     pub provider_node_id: Option<&'a str>,
+    /// A model pass for the node `provider_node_id` names, sent with every
+    /// request to it. The node must confirm that it charges the pass issuer.
+    #[cfg(feature = "remote")]
+    pub model_pass: Option<querymt_remote::ModelPass>,
 }
 
 impl<'a> ProviderRequest<'a> {
@@ -2007,6 +2052,8 @@ impl<'a> ProviderRequest<'a> {
             session_id: "standalone",
             #[cfg(feature = "remote")]
             provider_node_id: None,
+            #[cfg(feature = "remote")]
+            model_pass: None,
         }
     }
 
@@ -2028,6 +2075,12 @@ impl<'a> ProviderRequest<'a> {
     #[cfg(feature = "remote")]
     pub fn with_provider_node_id(mut self, provider_node_id: Option<&'a str>) -> Self {
         self.provider_node_id = provider_node_id;
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub fn with_model_pass(mut self, pass: Option<querymt_remote::ModelPass>) -> Self {
+        self.model_pass = pass;
         self
     }
 }

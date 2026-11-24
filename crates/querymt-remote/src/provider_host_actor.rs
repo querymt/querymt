@@ -24,8 +24,10 @@ use streams::{LiveStreams, Owner, Relay, StreamRequest, matching};
 #[cfg(feature = "kameo-mesh")]
 use crate::{
     MeshHandle,
-    mesh_ingress::PeerRequest,
-    provider_share::guarded::{GuardedProvider, failure, policy_error, quota_error},
+    mesh_ingress::{InboundAccess, PeerRequest},
+    provider_share::guarded::{
+        GuardedProvider, failure, policy_error, quota_error, rejection_error,
+    },
 };
 
 pub(crate) fn validate_item_aware_request(
@@ -327,7 +329,10 @@ impl Message<GuardedStreamStart> for ProviderHostActor {
         let streams = self.active_streams.clone();
         let cancel = self.shutdown.child_token();
         ctx.spawn(async move {
-            if msg.stream_router_ref.id().peer_id() != Some(peer.key().peer.as_peer_id()) {
+            // Callbacks go to the sender, never to the issuer of a model pass.
+            if peer.grant().is_none()
+                || msg.stream_router_ref.id().peer_id() != Some(peer.sender().as_peer_id())
+            {
                 return Err(quota_error(QuotaError::Denied));
             }
             let id = uuid::Uuid::parse_str(&msg.request_id).map_err(|_| {
@@ -336,7 +341,7 @@ impl Message<GuardedStreamStart> for ProviderHostActor {
             validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
             let request = policy.build_request(&msg.provider, &msg.model, msg.params.take())?;
             let access = policy.access(&peer, &msg.provider, &msg.model)?;
-            let owner = Owner::peer(&peer)?;
+            let owner = Owner::peer(&peer);
             let (provider, mut reservation) = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(RemoteProviderHostError::Internal("provider host stopped".into())),
@@ -390,8 +395,17 @@ macro_rules! guarded_control {
             ) -> Self::Reply {
                 let active = self.active_streams.clone();
                 ctx.spawn(async move {
-                    let owner = Owner::peer(&peer)?;
+                    let owner = Owner::peer(&peer);
                     let $streams = matching(&active, &owner, &$request.session_id, $request_id);
+                    // The stream's own grant applies: a stream opened under a model
+                    // pass is authorized by the issuer, not by the host that controls it.
+                    let authority = $streams
+                        .first()
+                        .and_then(|stream| stream.authority())
+                        .filter(|authority| authority != peer.sender());
+                    peer.authorize_as(authority.as_ref(), InboundAccess::Providers)
+                        .await
+                        .map_err(rejection_error)?;
                     $operation
                 })
             }
@@ -688,6 +702,7 @@ pub(crate) mod tests {
             params: None,
             item_aware_contract_version: None,
             options,
+            pass: None,
         }
     }
 
@@ -768,6 +783,7 @@ pub(crate) mod tests {
                 provider: "demo".into(),
                 model: "m1".into(),
                 params: None,
+                pass: None,
             })
             .await
             .expect("contract info");

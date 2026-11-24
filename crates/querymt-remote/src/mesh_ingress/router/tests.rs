@@ -10,6 +10,9 @@ struct TestStore {
     entries: RwLock<HashMap<PeerGrantKey, PeerGrantState>>,
     unavailable: AtomicBool,
     changes: broadcast::Sender<PolicyChange>,
+    /// Suspends the next grant read after it took its snapshot: it signals the
+    /// first notify, then waits for the second.
+    pause: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl Default for TestStore {
@@ -18,6 +21,7 @@ impl Default for TestStore {
             entries: Default::default(),
             unavailable: Default::default(),
             changes: broadcast::channel(8).0,
+            pause: Default::default(),
         }
     }
 }
@@ -30,7 +34,13 @@ impl GrantStore for TestStore {
                 "offline fixture",
             ))));
         }
-        Ok(self.entries.read().get(key).cloned().unwrap_or_default())
+        let snapshot = self.entries.read().get(key).cloned().unwrap_or_default();
+        let pause = self.pause.lock().take();
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
+        Ok(snapshot)
     }
 
     async fn replace_grant(
@@ -586,4 +596,71 @@ async fn legacy_router_suppresses_reply_after_grant_changes() {
     })
     .await
     .unwrap();
+}
+
+/// A handler route authorizes inside the handler, and its grant read may be
+/// suspended while the grant is revoked and restored. The router must still
+/// see that history before it delivers the reply.
+async fn handler_route_outcome(
+    revoke_and_restore: bool,
+) -> Result<SwarmResponse, SharingRejection> {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(18, host);
+    let store = Arc::new(TestStore::default());
+    let peer_key = key(host, peer);
+    let full = store
+        .replace_grant(&peer_key, Uuid::nil(), PeerGrant::Full)
+        .await
+        .unwrap();
+    let router = InboundRouter::new(host, store.clone());
+    router.register::<FixtureActor, Echo, _, (), _, _>(
+        actor,
+        InboundDelivery::V1Ask,
+        InboundAccess::Handler,
+        move |origin, _| {
+            let store = store.clone();
+            let peer_key = peer_key.clone();
+            async move {
+                let reached = Arc::new(Notify::new());
+                let release = Arc::new(Notify::new());
+                *store.pause.lock() = Some((reached.clone(), release.clone()));
+                let (authorized, ()) =
+                    tokio::join!(origin.authorize_as(None, InboundAccess::Providers), async {
+                        reached.notified().await;
+                        if revoke_and_restore {
+                            let revoked = store
+                                .replace_grant(&peer_key, full.revision, PeerGrant::None)
+                                .await
+                                .unwrap();
+                            store
+                                .replace_grant(&peer_key, revoked.revision, PeerGrant::Full)
+                                .await
+                                .unwrap();
+                        }
+                        release.notify_one();
+                    });
+                // The suspended read returned the snapshot from before the change.
+                authorized.unwrap();
+                Ok(())
+            }
+        },
+    );
+    router.handle_v1(peer, request(actor, peer)).await
+}
+
+#[tokio::test]
+async fn handler_route_refuses_reply_after_revoke_and_restore_during_the_grant_read() {
+    assert!(matches!(
+        handler_route_outcome(true).await,
+        Err(SharingRejection::Changed)
+    ));
+}
+
+#[tokio::test]
+async fn handler_route_delivers_when_the_grant_is_unchanged_during_the_read() {
+    assert!(matches!(
+        handler_route_outcome(false).await,
+        Ok(SwarmResponse::Ask(Ok(_)))
+    ));
 }

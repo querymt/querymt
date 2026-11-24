@@ -4,6 +4,7 @@ use crate::mesh_ingress::{
     SharingResponse,
 };
 use crate::mesh_runtime_support::SwarmCommand;
+use crate::model_pass::ModelPass;
 use crate::peer_access::quota::{
     AccessEdit, AttemptUsage, QuotaAttempt, QuotaEstimate, QuotaSettlement, QuotaStatus,
     ReservationId, ReservedAttempt,
@@ -603,6 +604,7 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         },
     };
     let provider = share.provider_host().id();
@@ -648,6 +650,7 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
         provider: "fixture".into(),
         model: "allowed".into(),
         params: None,
+        pass: None,
     };
     // Withdraw explicitly so this assertion does not race the shutdown watcher.
     router.withdraw_actor(provider);
@@ -748,6 +751,7 @@ async fn guarded_catalog_and_chat_enforce_grants_host_binding_and_attempt_identi
             ),
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         },
     };
     let denied = ask::<ProviderHostActor, _, ProviderChatResponse, RemoteProviderHostError>(
@@ -873,7 +877,7 @@ async fn guarded_provider_streams_isolate_peer_controls_and_settle_revoked_work(
             session_id: "shared".into(), request_id: request_id.to_string(),
             stream_router_ref: Callback { id: ActorId::new_with_peer_id(2, other) },
             reconnect_grace_secs: 5, heartbeat_interval_secs: 60, lease_ttl_secs: 60,
-            params: None, item_aware_contract_version: None, options: None,
+            params: None, item_aware_contract_version: None, options: None, pass: None,
         };
         let rejected = ask::<ProviderHostActor, _, (), RemoteProviderHostError>(&ingress, peer, provider_id, &request).await.unwrap_err();
         assert_eq!(code(rejected), "mesh_access_denied");
@@ -934,7 +938,7 @@ struct StreamFixture {
     peer: PeerId,
     actor: ActorId,
     host_actor: ActorRef<ProviderHostActor>,
-    router: InboundRouter,
+    router: Arc<InboundRouter>,
     store: Arc<Store>,
     backend: Arc<Backend>,
     commands: mpsc::UnboundedReceiver<SwarmCommand>,
@@ -954,7 +958,7 @@ impl StreamFixture {
             stream_ending: ending,
             ..Backend::default()
         });
-        let router = InboundRouter::new(host, store.clone());
+        let router = Arc::new(InboundRouter::new(host, store.clone()));
         let (command_tx, commands) = mpsc::unbounded_channel();
         let mesh = MeshHandle::new(
             host,
@@ -1017,6 +1021,7 @@ impl StreamFixture {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         }
     }
 
@@ -1802,6 +1807,7 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
         provider: "fixture".into(),
         model: "allowed".into(),
         params: None,
+        pass: None,
     };
     assert_eq!(
         code(
@@ -1857,6 +1863,7 @@ async fn guarded_provider_contract_requires_eligibility_and_valid_inference_opti
         params: None,
         item_aware_contract_version: None,
         options: None,
+        pass: None,
     };
     let response = router
         .handle_legacy(full, ask_request::<ProviderHostActor, _>(actor, &chat))
@@ -2037,4 +2044,333 @@ async fn hosted_stream_reports_success_and_actual_usage_above_the_estimate() {
             AttemptUsage::Observed(35)
         )]
     );
+}
+
+// Model passes: the host is the sender and holds no grant on this node.
+
+fn pass_claim<'a>(
+    fixture: &StreamFixture,
+    audience: &'a str,
+    node: &'a str,
+    provider: &'a str,
+    model: &'a str,
+) -> crate::model_pass::ModelPassClaim<'a> {
+    let _ = fixture;
+    crate::model_pass::ModelPassClaim {
+        audience,
+        model_node: node,
+        provider,
+        model,
+        session_id: "fixture-session",
+    }
+}
+
+fn issue_pass(fixture: &StreamFixture, issuer: &libp2p::identity::Keypair) -> ModelPass {
+    let (audience, node) = (fixture.peer.to_string(), fixture.host.to_string());
+    ModelPass::issue_now(
+        issuer,
+        pass_claim(fixture, &audience, &node, "fixture", "allowed"),
+    )
+    .unwrap()
+}
+
+/// The issuer holds `allowed()` on this node and the sender holds nothing.
+async fn lend_access(
+    fixture: &StreamFixture,
+    issuer: &libp2p::identity::Keypair,
+    grant: PeerGrant,
+) -> Uuid {
+    fixture
+        .store
+        .grants
+        .lock()
+        .remove(&key(fixture.host, fixture.peer));
+    fixture
+        .store
+        .replace_grant(
+            &key(fixture.host, issuer.public().to_peer_id()),
+            Uuid::nil(),
+            grant,
+        )
+        .await
+        .unwrap()
+        .revision
+}
+
+fn install_contract(fixture: &StreamFixture) {
+    Arc::new(GuardedProvider {
+        backend: fixture.backend.clone(),
+        catalog: Arc::new(StaticCatalogBackend::provider_model(
+            fixture.host.to_string(),
+            None,
+            "fixture",
+            "allowed",
+        )),
+        store: fixture.store.clone(),
+    })
+    .install(
+        &fixture.router,
+        ActorId::new_with_peer_id(3, fixture.host),
+        fixture.actor,
+        &fixture.host_actor,
+    );
+}
+
+async fn stream_refusal(fixture: &StreamFixture, request: &ProviderStreamRequest<Callback>) {
+    let response = fixture
+        .router
+        .handle_v1(
+            fixture.peer,
+            ask_request::<ProviderHostActor, _>(fixture.actor, request),
+        )
+        .await;
+    assert!(
+        matches!(response, Err(SharingRejection::Denied)),
+        "expected an access denial"
+    );
+}
+
+#[tokio::test]
+async fn model_pass_admits_only_what_it_names() {
+    // The sender has Full access, so a refused pass that fell back to the
+    // sender's own grant would be admitted.
+    let fixture = StreamFixture::new(StreamEnding::Done).await;
+    let issuer = libp2p::identity::Keypair::generate_ed25519();
+    let stranger = libp2p::identity::Keypair::generate_ed25519();
+    fixture
+        .store
+        .replace_grant(
+            &key(fixture.host, issuer.public().to_peer_id()),
+            Uuid::nil(),
+            allowed(),
+        )
+        .await
+        .unwrap();
+    let (audience, node) = (fixture.peer.to_string(), fixture.host.to_string());
+    let other = PeerId::random().to_string();
+    let issue = |signer: &libp2p::identity::Keypair, claim, issued_at: Option<u64>| match issued_at
+    {
+        Some(at) => ModelPass::issue(signer, claim, at, 3600).unwrap(),
+        None => ModelPass::issue_now(signer, claim).unwrap(),
+    };
+    let mut altered = issue_pass(&fixture, &issuer);
+    altered.expires_at += 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cases = [
+        (
+            "another host",
+            issue(
+                &issuer,
+                pass_claim(&fixture, &other, &node, "fixture", "allowed"),
+                None,
+            ),
+        ),
+        (
+            "another model node",
+            issue(
+                &issuer,
+                pass_claim(&fixture, &audience, &other, "fixture", "allowed"),
+                None,
+            ),
+        ),
+        (
+            "another provider",
+            issue(
+                &issuer,
+                pass_claim(&fixture, &audience, &node, "other", "allowed"),
+                None,
+            ),
+        ),
+        (
+            "another model",
+            issue(
+                &issuer,
+                pass_claim(&fixture, &audience, &node, "fixture", "other"),
+                None,
+            ),
+        ),
+        (
+            "expired",
+            issue(
+                &issuer,
+                pass_claim(&fixture, &audience, &node, "fixture", "allowed"),
+                Some(now - 7200),
+            ),
+        ),
+        ("altered", altered),
+        ("issuer without access", issue_pass(&fixture, &stranger)),
+    ];
+    for (name, pass) in cases {
+        let mut request = fixture.request();
+        request.pass = Some(pass);
+        let response = fixture
+            .router
+            .handle_v1(
+                fixture.peer,
+                ask_request::<ProviderHostActor, _>(fixture.actor, &request),
+            )
+            .await;
+        assert!(
+            matches!(response, Err(SharingRejection::Denied)),
+            "{name} must be refused"
+        );
+    }
+    assert_eq!(fixture.store.reserve_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 0);
+    assert!(fixture.store.attempts.lock().is_empty());
+
+    // The same fixture admits a pass that names exactly this request.
+    let mut request = fixture.request();
+    request.pass = Some(issue_pass(&fixture, &issuer));
+    fixture.call::<_, ()>(&request).await.unwrap();
+
+    // A pass needs the grant-aware contract.
+    install_contract(&fixture);
+    let contract = GetProviderContractInfo {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        params: None,
+        pass: Some(issue_pass(&fixture, &issuer)),
+    };
+    let response = fixture
+        .router
+        .handle_legacy(
+            fixture.peer,
+            ask_request::<ProviderHostActor, _>(fixture.actor, &contract),
+        )
+        .await;
+    assert!(
+        matches!(&response, SwarmResponse::Ask(Err(error)) if crate::mesh_ingress::is_legacy_access_denial(error)),
+        "a legacy request must not carry a pass"
+    );
+
+    // The legacy chat route serves the sender's own access, which is Full here.
+    // A pass on it must be refused rather than charged to the sender.
+    let calls = fixture.backend.calls.load(Ordering::Relaxed);
+    let attempts = fixture.store.attempts.lock().len();
+    let chat = ProviderChatRequest {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        messages: vec![],
+        tools: None,
+        params: None,
+        item_aware_contract_version: None,
+        options: None,
+        pass: Some(issue_pass(&fixture, &issuer)),
+    };
+    let response = fixture
+        .router
+        .handle_legacy(
+            fixture.peer,
+            ask_request::<ProviderHostActor, _>(fixture.actor, &chat),
+        )
+        .await;
+    assert!(
+        matches!(&response, SwarmResponse::Ask(Err(_))),
+        "a legacy chat must not carry a pass"
+    );
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), calls);
+    assert_eq!(fixture.store.attempts.lock().len(), attempts);
+}
+
+#[tokio::test]
+async fn a_pass_spends_the_issuers_allowance() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let issuer = libp2p::identity::Keypair::generate_ed25519();
+    let issuer_id = issuer.public().to_peer_id();
+    lend_access(&fixture, &issuer, allowed()).await;
+
+    // The contract reply names the peer that is charged.
+    install_contract(&fixture);
+    let contract = |pass| GetProviderContractInfo {
+        provider: "fixture".into(),
+        model: "allowed".into(),
+        params: None,
+        pass,
+    };
+    let reply: ProviderContractInfo = fixture
+        .call(&contract(Some(issue_pass(&fixture, &issuer))))
+        .await
+        .unwrap();
+    assert_eq!(reply.charged_peer, Some(issuer_id.to_string()));
+    let response = fixture
+        .router
+        .handle_v1(
+            fixture.peer,
+            ask_request::<ProviderHostActor, _>(fixture.actor, &contract(None)),
+        )
+        .await;
+    assert!(matches!(response, Err(SharingRejection::Denied)));
+
+    // Without a pass the sender is its own authority and has no access.
+    let mut request = fixture.request();
+    stream_refusal(&fixture, &request).await;
+    assert_eq!(fixture.store.reserve_calls.load(Ordering::Relaxed), 0);
+
+    request.pass = Some(issue_pass(&fixture, &issuer));
+    fixture.call::<_, ()>(&request).await.unwrap();
+    // Callbacks go to the sender, and the sender alone controls the stream.
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+    let status = fixture
+        .call::<_, Option<ProviderStreamStatus>>(&stream_status(&request))
+        .await
+        .unwrap();
+    assert!(status.is_some());
+
+    fixture.backend.finish_stream.notify_one();
+    let (terminal, reply) = fixture.relay(&request).await;
+    assert!(crate::relay_message_is_terminal(&terminal.message));
+    let request_id: Uuid = request.request_id.parse().unwrap();
+    {
+        let attempts = fixture.store.attempts.lock();
+        assert_eq!(attempts.len(), 1);
+        let id = attempts[&(key(fixture.host, issuer_id), request_id)];
+        assert!(!attempts.contains_key(&(key(fixture.host, fixture.peer), request_id)));
+        assert_eq!(
+            *fixture.store.settled.lock(),
+            [(id, AttemptUsage::Observed(18))]
+        );
+    }
+    ack(reply);
+}
+
+#[tokio::test]
+async fn revoking_the_issuer_stops_the_host() {
+    let mut fixture = StreamFixture::new(StreamEnding::Done).await;
+    let issuer = libp2p::identity::Keypair::generate_ed25519();
+    let issuer_id = issuer.public().to_peer_id();
+    let revision = lend_access(&fixture, &issuer, allowed()).await;
+
+    let mut request = fixture.request();
+    request.pass = Some(issue_pass(&fixture, &issuer));
+    fixture.call::<_, ()>(&request).await.unwrap();
+    let (initial, reply) = fixture.relay(&request).await;
+    assert_eq!(initial.seq, Some(0));
+    ack(reply);
+
+    fixture
+        .store
+        .replace_grant(&key(fixture.host, issuer_id), revision, PeerGrant::None)
+        .await
+        .unwrap();
+    let (stopped, reply) = fixture.relay(&request).await;
+    let StreamRelayMessage::ProviderError { error } = stopped.message else {
+        panic!("expected the stream to stop with an access error");
+    };
+    assert!(matches!(
+        LLMError::from_payload(error),
+        LLMError::ProviderResponseError(failure) if failure.code() == Some("mesh_access_denied")
+    ));
+    ack(reply);
+
+    // Later attempts under the same pass are refused without upstream work.
+    let mut again = fixture.request();
+    again.pass = request.pass.clone();
+    stream_refusal(&fixture, &again).await;
+    assert_eq!(fixture.backend.calls.load(Ordering::Relaxed), 1);
 }

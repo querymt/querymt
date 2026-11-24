@@ -122,6 +122,7 @@ mod provider_host_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
 
         let result = actor_ref.ask(req).await;
@@ -349,6 +350,7 @@ mod provider_host_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
         let result = f.actor_ref.ask(req).await;
         // The ask returns Result<Result<ProviderChatResponse, AgentError>, SendError>
@@ -388,6 +390,7 @@ mod provider_host_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
 
         // Both calls fail for the same reason (provider not found).
@@ -681,6 +684,7 @@ mod provider_host_tests {
             })),
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
 
         let json = serde_json::to_string(&req).expect("serialize");
@@ -761,6 +765,7 @@ mod provider_host_tests {
             params: None,
             item_aware_contract_version: None,
             options: None,
+            pass: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(

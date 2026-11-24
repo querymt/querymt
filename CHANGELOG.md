@@ -338,11 +338,32 @@
   model on the prompting node no longer fails with `mesh_access_denied`. The
   host sends that inference back to the prompting node, which authorizes and
   meters it, instead of checking its own model grant and quotas. Session access
-  is enough to select such a model; other selections still need Full. Hosted
-  turns still refuse models on a third node. A request for an actor that is not
+  is enough to select such a model; selecting one of the host's own models
+  still needs Full. A request for an actor that is not
   exported, such as one from before the host restarted, now fails as
   `ActorNotRunning` instead of an unknown message, so clients reattach. Hosts
   log refused mesh requests and denied turns with the reason.
+- **Mesh model passes (third-node models):** a hosted session may be bound to a
+  model on a node that is neither the session host nor the prompting peer (a
+  desktop prompts an agent on a phone that uses a GPU server). Session access is
+  enough to select such a model. The prompting node signs a short-lived
+  **model pass** (default one hour, no renewal) that names the session host, the
+  model node, the provider, the model and the session, and attaches it to the
+  `Prompt` or `SubmitSessionInput` when the model node reports that it shares
+  the model with it. The host runs the turn under the pass: the model node
+  authorizes and meters the host's calls under the prompter's grant and
+  quotas, the host checks neither its own model grant nor its own quotas, and
+  removing the prompter's access on the model node stops the stream. Without a
+  pass, only a peer with Full access can have the host use its own access on a
+  third node; below Full, and for scheduled turns, the host refuses the turn. A
+  pass that does not match the turn, and a model node that does not confirm
+  that it charges the issuer (for example one that predates passes), refuse the
+  turn: the host never falls back to its own access. Rust, feature `remote`:
+  `querymt_remote::ModelPass`; `GetProviderContractInfo`,
+  `ProviderChatRequest` and `ProviderStreamRequest` gain an optional `pass`,
+  `ProviderContractInfo` gains `charged_peer` (**BREAKING** for struct
+  literals), `Prompt` and `SubmitSessionInput` gain an optional `pass`, and
+  `InboundAccess` gains `Handler`.
 - **Mesh quotas:** Provider and model quotas apply to all shared models on Custom
   grants. Direct calls and hosted turns use the same prompt-plus-output estimate.
   Actual usage is charged even above the estimate; missing usage is charged at

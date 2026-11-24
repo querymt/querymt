@@ -174,6 +174,47 @@ mod remote_paths {
         assert_eq!(failure.delivery, DeliveryCertainty::NotDelivered);
     }
 
+    /// A node issues passes only for its own owner's prompts: a turn that runs
+    /// under a peer's authority is refused before it reaches a remote session.
+    #[tokio::test]
+    async fn a_node_issues_no_pass_for_a_peers_turn() {
+        use crate::agent::session_actor::PeerTurn;
+        use crate::error::AgentError;
+
+        let mesh = get_test_mesh().await;
+        let fixture = AgentConfigFixture::new().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let local = SessionActorRef::from(workspace_session(&fixture, &workspace).await);
+        let SessionActorRef::Local(actor) = &local else {
+            unreachable!()
+        };
+        let reference = SessionActorRef::Remote {
+            actor_ref: actor.into_remote_ref().await,
+            peer_label: "fixture owner".into(),
+            remote_node_id: Some(mesh.peer_id().to_string()),
+            mesh: Some(Arc::new(mesh.clone())),
+        };
+        let store = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(
+                &workspace.path().join("peer-turn.mesh_state.json"),
+            )
+            .unwrap(),
+        ));
+        let authority =
+            PeerTurn::test_authority(querymt_remote::peer_access::PeerGrant::Full, store);
+        let session_id = actor.id().to_string();
+        let error = reference
+            .prompt_with_authority(
+                crate::acp::protocol::PromptRequest::new(session_id, vec![]),
+                &authority,
+            )
+            .await
+            .unwrap_err();
+        let expected: crate::acp::protocol::Error = AgentError::MeshAccessDenied.into();
+        assert_eq!(error.code, expected.code);
+        local.shutdown_with_timeout(TIMEOUT, TIMEOUT).await.unwrap();
+    }
+
     #[tokio::test]
     async fn remote_reference_reads_session_control_history_and_idle_state() {
         use querymt_agent_core::runtime_status::{RuntimeAvailability, SessionRuntimePhase};

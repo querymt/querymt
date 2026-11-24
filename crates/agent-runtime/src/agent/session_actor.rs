@@ -387,10 +387,24 @@ pub(crate) struct PeerTurn {
         Option<tokio::sync::broadcast::Receiver<querymt_remote::peer_access::PolicyChange>>,
     >,
     store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    /// A model pass the submitter signed for this turn. It is checked against
+    /// the session's binding when the turn starts, and goes only to the model
+    /// node it names.
+    pass: Option<querymt_remote::ModelPass>,
 }
 
 #[cfg(feature = "remote")]
 impl PeerTurn {
+    /// Keep the model pass the submitter attached to this turn or queued input.
+    pub(crate) fn with_pass(mut self, pass: Option<querymt_remote::ModelPass>) -> Self {
+        self.pass = pass;
+        self
+    }
+
+    pub(crate) fn pass(&self) -> Option<&querymt_remote::ModelPass> {
+        self.pass.as_ref()
+    }
+
     pub(crate) fn from_request(
         origin: &querymt_remote::mesh_ingress::PeerRequest,
         store: Arc<dyn querymt_remote::peer_access::GrantStore>,
@@ -404,6 +418,7 @@ impl PeerTurn {
                 .ok_or(AgentError::MeshAccessDenied)?,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
+            pass: None,
         })
     }
 
@@ -439,7 +454,11 @@ impl PeerTurn {
         &self,
         session: &'a crate::session::provider::SessionHandle,
     ) -> Option<(&'a str, &'a str)> {
-        if self.is_peer_node(session.provider_node_id()) {
+        // A model on the peer's node, or one the peer lends through a pass, is
+        // governed by that node's grant for the peer, not by this host's model
+        // grant. `SessionHandle::for_mesh_turn` refuses a pass that does not
+        // match the session's binding.
+        if self.is_peer_node(session.provider_node_id()) || self.pass.is_some() {
             return None;
         }
         session
@@ -564,12 +583,23 @@ impl PeerTurn {
         pinned: querymt_remote::peer_access::PeerGrant,
         store: Arc<dyn querymt_remote::peer_access::GrantStore>,
     ) -> Arc<Self> {
+        Self::test_peer_with_pass(key, pinned, store, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_peer_with_pass(
+        key: querymt_remote::peer_access::PeerGrantKey,
+        pinned: querymt_remote::peer_access::PeerGrant,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+        pass: Option<querymt_remote::ModelPass>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             key,
             protocol: querymt_remote::peer_access::SharingProtocol::V1,
             pinned,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
+            pass,
         })
     }
 
@@ -591,6 +621,7 @@ impl PeerTurn {
             pinned,
             changes: parking_lot::Mutex::new(store.subscribe_changes()),
             store,
+            pass: None,
         }))
     }
 }
@@ -3052,7 +3083,9 @@ impl Message<SubmitSessionInput> for SessionActor {
         msg: SubmitSessionInput,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let SubmitSessionInput { input, authority } = msg;
+        let SubmitSessionInput {
+            input, authority, ..
+        } = msg;
         let authority = &authority;
         let actor_ref = ctx.actor_ref();
         authority.check().await?;
@@ -3422,6 +3455,7 @@ impl TurnAuthority {
                         SchedulePeerProtocol::V1 => SharingProtocol::V1,
                     },
                     store,
+                    pass: None,
                 })))
             }
             #[cfg(not(feature = "remote"))]

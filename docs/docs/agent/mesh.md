@@ -978,7 +978,29 @@ Manage grants and quotas through ACP. When the mesh access store is configured, 
 
 ### Default Access
 
-Access is one-way: each node decides what it gives the nodes that call it. Running a remote session needs session access on the remote node. Running that session with a model on your own node also needs your node to give the remote node access to that model, because the remote node calls back to your node for each request. With session access below Full, you can only pick models on your own node for a remote session; the remote node's own models need Full.
+Access is one-way: each node decides what it gives the nodes that call it. Running a remote session needs session access on the remote node. Running that session with a model on your own node also needs your node to give the remote node access to that model, because the remote node calls back to your node for each request. With session access below Full, you can pick a model on your own node or on a third node for a remote session; the remote node's own models need Full.
+
+### Models on a third node
+
+A remote session can use a model on a node that is neither the session host nor you: you prompt an agent on a phone that runs on a GPU server. Selecting the model needs only session access on the host. Using it needs one of two things:
+
+- **A model pass (any grant with session access).** Your node signs a short-lived pass (one hour, no renewal) when you prompt, if the model node reports that it shares the model with you. The pass names the session host, the model node, the provider, the model and the session. The host sends it with each inference request. The model node checks your grant, charges your quotas and stops the stream if you lose access, and needs no grant for the host. The host checks neither its own model grant nor its quotas for that turn.
+- **Full access on the host, without a pass.** The host then calls the model node under its own grant there, which that node authorizes and meters.
+
+Below Full, a turn without a pass is refused, including turns started by a schedule. A pass is never a reason to fall back: a pass that does not match the turn, an expired pass, or a model node that does not confirm that it charges you refuses the turn, and the host does not use its own access. Passes need the grant-aware protocol, so a model node on a build without passes cannot serve them. The host is trusted with your access to that one model until the pass expires, within your quotas on the model node; it can already see the conversation. The model node checks the pass on every contract and inference request, so expiry refuses new requests. It does not cut a stream that is already running: that stream ends when it finishes, when your grant or quotas change, or when its lease lapses. A queued input that waits longer than the pass lives is refused when its turn starts. Chains of passes, renewal while a turn runs, passes for scheduled work and a revocation list are not supported.
+
+```mermaid
+sequenceDiagram
+    participant P as You (prompter)
+    participant H as Session host
+    participant M as Model node
+    P->>H: Prompt with a pass for this session and model
+    H->>H: You have session access; the pass names this host and session
+    H->>M: Contract and inference request with the pass
+    M->>M: Your grant allows the model; reserve against your quotas
+    M-->>H: Stream, stopped if your access is removed
+    H-->>P: Session events
+```
 
 A peer without a saved grant gets the union of the host defaults that currently apply to it. A saved grant, including No access, always replaces the defaults. `outgoing.source` reports which applies: `{"kind":"explicit"}` or `{"kind":"default","defaults":["lan","trust:acme"]}`. `querymt/mesh/clearPeerAccess` (`version`, `peer_id`, `expected_revision`) removes a saved grant and keeps its quotas. Defaults are not saved and do not change the revision; they follow live connections and end when the peer disconnects.
 

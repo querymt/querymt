@@ -39,13 +39,10 @@ pub(super) enum Owner {
 
 impl Owner {
     #[cfg(feature = "kameo-mesh")]
-    pub(super) fn peer(peer: &PeerRequest) -> Result<Self, RemoteProviderHostError> {
-        if peer.grant().is_none() {
-            return Err(super::quota_error(
-                crate::peer_access::quota::QuotaError::Denied,
-            ));
-        }
-        Ok(Self::Peer(peer.key().clone(), peer.protocol()))
+    /// Streams belong to the transport-authenticated sender, even when a model
+    /// pass makes another peer's grant and quotas apply to them.
+    pub(super) fn peer(peer: &PeerRequest) -> Self {
+        Self::Peer(peer.sender_key(), peer.protocol())
     }
 
     fn guarded(&self) -> bool {
@@ -144,6 +141,14 @@ impl ActiveStream {
         progress.lease_expires = deadline;
         self.lease_changed.notify_one();
         true
+    }
+
+    /// The peer whose grant applies to this stream, if it is peer-owned.
+    #[cfg(feature = "kameo-mesh")]
+    pub(super) fn authority(&self) -> Option<crate::NodeId> {
+        self.access
+            .as_ref()
+            .map(|access| access.authority().peer.clone())
     }
 
     pub(super) async fn authorize(&self) -> Result<(), RemoteProviderHostError> {
@@ -836,6 +841,7 @@ mod tests {
                 params: None,
                 item_aware_contract_version: None,
                 options: None,
+                pass: None,
             };
             let backend = FixtureBackend(
                 stream.map(|stream| Arc::new(FixtureProvider(Mutex::new(Some(stream))))),

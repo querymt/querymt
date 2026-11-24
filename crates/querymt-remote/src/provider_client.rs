@@ -1,3 +1,4 @@
+use crate::model_pass::ModelPass;
 use crate::{
     ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderStreamRequest,
     messages_require_item_aware_contract,
@@ -12,6 +13,10 @@ pub struct RemoteProviderClientConfig {
     pub params: Option<serde_json::Value>,
     pub heartbeat_interval_secs: u64,
     pub lease_ttl_secs: u64,
+    /// A model pass lending its issuer's access on the target node to this node.
+    /// Every request carries it, and the contract handshake must confirm that
+    /// the target charges its issuer.
+    pub pass: Option<ModelPass>,
 }
 
 impl RemoteProviderClientConfig {
@@ -27,7 +32,13 @@ impl RemoteProviderClientConfig {
             params: None,
             heartbeat_interval_secs: 10,
             lease_ttl_secs: 60,
+            pass: None,
         }
+    }
+
+    pub fn with_pass(mut self, pass: Option<ModelPass>) -> Self {
+        self.pass = pass;
+        self
     }
 
     pub fn target_locator(&self) -> &str {
@@ -70,6 +81,7 @@ impl RemoteProviderClientConfig {
             item_aware_contract_version: messages_require_item_aware_contract(call.messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             options: call.options.non_empty(),
+            pass: self.pass.clone(),
         }
     }
 
@@ -96,6 +108,7 @@ impl RemoteProviderClientConfig {
             item_aware_contract_version: messages_require_item_aware_contract(call.messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             options: call.options.non_empty(),
+            pass: self.pass.clone(),
         }
     }
 }
