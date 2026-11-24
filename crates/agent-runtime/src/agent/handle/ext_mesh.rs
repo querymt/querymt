@@ -1,9 +1,10 @@
 use super::utils::ext_json_response;
 use super::*;
 
-pub(super) const ACCESS_METHODS: [&str; 4] = [
+pub(super) const ACCESS_METHODS: [&str; 5] = [
     "querymt/mesh/getPeerAccess",
     "querymt/mesh/setPeerAccess",
+    "querymt/mesh/clearPeerAccess",
     "querymt/mesh/setPeerQuota",
     "querymt/mesh/resetPeerQuota",
 ];
@@ -106,7 +107,7 @@ mod access {
     use querymt_remote::{
         NodeId,
         peer_access::{
-            GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant,
+            GrantSource, GrantStoreError, ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant,
             SharingProtocol,
             quota::{
                 AccessEdit, QuotaEdit, QuotaError, QuotaLimit, QuotaScope, QuotaStatus, QuotaWindow,
@@ -135,6 +136,17 @@ mod access {
         #[typeshare(serialized_as = "String")]
         expected_revision: Uuid,
         grant: PeerGrant,
+    }
+
+    /// Remove the saved grant so the host defaults apply again.
+    #[typeshare]
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ClearMeshPeerAccessRequest {
+        version: u32,
+        peer_id: String,
+        #[typeshare(serialized_as = "String")]
+        expected_revision: Uuid,
     }
 
     #[typeshare]
@@ -211,7 +223,42 @@ mod access {
         #[typeshare(serialized_as = "String")]
         revision: Uuid,
         grant: PeerGrant,
+        source: MeshGrantSource,
         quotas: Vec<MeshPeerQuota>,
+    }
+
+    #[typeshare]
+    #[derive(Serialize, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    enum MeshGrantSourceKind {
+        /// The owner saved this grant for the peer.
+        Explicit,
+        /// No saved grant; `defaults` lists the host defaults that apply now.
+        Default,
+    }
+
+    /// Where the effective outgoing grant comes from.
+    #[typeshare]
+    #[derive(Serialize, Debug, PartialEq, Eq)]
+    struct MeshGrantSource {
+        kind: MeshGrantSourceKind,
+        /// `lan` and/or `trust:<scope>`; empty for an explicit grant or No access.
+        defaults: Vec<String>,
+    }
+
+    impl From<GrantSource> for MeshGrantSource {
+        fn from(source: GrantSource) -> Self {
+            match source {
+                GrantSource::Explicit => Self {
+                    kind: MeshGrantSourceKind::Explicit,
+                    defaults: Vec::new(),
+                },
+                GrantSource::Default { defaults } => Self {
+                    kind: MeshGrantSourceKind::Default,
+                    defaults,
+                },
+            }
+        }
     }
 
     #[typeshare]
@@ -621,6 +668,18 @@ mod access {
                     Some((expected_revision, AccessEdit::Grant(grant))),
                 )
             }
+            "querymt/mesh/clearPeerAccess" => {
+                let ClearMeshPeerAccessRequest {
+                    version,
+                    peer_id,
+                    expected_revision,
+                } = parse(&req)?;
+                (
+                    version,
+                    peer_id,
+                    Some((expected_revision, AccessEdit::Inherit)),
+                )
+            }
             "querymt/mesh/setPeerQuota" => {
                 let SetMeshPeerQuotaRequest {
                     version,
@@ -694,7 +753,7 @@ mod access {
         let (state, statuses) = if let Some((expected, edit)) = edit {
             use crate::agent::remote::node_manager::PeerAccessInvalidated;
             let (reason, scope) = match &edit {
-                AccessEdit::Grant(_) => (PeerAccessInvalidated::Policy, None),
+                AccessEdit::Grant(_) | AccessEdit::Inherit => (PeerAccessInvalidated::Policy, None),
                 AccessEdit::Quota(scope, _) => (PeerAccessInvalidated::Quota, Some(scope.clone())),
             };
             let snapshot = store
@@ -716,12 +775,14 @@ mod access {
             .into_iter()
             .map(|quota| quota_wire(&state.grant, quota))
             .collect();
+        let source = store.grant_source(&key).await.map_err(grant_error)?;
         let mut response = MeshPeerAccessResponse {
             version: 1,
             peer_id,
             outgoing: MeshPeerOutgoingAccess {
                 revision: state.revision,
                 grant: state.grant,
+                source: source.into(),
                 quotas,
             },
             incoming: None,
@@ -826,6 +887,7 @@ mod access {
                     node_name: None,
                     peers: vec![],
                     auto_fallback: false,
+                    access: Default::default(),
                 },
                 store.clone(),
             )
@@ -901,6 +963,129 @@ mod access {
             let after_peer = peer_access(router, &peer, actor.id()).await;
             assert_eq!(after_peer["status"], "granted");
             assert_eq!(after_peer["effective"]["providers"], json!([]));
+            mesh.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn lan_default_is_reported_and_an_explicit_grant_can_be_cleared() {
+            let (config, _fixture, dir) = CatalogFixture::config().await;
+            let handle = LocalAgentHandle::from_config(config);
+            let deadline = Duration::from_secs(5);
+            let store = Arc::new(querymt_remote::MeshAccessStore::new(
+                querymt_remote::MeshStateStore::shared(&dir.path().join("mesh_state.json"))
+                    .unwrap(),
+            ));
+            let runtime = querymt_remote::bootstrap_mesh_runtime_with_policy(
+                &MeshRuntimeConfig {
+                    enabled: true,
+                    lan: Some(LanMeshConfig {
+                        listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+                        discovery: LanDiscovery::None,
+                        directory: querymt_remote::DirectoryMode::Cached,
+                    }),
+                    iroh_enabled: false,
+                    iroh_gso: false,
+                    iroh_dns: None,
+                    iroh_scopes: vec![],
+                    identity_file: Some(dir.path().join("identity.key")),
+                    request_timeout: deadline,
+                    stream_reconnect_grace: deadline,
+                    node_name: None,
+                    peers: vec![],
+                    auto_fallback: false,
+                    access: querymt_remote::peer_access::MeshAccessConfig {
+                        lan: PeerGrant::Full,
+                        trust: vec![],
+                    },
+                },
+                store.clone(),
+            )
+            .await
+            .unwrap();
+            let mesh = runtime.as_mesh_handle();
+            handle.set_mesh(mesh.clone());
+            let actor = RemoteNodeManager::spawn(RemoteNodeManager::new(
+                handle.config.clone(),
+                handle.registry.clone(),
+                Some(mesh.clone()),
+                handle.scheduler_handle.clone(),
+            ));
+            let router = mesh.inbound_router().unwrap();
+            register_peer_access_read(router, store.clone(), &actor, &handle, mesh);
+            let peer = NodeId::from_peer_id(libp2p::PeerId::random());
+
+            // A peer without a private-network connection gets nothing.
+            let offline = acp_access(&handle, &peer).await;
+            assert_eq!(offline["outgoing"]["grant"], json!({"mode": "none"}));
+            assert_eq!(
+                offline["outgoing"]["source"],
+                json!({"kind": "default", "defaults": []})
+            );
+            assert_eq!(
+                peer_access(router, &peer, actor.id()).await["status"],
+                "denied"
+            );
+
+            // The swarm reports private-network LAN connections to the defaults.
+            store
+                .access_defaults()
+                .unwrap()
+                .lan_connection_opened(&peer);
+            let lan = acp_access(&handle, &peer).await;
+            assert_eq!(lan["outgoing"]["grant"], json!({"mode": "full"}));
+            assert_eq!(
+                lan["outgoing"]["source"],
+                json!({"kind": "default", "defaults": ["lan"]})
+            );
+            assert_eq!(lan["outgoing"]["revision"], offline["outgoing"]["revision"]);
+            let incoming = peer_access(router, &peer, actor.id()).await;
+            assert_eq!(incoming["status"], "granted");
+            assert_eq!(incoming["effective"]["mode"], "full");
+
+            let call = |method: &str, params: serde_json::Value| {
+                let request = ExtRequest::new(
+                    method,
+                    serde_json::value::to_raw_value(&params).unwrap().into(),
+                );
+                let handle = &handle;
+                async move {
+                    let response = handle.handle_ext_method(request).await.unwrap();
+                    serde_json::from_str::<serde_json::Value>(response.0.get()).unwrap()
+                }
+            };
+            // An explicit No access overrides the LAN default.
+            let denied = call(
+                "querymt/mesh/setPeerAccess",
+                json!({"version": 1, "peer_id": peer.to_string(),
+                    "expected_revision": lan["outgoing"]["revision"], "grant": {"mode": "none"}}),
+            )
+            .await;
+            assert_eq!(denied["outgoing"]["grant"], json!({"mode": "none"}));
+            assert_eq!(
+                denied["outgoing"]["source"],
+                json!({"kind": "explicit", "defaults": []})
+            );
+            assert_eq!(
+                peer_access(router, &peer, actor.id()).await["status"],
+                "denied"
+            );
+
+            // Clearing the saved grant restores the default.
+            let cleared = call(
+                "querymt/mesh/clearPeerAccess",
+                json!({"version": 1, "peer_id": peer.to_string(),
+                    "expected_revision": denied["outgoing"]["revision"]}),
+            )
+            .await;
+            assert_eq!(cleared["outgoing"]["grant"], json!({"mode": "full"}));
+            assert_eq!(
+                cleared["outgoing"]["source"],
+                json!({"kind": "default", "defaults": ["lan"]})
+            );
+            assert_ne!(
+                cleared["outgoing"]["revision"],
+                denied["outgoing"]["revision"]
+            );
             mesh.shutdown().await;
         }
     }

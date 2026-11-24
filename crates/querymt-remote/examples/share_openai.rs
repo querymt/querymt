@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
         node_name: label.clone(),
         peers: Vec::new(),
         auto_fallback: false,
+        access: Default::default(),
     })
     .await?;
 

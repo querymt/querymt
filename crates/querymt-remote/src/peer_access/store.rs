@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{InvalidPeerGrant, PeerGrant, PeerGrantKey};
+use super::{AccessDefaults, GrantSource, InvalidPeerGrant, PeerGrant, PeerGrantKey};
 use crate::NodeId;
 
 /// Last committed policy and the revision to supply to the next owner write.
@@ -70,6 +70,17 @@ pub trait GrantStore: Send + Sync {
 
     /// List persisted peers, including those not currently connected.
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError>;
+
+    /// Whether `grant` returns a saved grant or one resolved from host defaults.
+    /// Stores without defaults report every grant as explicit.
+    async fn grant_source(&self, _key: &PeerGrantKey) -> Result<GrantSource, GrantStoreError> {
+        Ok(GrantSource::Explicit)
+    }
+
+    /// The host defaults applied to peers without a saved grant, if supported.
+    fn access_defaults(&self) -> Option<AccessDefaults> {
+        None
+    }
 }
 
 /// Observe policy effects since admission, checking the live grant at use time.

@@ -532,6 +532,7 @@ async fn registered_provider_share_gates_catalog_independently_of_discovery() {
         node_name: Some("catalog-fixture".into()),
         peers: vec![],
         auto_fallback: false,
+        access: Default::default(),
     };
     let watchless = Arc::new(Store {
         watchless: true,

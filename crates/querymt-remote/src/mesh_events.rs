@@ -160,6 +160,31 @@ pub(crate) fn connection_transport(remote_addr: &Multiaddr) -> MeshTransportKind
     }
 }
 
+/// Whether a connection's remote address is on a private network: RFC 1918,
+/// loopback, IPv4/IPv6 link-local, or IPv6 unique-local. Only these LAN
+/// connections receive the LAN default access. Routable addresses do not.
+pub(crate) fn is_private_network_addr(remote_addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    use std::net::IpAddr;
+    let ip = remote_addr.iter().find_map(|protocol| match protocol {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    });
+    match ip {
+        Some(IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        Some(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+            Some(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+            None => {
+                ip.is_loopback()
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80
+            }
+        },
+        None => false,
+    }
+}
+
 pub(crate) fn connection_route_plan(
     has_lan: bool,
     has_iroh: bool,
@@ -456,6 +481,38 @@ pub(crate) fn log_kameo_messaging_event(event: &remote::messaging::Event) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn only_private_network_addresses_receive_lan_defaults() {
+        for private in [
+            "/ip4/192.168.1.20/tcp/9000",
+            "/ip4/10.0.0.4/udp/9000/quic-v1",
+            "/ip4/172.16.3.1/tcp/1",
+            "/ip4/127.0.0.1/tcp/1",
+            "/ip4/169.254.1.1/tcp/1",
+            "/ip6/::1/tcp/1",
+            "/ip6/fd12:3456::1/tcp/1",
+            "/ip6/fe80::1/tcp/1",
+            "/ip6/::ffff:192.168.0.1/tcp/1",
+        ] {
+            assert!(
+                is_private_network_addr(&private.parse().unwrap()),
+                "{private}"
+            );
+        }
+        for public in [
+            "/ip4/8.8.8.8/tcp/9000",
+            "/ip4/100.64.0.1/tcp/1",
+            "/ip6/2001:db8::1/tcp/1",
+            "/dns4/example.com/tcp/1",
+            "/p2p/12D3KooWJ5MP5JUR1c8pF37dNHGGrVhCGHEHwrCYyowX6dPJtV6t",
+        ] {
+            assert!(
+                !is_private_network_addr(&public.parse().unwrap()),
+                "{public}"
+            );
+        }
+    }
 
     fn test_swarm() -> libp2p::Swarm<libp2p::swarm::dummy::Behaviour> {
         libp2p::SwarmBuilder::with_new_identity()

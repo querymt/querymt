@@ -69,6 +69,18 @@ client must also start with its own store so it can negotiate the grant-aware
 protocol. A client without a store uses the legacy protocol and needs a Full
 grant on a guarded host.
 
+On a trusted network, `lan_access="full"` gives peers connected from a
+private-network address (RFC 1918, loopback, link-local or IPv6 unique-local)
+Full access unless the store holds a grant for them:
+
+```python
+runtime = await querymt.MeshRuntime.lan(
+    peer_access_store="/path/to/mesh_state.json", lan_access="full"
+)
+```
+
+The default is `"none"`. A saved grant, including No access, always wins.
+
 Use the Rust `GrantStore` and `QuotaStore` APIs to provision the host file while
 it is stopped. Do not run another process that writes the same store or uses
 the same mesh identity while this runtime is active. This API hosts providers,

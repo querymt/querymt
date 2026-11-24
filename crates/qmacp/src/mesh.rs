@@ -9,6 +9,7 @@ const VERSION: u64 = 1;
 const NODES: &str = "querymt/mesh/nodes";
 const GET: &str = "querymt/mesh/getPeerAccess";
 const SET: &str = "querymt/mesh/setPeerAccess";
+const CLEAR: &str = "querymt/mesh/clearPeerAccess";
 const SET_QUOTA: &str = "querymt/mesh/setPeerQuota";
 const RESET_QUOTA: &str = "querymt/mesh/resetPeerQuota";
 const CHANGED: &str = "querymt/mesh/peerAccessChanged";
@@ -27,6 +28,13 @@ pub(crate) enum MeshCommand {
         /// A No access, Full access, or Custom grant object.
         #[arg(long, value_name = "JSON")]
         grant: String,
+    },
+    /// Remove a peer's saved grant so the host defaults (LAN access, trust scopes) apply.
+    /// Saved quotas are kept.
+    Clear {
+        peer_id: String,
+        #[arg(long)]
+        expected_revision: String,
     },
     /// Configure one provider or model quota.
     SetQuota {
@@ -127,6 +135,10 @@ pub(crate) async fn run(client: &AcpClient, command: MeshCommand) -> Result<Valu
             params["grant"] = parse_grant(&grant)?;
             (SET, params)
         }
+        MeshCommand::Clear {
+            peer_id,
+            expected_revision,
+        } => (CLEAR, mutation_params(peer_id, expected_revision)?),
         MeshCommand::SetQuota {
             peer_id,
             expected_revision,

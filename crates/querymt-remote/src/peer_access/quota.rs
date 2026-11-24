@@ -808,9 +808,10 @@ mod ledger {
         ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError> {
             utc_date(now)?;
             let key = key.clone();
+            let defaults = self.defaults.clone();
             self.transact(move |state, runtime| {
                 let (quotas, persist) = snapshot_quotas(state, runtime, &key, now)?;
-                Ok(((state.grant(&key), quotas), persist))
+                Ok(((state.effective(&defaults, &key), quotas), persist))
             })
             .await
         }
@@ -825,6 +826,7 @@ mod ledger {
             utc_date(now)?;
             match &edit {
                 AccessEdit::Grant(grant) => grant.validate().map_err(GrantStoreError::from)?,
+                AccessEdit::Inherit => {}
                 AccessEdit::Quota(scope, edit) => {
                     scope.validate()?;
                     if let QuotaEdit::Update(limit) | QuotaEdit::Reconfigure(limit) = *edit {
@@ -833,8 +835,10 @@ mod ledger {
                 }
             }
             let key = key.clone();
+            let defaults = self.defaults.clone();
             self.transact_access(move |state, runtime| {
-                let mut grant = state.grant(&key);
+                let mut grant = state.effective(&defaults, &key);
+                let mut explicit = state.is_explicit(&key);
                 if expected != grant.revision {
                     return Err(GrantStoreError::Conflict {
                         expected,
@@ -844,13 +848,24 @@ mod ledger {
                 }
                 let mut change = None;
                 let (edited, rolled_target) = match edit {
-                    AccessEdit::Grant(next) if next == grant.grant => (false, false),
+                    AccessEdit::Grant(next) if explicit && next == grant.grant => (false, false),
                     AccessEdit::Grant(next) => {
                         change = Some(AccessChange::Policy(PolicyChange {
                             key: key.clone(),
                             effect: PolicyEffect::Grant(next.clone()),
                         }));
                         grant.grant = next;
+                        explicit = true;
+                        (true, false)
+                    }
+                    AccessEdit::Inherit if !explicit => (false, false),
+                    AccessEdit::Inherit => {
+                        grant.grant = defaults.resolve(&key).0;
+                        change = Some(AccessChange::Policy(PolicyChange {
+                            key: key.clone(),
+                            effect: PolicyEffect::Grant(grant.grant.clone()),
+                        }));
+                        explicit = false;
                         (true, false)
                     }
                     AccessEdit::Quota(scope, edit) => {
@@ -859,7 +874,7 @@ mod ledger {
                 };
                 if edited {
                     grant.revision = Uuid::now_v7();
-                    state.put_grant(&key, grant.clone());
+                    state.put_row(&key, grant.clone(), explicit);
                 }
                 let (quotas, rolled) = snapshot_quotas(state, runtime, &key, now)?;
                 Ok(((grant, quotas), edited || rolled || rolled_target, change))
@@ -888,8 +903,9 @@ mod ledger {
                 provider_id: attempt.provider_id.clone(),
                 model_id: None,
             };
+            let defaults = self.defaults.clone();
             self.transact_with_usage::<_, QuotaError>(move |state, runtime| {
-                let grant = state.grant(&attempt.peer).grant;
+                let grant = state.effective(&defaults, &attempt.peer).grant;
                 let mut policy = AttemptPolicy {
                     changes,
                     require_sessions,
@@ -970,6 +986,7 @@ mod ledger {
         }
 
         async fn mark_dispatched(&self, attempt: ReservationId) -> Result<(), QuotaError> {
+            let defaults = self.defaults.clone();
             self.transact(move |state, runtime| {
                 let open = runtime
                     .open
@@ -977,7 +994,7 @@ mod ledger {
                     .filter(|open| !open.dispatched)
                     .ok_or(QuotaError::InvalidAttempt)?;
                 let req = &open.request;
-                let grant = state.grant(&req.peer).grant;
+                let grant = state.effective(&defaults, &req.peer).grant;
                 // An attempt admitted as Full cannot start under a subsequent Custom grant.
                 if !open.policy.lock().permits(req, &grant)
                     || (open.reservations.is_empty() && grant != PeerGrant::Full)

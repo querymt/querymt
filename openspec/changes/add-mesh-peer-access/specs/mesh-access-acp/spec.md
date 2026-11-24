@@ -30,6 +30,14 @@ ACP is unauthenticated; deployments may use a proxy if needed. ACP authenticatio
 - **WHEN** an owner writes with a stale revision or requests a reset while attempts are outstanding
 - **THEN** ACP returns a distinct machine-readable error for each case and neither request changes the grant or quota
 
+### Requirement: ACP reports and clears overrides of host defaults
+
+`outgoing.source` SHALL report whether the effective grant is saved or comes from host defaults. `querymt/mesh/clearPeerAccess` SHALL remove the saved grant under the same revision rules as other mutations, so the host defaults apply, and SHALL keep saved quotas.
+
+#### Scenario: ACP shows and clears an override of the defaults
+- **WHEN** a peer receives a host default, and the owner saves a grant for it and then clears that grant
+- **THEN** `outgoing.source` reports the applying defaults, then `explicit`, then the defaults again, and each mutation returns a new revision
+
 ### Requirement: ACP sends a peer-scoped sharing invalidation
 
 `querymt/mesh/peerAccessChanged` SHALL be a server-to-client invalidation identifying the affected peer and direction, not a state snapshot. It SHALL notify all ACP connections with the mesh access store of observed changes to policy, quota status, availability or shareable models. Mutations SHALL notify only after commit. Delivery MAY be coalesced and SHALL NOT require an attached session. Reads SHALL remain authoritative after missed notifications or reconnect.
@@ -58,11 +66,12 @@ Object fields use snake_case. The advertised method names are shown below. On th
 | --- | --- | --- |
 | `querymt/mesh/getPeerAccess` | `peer_id` | `{version, peer_id, outgoing, incoming, shareable_catalog}` |
 | `querymt/mesh/setPeerAccess` | `peer_id`, `expected_revision`, `grant` | `{version, peer_id, outgoing}` |
+| `querymt/mesh/clearPeerAccess` | `peer_id`, `expected_revision` | `{version, peer_id, outgoing}` |
 | `querymt/mesh/setPeerQuota` | `peer_id`, `expected_revision`, `scope`, `operation`, `limit` | `{version, peer_id, outgoing}` |
 | `querymt/mesh/resetPeerQuota` | `peer_id`, `expected_revision`, `scope` | `{version, peer_id, outgoing}` |
 
 - `peer_id` is the canonical mesh peer ID string, not the node label. It matches `nodes[].id` for mesh peers. The existing `querymt/mesh/nodes` result adds `managed_peer_ids: string[]` when the mesh access store is configured; it lists peers with saved grants or quota configuration, including offline peers. `nodes[].active_sessions` is omitted when not authorized or known. It is not reported as zero in place of a denial.
-- `outgoing` is `{revision, grant, quotas}`. `revision` is an opaque string that also exists for a default No access grant. The client echoes it as `expected_revision` on every mutation. It changes on committed grant/configuration changes and owner resets, not on usage or automatic rollover. A rejected edit does not advance it. Mutation results never depend on a remote lookup.
+- `outgoing` is `{revision, grant, source, quotas}`. `grant` is the effective grant. `source` is `{"kind":"explicit","defaults":[]}` for a saved grant or `{"kind":"default","defaults":[...]}` listing the applying host defaults (`lan`, `trust:<scope>`), empty for No access. A change in the applying defaults does not change `revision`; clients refresh on the `policy` invalidation. `revision` is an opaque string that also exists for a default No access grant. The client echoes it as `expected_revision` on every mutation. It changes on committed grant/configuration changes and owner resets, not on usage or automatic rollover. A rejected edit does not advance it. Mutation results never depend on a remote lookup.
 - A stored `grant` is `{"mode":"none"}`, `{"mode":"full"}`, or `{"mode":"custom","sessions":bool,"filesystem":bool,"shell":bool,"providers":[...]}`. Shell defaults to false and requires filesystem; filesystem requires sessions. Each provider selection is `{provider_id, models}`, where `models` is `{"mode":"all"}` or `{"mode":"selected","model_ids":[...]}` with a non-empty canonical model ID list. The provider list may be empty; omitted providers are not shared. `setPeerAccess` replaces the selection, not quota configuration.
 - `scope` is `{provider_id}` for a provider or `{provider_id, model_id}` for a single model. A `limit` is `{"kind":"unlimited"}` or `{"kind":"finite","limit_tokens":"2000000","window":"daily"}`. `window` is `manual`, `daily`, `weekly`, or `monthly`, with `manual` the default when omitted on input. Token counters and limits are exact integer decimal strings in whole tokens. Presentation is up to clients. `operation: "update"` changes only the amount of an existing finite quota without a reset; `operation: "reconfigure"` explicitly changes finite/unlimited state or cadence (including adding the first finite cap). Owners can preconfigure quotas before granting access; doing so does not grant access.
 - Each entry in `quotas` is `{scope, limit, active, usage}`. `active` distinguishes a quota currently applied to Custom access from a saved quota not currently applied. `usage` contains `known_tokens`, `estimated_tokens` and `has_unknown_usage`; for a finite entry, `usage` also contains `window_started_at`, `reserved_tokens`, and `available_tokens`, plus `next_reset_at` for recurring windows. UTC times are RFC 3339 strings. The host derives status at read time; the client does not compute the authoritative remaining balance.

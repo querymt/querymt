@@ -132,7 +132,7 @@ fn mesh_capabilities() -> Value {
     json!({
         "mesh_access_version": 1,
         "methods": ["querymt/mesh/nodes", "querymt/mesh/getPeerAccess", "querymt/mesh/setPeerAccess",
-                    "querymt/mesh/setPeerQuota", "querymt/mesh/resetPeerQuota"],
+                    "querymt/mesh/clearPeerAccess", "querymt/mesh/setPeerQuota", "querymt/mesh/resetPeerQuota"],
         "notifications": ["querymt/mesh/peerAccessChanged"],
     })
 }
@@ -302,6 +302,48 @@ async fn mesh_quota_requests_retain_exact_scoped_limits() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn mesh_clear_returns_a_peer_to_the_host_defaults() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => Reply::Result(mesh_capabilities()),
+        Some("_querymt/mesh/clearPeerAccess") => {
+            assert_eq!(
+                request["params"],
+                json!({"version": 1, "peer_id": "peer", "expected_revision": "r1"})
+            );
+            Reply::Result(json!({"version": 1, "peer_id": "peer", "outgoing": {
+                "revision": "r2", "grant": {"mode": "full"},
+                "source": {"kind": "default", "defaults": ["lan"]}
+            }}))
+        }
+        _ => unexpected(request),
+    })
+    .await;
+    let out = invoke(
+        cli().args([
+            "--quiet",
+            "--url",
+            &server.url,
+            "mesh",
+            "clear",
+            "peer",
+            "--expected-revision",
+            "r1",
+        ]),
+        None,
+    )
+    .await;
+    assert!(out.status.success(), "{:?}", events(&out));
+    let output = events(&out);
+    assert!(
+        output
+            .iter()
+            .any(|event| event.to_string().contains("\"defaults\":[\"lan\"]")),
+        "{output:?}"
+    );
+    server.finish().await;
 }
 
 #[tokio::test]

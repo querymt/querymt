@@ -132,6 +132,7 @@ async fn plain_websocket_connections_share_the_mesh_access_contract() {
         node_name: None,
         peers: Vec::new(),
         auto_fallback: false,
+        access: Default::default(),
     })
     .await
     .expect("guarded LAN mesh");

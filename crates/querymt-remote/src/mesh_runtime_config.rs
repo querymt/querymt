@@ -1,3 +1,4 @@
+use crate::peer_access::MeshAccessConfig;
 use crate::scope::{MeshScopeId, MeshTransportKind};
 use anyhow::{Result, ensure};
 use std::path::PathBuf;
@@ -21,6 +22,9 @@ pub struct MeshRuntimeConfig {
     pub node_name: Option<String>,
     pub peers: Vec<String>,
     pub auto_fallback: bool,
+    /// Access for peers without a saved grant on a policy-enforcing mesh.
+    /// The default grants nothing.
+    pub access: MeshAccessConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +63,10 @@ impl MeshRuntimeConfig {
         if let Some(dns) = &self.iroh_dns {
             dns.validate()?;
         }
+
+        self.access
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid mesh access defaults: {error}"))?;
 
         let has_lan = self.lan.is_some();
         let has_iroh = self.iroh_enabled;
@@ -134,7 +142,26 @@ mod tests {
             node_name: None,
             peers: Vec::new(),
             auto_fallback: false,
+            access: MeshAccessConfig::default(),
         }
+    }
+
+    #[test]
+    fn invalid_access_defaults_are_rejected() {
+        let mut config = base_config();
+        config.lan = Some(LanMeshConfig {
+            listen: None,
+            discovery: LanDiscovery::Mdns,
+            directory: DirectoryMode::default(),
+        });
+        config.access.lan = crate::peer_access::PeerGrant::Custom {
+            sessions: false,
+            filesystem: true,
+            shell: false,
+            providers: vec![],
+        };
+        let err = config.validate().expect_err("invalid LAN default");
+        assert!(err.to_string().contains("invalid mesh access defaults"));
     }
 
     #[test]

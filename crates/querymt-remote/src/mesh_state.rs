@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::invite::{InviteError, MembershipToken, PeerEntry};
 use crate::peer_access::quota::{QuotaLedger, QuotaRuntime, UnknownUsageCharge};
 use crate::peer_access::{
-    GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState, PolicyChange,
-    PolicyEffect,
+    AccessDefaults, GrantSource, GrantStore, GrantStoreError, PeerGrant, PeerGrantKey,
+    PeerGrantState, PolicyChange, PolicyEffect,
 };
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -32,11 +32,16 @@ pub struct MeshState {
 pub(crate) struct PeerAccessState {
     #[serde(default)]
     grants: BTreeMap<String, BTreeMap<String, PeerGrantState>>,
+    /// Rows kept only for their revision and quotas. Their grant follows the
+    /// host defaults, like a peer without a row.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    inherited: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub(crate) quotas: QuotaLedger,
 }
 
 impl PeerAccessState {
+    /// The stored row, which is not the effective grant unless it is explicit.
     pub(crate) fn grant(&self, key: &PeerGrantKey) -> PeerGrantState {
         self.grants
             .get(&key.host.as_str())
@@ -45,11 +50,70 @@ impl PeerAccessState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn put_grant(&mut self, key: &PeerGrantKey, state: PeerGrantState) {
+    /// Whether the owner saved a grant that replaces the host defaults.
+    pub(crate) fn is_explicit(&self, key: &PeerGrantKey) -> bool {
+        let (host, peer) = (key.host.as_str(), key.peer.as_str());
         self.grants
-            .entry(key.host.as_str())
-            .or_default()
-            .insert(key.peer.as_str(), state);
+            .get(&host)
+            .is_some_and(|peers| peers.contains_key(&peer))
+            && !self
+                .inherited
+                .get(&host)
+                .is_some_and(|peers| peers.contains(&peer))
+    }
+
+    /// The grant in effect: the saved grant, or the current host defaults.
+    pub(crate) fn effective(
+        &self,
+        defaults: &AccessDefaults,
+        key: &PeerGrantKey,
+    ) -> PeerGrantState {
+        let row = self.grant(key);
+        if self.is_explicit(key) {
+            return row;
+        }
+        PeerGrantState {
+            revision: row.revision,
+            grant: defaults.resolve(key).0,
+        }
+    }
+
+    pub(crate) fn source(&self, defaults: &AccessDefaults, key: &PeerGrantKey) -> GrantSource {
+        if self.is_explicit(key) {
+            GrantSource::Explicit
+        } else {
+            defaults.resolve(key).1
+        }
+    }
+
+    /// Save an explicit grant.
+    pub(crate) fn put_grant(&mut self, key: &PeerGrantKey, state: PeerGrantState) {
+        self.put_row(key, state, true);
+    }
+
+    /// Save a row. A non-explicit row stores No access and follows the defaults.
+    pub(crate) fn put_row(
+        &mut self,
+        key: &PeerGrantKey,
+        mut state: PeerGrantState,
+        explicit: bool,
+    ) {
+        let (host, peer) = (key.host.as_str(), key.peer.as_str());
+        if explicit {
+            if let Some(peers) = self.inherited.get_mut(&host) {
+                peers.remove(&peer);
+                if peers.is_empty() {
+                    self.inherited.remove(&host);
+                }
+            }
+        } else {
+            state.grant = PeerGrant::None;
+            self.inherited
+                .entry(host.clone())
+                .or_default()
+                .insert(peer.clone());
+        }
+        self.grants.entry(host).or_default().insert(peer, state);
     }
 }
 
@@ -453,6 +517,8 @@ pub struct MeshAccessStore {
     pub(crate) changes: broadcast::Sender<PolicyChange>,
     pub(crate) usage_changes: broadcast::Sender<PeerGrantKey>,
     pub(crate) unknown_usage_charge: UnknownUsageCharge,
+    /// Live defaults for peers without a saved grant. The mesh runtime configures them.
+    pub(crate) defaults: AccessDefaults,
 }
 
 pub(crate) enum AccessChange {
@@ -479,12 +545,44 @@ impl MeshAccessStore {
             let state = owner.read();
             (state.changes.clone(), state.usage_changes.clone())
         };
+        let defaults = AccessDefaults::default();
+        let weak_owner = Arc::downgrade(&owner);
+        let weak_defaults = defaults.downgrade();
+        // A default change is a policy change for peers that follow the defaults.
+        defaults.set_publisher(Arc::new(move |peer: &NodeId| {
+            let (Some(owner), Some(defaults)) = (weak_owner.upgrade(), weak_defaults.upgrade())
+            else {
+                return;
+            };
+            let Some(host) = defaults.host() else {
+                return;
+            };
+            let key = PeerGrantKey {
+                host,
+                peer: peer.clone(),
+            };
+            let owner = owner.read();
+            if owner.state.peer_access.is_explicit(&key) {
+                return;
+            }
+            let grant = defaults.resolve(&key).0;
+            owner.publish_policy_change(PolicyChange {
+                key,
+                effect: PolicyEffect::Grant(grant),
+            });
+        }));
         Self {
             owner,
             changes,
             usage_changes,
             unknown_usage_charge: UnknownUsageCharge::default(),
+            defaults,
         }
+    }
+
+    /// The live defaults for peers without a saved grant.
+    pub fn defaults(&self) -> &AccessDefaults {
+        &self.defaults
     }
 
     #[must_use]
@@ -570,7 +668,25 @@ impl MeshAccessStore {
 #[async_trait]
 impl GrantStore for MeshAccessStore {
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
-        Ok(self.owner.read().state.peer_access.grant(key))
+        Ok(self
+            .owner
+            .read()
+            .state
+            .peer_access
+            .effective(&self.defaults, key))
+    }
+
+    async fn grant_source(&self, key: &PeerGrantKey) -> Result<GrantSource, GrantStoreError> {
+        Ok(self
+            .owner
+            .read()
+            .state
+            .peer_access
+            .source(&self.defaults, key))
+    }
+
+    fn access_defaults(&self) -> Option<AccessDefaults> {
+        Some(self.defaults.clone())
     }
 
     async fn replace_grant(
@@ -581,17 +697,18 @@ impl GrantStore for MeshAccessStore {
     ) -> Result<PeerGrantState, GrantStoreError> {
         grant.validate()?;
         let owner = Arc::clone(&self.owner);
+        let defaults = self.defaults.clone();
         let key = key.clone();
         tokio::task::spawn_blocking(move || {
             let mut state = owner.write();
-            let current = state.state.peer_access.grant(&key);
+            let current = state.state.peer_access.effective(&defaults, &key);
             if expected != current.revision {
                 return Err(GrantStoreError::Conflict {
                     expected,
                     actual: current.revision,
                 });
             }
-            if grant == current.grant {
+            if grant == current.grant && state.state.peer_access.is_explicit(&key) {
                 return Ok(current);
             }
             let mut access = state.state.peer_access.clone();
@@ -759,6 +876,115 @@ mod tests {
             changes.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn host_defaults_apply_until_the_owner_saves_a_grant() {
+        use crate::peer_access::MeshAccessConfig;
+        use crate::peer_access::quota::{
+            AccessEdit, QuotaEdit, QuotaLimit, QuotaScope, QuotaStore, QuotaWindow,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let access = MeshAccessStore::new(MeshStateStore::shared(&path).unwrap());
+        let key = grant_key();
+        let defaults = access.access_defaults().unwrap();
+        defaults
+            .configure(
+                key.host.clone(),
+                &MeshAccessConfig {
+                    lan: PeerGrant::Full,
+                    trust: vec![],
+                },
+            )
+            .unwrap();
+        let mut changes = access.subscribe_peer_changes(&key).unwrap();
+        defaults.lan_connection_opened(&key.peer);
+        let change = tokio::time::timeout(std::time::Duration::from_secs(5), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            change.effect,
+            PolicyEffect::Grant(PeerGrant::Full)
+        ));
+        assert_eq!(access.grant(&key).await.unwrap().grant, PeerGrant::Full);
+        assert_eq!(
+            access.grant_source(&key).await.unwrap(),
+            GrantSource::Default {
+                defaults: vec!["lan".into()]
+            }
+        );
+
+        // Preconfiguring a quota keeps the peer on the defaults.
+        let now = 1_700_000_000;
+        let scope = QuotaScope {
+            provider_id: "fixture".into(),
+            model_id: None,
+        };
+        let limit = QuotaLimit::Finite {
+            tokens: 10,
+            window: QuotaWindow::Manual,
+        };
+        let (state, _) = access
+            .edit_access(
+                &key,
+                Uuid::nil(),
+                AccessEdit::Quota(scope, QuotaEdit::Reconfigure(limit)),
+                now,
+            )
+            .await
+            .unwrap();
+        assert_ne!(state.revision, Uuid::nil());
+        assert_eq!(state.grant, PeerGrant::Full);
+        assert!(matches!(
+            access.grant_source(&key).await.unwrap(),
+            GrantSource::Default { .. }
+        ));
+
+        // A saved grant, even No access, replaces the defaults.
+        let (state, _) = access
+            .edit_access(
+                &key,
+                state.revision,
+                AccessEdit::Grant(PeerGrant::None),
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.grant, PeerGrant::None);
+        assert_eq!(access.grant(&key).await.unwrap().grant, PeerGrant::None);
+        assert_eq!(
+            access.grant_source(&key).await.unwrap(),
+            GrantSource::Explicit
+        );
+
+        // Clearing it restores the defaults and survives a reload.
+        let (state, _) = access
+            .edit_access(&key, state.revision, AccessEdit::Inherit, now)
+            .await
+            .unwrap();
+        assert_eq!(state.grant, PeerGrant::Full);
+        let unchanged = access
+            .edit_access(&key, state.revision, AccessEdit::Inherit, now)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(unchanged, state);
+        let reloaded = MeshStateStore::load_or_create(&path).unwrap();
+        assert!(!reloaded.state.peer_access.is_explicit(&key));
+        assert!(
+            reloaded
+                .state
+                .peer_access
+                .grants
+                .get(&key.host.as_str())
+                .is_some_and(|peers| peers.contains_key(&key.peer.as_str()))
+        );
+
+        // Defaults end with the connection.
+        defaults.peer_disconnected(&key.peer);
+        assert_eq!(access.grant(&key).await.unwrap().grant, PeerGrant::None);
     }
 
     #[test]

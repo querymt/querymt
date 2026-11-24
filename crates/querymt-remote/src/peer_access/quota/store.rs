@@ -19,7 +19,10 @@ use crate::{
 
 /// An owner edit guarded by the shared grant/quota revision.
 pub enum AccessEdit {
+    /// Save a grant that replaces the host defaults.
     Grant(PeerGrant),
+    /// Remove the saved grant so the host defaults apply. Quotas are kept.
+    Inherit,
     Quota(QuotaScope, QuotaEdit),
 }
 

@@ -2,15 +2,51 @@
 
 ### Requirement: Mesh grants are host-owned and directional
 
-The resource host SHALL keep one durable grant per transport-authenticated peer across its mesh scopes. Membership, claimed identity, and actor references SHALL NOT confer access. Peers without a grant, including on upgrade, SHALL get identity-only discovery. If the policy store is unavailable, protected requests SHALL fail closed.
+The resource host SHALL keep at most one durable grant per transport-authenticated peer across its mesh scopes. Membership, claimed identity, and actor references SHALL NOT confer access by themselves. A peer without a saved grant SHALL get only the host defaults that currently apply to it, and identity-only discovery when none do, including on upgrade. If the policy store is unavailable, protected requests SHALL fail closed.
 
 #### Scenario: An admitted peer has no grant
-- **WHEN** a LAN or invited peer without a grant discovers the host and requests sessions or providers
+- **WHEN** a LAN or invited peer without a grant discovers a host with no enabled defaults and requests sessions or providers
 - **THEN** it can see the node's identity but receives no protected data and cannot invoke protected operations
 
 #### Scenario: Grant direction and identity do not change across scopes
 - **WHEN** a host grants a peer access, that peer reconnects under a different name or scope, and another peer claims the same identity in a request field
 - **THEN** only the authenticated grantee receives access; no reverse grant or grant for the other peer is created
+
+### Requirement: Saved grants override host defaults
+
+A peer without a saved grant SHALL receive the union of the host defaults that currently apply to it. A saved grant, including No access, SHALL replace every default. Defaults SHALL NOT be persisted or advance the revision. When the applying defaults change for a peer without a saved grant, admitted work SHALL be rechecked as after an owner edit.
+
+#### Scenario: A saved grant overrides the defaults until cleared
+- **WHEN** the owner saves No access for a peer that receives the LAN default, then clears the saved grant
+- **THEN** the peer has no access while the grant is saved and the LAN default again after it is cleared, and any saved quotas are kept
+
+#### Scenario: Preconfiguring a quota keeps the defaults
+- **WHEN** the owner sets a quota for a peer without a saved grant
+- **THEN** the revision advances but the peer still receives the defaults
+
+### Requirement: LAN access follows private-network connections
+
+The LAN default SHALL apply only while the peer has a live LAN connection from a private-network address (RFC 1918, loopback, link-local, or IPv6 unique-local). It SHALL default to No access.
+
+#### Scenario: LAN access is off unless the owner enables it
+- **WHEN** a host with default settings accepts a connection from a private-network peer without a saved grant
+- **THEN** the peer gets identity-only discovery
+
+#### Scenario: Enabled LAN access needs no per-peer setup
+- **WHEN** the owner starts a host with LAN access Full and a peer without a saved grant connects from a private-network address, then disconnects
+- **THEN** the peer has Full access while connected, including over the legacy protocol, and no access after its last private-network connection closes
+
+#### Scenario: Routable addresses do not receive the LAN default
+- **WHEN** a peer connects to a host with LAN access enabled from a public or CGNAT address
+- **THEN** the LAN default does not apply
+
+### Requirement: Trust scopes admit holders of offline-signed tokens
+
+A trust-scope default SHALL apply only after the peer presents, on its current connection, an unexpired token signed by the scope's configured authority for that scope and for the peer's transport-authenticated identity. It SHALL work over any transport without contacting the authority, and SHALL end when the peer's last connection closes or the token expires.
+
+#### Scenario: A trust token admits only its subject
+- **WHEN** a peer presents tokens for a configured scope that were issued to another peer, signed by another key, issued for another scope, expired, or tampered with, and then presents a valid token issued to itself
+- **THEN** only the valid token admits the peer, and its access is the union of the scope access and any other applicable default
 
 ### Requirement: Mesh state stores peer access alongside membership
 
@@ -126,9 +162,9 @@ An upgraded client SHALL support existing shared resources of a host whose legac
 - **WHEN** an upgraded host denies a request or protocol negotiation times out or cannot be verified
 - **THEN** the client reports the denial or negotiation failure and does not retry via a legacy protocol
 
-### Requirement: Legacy requests to upgraded hosts require explicit Full access
+### Requirement: Legacy requests to upgraded hosts require Full access
 
-An upgraded host SHALL serve protected requests in a legacy wire format only for peers with an explicit current Full access grant, identified by the authenticated transport. It SHALL apply the same authorization and revocation rules as for upgraded clients. Custom grants SHALL require the new sharing protocol. A legacy operation the host cannot authorize SHALL be refused even under Full access.
+An upgraded host SHALL serve protected requests in a legacy wire format only for peers whose current effective grant is Full access, saved or from a host default, identified by the authenticated transport. It SHALL apply the same authorization and revocation rules as for upgraded clients. Custom grants SHALL require the new sharing protocol. A legacy operation the host cannot authorize SHALL be refused even under Full access.
 
 #### Scenario: Legacy client needs explicit Full access
 - **WHEN** a legacy client requests sessions, workspace files, or models on an upgraded host before and after its owner grants that peer Full access

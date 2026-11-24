@@ -31,6 +31,13 @@ pub(crate) enum SwarmCommand {
     Shutdown {
         completion: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Retry presenting trust tokens, if `session` is still the peer's
+    /// current connection session.
+    PresentTrust {
+        peer: PeerId,
+        session: u64,
+        attempt: u32,
+    },
 }
 
 pub(crate) fn resolve_local_hostname() -> String {

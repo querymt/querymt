@@ -74,6 +74,7 @@ fn runtime_configs_compatible(existing: &MeshRuntimeConfig, requested: &MeshRunt
         && existing.node_name == requested.node_name
         && existing.peers == requested.peers
         && existing.auto_fallback == requested.auto_fallback
+        && existing.access == requested.access
         && existing
             .iroh_scopes
             .iter()
@@ -104,6 +105,7 @@ fn runtime_config_label(config: &MeshRuntimeConfig) -> String {
 
 fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
     let cfg: MeshTomlConfig = spec.into_toml();
+    let access = cfg.access_config();
     from_toml_config(
         cfg.enabled,
         cfg.transport,
@@ -120,12 +122,67 @@ fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
         cfg.iroh,
         cfg.iroh_gso,
         cfg.iroh_dns,
+        access,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toml_lan_access_and_trust_scopes_reach_the_runtime_config() {
+        use querymt_remote::peer_access::{ModelSelection, PeerGrant, ProviderGrant};
+        let authority = libp2p::PeerId::random().to_string();
+        let cfg: MeshTomlConfig = toml::from_str(&format!(
+            r#"
+            enabled = true
+            lan_access = {{ mode = "custom", sessions = false, filesystem = false, providers = [
+              {{ provider_id = "llama_cpp", models = {{ mode = "all" }} }},
+            ] }}
+            [[trust]]
+            name = "acme"
+            authority = "{authority}"
+            access = "full"
+            [[trust]]
+            name = "members-only"
+            authority = "{authority}"
+            "#
+        ))
+        .unwrap();
+        let config = runtime_config_from_spec(MeshSpec::Toml(Box::new(cfg))).unwrap();
+        assert_eq!(
+            config.access.lan,
+            PeerGrant::Custom {
+                sessions: false,
+                filesystem: false,
+                shell: false,
+                providers: vec![ProviderGrant {
+                    provider_id: "llama_cpp".into(),
+                    models: ModelSelection::All,
+                }],
+            }
+        );
+        assert_eq!(config.access.trust.len(), 2);
+        assert_eq!(config.access.trust[0].access, PeerGrant::Full);
+        assert_eq!(config.access.trust[1].access, PeerGrant::None);
+        assert_eq!(config.access.trust[0].authority, authority);
+
+        let default: MeshTomlConfig = toml::from_str("enabled = true").unwrap();
+        let default = runtime_config_from_spec(MeshSpec::Toml(Box::new(default))).unwrap();
+        assert_eq!(default.access, Default::default());
+        assert!(!runtime_configs_compatible(&default, &config));
+
+        let full: MeshTomlConfig = toml::from_str("enabled = true\nlan_access = \"full\"").unwrap();
+        let full = runtime_config_from_spec(MeshSpec::Toml(Box::new(full))).unwrap();
+        assert_eq!(full.access.lan, PeerGrant::Full);
+
+        let invalid: MeshTomlConfig = toml::from_str(&format!(
+            "enabled = true\n[[trust]]\nname = \"x\"\nauthority = \"{authority}\"\ntoken = \"garbage\""
+        ))
+        .unwrap();
+        assert!(runtime_config_from_spec(MeshSpec::Toml(Box::new(invalid))).is_err());
+    }
 
     #[test]
     fn iroh_gso_defaults_on_for_api_modes() {

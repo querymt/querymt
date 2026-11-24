@@ -62,6 +62,12 @@ pub trait MeshIngress: Send + Sync + 'static {
     ) -> Result<SwarmResponse, SharingRejection> {
         Err(SharingRejection::UnsupportedOperation)
     }
+
+    /// Verify trust-scope tokens presented by the authenticated `peer` for its
+    /// current connection. Returns the scope names they prove membership of.
+    async fn present_trust(&self, _peer: PeerId, _tokens: Vec<String>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub(crate) enum InboundRequest<Q, R> {

@@ -61,12 +61,24 @@ pub enum SharingCallError {
 pub(crate) enum SharingRequest {
     Probe,
     Actor(Box<SwarmRequest>),
+    /// Trust-scope tokens for the sender's current connection.
+    Trust(Vec<String>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum SharingResponse {
     Supported,
     Actor(Result<SwarmResponse, SharingRejection>),
+    /// The trust scopes the presented tokens admitted the sender to.
+    Trust(Vec<String>),
+    /// The host was too busy to verify the presented tokens; retry later.
+    TrustBusy,
+}
+
+/// Work that needs the ingress gate.
+pub(crate) enum SharingDispatch {
+    Actor(Box<SwarmRequest>),
+    Trust(Vec<String>),
 }
 
 pub(crate) type ResponseSender = oneshot::Sender<Result<SharingResponse, SharingCallError>>;
@@ -93,7 +105,7 @@ impl Inbound<Sharing> {
 
 impl InboundProtocol for Sharing {
     type Request = SharingRequest;
-    type ActorRequest = Box<SwarmRequest>;
+    type ActorRequest = SharingDispatch;
     type Response = SharingResponse;
 
     const PROTOCOL: StreamProtocol = SHARING_PROTOCOL;
@@ -103,7 +115,12 @@ impl InboundProtocol for Sharing {
     fn receive(request: SharingRequest) -> InboundRequest<Self::ActorRequest, SharingResponse> {
         match request {
             SharingRequest::Probe => InboundRequest::Reply(SharingResponse::Supported),
-            SharingRequest::Actor(request) => InboundRequest::Dispatch(request),
+            SharingRequest::Actor(request) => {
+                InboundRequest::Dispatch(SharingDispatch::Actor(request))
+            }
+            SharingRequest::Trust(tokens) => {
+                InboundRequest::Dispatch(SharingDispatch::Trust(tokens))
+            }
         }
     }
 
@@ -112,22 +129,35 @@ impl InboundProtocol for Sharing {
         peer: PeerId,
         request: Self::ActorRequest,
     ) -> SharingResponse {
-        SharingResponse::Actor(gate.handle_v1(peer, *request).await)
+        match request {
+            SharingDispatch::Actor(request) => {
+                SharingResponse::Actor(gate.handle_v1(peer, *request).await)
+            }
+            SharingDispatch::Trust(tokens) => {
+                SharingResponse::Trust(gate.present_trust(peer, tokens).await)
+            }
+        }
     }
 
-    fn overloaded(_: Self::ActorRequest) -> SharingResponse {
-        SharingResponse::Actor(Err(SharingRejection::Busy))
+    fn overloaded(request: Self::ActorRequest) -> SharingResponse {
+        match request {
+            SharingDispatch::Actor(_) => SharingResponse::Actor(Err(SharingRejection::Busy)),
+            SharingDispatch::Trust(_) => SharingResponse::TrustBusy,
+        }
     }
 
     fn dispatch_budget(request: &Self::ActorRequest, wire_budget: Duration) -> Duration {
         // V1 callers advertise their whole exchange budget as the reply timeout.
         // A peer can shorten, but never extend, the host's wire budget.
-        match request.as_ref() {
-            SwarmRequest::Ask {
-                reply_timeout: Some(timeout),
-                ..
-            } => wire_budget.min(*timeout),
-            _ => wire_budget,
+        match request {
+            SharingDispatch::Actor(request) => match request.as_ref() {
+                SwarmRequest::Ask {
+                    reply_timeout: Some(timeout),
+                    ..
+                } => wire_budget.min(*timeout),
+                _ => wire_budget,
+            },
+            SharingDispatch::Trust(_) => wire_budget,
         }
     }
 

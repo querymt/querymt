@@ -652,6 +652,7 @@ fn schedule_mesh_config(
         node_name: None,
         peers: vec![],
         auto_fallback: false,
+        access: Default::default(),
     }
 }
 

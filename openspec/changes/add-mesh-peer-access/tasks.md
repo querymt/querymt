@@ -40,6 +40,14 @@ Remaining evidence: direct and hosted inference at the same quota scope through 
 
 Remaining evidence: sessionless stdio discovery (4.1), two finite scopes with only one reset through ACP (4.2), and incoming change readback after a missed invalidation (4.3).
 
+## 6. Host defaults (LAN access and trust scopes)
+
+- [x] 6.1 Resolve peers without a saved grant to the union of applying defaults in the mesh access store, including quota admission and dispatch; add inherited rows, `AccessEdit::Inherit`, and default-change publication. Cover `mesh-peer-access / A saved grant overrides the defaults until cleared` and `mesh-peer-access / Preconfiguring a quota keeps the defaults` (`host_defaults_apply_until_the_owner_saves_a_grant`).
+- [x] 6.2 Track private-network LAN connections in the swarm loop. Cover `mesh-peer-access / LAN access is off unless the owner enables it`, `mesh-peer-access / Enabled LAN access needs no per-peer setup` and `mesh-peer-access / Routable addresses do not receive the LAN default` (`lan_default_*`, `only_private_network_addresses_receive_lan_defaults`, `host_defaults_follow_private_lan_connections_and_presented_trust_tokens`).
+- [x] 6.3 Add offline-signed trust tokens, presentation on each new connection over the grant-aware protocol, and host verification. Cover `mesh-peer-access / A trust token admits only its subject` (`trust_tokens_admit_only_the_authenticated_subject`, `tampered_and_expired_trust_tokens_are_rejected`, `a_member_presents_its_trust_token_on_each_new_connection`).
+- [x] 6.4 Add `[mesh] lan_access`, `[[mesh.trust]]`, `--mesh-lan-access`, `--mesh-trust-issue`, Python `lan_access`, ACP `outgoing.source` and `clearPeerAccess`. Cover `mesh-access-acp / ACP shows and clears an override of the defaults` (`lan_default_is_reported_and_an_explicit_grant_can_be_cleared`, `toml_lan_access_and_trust_scopes_reach_the_runtime_config`).
+- [ ] 6.5 Run a multi-process LAN check with a pre-upgrade client against a host with `--mesh-lan-access=full`, and a trust-scope check over Iroh. Hand off `source` and `clearPeerAccess` to `querymt-desktop` and `qmacp`.
+
 ## 5. Verification and handoff
 
 - [ ] 5.1 In the Nix devShell, use `cargo check`, the focused commands below, `cargo fmt -p <package> -- --check`, and `cargo clippy -p <package> --all-targets` with the same feature set and `-- -D warnings`, in that order for each changed package. Use each CI feature set. Run the matching package suite after its focused tests pass.

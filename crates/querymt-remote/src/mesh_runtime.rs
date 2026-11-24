@@ -11,9 +11,9 @@ use crate::mesh_bootstrap::{MeshBootstrapContext, finalize_bootstrap, prepare_ru
 use crate::mesh_events::{
     MeshConnections, attach_iroh_scope_routes, connection_route_plan, connection_transport,
     handle_connection_closed, handle_connection_established, handle_mdns_discovered,
-    handle_mdns_expired, log_kameo_messaging_event, peer_id_from_multiaddr,
-    reconnect_backoff_duration, refresh_mesh_state_known_peers, run_re_registration_task,
-    seed_scoped_dial_peer, should_dial_peer_command,
+    handle_mdns_expired, is_private_network_addr, log_kameo_messaging_event,
+    peer_id_from_multiaddr, reconnect_backoff_duration, refresh_mesh_state_known_peers,
+    run_re_registration_task, seed_scoped_dial_peer, should_dial_peer_command,
 };
 use crate::mesh_runtime_support::{DialReason, SwarmCommand, resolve_local_hostname};
 use crate::{
@@ -123,6 +123,86 @@ fn iroh_transport_config(config: &MeshRuntimeConfig) -> libp2p_iroh::TransportCo
         dns_resolver: config.iroh_dns.as_ref().map(crate::IrohDnsConfig::resolver),
         ..Default::default()
     }
+}
+
+/// Present this node's trust-scope tokens to a newly connected peer. Hosts
+/// that do not know the scopes or the protocol ignore them.
+fn present_trust_tokens(
+    swarm: &mut libp2p::Swarm<UnifiedMeshBehaviour>,
+    peer: PeerId,
+    tokens: Vec<String>,
+    events: tokio::sync::broadcast::Sender<crate::MeshEvent>,
+    retry: mpsc::WeakUnboundedSender<SwarmCommand>,
+    session: u64,
+    attempt: u32,
+) {
+    use crate::mesh_ingress::{SharingRequest, SharingResponse};
+    let Either::Right(guarded) = &mut swarm.behaviour_mut().kameo else {
+        return;
+    };
+    let (tx, rx) = oneshot::channel();
+    guarded
+        .sharing
+        .send(peer, SharingRequest::Trust(tokens), tx);
+    tokio::spawn(async move {
+        let result = rx.await;
+        match &result {
+            Ok(Ok(SharingResponse::Trust(scopes))) if !scopes.is_empty() => {
+                log::info!("Peer {peer} admitted this node to trust scope(s): {scopes:?}");
+                // Access on that host changed; let consumers refresh.
+                let _ = events.send(crate::MeshEvent::Discovered(peer));
+            }
+            Ok(Ok(SharingResponse::Trust(_))) => {
+                log::debug!("Peer {peer} accepted no trust tokens");
+            }
+            Ok(Ok(other)) => log::debug!("Trust presentation to {peer} not completed: {other:?}"),
+            Ok(Err(error)) => log::debug!("Trust presentation to {peer} failed: {error}"),
+            Err(_) => {}
+        }
+        let Ok(result) = result else {
+            return;
+        };
+        if !trust_presentation_retryable(&result) {
+            return;
+        }
+        let Some(delay) = trust_retry_delay(attempt) else {
+            log::warn!("Peer {peer} stayed too busy to verify this node's trust tokens");
+            return;
+        };
+        tokio::time::sleep(delay).await;
+        // The swarm loop drops the retry if this connection session ended.
+        if let Some(retry) = retry.upgrade() {
+            let _ = retry.send(SwarmCommand::PresentTrust {
+                peer,
+                session,
+                attempt: attempt + 1,
+            });
+        }
+    });
+}
+
+/// Attempts after the first before giving up on a busy host.
+const MAX_TRUST_RETRIES: u32 = 5;
+
+/// Backoff before retry `attempt + 1`: 1s, 2s, 4s, 8s, 16s.
+fn trust_retry_delay(attempt: u32) -> Option<std::time::Duration> {
+    (attempt < MAX_TRUST_RETRIES).then(|| std::time::Duration::from_secs(1 << attempt))
+}
+
+/// Whether a trust presentation failed only because the exchange was busy or
+/// timed out. A verified reply, even an empty one, is final.
+fn trust_presentation_retryable(
+    result: &Result<crate::mesh_ingress::SharingResponse, crate::mesh_ingress::SharingCallError>,
+) -> bool {
+    use crate::mesh_ingress::{SharingCallError, SharingRejection, SharingResponse};
+    matches!(
+        result,
+        Ok(SharingResponse::TrustBusy)
+            | Err(SharingCallError::Rejected(SharingRejection::Busy))
+            | Err(SharingCallError::Transport(
+                libp2p::request_response::OutboundFailure::Timeout
+            ))
+    )
 }
 
 async fn finish_swarm_shutdown<F, T>(
@@ -262,6 +342,28 @@ async fn bootstrap_with_ingress(
             MeshError::SwarmError(format!("failed to reconcile mesh quotas: {error}"))
         })?;
     }
+    let access_defaults = policy_store
+        .as_ref()
+        .and_then(|store| store.access_defaults());
+    match &access_defaults {
+        Some(defaults) => defaults
+            .configure(
+                crate::NodeId::from_peer_id(keypair.public().to_peer_id()),
+                &config.access,
+            )
+            .map_err(MeshError::SwarmError)?,
+        None if config.access != crate::peer_access::MeshAccessConfig::default() => {
+            return Err(MeshError::SwarmError(
+                "mesh access defaults need a policy store that supports them (MeshAccessStore)"
+                    .into(),
+            ));
+        }
+        None => {}
+    }
+    let trust_tokens = access_defaults
+        .as_ref()
+        .map(crate::peer_access::AccessDefaults::own_tokens)
+        .unwrap_or_default();
     let policy = policy_store.map(|store| MeshPolicy {
         router: Arc::new(InboundRouter::new(
             keypair.public().to_peer_id(),
@@ -516,6 +618,8 @@ async fn bootstrap_with_ingress(
     reconnect_targets.remove(&local_peer_id);
 
     let (swarm_cmd_tx, mut swarm_cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
+    // Weak, so the loop's own retries never keep the command channel open.
+    let trust_retry_tx = swarm_cmd_tx.downgrade();
     let has_lan_loop = has_lan;
     let has_iroh_loop = has_iroh;
 
@@ -526,6 +630,9 @@ async fn bootstrap_with_ingress(
         let mut connections = MeshConnections::new();
         let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
         let mut reconnect_next_due: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+        // Each connected peer's session, so trust retries stop when it disconnects.
+        let mut trust_sessions: HashMap<PeerId, u64> = HashMap::new();
+        let mut next_trust_session: u64 = 0;
         let mut peer_iroh_scope_loop: HashMap<PeerId, MeshScopeId> = reconnect_targets_by_scope
             .iter()
             .flat_map(|(mesh_id, pids)| {
@@ -646,7 +753,14 @@ async fn bootstrap_with_ingress(
                                 Either::Left(_) => { let _ = tx.send(Err(SharingCallError::Unavailable)); }
                             }
                         }
+                        SwarmCommand::PresentTrust { peer, session, attempt } => {
+                            if trust_sessions.get(&peer) == Some(&session) && swarm.is_connected(&peer) {
+                                present_trust_tokens(&mut swarm, peer, trust_tokens.clone(), peer_events_tx_loop.clone(),
+                                    trust_retry_tx.clone(), session, attempt);
+                            }
+                        }
                         SwarmCommand::Shutdown { completion } => {
+                            trust_sessions.clear();
                             reconnect_targets.clear();
                             reconnect_targets_by_scope.clear();
                             pending_dials.clear();
@@ -686,6 +800,23 @@ async fn bootstrap_with_ingress(
                             let remote_addr = endpoint.get_remote_address().clone();
                             let transport = connection_transport(&remote_addr);
                             connections.insert(connection_id, (peer_id, transport, remote_addr.clone()));
+                            if let Some(defaults) = &access_defaults
+                                && transport == MeshTransportKind::Lan
+                                && is_private_network_addr(&remote_addr)
+                            {
+                                defaults.lan_connection_opened(&crate::NodeId::from_peer_id(peer_id));
+                            }
+                            if num_established.get() == 1 {
+                                if let Some(defaults) = &access_defaults {
+                                    defaults.peer_connected(&crate::NodeId::from_peer_id(peer_id));
+                                }
+                                next_trust_session = next_trust_session.wrapping_add(1);
+                                trust_sessions.insert(peer_id, next_trust_session);
+                                if !trust_tokens.is_empty() {
+                                    present_trust_tokens(&mut swarm, peer_id, trust_tokens.clone(), peer_events_tx_loop.clone(),
+                                        trust_retry_tx.clone(), next_trust_session, 0);
+                                }
+                            }
                             let plan = if transport == MeshTransportKind::Iroh {
                                 reconnect_targets_by_scope.iter()
                                     .filter(|(_, peers)| peers.contains(&peer_id))
@@ -706,8 +837,20 @@ async fn bootstrap_with_ingress(
                             reconnect_targets.insert(peer_id);
                             if num_established == 0 {
                                 reconnect_next_due.remove(&peer_id);
+                                trust_sessions.remove(&peer_id);
                             }
                             let closed = connections.remove(&connection_id);
+                            if let Some(defaults) = &access_defaults {
+                                let node = crate::NodeId::from_peer_id(peer_id);
+                                if let Some((_, MeshTransportKind::Lan, addr)) = &closed
+                                    && is_private_network_addr(addr)
+                                {
+                                    defaults.lan_connection_closed(&node);
+                                }
+                                if num_established == 0 {
+                                    defaults.peer_disconnected(&node);
+                                }
+                            }
                             if num_established > 0 && let Some((_, transport, _)) = closed
                                 && !connections.values().any(|(peer, kind, _)| *peer == peer_id && *kind == transport) {
                                 for route in routes_loop.remove_transport(&peer_id, transport) {
@@ -778,6 +921,35 @@ mod tests {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
+    #[test]
+    fn only_busy_or_timed_out_trust_presentations_are_retried() {
+        use crate::mesh_ingress::{SharingCallError, SharingRejection, SharingResponse};
+        use libp2p::request_response::OutboundFailure;
+        assert!(trust_presentation_retryable(&Ok(
+            SharingResponse::TrustBusy
+        )));
+        assert!(trust_presentation_retryable(&Err(
+            SharingCallError::Rejected(SharingRejection::Busy)
+        )));
+        assert!(trust_presentation_retryable(&Err(
+            SharingCallError::Transport(OutboundFailure::Timeout)
+        )));
+        // A verified reply is final, even if it admits nothing.
+        assert!(!trust_presentation_retryable(&Ok(SharingResponse::Trust(
+            vec![]
+        ))));
+        assert!(!trust_presentation_retryable(&Err(
+            SharingCallError::Transport(OutboundFailure::UnsupportedProtocols)
+        )));
+        assert!(!trust_presentation_retryable(&Err(
+            SharingCallError::Transport(OutboundFailure::ConnectionClosed)
+        )));
+        let delays: Vec<_> = (0..=MAX_TRUST_RETRIES).map(trust_retry_delay).collect();
+        assert_eq!(delays[0], Some(std::time::Duration::from_secs(1)));
+        assert_eq!(delays[4], Some(std::time::Duration::from_secs(16)));
+        assert_eq!(delays[5], None);
+    }
+
     fn test_runtime_handle(
         mode: MeshTransportMode,
     ) -> (MeshRuntimeHandle, mpsc::UnboundedReceiver<SwarmCommand>) {
@@ -845,6 +1017,7 @@ mod tests {
                     node_name: None,
                     peers: Vec::new(),
                     auto_fallback: false,
+                    access: Default::default(),
                 };
                 let transport = iroh_transport_config(&config);
                 assert_eq!(transport.enable_gso, iroh_gso);
@@ -1126,6 +1299,7 @@ mod tests {
             node_name: None,
             peers: vec![],
             auto_fallback: false,
+            access: Default::default(),
         })
         .await
         .unwrap();

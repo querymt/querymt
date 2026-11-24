@@ -217,7 +217,9 @@ impl MeshHandle {
                 self.known_sharing.write().insert(peer);
                 result.map_err(SharingCallError::from)
             }
-            SharingResponse::Supported => Err(SharingCallError::UnexpectedReply),
+            SharingResponse::Supported | SharingResponse::Trust(_) | SharingResponse::TrustBusy => {
+                Err(SharingCallError::UnexpectedReply)
+            }
         }
     }
 
@@ -935,6 +937,7 @@ mod tests {
             node_name: None,
             peers: vec![],
             auto_fallback: false,
+            access: Default::default(),
         };
         let policy = Arc::new(MeshAccessStore::new(Arc::clone(
             mesh.mesh_state_store().unwrap(),

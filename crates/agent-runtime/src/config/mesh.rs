@@ -104,6 +104,85 @@ pub struct IrohMeshTomlConfig {
     pub name: Option<String>,
 }
 
+/// Shorthand access modes for mesh defaults.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshAccessMode {
+    /// No access beyond identity discovery.
+    None,
+    /// Sessions, filesystem, unsandboxed shell, and every provider and model.
+    Full,
+}
+
+/// Default access for peers without a saved grant.
+///
+/// Either `"none"`, `"full"`, or a custom grant table:
+/// ```toml
+/// lan_access = { mode = "custom", sessions = false, filesystem = false, providers = [
+///   { provider_id = "llama_cpp", models = { mode = "all" } },
+/// ] }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(untagged)]
+pub enum MeshAccessToml {
+    Mode(MeshAccessMode),
+    Grant(#[schemars(with = "serde_json::Value")] querymt_remote::peer_access::PeerGrant),
+}
+
+impl MeshAccessToml {
+    pub fn into_grant(self) -> querymt_remote::peer_access::PeerGrant {
+        use querymt_remote::peer_access::PeerGrant;
+        match self {
+            Self::Mode(MeshAccessMode::None) => PeerGrant::None,
+            Self::Mode(MeshAccessMode::Full) => PeerGrant::Full,
+            Self::Grant(grant) => grant,
+        }
+    }
+}
+
+/// A trust scope: peers holding a token signed by `authority` for `name`
+/// receive `access` on this host, over any transport and without internet access.
+///
+/// ```toml
+/// [[mesh.trust]]
+/// name = "acme-eng"
+/// authority = "12D3KooW..."   # peer ID of the signing key
+/// access = "full"              # what this host gives members (default: "none")
+/// token = "${QMT_TRUST_TOKEN}" # this node's own membership token, if any
+/// ```
+///
+/// Issue a token offline with `qmtcode --mesh-trust-issue=<peer_id> --mesh-trust-scope=<name>`
+/// on the authority machine.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MeshTrustTomlConfig {
+    /// Scope name. Tokens are bound to it.
+    pub name: String,
+    /// Peer ID of the authority key that signs membership tokens.
+    pub authority: String,
+    /// Access this host gives scope members. Default: `"none"`.
+    #[serde(default)]
+    pub access: Option<MeshAccessToml>,
+    /// This node's membership token, presented to every peer it connects to.
+    /// Supports `${VAR}` interpolation.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl MeshTrustTomlConfig {
+    pub fn into_runtime(self) -> querymt_remote::peer_access::TrustScopeConfig {
+        querymt_remote::peer_access::TrustScopeConfig {
+            name: self.name,
+            authority: self.authority,
+            access: self
+                .access
+                .map(MeshAccessToml::into_grant)
+                .unwrap_or_default(),
+            token: self.token.filter(|token| !token.trim().is_empty()),
+        }
+    }
+}
+
 fn default_mesh_listen() -> Option<String> {
     Some("/ip4/0.0.0.0/tcp/0".to_string())
 }
@@ -229,6 +308,35 @@ pub struct MeshTomlConfig {
     /// activated alongside LAN (if also enabled).
     #[serde(default)]
     pub iroh: Vec<IrohMeshTomlConfig>,
+
+    /// Access for peers that have a live connection from a private-network
+    /// address (RFC 1918, loopback, link-local, IPv6 unique-local) and no saved
+    /// grant. Default: `"none"`. A saved per-peer grant always wins.
+    #[serde(default)]
+    pub lan_access: Option<MeshAccessToml>,
+
+    /// Trust scopes that grant access to token holders without per-peer grants.
+    #[serde(default)]
+    pub trust: Vec<MeshTrustTomlConfig>,
+}
+
+impl MeshTomlConfig {
+    /// Host defaults for peers without a saved grant.
+    pub fn access_config(&self) -> querymt_remote::peer_access::MeshAccessConfig {
+        querymt_remote::peer_access::MeshAccessConfig {
+            lan: self
+                .lan_access
+                .clone()
+                .map(MeshAccessToml::into_grant)
+                .unwrap_or_default(),
+            trust: self
+                .trust
+                .iter()
+                .cloned()
+                .map(MeshTrustTomlConfig::into_runtime)
+                .collect(),
+        }
+    }
 }
 
 impl Default for MeshTomlConfig {
@@ -249,6 +357,8 @@ impl Default for MeshTomlConfig {
             node_name: None,
             lan: None,
             iroh: Vec::new(),
+            lan_access: None,
+            trust: Vec::new(),
         }
     }
 }

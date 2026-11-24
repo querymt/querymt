@@ -54,6 +54,7 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
         node_name: None,
         peers: vec![],
         auto_fallback: false,
+        access: Default::default(),
     };
     let mesh = crate::agent::remote::bootstrap_mesh_runtime(&config, store)
         .await

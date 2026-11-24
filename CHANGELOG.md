@@ -322,6 +322,18 @@
 - **BREAKING (mesh sharing):** Agent mesh runtimes start with no sharing grants.
   Joining a scope does not grant access in either direction. Use ACP to grant
   access explicitly; pre-upgrade clients require Full access on an upgraded host.
+- **Mesh default access:** peers without a saved grant get the union of host
+  defaults. `[mesh] lan_access` (CLI `--mesh-lan-access`, env
+  `QMT_MESH_LAN_ACCESS`, Python `MeshRuntime.lan(lan_access=...)`) applies to
+  peers connected from a private-network address; it defaults to `"none"`.
+  `[[mesh.trust]]` scopes give holders of an offline-signed token access over
+  any transport; issue tokens with `qmtcode --mesh-trust-issue`. ACP
+  `getPeerAccess` reports `outgoing.source`, and the new
+  `querymt/mesh/clearPeerAccess` returns a peer to the defaults. Rust:
+  `MeshRuntimeConfig` has a new `access` field (**BREAKING** for struct
+  literals), `AccessEdit` has a new `Inherit` variant, `GrantStore` gains
+  defaulted `grant_source` and `access_defaults`, and the grant-aware wire adds
+  a trust presentation exchange.
 - **Mesh quotas:** Provider and model quotas apply to all shared models on Custom
   grants. Direct calls and hosted turns use the same prompt-plus-output estimate.
   Actual usage is charged even above the estimate; missing usage is charged at

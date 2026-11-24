@@ -431,6 +431,16 @@ impl MeshIngress for InboundRouter {
         }
     }
 
+    async fn present_trust(&self, peer: PeerId, tokens: Vec<String>) -> Vec<String> {
+        let Some(defaults) = self.store.access_defaults() else {
+            return Vec::new();
+        };
+        // Signature checks are CPU work; keep them off the async workers.
+        tokio::task::spawn_blocking(move || defaults.present(&NodeId::from_peer_id(peer), &tokens))
+            .await
+            .unwrap_or_default()
+    }
+
     async fn handle_legacy(&self, peer: PeerId, request: SwarmRequest) -> SwarmResponse {
         match request {
             ask @ SwarmRequest::Ask { .. } => SwarmResponse::Ask(self.ask(peer, ask).await),

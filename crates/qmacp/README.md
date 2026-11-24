@@ -75,6 +75,7 @@ qmacp --quiet mesh get "$PEER_ID"
 qmacp --quiet mesh set-quota "$PEER_ID" --expected-revision "$REV" \
   --provider "$PROVIDER_ID" --model "$MODEL_ID" --tokens 2.5M --window daily --operation reconfigure
 qmacp --quiet mesh set "$PEER_ID" --expected-revision "$REV" --grant '{"mode":"none"}'
+qmacp --quiet mesh clear "$PEER_ID" --expected-revision "$REV"   # back to host defaults
 qmacp --quiet mesh reset-quota "$PEER_ID" --expected-revision "$REV" --provider "$PROVIDER_ID"
 qmacp --quiet mesh watch "$PEER_ID" --timeout 30
 ```

@@ -22,6 +22,7 @@ pub fn from_toml_config(
     iroh: Vec<crate::config::IrohMeshTomlConfig>,
     iroh_gso: bool,
     iroh_dns: Option<querymt_remote::IrohDnsConfig>,
+    access: querymt_remote::peer_access::MeshAccessConfig,
 ) -> Result<MeshRuntimeConfig> {
     let identity_file = identity_file.map(PathBuf::from);
     let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -135,6 +136,7 @@ pub fn from_toml_config(
         node_name,
         peers,
         auto_fallback,
+        access,
     };
 
     config.validate()?;

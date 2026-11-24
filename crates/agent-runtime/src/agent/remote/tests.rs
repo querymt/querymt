@@ -2699,6 +2699,7 @@ mod node_manager_tests {
             node_name: None,
             peers: Vec::new(),
             auto_fallback: false,
+            access: Default::default(),
         };
         crate::agent::remote::mesh::bootstrap_mesh_runtime(&config, store)
             .await

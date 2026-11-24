@@ -135,6 +135,7 @@ pub mod fixtures {
                             node_name: None,
                             peers: vec![],
                             auto_fallback: false,
+                            access: Default::default(),
                         };
                         // Leak the tempdir so it lives for the entire process
                         // (the test mesh is a process-global singleton).

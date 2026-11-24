@@ -93,6 +93,7 @@ mod tests {
             node_name: None,
             peers: vec![],
             auto_fallback: false,
+            access: Default::default(),
         })
         .await
         .unwrap_err();

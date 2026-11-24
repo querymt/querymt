@@ -445,6 +445,7 @@ async fn mesh_provider_v1_requests_and_revoked_controls_do_not_downgrade() {
             node_name: None,
             peers: vec![host_addr.with(libp2p::multiaddr::Protocol::P2p(host_peer)).to_string(), legacy_addr.with(libp2p::multiaddr::Protocol::P2p(legacy_peer)).to_string()],
             auto_fallback: false,
+            access: Default::default(),
         }, Arc::new(RecordingGate(unused))).await.unwrap();
         let run = async {
             for peer in [host_peer, legacy_peer] {
@@ -593,4 +594,267 @@ async fn legacy_iroh_requests_reach_only_the_authenticated_ingress() {
     })
     .await
     .expect("Iroh ingress test timed out");
+}
+
+/// Drive `swarm` until `future` completes.
+async fn driving<B: NetworkBehaviour, F: std::future::Future>(
+    swarm: &mut libp2p::Swarm<B>,
+    future: F,
+) -> F::Output {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return output,
+            _ = swarm.select_next_some() => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_defaults_follow_private_lan_connections_and_presented_trust_tokens() {
+    use crate::NodeId;
+    use crate::mesh_runtime_config::{
+        DirectoryMode, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
+    };
+    use crate::peer_access::defaults::issue_trust_token;
+    use crate::peer_access::{GrantSource, MeshAccessConfig, PolicyEffect, TrustScopeConfig};
+    use tokio::sync::oneshot;
+
+    let (unused, _calls) = mpsc::unbounded_channel();
+    // Keep the idle connection open; the default swarm closes it at once.
+    let mut client = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(|_| {
+            SharingWire::new(Arc::new(RecordingGate(unused)), Duration::from_secs(3))
+        })
+        .unwrap()
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let client_addr = listening(&mut client, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+    let client_peer = *client.local_peer_id();
+    let authority = libp2p::identity::Keypair::generate_ed25519();
+    let providers = PeerGrant::Custom {
+        sessions: false,
+        filesystem: false,
+        shell: false,
+        providers: vec![ProviderGrant {
+            provider_id: "fixture".into(),
+            models: ModelSelection::All,
+        }],
+    };
+    let sessions = PeerGrant::Custom {
+        sessions: true,
+        filesystem: false,
+        shell: false,
+        providers: vec![],
+    };
+    let identity = tempfile::tempdir().unwrap();
+    let runtime = crate::bootstrap_mesh_runtime_guarded(&MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: DirectoryMode::Cached,
+        }),
+        iroh_enabled: false,
+        iroh_gso: false,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        identity_file: Some(identity.path().join("identity")),
+        request_timeout: Duration::from_secs(3),
+        stream_reconnect_grace: Duration::from_secs(3),
+        node_name: None,
+        peers: vec![
+            client_addr
+                .with(libp2p::multiaddr::Protocol::P2p(client_peer))
+                .to_string(),
+        ],
+        auto_fallback: false,
+        access: MeshAccessConfig {
+            lan: providers.clone(),
+            trust: vec![TrustScopeConfig {
+                name: "eng".into(),
+                authority: authority.public().to_peer_id().to_string(),
+                access: sessions.clone(),
+                token: None,
+            }],
+        },
+    })
+    .await
+    .unwrap();
+    let mesh = runtime.as_mesh_handle().clone();
+    let host_peer = *mesh.peer_id();
+    let store = mesh.quota_store().unwrap().clone();
+    let key = PeerGrantKey {
+        host: NodeId::from_peer_id(host_peer),
+        peer: NodeId::from_peer_id(client_peer),
+    };
+    let mut changes = store.subscribe_peer_changes(&key).unwrap();
+    let deadline = Duration::from_secs(5);
+
+    // The host dials the client on loopback: a private-network LAN connection.
+    tokio::time::timeout(deadline, async {
+        loop {
+            if let SwarmEvent::ConnectionEstablished { peer_id, .. } =
+                client.select_next_some().await
+                && peer_id == host_peer
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("host connects to the client");
+    let change = driving(&mut client, tokio::time::timeout(deadline, changes.recv()))
+        .await
+        .expect("LAN default publishes a policy change")
+        .unwrap();
+    assert!(matches!(&change.effect, PolicyEffect::Grant(grant) if *grant == providers));
+    assert_eq!(store.grant(&key).await.unwrap().grant, providers);
+    assert_eq!(
+        store.grant_source(&key).await.unwrap(),
+        GrantSource::Default {
+            defaults: vec!["lan".into()]
+        }
+    );
+
+    // Only the token issued to the authenticated sender counts.
+    let token = issue_trust_token(&authority, "eng", &client_peer.to_string(), None).unwrap();
+    let for_other =
+        issue_trust_token(&authority, "eng", &PeerId::random().to_string(), None).unwrap();
+    let (tx, rx) = oneshot::channel();
+    client
+        .behaviour_mut()
+        .send(host_peer, SharingRequest::Trust(vec![for_other, token]), tx);
+    let reply = driving(&mut client, tokio::time::timeout(deadline, rx))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, SharingResponse::Trust(scopes) if scopes == ["eng"]));
+    assert_eq!(
+        store.grant(&key).await.unwrap().grant,
+        providers.clone().union(sessions)
+    );
+    assert_eq!(
+        store.grant_source(&key).await.unwrap(),
+        GrantSource::Default {
+            defaults: vec!["lan".into(), "trust:eng".into()]
+        }
+    );
+
+    // Defaults end with the connection.
+    drop(client);
+    tokio::time::timeout(deadline, async {
+        loop {
+            let change = changes.recv().await.unwrap();
+            if matches!(change.effect, PolicyEffect::Grant(PeerGrant::None)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("disconnect revokes default access");
+    assert_eq!(store.grant(&key).await.unwrap().grant, PeerGrant::None);
+    mesh.shutdown().await;
+}
+
+struct TrustGate(mpsc::UnboundedSender<(PeerId, Vec<String>)>);
+
+#[async_trait]
+impl MeshIngress for TrustGate {
+    async fn handle_legacy(&self, _: PeerId, request: SwarmRequest) -> SwarmResponse {
+        Legacy::overloaded(request)
+    }
+
+    async fn present_trust(&self, peer: PeerId, tokens: Vec<String>) -> Vec<String> {
+        self.0.send((peer, tokens)).unwrap();
+        vec!["eng".into()]
+    }
+}
+
+#[tokio::test]
+async fn a_member_presents_its_trust_token_on_each_new_connection() {
+    use crate::mesh_runtime_config::{
+        DirectoryMode, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
+    };
+    use crate::peer_access::defaults::issue_trust_token;
+    use crate::peer_access::{MeshAccessConfig, TrustScopeConfig};
+
+    let (presented_tx, mut presented) = mpsc::unbounded_channel();
+    let mut host = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(|_| {
+            SharingWire::new(Arc::new(TrustGate(presented_tx)), Duration::from_secs(3))
+        })
+        .unwrap()
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let host_addr = listening(&mut host, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+    let host_peer = *host.local_peer_id();
+
+    let identity = tempfile::tempdir().unwrap();
+    let keypair =
+        crate::identity::load_or_generate_keypair(Some(&identity.path().join("identity"))).unwrap();
+    let member = keypair.public().to_peer_id();
+    let authority = libp2p::identity::Keypair::generate_ed25519();
+    let token = issue_trust_token(&authority, "eng", &member.to_string(), Some(3600)).unwrap();
+    let runtime = crate::bootstrap_mesh_runtime_guarded(&MeshRuntimeConfig {
+        enabled: true,
+        lan: Some(LanMeshConfig {
+            listen: Some("/ip4/127.0.0.1/tcp/0".into()),
+            discovery: LanDiscovery::None,
+            directory: DirectoryMode::Cached,
+        }),
+        iroh_enabled: false,
+        iroh_gso: false,
+        iroh_dns: None,
+        iroh_scopes: vec![],
+        identity_file: Some(identity.path().join("identity")),
+        request_timeout: Duration::from_secs(3),
+        stream_reconnect_grace: Duration::from_secs(3),
+        node_name: None,
+        peers: vec![
+            host_addr
+                .with(libp2p::multiaddr::Protocol::P2p(host_peer))
+                .to_string(),
+        ],
+        auto_fallback: false,
+        access: MeshAccessConfig {
+            lan: PeerGrant::None,
+            trust: vec![TrustScopeConfig {
+                name: "eng".into(),
+                authority: authority.public().to_peer_id().to_string(),
+                access: PeerGrant::None,
+                token: Some(token.clone()),
+            }],
+        },
+    })
+    .await
+    .unwrap();
+    let mesh = runtime.as_mesh_handle().clone();
+    assert_eq!(*mesh.peer_id(), member);
+
+    let (peer, tokens) = driving(
+        &mut host,
+        tokio::time::timeout(Duration::from_secs(5), presented.recv()),
+    )
+    .await
+    .expect("the member presents its token")
+    .unwrap();
+    assert_eq!(peer, member);
+    assert_eq!(tokens, [token]);
+    mesh.shutdown().await;
 }

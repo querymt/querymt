@@ -7,16 +7,30 @@ use thiserror::Error;
 
 use crate::NodeId;
 
+pub mod defaults;
 pub mod quota;
 mod store;
+pub use defaults::{AccessDefaults, MeshAccessConfig, TrustScopeConfig};
 pub use store::{
     GrantStore, GrantStoreError, PeerGrantState, PolicyChange, PolicyEffect, wait_for_policy_loss,
 };
 
+/// Where a peer's effective grant comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GrantSource {
+    /// The owner saved a grant for this peer. It replaces every default.
+    Explicit,
+    /// No saved grant: the union of the host defaults that currently apply.
+    /// `defaults` names them (`lan`, `trust:<scope>`); empty means No access.
+    Default { defaults: Vec<String> },
+}
+
 /// Wire contract under which a protected operation was received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SharingProtocol {
-    /// Legacy wire format: only an explicit Full grant permits resource access.
+    /// Legacy wire format: only an effective Full grant, saved or from a host
+    /// default, permits resource access.
     Legacy,
     /// The grant-aware mesh sharing contract.
     V1,
@@ -113,6 +127,64 @@ impl PeerGrant {
         Ok(())
     }
 
+    /// Combine two grants, allowing whatever either one allows.
+    /// The union of valid grants is valid.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::None, grant) | (grant, Self::None) => grant,
+            (
+                Self::Custom {
+                    sessions,
+                    filesystem,
+                    shell,
+                    mut providers,
+                },
+                Self::Custom {
+                    sessions: other_sessions,
+                    filesystem: other_filesystem,
+                    shell: other_shell,
+                    providers: other_providers,
+                },
+            ) => {
+                for grant in other_providers {
+                    match providers
+                        .iter_mut()
+                        .find(|existing| existing.provider_id == grant.provider_id)
+                    {
+                        None => providers.push(grant),
+                        Some(existing) => {
+                            existing.models = match (
+                                std::mem::replace(&mut existing.models, ModelSelection::All),
+                                grant.models,
+                            ) {
+                                (
+                                    ModelSelection::Selected { mut model_ids },
+                                    ModelSelection::Selected { model_ids: more },
+                                ) => {
+                                    for id in more {
+                                        if !model_ids.contains(&id) {
+                                            model_ids.push(id);
+                                        }
+                                    }
+                                    ModelSelection::Selected { model_ids }
+                                }
+                                _ => ModelSelection::All,
+                            };
+                        }
+                    }
+                }
+                Self::Custom {
+                    sessions: sessions || other_sessions,
+                    filesystem: filesystem || other_filesystem,
+                    shell: shell || other_shell,
+                    providers,
+                }
+            }
+        }
+    }
+
     /// Whether the peer may access host sessions.
     pub fn allows_sessions(&self, protocol: SharingProtocol) -> bool {
         matches!(self, Self::Full)
@@ -158,7 +230,7 @@ impl PeerGrant {
     }
 }
 
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
 }
 

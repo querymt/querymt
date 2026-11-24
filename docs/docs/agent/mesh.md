@@ -976,6 +976,43 @@ Manage grants and quotas through ACP. When the mesh access store is configured, 
 - **Full:** Grants the supported shell, session, filesystem, and provider capabilities. Existing host approvals still apply. Pre-upgrade clients need explicit Full for protected operations on an upgraded host.
 - **Revocation:** Changing a grant stops further authorized delivery and affected work at the next supported boundary. It does not recall previously delivered content or undo completed effects.
 
+### Default Access
+
+A peer without a saved grant gets the union of the host defaults that currently apply to it. A saved grant, including No access, always replaces the defaults. `outgoing.source` reports which applies: `{"kind":"explicit"}` or `{"kind":"default","defaults":["lan","trust:acme"]}`. `querymt/mesh/clearPeerAccess` (`version`, `peer_id`, `expected_revision`) removes a saved grant and keeps its quotas. Defaults are not saved and do not change the revision; they follow live connections and end when the peer disconnects.
+
+**LAN access (zeroconf).** `lan_access` applies to peers with a live connection from a private-network address: RFC 1918, loopback, IPv4/IPv6 link-local, or IPv6 unique-local. Public addresses, including CGNAT ranges such as Tailscale's `100.64.0.0/10`, do not qualify. The default is `"none"`. On a network you trust, turn it on with `--mesh-lan-access=full` (or `QMT_MESH_LAN_ACCESS=full`):
+
+```toml
+[mesh]
+enabled = true
+lan_access = "full"   # or "none", or a custom grant table
+# lan_access = { mode = "custom", sessions = false, filesystem = false, providers = [
+#   { provider_id = "llama_cpp", models = { mode = "all" } },
+# ] }
+```
+
+`full` shares sessions, workspace files, the unsandboxed shell, and every model with anyone who can reach the node from such an address. It also admits pre-upgrade clients, which need Full. Keep the ACP and dashboard listeners on loopback: ACP is unauthenticated.
+
+**Trust scopes (offline, enterprise).** A trust scope gives its members access on every host that lists it, over LAN or Iroh, without an internet connection or per-peer grants. An authority key signs a token for each member's peer ID. The authority does not need to be online.
+
+```sh
+# On the authority machine (its mesh identity signs; default lifetime 30d):
+qmtcode --mesh-trust-issue=12D3KooWMember... --mesh-trust-scope=acme-eng --mesh-trust-ttl=90d
+```
+
+```toml
+# Every host that grants access to the scope, and every member:
+[[mesh.trust]]
+name = "acme-eng"
+authority = "12D3KooWAuthority..."   # peer ID printed by --mesh-trust-issue
+access = { mode = "custom", sessions = false, filesystem = false, providers = [
+  { provider_id = "llama_cpp", models = { mode = "all" } },
+] }                                    # what this host gives members (default "none")
+token = "${QMT_TRUST_TOKEN}"           # this node's token, if it is a member
+```
+
+A member presents its tokens on each new connection. The host accepts a token only if it was issued to the authenticated sender for a configured scope and authority and has not expired. The membership lasts for that connection, or until the token expires. To revoke a member, let its token expire, remove the scope, or save an explicit grant for its peer ID. Only token lifetime limits a stolen identity key, so issue short-lived tokens and rotate them. For a locked-down deployment, leave `lan_access = "none"` and rely on trust scopes: unlisted peers can discover the node but get nothing.
+
 Provider-wide and model-specific quotas both apply to a Custom inference request. Direct mesh calls and hosted turns share the same balance on the resource host. Quotas default to unlimited, and Full access does not use saved Custom quotas.
 
 Finite quotas use the same reservation estimate for every provider: estimated prompt tokens, including configured system text and tool definitions, plus the effective output cap. A request's `max_tokens` overrides the configured cap only if the bound provider supports it. The host caps the estimate at the configured llama.cpp `n_ctx` when present, or at the model's context limit from models.dev. Only if the model is absent from models.dev and no `n_ctx` is configured does it use the profile context middleware's `fallback_max_tokens`, if present. With no applicable ceiling the estimate is uncapped; missing metadata is not a reason to refuse inference. Context overrides do not affect this calculation, media gets no separate allowance, and every token kind counts equally.

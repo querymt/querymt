@@ -218,6 +218,97 @@ struct Cli {
         conflicts_with = "mesh_join"
     )]
     mesh_peer: Vec<String>,
+
+    /// Access for peers on a private-network LAN connection that have no saved grant.
+    ///
+    /// Precedence: CLI > QMT_MESH_LAN_ACCESS > `[mesh] lan_access` > none.
+    /// `full` shares sessions, files, the unsandboxed shell and all models with
+    /// any such peer; use it only on networks you trust. A per-peer grant saved
+    /// over ACP always takes precedence.
+    #[cfg(feature = "remote")]
+    #[arg(long, env = "QMT_MESH_LAN_ACCESS", value_name = "none|full", value_parser = ["none", "full"])]
+    mesh_lan_access: Option<String>,
+
+    /// Sign a trust-scope membership token for PEER_ID with this node's identity
+    /// key, print it, and exit. Requires --mesh-trust-scope.
+    ///
+    /// Hosts that list this node's peer ID as the scope `authority` in
+    /// `[[mesh.trust]]` give the token holder that scope's access. The authority
+    /// does not need to be online, and no internet access is required.
+    #[cfg(feature = "remote")]
+    #[arg(long, value_name = "peer_id", requires = "mesh_trust_scope")]
+    mesh_trust_issue: Option<String>,
+
+    /// Trust scope name for --mesh-trust-issue.
+    #[cfg(feature = "remote")]
+    #[arg(long, value_name = "name")]
+    mesh_trust_scope: Option<String>,
+
+    /// Lifetime of an issued trust token. Default: 30d. Use `none` for no expiry.
+    ///
+    /// Expiry is the only way to revoke a token other than removing the scope
+    /// or saving a per-peer grant on the host.
+    #[cfg(feature = "remote")]
+    #[arg(long, value_name = "duration", default_value = "30d")]
+    mesh_trust_ttl: String,
+}
+
+/// Host defaults from `[mesh]` (`lan_access`, `[[mesh.trust]]`), with the CLI
+/// LAN override applied.
+#[cfg(feature = "remote")]
+fn mesh_access(
+    config: &Config,
+    lan_override: Option<&str>,
+) -> querymt_remote::peer_access::MeshAccessConfig {
+    use querymt_remote::peer_access::PeerGrant;
+    let mesh = match config {
+        Config::Single(config) => &config.mesh,
+        Config::Multi(config) => &config.mesh,
+    };
+    let mut access = mesh.access_config();
+    match lan_override {
+        Some("full") => access.lan = PeerGrant::Full,
+        Some("none") => access.lan = PeerGrant::None,
+        _ => {}
+    }
+    access
+}
+
+/// Issue a trust-scope token signed by this node's identity.
+#[cfg(feature = "remote")]
+fn issue_trust_token(cli: &Cli, peer: &str) -> anyhow::Result<()> {
+    let scope = cli
+        .mesh_trust_scope
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--mesh-trust-issue requires --mesh-trust-scope"))?;
+    let ttl = match cli.mesh_trust_ttl.trim() {
+        "none" | "never" | "0" => None,
+        ttl => Some(
+            querymt_agent::agent::remote::invite::parse_duration_secs(ttl)
+                .ok_or_else(|| anyhow::anyhow!("invalid --mesh-trust-ttl '{ttl}'"))?,
+        ),
+    };
+    let identity = querymt_agent::agent::remote::identity::load_or_generate_keypair(None)?;
+    let token =
+        querymt_remote::peer_access::defaults::issue_trust_token(&identity, scope, peer, ttl)?;
+    let authority = identity.public().to_peer_id();
+    let expiry = ttl.map_or_else(
+        || "no expiry".to_string(),
+        |secs| {
+            format!(
+                "expires in {}",
+                querymt_agent::agent::remote::invite::format_duration_human(secs)
+            )
+        },
+    );
+    eprintln!("Trust token for {peer} in scope '{scope}' ({expiry}).");
+    eprintln!("Hosts trust it with:\n");
+    eprintln!(
+        "  [[mesh.trust]]\n  name = \"{scope}\"\n  authority = \"{authority}\"\n  access = \"full\"  # or a custom grant\n"
+    );
+    eprintln!("The member adds the token to the same entry:\n");
+    println!("{token}");
+    Ok(())
 }
 
 /// Peers declared in `[[mesh.peers]]` of the loaded config.
@@ -534,6 +625,12 @@ async fn run(
 
     validate_profile_args(&cli)?;
 
+    #[cfg(feature = "remote")]
+    if let Some(peer) = cli.mesh_trust_issue.as_deref() {
+        issue_trust_token(&cli, peer)?;
+        return Ok(());
+    }
+
     let profile_catalog = qmtcode_profile_catalog(&cli.profiles_dir, cli.config_file.as_deref())?;
     if cli.list_profiles {
         let profiles = profile_catalog.list_profiles().await?;
@@ -567,6 +664,8 @@ async fn run(
     let mesh_iroh_dns;
     #[cfg(feature = "remote")]
     let mesh_toml_peers;
+    #[cfg(feature = "remote")]
+    let mesh_access_config;
 
     let runner = {
         let selected_profile = selected_profile_id(&cli).to_string();
@@ -585,6 +684,7 @@ async fn run(
             mesh_iroh_gso = gso;
             mesh_iroh_dns = mesh_dns(&config);
             mesh_toml_peers = mesh_peers(&config);
+            mesh_access_config = mesh_access(&config, cli.mesh_lan_access.as_deref());
             MeshGsoProfileCatalog {
                 inner: profile_catalog,
                 iroh_gso: gso,
@@ -714,6 +814,7 @@ async fn run(
             node_name: None,
             peers: merge_mesh_peers(&cli.mesh_peer, &mesh_toml_peers)?,
             auto_fallback: false,
+            access: mesh_access_config.clone(),
         };
 
         match bootstrap_mesh_runtime(&runtime_config).await {
@@ -740,6 +841,27 @@ async fn run(
                 }
                 if !runtime_config.peers.is_empty() {
                     eprintln!("Mesh static peers: {}", runtime_config.peers.join(", "));
+                }
+                match &runtime_config.access.lan {
+                    querymt_remote::peer_access::PeerGrant::None => eprintln!(
+                        "Mesh LAN access: none (grant peers over ACP, or use --mesh-lan-access=full on a trusted network)"
+                    ),
+                    querymt_remote::peer_access::PeerGrant::Full => eprintln!(
+                        "Mesh LAN access: FULL for private-network peers without a saved grant"
+                    ),
+                    _ => eprintln!("Mesh LAN access: custom default for private-network peers"),
+                }
+                for scope in &runtime_config.access.trust {
+                    eprintln!(
+                        "Mesh trust scope '{}' (authority {}){}",
+                        scope.name,
+                        scope.authority,
+                        if scope.token.is_some() {
+                            ", presenting a token"
+                        } else {
+                            ""
+                        }
+                    );
                 }
 
                 if let Some(name) = &cli.mesh_invite {
@@ -1224,6 +1346,24 @@ system = "inline"
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--db <path>"));
         assert!(help.contains("QMT_SESSIONS_DB"));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_lan_access_flag_accepts_only_known_modes() {
+        let cli = Cli::try_parse_from(["qmtcode", "--mesh", "--mesh-lan-access=full"]).unwrap();
+        assert_eq!(cli.mesh_lan_access.as_deref(), Some("full"));
+        assert!(
+            Cli::try_parse_from(["qmtcode", "--mesh", "--mesh-lan-access=everything"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["qmtcode", "--mesh-trust-issue=PEER"]).is_err());
+        let cli = Cli::try_parse_from([
+            "qmtcode",
+            "--mesh-trust-issue=PEER",
+            "--mesh-trust-scope=eng",
+        ])
+        .unwrap();
+        assert_eq!(cli.mesh_trust_ttl, "30d");
     }
 
     #[test]

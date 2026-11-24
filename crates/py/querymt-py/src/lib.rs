@@ -279,8 +279,10 @@ impl PyProvider {
 impl PyMeshRuntime {
     /// Start a LAN runtime. Pass a mesh state path to enforce peer grants and quotas.
     /// Without it, connected peers can use shared providers within the global model allowlist.
+    /// With a store, `lan_access="full"` gives private-network peers without a saved
+    /// grant full access (default `"none"`).
     #[staticmethod]
-    #[pyo3(signature = (node_name=None, listen=None, request_timeout_secs=300, stream_reconnect_grace_secs=120, *, peer_access_store=None))]
+    #[pyo3(signature = (node_name=None, listen=None, request_timeout_secs=300, stream_reconnect_grace_secs=120, *, peer_access_store=None, lan_access=None))]
     fn lan<'py>(
         py: Python<'py>,
         node_name: Option<String>,
@@ -288,7 +290,23 @@ impl PyMeshRuntime {
         request_timeout_secs: u64,
         stream_reconnect_grace_secs: u64,
         peer_access_store: Option<PathBuf>,
+        lan_access: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        use querymt_remote::peer_access::{MeshAccessConfig, PeerGrant};
+        let lan = match lan_access.as_deref() {
+            None | Some("none") => PeerGrant::None,
+            Some("full") => PeerGrant::Full,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "lan_access must be 'none' or 'full', not '{other}'"
+                )));
+            }
+        };
+        if lan != PeerGrant::None && peer_access_store.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lan_access requires peer_access_store",
+            ));
+        }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let config = MeshRuntimeConfig {
                 enabled: true,
@@ -307,6 +325,10 @@ impl PyMeshRuntime {
                 node_name,
                 peers: Vec::new(),
                 auto_fallback: false,
+                access: MeshAccessConfig {
+                    lan,
+                    trust: Vec::new(),
+                },
             };
             let runtime = if let Some(path) = peer_access_store {
                 let owner = tokio::task::spawn_blocking(move || MeshStateStore::shared(&path))
