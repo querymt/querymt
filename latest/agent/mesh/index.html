@@ -2449,6 +2449,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#models-on-a-third-node" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Models on a third node
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -4658,6 +4669,24 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li><strong>Revocation:</strong> Changing a grant stops further authorized delivery and affected work at the next supported boundary. It does not recall previously delivered content or undo completed effects.</li>
 </ul>
 <h3 id="default-access">Default Access</h3>
+<p>Access is one-way: each node decides what it gives the nodes that call it. Running a remote session needs session access on the remote node. Running that session with a model on your own node also needs your node to give the remote node access to that model, because the remote node calls back to your node for each request. With session access below Full, you can pick a model on your own node or on a third node for a remote session; the remote node's own models need Full.</p>
+<h3 id="models-on-a-third-node">Models on a third node</h3>
+<p>A remote session can use a model on a node that is neither the session host nor you: you prompt an agent on a phone that runs on a GPU server. Selecting the model needs only session access on the host. Using it needs one of two things:</p>
+<ul>
+<li><strong>A model pass (any grant with session access).</strong> Your node signs a short-lived pass (one hour, no renewal) when you prompt, if the model node reports that it shares the model with you. The pass names the session host, the model node, the provider, the model and the session. The host sends it with each inference request. The model node checks your grant, charges your quotas and stops the stream if you lose access, and needs no grant for the host. The host checks neither its own model grant nor its quotas for that turn.</li>
+<li><strong>Full access on the host, without a pass.</strong> The host then calls the model node under its own grant there, which that node authorizes and meters.</li>
+</ul>
+<p>Below Full, a turn without a pass is refused, including turns started by a schedule. A pass is never a reason to fall back: a pass that does not match the turn, an expired pass, or a model node that does not confirm that it charges you refuses the turn, and the host does not use its own access. Passes need the grant-aware protocol, so a model node on a build without passes cannot serve them. The host is trusted with your access to that one model until the pass expires, within your quotas on the model node; it can already see the conversation. The model node checks the pass on every contract and inference request, so expiry refuses new requests. It does not cut a stream that is already running: that stream ends when it finishes, when your grant or quotas change, or when its lease lapses. A queued input that waits longer than the pass lives is refused when its turn starts. Chains of passes, renewal while a turn runs, passes for scheduled work and a revocation list are not supported.</p>
+<pre class="mermaid"><code>sequenceDiagram
+    participant P as You (prompter)
+    participant H as Session host
+    participant M as Model node
+    P-&gt;&gt;H: Prompt with a pass for this session and model
+    H-&gt;&gt;H: You have session access; the pass names this host and session
+    H-&gt;&gt;M: Contract and inference request with the pass
+    M-&gt;&gt;M: Your grant allows the model; reserve against your quotas
+    M--&gt;&gt;H: Stream, stopped if your access is removed
+    H--&gt;&gt;P: Session events</code></pre>
 <p>A peer without a saved grant gets the union of the host defaults that currently apply to it. A saved grant, including No access, always replaces the defaults. <code>outgoing.source</code> reports which applies: <code>{"kind":"explicit"}</code> or <code>{"kind":"default","defaults":["lan","trust:acme"]}</code>. <code>querymt/mesh/clearPeerAccess</code> (<code>version</code>, <code>peer_id</code>, <code>expected_revision</code>) removes a saved grant and keeps its quotas. Defaults are not saved and do not change the revision; they follow live connections and end when the peer disconnects.</p>
 <p><strong>LAN access (zeroconf).</strong> <code>lan_access</code> applies to peers with a live connection from a private-network address: RFC 1918, loopback, IPv4/IPv6 link-local, or IPv6 unique-local. Public addresses, including CGNAT ranges such as Tailscale's <code>100.64.0.0/10</code>, do not qualify. The default is <code>"none"</code>. On a network you trust, turn it on with <code>--mesh-lan-access=full</code> (or <code>QMT_MESH_LAN_ACCESS=full</code>):</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1">1</a></span>
