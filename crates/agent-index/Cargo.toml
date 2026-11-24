@@ -57,7 +57,7 @@ tree-sitter-swift = "0.7"
 # on crates.io. The crates.io `tree-sitter-lean4` crate needs tree-sitter 0.25,
 # which conflicts with the 0.26 runtime through the `links = "tree-sitter"` key.
 # This grammar binds via tree-sitter-language only.
-tree-sitter-lean = { git = "https://github.com/Julian/tree-sitter-lean", rev = "fefc2eff9a83eeb72cda44646709e40e33e09175" }
+tree-sitter-lean = { git = "https://github.com/Julian/tree-sitter-lean", rev = "f35fa9b1ad3edd22c2b07b61f569a6d9c8e07d6e" }
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"

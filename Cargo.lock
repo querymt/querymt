@@ -16804,7 +16804,7 @@ checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 [[package]]
 name = "tree-sitter-lean"
 version = "0.2.0"
-source = "git+https://github.com/Julian/tree-sitter-lean?rev=fefc2eff9a83eeb72cda44646709e40e33e09175#fefc2eff9a83eeb72cda44646709e40e33e09175"
+source = "git+https://github.com/Julian/tree-sitter-lean?rev=f35fa9b1ad3edd22c2b07b61f569a6d9c8e07d6e#f35fa9b1ad3edd22c2b07b61f569a6d9c8e07d6e"
 dependencies = [
  "cc",
  "tree-sitter-language",
