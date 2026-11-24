@@ -1986,8 +1986,10 @@ impl AgentsStore {
     /// no session is open (design D4). The palette and the composer list
     /// read only this.
     pub fn session_slash_commands(&self) -> &[querymt_agent_session_core::view::SlashCommandView] {
+        // A read-only session has no composer, so it advertises no commands.
         self.session
             .as_ref()
+            .filter(|view| view.access.is_none())
             .map_or(&[], |view| view.slash_commands.as_slice())
     }
 
