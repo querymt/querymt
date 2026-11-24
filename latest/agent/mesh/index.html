@@ -2435,6 +2435,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Peer Sharing and Quotas">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#default-access" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Default Access
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -4640,6 +4657,44 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li><strong>Full:</strong> Grants the supported shell, session, filesystem, and provider capabilities. Existing host approvals still apply. Pre-upgrade clients need explicit Full for protected operations on an upgraded host.</li>
 <li><strong>Revocation:</strong> Changing a grant stops further authorized delivery and affected work at the next supported boundary. It does not recall previously delivered content or undo completed effects.</li>
 </ul>
+<h3 id="default-access">Default Access</h3>
+<p>A peer without a saved grant gets the union of the host defaults that currently apply to it. A saved grant, including No access, always replaces the defaults. <code>outgoing.source</code> reports which applies: <code>{"kind":"explicit"}</code> or <code>{"kind":"default","defaults":["lan","trust:acme"]}</code>. <code>querymt/mesh/clearPeerAccess</code> (<code>version</code>, <code>peer_id</code>, <code>expected_revision</code>) removes a saved grant and keeps its quotas. Defaults are not saved and do not change the revision; they follow live connections and end when the peer disconnects.</p>
+<p><strong>LAN access (zeroconf).</strong> <code>lan_access</code> applies to peers with a live connection from a private-network address: RFC 1918, loopback, IPv4/IPv6 link-local, or IPv6 unique-local. Public addresses, including CGNAT ranges such as Tailscale's <code>100.64.0.0/10</code>, do not qualify. The default is <code>"none"</code>. On a network you trust, turn it on with <code>--mesh-lan-access=full</code> (or <code>QMT_MESH_LAN_ACCESS=full</code>):</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1">1</a></span>
+<span class="normal"><a href="#__codelineno-43-2">2</a></span>
+<span class="normal"><a href="#__codelineno-43-3">3</a></span>
+<span class="normal"><a href="#__codelineno-43-4">4</a></span>
+<span class="normal"><a href="#__codelineno-43-5">5</a></span>
+<span class="normal"><a href="#__codelineno-43-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-43-1" name="__codelineno-43-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-43-2" name="__codelineno-43-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-43-3" name="__codelineno-43-3"></a><span class="n">lan_access</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"full"</span><span class="w">   </span><span class="c1"># or "none", or a custom grant table</span>
+<a id="__codelineno-43-4" name="__codelineno-43-4"></a><span class="c1"># lan_access = { mode = "custom", sessions = false, filesystem = false, providers = [</span>
+<a id="__codelineno-43-5" name="__codelineno-43-5"></a><span class="c1">#   { provider_id = "llama_cpp", models = { mode = "all" } },</span>
+<a id="__codelineno-43-6" name="__codelineno-43-6"></a><span class="c1"># ] }</span>
+</code></pre></div></td></tr></table></div>
+<p><code>full</code> shares sessions, workspace files, the unsandboxed shell, and every model with anyone who can reach the node from such an address. It also admits pre-upgrade clients, which need Full. Keep the ACP and dashboard listeners on loopback: ACP is unauthenticated.</p>
+<p><strong>Trust scopes (offline, enterprise).</strong> A trust scope gives its members access on every host that lists it, over LAN or Iroh, without an internet connection or per-peer grants. An authority key signs a token for each member's peer ID. The authority does not need to be online.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-44-1">1</a></span>
+<span class="normal"><a href="#__codelineno-44-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-44-1" name="__codelineno-44-1"></a><span class="c1"># On the authority machine (its mesh identity signs; default lifetime 30d):</span>
+<a id="__codelineno-44-2" name="__codelineno-44-2"></a>qmtcode<span class="w"> </span>--mesh-trust-issue<span class="o">=</span>12D3KooWMember...<span class="w"> </span>--mesh-trust-scope<span class="o">=</span>acme-eng<span class="w"> </span>--mesh-trust-ttl<span class="o">=</span>90d
+</code></pre></div></td></tr></table></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-45-1">1</a></span>
+<span class="normal"><a href="#__codelineno-45-2">2</a></span>
+<span class="normal"><a href="#__codelineno-45-3">3</a></span>
+<span class="normal"><a href="#__codelineno-45-4">4</a></span>
+<span class="normal"><a href="#__codelineno-45-5">5</a></span>
+<span class="normal"><a href="#__codelineno-45-6">6</a></span>
+<span class="normal"><a href="#__codelineno-45-7">7</a></span>
+<span class="normal"><a href="#__codelineno-45-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-45-1" name="__codelineno-45-1"></a><span class="c1"># Every host that grants access to the scope, and every member:</span>
+<a id="__codelineno-45-2" name="__codelineno-45-2"></a><span class="k">[[mesh.trust]]</span>
+<a id="__codelineno-45-3" name="__codelineno-45-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"acme-eng"</span>
+<a id="__codelineno-45-4" name="__codelineno-45-4"></a><span class="n">authority</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"12D3KooWAuthority..."</span><span class="w">   </span><span class="c1"># peer ID printed by --mesh-trust-issue</span>
+<a id="__codelineno-45-5" name="__codelineno-45-5"></a><span class="n">access</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mode</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"custom"</span><span class="p">,</span><span class="w"> </span><span class="n">sessions</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">filesystem</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">providers</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-45-6" name="__codelineno-45-6"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">provider_id</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"llama_cpp"</span><span class="p">,</span><span class="w"> </span><span class="n">models</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mode</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"all"</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-45-7" name="__codelineno-45-7"></a><span class="p">]</span><span class="w"> </span><span class="p">}</span><span class="w">                                    </span><span class="c1"># what this host gives members (default "none")</span>
+<a id="__codelineno-45-8" name="__codelineno-45-8"></a><span class="n">token</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_TRUST_TOKEN}"</span><span class="w">           </span><span class="c1"># this node's token, if it is a member</span>
+</code></pre></div></td></tr></table></div>
+<p>A member presents its tokens on each new connection. The host accepts a token only if it was issued to the authenticated sender for a configured scope and authority and has not expired. The membership lasts for that connection, or until the token expires. To revoke a member, let its token expire, remove the scope, or save an explicit grant for its peer ID. Only token lifetime limits a stolen identity key, so issue short-lived tokens and rotate them. For a locked-down deployment, leave <code>lan_access = "none"</code> and rely on trust scopes: unlisted peers can discover the node but get nothing.</p>
 <p>Provider-wide and model-specific quotas both apply to a Custom inference request. Direct mesh calls and hosted turns share the same balance on the resource host. Quotas default to unlimited, and Full access does not use saved Custom quotas.</p>
 <p>Finite quotas use the same reservation estimate for every provider: estimated prompt tokens, including configured system text and tool definitions, plus the effective output cap. A request's <code>max_tokens</code> overrides the configured cap only if the bound provider supports it. The host caps the estimate at the configured llama.cpp <code>n_ctx</code> when present, or at the model's context limit from models.dev. Only if the model is absent from models.dev and no <code>n_ctx</code> is configured does it use the profile context middleware's <code>fallback_max_tokens</code>, if present. With no applicable ceiling the estimate is uncapped; missing metadata is not a reason to refuse inference. Context overrides do not affect this calculation, media gets no separate allowance, and every token kind counts equally.</p>
 <p>A request can start if every applicable finite quota has capacity left after settled usage and outstanding reservations. The host reserves the entire estimate in all scopes or none. Requests can run in parallel, and the last admitted request can reserve more than is left. The host charges actual usage even when it exceeds the estimate, without treating it as a model fault. If usage is missing or incomplete, it charges the reservation as estimated usage by default; programmatic callers can select the estimated prompt instead, without a user-facing setting.</p>
@@ -4649,49 +4704,49 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <p>Writes require the current <code>outgoing.revision</code>; after a conflict, read the policy again before choosing whether to retry. Notifications are refresh hints, not policy snapshots. The JSON storage format version is separate from the mesh access ACP protocol version. For ACP client integration, <code>scripts/generate-types.sh</code> emits the versioned peer-access types in <code>target/generated/types.ts</code>.</p>
 <h2 id="session-management">Session Management</h2>
 <h3 id="creating-remote-sessions">Creating Remote Sessions</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-43-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-43-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-43-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-43-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-43-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-43-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-43-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-43-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-43-10">10</a></span>
-<span class="normal"><a href="#__codelineno-43-11">11</a></span>
-<span class="normal"><a href="#__codelineno-43-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-43-1" name="__codelineno-43-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
-<a id="__codelineno-43-2" name="__codelineno-43-2"></a>
-<a id="__codelineno-43-3" name="__codelineno-43-3"></a><span class="c1">// Create session on remote node</span>
-<a id="__codelineno-43-4" name="__codelineno-43-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">remote_session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
-<a id="__codelineno-43-5" name="__codelineno-43-5"></a><span class="w">    </span><span class="p">.</span><span class="n">create_remote_session</span><span class="p">(</span><span class="s">"gpu-server"</span><span class="p">,</span><span class="w"> </span><span class="s">"coder"</span><span class="p">)</span>
-<a id="__codelineno-43-6" name="__codelineno-43-6"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-43-7" name="__codelineno-43-7"></a>
-<a id="__codelineno-43-8" name="__codelineno-43-8"></a><span class="c1">// Attach to remote session</span>
-<a id="__codelineno-43-9" name="__codelineno-43-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">attach_remote_session</span><span class="p">(</span><span class="n">remote_session</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-43-10" name="__codelineno-43-10"></a>
-<a id="__codelineno-43-11" name="__codelineno-43-11"></a><span class="c1">// Use session normally</span>
-<a id="__codelineno-43-12" name="__codelineno-43-12"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Hello!"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-46-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-46-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-46-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-46-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-46-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-46-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-46-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-46-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-46-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-46-10">10</a></span>
+<span class="normal"><a href="#__codelineno-46-11">11</a></span>
+<span class="normal"><a href="#__codelineno-46-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-46-1" name="__codelineno-46-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<a id="__codelineno-46-2" name="__codelineno-46-2"></a>
+<a id="__codelineno-46-3" name="__codelineno-46-3"></a><span class="c1">// Create session on remote node</span>
+<a id="__codelineno-46-4" name="__codelineno-46-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">remote_session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
+<a id="__codelineno-46-5" name="__codelineno-46-5"></a><span class="w">    </span><span class="p">.</span><span class="n">create_remote_session</span><span class="p">(</span><span class="s">"gpu-server"</span><span class="p">,</span><span class="w"> </span><span class="s">"coder"</span><span class="p">)</span>
+<a id="__codelineno-46-6" name="__codelineno-46-6"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-46-7" name="__codelineno-46-7"></a>
+<a id="__codelineno-46-8" name="__codelineno-46-8"></a><span class="c1">// Attach to remote session</span>
+<a id="__codelineno-46-9" name="__codelineno-46-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">attach_remote_session</span><span class="p">(</span><span class="n">remote_session</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-46-10" name="__codelineno-46-10"></a>
+<a id="__codelineno-46-11" name="__codelineno-46-11"></a><span class="c1">// Use session normally</span>
+<a id="__codelineno-46-12" name="__codelineno-46-12"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Hello!"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="listing-remote-nodes">Listing Remote Nodes</h3>
 <p>Use <code>list_remote_nodes()</code> to discover available mesh peers and their capabilities:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-44-1">1</a></span>
-<span class="normal"><a href="#__codelineno-44-2">2</a></span>
-<span class="normal"><a href="#__codelineno-44-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-44-1" name="__codelineno-44-1"></a><span class="c1">// List available mesh nodes</span>
-<a id="__codelineno-44-2" name="__codelineno-44-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">nodes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">list_remote_nodes</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
-<a id="__codelineno-44-3" name="__codelineno-44-3"></a><span class="c1">// Returns Vec&lt;NodeInfo&gt; with peer_id, name, scopes, and provider info</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-47-1">1</a></span>
+<span class="normal"><a href="#__codelineno-47-2">2</a></span>
+<span class="normal"><a href="#__codelineno-47-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-47-1" name="__codelineno-47-1"></a><span class="c1">// List available mesh nodes</span>
+<a id="__codelineno-47-2" name="__codelineno-47-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">nodes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">list_remote_nodes</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<a id="__codelineno-47-3" name="__codelineno-47-3"></a><span class="c1">// Returns Vec&lt;NodeInfo&gt; with peer_id, name, scopes, and provider info</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="attaching-existing-sessions">Attaching Existing Sessions</h3>
 <p>Attach to a session running on another node through the embedded ACP dashboard or the <code>attach_remote_session</code> API.</p>
 <h3 id="forking-sessions">Forking Sessions</h3>
 <p>Create a copy of a remote session at a specific message point:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-45-1">1</a></span>
-<span class="normal"><a href="#__codelineno-45-2">2</a></span>
-<span class="normal"><a href="#__codelineno-45-3">3</a></span>
-<span class="normal"><a href="#__codelineno-45-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-45-1" name="__codelineno-45-1"></a><span class="c1">// Fork remote session at specific message</span>
-<a id="__codelineno-45-2" name="__codelineno-45-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
-<a id="__codelineno-45-3" name="__codelineno-45-3"></a><span class="w">    </span><span class="p">.</span><span class="n">fork_remote_session</span><span class="p">(</span><span class="o">&amp;</span><span class="n">node_manager_ref</span><span class="p">,</span><span class="w"> </span><span class="n">source_session_id</span><span class="p">,</span><span class="w"> </span><span class="n">message_id</span><span class="p">)</span>
-<a id="__codelineno-45-4" name="__codelineno-45-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-48-1">1</a></span>
+<span class="normal"><a href="#__codelineno-48-2">2</a></span>
+<span class="normal"><a href="#__codelineno-48-3">3</a></span>
+<span class="normal"><a href="#__codelineno-48-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-48-1" name="__codelineno-48-1"></a><span class="c1">// Fork remote session at specific message</span>
+<a id="__codelineno-48-2" name="__codelineno-48-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
+<a id="__codelineno-48-3" name="__codelineno-48-3"></a><span class="w">    </span><span class="p">.</span><span class="n">fork_remote_session</span><span class="p">(</span><span class="o">&amp;</span><span class="n">node_manager_ref</span><span class="p">,</span><span class="w"> </span><span class="n">source_session_id</span><span class="p">,</span><span class="w"> </span><span class="n">message_id</span><span class="p">)</span>
+<a id="__codelineno-48-4" name="__codelineno-48-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Use cases:</strong>
 - <strong>Branching conversations</strong>: Try different approaches from same starting point
@@ -4700,13 +4755,13 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 - <strong>Rollback</strong>: Fork from known good state if current path isn't working</p>
 <h3 id="resuming-sessions">Resuming Sessions</h3>
 <p>Reconnect to sessions across node restarts or disconnections:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-46-1">1</a></span>
-<span class="normal"><a href="#__codelineno-46-2">2</a></span>
-<span class="normal"><a href="#__codelineno-46-3">3</a></span>
-<span class="normal"><a href="#__codelineno-46-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-46-1" name="__codelineno-46-1"></a><span class="c1">// Resume existing session by ID</span>
-<a id="__codelineno-46-2" name="__codelineno-46-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
-<a id="__codelineno-46-3" name="__codelineno-46-3"></a><span class="w">    </span><span class="p">.</span><span class="n">resume_remote_session</span><span class="p">(</span><span class="o">&amp;</span><span class="n">node_manager_ref</span><span class="p">,</span><span class="w"> </span><span class="n">session_id</span><span class="p">)</span>
-<a id="__codelineno-46-4" name="__codelineno-46-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-49-1">1</a></span>
+<span class="normal"><a href="#__codelineno-49-2">2</a></span>
+<span class="normal"><a href="#__codelineno-49-3">3</a></span>
+<span class="normal"><a href="#__codelineno-49-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-49-1" name="__codelineno-49-1"></a><span class="c1">// Resume existing session by ID</span>
+<a id="__codelineno-49-2" name="__codelineno-49-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
+<a id="__codelineno-49-3" name="__codelineno-49-3"></a><span class="w">    </span><span class="p">.</span><span class="n">resume_remote_session</span><span class="p">(</span><span class="o">&amp;</span><span class="n">node_manager_ref</span><span class="p">,</span><span class="w"> </span><span class="n">session_id</span><span class="p">)</span>
+<a id="__codelineno-49-4" name="__codelineno-49-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Recovery semantics:</strong>
 - <strong>Durable identity</strong>: a remote bookmark is the authoritative local record for a remote session (session ID, node, metadata). A bookmarked session is never replaced by a locally created session, and its cached history stays readable while the host is offline.
@@ -4762,11 +4817,11 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <p><strong>Prompt response ordering.</strong> The response to <code>session/prompt</code> is sent only after the requesting connection has delivered every <code>session/update</code> the prompt produced, for remote-hosted sessions as well as local ones. The wait is bounded: if the relay disconnects, the connection lags and cannot fully recover, or the 30 second safety limit passes, the response is sent anyway and a warning is logged. See <a href="#event-ordering-across-nodes">Event ordering across nodes</a>.</p>
 <h3 id="session-persistence">Session Persistence</h3>
 <p>Remote sessions are persisted on the host node:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-47-1">1</a></span>
-<span class="normal"><a href="#__codelineno-47-2">2</a></span>
-<span class="normal"><a href="#__codelineno-47-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-47-1" name="__codelineno-47-1"></a><span class="c1"># On remote node (host)</span>
-<a id="__codelineno-47-2" name="__codelineno-47-2"></a><span class="k">[agent]</span>
-<a id="__codelineno-47-3" name="__codelineno-47-3"></a><span class="n">db</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/sessions.db"</span><span class="w">  </span><span class="c1"># Session storage</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-50-1">1</a></span>
+<span class="normal"><a href="#__codelineno-50-2">2</a></span>
+<span class="normal"><a href="#__codelineno-50-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-50-1" name="__codelineno-50-1"></a><span class="c1"># On remote node (host)</span>
+<a id="__codelineno-50-2" name="__codelineno-50-2"></a><span class="k">[agent]</span>
+<a id="__codelineno-50-3" name="__codelineno-50-3"></a><span class="n">db</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/sessions.db"</span><span class="w">  </span><span class="c1"># Session storage</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Persistence features:</strong>
 - <strong>SQLite storage</strong>: Sessions stored in SQLite database
@@ -4777,11 +4832,11 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <h4 id="connection-failures">Connection Failures</h4>
 <p>Remote operations may fail due to network issues, peer unavailability, or timeout. Check logs for specific error details and adjust <code>request_timeout_secs</code> or <code>stream_reconnect_grace_secs</code> as needed.</p>
 <h4 id="stream-disconnections">Stream Disconnections</h4>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-48-1">1</a></span>
-<span class="normal"><a href="#__codelineno-48-2">2</a></span>
-<span class="normal"><a href="#__codelineno-48-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-48-1" name="__codelineno-48-1"></a><span class="c1">// Configure graceful handling</span>
-<a id="__codelineno-48-2" name="__codelineno-48-2"></a><span class="p">[</span><span class="n">mesh</span><span class="p">]</span>
-<a id="__codelineno-48-3" name="__codelineno-48-3"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w">  </span><span class="p">#</span><span class="w"> </span><span class="n">Wait</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="n">minutes</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">reconnection</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-51-1">1</a></span>
+<span class="normal"><a href="#__codelineno-51-2">2</a></span>
+<span class="normal"><a href="#__codelineno-51-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-51-1" name="__codelineno-51-1"></a><span class="c1">// Configure graceful handling</span>
+<a id="__codelineno-51-2" name="__codelineno-51-2"></a><span class="p">[</span><span class="n">mesh</span><span class="p">]</span>
+<a id="__codelineno-51-3" name="__codelineno-51-3"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w">  </span><span class="p">#</span><span class="w"> </span><span class="n">Wait</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="n">minutes</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">reconnection</span>
 </code></pre></div></td></tr></table></div>
 <p>During stream disconnection:
 1. <strong>Buffer messages</strong>: Messages buffered locally
@@ -4800,62 +4855,62 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <h2 id="routing">Routing</h2>
 <h3 id="routing-table">Routing Table</h3>
 <p>The mesh maintains a routing table that maps agents to nodes:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-49-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-49-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-49-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-49-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-49-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-49-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-49-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-49-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-49-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-49-10">10</a></span>
-<span class="normal"><a href="#__codelineno-49-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-49-1" name="__codelineno-49-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RoutingPolicy</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-49-2" name="__codelineno-49-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-49-3" name="__codelineno-49-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">provider_target</span><span class="p">:</span><span class="w"> </span><span class="nc">RouteTarget</span><span class="p">,</span>
-<a id="__codelineno-49-4" name="__codelineno-49-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">resolved_provider_node_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
-<a id="__codelineno-49-5" name="__codelineno-49-5"></a><span class="p">}</span>
-<a id="__codelineno-49-6" name="__codelineno-49-6"></a>
-<a id="__codelineno-49-7" name="__codelineno-49-7"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">RouteTarget</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-49-8" name="__codelineno-49-8"></a><span class="w">    </span><span class="n">Local</span><span class="p">,</span><span class="w">           </span><span class="c1">// Run locally</span>
-<a id="__codelineno-49-9" name="__codelineno-49-9"></a><span class="w">    </span><span class="n">Peer</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span><span class="w">    </span><span class="c1">// Run on specific peer</span>
-<a id="__codelineno-49-10" name="__codelineno-49-10"></a><span class="w">    </span><span class="n">Any</span><span class="p">,</span><span class="w">             </span><span class="c1">// Run on any available peer</span>
-<a id="__codelineno-49-11" name="__codelineno-49-11"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-52-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-52-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-52-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-52-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-52-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-52-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-52-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-52-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-52-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-52-10">10</a></span>
+<span class="normal"><a href="#__codelineno-52-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-52-1" name="__codelineno-52-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RoutingPolicy</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-52-2" name="__codelineno-52-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-52-3" name="__codelineno-52-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">provider_target</span><span class="p">:</span><span class="w"> </span><span class="nc">RouteTarget</span><span class="p">,</span>
+<a id="__codelineno-52-4" name="__codelineno-52-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">resolved_provider_node_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
+<a id="__codelineno-52-5" name="__codelineno-52-5"></a><span class="p">}</span>
+<a id="__codelineno-52-6" name="__codelineno-52-6"></a>
+<a id="__codelineno-52-7" name="__codelineno-52-7"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">RouteTarget</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-52-8" name="__codelineno-52-8"></a><span class="w">    </span><span class="n">Local</span><span class="p">,</span><span class="w">           </span><span class="c1">// Run locally</span>
+<a id="__codelineno-52-9" name="__codelineno-52-9"></a><span class="w">    </span><span class="n">Peer</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span><span class="w">    </span><span class="c1">// Run on specific peer</span>
+<a id="__codelineno-52-10" name="__codelineno-52-10"></a><span class="w">    </span><span class="n">Any</span><span class="p">,</span><span class="w">             </span><span class="c1">// Run on any available peer</span>
+<a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="routing-snapshot">Routing Snapshot</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-50-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-50-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-50-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-50-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-50-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-50-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-50-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-50-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-50-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-50-10">10</a></span>
-<span class="normal"><a href="#__codelineno-50-11">11</a></span>
-<span class="normal"><a href="#__codelineno-50-12">12</a></span>
-<span class="normal"><a href="#__codelineno-50-13">13</a></span>
-<span class="normal"><a href="#__codelineno-50-14">14</a></span>
-<span class="normal"><a href="#__codelineno-50-15">15</a></span>
-<span class="normal"><a href="#__codelineno-50-16">16</a></span>
-<span class="normal"><a href="#__codelineno-50-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-50-1" name="__codelineno-50-1"></a><span class="c1">// Load routing snapshot</span>
-<a id="__codelineno-50-2" name="__codelineno-50-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">snapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">routing_handle</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
-<a id="__codelineno-50-3" name="__codelineno-50-3"></a>
-<a id="__codelineno-50-4" name="__codelineno-50-4"></a><span class="c1">// Get routing policy for an agent</span>
-<a id="__codelineno-50-5" name="__codelineno-50-5"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">policy</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">snapshot</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">agent_id</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-50-6" name="__codelineno-50-6"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="o">&amp;</span><span class="n">policy</span><span class="p">.</span><span class="n">provider_target</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-50-7" name="__codelineno-50-7"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Peer</span><span class="p">(</span><span class="n">peer_id</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-50-8" name="__codelineno-50-8"></a><span class="w">            </span><span class="c1">// Route LLM calls to peer</span>
-<a id="__codelineno-50-9" name="__codelineno-50-9"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-50-10" name="__codelineno-50-10"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Local</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-50-11" name="__codelineno-50-11"></a><span class="w">            </span><span class="c1">// Run locally</span>
-<a id="__codelineno-50-12" name="__codelineno-50-12"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-50-13" name="__codelineno-50-13"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Any</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-50-14" name="__codelineno-50-14"></a><span class="w">            </span><span class="c1">// Use any available node</span>
-<a id="__codelineno-50-15" name="__codelineno-50-15"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-50-16" name="__codelineno-50-16"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-50-17" name="__codelineno-50-17"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-53-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-53-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-53-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-53-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-53-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-53-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-53-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-53-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-53-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-53-10">10</a></span>
+<span class="normal"><a href="#__codelineno-53-11">11</a></span>
+<span class="normal"><a href="#__codelineno-53-12">12</a></span>
+<span class="normal"><a href="#__codelineno-53-13">13</a></span>
+<span class="normal"><a href="#__codelineno-53-14">14</a></span>
+<span class="normal"><a href="#__codelineno-53-15">15</a></span>
+<span class="normal"><a href="#__codelineno-53-16">16</a></span>
+<span class="normal"><a href="#__codelineno-53-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-53-1" name="__codelineno-53-1"></a><span class="c1">// Load routing snapshot</span>
+<a id="__codelineno-53-2" name="__codelineno-53-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">snapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">routing_handle</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+<a id="__codelineno-53-3" name="__codelineno-53-3"></a>
+<a id="__codelineno-53-4" name="__codelineno-53-4"></a><span class="c1">// Get routing policy for an agent</span>
+<a id="__codelineno-53-5" name="__codelineno-53-5"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">policy</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">snapshot</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">agent_id</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-53-6" name="__codelineno-53-6"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="o">&amp;</span><span class="n">policy</span><span class="p">.</span><span class="n">provider_target</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-53-7" name="__codelineno-53-7"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Peer</span><span class="p">(</span><span class="n">peer_id</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-53-8" name="__codelineno-53-8"></a><span class="w">            </span><span class="c1">// Route LLM calls to peer</span>
+<a id="__codelineno-53-9" name="__codelineno-53-9"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-53-10" name="__codelineno-53-10"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Local</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-53-11" name="__codelineno-53-11"></a><span class="w">            </span><span class="c1">// Run locally</span>
+<a id="__codelineno-53-12" name="__codelineno-53-12"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-53-13" name="__codelineno-53-13"></a><span class="w">        </span><span class="n">RouteTarget</span><span class="p">::</span><span class="n">Any</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-53-14" name="__codelineno-53-14"></a><span class="w">            </span><span class="c1">// Use any available node</span>
+<a id="__codelineno-53-15" name="__codelineno-53-15"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-53-16" name="__codelineno-53-16"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-53-17" name="__codelineno-53-17"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="use-cases">Use Cases</h2>
 <h3 id="1-gpu-accelerated-coding">1. GPU-Accelerated Coding</h3>
@@ -4873,31 +4928,31 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
     PA --&gt;|"LLM calls&lt;br/&gt;(routed to GPU)"| GM
     CA --&gt;|"Fast model inference"| GM</code></pre>
 <p><strong>Configuration:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-51-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-51-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-51-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-51-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-51-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-51-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-51-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-51-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-51-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-51-10">10</a></span>
-<span class="normal"><a href="#__codelineno-51-11">11</a></span>
-<span class="normal"><a href="#__codelineno-51-12">12</a></span>
-<span class="normal"><a href="#__codelineno-51-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-51-1" name="__codelineno-51-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-51-2" name="__codelineno-51-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-51-3" name="__codelineno-51-3"></a>
-<a id="__codelineno-51-4" name="__codelineno-51-4"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-51-5" name="__codelineno-51-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
-<a id="__codelineno-51-6" name="__codelineno-51-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
-<a id="__codelineno-51-7" name="__codelineno-51-7"></a>
-<a id="__codelineno-51-8" name="__codelineno-51-8"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-51-9" name="__codelineno-51-9"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
-<a id="__codelineno-51-10" name="__codelineno-51-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-51-11" name="__codelineno-51-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
-<a id="__codelineno-51-12" name="__codelineno-51-12"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
-<a id="__codelineno-51-13" name="__codelineno-51-13"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-54-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-54-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-54-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-54-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-54-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-54-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-54-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-54-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-54-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-54-10">10</a></span>
+<span class="normal"><a href="#__codelineno-54-11">11</a></span>
+<span class="normal"><a href="#__codelineno-54-12">12</a></span>
+<span class="normal"><a href="#__codelineno-54-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-54-1" name="__codelineno-54-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-54-2" name="__codelineno-54-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-54-3" name="__codelineno-54-3"></a>
+<a id="__codelineno-54-4" name="__codelineno-54-4"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-54-5" name="__codelineno-54-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-54-6" name="__codelineno-54-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
+<a id="__codelineno-54-7" name="__codelineno-54-7"></a>
+<a id="__codelineno-54-8" name="__codelineno-54-8"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-54-9" name="__codelineno-54-9"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-54-10" name="__codelineno-54-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-54-11" name="__codelineno-54-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-54-12" name="__codelineno-54-12"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-54-13" name="__codelineno-54-13"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="2-distributed-team-collaboration">2. Distributed Team Collaboration</h3>
 <pre class="mermaid"><code>flowchart TD
@@ -4923,27 +4978,27 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 
     SR --&gt; W1 &amp; W2</code></pre>
 <p><strong>Configuration:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-52-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-52-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-52-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-52-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-52-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-52-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-52-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-52-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-52-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-52-10">10</a></span>
-<span class="normal"><a href="#__codelineno-52-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-52-1" name="__codelineno-52-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-52-2" name="__codelineno-52-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-52-3" name="__codelineno-52-3"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"kademlia"</span>
-<a id="__codelineno-52-4" name="__codelineno-52-4"></a>
-<a id="__codelineno-52-5" name="__codelineno-52-5"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-52-6" name="__codelineno-52-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker1"</span>
-<a id="__codelineno-52-7" name="__codelineno-52-7"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.1/tcp/9000"</span>
-<a id="__codelineno-52-8" name="__codelineno-52-8"></a>
-<a id="__codelineno-52-9" name="__codelineno-52-9"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-52-10" name="__codelineno-52-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker2"</span>
-<a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.2/tcp/9000"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-55-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-55-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-55-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-55-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-55-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-55-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-55-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-55-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-55-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-55-10">10</a></span>
+<span class="normal"><a href="#__codelineno-55-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-55-1" name="__codelineno-55-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-55-2" name="__codelineno-55-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-55-3" name="__codelineno-55-3"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"kademlia"</span>
+<a id="__codelineno-55-4" name="__codelineno-55-4"></a>
+<a id="__codelineno-55-5" name="__codelineno-55-5"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-55-6" name="__codelineno-55-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker1"</span>
+<a id="__codelineno-55-7" name="__codelineno-55-7"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.1/tcp/9000"</span>
+<a id="__codelineno-55-8" name="__codelineno-55-8"></a>
+<a id="__codelineno-55-9" name="__codelineno-55-9"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-55-10" name="__codelineno-55-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker2"</span>
+<a id="__codelineno-55-11" name="__codelineno-55-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.2/tcp/9000"</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="4-specialized-hardware">4. Specialized Hardware</h3>
 <pre class="mermaid"><code>flowchart LR
@@ -4961,11 +5016,11 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <p>QueryMT includes robust streaming stability features for handling network interruptions and maintaining reliable LLM streaming across the mesh.</p>
 <h3 id="stream-reconnection">Stream Reconnection</h3>
 <p>When a remote streaming connection is interrupted, QueryMT automatically attempts reconnection:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-53-1">1</a></span>
-<span class="normal"><a href="#__codelineno-53-2">2</a></span>
-<span class="normal"><a href="#__codelineno-53-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-53-1" name="__codelineno-53-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-53-2" name="__codelineno-53-2"></a><span class="c1"># Grace period for stream reconnection (default: 120 seconds)</span>
-<a id="__codelineno-53-3" name="__codelineno-53-3"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-56-1">1</a></span>
+<span class="normal"><a href="#__codelineno-56-2">2</a></span>
+<span class="normal"><a href="#__codelineno-56-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-56-1" name="__codelineno-56-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-56-2" name="__codelineno-56-2"></a><span class="c1"># Grace period for stream reconnection (default: 120 seconds)</span>
+<a id="__codelineno-56-3" name="__codelineno-56-3"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Reconnection behavior:</strong></p>
 <ol>
@@ -5003,11 +5058,11 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <p>QueryMT distinguishes between different timeout scenarios for better reliability:</p>
 <h4 id="request-timeout">Request Timeout</h4>
 <p>Timeout for non-streaming mesh requests (e.g., compaction, metadata queries):</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-54-1">1</a></span>
-<span class="normal"><a href="#__codelineno-54-2">2</a></span>
-<span class="normal"><a href="#__codelineno-54-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-54-1" name="__codelineno-54-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-54-2" name="__codelineno-54-2"></a><span class="c1"># Timeout for non-streaming requests (default: 300 seconds = 5 minutes)</span>
-<a id="__codelineno-54-3" name="__codelineno-54-3"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-57-1">1</a></span>
+<span class="normal"><a href="#__codelineno-57-2">2</a></span>
+<span class="normal"><a href="#__codelineno-57-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-57-1" name="__codelineno-57-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-57-2" name="__codelineno-57-2"></a><span class="c1"># Timeout for non-streaming requests (default: 300 seconds = 5 minutes)</span>
+<a id="__codelineno-57-3" name="__codelineno-57-3"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Use cases:</strong>
 - Agent metadata queries
@@ -5022,9 +5077,9 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li><strong>Reconnection</strong>: If a stream disconnects, the system attempts reconnection within the <code>stream_reconnect_grace_secs</code> window</li>
 </ul>
 <p>These behaviors are managed internally by the mesh transport. Configure the grace period for reconnection:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-55-1">1</a></span>
-<span class="normal"><a href="#__codelineno-55-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-55-1" name="__codelineno-55-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-55-2" name="__codelineno-55-2"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w">  </span><span class="c1"># Wait 2 minutes for reconnection (default)</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-58-1">1</a></span>
+<span class="normal"><a href="#__codelineno-58-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-58-1" name="__codelineno-58-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-58-2" name="__codelineno-58-2"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w">  </span><span class="c1"># Wait 2 minutes for reconnection (default)</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="transient-disconnect-handling">Transient Disconnect Handling</h3>
 <p>QueryMT gracefully handles temporary network issues:</p>
@@ -5036,55 +5091,55 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li>NAT re-binding</li>
 </ul>
 <h4 id="handling-strategy">Handling Strategy</h4>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-56-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-56-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-56-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-56-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-56-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-56-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-56-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-56-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-56-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-56-10">10</a></span>
-<span class="normal"><a href="#__codelineno-56-11">11</a></span>
-<span class="normal"><a href="#__codelineno-56-12">12</a></span>
-<span class="normal"><a href="#__codelineno-56-13">13</a></span>
-<span class="normal"><a href="#__codelineno-56-14">14</a></span>
-<span class="normal"><a href="#__codelineno-56-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-56-1" name="__codelineno-56-1"></a><span class="c1">// Automatic retry with backoff</span>
-<a id="__codelineno-56-2" name="__codelineno-56-2"></a><span class="k">const</span><span class="w"> </span><span class="n">MAX_RETRIES</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
-<a id="__codelineno-56-3" name="__codelineno-56-3"></a><span class="k">const</span><span class="w"> </span><span class="n">INITIAL_BACKOFF</span><span class="p">:</span><span class="w"> </span><span class="nc">Duration</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Duration</span><span class="p">::</span><span class="n">from_secs</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
-<a id="__codelineno-56-4" name="__codelineno-56-4"></a>
-<a id="__codelineno-56-5" name="__codelineno-56-5"></a><span class="k">for</span><span class="w"> </span><span class="n">attempt</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="n">MAX_RETRIES</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-56-6" name="__codelineno-56-6"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">send_request</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-56-7" name="__codelineno-56-7"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">),</span>
-<a id="__codelineno-56-8" name="__codelineno-56-8"></a><span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">is_transient</span><span class="p">()</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-56-9" name="__codelineno-56-9"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">backoff</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">INITIAL_BACKOFF</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="k">u32</span><span class="p">.</span><span class="n">pow</span><span class="p">(</span><span class="n">attempt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u32</span><span class="p">);</span>
-<a id="__codelineno-56-10" name="__codelineno-56-10"></a><span class="w">            </span><span class="n">tokio</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">sleep</span><span class="p">(</span><span class="n">backoff</span><span class="p">).</span><span class="k">await</span><span class="p">;</span>
-<a id="__codelineno-56-11" name="__codelineno-56-11"></a><span class="w">            </span><span class="k">continue</span><span class="p">;</span>
-<a id="__codelineno-56-12" name="__codelineno-56-12"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-56-13" name="__codelineno-56-13"></a><span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">),</span>
-<a id="__codelineno-56-14" name="__codelineno-56-14"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-56-15" name="__codelineno-56-15"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-59-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-59-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-59-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-59-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-59-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-59-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-59-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-59-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-59-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-59-10">10</a></span>
+<span class="normal"><a href="#__codelineno-59-11">11</a></span>
+<span class="normal"><a href="#__codelineno-59-12">12</a></span>
+<span class="normal"><a href="#__codelineno-59-13">13</a></span>
+<span class="normal"><a href="#__codelineno-59-14">14</a></span>
+<span class="normal"><a href="#__codelineno-59-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-59-1" name="__codelineno-59-1"></a><span class="c1">// Automatic retry with backoff</span>
+<a id="__codelineno-59-2" name="__codelineno-59-2"></a><span class="k">const</span><span class="w"> </span><span class="n">MAX_RETRIES</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<a id="__codelineno-59-3" name="__codelineno-59-3"></a><span class="k">const</span><span class="w"> </span><span class="n">INITIAL_BACKOFF</span><span class="p">:</span><span class="w"> </span><span class="nc">Duration</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Duration</span><span class="p">::</span><span class="n">from_secs</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<a id="__codelineno-59-4" name="__codelineno-59-4"></a>
+<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="k">for</span><span class="w"> </span><span class="n">attempt</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="n">MAX_RETRIES</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-59-6" name="__codelineno-59-6"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">send_request</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-59-7" name="__codelineno-59-7"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">),</span>
+<a id="__codelineno-59-8" name="__codelineno-59-8"></a><span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">is_transient</span><span class="p">()</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-59-9" name="__codelineno-59-9"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">backoff</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">INITIAL_BACKOFF</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="k">u32</span><span class="p">.</span><span class="n">pow</span><span class="p">(</span><span class="n">attempt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u32</span><span class="p">);</span>
+<a id="__codelineno-59-10" name="__codelineno-59-10"></a><span class="w">            </span><span class="n">tokio</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">sleep</span><span class="p">(</span><span class="n">backoff</span><span class="p">).</span><span class="k">await</span><span class="p">;</span>
+<a id="__codelineno-59-11" name="__codelineno-59-11"></a><span class="w">            </span><span class="k">continue</span><span class="p">;</span>
+<a id="__codelineno-59-12" name="__codelineno-59-12"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-59-13" name="__codelineno-59-13"></a><span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">),</span>
+<a id="__codelineno-59-14" name="__codelineno-59-14"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-59-15" name="__codelineno-59-15"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="configuration-for-unstable-networks">Configuration for Unstable Networks</h4>
 <p>For networks with frequent interruptions:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-57-1">1</a></span>
-<span class="normal"><a href="#__codelineno-57-2">2</a></span>
-<span class="normal"><a href="#__codelineno-57-3">3</a></span>
-<span class="normal"><a href="#__codelineno-57-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-57-1" name="__codelineno-57-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-57-2" name="__codelineno-57-2"></a><span class="c1"># Increase timeouts for unreliable networks</span>
-<a id="__codelineno-57-3" name="__codelineno-57-3"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">600</span><span class="w">  </span><span class="c1"># 10 minutes</span>
-<a id="__codelineno-57-4" name="__codelineno-57-4"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span><span class="w">  </span><span class="c1"># 5 minutes</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-60-1">1</a></span>
+<span class="normal"><a href="#__codelineno-60-2">2</a></span>
+<span class="normal"><a href="#__codelineno-60-3">3</a></span>
+<span class="normal"><a href="#__codelineno-60-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-60-1" name="__codelineno-60-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-60-2" name="__codelineno-60-2"></a><span class="c1"># Increase timeouts for unreliable networks</span>
+<a id="__codelineno-60-3" name="__codelineno-60-3"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">600</span><span class="w">  </span><span class="c1"># 10 minutes</span>
+<a id="__codelineno-60-4" name="__codelineno-60-4"></a><span class="n">stream_reconnect_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span><span class="w">  </span><span class="c1"># 5 minutes</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="mesh-provider-stability">Mesh Provider Stability</h3>
 <p>For remote model providers in the mesh:</p>
 <h4 id="fallback-strategies">Fallback Strategies</h4>
 <p>Configure automatic fallback when remote providers fail:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-58-1">1</a></span>
-<span class="normal"><a href="#__codelineno-58-2">2</a></span>
-<span class="normal"><a href="#__codelineno-58-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-58-1" name="__codelineno-58-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-58-2" name="__codelineno-58-2"></a><span class="c1"># Allow fallback to mesh provider discovery</span>
-<a id="__codelineno-58-3" name="__codelineno-58-3"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-61-1">1</a></span>
+<span class="normal"><a href="#__codelineno-61-2">2</a></span>
+<span class="normal"><a href="#__codelineno-61-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-61-1" name="__codelineno-61-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-61-2" name="__codelineno-61-2"></a><span class="c1"># Allow fallback to mesh provider discovery</span>
+<a id="__codelineno-61-3" name="__codelineno-61-3"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Fallback chain:</strong>
 1. Try primary remote provider
@@ -5094,21 +5149,21 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <h3 id="monitoring-stream-health">Monitoring Stream Health</h3>
 <h4 id="log-monitoring">Log Monitoring</h4>
 <p>Enable detailed stream logging:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-59-1">1</a></span>
-<span class="normal"><a href="#__codelineno-59-2">2</a></span>
-<span class="normal"><a href="#__codelineno-59-3">3</a></span>
-<span class="normal"><a href="#__codelineno-59-4">4</a></span>
-<span class="normal"><a href="#__codelineno-59-5">5</a></span>
-<span class="normal"><a href="#__codelineno-59-6">6</a></span>
-<span class="normal"><a href="#__codelineno-59-7">7</a></span>
-<span class="normal"><a href="#__codelineno-59-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-59-1" name="__codelineno-59-1"></a><span class="c1"># Enable mesh stream logging</span>
-<a id="__codelineno-59-2" name="__codelineno-59-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span>querymt_agent_runtime::agent::remote<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
-<a id="__codelineno-59-3" name="__codelineno-59-3"></a>
-<a id="__codelineno-59-4" name="__codelineno-59-4"></a><span class="c1"># Enable debug logging for every querymt-agent crate (prefix match)</span>
-<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">querymt_agent</span><span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
-<a id="__codelineno-59-6" name="__codelineno-59-6"></a>
-<a id="__codelineno-59-7" name="__codelineno-59-7"></a><span class="c1"># Enable all libp2p logging</span>
-<a id="__codelineno-59-8" name="__codelineno-59-8"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info,querymt<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-62-1">1</a></span>
+<span class="normal"><a href="#__codelineno-62-2">2</a></span>
+<span class="normal"><a href="#__codelineno-62-3">3</a></span>
+<span class="normal"><a href="#__codelineno-62-4">4</a></span>
+<span class="normal"><a href="#__codelineno-62-5">5</a></span>
+<span class="normal"><a href="#__codelineno-62-6">6</a></span>
+<span class="normal"><a href="#__codelineno-62-7">7</a></span>
+<span class="normal"><a href="#__codelineno-62-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-62-1" name="__codelineno-62-1"></a><span class="c1"># Enable mesh stream logging</span>
+<a id="__codelineno-62-2" name="__codelineno-62-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span>querymt_agent_runtime::agent::remote<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-62-3" name="__codelineno-62-3"></a>
+<a id="__codelineno-62-4" name="__codelineno-62-4"></a><span class="c1"># Enable debug logging for every querymt-agent crate (prefix match)</span>
+<a id="__codelineno-62-5" name="__codelineno-62-5"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">querymt_agent</span><span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-62-6" name="__codelineno-62-6"></a>
+<a id="__codelineno-62-7" name="__codelineno-62-7"></a><span class="c1"># Enable all libp2p logging</span>
+<a id="__codelineno-62-8" name="__codelineno-62-8"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info,querymt<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <p><strong>Key log messages:</strong>
 - <code>Stream reconnected successfully</code> - Good
@@ -5221,15 +5276,15 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <h2 id="security">Security</h2>
 <h3 id="peer-authentication">Peer Authentication</h3>
 <p>Mesh nodes authenticate using libp2p's built-in peer ID system:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-60-1">1</a></span>
-<span class="normal"><a href="#__codelineno-60-2">2</a></span>
-<span class="normal"><a href="#__codelineno-60-3">3</a></span>
-<span class="normal"><a href="#__codelineno-60-4">4</a></span>
-<span class="normal"><a href="#__codelineno-60-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-60-1" name="__codelineno-60-1"></a><span class="c1">// Each node has a unique peer ID</span>
-<a id="__codelineno-60-2" name="__codelineno-60-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">peer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">peer_id</span><span class="p">();</span>
-<a id="__codelineno-60-3" name="__codelineno-60-3"></a>
-<a id="__codelineno-60-4" name="__codelineno-60-4"></a><span class="c1">// Connections are authenticated</span>
-<a id="__codelineno-60-5" name="__codelineno-60-5"></a><span class="c1">// Only known peers can connect</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-63-1">1</a></span>
+<span class="normal"><a href="#__codelineno-63-2">2</a></span>
+<span class="normal"><a href="#__codelineno-63-3">3</a></span>
+<span class="normal"><a href="#__codelineno-63-4">4</a></span>
+<span class="normal"><a href="#__codelineno-63-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-63-1" name="__codelineno-63-1"></a><span class="c1">// Each node has a unique peer ID</span>
+<a id="__codelineno-63-2" name="__codelineno-63-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">peer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">peer_id</span><span class="p">();</span>
+<a id="__codelineno-63-3" name="__codelineno-63-3"></a>
+<a id="__codelineno-63-4" name="__codelineno-63-4"></a><span class="c1">// Connections are authenticated</span>
+<a id="__codelineno-63-5" name="__codelineno-63-5"></a><span class="c1">// Only known peers can connect</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="firewall-configuration">Firewall Configuration</h3>
 <p>Required ports for mesh networking:</p>
@@ -5258,15 +5313,15 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 </tbody>
 </table>
 <p><strong>Example firewall rules:</strong></p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-61-1">1</a></span>
-<span class="normal"><a href="#__codelineno-61-2">2</a></span>
-<span class="normal"><a href="#__codelineno-61-3">3</a></span>
-<span class="normal"><a href="#__codelineno-61-4">4</a></span>
-<span class="normal"><a href="#__codelineno-61-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-61-1" name="__codelineno-61-1"></a><span class="c1"># Allow inbound mesh connections</span>
-<a id="__codelineno-61-2" name="__codelineno-61-2"></a>ufw<span class="w"> </span>allow<span class="w"> </span><span class="m">9000</span>/tcp
-<a id="__codelineno-61-3" name="__codelineno-61-3"></a>
-<a id="__codelineno-61-4" name="__codelineno-61-4"></a><span class="c1"># Allow outbound connections</span>
-<a id="__codelineno-61-5" name="__codelineno-61-5"></a>ufw<span class="w"> </span>allow<span class="w"> </span>out<span class="w"> </span><span class="m">9000</span>/tcp
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-64-1">1</a></span>
+<span class="normal"><a href="#__codelineno-64-2">2</a></span>
+<span class="normal"><a href="#__codelineno-64-3">3</a></span>
+<span class="normal"><a href="#__codelineno-64-4">4</a></span>
+<span class="normal"><a href="#__codelineno-64-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-64-1" name="__codelineno-64-1"></a><span class="c1"># Allow inbound mesh connections</span>
+<a id="__codelineno-64-2" name="__codelineno-64-2"></a>ufw<span class="w"> </span>allow<span class="w"> </span><span class="m">9000</span>/tcp
+<a id="__codelineno-64-3" name="__codelineno-64-3"></a>
+<a id="__codelineno-64-4" name="__codelineno-64-4"></a><span class="c1"># Allow outbound connections</span>
+<a id="__codelineno-64-5" name="__codelineno-64-5"></a>ufw<span class="w"> </span>allow<span class="w"> </span>out<span class="w"> </span><span class="m">9000</span>/tcp
 </code></pre></div></td></tr></table></div>
 <h3 id="nat-traversal">NAT Traversal</h3>
 <p>For nodes behind NAT:</p>
@@ -5277,25 +5332,25 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 </ol>
 <h2 id="monitoring">Monitoring</h2>
 <h3 id="node-status">Node Status</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-62-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-62-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-62-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-62-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-62-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-62-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-62-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-62-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-62-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-62-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-62-1" name="__codelineno-62-1"></a><span class="c1">// Get local node info</span>
-<a id="__codelineno-62-2" name="__codelineno-62-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">peer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">peer_id</span><span class="p">();</span>
-<a id="__codelineno-62-3" name="__codelineno-62-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">listen_addrs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">listen_addresses</span><span class="p">();</span>
-<a id="__codelineno-62-4" name="__codelineno-62-4"></a>
-<a id="__codelineno-62-5" name="__codelineno-62-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Local peer ID: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">peer_id</span><span class="p">);</span>
-<a id="__codelineno-62-6" name="__codelineno-62-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Listening on: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">listen_addrs</span><span class="p">);</span>
-<a id="__codelineno-62-7" name="__codelineno-62-7"></a>
-<a id="__codelineno-62-8" name="__codelineno-62-8"></a><span class="c1">// Get connected peers</span>
-<a id="__codelineno-62-9" name="__codelineno-62-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">peers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">connected_peers</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
-<a id="__codelineno-62-10" name="__codelineno-62-10"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Connected to {} peers"</span><span class="p">,</span><span class="w"> </span><span class="n">peers</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-65-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-65-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-65-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-65-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-65-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-65-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-65-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-65-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-65-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-65-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-65-1" name="__codelineno-65-1"></a><span class="c1">// Get local node info</span>
+<a id="__codelineno-65-2" name="__codelineno-65-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">peer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">peer_id</span><span class="p">();</span>
+<a id="__codelineno-65-3" name="__codelineno-65-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">listen_addrs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">listen_addresses</span><span class="p">();</span>
+<a id="__codelineno-65-4" name="__codelineno-65-4"></a>
+<a id="__codelineno-65-5" name="__codelineno-65-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Local peer ID: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">peer_id</span><span class="p">);</span>
+<a id="__codelineno-65-6" name="__codelineno-65-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Listening on: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">listen_addrs</span><span class="p">);</span>
+<a id="__codelineno-65-7" name="__codelineno-65-7"></a>
+<a id="__codelineno-65-8" name="__codelineno-65-8"></a><span class="c1">// Get connected peers</span>
+<a id="__codelineno-65-9" name="__codelineno-65-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">peers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">connected_peers</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<a id="__codelineno-65-10" name="__codelineno-65-10"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Connected to {} peers"</span><span class="p">,</span><span class="w"> </span><span class="n">peers</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="iroh-transport-diagnostics">Iroh Transport Diagnostics</h3>
 <p>The <code>querymt/mesh/status</code> response includes an optional <code>iroh</code> snapshot. It is
@@ -5327,9 +5382,9 @@ liveness, authorization, routing, or application reconnect/backoff behavior.
 Batched unreliable datagrams are deliberately not used for actor/provider traffic.</p>
 <h3 id="event-logging">Event Logging</h3>
 <p>Enable mesh logging:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-63-1">1</a></span>
-<span class="normal"><a href="#__codelineno-63-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-63-1" name="__codelineno-63-1"></a><span class="c1"># Enable libp2p logging</span>
-<a id="__codelineno-63-2" name="__codelineno-63-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-66-1">1</a></span>
+<span class="normal"><a href="#__codelineno-66-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-66-1" name="__codelineno-66-1"></a><span class="c1"># Enable libp2p logging</span>
+<a id="__codelineno-66-2" name="__codelineno-66-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <h3 id="metrics">Metrics</h3>
 <p>Key metrics to monitor:</p>
@@ -5392,84 +5447,84 @@ Batched unreliable datagrams are deliberately not used for actor/provider traffi
 </ol>
 <h2 id="examples_1">Examples</h2>
 <h3 id="full-mesh-configuration">Full Mesh Configuration</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-64-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-64-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-64-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-64-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-64-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-64-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-64-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-64-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-64-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-64-10">10</a></span>
-<span class="normal"><a href="#__codelineno-64-11">11</a></span>
-<span class="normal"><a href="#__codelineno-64-12">12</a></span>
-<span class="normal"><a href="#__codelineno-64-13">13</a></span>
-<span class="normal"><a href="#__codelineno-64-14">14</a></span>
-<span class="normal"><a href="#__codelineno-64-15">15</a></span>
-<span class="normal"><a href="#__codelineno-64-16">16</a></span>
-<span class="normal"><a href="#__codelineno-64-17">17</a></span>
-<span class="normal"><a href="#__codelineno-64-18">18</a></span>
-<span class="normal"><a href="#__codelineno-64-19">19</a></span>
-<span class="normal"><a href="#__codelineno-64-20">20</a></span>
-<span class="normal"><a href="#__codelineno-64-21">21</a></span>
-<span class="normal"><a href="#__codelineno-64-22">22</a></span>
-<span class="normal"><a href="#__codelineno-64-23">23</a></span>
-<span class="normal"><a href="#__codelineno-64-24">24</a></span>
-<span class="normal"><a href="#__codelineno-64-25">25</a></span>
-<span class="normal"><a href="#__codelineno-64-26">26</a></span>
-<span class="normal"><a href="#__codelineno-64-27">27</a></span>
-<span class="normal"><a href="#__codelineno-64-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-64-1" name="__codelineno-64-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-64-2" name="__codelineno-64-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-64-3" name="__codelineno-64-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
-<a id="__codelineno-64-4" name="__codelineno-64-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
-<a id="__codelineno-64-5" name="__codelineno-64-5"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-64-6" name="__codelineno-64-6"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
-<a id="__codelineno-64-7" name="__codelineno-64-7"></a>
-<a id="__codelineno-64-8" name="__codelineno-64-8"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-64-9" name="__codelineno-64-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
-<a id="__codelineno-64-10" name="__codelineno-64-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
-<a id="__codelineno-64-11" name="__codelineno-64-11"></a>
-<a id="__codelineno-64-12" name="__codelineno-64-12"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-64-13" name="__codelineno-64-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build-server"</span>
-<a id="__codelineno-64-14" name="__codelineno-64-14"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.101/tcp/9000"</span>
-<a id="__codelineno-64-15" name="__codelineno-64-15"></a>
-<a id="__codelineno-64-16" name="__codelineno-64-16"></a><span class="k">[[remote_agents]]</span>
-<a id="__codelineno-64-17" name="__codelineno-64-17"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
-<a id="__codelineno-64-18" name="__codelineno-64-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
-<a id="__codelineno-64-19" name="__codelineno-64-19"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU machine"</span>
-<a id="__codelineno-64-20" name="__codelineno-64-20"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
-<a id="__codelineno-64-21" name="__codelineno-64-21"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">]</span>
-<a id="__codelineno-64-22" name="__codelineno-64-22"></a>
-<a id="__codelineno-64-23" name="__codelineno-64-23"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-64-24" name="__codelineno-64-24"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder-delegate"</span>
-<a id="__codelineno-64-25" name="__codelineno-64-25"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-64-26" name="__codelineno-64-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
-<a id="__codelineno-64-27" name="__codelineno-64-27"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
-<a id="__codelineno-64-28" name="__codelineno-64-28"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-67-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-67-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-67-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-67-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-67-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-67-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-67-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-67-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-67-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-67-10">10</a></span>
+<span class="normal"><a href="#__codelineno-67-11">11</a></span>
+<span class="normal"><a href="#__codelineno-67-12">12</a></span>
+<span class="normal"><a href="#__codelineno-67-13">13</a></span>
+<span class="normal"><a href="#__codelineno-67-14">14</a></span>
+<span class="normal"><a href="#__codelineno-67-15">15</a></span>
+<span class="normal"><a href="#__codelineno-67-16">16</a></span>
+<span class="normal"><a href="#__codelineno-67-17">17</a></span>
+<span class="normal"><a href="#__codelineno-67-18">18</a></span>
+<span class="normal"><a href="#__codelineno-67-19">19</a></span>
+<span class="normal"><a href="#__codelineno-67-20">20</a></span>
+<span class="normal"><a href="#__codelineno-67-21">21</a></span>
+<span class="normal"><a href="#__codelineno-67-22">22</a></span>
+<span class="normal"><a href="#__codelineno-67-23">23</a></span>
+<span class="normal"><a href="#__codelineno-67-24">24</a></span>
+<span class="normal"><a href="#__codelineno-67-25">25</a></span>
+<span class="normal"><a href="#__codelineno-67-26">26</a></span>
+<span class="normal"><a href="#__codelineno-67-27">27</a></span>
+<span class="normal"><a href="#__codelineno-67-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-67-1" name="__codelineno-67-1"></a><span class="k">[mesh]</span>
+<a id="__codelineno-67-2" name="__codelineno-67-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-67-3" name="__codelineno-67-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
+<a id="__codelineno-67-4" name="__codelineno-67-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
+<a id="__codelineno-67-5" name="__codelineno-67-5"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-67-6" name="__codelineno-67-6"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
+<a id="__codelineno-67-7" name="__codelineno-67-7"></a>
+<a id="__codelineno-67-8" name="__codelineno-67-8"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-67-9" name="__codelineno-67-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-67-10" name="__codelineno-67-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
+<a id="__codelineno-67-11" name="__codelineno-67-11"></a>
+<a id="__codelineno-67-12" name="__codelineno-67-12"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-67-13" name="__codelineno-67-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build-server"</span>
+<a id="__codelineno-67-14" name="__codelineno-67-14"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.101/tcp/9000"</span>
+<a id="__codelineno-67-15" name="__codelineno-67-15"></a>
+<a id="__codelineno-67-16" name="__codelineno-67-16"></a><span class="k">[[remote_agents]]</span>
+<a id="__codelineno-67-17" name="__codelineno-67-17"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-67-18" name="__codelineno-67-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-67-19" name="__codelineno-67-19"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU machine"</span>
+<a id="__codelineno-67-20" name="__codelineno-67-20"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-67-21" name="__codelineno-67-21"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">]</span>
+<a id="__codelineno-67-22" name="__codelineno-67-22"></a>
+<a id="__codelineno-67-23" name="__codelineno-67-23"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-67-24" name="__codelineno-67-24"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder-delegate"</span>
+<a id="__codelineno-67-25" name="__codelineno-67-25"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-67-26" name="__codelineno-67-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-67-27" name="__codelineno-67-27"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-67-28" name="__codelineno-67-28"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="command-line-examples">Command Line Examples</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-65-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-65-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-65-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-65-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-65-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-65-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-65-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-65-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-65-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-65-10">10</a></span>
-<span class="normal"><a href="#__codelineno-65-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-65-1" name="__codelineno-65-1"></a><span class="c1"># Start as mesh node</span>
-<a id="__codelineno-65-2" name="__codelineno-65-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
-<a id="__codelineno-65-3" name="__codelineno-65-3"></a>
-<a id="__codelineno-65-4" name="__codelineno-65-4"></a><span class="c1"># Start with specific address</span>
-<a id="__codelineno-65-5" name="__codelineno-65-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/0.0.0.0/tcp/9001
-<a id="__codelineno-65-6" name="__codelineno-65-6"></a>
-<a id="__codelineno-65-7" name="__codelineno-65-7"></a><span class="c1"># Start with dashboard and mesh</span>
-<a id="__codelineno-65-8" name="__codelineno-65-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
-<a id="__codelineno-65-9" name="__codelineno-65-9"></a>
-<a id="__codelineno-65-10" name="__codelineno-65-10"></a><span class="c1"># Connect to specific peer</span>
-<a id="__codelineno-65-11" name="__codelineno-65-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/192.168.1.100/tcp/9000
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-68-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-68-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-68-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-68-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-68-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-68-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-68-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-68-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-68-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-68-10">10</a></span>
+<span class="normal"><a href="#__codelineno-68-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-68-1" name="__codelineno-68-1"></a><span class="c1"># Start as mesh node</span>
+<a id="__codelineno-68-2" name="__codelineno-68-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-68-3" name="__codelineno-68-3"></a>
+<a id="__codelineno-68-4" name="__codelineno-68-4"></a><span class="c1"># Start with specific address</span>
+<a id="__codelineno-68-5" name="__codelineno-68-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/0.0.0.0/tcp/9001
+<a id="__codelineno-68-6" name="__codelineno-68-6"></a>
+<a id="__codelineno-68-7" name="__codelineno-68-7"></a><span class="c1"># Start with dashboard and mesh</span>
+<a id="__codelineno-68-8" name="__codelineno-68-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-68-9" name="__codelineno-68-9"></a>
+<a id="__codelineno-68-10" name="__codelineno-68-10"></a><span class="c1"># Connect to specific peer</span>
+<a id="__codelineno-68-11" name="__codelineno-68-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/192.168.1.100/tcp/9000
 </code></pre></div></td></tr></table></div>
 <h2 id="related-documentation">Related Documentation</h2>
 <ul>
