@@ -435,8 +435,10 @@ impl QmtApp {
                 window,
                 |this, _, ev: &InputEvent, _, cx| {
                     if matches!(ev, InputEvent::Change) {
-                        // A new query starts at the best match.
+                        // A new query starts at the best match, and a
+                        // dismissal (Esc) ends with the first edit.
                         this.slash_cursor = 0;
+                        this.slash_dismissed = None;
                         cx.notify();
                     }
                 },

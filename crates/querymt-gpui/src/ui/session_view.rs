@@ -3754,7 +3754,9 @@ impl QmtApp {
         let connected = store
             .runtime(&view.agent_id)
             .is_some_and(|rt| rt.is_connected());
+        // A read-only session (archived, handed off) takes no prompts.
         connected
+            && view.access.is_none()
             && !view.loading
             && view.error.is_none()
             && (!view.running() || store.session_can_control_run())

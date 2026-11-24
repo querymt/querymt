@@ -363,6 +363,9 @@ impl QmtApp {
             return;
         }
         if !self.session_ready(cx) {
+            // Nothing is sent, but the palette is closed: hand the focus back.
+            self.restore_focus(window, cx);
+            cx.notify();
             return;
         }
         let delivery = self.delivery;
@@ -1050,6 +1053,31 @@ mod tests {
             sent(&rig).is_empty(),
             "same readiness rule as a typed prompt"
         );
+        // The palette is closed, so the composer gets the focus back.
+        rig.app.read_with(cx, |app, _| assert!(!app.palette_open));
+        assert!(prompt_focused(cx, &rig), "focus returns to the composer");
+    }
+
+    /// A read-only session (archived, handed off) has no composer: it lists
+    /// no commands and sends nothing, whatever reaches `run_slash_command`.
+    #[gpui_kit::test]
+    fn a_read_only_session_offers_and_sends_no_commands(cx: &mut TestAppContext) {
+        let mut view = session_with(two_commands());
+        view.access = Some(crate::session::SessionAccess {
+            reason: None,
+            owner_session_id: None,
+        });
+        let rig = rig(cx, Page::Session, Some(view), |_| {});
+        assert!(!group_labels(&groups(cx, &rig)).contains(&"Slash commands"));
+        pick(
+            cx,
+            &rig,
+            PaletteTarget::SlashCommand {
+                name: "worktree".into(),
+                takes_input: false,
+            },
+        );
+        assert!(sent(&rig).is_empty(), "no prompt for a read-only session");
     }
 
     #[gpui_kit::test]

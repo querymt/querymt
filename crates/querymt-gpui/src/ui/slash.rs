@@ -692,6 +692,21 @@ mod ui_tests {
         assert_eq!(listed(cx, &rig), ["compact"]);
     }
 
+    /// Regression: the dismissal was kept for the text Esc closed the list at,
+    /// so backspacing to that text hid the list again.
+    #[gpui_kit::test]
+    fn dismissal_ends_with_the_first_edit(cx: &mut TestAppContext) {
+        let rig = rig(cx, session(two_commands(), false), false);
+        type_text(cx, &rig, "/co");
+        keys(cx, &rig, "escape");
+        assert!(listed(cx, &rig).is_empty());
+        type_text(cx, &rig, "m");
+        assert_eq!(listed(cx, &rig), ["compact"]);
+        keys(cx, &rig, "backspace");
+        assert_eq!(text(cx, &rig), "/co");
+        assert_eq!(listed(cx, &rig), ["compact"], "back at the dismissed text");
+    }
+
     #[gpui_kit::test]
     fn send_after_completion_sends_arguments(cx: &mut TestAppContext) {
         let rig = rig(cx, session(two_commands(), false), false);

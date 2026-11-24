@@ -2284,7 +2284,6 @@ mod model_picker_tests {
     /// Regression: `op` listed an openrouter model first, on the provider's
     /// name alone (`openrouter` begins with it), above `claude-opus-*`.
     #[gpui_kit::test]
-    #[gpui_kit::test]
     fn a_name_match_beats_a_provider_match(cx: &mut TestAppContext) {
         // The reported case: `op` began the provider `openrouter`, so its
         // models led, above `claude-opus-*`.
