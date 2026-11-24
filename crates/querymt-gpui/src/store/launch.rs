@@ -387,6 +387,37 @@ pub(crate) fn peer_fixture() -> AgentsStore {
     store
 }
 
+/// A connected agent with a model catalog: Anthropic (two), OpenAI (three),
+/// Google (one), then `bulk` models of the provider `bulk`.
+#[cfg(test)]
+pub(crate) fn models_fixture(bulk: usize) -> AgentsStore {
+    let mut models = vec![
+        json!({ "id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5", "provider": "anthropic" }),
+        json!({ "id": "anthropic/claude-haiku-4-5", "label": "Claude Haiku 4.5", "provider": "anthropic" }),
+        json!({ "id": "openai/gpt-5", "label": "GPT-5", "provider": "openai" }),
+        json!({ "id": "openai/gpt-5-mini", "label": "GPT-5 mini", "provider": "openai" }),
+        json!({ "id": "openai/o3", "label": "o3", "provider": "openai" }),
+        json!({ "id": "google/gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "google" }),
+    ];
+    models.extend((0..bulk).map(|i| {
+        json!({ "id": format!("bulk/m{i:02}"), "label": format!("Bulk {i:02}"), "provider": "bulk" })
+    }));
+    let mut store = super::automations::schedule_ui_fixture();
+    let rt = store.runtime.get_mut("test-agent").expect("fixture agent");
+    rt.models = super::parse_models(&json!({ "models": models }));
+    rt.models_loaded = true;
+    store
+}
+
+/// Append `models` (wire shape: `id`, `label`, `provider`) to the fixture
+/// agent's catalog, after the ones it has.
+#[cfg(test)]
+pub(crate) fn add_models_for_test(store: &mut AgentsStore, models: Value) {
+    let rt = store.runtime.get_mut("test-agent").expect("fixture agent");
+    rt.models
+        .extend(super::parse_models(&json!({ "models": models })));
+}
+
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's prelude brings its own `test` attribute.

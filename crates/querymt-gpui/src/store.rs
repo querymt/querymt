@@ -8,6 +8,7 @@ pub(crate) mod agent_log;
 pub(crate) mod automations;
 pub(crate) mod delegates;
 mod devtools;
+mod early_commands;
 pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod mcp_notice;
@@ -1694,6 +1695,9 @@ pub struct AgentsStore {
     pub first_run: bool,
     /// Sidebar lists: sessions already seen this run.
     sidebar: sidebar::SidebarState,
+    /// Slash commands advertised for sessions that have no view yet, until
+    /// a view takes them (design D3).
+    early_commands: early_commands::EarlyCommands,
     _launch_task: Option<Task<()>>,
 }
 
@@ -1728,6 +1732,7 @@ impl AgentsStore {
             requests: Vec::new(),
             runtime: HashMap::new(),
             sidebar: Default::default(),
+            early_commands: Default::default(),
             first_run,
             _launch_task: None,
         };
@@ -1975,6 +1980,15 @@ impl AgentsStore {
             .and_then(|m| m.peer_id.as_deref());
         let node = view.model_node.as_deref().filter(|n| Some(*n) != own);
         Some(model_key(view.model.as_deref()?, node))
+    }
+
+    /// The slash commands the open session's agent advertises, or none when
+    /// no session is open (design D4). The palette and the composer list
+    /// read only this.
+    pub fn session_slash_commands(&self) -> &[querymt_agent_session_core::view::SlashCommandView] {
+        self.session
+            .as_ref()
+            .map_or(&[], |view| view.slash_commands.as_slice())
     }
 
     /// The open session's model in its agent's catalog.
@@ -2555,6 +2569,8 @@ impl AgentsStore {
         };
         let config_id = config.id.clone();
         let developer = self.prefs.developer_mode;
+        // A new connection generation: what the old one advertised is stale.
+        self.early_commands.clear_agent(id);
         let rt = self.runtime.entry(id.to_string()).or_default();
         rt.wire.set_enabled(developer);
         if let Some(rpc) = rt.rpc.take() {
@@ -2714,6 +2730,7 @@ impl AgentsStore {
     }
 
     pub fn disconnect(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.early_commands.clear_agent(id);
         if let Some(rt) = self.runtime.get_mut(id) {
             rt.generation += 1;
             rt.reconnect_attempt = 0;
@@ -2917,6 +2934,8 @@ impl AgentsStore {
                 let prompt_id = crate::session::next_client_id();
                 let _ = this.update(cx, |s, cx| {
                     let mut view = SessionView::new(&agent_id, &session_id, &cwd, &prompt.chars().take(80).collect::<String>());
+                    // Commands advertised since `session/new` go in first.
+                    s.take_early_commands(&mut view);
                     view.prompt_optimistic(&prompt_id, &first_prompt);
                     view.prompting = true;
                     view.sync_inputs();
@@ -2996,7 +3015,13 @@ impl AgentsStore {
             return;
         }
         self.remember_recent_session(agent_id, session_id);
+        if !self.runtime.contains_key(agent_id) {
+            return;
+        }
         let mut view = SessionView::new(agent_id, session_id, cwd, title);
+        // Only once the view is certain to open: a return above must not
+        // consume what the agent advertised.
+        self.take_early_commands(&mut view);
         let Some(rt) = self.runtime.get(agent_id) else {
             return;
         };
@@ -3073,7 +3098,8 @@ impl AgentsStore {
                             // state, history window and options). A large one is
                             // decoded off the UI thread: the view keeps loading and
                             // queues inputs behind it (design D6; native only).
-                            let big = !cfg!(target_arch = "wasm32") && json_size(&v) > HYDRATE_BYTES;
+                            let big =
+                                !cfg!(target_arch = "wasm32") && json_size(&v) > HYDRATE_BYTES;
                             let v = if big {
                                 match view.begin_load(v) {
                                     Ok(started) => {
@@ -3953,8 +3979,11 @@ impl AgentsStore {
             match &result {
                 Ok(v) => view.prompt_completed(
                     Some(client_prompt_id),
-                    v.pointer("/_meta/querymt/messageId").and_then(Value::as_str),
-                    v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn"),
+                    v.pointer("/_meta/querymt/messageId")
+                        .and_then(Value::as_str),
+                    v.get("stopReason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("end_turn"),
                 ),
                 Err(err) => view.prompt_failed(client_prompt_id, err),
             }
@@ -4394,23 +4423,15 @@ impl AgentsStore {
                 }
             }
             Incoming::Notification { method, params } => {
-                if method == "session/update" {
-                    let session_id = params
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(view) = self
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == id && v.session_id == session_id)
-                    {
-                        view.queue_session_update(&params);
-                        self.schedule_session_flush(cx);
-                    }
+                if method == "session/update" && self.deliver_session_update(id, &params) {
+                    self.schedule_session_flush(cx);
                 }
                 // Run state of any run, including ones other clients started.
                 // Child links arrive as `subagent_update`s through the core.
-                if method.trim_start_matches('_').ends_with("session/stateUpdate") {
+                if method
+                    .trim_start_matches('_')
+                    .ends_with("session/stateUpdate")
+                {
                     let sid = params
                         .get("sessionId")
                         .and_then(Value::as_str)
@@ -5526,6 +5547,7 @@ mod tests {
             requests: Vec::new(),
             runtime: HashMap::new(),
             sidebar: Default::default(),
+            early_commands: Default::default(),
             first_run: false,
             _launch_task: None,
         };

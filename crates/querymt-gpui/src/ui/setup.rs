@@ -109,6 +109,7 @@ impl QmtApp {
         self.setup.visited = self.setup.visited.max(self.setup.step);
         self.model_query
             .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
+        self.reset_model_cursor(cx);
         cx.notify();
     }
 
@@ -682,6 +683,7 @@ impl QmtApp {
                     .id("setup-model-list")
                     .h(px(MODEL_LIST_H))
                     .overflow_y_scroll()
+                    .track_scroll(&self.model_scroll)
                     .children(rows)
                     .map(|el| self.smooth_scroll.region("setup-model-list", el)),
             )

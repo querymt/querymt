@@ -102,7 +102,7 @@
             # One hash for the whole querymt/querymt checkout at the pinned
             # rev (Cargo.toml); refresh all three together when the rev moves.
             outputHashes = let
-              querymt = "sha256-KOIjIKL+/XIs1fccdALKVbf6mMlxMbKfKZJN8shA1YE=";
+              querymt = "sha256-iUprdJSzgu4zwq7xQRJzdMnQ1wEDWb38YAEGRtQbTI0=";
             in {
               "querymt-0.6.0" = querymt;
               "querymt-agent-protocol-types-0.6.0" = querymt;

@@ -469,6 +469,7 @@ pub(crate) fn schedule_ui_fixture() -> AgentsStore {
         requests: Vec::new(),
         runtime: HashMap::from([(id, runtime)]),
         sidebar: Default::default(),
+        early_commands: Default::default(),
         first_run: false,
         _launch_task: None,
     }

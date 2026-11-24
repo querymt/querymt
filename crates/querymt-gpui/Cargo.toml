@@ -20,7 +20,7 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 # (branch feat/agent-session-core). Bumping it means: change `rev` here and in
 # [dev-dependencies], refresh `cargoLock.outputHashes` in flake.nix, and run
 # the tests (they read the core's golden cases from the pinned rev).
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "485919a804807671e7ad404703783eb4b70c97ba" }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "a8895c5a0d918476502e33c243ede5ea7e707718" }
 async-channel = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +34,8 @@ markdown = "1.0.0"
 tracing = "0.1"
 # The system time zone, default of the automation time zone picker.
 iana-time-zone = "0.1"
+# Fuzzy, typo-tolerant matching behind every search box (src/search.rs).
+frizbee = "0.13"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dirs = "6"
@@ -68,7 +70,7 @@ web-sys = { version = "0.3", features = [
 gpui-kit = { version = "0.9.1", features = ["test-support"] }
 # Same rev as above: tests replay the core's seeded golden cases
 # (`testing::golden_cases()`) instead of storing trace files.
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "485919a804807671e7ad404703783eb4b70c97ba", features = ["test-support"] }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "a8895c5a0d918476502e33c243ede5ea7e707718", features = ["test-support"] }
 
 [build-dependencies]
 dirs = "6"

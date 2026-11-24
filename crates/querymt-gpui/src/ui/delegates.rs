@@ -51,6 +51,7 @@ impl QmtApp {
                 s.focus(window, cx);
             }
         });
+        self.reset_model_cursor(cx);
         cx.notify();
     }
 
@@ -770,6 +771,7 @@ impl QmtApp {
                     .id("delegate-model-list")
                     .h(px(LIST_H))
                     .overflow_y_scroll()
+                    .track_scroll(&self.model_scroll)
                     .when(busy, |el| el.opacity(0.6))
                     .children(rows)
                     .map(|el| self.smooth_scroll.region("delegate-model-list", el)),
@@ -964,5 +966,70 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn enter_in_delegate_dialog_routes_the_delegate(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let mut store = crate::store::launch::models_fixture(0);
+        let (_rpc, requests) = store.rpc_for_test("test-agent");
+        store.session = Some(crate::session::SessionView::new(
+            "test-agent",
+            "s",
+            "/w",
+            "Session",
+        ));
+        store.set_delegate_routes_for_test(
+            &serde_json::from_str(
+                r#"{"session_id":"s","profile_id":"dev","revision":2,"durable":true,
+                    "editable":true,"reasoning_effort_supported":true,
+                    "assignments":[{"agent_id":"coder","name":"Coder","description":"",
+                      "model":{"model_id":"openai/o3"},"configured_default_model_id":null,
+                      "reasoning_effort":null}],
+                    "orphaned_overrides":[]}"#,
+            )
+            .unwrap(),
+        );
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Session, cx);
+                app.delegates.open = true;
+            });
+            window.render_frame(cx);
+            app.update(cx, |app, cx| {
+                app.pick_delegate(Some("coder".into()), window, cx)
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The highlight starts on the delegate's current route (`o3`); one
+        // step down is the next model, in the Google group.
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        vcx.simulate_keystrokes("down enter");
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(request["method"], "_querymt/session/setDelegateModel");
+        assert_eq!(
+            request["params"]["agentId"]
+                .as_str()
+                .or(request["params"]["agent_id"].as_str()),
+            Some("coder")
+        );
+        assert!(request.to_string().contains("google/gemini-2.5-pro"));
+        // The session's own model request was not sent.
+        assert!(requests.try_recv().is_err());
     }
 }

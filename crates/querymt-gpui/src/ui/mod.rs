@@ -20,6 +20,7 @@ mod sessions;
 mod settings;
 mod setup;
 mod sidebar;
+mod slash;
 mod smooth_scroll;
 mod start;
 mod turn_diff;
@@ -216,6 +217,12 @@ pub struct QmtApp {
     prompt: Entity<TextareaState>,
     model_open: bool,
     model_query: Entity<InputState>,
+    /// Highlighted row of the model picker: position among its model rows.
+    model_cursor: usize,
+    /// Search text `model_cursor` was last reset for; programmatic resets of
+    /// the field (opening the picker) must not move the cursor again.
+    model_seen_query: String,
+    model_scroll: ScrollHandle,
     options_open: bool,
     attachments: Vec<Attachment>,
     attach_error: Option<String>,
@@ -293,6 +300,12 @@ pub struct QmtApp {
     waiting_open: bool,
     /// When Escape was last pressed during a running turn (double Esc cancels).
     last_escape: Option<std::time::Instant>,
+    /// Highlighted row of the composer's slash command list.
+    slash_cursor: usize,
+    /// Composer text at which Esc closed the slash command list; the list
+    /// stays closed until the text changes.
+    slash_dismissed: Option<String>,
+    slash_scroll: ScrollHandle,
     /// Header details popover (context, token usage, cost, active time).
     session_details_open: bool,
     /// Details popover shows session totals instead of the latest request.
@@ -411,17 +424,23 @@ impl QmtApp {
             cx.subscribe_in(
                 &model_query,
                 window,
-                |this, _, ev: &InputEvent, _, cx| match ev {
-                    InputEvent::PressEnter { .. } => this.pick_first_model(cx),
-                    InputEvent::Change => cx.notify(),
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.pick_highlighted_model(window, cx),
+                    InputEvent::Change => this.model_query_changed(cx),
                     _ => {}
                 },
             ),
-            cx.subscribe_in(&session_prompt, window, |_, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &session_prompt,
+                window,
+                |this, _, ev: &InputEvent, _, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        // A new query starts at the best match.
+                        this.slash_cursor = 0;
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(&session_query, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -479,6 +498,9 @@ impl QmtApp {
             prompt,
             model_open: false,
             model_query,
+            model_cursor: 0,
+            model_seen_query: String::new(),
+            model_scroll: ScrollHandle::new(),
             options_open: false,
             attachments: Vec::new(),
             attach_error: None,
@@ -534,6 +556,9 @@ impl QmtApp {
             session_options_open: false,
             waiting_open: false,
             last_escape: None,
+            slash_cursor: 0,
+            slash_dismissed: None,
+            slash_scroll: ScrollHandle::new(),
             session_details_open: false,
             usage_totals: false,
             usage_pinned: None,
@@ -600,6 +625,37 @@ impl QmtApp {
             self.store.update(cx, |s, cx| s.refresh_extras(&agent, cx));
         }
         cx.notify();
+    }
+
+    /// Hand focus back after a popover, picker or palette closes: to the
+    /// prompt of the page when it has one on screen (Start, or a session
+    /// that is not read-only), else to the app shell so shortcuts keep working.
+    pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Start => self.prompt.update(cx, |s, cx| s.focus(window, cx)),
+            Page::Session
+                if self
+                    .store
+                    .read(cx)
+                    .session
+                    .as_ref()
+                    .is_some_and(|v| v.access.is_none()) =>
+            {
+                self.session_prompt.update(cx, |s, cx| s.focus(window, cx))
+            }
+            _ => self.app_focus.focus(window, cx),
+        }
+    }
+
+    /// Whether a composer popover or picker is open: what Escape hands the
+    /// focus back from (dialogs with fields of their own are not).
+    fn composer_popover_open(&self) -> bool {
+        !self.delegates.open
+            && (self.palette_open
+                || self.model_open
+                || self.options_open
+                || self.session_options_open
+                || self.option_menu.is_some())
     }
 
     /// Re-apply theme mode + accent from preferences.
@@ -1222,14 +1278,26 @@ impl Render for QmtApp {
                 self.smooth_scroll.set_preset(&preset, &curve, &inertia);
                 self.smooth_scroll.element()
             })
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key != "escape" {
                     return;
                 }
+                // The composer's command list is the innermost thing: its Esc
+                // closes only it, and does not count toward the double Esc.
+                if this.close_slash_list(window, cx) {
+                    this.last_escape = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                let popover = this.composer_popover_open();
                 if this.close_delegate_dialog(cx)
                     || this.close_topmost()
                     || this.close_automation_overlay(cx)
                 {
+                    if popover {
+                        this.restore_focus(window, cx);
+                    }
                     this.last_escape = None;
                     cx.stop_propagation();
                     cx.notify();

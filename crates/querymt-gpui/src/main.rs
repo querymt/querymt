@@ -15,6 +15,7 @@ mod highlight;
 mod profile_templates;
 mod rpc;
 mod rpc_log;
+mod search;
 mod session;
 mod store;
 mod telemetry;
@@ -242,6 +243,7 @@ mod web {
             FilePen,
             FileSearch,
             SquareTerminal,
+            SquareSlash,
             ListChecks,
             ShieldAlert,
             Hand,

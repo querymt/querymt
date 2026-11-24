@@ -5,17 +5,16 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use querymt_agent_session_core::SessionCore;
 use querymt_agent_session_core::entry::{EntryKind, PromptStatus};
 use querymt_agent_session_core::input::SessionInput;
-use querymt_agent_session_core::SessionCore;
 use querymt_agent_session_core::view::ChangeReport;
 use serde_json::{Value, json};
 
 use super::projection::Projection;
 use super::{
-    Compaction, CompactionStatus, ContentFetch, ForkTarget, ItemKind, PendingInput,
-    SelectOption, SessionAccess, SessionView, ToolCall, TurnDiffChange, TurnDiffFile, WorkEntry,
-    diff_stats,
+    Compaction, CompactionStatus, ContentFetch, ForkTarget, ItemKind, PendingInput, SelectOption,
+    SessionAccess, SessionView, ToolCall, TurnDiffChange, TurnDiffFile, WorkEntry, diff_stats,
 };
 
 /// An input of the session core from its adjacently tagged JSON form, so the
@@ -48,17 +47,21 @@ struct LoadParts {
 }
 
 /// A `session/load` response whose snapshot is decoded off the UI thread.
+///
+/// The job owns the view's core while it decodes (design D9): what the core
+/// already holds, such as the slash commands the agent advertised before the
+/// response, goes through the load exactly as it does for an inline `load`.
 pub struct LoadJob {
-    session_id: String,
+    core: SessionCore,
     response: Value,
     parts: LoadParts,
 }
 
 impl LoadJob {
-    /// Decode the snapshot into a fresh core. Heavy; run it on a background
-    /// executor.
+    /// Apply the snapshot to the core the job carries. Heavy; run it on a
+    /// background executor.
     pub fn hydrate(self) -> Hydrated {
-        let mut core = SessionCore::new(self.session_id);
+        let mut core = self.core;
         core.apply(&[SessionInput::SnapshotLoaded {
             response: self.response,
         }]);
@@ -206,6 +209,7 @@ impl SessionView {
             self.select_from(&f.options);
             self.options = f.options;
         }
+        self.slash_commands = f.slash_commands;
         self.history_more = f.history_more;
         self.history_before = f.history_before;
         self.undo_stack = f.undo_stack;
@@ -256,6 +260,10 @@ impl SessionView {
     /// then every input queues behind it, in arrival order. Only a view with
     /// no turns yet can hydrate this way (the load replaces nothing a client
     /// still needs); any other falls back to `load` and returns the response.
+    ///
+    /// The queued inputs are applied first and the core, with everything they
+    /// put in its header, moves into the job; an empty core stands in until
+    /// `finish_load` (nothing is applied to it meanwhile: the queue holds).
     pub fn begin_load(&mut self, response: Value) -> Result<LoadJob, Value> {
         if !self.proj.slices().is_empty() {
             return Err(response);
@@ -263,8 +271,12 @@ impl SessionView {
         self.flush();
         let parts = self.load_parts(&response);
         self.hydrating = true;
+        let core = std::mem::replace(
+            &mut self.proj.core,
+            SessionCore::new(self.session_id.as_str()),
+        );
         Ok(LoadJob {
-            session_id: self.session_id.clone(),
+            core,
             response,
             parts,
         })
@@ -426,7 +438,9 @@ impl SessionView {
     /// A lifecycle notification: applied at once when the input is known,
     /// otherwise kept until the submit response gives it its agent id.
     pub fn note_input_state(&mut self, input_id: &str, delivery: &str, state: &str) {
-        self.proj.overlay.note_input_state(input_id, delivery, state);
+        self.proj
+            .overlay
+            .note_input_state(input_id, delivery, state);
         self.refresh_inputs();
     }
 
@@ -452,7 +466,11 @@ impl SessionView {
     /// replaces the shortened one in place.
     pub fn set_full_tool_content(&mut self, id: &str, part: &str, content: String) {
         self.proj.overlay.fetches.remove(id);
-        let part = if part == "result" { "result" } else { "arguments" };
+        let part = if part == "result" {
+            "result"
+        } else {
+            "arguments"
+        };
         let data = json!({ "tool_call_id": id, "part": part, "content": content });
         match input("tool_content", data) {
             Some(input) => {
@@ -637,6 +655,7 @@ impl SessionView {
             model: self.model.clone(),
             model_node: self.model_node.clone(),
             options: self.options.clone(),
+            slash_commands: self.slash_commands.clone(),
             modes: self.modes.clone(),
             pending_options: self.pending_options.clone(),
             history_more: self.history_more,

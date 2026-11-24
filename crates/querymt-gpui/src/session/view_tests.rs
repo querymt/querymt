@@ -129,12 +129,16 @@ fn replayed_updates_before_the_load_response() {
     assert!(loaded_only.len() > 2);
     let mut v = view();
     // An agent that replays anyway sends the first turn before the response.
-    v.session_update(&json!({ "sessionId": "s1", "_meta": { "querymtReplay": true },
+    v.session_update(
+        &json!({ "sessionId": "s1", "_meta": { "querymtReplay": true },
         "update": { "sessionUpdate": "user_message_chunk", "messageId": "u0",
-            "content": { "type": "text", "text": "sed labore ut labore" } } }));
-    v.session_update(&json!({ "sessionId": "s1", "_meta": { "querymtReplay": true },
+            "content": { "type": "text", "text": "sed labore ut labore" } } }),
+    );
+    v.session_update(
+        &json!({ "sessionId": "s1", "_meta": { "querymtReplay": true },
         "update": { "sessionUpdate": "agent_message_chunk", "messageId": "a0",
-            "content": { "type": "text", "text": "partial" } } }));
+            "content": { "type": "text", "text": "partial" } } }),
+    );
     v.load(snapshot_response("small_snapshot"));
     assert_eq!(texts(&v), loaded_only);
     assert_eq!(
@@ -175,8 +179,10 @@ fn active_time_is_the_cores() {
     // started at host time 50 s.
     assert_eq!(v.active_work_ms, 120_000.);
     assert_eq!(v.active_started_at, Some(50_000.), "the host's start");
-    v.state_update(&json!({ "sessionId": "s1", "state": "idle", "runId": "r-live",
-        "stopReason": "end_turn", "atMs": 65_000 }));
+    v.state_update(
+        &json!({ "sessionId": "s1", "state": "idle", "runId": "r-live",
+        "stopReason": "end_turn", "atMs": 65_000 }),
+    );
     assert_eq!(v.active_work_ms, 135_000., "the ended run is added");
     assert_eq!(v.active_started_at, None);
 }
@@ -244,10 +250,11 @@ fn two_identical_prompts() {
     assert_eq!(local, [false, true]);
     echo(&mut v, "u2", "c2", "again");
     assert_eq!(texts(&v), ["again", "again"]);
-    assert!(v.items.iter().all(|i| !matches!(
-        i.kind,
-        ItemKind::User { local: true, .. }
-    )));
+    assert!(
+        v.items
+            .iter()
+            .all(|i| !matches!(i.kind, ItemKind::User { local: true, .. }))
+    );
 }
 
 #[test]
@@ -359,7 +366,11 @@ fn undo_a_steered_turn() {
     // The first prompt is the target; the whole run, steering included, goes.
     assert_eq!(v.undo_target().as_deref(), Some("r1-u1"));
     assert_eq!(v.undo_affected_turns("r1-u1"), Some(1));
-    assert_eq!(v.undo_affected_turns("r1-u2"), None, "steering is not a target");
+    assert_eq!(
+        v.undo_affected_turns("r1-u2"),
+        None,
+        "steering is not a target"
+    );
     v.set_undo_stack(&[frame("r1-u1")]);
     assert_eq!(v.reverted_from(), Some(0));
     assert_eq!(v.undo_target(), None);
@@ -421,7 +432,11 @@ fn diff_of_a_steered_turn() {
     let rows = v.turn_range(v.turn_key(0).unwrap()).unwrap();
     let files = v.turn_diffs(rows);
     let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, ["a.rs", "b.rs"], "edits on both sides of the steering");
+    assert_eq!(
+        paths,
+        ["a.rs", "b.rs"],
+        "edits on both sides of the steering"
+    );
 }
 
 #[test]
@@ -494,6 +509,51 @@ fn inputs_during_background_hydration_keep_their_order() {
     assert_eq!(texts(&v), inline, "the inputs follow the load, in order");
 }
 
+fn advertise(v: &mut SessionView, names: &[&str]) {
+    let list: Vec<Value> = names
+        .iter()
+        .map(|n| json!({ "name": n, "description": format!("{n} command") }))
+        .collect();
+    v.queue_session_update(&commands_update("s1", json!(list)));
+}
+
+/// Regression: a large load is decoded into a core of its own, which used to
+/// replace the view's core and with it the commands advertised before the
+/// response (the agent sends them first on a websocket, and right after the
+/// response on stdio, ahead of the load task's turn).
+#[test]
+fn background_load_keeps_the_commands_advertised_before_it() {
+    let mut inline = view();
+    advertise(&mut inline, &["compact", "worktree"]);
+    inline.load(snapshot_response("small_snapshot"));
+    assert_eq!(command_names(&inline), ["compact", "worktree"]);
+
+    let mut v = view();
+    advertise(&mut v, &["compact", "worktree"]);
+    let job = v
+        .begin_load(snapshot_response("small_snapshot"))
+        .unwrap_or_else(|_| panic!("a view with no turns hydrates"));
+    let hydrated = std::thread::spawn(move || job.hydrate()).join().unwrap();
+    v.finish_load(hydrated);
+    assert_eq!(command_names(&v), ["compact", "worktree"]);
+    assert_eq!(texts(&v), texts(&inline), "the snapshot was applied");
+}
+
+#[test]
+fn background_load_applies_a_later_advertisement_on_top() {
+    let mut v = view();
+    advertise(&mut v, &["compact", "worktree"]);
+    let job = v
+        .begin_load(snapshot_response("small_snapshot"))
+        .unwrap_or_else(|_| panic!("a view with no turns hydrates"));
+    // The agent advertises again while the snapshot decodes: it replaces the
+    // list once the load is in.
+    advertise(&mut v, &["compact"]);
+    let hydrated = std::thread::spawn(move || job.hydrate()).join().unwrap();
+    v.finish_load(hydrated);
+    assert_eq!(command_names(&v), ["compact"]);
+}
+
 #[test]
 fn a_burst_of_chunks_is_one_batch() {
     let mut v = view();
@@ -506,7 +566,11 @@ fn a_burst_of_chunks_is_one_batch() {
     }
     assert!(v.items.is_empty(), "queued, not applied");
     let report = v.flush();
-    assert_eq!(report.updated.len() + report.added.len(), 1, "one turn, one report");
+    assert_eq!(
+        report.updated.len() + report.added.len(),
+        1,
+        "one turn, one report"
+    );
     assert_eq!(v.items.len(), 1);
     assert!(!v.has_queued());
 }
@@ -519,25 +583,45 @@ fn long_snapshot(turns: usize) -> Value {
     let mut seq = 0u64;
     let mut push = |kind: &str, data: Value| {
         seq += 1;
-        events.push(json!({ "seq": seq, "session_seq": seq, "timestamp": 1_000_000 + seq,
-            "session_id": "s1", "origin": "local", "kind": { "type": kind, "data": data } }));
+        events.push(
+            json!({ "seq": seq, "session_seq": seq, "timestamp": 1_000_000 + seq,
+            "session_id": "s1", "origin": "local", "kind": { "type": kind, "data": data } }),
+        );
     };
     for t in 0..turns {
         let run = format!("r{t}");
-        push("run_started", json!({ "run_id": run, "origin": "interactive" }));
-        push("prompt_received", json!({ "content": format!("prompt {t}"), "message_id": format!("u{t}") }));
-        push("assistant_message_stored", json!({
+        push(
+            "run_started",
+            json!({ "run_id": run, "origin": "interactive" }),
+        );
+        push(
+            "prompt_received",
+            json!({ "content": format!("prompt {t}"), "message_id": format!("u{t}") }),
+        );
+        push(
+            "assistant_message_stored",
+            json!({
             "content": format!("reply {t} {}", "lorem ipsum ".repeat(40)),
             "reasoning_parts": [{ "id": format!("a{t}:summary:0"), "text": "thinking about it" }],
-            "message_id": format!("a{t}") }));
+            "message_id": format!("a{t}") }),
+        );
         for k in 0..2 {
             let id = format!("t{t}-{k}");
-            push("tool_call_start", json!({ "tool_call_id": id, "tool_name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}" }));
-            push("tool_call_end", json!({ "tool_call_id": id, "tool_name": "shell",
-                "is_error": false, "result": "file_a\nfile_b\n".repeat(20) }));
+            push(
+                "tool_call_start",
+                json!({ "tool_call_id": id, "tool_name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}" }),
+            );
+            push(
+                "tool_call_end",
+                json!({ "tool_call_id": id, "tool_name": "shell",
+                "is_error": false, "result": "file_a\nfile_b\n".repeat(20) }),
+            );
         }
-        push("run_completed", json!({ "run_id": run, "outcome": "completed" }));
+        push(
+            "run_completed",
+            json!({ "run_id": run, "outcome": "completed" }),
+        );
     }
     response["_meta"]["querymt/sessionLoadSnapshot.v1"]["audit"]["events"] = json!(events);
     response
@@ -600,4 +684,77 @@ fn a_turn_diff_groups_changes_by_file() {
     // First-touched order, `./` dropped, each tool's change kept apart; the
     // next turn's edit isn't included.
     assert_eq!(summary, [("src/a.rs", 2), ("src/b.rs", 1)]);
+}
+
+// ---- slash commands (slash-commands / Advertised commands follow the agent) ----
+
+/// An `available_commands_update` for `session`.
+fn commands_update(session: &str, commands: Value) -> Value {
+    json!({ "sessionId": session, "update": {
+        "sessionUpdate": "available_commands_update", "availableCommands": commands } })
+}
+
+fn command_names(view: &SessionView) -> Vec<&str> {
+    view.slash_commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+#[test]
+fn commands_follow_the_latest_update() {
+    let mut v = view();
+    v.session_update(&commands_update(
+        "s1",
+        json!([
+            { "name": "compact", "description": "Compact",
+              "input": { "hint": "[instructions]" } },
+            { "name": "/worktree", "description": "Worktrees" },
+        ]),
+    ));
+    // Spec-style and slash-prefixed names both end up bare.
+    assert_eq!(command_names(&v), ["compact", "worktree"]);
+    assert_eq!(
+        v.slash_commands[0].input_hint.as_deref(),
+        Some("[instructions]")
+    );
+    assert_eq!(v.slash_commands[1].input_hint, None);
+    v.session_update(&commands_update(
+        "s1",
+        json!([{ "name": "compact", "description": "Compact" }]),
+    ));
+    assert_eq!(
+        command_names(&v),
+        ["compact"],
+        "an update replaces the list"
+    );
+}
+
+#[test]
+fn empty_update_clears_commands() {
+    let mut v = view();
+    v.session_update(&commands_update(
+        "s1",
+        json!([{ "name": "compact", "description": "Compact" }]),
+    ));
+    assert_eq!(command_names(&v), ["compact"]);
+    v.session_update(&commands_update("s1", json!([])));
+    assert!(v.slash_commands.is_empty());
+}
+
+#[test]
+fn commands_of_another_session_are_ignored() {
+    let mut v = view();
+    v.session_update(&commands_update(
+        "s1",
+        json!([{ "name": "compact", "description": "Compact" }]),
+    ));
+    v.session_update(&commands_update(
+        "other",
+        json!([{ "name": "intruder", "description": "Not ours" }]),
+    ));
+    assert_eq!(command_names(&v), ["compact"]);
+    // An empty update for another session does not clear them either.
+    v.session_update(&commands_update("other", json!([])));
+    assert_eq!(command_names(&v), ["compact"]);
 }
