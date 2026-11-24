@@ -62,6 +62,10 @@ pub enum UndoError {
     #[error("Actor send error: {0}")]
     ActorSend(String),
 
+    /// The session owner's mesh access policy refused the request.
+    #[error("mesh access denied")]
+    AccessDenied,
+
     /// A classified remote transport failure (failure kind + delivery
     /// certainty), preserved for safe retry decisions by the operation layer.
     #[error("{0}")]

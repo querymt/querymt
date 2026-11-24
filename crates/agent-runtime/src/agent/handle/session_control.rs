@@ -370,7 +370,6 @@ impl LocalAgentHandle {
         if session_ref.is_remote() {
             #[cfg(feature = "remote")]
             {
-                let remote_request_timeout = Self::remote_request_timeout();
                 let bookmark = self
                     .config
                     .provider
@@ -381,99 +380,20 @@ impl LocalAgentHandle {
                     .into_iter()
                     .find(|b| b.session_id == session_id);
 
+                // Stopping the owner's runtime cancels its run; the owner's
+                // provider client then cancels the stream on the provider host
+                // when the run drops it. A viewer cannot control those streams,
+                // since provider hosts only accept stream controls from the
+                // peer that opened the stream.
                 if let Some(bookmark) = bookmark {
-                    if let Some(mesh) = self.mesh() {
-                        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-                        let mut provider_host = None;
-                        for scope in runtime.active_scopes() {
-                            let provider_host_name =
-                                crate::agent::remote::scope::scoped_provider_host(
-                                    &scope,
-                                    &bookmark.node_id,
-                                );
-                            if let Ok(Some(found)) = mesh
-                                .lookup_actor::<querymt_remote::ProviderHostActor>(
-                                    &provider_host_name,
-                                )
-                                .await
-                            {
-                                provider_host = Some(found);
-                                break;
-                            }
-                        }
-                        if let Some(provider_host) = provider_host {
-                            let status = querymt_remote::ask_remote_with_timeout(
-                                &provider_host,
-                                &crate::agent::remote::GetProviderStreamStatus {
-                                    session_id: session_id.to_string(),
-                                    request_id: None,
-                                },
-                                remote_request_timeout,
-                            )
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Some(status) = status {
-                                tracing::warn!(
-                                    session_id,
-                                    request_id = %status.request_id,
-                                    phase = ?status.phase,
-                                    elapsed_ms = status.elapsed_ms,
-                                    idle_ms = status.idle_ms,
-                                    chunk_count = status.chunk_count,
-                                    receiver_connected = status.receiver_connected,
-                                    lease_expires_in_ms = status.lease_expires_in_ms,
-                                    provider = %status.provider,
-                                    model = %status.model,
-                                    last_error = ?status.last_error,
-                                    "remote stop found active provider stream; issuing provider-host cancel"
-                                );
-                                let _ = querymt_remote::ask_remote_with_timeout(
-                                    &provider_host,
-                                    &crate::agent::remote::CancelProviderStreamRequest {
-                                        session_id: session_id.to_string(),
-                                        request_id: Some(status.request_id.clone()),
-                                        reason: Some("session stop requested".to_string()),
-                                    },
-                                    remote_request_timeout,
-                                )
-                                .await;
-                            } else {
-                                let _ = querymt_remote::ask_remote_with_timeout(
-                                    &provider_host,
-                                    &crate::agent::remote::CancelProviderStreamRequest {
-                                        session_id: session_id.to_string(),
-                                        request_id: None,
-                                        reason: Some(
-                                            "session stop requested without status".to_string(),
-                                        ),
-                                    },
-                                    remote_request_timeout,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-
-                    let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
-                    querymt_remote::ask_remote_with_timeout(
-                        &nm_ref,
+                    let node_manager = self.find_node_manager(&bookmark.node_id).await?;
+                    self.ask_node_manager::<_, Error>(
+                        &node_manager,
                         &crate::agent::remote::StopRemoteSessionRuntime {
                             session_id: session_id.to_string(),
                         },
-                        remote_request_timeout,
                     )
-                    .await
-                    .map_err(|e| {
-                        Error::from(match querymt_remote::classify_remote_send_error(e) {
-                            Ok(failure) => {
-                                crate::error::AgentError::from_transport_failure(failure)
-                            }
-                            Err(handler_error) => {
-                                crate::error::AgentError::RemoteActor(handler_error.to_string())
-                            }
-                        })
-                    })?;
+                    .await?;
                 }
 
                 self.detach_remote_session_attachment(session_id, true)

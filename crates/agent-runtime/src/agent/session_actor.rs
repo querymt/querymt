@@ -2353,6 +2353,72 @@ impl Message<Shutdown> for SessionActor {
     }
 }
 
+/// A peer's request to stop this runtime.
+///
+/// Stopping cancels the running turn and drops queued prompts, so the peer
+/// must be allowed to cancel each of them, as for [`Cancel`]. The check and
+/// the stop happen in one handler, so no turn can start in between, and the
+/// grant is re-read here, at the last boundary before the side effect.
+#[cfg(feature = "remote")]
+pub(crate) struct PeerShutdown(pub(crate) Arc<PeerTurn>);
+
+#[cfg(feature = "remote")]
+impl Message<PeerShutdown> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        PeerShutdown(peer): PeerShutdown,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        peer.check_mutation().await?;
+        let caller = TurnAuthority::Peer(peer);
+        let foreign_run = self
+            .run
+            .authority()
+            .is_some_and(|authority| !caller.can_control(authority));
+        let foreign_queued = self
+            .queued_prompts
+            .iter()
+            .any(|queued| !caller.can_control(&queued.authority));
+        if foreign_run || foreign_queued {
+            return Err(AgentError::MeshAccessDenied);
+        }
+        ctx.stop();
+        Ok(())
+    }
+}
+
+/// [`GetLlmConfig`] for a mesh peer.
+///
+/// Only a full grant sees the stored provider parameters and endpoint: they
+/// can hold the owner's provider-specific credentials, headers, base URL and
+/// system prompt, none of which a session grant bounds.
+#[cfg(feature = "remote")]
+pub(crate) struct GetPeerLlmConfig {
+    pub(crate) full: bool,
+}
+
+#[cfg(feature = "remote")]
+impl Message<GetPeerLlmConfig> for SessionActor {
+    type Reply = Result<Option<LLMConfig>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: GetPeerLlmConfig,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let config = <Self as Message<GetLlmConfig>>::handle(self, GetLlmConfig, ctx).await?;
+        Ok(config.map(|mut config| {
+            if !msg.full {
+                config.params = None;
+                config.endpoint.clear();
+            }
+            config
+        }))
+    }
+}
+
 // ── Remote-ready messages ────────────────────────────────────────────────
 
 /// Get the full message history for this session.
@@ -8717,6 +8783,133 @@ mod tests {
         let back = f.select("capture/M").await;
         assert_eq!(back.current.effective_model.llm_config_id, first_use);
         assert_profile_params(&f.stored_params().await);
+    }
+
+    /// A sessions-only peer backed by a real grant store, with its grant state.
+    #[cfg(feature = "remote")]
+    async fn sessions_peer(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<querymt_remote::MeshAccessStore>,
+        PeerGrantKey,
+        PeerGrantState,
+        Arc<PeerTurn>,
+    ) {
+        let grants = Arc::new(querymt_remote::MeshAccessStore::new(
+            querymt_remote::MeshStateStore::shared(&dir.path().join("mesh_state.json")).unwrap(),
+        ));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let grant = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        let state = grants
+            .replace_grant(&key, Uuid::nil(), grant.clone())
+            .await
+            .unwrap();
+        let peer = PeerTurn::test_peer(key.clone(), grant, grants.clone());
+        (grants, key, state, peer)
+    }
+
+    #[cfg(feature = "remote")]
+    fn running(authority: TurnAuthority) -> impl FnOnce(SessionActor) -> SessionActor {
+        move |mut actor| {
+            actor.run = RunSlot::Running(
+                ActiveRun::new(
+                    querymt_agent_core::model::TurnId::new(),
+                    1,
+                    CancellationToken::new(),
+                ),
+                authority,
+            );
+            actor
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_shutdown_refuses_a_run_the_peer_cannot_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_grants, _, _, peer) = sessions_peer(&dir).await;
+        let f = SelectionFixture::build(running(TurnAuthority::Local)).await;
+
+        let stopped = f.actor_ref.ask(PeerShutdown(peer)).await;
+        assert!(matches!(
+            stopped,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshAccessDenied
+            ))
+        ));
+        assert!(f.actor_ref.is_alive(), "the owner's run keeps its session");
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_shutdown_stops_the_peers_own_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_grants, _, _, peer) = sessions_peer(&dir).await;
+        let f = SelectionFixture::build(running(TurnAuthority::Peer(peer.clone()))).await;
+
+        f.actor_ref.ask(PeerShutdown(peer)).await.expect("stop");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.actor_ref.wait_for_shutdown(),
+        )
+        .await
+        .expect("actor stops");
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_shutdown_rechecks_the_grant_before_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grants, key, state, peer) = sessions_peer(&dir).await;
+        let f = SelectionFixture::new().await;
+        grants
+            .replace_grant(&key, state.revision, PeerGrant::None)
+            .await
+            .unwrap();
+
+        let stopped = f.actor_ref.ask(PeerShutdown(peer)).await;
+        assert!(matches!(
+            stopped,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshAccessDenied
+            ))
+        ));
+        assert!(f.actor_ref.is_alive());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn peer_llm_config_hides_provider_parameters_below_full_grant() {
+        let f = SelectionFixture::new().await;
+        f.control().await;
+        let full = f
+            .actor_ref
+            .ask(GetPeerLlmConfig { full: true })
+            .await
+            .unwrap()
+            .expect("bound config");
+        assert!(full.params.is_some(), "fixture profile stores parameters");
+
+        let restricted = f
+            .actor_ref
+            .ask(GetPeerLlmConfig { full: false })
+            .await
+            .unwrap()
+            .expect("bound config");
+        assert_eq!(
+            (restricted.provider.as_str(), restricted.model.as_str()),
+            (full.provider.as_str(), full.model.as_str())
+        );
+        assert!(restricted.params.is_none());
+        assert!(restricted.endpoint.is_empty());
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ use crate::acp::protocol::{Error as AcpError, PromptRequest, PromptResponse};
 use crate::agent::core::AgentMode;
 use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse, ReadRemoteFileResponse};
 use crate::agent::messages;
+#[cfg(feature = "remote")]
+use crate::agent::remote::remote_call::{CallTimeouts, ask_remote};
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_control::{
     SessionControlState, SessionControlTransition, SessionModelSelection,
@@ -20,9 +22,6 @@ use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
 use querymt_agent_core::events::SessionLimits;
 use querymt_agent_core::model::AgentMessage;
-use querymt_remote::{
-    classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
-};
 use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
@@ -50,41 +49,41 @@ pub enum SessionActorRef {
 
 // ── Constructors ─────────────────────────────────────────────────────────
 
-/// Map a remote send failure of an interaction message.
-///
-/// kameo answers `UnknownMessage` when the remote actor has no handler
-/// registered for the message ID, i.e. the node runs an agent without the
-/// session-interaction contract. Surface that as an explicit upgrade-required
-/// error instead of any fallback.
+/// An owner without a route for an interaction message runs an agent without
+/// the session-interaction contract. Surface that as an explicit
+/// upgrade-required error instead of any fallback.
 #[cfg(feature = "remote")]
-fn map_interaction_send_error(
-    node: &str,
-    error: kameo::error::RemoteSendError<AgentError>,
-    timeout_message: &str,
-) -> AgentError {
-    if matches!(error, kameo::error::RemoteSendError::UnknownMessage { .. }) {
-        return AgentError::RemoteNodeUpgradeRequired {
-            node: node.to_string(),
-        };
+fn require_interaction_support(node: &str, error: AgentError) -> AgentError {
+    match error.transport_failure() {
+        Some(failure)
+            if failure.kind == querymt_remote::RemoteTransportFailureKind::ProtocolMismatch =>
+        {
+            AgentError::RemoteNodeUpgradeRequired {
+                node: node.to_string(),
+            }
+        }
+        _ => error,
     }
-    SessionActorRef::map_agent_timeout_remote_send_error(error, timeout_message)
 }
 
 #[cfg(all(test, feature = "remote"))]
 mod interaction_error_tests {
     use super::*;
-    use kameo::error::RemoteSendError;
-    use std::borrow::Cow;
+    use querymt_remote::{DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind};
+
+    fn transport(kind: RemoteTransportFailureKind) -> AgentError {
+        AgentError::from_transport_failure(RemoteTransportFailure::new(
+            kind,
+            DeliveryCertainty::NotDelivered,
+            "failure",
+        ))
+    }
 
     #[test]
     fn unregistered_interaction_message_requires_node_upgrade() {
-        let error = map_interaction_send_error(
+        let error = require_interaction_support(
             "old-node",
-            RemoteSendError::UnknownMessage {
-                actor_remote_id: Cow::Borrowed("querymt::SessionActor"),
-                message_remote_id: Cow::Borrowed("querymt::ResolveInteraction"),
-            },
-            "timeout",
+            transport(RemoteTransportFailureKind::ProtocolMismatch),
         );
         assert!(
             matches!(&error, AgentError::RemoteNodeUpgradeRequired { node } if node == "old-node"),
@@ -96,13 +95,10 @@ mod interaction_error_tests {
 
     #[test]
     fn other_send_failures_stay_transport_or_handler_errors() {
-        let handler = map_interaction_send_error(
-            "n",
-            RemoteSendError::HandlerError(AgentError::Internal("boom".into())),
-            "timeout",
-        );
+        let handler = require_interaction_support("n", AgentError::Internal("boom".into()));
         assert!(matches!(handler, AgentError::Internal(_)));
-        let timeout = map_interaction_send_error("n", RemoteSendError::ReplyTimeout, "timed out");
+        let timeout =
+            require_interaction_support("n", transport(RemoteTransportFailureKind::ReplyTimeout));
         assert!(timeout.transport_failure().is_some());
     }
 }
@@ -178,88 +174,6 @@ impl SessionActorRef {
         }
         Ok(())
     }
-
-    async fn request_remote_file<M, R>(
-        mesh: Option<&crate::agent::remote::MeshHandle>,
-        actor: &kameo::actor::RemoteActorRef<SessionActor>,
-        message: &M,
-    ) -> Result<R, FileProxyError>
-    where
-        SessionActor: kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
-        M: serde::Serialize + Send + Sync + 'static,
-        <SessionActor as kameo::message::Message<M>>::Reply:
-            kameo::reply::Reply<Ok = R, Error = FileProxyError>,
-        R: serde::de::DeserializeOwned,
-    {
-        use querymt_remote::mesh_ingress::{SharingCallError, SharingRejection};
-        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
-
-        let timeout = Self::REMOTE_IO_REPLY_TIMEOUT;
-        let error = match mesh {
-            Some(mesh) => match ask_with_sharing(mesh, actor, message, timeout).await {
-                Ok(response) => return Ok(response),
-                Err(SharingAskError::Actor(error)) => error,
-                Err(SharingAskError::Sharing(SharingCallError::Rejected(
-                    SharingRejection::Denied | SharingRejection::Changed,
-                ))) => return Err(FileProxyError::AccessDenied),
-                Err(SharingAskError::Sharing(SharingCallError::Transport(error))) => error.into(),
-                Err(error) => return Err(FileProxyError::ActorSend(error.to_string())),
-            },
-            None => match querymt_remote::ask_remote_with_timeout(actor, message, timeout).await {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
-            },
-        };
-        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
-            return Err(FileProxyError::AccessDenied);
-        }
-        Err(match querymt_remote::classify_remote_send_error(error) {
-            Ok(failure) => FileProxyError::from_transport_failure(failure),
-            Err(error) => error,
-        })
-    }
-
-    async fn read_remote<M>(
-        mesh: Option<&crate::agent::remote::MeshHandle>,
-        actor: &kameo::actor::RemoteActorRef<SessionActor>,
-        message: &M,
-        timeout: Duration,
-    ) -> Result<
-        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok,
-        AgentError,
-    >
-    where
-        SessionActor: kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
-        M: serde::Serialize + Send + Sync + 'static,
-        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok:
-            serde::de::DeserializeOwned,
-        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Error:
-            Into<AgentError> + serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display,
-    {
-        match mesh {
-            Some(mesh) => {
-                use querymt_remote::request_timeout::SharingAskError;
-                querymt_remote::request_timeout::ask_with_sharing(mesh, actor, message, timeout)
-                    .await
-                    .map_err(|error| {
-                        AgentError::from_sharing_ask(match error {
-                            SharingAskError::Actor(error) => {
-                                SharingAskError::Actor(error.map_err(Into::into))
-                            }
-                            SharingAskError::Sharing(error) => SharingAskError::Sharing(error),
-                        })
-                    })
-            }
-            None => querymt_remote::ask_remote_with_timeout(actor, message, timeout)
-                .await
-                .map_err(|error| {
-                    Self::map_agent_timeout_remote_send_error(
-                        error.map_err(Into::into),
-                        "session request timed out",
-                    )
-                }),
-        }
-    }
 }
 
 // ── Identification ───────────────────────────────────────────────────────
@@ -305,14 +219,19 @@ impl SessionActorRef {
 // `SendError` failures are in-process and keep mapping to `AgentError::RemoteActor`.
 
 impl SessionActorRef {
-    const REMOTE_CONTROL_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
-    const REMOTE_CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-    const REMOTE_PROMPT_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
-    const REMOTE_PROMPT_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
-    const REMOTE_MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
-    const REMOTE_UNDO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
-    const REMOTE_HISTORY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
-    const REMOTE_IO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+    #[cfg(feature = "remote")]
+    const CONTROL: CallTimeouts = CallTimeouts::uniform(Duration::from_secs(10));
+    /// Controls that may wait for the owner's provider or filesystem.
+    #[cfg(feature = "remote")]
+    const SLOW_CONTROL: CallTimeouts =
+        CallTimeouts::new(Duration::from_secs(10), Duration::from_secs(30));
+    #[cfg(feature = "remote")]
+    const PROMPT: CallTimeouts =
+        CallTimeouts::new(Duration::from_secs(10), Duration::from_secs(600));
+    #[cfg(feature = "remote")]
+    const HISTORY: CallTimeouts = CallTimeouts::uniform(Duration::from_secs(60));
+    #[cfg(feature = "remote")]
+    const IO: CallTimeouts = CallTimeouts::uniform(Duration::from_secs(30));
 
     #[cfg(test)]
     pub(super) fn map_local_prompt_send_error(
@@ -325,41 +244,6 @@ impl SessionActorRef {
         match error {
             kameo::error::SendError::HandlerError(err) => err,
             other => AgentError::RemoteActor(other.to_string()),
-        }
-    }
-
-    pub(super) fn map_infallible_remote_send_error(
-        error: kameo::error::RemoteSendError<kameo::error::Infallible>,
-    ) -> AgentError {
-        AgentError::from_transport_failure(classify_infallible_remote_send_error(error))
-    }
-
-    pub(super) fn map_agent_timeout_remote_send_error(
-        error: kameo::error::RemoteSendError<AgentError>,
-        timeout_message: impl Into<String>,
-    ) -> AgentError {
-        #[cfg(feature = "remote")]
-        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
-            return AgentError::MeshAccessDenied;
-        }
-        match classify_remote_send_error_with_timeout_message(error, timeout_message) {
-            Ok(failure) => AgentError::from_transport_failure(failure),
-            // Handler errors are delivered remote-side and pass through unchanged.
-            Err(handler_error) => handler_error,
-        }
-    }
-
-    pub(super) fn map_infallible_timeout_remote_send_error(
-        error: kameo::error::RemoteSendError<kameo::error::Infallible>,
-        timeout_message: impl Into<String>,
-    ) -> AgentError {
-        #[cfg(feature = "remote")]
-        if querymt_remote::mesh_ingress::is_legacy_access_denial(&error) {
-            return AgentError::MeshAccessDenied;
-        }
-        match classify_remote_send_error_with_timeout_message(error, timeout_message) {
-            Ok(failure) => AgentError::from_transport_failure(failure),
-            Err(never) => match never {},
         }
     }
 
@@ -384,44 +268,21 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                let message = messages::Prompt::new(req);
-                if let Some(mesh) = mesh
-                    .as_deref()
-                    .filter(|mesh| mesh.inbound_router().is_some())
-                {
-                    return Self::read_remote(
-                        Some(mesh),
-                        actor_ref,
-                        &message,
-                        Self::REMOTE_PROMPT_REPLY_TIMEOUT,
-                    )
-                    .await;
-                }
-                actor_ref
-                    .ask(&message)
-                    .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
-                    .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::Span::current().record(
-                            "timed_out",
-                            matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
-                        );
-                        // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
-                        // must never be auto-replayed after such a failure.
-                        match classify_remote_send_error_with_timeout_message(
-                            e,
-                            format!(
-                                "Remote prompt timed out (mailbox={}s, reply={}s)",
-                                Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
-                                Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
-                            ),
-                        ) {
-                            Ok(failure) => AgentError::from_transport_failure(failure),
-                            Err(handler_error) => handler_error,
-                        }
-                    })
+                // Reply loss stays ambiguous (`delivery=unknown`); a prompt must
+                // never be auto-replayed after such a failure.
+                ask_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::Prompt::new(req),
+                    Self::PROMPT,
+                )
+                .await
+                .inspect_err(|error: &AgentError| {
+                    let timed_out = error.transport_failure().is_some_and(|failure| {
+                        failure.kind == querymt_remote::RemoteTransportFailureKind::ReplyTimeout
+                    });
+                    tracing::Span::current().record("timed_out", timed_out);
+                })
             }
         }
     }
@@ -458,61 +319,37 @@ impl SessionActorRef {
     ) -> Result<messages::SubmitInputResult, AgentError> {
         let message = messages::SubmitSessionInput::new(input);
         match self {
-            Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
-                kameo::error::SendError::HandlerError(error) => error,
-                other => AgentError::RemoteActor(other.to_string()),
-            }),
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                Self::read_remote(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &message,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
-                )
-                .await
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::CONTROL).await,
         }
     }
 
-    /// Map a remote send failure for the interaction messages. A node that
-    /// does not register these messages answers `UnknownMessage`; that means
-    /// the node runs an older agent and must be upgraded.
+    /// Ask an interaction message; an owner without it must be upgraded.
     #[cfg(feature = "remote")]
-    async fn ask_remote_interaction<M, R>(
-        &self,
-        mesh: Option<&crate::agent::remote::MeshHandle>,
-        actor: &kameo::actor::RemoteActorRef<SessionActor>,
-        message: &M,
-        timeout_message: &str,
-    ) -> Result<R, AgentError>
+    async fn ask_interaction<M, R>(&self, message: M) -> Result<R, AgentError>
     where
         SessionActor: kameo::message::Message<M, Reply = Result<R, AgentError>>
             + kameo::remote::RemoteMessage<M>,
         M: serde::Serialize + Send + Sync + 'static,
         R: serde::de::DeserializeOwned + Send + 'static,
     {
-        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
-
-        let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
-        let error = match mesh {
-            Some(mesh) => match ask_with_sharing(mesh, actor, message, timeout).await {
-                Ok(reply) => return Ok(reply),
-                Err(SharingAskError::Actor(error)) => error,
-                Err(error) => return Err(AgentError::from_sharing_ask(error)),
-            },
-            None => match querymt_remote::ask_remote_with_timeout(actor, message, timeout).await {
-                Ok(reply) => return Ok(reply),
-                Err(error) => error,
-            },
-        };
-        Err(map_interaction_send_error(
-            self.node_label(),
-            error,
-            timeout_message,
-        ))
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::CONTROL)
+                .await
+                .map_err(|error| require_interaction_support(self.node_label(), error)),
+        }
     }
 
     /// Snapshot this session's pending interactions (see
@@ -522,23 +359,14 @@ impl SessionActorRef {
         assign_authority: Option<String>,
     ) -> Result<Vec<crate::elicitation::PendingElicitationSnapshot>, AgentError> {
         let message = messages::ListPendingInteractions { assign_authority };
+        #[cfg(feature = "remote")]
+        return self.ask_interaction(message).await;
+        #[cfg(not(feature = "remote"))]
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
-            #[cfg(feature = "remote")]
-            Self::Remote {
-                actor_ref, mesh, ..
-            } => {
-                self.ask_remote_interaction(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &message,
-                    "ListPendingInteractions timed out on remote session",
-                )
-                .await
-            }
         }
     }
 
@@ -555,23 +383,14 @@ impl SessionActorRef {
             connection_id,
             authority,
         };
+        #[cfg(feature = "remote")]
+        return self.ask_interaction(message).await;
+        #[cfg(not(feature = "remote"))]
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
-            #[cfg(feature = "remote")]
-            Self::Remote {
-                actor_ref, mesh, ..
-            } => {
-                self.ask_remote_interaction(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &message,
-                    "ClaimInteractionDelivery timed out on remote session",
-                )
-                .await
-            }
         }
     }
 
@@ -589,23 +408,14 @@ impl SessionActorRef {
             delivery_generation,
             response,
         };
+        #[cfg(feature = "remote")]
+        return self.ask_interaction(message).await;
+        #[cfg(not(feature = "remote"))]
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
-            #[cfg(feature = "remote")]
-            Self::Remote {
-                actor_ref, mesh, ..
-            } => {
-                self.ask_remote_interaction(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &message,
-                    "ResolveInteraction timed out on remote session",
-                )
-                .await
-            }
         }
     }
 
@@ -615,22 +425,14 @@ impl SessionActorRef {
     ) -> Result<messages::DiscardQueuedInputResult, AgentError> {
         let message = messages::DiscardQueuedInput::new(input_id);
         match self {
-            Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
-                kameo::error::SendError::HandlerError(error) => error,
-                other => AgentError::RemoteActor(other.to_string()),
-            }),
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                Self::read_remote(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &message,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
-                )
-                .await
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::CONTROL).await,
         }
     }
 
@@ -665,7 +467,8 @@ impl SessionActorRef {
         .await
     }
 
-    /// Fire-and-forget cancellation.
+    /// Cancel the running turn. Local cancellation is fire-and-forget; a
+    /// remote owner acknowledges it so a refusal is not silently lost.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
@@ -676,81 +479,23 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                use querymt_remote::request_timeout::{ask_sharing_v1, with_sharing_protocol};
-
-                let legacy = async {
-                    actor_ref
-                        .tell(&messages::Cancel)
-                        .send()
-                        .map_err(Self::map_infallible_remote_send_error)
-                };
-                let Some(mesh) = mesh else {
-                    return legacy.await;
-                };
-                let timeout = Self::REMOTE_CONTROL_REPLY_TIMEOUT;
-                with_sharing_protocol(
-                    mesh,
-                    actor_ref.id().peer_id().copied(),
-                    timeout,
-                    async {
-                        ask_sharing_v1(mesh, actor_ref, &messages::Cancel, timeout)
-                            .await
-                            .map_err(AgentError::from_sharing_ask)
-                    },
-                    legacy,
-                )
-                .await
-                .map_err(|error| AgentError::from_sharing_ask(error.into()))?
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &messages::Cancel, Self::CONTROL).await,
         }
     }
 
     /// Set the agent mode for this session.
     pub async fn set_mode(&self, mode: AgentMode) -> Result<SessionControlTransition, AgentError> {
+        let message = messages::SetMode { mode };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::SetMode { mode })
+                .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                use querymt_remote::request_timeout::{
-                    SharingAskError, ask_sharing_v1, with_sharing_protocol,
-                };
-
-                let message = messages::SetMode { mode };
-                let legacy = async {
-                    actor_ref
-                        .ask(&message)
-                        .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                        .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
-                        .send()
-                        .await
-                };
-                if let Some(mesh) = mesh {
-                    with_sharing_protocol(
-                        mesh,
-                        actor_ref.id().peer_id().copied(),
-                        Self::REMOTE_MODEL_REPLY_TIMEOUT,
-                        ask_sharing_v1(mesh, actor_ref, &message, Self::REMOTE_MODEL_REPLY_TIMEOUT),
-                        async { Ok(legacy.await?) },
-                    )
-                    .await
-                    .map_err(|error| AgentError::from_sharing_ask(SharingAskError::Sharing(error)))?
-                    .map_err(AgentError::from_sharing_ask)
-                } else {
-                    legacy.await.map_err(|error| {
-                        Self::map_agent_timeout_remote_send_error(
-                            error,
-                            "SetMode timed out on remote session",
-                        )
-                    })
-                }
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::SLOW_CONTROL).await,
         }
     }
 
@@ -766,11 +511,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::read_remote(
+                ask_remote(
                     mesh.as_deref(),
                     actor_ref,
                     &messages::GetMode,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                    Self::CONTROL,
                 )
                 .await
             }
@@ -783,25 +528,17 @@ impl SessionActorRef {
         &self,
         effort: Option<ReasoningEffort>,
     ) -> Result<SessionControlTransition, AgentError> {
+        let message = messages::SetReasoningEffort { effort };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::SetReasoningEffort { effort })
+                .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SetReasoningEffort { effort })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "SetReasoningEffort timed out on remote session",
-                    )
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::CONTROL).await,
         }
     }
 
@@ -816,11 +553,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::read_remote(
+                ask_remote(
                     mesh.as_deref(),
                     actor_ref,
                     &messages::GetSessionControl,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                    Self::CONTROL,
                 )
                 .await
             }
@@ -833,28 +570,19 @@ impl SessionActorRef {
         config: querymt::LLMParams,
         provider_node_id: Option<String>,
     ) -> Result<(), AgentError> {
-        let msg = messages::SetLlmConfig {
+        let message = messages::SetLlmConfig {
             config,
             provider_node_id,
         };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(msg)
+                .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&msg)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|error| {
-                    Self::map_agent_timeout_remote_send_error(
-                        error,
-                        "SetLlmConfig timed out on remote session",
-                    )
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::SLOW_CONTROL).await,
         }
     }
 
@@ -867,62 +595,43 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetReasoningEffort)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                ask_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetReasoningEffort,
+                    Self::CONTROL,
+                )
                 .await
-                .map_err(|e| {
-                    Self::map_infallible_timeout_remote_send_error(
-                        e,
-                        "GetReasoningEffort timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
     /// Undo filesystem changes back to a specific message.
     ///
-    /// Works for both local and remote sessions. For remote sessions the handler
-    /// runs on the remote node (where the filesystem lives) and returns the result
-    /// over the kameo mesh.
+    /// For remote sessions the handler runs on the owner, where the
+    /// filesystem lives.
     pub async fn undo(&self, message_id: String) -> Result<UndoResult, UndoError> {
+        let message = messages::Undo { message_id };
         match self {
-            Self::Local(actor_ref) => {
-                actor_ref
-                    .ask(messages::Undo { message_id })
-                    .await
-                    .map_err(|e| match e {
-                        kameo::error::SendError::HandlerError(error) => error,
-                        error => UndoError::ActorSend(error.to_string()),
-                    })
-            }
+            Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|e| match e {
+                kameo::error::SendError::HandlerError(error) => error,
+                error => UndoError::ActorSend(error.to_string()),
+            }),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::Undo { message_id })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        "Undo timed out on remote session",
-                    ) {
-                        Ok(failure) => UndoError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::SLOW_CONTROL).await,
         }
     }
 
     /// Redo: restore to pre-undo state.
     ///
-    /// Works for both local and remote sessions. For remote sessions the handler
-    /// runs on the remote node (where the filesystem lives) and returns the result
-    /// over the kameo mesh.
+    /// For remote sessions the handler runs on the owner, where the
+    /// filesystem lives.
     pub async fn redo(&self) -> Result<RedoResult, UndoError> {
         match self {
             Self::Local(actor_ref) => actor_ref.ask(messages::Redo).await.map_err(|e| match e {
@@ -931,21 +640,17 @@ impl SessionActorRef {
             }),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::Redo)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                ask_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::Redo,
+                    Self::SLOW_CONTROL,
+                )
                 .await
-                .map_err(|e| {
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        "Redo timed out on remote session",
-                    ) {
-                        Ok(failure) => UndoError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            }
         }
     }
 
@@ -972,26 +677,17 @@ impl SessionActorRef {
         &self,
         selection: SessionModelSelection,
     ) -> Result<SessionControlTransition, AgentError> {
-        let msg = messages::SetSessionModel { selection };
+        let message = messages::SetSessionModel { selection };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(msg)
+                .ask(message)
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&msg)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "SetSessionModel timed out on remote session",
-                    )
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::SLOW_CONTROL).await,
         }
     }
 
@@ -1011,11 +707,11 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => Self::read_remote(
+            } => ask_remote::<_, _, AgentError>(
                 mesh.as_deref(),
                 actor_ref,
                 &messages::GetHistory,
-                Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                Self::HISTORY,
             )
             .await
             .map_err(AcpError::from),
@@ -1045,15 +741,7 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                Self::read_remote(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &request,
-                    Self::REMOTE_HISTORY_REPLY_TIMEOUT,
-                )
-                .await
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &request, Self::HISTORY).await,
         };
         match direct {
             Err(error) if crate::agent::event_chunk::is_unsupported_message(&error) => {
@@ -1127,11 +815,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                let page = Self::read_remote(
+                let page: messages::EventStreamPage = ask_remote::<_, _, AgentError>(
                     mesh.as_deref(),
                     actor_ref,
                     &message,
-                    Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                    Self::HISTORY,
                 )
                 .await?;
                 crate::agent::load_telemetry::record_mesh_history_request(page.events.len());
@@ -1174,11 +862,11 @@ impl SessionActorRef {
                     &crate::agent::event_chunk::CHUNK_SUPPORT,
                     request,
                     |request| async move {
-                        let chunk = Self::read_remote(
+                        let chunk: messages::EventStreamChunk = ask_remote::<_, _, AgentError>(
                             mesh.as_deref(),
                             actor_ref,
                             &request,
-                            Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                            Self::HISTORY,
                         )
                         .await?;
                         crate::agent::load_telemetry::record_mesh_history_request(
@@ -1250,18 +938,16 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetLlmConfig)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetLlmConfig timed out on remote session",
-                    ))
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => ask_remote::<_, _, AgentError>(
+                mesh.as_deref(),
+                actor_ref,
+                &messages::GetLlmConfig,
+                Self::CONTROL,
+            )
+            .await
+            .map_err(AcpError::from),
         }
     }
 
@@ -1277,11 +963,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::read_remote(
+                ask_remote(
                     mesh.as_deref(),
                     actor_ref,
                     &messages::GetSessionLimits,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                    Self::CONTROL,
                 )
                 .await
             }
@@ -1300,11 +986,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::read_remote(
+                ask_remote(
                     mesh.as_deref(),
                     actor_ref,
                     &messages::GetRuntimeStatus,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                    Self::CONTROL,
                 )
                 .await
             }
@@ -1323,11 +1009,11 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::read_remote(
+                ask_remote(
                     mesh.as_deref(),
                     actor_ref,
                     &messages::SessionDeliveryBarrier,
-                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                    Self::CONTROL,
                 )
                 .await
             }
@@ -1363,64 +1049,13 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                use querymt_remote::request_timeout::{
-                    SharingAskError, ask_sharing_v1_with_timeouts, with_sharing_protocol,
-                };
-
-                let legacy = async {
-                    actor_ref
-                        .ask(&messages::GetRuntimeStatus)
-                        .mailbox_timeout(mailbox_timeout)
-                        .reply_timeout(reply_timeout)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            Self::map_infallible_timeout_remote_send_error(
-                                error,
-                                format!(
-                                    "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
-                                    mailbox_timeout.as_millis(),
-                                    reply_timeout.as_millis()
-                                ),
-                            )
-                        })
-                };
-                if let Some(mesh) = mesh.as_deref() {
-                    with_sharing_protocol(
-                        mesh,
-                        actor_ref.id().peer_id().copied(),
-                        reply_timeout,
-                        async {
-                            ask_sharing_v1_with_timeouts(
-                                mesh,
-                                actor_ref,
-                                &messages::GetRuntimeStatus,
-                                mailbox_timeout,
-                                reply_timeout,
-                            )
-                            .await
-                            .map_err(
-                                |error: SharingAskError<kameo::error::Infallible>| {
-                                    AgentError::from_sharing_ask(match error {
-                                        SharingAskError::Actor(error) => {
-                                            SharingAskError::Actor(error.map_err(Into::into))
-                                        }
-                                        SharingAskError::Sharing(error) => {
-                                            SharingAskError::Sharing(error)
-                                        }
-                                    })
-                                },
-                            )
-                        },
-                        legacy,
-                    )
-                    .await
-                    .map_err(|error| {
-                        AgentError::from_sharing_ask(SharingAskError::Sharing(error))
-                    })?
-                } else {
-                    legacy.await
-                }
+                ask_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetRuntimeStatus,
+                    CallTimeouts::new(mailbox_timeout, reply_timeout),
+                )
+                .await
             }
         }
     }
@@ -1546,14 +1181,11 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => Self::read_remote(
-                mesh.as_deref(),
-                actor_ref,
-                &message,
-                Self::REMOTE_CONTROL_REPLY_TIMEOUT,
-            )
-            .await
-            .map_err(AcpError::from),
+            } => {
+                ask_remote::<_, _, AgentError>(mesh.as_deref(), actor_ref, &message, Self::CONTROL)
+                    .await
+                    .map_err(AcpError::from)
+            }
         }
     }
 
@@ -1563,25 +1195,21 @@ impl SessionActorRef {
     /// Used by the delegation orchestrator to provide context without requiring direct
     /// access to the child's `SessionStore`.
     pub async fn set_planning_context(&self, summary: String) -> Result<(), AcpError> {
+        let message = messages::SetPlanningContext { summary };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::SetPlanningContext { summary })
+                .ask(message)
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))?,
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SetPlanningContext { summary })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "SetPlanningContext timed out on remote session",
-                    ))
-                })?,
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                ask_remote::<_, _, AgentError>(mesh.as_deref(), actor_ref, &message, Self::CONTROL)
+                    .await
+                    .map_err(AcpError::from)?
+            }
         }
         Ok(())
     }
@@ -1592,29 +1220,24 @@ impl SessionActorRef {
         relay_actor_id: u64,
         relay_dht_name: String,
     ) -> Result<(), AcpError> {
+        let message = messages::UnsubscribeEvents {
+            relay_actor_id,
+            relay_dht_name,
+        };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::UnsubscribeEvents {
-                    relay_actor_id,
-                    relay_dht_name,
-                })
+                .ask(message)
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => Self::read_remote(
-                mesh.as_deref(),
-                actor_ref,
-                &messages::UnsubscribeEvents {
-                    relay_actor_id,
-                    relay_dht_name,
-                },
-                Self::REMOTE_CONTROL_REPLY_TIMEOUT,
-            )
-            .await
-            .map_err(AcpError::from),
+            } => {
+                ask_remote::<_, _, AgentError>(mesh.as_deref(), actor_ref, &message, Self::CONTROL)
+                    .await
+                    .map_err(AcpError::from)
+            }
         }
     }
 
@@ -1638,7 +1261,13 @@ impl SessionActorRef {
             Self::Remote {
                 actor_ref, mesh, ..
             } => {
-                Self::request_remote_file(mesh.as_deref(), actor_ref, &messages::GetFileIndex).await
+                ask_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetFileIndex,
+                    Self::IO,
+                )
+                .await
             }
         }
     }
@@ -1664,31 +1293,21 @@ impl SessionActorRef {
         offset: usize,
         limit: usize,
     ) -> Result<ReadRemoteFileResponse, FileProxyError> {
+        let message = messages::ReadRemoteFile {
+            path,
+            offset,
+            limit,
+        };
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::ReadRemoteFile {
-                    path,
-                    offset,
-                    limit,
-                })
+                .ask(message)
                 .await
                 .map_err(|e| FileProxyError::ActorSend(e.to_string())),
 
             #[cfg(feature = "remote")]
             Self::Remote {
                 actor_ref, mesh, ..
-            } => {
-                Self::request_remote_file(
-                    mesh.as_deref(),
-                    actor_ref,
-                    &messages::ReadRemoteFile {
-                        path,
-                        offset,
-                        limit,
-                    },
-                )
-                .await
-            }
+            } => ask_remote(mesh.as_deref(), actor_ref, &message, Self::IO).await,
         }
     }
 

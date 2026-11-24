@@ -236,6 +236,21 @@ impl InboundRouter {
         self.routes.write().remove(&actor);
     }
 
+    /// The messages reachable on `actor`, by `message_remote_id`, with the
+    /// access each route requires at ingress.
+    pub fn registered_messages(&self, actor: ActorId) -> Vec<(&'static str, InboundAccess)> {
+        self.routes
+            .read()
+            .get(&actor)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .map(|((_, message), route)| (*message, route.access))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn authorize(
         &self,
         peer: &PeerRequest,
@@ -307,6 +322,15 @@ impl InboundRouter {
                 .cloned()
         };
         let Some(route) = route else {
+            // A version mismatch or a missing registration; both need operator action.
+            tracing::warn!(
+                %peer,
+                actor = %actor_remote_id,
+                message = %message_remote_id,
+                ?protocol,
+                ?delivery,
+                "mesh request has no guarded route"
+            );
             return Ok(Err(RemoteSendError::UnknownMessage {
                 actor_remote_id,
                 message_remote_id,

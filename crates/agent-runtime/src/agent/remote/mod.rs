@@ -58,6 +58,9 @@ pub mod remote_setup;
 #[cfg(feature = "remote")]
 pub(crate) mod remote_actor_impl;
 
+#[cfg(feature = "remote")]
+pub(crate) mod remote_call;
+
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests;

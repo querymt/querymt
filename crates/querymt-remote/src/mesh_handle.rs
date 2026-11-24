@@ -230,7 +230,11 @@ impl MeshHandle {
         self.swarm_cmd_tx
             .send(SwarmCommand::Sharing { peer, request, tx })
             .map_err(|_| SharingCallError::Unavailable)?;
-        rx.await.map_err(|_| SharingCallError::Unavailable)?
+        // The swarm drops a pending reply when it stops, possibly after the
+        // request was sent: report it as in flight, not as never delivered.
+        rx.await.map_err(|_| {
+            SharingCallError::Transport(libp2p::request_response::OutboundFailure::ConnectionClosed)
+        })?
     }
 
     pub fn local_hostname(&self) -> &str {

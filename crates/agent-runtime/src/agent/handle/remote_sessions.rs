@@ -1,47 +1,37 @@
 use super::*;
 
 impl LocalAgentHandle {
+    /// Ask a remote node manager over the protocol negotiated with its node.
     #[cfg(feature = "remote")]
-    async fn read_remote_session_metadata<M, R>(
+    pub(super) async fn ask_node_manager<M, T>(
         &self,
         node: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         request: &M,
-    ) -> Result<R, agent_client_protocol::Error>
+    ) -> Result<
+        <<crate::agent::remote::RemoteNodeManager as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok,
+        T,
+    >
     where
         crate::agent::remote::RemoteNodeManager:
             kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
         M: serde::Serialize + Send + Sync + 'static,
-        <crate::agent::remote::RemoteNodeManager as kameo::message::Message<M>>::Reply:
-            kameo::reply::Reply<Ok = R, Error = crate::error::AgentError>,
-        R: serde::de::DeserializeOwned,
-    {
-        use crate::error::AgentError;
-        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
-        querymt_remote::request_timeout::ask_with_sharing(
-            &mesh,
+        <<crate::agent::remote::RemoteNodeManager as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok:
+            serde::de::DeserializeOwned,
+        <<crate::agent::remote::RemoteNodeManager as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Error:
+            serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display + Into<T>,
+        T: crate::agent::remote::remote_call::RemoteCallError + From<crate::error::AgentError>,
+{
+        use crate::agent::remote::remote_call::{CallTimeouts, ask_remote};
+        let mesh = self
+            .mesh()
+            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
+        ask_remote(
+            Some(&mesh),
             node,
             request,
-            Self::remote_request_timeout(),
+            CallTimeouts::uniform(Self::remote_request_timeout()),
         )
         .await
-        .map_err(|error| AgentError::from_sharing_ask(error).into())
-    }
-
-    #[cfg(feature = "remote")]
-    fn map_remote_node_manager_error(
-        error: kameo::error::RemoteSendError<crate::error::AgentError>,
-    ) -> agent_client_protocol::Error {
-        crate::error::AgentError::from_remote_send(error).into()
-    }
-
-    #[cfg(feature = "remote")]
-    fn map_remote_control_error(
-        error: kameo::error::RemoteSendError<agent_client_protocol::Error>,
-    ) -> agent_client_protocol::Error {
-        match querymt_remote::classify_remote_send_error(error) {
-            Ok(failure) => crate::error::AgentError::from_transport_failure(failure).into(),
-            Err(error) => error,
-        }
     }
 
     /// Create a session for a delegation. The owner records it with fork
@@ -53,16 +43,11 @@ impl LocalAgentHandle {
         cwd: Option<String>,
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
-        use crate::error::AgentError;
-        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
-        querymt_remote::request_timeout::ask_with_sharing(
-            &mesh,
+        self.ask_node_manager(
             node_manager_ref,
             &crate::agent::remote::CreateRemoteDelegationSession { cwd },
-            Self::remote_request_timeout(),
         )
         .await
-        .map_err(|error| AgentError::from_sharing_ask(error).into())
     }
 
     #[cfg(feature = "remote")]
@@ -88,13 +73,12 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub(crate) async fn remote_profiles(&self, node_id: &str) -> Result<serde_json::Value, Error> {
         let manager = self.find_node_manager(node_id).await?;
-        let mut response = querymt_remote::ask_remote_with_timeout(
-            &manager,
-            &crate::agent::remote::node_manager::ListRemoteProfiles,
-            Self::remote_request_timeout(),
-        )
-        .await
-        .map_err(Self::map_remote_control_error)?;
+        let mut response = self
+            .ask_node_manager::<_, Error>(
+                &manager,
+                &crate::agent::remote::node_manager::ListRemoteProfiles,
+            )
+            .await?;
         response["node_id"] = node_id.into();
         Ok(response)
     }
@@ -106,13 +90,12 @@ impl LocalAgentHandle {
         request: crate::control::delegate_models::DelegateModelsRequest,
     ) -> Result<crate::control::delegate_models::DelegateAssignmentsInfo, Error> {
         let manager = self.find_node_manager(node_id).await?;
-        let mut result = querymt_remote::ask_remote_with_timeout(
-            &manager,
-            &crate::agent::remote::node_manager::GetRemoteDelegateModels(request),
-            Self::remote_request_timeout(),
-        )
-        .await
-        .map_err(Self::map_remote_control_error)?;
+        let mut result = self
+            .ask_node_manager::<_, Error>(
+                &manager,
+                &crate::agent::remote::node_manager::GetRemoteDelegateModels(request),
+            )
+            .await?;
         let viewer = self.mesh().map(|mesh| mesh.peer_id().to_string());
         for assignment in &mut result.assignments {
             Self::qualify_owner_model(&mut assignment.model.0, node_id, viewer.as_deref());
@@ -155,13 +138,12 @@ impl LocalAgentHandle {
             );
         }
         let manager = self.find_node_manager(node_id).await?;
-        let mut result = querymt_remote::ask_remote_with_timeout(
-            &manager,
-            &crate::agent::remote::node_manager::SetRemoteDelegateModel(request),
-            Self::remote_request_timeout(),
-        )
-        .await
-        .map_err(Self::map_remote_control_error)?;
+        let mut result = self
+            .ask_node_manager::<_, Error>(
+                &manager,
+                &crate::agent::remote::node_manager::SetRemoteDelegateModel(request),
+            )
+            .await?;
         Self::qualify_owner_model(
             &mut result.model.0,
             node_id,
@@ -216,9 +198,8 @@ impl LocalAgentHandle {
         kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         agent_client_protocol::Error,
     > {
-        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
-        use futures_util::{StreamExt, stream::FuturesUnordered};
-        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+        use crate::agent::remote::RemoteNodeManager;
+        use futures_util::StreamExt;
 
         use crate::error::AgentError;
         let mesh = self
@@ -290,73 +271,45 @@ impl LocalAgentHandle {
         // contact before giving up. The 3-second timeout on GetNodeInfo is the
         // real liveness check for a targeted user action.
         let local_peer_id = *mesh.peer_id();
-        let timeout = Self::remote_node_info_timeout();
-        let concurrency = Self::remote_node_lookup_parallelism();
-        let semaphore = Arc::new(Semaphore::new(concurrency));
-        let mut lookups = FuturesUnordered::new();
+        let mut probes = super::remote_nodes::NodeInfoProbes::new(mesh.clone());
 
         for scope in runtime.active_scopes() {
             let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(
                 crate::agent::remote::scope::scoped_node_manager(&scope),
             );
             while let Some(result) = stream.next().await {
-                match result {
-                    Ok(node_manager_ref) => {
-                        let peer_id = node_manager_ref.id().peer_id().copied();
-                        if peer_id == Some(local_peer_id)
-                            || parsed_peer_id.is_some_and(|expected| peer_id != Some(expected))
-                        {
-                            continue;
-                        }
-                        // No is_peer_alive check here — we contact the peer
-                        // directly and let the GetNodeInfo timeout decide.
-
-                        let cache_key =
-                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
-                            if info.node_id.to_string() == node_id {
-                                return Ok(node_manager_ref);
-                            }
-                            continue;
-                        }
-
-                        let semaphore = Arc::clone(&semaphore);
-                        let mesh = mesh.clone();
-                        lookups.push(async move {
-                            let permit = semaphore.acquire_owned().await.ok();
-                            let res =
-                                ask_with_sharing(&mesh, &node_manager_ref, &GetNodeInfo, timeout)
-                                    .await;
-                            drop(permit);
-                            (node_manager_ref, cache_key, peer_id, res)
-                        });
-                    }
+                let node_manager_ref = match result {
+                    Ok(node_manager_ref) => node_manager_ref,
                     Err(e) => {
                         log::warn!("find_node_manager: lookup error: {}", e);
+                        continue;
                     }
+                };
+                let peer_id = node_manager_ref.id().peer_id().copied();
+                if peer_id == Some(local_peer_id)
+                    || parsed_peer_id.is_some_and(|expected| peer_id != Some(expected))
+                {
+                    continue;
                 }
-            }
-        }
-
-        while let Some((node_manager_ref, cache_key, peer_id, result)) = lookups.next().await {
-            match result {
-                Ok(info) if peer_id == Some(*info.node_id.as_peer_id()) => {
-                    self.insert_cached_remote_node(cache_key, info.clone());
+                // No is_peer_alive check here — we contact the peer
+                // directly and let the GetNodeInfo timeout decide.
+                let cache_key = Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                if let Some(info) = self.get_cached_remote_node(&cache_key) {
                     if info.node_id.to_string() == node_id {
                         return Ok(node_manager_ref);
                     }
+                    continue;
                 }
-                Ok(_) => {
-                    log::warn!("find_node_manager: GetNodeInfo returned a different peer identity")
-                }
-                Err(SharingAskError::Actor(kameo::error::RemoteSendError::ReplyTimeout)) => {
-                    log::warn!(
-                        "find_node_manager: GetNodeInfo timed out for peer {:?}",
-                        peer_id
-                    );
-                }
-                Err(e) => {
-                    log::warn!("find_node_manager: GetNodeInfo failed: {}", e);
+                probes.push(node_manager_ref, cache_key);
+            }
+        }
+
+        while let Some(probe) = probes.next().await {
+            if let Ok(Some(info)) = probe.result {
+                let matches = info.node_id.to_string() == node_id;
+                self.insert_cached_remote_node(probe.cache_key, info);
+                if matches {
+                    return Ok(probe.node_manager);
                 }
             }
         }
@@ -391,7 +344,7 @@ impl LocalAgentHandle {
         agent_client_protocol::Error,
     > {
         use crate::agent::remote::ListRemoteSessions;
-        self.read_remote_session_metadata(node_manager_ref, &ListRemoteSessions { offset, limit })
+        self.ask_node_manager(node_manager_ref, &ListRemoteSessions { offset, limit })
             .await
     }
 
@@ -409,7 +362,7 @@ impl LocalAgentHandle {
         crate::agent::remote::node_manager::ListRemoteSessionsWithLifecycleResponse,
         agent_client_protocol::Error,
     > {
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &crate::agent::remote::ListRemoteSessionsWithLifecycle {
                 offset,
@@ -429,7 +382,7 @@ impl LocalAgentHandle {
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         session_id: String,
     ) -> Result<crate::session::lifecycle::SessionLifecycle, agent_client_protocol::Error> {
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &crate::agent::remote::GetRemoteSessionLifecycle { session_id },
         )
@@ -444,14 +397,11 @@ impl LocalAgentHandle {
         session_id: String,
         patch: crate::session::lifecycle::SessionLifecyclePatch,
     ) -> Result<crate::session::lifecycle::SessionLifecycle, agent_client_protocol::Error> {
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.ask_node_manager(
             node_manager_ref,
             &crate::agent::remote::SetRemoteSessionLifecycle { session_id, patch },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Read display-only profile identity from the session's owning node.
@@ -465,13 +415,11 @@ impl LocalAgentHandle {
         // Missing metadata must not block loading a healthy remote session.
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let manager = self.find_node_manager(node_id).await.ok()?;
-            querymt_remote::request_timeout::ask_with_sharing(
-                &self.mesh()?,
+            self.ask_node_manager::<_, crate::error::AgentError>(
                 &manager,
                 &GetRemoteSessionProfile {
                     session_id: session_id.to_string(),
                 },
-                Self::remote_request_timeout(),
             )
             .await
             .ok()
@@ -507,7 +455,7 @@ impl LocalAgentHandle {
         use crate::agent::remote::CreateRemoteSession;
         if let Some(profile_id) = profile_id {
             return self
-                .read_remote_session_metadata(
+                .ask_node_manager(
                     node_manager_ref,
                     &crate::agent::remote::node_manager::CreateRemoteSessionWithProfile {
                         cwd,
@@ -516,7 +464,7 @@ impl LocalAgentHandle {
                 )
                 .await;
         }
-        self.read_remote_session_metadata(node_manager_ref, &CreateRemoteSession { cwd })
+        self.ask_node_manager(node_manager_ref, &CreateRemoteSession { cwd })
             .await
     }
 
@@ -530,7 +478,7 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
 
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &ForkRemoteSession {
                 source_session_id,
@@ -601,16 +549,17 @@ impl LocalAgentHandle {
         Some(session_ref)
     }
 
+    /// Re-materialize a persisted session on its owner. Failures stay typed so
+    /// recovery can decide from the transport failure.
     #[cfg(feature = "remote")]
     pub async fn resume_remote_session(
         &self,
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         session_id: String,
-    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
-    {
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, crate::error::AgentError> {
         use crate::agent::remote::ResumeRemoteSession;
 
-        self.read_remote_session_metadata(node_manager_ref, &ResumeRemoteSession { session_id })
+        self.ask_node_manager(node_manager_ref, &ResumeRemoteSession { session_id })
             .await
     }
 
@@ -621,8 +570,7 @@ impl LocalAgentHandle {
         request: crate::agent::remote::CreateRemoteSchedule,
     ) -> Result<crate::agent::remote::CreateRemoteScheduleResponse, agent_client_protocol::Error>
     {
-        self.read_remote_session_metadata(node_manager_ref, &request)
-            .await
+        self.ask_node_manager(node_manager_ref, &request).await
     }
 
     #[cfg(feature = "remote")]
@@ -634,7 +582,7 @@ impl LocalAgentHandle {
     {
         use crate::agent::remote::ListRemoteSchedules;
 
-        self.read_remote_session_metadata(node_manager_ref, &ListRemoteSchedules { session_id })
+        self.ask_node_manager(node_manager_ref, &ListRemoteSchedules { session_id })
             .await
     }
 
@@ -646,7 +594,7 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::PauseRemoteSchedule;
 
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &PauseRemoteSchedule { schedule_public_id },
         )
@@ -661,7 +609,7 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::ResumeRemoteSchedule;
 
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &ResumeRemoteSchedule { schedule_public_id },
         )
@@ -676,7 +624,7 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::TriggerRemoteSchedule;
 
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &TriggerRemoteSchedule { schedule_public_id },
         )
@@ -691,7 +639,7 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::DeleteRemoteSchedule;
 
-        self.read_remote_session_metadata(
+        self.ask_node_manager(
             node_manager_ref,
             &DeleteRemoteSchedule { schedule_public_id },
         )

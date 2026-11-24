@@ -97,6 +97,7 @@ pub type RenewLeaseFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>
 pub type PeerAliveFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 pub type StreamRenewFn = Arc<dyn Fn() -> RenewLeaseFuture + Send + Sync>;
 pub type StreamPeerAliveFn = Arc<dyn Fn() -> PeerAliveFuture + Send + Sync>;
+pub type CancelStreamFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 pub struct PollStreamContext<'a> {
     pub setup_span: tracing::Span,
@@ -495,6 +496,31 @@ where
                     .await
                     .unwrap_or(false)
             })
+        })
+    }
+
+    /// A lazy host-side cancellation of one stream; nothing is sent until it is polled.
+    pub fn cancel_stream_future(
+        &self,
+        host: TTransport::HostRef,
+        session_id: String,
+        request_id: String,
+        reason: &'static str,
+    ) -> CancelStreamFuture {
+        let transport = Arc::clone(&self.transport);
+        Box::pin(async move {
+            let request = CancelProviderStreamRequest {
+                session_id,
+                request_id: Some(request_id),
+                reason: Some(reason.to_owned()),
+            };
+            if let Err(error) = transport.cancel_stream(&host, request).await {
+                tracing::debug!(
+                    target: "querymt_remote::provider::stream",
+                    %error,
+                    "remote provider stream cancellation failed"
+                );
+            }
         })
     }
 

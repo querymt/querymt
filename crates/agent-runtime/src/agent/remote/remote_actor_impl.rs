@@ -14,75 +14,197 @@
 //! The `linkme::distributed_slice` registrations that the macros normally
 //! generate are also included here — they are required for kameo's remote
 //! dispatch to find our actor and message handlers at runtime.
+//!
+//! ## Guarded routes
+//!
+//! A guarded mesh only dispatches messages installed on its
+//! [`InboundRouter`]. Every route goes through [`route`], which converts the
+//! wire message into the local message (attaching the authenticated peer
+//! where the handler needs it), asks the actor with bounded timeouts and
+//! reports a stopped actor as a typed transport failure.
 
+use crate::agent::file_proxy::FileProxyError;
 use crate::agent::messages;
 use crate::agent::remote::event_forwarder::PeerSubscription;
 use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
+use crate::agent::remote::remote_call::{CallTimeouts, RemoteCallError};
 use crate::agent::session_actor::{
-    PeerTurn, SessionActor, SubscribePeerEvents, TurnAuthority, UnsubscribePeerEvents,
+    PeerInteraction, PeerTurn, SessionActor, SubscribePeerEvents, TurnAuthority,
+    UnsubscribePeerEvents,
 };
+use crate::agent::undo::UndoError;
 use crate::error::AgentError;
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, WeakActorRef};
+use kameo::error::SendError;
 use kameo::message::Message;
 use kameo::remote::{_internal, RemoteActor, RemoteMessage};
 use kameo::reply::Reply;
 use querymt_remote::mesh_ingress::{InboundAccess, InboundDelivery, InboundRouter, PeerRequest};
 use querymt_remote::peer_access::GrantStore;
+use querymt_remote::{DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Use only for reads that are safe under the session grant. Mutations must
-// carry their authenticated origin into the actor and deferred work instead.
-pub(crate) fn register_session_read<A, M>(router: &InboundRouter, actor: &ActorRef<A>)
-where
-    A: RemoteActor + RemoteMessage<M> + Message<M>,
-    M: serde::de::DeserializeOwned + Send + 'static,
-    <A::Reply as Reply>::Ok: serde::Serialize + Send,
-    <A::Reply as Reply>::Error: std::fmt::Display,
-    AgentError: From<<A::Reply as Reply>::Error>,
-{
-    register_session_request::<A, M>(router, actor, InboundAccess::Sessions);
+/// Session and node reads, and owner-wide controls.
+pub(crate) const READ: CallTimeouts =
+    CallTimeouts::new(Duration::from_secs(10), Duration::from_secs(60));
+/// Node-manager mutations that may materialize a session (create, resume,
+/// fork). The ingress dispatch budget, the owner's request timeout shortened
+/// to the caller's reply timeout, is what bounds them; this cap must not
+/// undercut it, or a slow materialization would fail after it committed.
+pub(crate) const NODE_MUTATION: CallTimeouts =
+    CallTimeouts::new(Duration::from_secs(10), Duration::from_secs(600));
+/// Session controls answered from actor state.
+const CONTROL: CallTimeouts = CallTimeouts::uniform(Duration::from_secs(10));
+/// A turn runs until the model finishes.
+const TURN: CallTimeouts = CallTimeouts::new(Duration::from_secs(10), Duration::from_secs(600));
+/// Workspace reads and subscriptions must not queue behind a busy session.
+const FAST_INDEX: CallTimeouts = CallTimeouts::new(Duration::from_secs(3), Duration::from_secs(10));
+const FAST_READ: CallTimeouts = CallTimeouts::new(Duration::from_secs(3), Duration::from_secs(30));
+
+/// The error a route returns on the wire for a local reply error: the type the
+/// caller decodes, which is [`AgentError`] for infallible replies.
+pub(crate) trait WireError: Sized {
+    type Wire: RemoteCallError + From<Self> + serde::Serialize + Send + 'static;
 }
 
-pub(super) fn register_session_request<A, M>(
+macro_rules! wire_error {
+    ($($error:ty => $wire:ty),+ $(,)?) => {
+        $(impl WireError for $error {
+            type Wire = $wire;
+        })+
+    };
+}
+
+wire_error!(
+    AgentError => AgentError,
+    kameo::error::Infallible => AgentError,
+    UndoError => UndoError,
+    FileProxyError => FileProxyError,
+    agent_client_protocol::Error => agent_client_protocol::Error,
+);
+
+type ReplyOk<A, W> = <<A as Message<W>>::Reply as Reply>::Ok;
+type ReplyWire<A, W> = <<<A as Message<W>>::Reply as Reply>::Error as WireError>::Wire;
+
+/// Ask a local actor on behalf of a mesh peer.
+///
+/// # Errors
+///
+/// Returns the handler error, or an `ActorUnavailable`, `MailboxFull` or
+/// `ReplyTimeout` transport failure with the delivery certainty kameo proves.
+pub(crate) async fn ask_local<A, W>(
+    actor: &WeakActorRef<A>,
+    message: W,
+    timeouts: CallTimeouts,
+) -> Result<ReplyOk<A, W>, ReplyWire<A, W>>
+where
+    A: kameo::Actor + Message<W>,
+    W: Send + 'static,
+    <A::Reply as Reply>::Error: WireError,
+{
+    use DeliveryCertainty::{NotDelivered, Unknown};
+    use RemoteTransportFailureKind as Kind;
+
+    let actor = actor.upgrade().ok_or_else(|| {
+        ReplyWire::<A, W>::transport(RemoteTransportFailure::new(
+            Kind::ActorUnavailable,
+            NotDelivered,
+            "actor stopped",
+        ))
+    })?;
+    let (kind, delivery, detail) = match actor
+        .ask(message)
+        .mailbox_timeout(timeouts.mailbox)
+        .reply_timeout(timeouts.reply)
+        .send()
+        .await
+    {
+        Ok(reply) => return Ok(reply),
+        Err(SendError::HandlerError(error)) => return Err(error.into()),
+        Err(SendError::ActorNotRunning(_) | SendError::ActorRestarting(_)) => {
+            (Kind::ActorUnavailable, NotDelivered, "actor not running")
+        }
+        Err(SendError::ActorStopped) => (Kind::ActorUnavailable, Unknown, "actor stopped"),
+        Err(SendError::MailboxFull(_) | SendError::Timeout(Some(_))) => {
+            (Kind::MailboxFull, NotDelivered, "actor mailbox full")
+        }
+        Err(SendError::Timeout(None)) => (Kind::ReplyTimeout, Unknown, "actor reply timed out"),
+    };
+    Err(ReplyWire::<A, W>::transport(RemoteTransportFailure::new(
+        kind, delivery, detail,
+    )))
+}
+
+/// Install the guarded route for wire message `M` on `actor`.
+///
+/// `local` turns the decoded wire message into the message the actor
+/// handles. It runs before the ask, so it is where the authenticated peer is
+/// attached; it must never copy authority from the wire payload.
+pub(crate) fn route<A, M, W, F>(
     router: &InboundRouter,
     actor: &ActorRef<A>,
-    v1_access: InboundAccess,
+    delivery: InboundDelivery,
+    access: InboundAccess,
+    timeouts: CallTimeouts,
+    local: F,
 ) where
-    A: RemoteActor + RemoteMessage<M> + Message<M>,
+    A: kameo::Actor + RemoteActor + RemoteMessage<M> + Message<W>,
     M: serde::de::DeserializeOwned + Send + 'static,
+    W: Send + 'static,
+    F: Fn(PeerRequest, M) -> Result<W, ReplyWire<A, W>> + Send + Sync + 'static,
     <A::Reply as Reply>::Ok: serde::Serialize + Send,
-    <A::Reply as Reply>::Error: std::fmt::Display,
-    AgentError: From<<A::Reply as Reply>::Error>,
+    <A::Reply as Reply>::Error: WireError,
 {
     let weak = actor.downgrade();
-    let read = move |_, msg| {
+    let handler = move |origin, message| {
         let weak = weak.clone();
-        async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| AgentError::RemoteActor("session reader stopped".into()))?;
-            actor
-                .ask(msg)
-                .mailbox_timeout(Duration::from_secs(10))
-                .reply_timeout(Duration::from_secs(60))
-                .send()
-                .await
-                .map_err(|error| match error {
-                    kameo::error::SendError::HandlerError(error) => error.into(),
-                    other => AgentError::RemoteActor(other.to_string()),
-                })
-        }
+        let message = local(origin, message);
+        async move { ask_local(&weak, message?, timeouts).await }
     };
-    router.register::<A, M, _, _, _, _>(actor.id(), InboundDelivery::Ask, v1_access, read);
+    router.register::<A, M, _, _, _, _>(actor.id(), delivery, access, handler);
+}
+
+/// Route a message the actor handles as received.
+pub(crate) fn route_direct<A, M>(
+    router: &InboundRouter,
+    actor: &ActorRef<A>,
+    access: InboundAccess,
+    timeouts: CallTimeouts,
+) where
+    A: kameo::Actor + RemoteActor + RemoteMessage<M> + Message<M>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    <A::Reply as Reply>::Ok: serde::Serialize + Send,
+    <A::Reply as Reply>::Error: WireError,
+{
+    route::<A, M, M, _>(
+        router,
+        actor,
+        InboundDelivery::Ask,
+        access,
+        timeouts,
+        |_, message| Ok(message),
+    );
+}
+
+/// Use only for reads that are safe under the session grant. Mutations must
+/// carry their authenticated origin into the actor, or require full access.
+pub(crate) fn route_read<A, M>(router: &InboundRouter, actor: &ActorRef<A>)
+where
+    A: kameo::Actor + RemoteActor + RemoteMessage<M> + Message<M>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    <A::Reply as Reply>::Ok: serde::Serialize + Send,
+    <A::Reply as Reply>::Error: WireError,
+{
+    route_direct::<A, M>(router, actor, InboundAccess::Sessions, READ);
 }
 
 pub(crate) fn register_session_history(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
-    register_session_read::<_, messages::GetHistory>(router, actor);
-    register_session_read::<_, messages::GetUserPrompts>(router, actor);
-    register_session_read::<_, messages::GetEventStream>(router, actor);
-    register_session_read::<_, messages::GetEventStreamSince>(router, actor);
-    register_session_read::<_, messages::GetEventStreamChunk>(router, actor);
+    route_read::<_, messages::GetHistory>(router, actor);
+    route_read::<_, messages::GetUserPrompts>(router, actor);
+    route_read::<_, messages::GetEventStream>(router, actor);
+    route_read::<_, messages::GetEventStreamSince>(router, actor);
+    route_read::<_, messages::GetEventStreamChunk>(router, actor);
 }
 
 pub(crate) fn register_session_routes(
@@ -93,15 +215,51 @@ pub(crate) fn register_session_routes(
         return;
     };
     register_session_history(router, actor);
-    register_session_read::<_, messages::SessionDeliveryBarrier>(router, actor);
-    register_session_read::<_, messages::GetSessionControl>(router, actor);
-    register_session_read::<_, messages::GetMode>(router, actor);
-    register_session_request::<_, messages::SetMode>(router, actor, InboundAccess::Full);
-    register_session_read::<_, messages::GetSessionLimits>(router, actor);
+    register_session_controls(router, actor);
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
     register_session_turns(router, store.clone(), actor);
     register_session_interactions(router, store.clone(), actor);
+}
+
+/// Reads of session state, and controls that change the session's model,
+/// tools context or workspace. Those controls are not bounded by a session
+/// grant's model and tool limits, so they need full access.
+fn register_session_controls(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
+    route_read::<_, messages::SessionDeliveryBarrier>(router, actor);
+    route_read::<_, messages::GetSessionControl>(router, actor);
+    route_read::<_, messages::GetMode>(router, actor);
+    route_read::<_, messages::GetSessionLimits>(router, actor);
+    route::<_, messages::GetLlmConfig, _, _>(
+        router,
+        actor,
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        READ,
+        |origin, _| {
+            Ok(crate::agent::session_actor::GetPeerLlmConfig {
+                full: matches!(
+                    origin.grant(),
+                    Some(querymt_remote::peer_access::PeerGrant::Full)
+                ),
+            })
+        },
+    );
+    route_read::<_, messages::GetReasoningEffort>(router, actor);
+    macro_rules! full {
+        ($($message:ty),+ $(,)?) => {
+            $(route_direct::<_, $message>(router, actor, InboundAccess::Full, READ);)+
+        };
+    }
+    full!(
+        messages::SetMode,
+        messages::SetReasoningEffort,
+        messages::SetSessionModel,
+        messages::SetLlmConfig,
+        messages::SetPlanningContext,
+        messages::Undo,
+        messages::Redo,
+    );
 }
 
 fn register_session_interactions(
@@ -109,45 +267,32 @@ fn register_session_interactions(
     store: Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
 ) {
-    register_peer_interaction::<messages::ListPendingInteractions, _>(router, &store, actor);
-    register_peer_interaction::<messages::ClaimInteractionDelivery, _>(router, &store, actor);
-    register_peer_interaction::<messages::ResolveInteraction, _>(router, &store, actor);
-}
-
-fn register_peer_interaction<M, R>(
-    router: &InboundRouter,
-    store: &Arc<dyn GrantStore>,
-    actor: &ActorRef<SessionActor>,
-) where
-    SessionActor: RemoteMessage<M>
-        + Message<crate::agent::session_actor::PeerInteraction<M>, Reply = Result<R, AgentError>>,
-    M: serde::de::DeserializeOwned + Send + 'static,
-    R: serde::Serialize + Send + 'static,
-{
-    let weak = actor.downgrade();
-    let store = store.clone();
-    router.register::<SessionActor, M, _, _, _, _>(
-        actor.id(),
-        InboundDelivery::Ask,
-        InboundAccess::Sessions,
-        move |request, message| {
-            let weak = weak.clone();
-            let store = store.clone();
-            async move {
-                let actor = weak
-                    .upgrade()
-                    .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
-                let peer = Arc::new(PeerTurn::from_request(&request, store)?);
-                actor
-                    .ask(crate::agent::session_actor::PeerInteraction { peer, message })
-                    .mailbox_timeout(Duration::from_secs(10))
-                    .reply_timeout(Duration::from_secs(10))
-                    .send()
-                    .await
-                    .map_err(local_session_error)
-            }
-        },
-    );
+    fn interaction<M>(
+        router: &InboundRouter,
+        store: &Arc<dyn GrantStore>,
+        actor: &ActorRef<SessionActor>,
+    ) where
+        SessionActor: RemoteMessage<M> + Message<PeerInteraction<M>>,
+        <SessionActor as Message<PeerInteraction<M>>>::Reply:
+            Reply<Error = AgentError, Ok: serde::Serialize + Send>,
+        M: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let store = store.clone();
+        route::<SessionActor, M, _, _>(
+            router,
+            actor,
+            InboundDelivery::Ask,
+            InboundAccess::Sessions,
+            CONTROL,
+            move |origin, message| {
+                let peer = Arc::new(PeerTurn::from_request(&origin, store.clone())?);
+                Ok(PeerInteraction { peer, message })
+            },
+        );
+    }
+    interaction::<messages::ListPendingInteractions>(router, &store, actor);
+    interaction::<messages::ClaimInteractionDelivery>(router, &store, actor);
+    interaction::<messages::ResolveInteraction>(router, &store, actor);
 }
 
 pub(super) fn register_session_turns(
@@ -155,239 +300,98 @@ pub(super) fn register_session_turns(
     store: Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
 ) {
-    register_peer_session_ask::<messages::Prompt, _>(
-        router,
-        &store,
-        actor,
-        Duration::from_secs(600),
-        InboundDelivery::Ask,
-        |msg| &mut msg.authority,
-    );
-    register_peer_session_ask::<messages::SubmitSessionInput, _>(
-        router,
-        &store,
-        actor,
-        Duration::from_secs(10),
-        InboundDelivery::Ask,
-        |msg| &mut msg.authority,
-    );
-    register_peer_session_ask::<messages::DiscardQueuedInput, _>(
-        router,
-        &store,
-        actor,
-        Duration::from_secs(10),
-        InboundDelivery::Ask,
-        |msg| &mut msg.authority,
-    );
-    register_peer_session_ask::<messages::GetRuntimeStatus, _>(
-        router,
-        &store,
-        actor,
-        Duration::from_secs(10),
-        InboundDelivery::Ask,
-        |msg| &mut msg.authority,
-    );
-    register_peer_session_ask::<messages::Cancel, _>(
-        router,
-        &store,
-        actor,
-        Duration::from_secs(10),
-        InboundDelivery::LegacyTellV1Ask,
-        |msg| &mut msg.authority,
-    );
-}
-
-fn register_peer_session_ask<M, R>(
-    router: &InboundRouter,
-    store: &Arc<dyn GrantStore>,
-    actor: &ActorRef<SessionActor>,
-    timeout: Duration,
-    delivery: InboundDelivery,
-    authority: fn(&mut M) -> &mut TurnAuthority,
-) where
-    SessionActor: RemoteMessage<M> + Message<M>,
-    M: serde::de::DeserializeOwned + Send + 'static,
-    <SessionActor as Message<M>>::Reply: Reply<Ok = R>,
-    <<SessionActor as Message<M>>::Reply as Reply>::Error: Into<AgentError>,
-    R: serde::Serialize + Send + 'static,
-{
-    let weak = actor.downgrade();
-    let store = store.clone();
-    let handle = move |origin: PeerRequest, mut message: M| {
-        let weak = weak.clone();
+    fn turn<M>(
+        router: &InboundRouter,
+        store: &Arc<dyn GrantStore>,
+        actor: &ActorRef<SessionActor>,
+        timeouts: CallTimeouts,
+        authority: fn(&mut M) -> &mut TurnAuthority,
+    ) where
+        SessionActor: RemoteMessage<M> + Message<M>,
+        <SessionActor as Message<M>>::Reply: Reply<Ok: serde::Serialize + Send>,
+        <<SessionActor as Message<M>>::Reply as Reply>::Error: WireError<Wire = AgentError>,
+        M: serde::de::DeserializeOwned + Send + 'static,
+    {
         let store = store.clone();
-        async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
-            *authority(&mut message) =
-                TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store)?));
-            actor
-                .ask(message)
-                .mailbox_timeout(Duration::from_secs(10))
-                .reply_timeout(timeout)
-                .send()
-                .await
-                .map_err(|error| local_session_error(error.map_err(Into::into)))
-        }
-    };
-    router.register::<SessionActor, M, _, _, _, _>(
-        actor.id(),
-        delivery,
-        InboundAccess::Sessions,
-        handle,
-    );
+        route::<SessionActor, M, M, _>(
+            router,
+            actor,
+            InboundDelivery::Ask,
+            InboundAccess::Sessions,
+            timeouts,
+            move |origin, mut message| {
+                *authority(&mut message) =
+                    TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store.clone())?));
+                Ok(message)
+            },
+        );
+    }
+    turn::<messages::Prompt>(router, &store, actor, TURN, |msg| &mut msg.authority);
+    turn::<messages::SubmitSessionInput>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
+    turn::<messages::DiscardQueuedInput>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
+    turn::<messages::GetRuntimeStatus>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
+    turn::<messages::Cancel>(router, &store, actor, CONTROL, |msg| &mut msg.authority);
 }
 
 pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
     use crate::agent::session_actor::{GetPeerFileIndex, ReadPeerFile};
 
-    let weak = actor.downgrade();
-    let index = move |_, _: messages::GetFileIndex| {
-        let weak = weak.clone();
-        async move {
-            let actor = weak.upgrade().ok_or_else(|| {
-                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
-            })?;
-            actor
-                .ask(GetPeerFileIndex)
-                .mailbox_timeout(Duration::from_secs(3))
-                .reply_timeout(Duration::from_secs(10))
-                .send()
-                .await
-                .map_err(file_proxy_send_error)
-        }
-    };
-    let weak = actor.downgrade();
-    let read = move |_, message| {
-        let weak = weak.clone();
-        async move {
-            let actor = weak.upgrade().ok_or_else(|| {
-                file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
-            })?;
-            actor
-                .ask(ReadPeerFile(message))
-                .mailbox_timeout(Duration::from_secs(3))
-                .reply_timeout(Duration::from_secs(30))
-                .send()
-                .await
-                .map_err(file_proxy_send_error)
-        }
-    };
-    router.register::<SessionActor, messages::GetFileIndex, _, _, _, _>(
-        actor.id(),
+    route::<_, messages::GetFileIndex, _, _>(
+        router,
+        actor,
         InboundDelivery::Ask,
         InboundAccess::Filesystem,
-        index,
+        FAST_INDEX,
+        |_, _| Ok(GetPeerFileIndex),
     );
-    router.register::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
-        actor.id(),
+    route::<_, messages::ReadRemoteFile, _, _>(
+        router,
+        actor,
         InboundDelivery::Ask,
         InboundAccess::Filesystem,
-        read,
+        FAST_READ,
+        |_, message| Ok(ReadPeerFile(message)),
     );
-}
-
-fn file_actor_unavailable(
-    delivery: querymt_remote::DeliveryCertainty,
-) -> crate::agent::file_proxy::FileProxyError {
-    crate::agent::file_proxy::FileProxyError::from_transport_failure(
-        querymt_remote::RemoteTransportFailure::new(
-            querymt_remote::RemoteTransportFailureKind::ActorUnavailable,
-            delivery,
-            "session stopped",
-        ),
-    )
-}
-
-fn file_proxy_send_error<M>(
-    error: kameo::error::SendError<M, crate::agent::file_proxy::FileProxyError>,
-) -> crate::agent::file_proxy::FileProxyError {
-    use crate::agent::file_proxy::FileProxyError;
-    match error {
-        kameo::error::SendError::HandlerError(error) => error,
-        kameo::error::SendError::ActorNotRunning(_)
-        | kameo::error::SendError::ActorRestarting(_) => {
-            file_actor_unavailable(querymt_remote::DeliveryCertainty::NotDelivered)
-        }
-        kameo::error::SendError::ActorStopped => {
-            file_actor_unavailable(querymt_remote::DeliveryCertainty::Unknown)
-        }
-        other => FileProxyError::ActorSend(other.to_string()),
-    }
 }
 
 pub(super) fn register_session_subscriptions(
     router: &InboundRouter,
     mesh: &querymt_remote::MeshHandle,
-    store: std::sync::Arc<dyn querymt_remote::peer_access::GrantStore>,
+    store: Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
 ) {
-    let weak = actor.downgrade();
     let egress = mesh.sharing_egress();
-    let subscribe = move |origin: PeerRequest, message| {
-        let weak = weak.clone();
-        let subscriber = PeerSubscription {
-            egress: egress.clone(),
-            store: store.clone(),
-            changes: origin.take_policy_changes(),
-            origin,
-        };
-        async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
-            actor
-                .ask(SubscribePeerEvents {
-                    message,
-                    subscriber,
-                })
-                .mailbox_timeout(Duration::from_secs(3))
-                .reply_timeout(Duration::from_secs(10))
-                .send()
-                .await
-                .map_err(local_session_error)
-        }
-    };
-    router.register::<SessionActor, messages::SubscribeEvents, _, _, _, _>(
-        actor.id(),
+    route::<_, messages::SubscribeEvents, _, _>(
+        router,
+        actor,
         InboundDelivery::Ask,
         InboundAccess::Sessions,
-        subscribe,
+        FAST_INDEX,
+        move |origin, message| {
+            Ok(SubscribePeerEvents {
+                message,
+                subscriber: PeerSubscription {
+                    egress: egress.clone(),
+                    store: store.clone(),
+                    changes: origin.take_policy_changes(),
+                    origin,
+                },
+            })
+        },
     );
-
-    let weak = actor.downgrade();
-    let unsubscribe = move |origin: querymt_remote::mesh_ingress::PeerRequest, message| {
-        let weak = weak.clone();
-        async move {
-            let actor = weak
-                .upgrade()
-                .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
-            actor
-                .ask(UnsubscribePeerEvents {
-                    message,
-                    peer: *origin.key().peer.as_peer_id(),
-                })
-                .mailbox_timeout(Duration::from_secs(3))
-                .reply_timeout(Duration::from_secs(10))
-                .send()
-                .await
-                .map_err(local_session_error)
-        }
-    };
-    router.register::<SessionActor, messages::UnsubscribeEvents, _, _, _, _>(
-        actor.id(),
+    route::<_, messages::UnsubscribeEvents, _, _>(
+        router,
+        actor,
         InboundDelivery::Ask,
         InboundAccess::Sessions,
-        unsubscribe,
+        FAST_INDEX,
+        |origin, message| {
+            Ok(UnsubscribePeerEvents {
+                message,
+                peer: *origin.key().peer.as_peer_id(),
+            })
+        },
     );
-}
-
-fn local_session_error<M>(error: kameo::error::SendError<M, AgentError>) -> AgentError {
-    match error {
-        kameo::error::SendError::HandlerError(error) => error,
-        other => AgentError::RemoteActor(other.to_string()),
-    }
 }
 
 // ── RemoteActor ──────────────────────────────────────────────────────────
@@ -545,45 +549,9 @@ remote_msg_impl!(
     REG_SESSION_DELIVERY_BARRIER
 );
 remote_msg_impl!(
-    messages::SetProvider,
-    "querymt::SetProvider",
-    REG_SET_PROVIDER
-);
-remote_msg_impl!(
     messages::SetLlmConfig,
     "querymt::SetLlmConfig",
     REG_SET_LLM_CONFIG
-);
-remote_msg_impl!(
-    messages::SetToolPolicy,
-    "querymt::SetToolPolicy",
-    REG_SET_TOOL_POLICY
-);
-remote_msg_impl!(
-    messages::SetAllowedTools,
-    "querymt::SetAllowedTools",
-    REG_SET_ALLOWED_TOOLS
-);
-remote_msg_impl!(
-    messages::ClearAllowedTools,
-    "querymt::ClearAllowedTools",
-    REG_CLEAR_ALLOWED_TOOLS
-);
-remote_msg_impl!(
-    messages::SetDeniedTools,
-    "querymt::SetDeniedTools",
-    REG_SET_DENIED_TOOLS
-);
-remote_msg_impl!(
-    messages::ClearDeniedTools,
-    "querymt::ClearDeniedTools",
-    REG_CLEAR_DENIED_TOOLS
-);
-remote_msg_impl!(messages::ExtMethod, "querymt::ExtMethod", REG_EXT_METHOD);
-remote_msg_impl!(
-    messages::ExtNotification,
-    "querymt::ExtNotification",
-    REG_EXT_NOTIFICATION
 );
 remote_msg_impl!(
     messages::SubscribeEvents,

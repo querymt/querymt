@@ -1755,17 +1755,18 @@ mod node_manager_tests {
             Err(SharingRejection::Denied)
         ));
         set_grant(PeerGrant::Full);
-        let legacy_cancel = kameo::remote::messaging::SwarmRequest::Tell {
+        let legacy_cancel = kameo::remote::messaging::SwarmRequest::Ask {
             actor_id: session.id(),
             actor_remote_id: "querymt::SessionActor".into(),
             message_remote_id: "querymt::Cancel".into(),
             payload: vec![0x90], // Legacy MessagePack unit struct.
             mailbox_timeout: None,
+            reply_timeout: None,
             immediate: false,
         };
         assert!(matches!(
             ingress.handle_legacy(peer, legacy_cancel).await,
-            SwarmResponse::Tell(Ok(()))
+            SwarmResponse::Ask(Ok(_))
         ));
 
         let mut prompt = Prompt::new(crate::acp::protocol::PromptRequest::new(id.clone(), vec![]));
@@ -2551,6 +2552,125 @@ mod node_manager_tests {
                 .schedules
                 .is_empty()
         );
+    }
+
+    /// A guarded owner dispatches only routed messages, so every wire message a
+    /// node manager or session declares must have a route, and each route must
+    /// require the access pinned here. Widening a route's access, or routing a
+    /// new message, has to update this table on purpose.
+    #[tokio::test]
+    async fn guarded_routes_cover_every_declared_wire_message() {
+        use crate::agent::remote::remote_actor_impl::register_session_routes;
+        use kameo::remote::{_internal, RemoteActor};
+        use querymt_remote::mesh_ingress::InboundAccess::{Filesystem, Full, Identity, Sessions};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let expected_node_manager = BTreeMap::from([
+            ("querymt::AdmissionRequest", Identity),
+            ("querymt::GetNodeInfo", Identity),
+            ("querymt::CreateRemoteSchedule", Sessions),
+            ("querymt::ListRemoteSchedules", Sessions),
+            ("querymt::PauseRemoteSchedule", Sessions),
+            ("querymt::ResumeRemoteSchedule", Sessions),
+            ("querymt::TriggerRemoteSchedule", Sessions),
+            ("querymt::DeleteRemoteSchedule", Sessions),
+            ("querymt::ResumeRemoteSession", Sessions),
+            ("querymt::CreateRemoteSession", Sessions),
+            ("querymt::CreateRemoteSessionWithProfile", Sessions),
+            ("querymt::ForkRemoteSession", Sessions),
+            ("querymt::SetRemoteSessionLifecycle", Sessions),
+            ("querymt::StopRemoteSessionRuntime", Sessions),
+            ("querymt::GetRemoteSessionProfile", Sessions),
+            ("querymt::ListRemoteSessions", Sessions),
+            ("querymt::ListRemoteSessionsWithLifecycle", Sessions),
+            ("querymt::GetRemoteSessionLifecycle", Sessions),
+            ("querymt::ListRemoteProfiles", Sessions),
+            ("querymt::GetRemoteDelegateModels", Sessions),
+            ("querymt::CreateRemoteDelegationSession", Full),
+            ("querymt::SetRemoteDelegateModel", Full),
+        ]);
+        let expected_session = BTreeMap::from([
+            ("querymt::GetHistory", Sessions),
+            ("querymt::GetUserPrompts", Sessions),
+            ("querymt::GetEventStream", Sessions),
+            ("querymt::GetEventStreamSince", Sessions),
+            ("querymt::GetEventStreamChunk", Sessions),
+            ("querymt::SessionDeliveryBarrier", Sessions),
+            ("querymt::GetSessionControl", Sessions),
+            ("querymt::GetMode", Sessions),
+            ("querymt::GetSessionLimits", Sessions),
+            // Provider parameters are stripped below a full grant.
+            ("querymt::GetLlmConfig", Sessions),
+            ("querymt::GetReasoningEffort", Sessions),
+            ("querymt::SetMode", Full),
+            ("querymt::SetReasoningEffort", Full),
+            ("querymt::SetSessionModel", Full),
+            ("querymt::SetLlmConfig", Full),
+            ("querymt::SetPlanningContext", Full),
+            ("querymt::Undo", Full),
+            ("querymt::Redo", Full),
+            ("querymt::GetFileIndex", Filesystem),
+            ("querymt::ReadRemoteFile", Filesystem),
+            ("querymt::SubscribeEvents", Sessions),
+            ("querymt::UnsubscribeEvents", Sessions),
+            // Turns carry the peer into the actor, which checks it per turn.
+            ("querymt::Prompt", Sessions),
+            ("querymt::SubmitSessionInput", Sessions),
+            ("querymt::DiscardQueuedInput", Sessions),
+            ("querymt::GetRuntimeStatus", Sessions),
+            ("querymt::Cancel", Sessions),
+            ("querymt::ListPendingInteractions", Sessions),
+            ("querymt::ClaimInteractionDelivery", Sessions),
+            ("querymt::ResolveInteraction", Sessions),
+        ]);
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let router = mesh.inbound_router().unwrap();
+        let (manager, _, _manager_dir) = spawn_test_node_manager_no_mesh().await;
+        RemoteNodeManager::register_guarded_discovery(
+            router,
+            mesh.quota_store().unwrap().clone(),
+            &manager,
+        );
+        let (SessionActorRef::Local(session), _) =
+            spawn_test_session_with_id(config, "route-coverage").await
+        else {
+            panic!("expected local fixture");
+        };
+        register_session_routes(&mesh, &session);
+
+        for (actor, actor_id, expected) in [
+            (
+                <RemoteNodeManager as RemoteActor>::REMOTE_ID,
+                manager.id(),
+                &expected_node_manager,
+            ),
+            (
+                <SessionActor as RemoteActor>::REMOTE_ID,
+                session.id(),
+                &expected_session,
+            ),
+        ] {
+            let routed: BTreeMap<_, _> = router.registered_messages(actor_id).into_iter().collect();
+            let declared: BTreeSet<_> = _internal::REMOTE_MESSAGES
+                .iter()
+                .filter(|(id, _)| id.actor_remote_id == actor)
+                .map(|(id, _)| id.message_remote_id)
+                .collect();
+            let unrouted: Vec<_> = declared
+                .iter()
+                .filter(|message| !routed.contains_key(*message))
+                .collect();
+            assert!(
+                unrouted.is_empty(),
+                "{actor} declares wire messages without a guarded route: {unrouted:?}"
+            );
+            assert_eq!(
+                &routed, expected,
+                "{actor} guarded routes differ from the pinned access table"
+            );
+        }
     }
 
     async fn bootstrap_guarded_lan(dir: &TempDir) -> querymt_remote::MeshHandle {

@@ -997,7 +997,7 @@ impl LocalAgentHandle {
                     message: e.message.clone(),
                 }
             })?;
-            self.resume_remote_session_typed(&node_manager, session_id)
+            self.resume_remote_session(&node_manager, session_id.to_string())
                 .await
                 .map_err(|e| {
                     // The host explicitly reports the session is absent (plain
@@ -1452,28 +1452,6 @@ impl LocalAgentHandle {
             }
         }
         None
-    }
-
-    /// `ResumeRemoteSession` with Phase-2 typed failure classification so
-    /// `RecoveryFailed` carries a real [`RemoteTransportFailure`] instead of a
-    /// string.
-    async fn resume_remote_session_typed(
-        &self,
-        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
-        session_id: &str,
-    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, AgentError> {
-        use crate::agent::remote::ResumeRemoteSession;
-        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
-        querymt_remote::request_timeout::ask_with_sharing(
-            &mesh,
-            node_manager_ref,
-            &ResumeRemoteSession {
-                session_id: session_id.to_string(),
-            },
-            Self::remote_request_timeout(),
-        )
-        .await
-        .map_err(AgentError::from_sharing_ask)
     }
 
     /// Whether a remote connect/recovery attempt is currently in flight for

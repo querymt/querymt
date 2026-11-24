@@ -1,3 +1,4 @@
+use crate::provider_client_runtime::CancelStreamFuture;
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
 use querymt::LLMProvider;
 use querymt::chat::{
@@ -6,6 +7,7 @@ use querymt::chat::{
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -267,6 +269,12 @@ where
         let lease_loss_grace = reconnect_grace
             .max(Duration::from_secs(1))
             .saturating_add(relay_timeout.saturating_mul(2));
+        let cancel_guard = Arc::new(CancelOnDrop::new(self.core.cancel_stream_future(
+            host_ref.clone(),
+            session_id.clone(),
+            request_id.clone(),
+            "stream consumer dropped",
+        )));
         let stream = futures_util::stream::unfold(
             Some((
                 raw_stream,
@@ -286,6 +294,7 @@ where
                 let setup_span = setup_span.clone();
                 let renew_lease = renew_lease_factory.clone();
                 let peer_alive_fn = peer_alive_fn.clone();
+                let cancel_guard = Arc::clone(&cancel_guard);
                 async move {
                     let (
                         mut raw_stream,
@@ -295,6 +304,7 @@ where
                         mut renewal,
                     ) = state?;
                     if stream_state.is_finished() {
+                        cancel_guard.disarm();
                         tracing::debug!(
                             target: "querymt_remote::provider::stream",
                             session_id = %session_id_for_stream,
@@ -308,6 +318,9 @@ where
                     if let Some((chunk, chunk_index, first_chunk_ms)) =
                         stream_state.take_pending(stream_start)
                     {
+                        if stream_state.is_finished() {
+                            cancel_guard.disarm();
+                        }
                         if let Some(first_chunk_ms) = first_chunk_ms {
                             setup_span.record("first_chunk_ms", first_chunk_ms);
                         }
@@ -399,6 +412,9 @@ where
                             peer_alive,
                         ) {
                             Ok(Some(chunk)) => {
+                                if stream_state.is_finished() {
+                                    cancel_guard.disarm();
+                                }
                                 break Some((
                                     Ok(chunk),
                                     Some((
@@ -423,6 +439,36 @@ where
         );
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// Cancels the host's stream when the consumer drops it before the terminal
+/// chunk, e.g. a cancelled run or a stopped session. Without it the host
+/// keeps generating until the stream lease expires.
+struct CancelOnDrop {
+    cancel: parking_lot::Mutex<Option<CancelStreamFuture>>,
+}
+
+impl CancelOnDrop {
+    fn new(cancel: CancelStreamFuture) -> Self {
+        Self {
+            cancel: parking_lot::Mutex::new(Some(cancel)),
+        }
+    }
+
+    /// The stream reached its terminal; there is nothing left to cancel.
+    fn disarm(&self) {
+        self.cancel.lock().take();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.get_mut().take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(cancel);
+        }
     }
 }
 
@@ -461,4 +507,35 @@ where
 impl<TTransport> LLMProvider for RemoteChatProvider<TTransport> where
     TTransport: RemoteProviderClientTransport + 'static
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn guard(cancelled: &Arc<AtomicBool>) -> CancelOnDrop {
+        let cancelled = Arc::clone(cancelled);
+        CancelOnDrop::new(Box::pin(async move {
+            cancelled.store(true, Ordering::SeqCst);
+        }))
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_stream_cancels_it_on_the_host() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        drop(guard(&cancelled));
+        tokio::task::yield_now().await;
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_sends_no_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = guard(&cancelled);
+        guard.disarm();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(!cancelled.load(Ordering::SeqCst));
+    }
 }

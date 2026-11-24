@@ -598,91 +598,92 @@ mod remote_impl {
             store: Arc<dyn querymt_remote::peer_access::GrantStore>,
             actor: &kameo::actor::ActorRef<Self>,
         ) {
-            use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
+            use crate::agent::remote::remote_actor_impl::{READ, route_direct, route_read};
 
             Self::register_admission(router, actor);
-            Self::register_peer_ask::<CreateRemoteSchedule, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
+            Self::register_node_info(router, store.clone(), actor);
+            macro_rules! peer {
+                ($($message:ty),+ $(,)?) => {
+                    $(Self::route_peer::<$message>(router, &store, actor);)+
+                };
+            }
+            peer!(
+                CreateRemoteSchedule,
+                ListRemoteSchedules,
+                PauseRemoteSchedule,
+                ResumeRemoteSchedule,
+                TriggerRemoteSchedule,
+                DeleteRemoteSchedule,
+                ResumeRemoteSession,
+                CreateRemoteSession,
+                CreateRemoteSessionWithProfile,
+                ForkRemoteSession,
+                SetRemoteSessionLifecycle,
+                StopRemoteSessionRuntime,
             );
-            Self::register_peer_ask::<ListRemoteSchedules, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            Self::register_peer_ask::<PauseRemoteSchedule, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            Self::register_peer_ask::<ResumeRemoteSchedule, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            Self::register_peer_ask::<TriggerRemoteSchedule, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            Self::register_peer_ask::<DeleteRemoteSchedule, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            use crate::agent::remote::remote_actor_impl::{
-                register_session_read, register_session_request,
-            };
-            Self::register_peer_ask::<ResumeRemoteSession, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            register_session_request::<_, CreateRemoteDelegationSession>(
+            route_read::<_, GetRemoteSessionProfile>(router, actor);
+            route_read::<_, ListRemoteSessions>(router, actor);
+            route_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
+            route_read::<_, GetRemoteSessionLifecycle>(router, actor);
+            route_read::<_, ListRemoteProfiles>(router, actor);
+            route_read::<_, GetRemoteDelegateModels>(router, actor);
+            // Delegation and delegate-model assignment act with the owner's tools
+            // and models, beyond what a session grant bounds.
+            route_direct::<_, CreateRemoteDelegationSession>(
                 router,
                 actor,
                 InboundAccess::Full,
+                READ,
             );
-            Self::register_peer_ask::<CreateRemoteSession, _>(
+            route_direct::<_, SetRemoteDelegateModel>(router, actor, InboundAccess::Full, READ);
+        }
+
+        /// Route a session-grant operation whose handler re-checks the
+        /// authenticated peer before its side effect.
+        fn route_peer<M>(
+            router: &InboundRouter,
+            store: &Arc<dyn querymt_remote::peer_access::GrantStore>,
+            actor: &kameo::actor::ActorRef<Self>,
+        ) where
+            Self: kameo::remote::RemoteMessage<M> + Message<PeerNodeRequest<M>>,
+            <Self as Message<PeerNodeRequest<M>>>::Reply:
+                kameo::reply::Reply<Error = AgentError, Ok: Serialize + Send>,
+            M: serde::de::DeserializeOwned + Send + 'static,
+        {
+            let store = store.clone();
+            crate::agent::remote::remote_actor_impl::route::<Self, M, _, _>(
                 router,
-                &store,
                 actor,
+                InboundDelivery::Ask,
                 InboundAccess::Sessions,
+                crate::agent::remote::remote_actor_impl::NODE_MUTATION,
+                move |origin, request| {
+                    let authority = Arc::new(PeerTurn::from_request(&origin, store.clone())?);
+                    Ok(PeerNodeRequest { request, authority })
+                },
             );
-            Self::register_peer_ask::<CreateRemoteSessionWithProfile, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            Self::register_peer_ask::<ForkRemoteSession, _>(
-                router,
-                &store,
-                actor,
-                InboundAccess::Sessions,
-            );
-            register_session_read::<_, GetRemoteSessionProfile>(router, actor);
-            register_session_read::<_, ListRemoteSessions>(router, actor);
-            register_session_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
-            register_session_read::<_, GetRemoteSessionLifecycle>(router, actor);
+        }
+
+        /// Node identity is public; its capabilities and session count are
+        /// trimmed to what the caller's grant allows.
+        fn register_node_info(
+            router: &InboundRouter,
+            store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+            actor: &kameo::actor::ActorRef<Self>,
+        ) {
+            use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
+
             let weak = actor.downgrade();
             let describe = move |origin: PeerRequest, msg: GetNodeInfo| {
                 let weak = weak.clone();
                 let store = store.clone();
                 async move {
-                    let actor = weak.upgrade().ok_or(AgentError::MeshNotBootstrapped)?;
-                    let mut info = actor.ask(msg).await.map_err(|error| match error {
-                        kameo::error::SendError::HandlerError(error) => error,
-                        _ => AgentError::MeshNotBootstrapped,
-                    })?;
+                    let mut info = crate::agent::remote::remote_actor_impl::ask_local(
+                        &weak,
+                        msg,
+                        crate::agent::remote::remote_actor_impl::READ,
+                    )
+                    .await?;
                     let protocol = origin.protocol();
                     let grant = store
                         .grant(origin.key())
@@ -705,43 +706,6 @@ mod remote_impl {
                 InboundDelivery::Ask,
                 InboundAccess::Identity,
                 describe,
-            );
-        }
-
-        fn register_peer_ask<M, R>(
-            router: &InboundRouter,
-            store: &Arc<dyn querymt_remote::peer_access::GrantStore>,
-            actor: &kameo::actor::ActorRef<Self>,
-            v1_access: InboundAccess,
-        ) where
-            Self: kameo::remote::RemoteMessage<M> + Message<PeerNodeRequest<M>>,
-            M: serde::de::DeserializeOwned + Send + 'static,
-            R: serde::Serialize + Send + 'static,
-            <Self as Message<PeerNodeRequest<M>>>::Reply:
-                kameo::reply::Reply<Ok = R, Error = AgentError>,
-        {
-            let weak = actor.downgrade();
-            let store = store.clone();
-            let handle = move |origin: PeerRequest, request| {
-                let weak = weak.clone();
-                let store = store.clone();
-                async move {
-                    let actor = weak.upgrade().ok_or(AgentError::MeshNotBootstrapped)?;
-                    let authority = Arc::new(PeerTurn::from_request(&origin, store)?);
-                    actor
-                        .ask(PeerNodeRequest { request, authority })
-                        .await
-                        .map_err(|error| match error {
-                            kameo::error::SendError::HandlerError(error) => error,
-                            _ => AgentError::MeshNotBootstrapped,
-                        })
-                }
-            };
-            router.register::<Self, M, _, _, _, _>(
-                actor.id(),
-                InboundDelivery::Ask,
-                v1_access,
-                handle,
             );
         }
 
@@ -2021,16 +1985,46 @@ mod remote_impl {
             msg: SetRemoteSessionLifecycle,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let store = self.shared_state.config.provider.history_store();
+            let state = self.shared_state.clone();
+            ctx.spawn(async move { state.patch_session_lifecycle(msg, None).await })
+        }
+    }
+
+    impl Message<PeerNodeRequest<SetRemoteSessionLifecycle>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<
+            Result<crate::session::lifecycle::SessionLifecycle, AgentError>,
+        >;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<SetRemoteSessionLifecycle>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
             ctx.spawn(async move {
-                crate::agent::handle::session_lifecycle::patch_stored_session_lifecycle(
-                    store.as_ref(),
-                    &msg.session_id,
-                    &msg.patch,
-                )
-                .await
-                .map_err(|error| AgentError::Internal(error.to_string()))
+                state
+                    .patch_session_lifecycle(msg.request, Some(&msg.authority))
+                    .await
             })
+        }
+    }
+
+    impl RemoteNodeManagerState {
+        async fn patch_session_lifecycle(
+            &self,
+            msg: SetRemoteSessionLifecycle,
+            peer: Option<&PeerTurn>,
+        ) -> Result<crate::session::lifecycle::SessionLifecycle, AgentError> {
+            if let Some(peer) = peer {
+                peer.check_mutation().await?;
+            }
+            crate::agent::handle::session_lifecycle::patch_stored_session_lifecycle(
+                self.config.provider.history_store().as_ref(),
+                &msg.session_id,
+                &msg.patch,
+            )
+            .await
+            .map_err(|error| AgentError::Internal(error.to_string()))
         }
     }
 
@@ -2413,6 +2407,105 @@ mod remote_impl {
         replacement.shutdown().await;
     }
 
+    /// A sessions-only peer cannot stop a runtime whose turn it could not
+    /// cancel; the session stays loaded. The owner's stop removes it only once
+    /// the actor has stopped.
+    #[cfg(test)]
+    #[tokio::test]
+    async fn peer_stop_keeps_a_session_running_an_owner_turn() {
+        use crate::agent::session_actor::RunSlot;
+        use crate::agent::turn_control::ActiveRun;
+        use kameo::actor::Spawn;
+        use querymt_remote::{
+            MeshAccessStore, MeshStateStore,
+            peer_access::{GrantStore, PeerGrant, PeerGrantKey},
+        };
+
+        let (config, _plugins) = crate::agent::remote::tests::test_agent_config().await;
+        let session_id = config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let manager = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config.clone(),
+            registry.clone(),
+            None,
+            Arc::new(parking_lot::Mutex::new(None)),
+        ));
+        let mut session = SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        session.run = RunSlot::Running(
+            ActiveRun::new(
+                querymt_agent_core::model::TurnId::new(),
+                1,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            TurnAuthority::Local,
+        );
+        let session = SessionActor::spawn(session);
+        registry
+            .lock()
+            .await
+            .insert(session_id.clone(), session.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Arc::new(MeshAccessStore::new(
+            MeshStateStore::shared(&dir.path().join("mesh_state.json")).unwrap(),
+        ));
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(libp2p::PeerId::random()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let grant = PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        };
+        grants
+            .replace_grant(&key, uuid::Uuid::nil(), grant.clone())
+            .await
+            .unwrap();
+        let peer = PeerTurn::test_peer(key, grant, grants);
+
+        let denied = manager
+            .ask(PeerNodeRequest {
+                authority: peer,
+                request: StopRemoteSessionRuntime {
+                    session_id: session_id.clone(),
+                },
+            })
+            .await;
+        assert!(matches!(
+            denied,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshAccessDenied
+            ))
+        ));
+        assert!(session.is_alive());
+        assert!(registry.lock().await.get(&session_id).is_some());
+
+        manager
+            .ask(StopRemoteSessionRuntime {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("owner stop");
+        assert!(!session.is_alive());
+        assert!(registry.lock().await.get(&session_id).is_none());
+    }
+
     impl Message<ListRemoteSchedules> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSchedulesResponse, AgentError>>;
 
@@ -2451,100 +2544,144 @@ mod remote_impl {
     impl Message<StopRemoteSessionRuntime> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
 
-        #[tracing::instrument(
-            name = "remote.node_manager.stop_session_runtime",
-            skip(self, ctx),
-            fields(session_id = %msg.session_id, found = tracing::field::Empty)
-        )]
         async fn handle(
             &mut self,
             msg: StopRemoteSessionRuntime,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move { state.stop_session_runtime(msg, None).await })
+        }
+    }
+
+    impl Message<PeerNodeRequest<StopRemoteSessionRuntime>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerNodeRequest<StopRemoteSessionRuntime>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .stop_session_runtime(msg.request, Some(&msg.authority))
+                    .await
+            })
+        }
+    }
+
+    impl RemoteNodeManagerState {
+        /// Stop a session's runtime and unload it.
+        ///
+        /// The registry entry is removed only once the actor has stopped, so a
+        /// stop that could not be confirmed returns an error and can be
+        /// retried against the same actor. The per-session materialization
+        /// lock keeps a concurrent resume from spawning a second actor while
+        /// the first one stops.
+        #[tracing::instrument(
+            name = "remote.node_manager.stop_session_runtime",
+            skip(self, peer),
+            fields(session_id = %msg.session_id, found = tracing::field::Empty)
+        )]
+        async fn stop_session_runtime(
+            &self,
+            msg: StopRemoteSessionRuntime,
+            peer: Option<&Arc<PeerTurn>>,
+        ) -> Result<(), AgentError> {
+            use crate::agent::remote::SessionActorRef;
+
+            // Bound shutdown latency so stop requests cannot hang forever
+            // if an actor is unresponsive.
+            const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
             tracing::debug!(
                 session_id = %msg.session_id,
-                "StopRemoteSessionRuntime received"
+                "StopRemoteSessionRuntime started"
             );
-            let shared_state = self.shared_state.clone();
+            let ticket = MaterializationTicket::new(&self.materialization_locks, &msg.session_id);
+            let _materializing = ticket.lock.lock().await;
+            let registry = self.session_registry(&msg.session_id).await?;
+            let session_ref = registry.lock().await.get(&msg.session_id).cloned();
+            let Some(session_ref) = session_ref else {
+                tracing::Span::current().record("found", false);
+                return Err(AgentError::SessionNotFound {
+                    session_id: msg.session_id.clone(),
+                });
+            };
+            tracing::Span::current().record("found", true);
 
-            ctx.spawn(async move {
-                tracing::debug!(
-                    session_id = %msg.session_id,
-                    "StopRemoteSessionRuntime spawned task started"
-                );
-                let session_ref = {
-                    let registry = shared_state.session_registry(&msg.session_id).await?;
-                    let mut registry = registry.lock().await;
-                    let removed = registry.remove(&msg.session_id);
-                    tracing::debug!(
-                        session_id = %msg.session_id,
-                        found = removed.is_some(),
-                        "StopRemoteSessionRuntime removed session from registry"
-                    );
-                    removed
-                };
-
-                if let Some(session_ref) = session_ref {
-                    tracing::Span::current().record("found", true);
-
-                    // Bound shutdown latency so stop requests cannot hang forever
-                    // if an actor is unresponsive.
-                    let shutdown_timeout = std::time::Duration::from_secs(2);
-                    tracing::debug!(
-                        session_id = %msg.session_id,
-                        timeout_ms = shutdown_timeout.as_millis(),
-                        "StopRemoteSessionRuntime beginning session shutdown"
-                    );
-                    match session_ref
-                        .shutdown_with_timeout(shutdown_timeout, shutdown_timeout)
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(AgentError::SessionTimeout { .. }) => {
-                            log::warn!(
-                                "RemoteNodeManager: shutdown timed out for session {} after {:?}",
-                                msg.session_id,
-                                shutdown_timeout
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "RemoteNodeManager: shutdown error for session {}: {}",
-                                msg.session_id,
-                                e
-                            );
-                        }
-                    }
-
-                    // Ensure this session's re-registration closure is removed from the
-                    // mesh handle so repeated create/stop cycles don't leak entries.
-                    if let Some(ref mesh) = shared_state.mesh {
-                        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-                        for scope in runtime.active_scopes() {
-                            let dht_name = crate::agent::remote::scope::scoped_session(
-                                &scope,
-                                &msg.session_id,
-                            );
-                            runtime.deregister_actor(&dht_name);
-                        }
-                    }
-
-                    log::info!(
-                        "RemoteNodeManager: stopped runtime for session {}",
-                        msg.session_id
-                    );
-                    tracing::debug!(
-                        session_id = %msg.session_id,
-                        "StopRemoteSessionRuntime completed successfully"
-                    );
-                    Ok(())
-                } else {
-                    tracing::Span::current().record("found", false);
-                    Err(AgentError::SessionNotFound {
-                        session_id: msg.session_id.clone(),
-                    })
+            let actor = match session_ref {
+                SessionActorRef::Local(actor) => actor,
+                // An owner registry holds local actors; drop anything else.
+                SessionActorRef::Remote { .. } => {
+                    registry.lock().await.remove(&msg.session_id);
+                    return Ok(());
                 }
-            })
+            };
+            tracing::debug!(
+                session_id = %msg.session_id,
+                timeout_ms = SHUTDOWN_TIMEOUT.as_millis(),
+                "StopRemoteSessionRuntime beginning session shutdown"
+            );
+            let not_stopped = |error: &dyn std::fmt::Display| AgentError::SessionTimeout {
+                details: format!("session {} did not stop: {error}", msg.session_id),
+            };
+            let requested = match peer {
+                // The session checks the peer's grant and turn ownership in
+                // the handler that stops it.
+                Some(peer) => match actor
+                    .ask(crate::agent::session_actor::PeerShutdown(peer.clone()))
+                    .mailbox_timeout(SHUTDOWN_TIMEOUT)
+                    .reply_timeout(SHUTDOWN_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(kameo::error::SendError::HandlerError(error)) => return Err(error),
+                    Err(error) => Err(error.to_string()),
+                },
+                None => actor
+                    .tell(crate::agent::messages::Shutdown)
+                    .mailbox_timeout(SHUTDOWN_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            // An actor that is no longer running has stopped already.
+            if let Err(error) = requested
+                && actor.is_alive()
+            {
+                return Err(not_stopped(&error));
+            }
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, actor.wait_for_shutdown())
+                .await
+                .map_err(|_| not_stopped(&"shutdown timed out"))?;
+            registry
+                .lock()
+                .await
+                .remove_local_if_same_actor(&msg.session_id, actor.id());
+
+            // Ensure this session's re-registration closure is removed from the
+            // mesh handle so repeated create/stop cycles don't leak entries.
+            if let Some(ref mesh) = self.mesh {
+                let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                for scope in runtime.active_scopes() {
+                    let dht_name =
+                        crate::agent::remote::scope::scoped_session(&scope, &msg.session_id);
+                    runtime.deregister_actor(&dht_name);
+                }
+            }
+
+            log::info!(
+                "RemoteNodeManager: stopped runtime for session {}",
+                msg.session_id
+            );
+            tracing::debug!(
+                session_id = %msg.session_id,
+                "StopRemoteSessionRuntime completed successfully"
+            );
+            Ok(())
         }
     }
 

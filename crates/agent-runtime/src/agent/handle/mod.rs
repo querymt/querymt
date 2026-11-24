@@ -206,22 +206,3 @@ impl Drop for DelegationService {
 pub type ProfileRuntime = Arc<dyn ProfileRuntimeHost>;
 pub type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
-
-// ── Remote node lookup type aliases ─────────────────────────────────────────
-// These aliases improve readability of the complex async types used for
-// concurrent remote node discovery operations.
-
-#[cfg(feature = "remote")]
-type RemoteNodeInfoResult = Result<
-    crate::agent::remote::NodeInfo,
-    querymt_remote::request_timeout::SharingAskError<crate::error::AgentError>,
->;
-
-#[cfg(feature = "remote")]
-type RemoteNodeLookupResult = (String, Option<libp2p::PeerId>, RemoteNodeInfoResult);
-
-#[cfg(feature = "remote")]
-type RemoteNodeLookupFuture = futures_util::future::BoxFuture<'static, RemoteNodeLookupResult>;
-
-#[cfg(feature = "remote")]
-type RemoteNodeLookupQueue = futures_util::stream::FuturesUnordered<RemoteNodeLookupFuture>;
