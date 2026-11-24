@@ -424,6 +424,29 @@ impl PeerTurn {
         Ok(self.pinned.clone())
     }
 
+    /// Whether `node` is the prompting peer's own node. A model there runs on
+    /// the peer's resources, under the grant that node gives this host, so
+    /// this host's model grant and quotas do not govern it.
+    pub(crate) fn is_peer_node(&self, node: Option<&str>) -> bool {
+        node.is_some_and(|node| {
+            querymt_remote::NodeId::parse(node).is_ok_and(|node| node == self.key.peer)
+        })
+    }
+
+    /// The `(provider, model)` this host's grant must allow for a turn on
+    /// `session`: none when the model runs on the peer's own node.
+    pub(crate) fn host_binding<'a>(
+        &self,
+        session: &'a crate::session::provider::SessionHandle,
+    ) -> Option<(&'a str, &'a str)> {
+        if self.is_peer_node(session.provider_node_id()) {
+            return None;
+        }
+        session
+            .llm_config()
+            .map(|config| (config.provider.as_str(), config.model.as_str()))
+    }
+
     pub(crate) fn allows_shell(&self) -> bool {
         self.grant_allows_shell(&self.pinned)
     }
@@ -3776,9 +3799,9 @@ async fn execute_authorized_prompt(
             .with_session(&exec.session_id)
             .await
             .map_err(|error| AgentError::Internal(error.to_string()))?;
-        let binding = session
-            .llm_config()
-            .map(|config| (config.provider.clone(), config.model.clone()));
+        let binding = peer
+            .host_binding(&session)
+            .map(|(provider, model)| (provider.to_string(), model.to_string()));
         let binding = binding
             .as_ref()
             .map(|(provider, model)| (provider.as_str(), model.as_str()));
@@ -3959,8 +3982,7 @@ async fn execute_prompt_inner(
             }
             let binding = pinned_session
                 .as_ref()
-                .and_then(|session| session.llm_config())
-                .map(|config| (config.provider.as_str(), config.model.as_str()));
+                .and_then(|session| peer.host_binding(session));
             Some((peer, peer.grant_for(binding).await?))
         }
     };

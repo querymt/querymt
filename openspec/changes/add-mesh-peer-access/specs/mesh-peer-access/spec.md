@@ -109,6 +109,58 @@ Full access SHALL grant sessions, filesystem, shell, and all providers and model
 - **WHEN** a Full access peer uses a shareable operation that the host's existing policies already allow without a prompt
 - **THEN** it proceeds without a mesh approval prompt, and an existing host always-ask rule still applies to operations it covers
 
+### Requirement: A hosted session may run on the prompting peer's own model
+
+A peer with session access SHALL be able to bind a hosted session to a model on its own node and run turns with it. The host SHALL route that inference to the peer's node and SHALL NOT apply its own model grant or quotas to it; the peer's node SHALL authorize and meter the host under the grant it gives the host. Below Full access, a peer SHALL NOT be able to select one of the host's own models for a hosted session.
+
+#### Scenario: A peer runs a remote session with its own model
+- **WHEN** a host gives a peer session access, the peer's node gives the host access to a model, and the peer prompts a hosted session bound to that model on its node
+- **THEN** the host sends the inference to the peer's node without checking or charging its own model grant, and the peer's node admits it under its grant for the host
+
+#### Scenario: Selecting a host model needs Full access
+- **WHEN** a peer below Full access selects one of the host's own models for a hosted session
+- **THEN** the host refuses the selection with an access denial and leaves the session's model unchanged
+
+### Requirement: A hosted session may run on a third node's model
+
+A peer with session access SHALL be able to bind a hosted session to a model on a node other than the host and itself; the binding alone SHALL NOT confer use of that model. A hosted turn on such a model SHALL run only under a model pass from the prompting peer, or, without a pass, under the host's own access on the model node when the prompting peer has Full access on the host.
+
+#### Scenario: A prompter lends its model access to a hosted session
+- **WHEN** a host gives a peer Custom access with Sessions On and no providers, a model node grants that peer a model and grants the host nothing, and the peer binds a hosted session to that model and prompts it with a model pass
+- **THEN** the model node serves the host's inference for that turn under the peer's grant, and the host checks neither its own model grant nor its own quotas
+
+#### Scenario: Full access may use the host's own access
+- **WHEN** a peer with Full access on the host prompts a session bound to a third node's model without a pass
+- **THEN** the host dispatches under its own grant on the model node, which authorizes and meters the host
+
+#### Scenario: Below Full, a third node needs a pass
+- **WHEN** a peer below Full access prompts a session bound to a third node's model without a pass, or that peer's scheduled turn starts on such a session
+- **THEN** the host refuses the turn with an access denial and dispatches nothing
+
+### Requirement: A model pass lends the issuer's access to one host
+
+A model pass SHALL be signed by the prompting peer's mesh identity and name the host, the model node, the provider and model, the session, and an expiry. A node SHALL issue passes only for prompts its own owner submits. The model node SHALL accept a pass only from the transport-authenticated host it names, SHALL authorize each inference attempt against the issuer's current grant, and SHALL NOT require a grant for the host.
+
+#### Scenario: A pass admits only what it names
+- **WHEN** a model node receives a pass from a node other than the host it names, a pass naming another model node, provider or model, an expired or altered pass, or a pass whose issuer has no access to the model
+- **THEN** it refuses the request without upstream work and does not evaluate the caller's own grant instead
+
+#### Scenario: Revoking the issuer stops the host
+- **WHEN** the model node's owner removes the issuer's access to the model while the host is receiving a stream under the issuer's pass
+- **THEN** the model node stops delivery, cancels the attempt at the next supported boundary, and refuses later attempts under that pass
+
+### Requirement: The session host forwards only the prompter's pass
+
+The session host SHALL require session access for the prompting peer, SHALL forward only a pass issued by the peer that submitted the turn, and SHALL NOT apply its own model grant or quotas to a turn under a pass. A refused pass SHALL NOT fall back to the host's own access, and the host SHALL NOT use its own access when the model node does not support passes.
+
+#### Scenario: The host forwards only the prompter's pass
+- **WHEN** a peer submits a turn with a pass issued by another peer, or a pass for another host, session or model binding
+- **THEN** the host refuses the turn with an access denial and sends nothing to the model node
+
+#### Scenario: A model node without pass support is not used
+- **WHEN** a host sends a pass and the model node does not confirm that it charges the pass's issuer
+- **THEN** the host refuses the turn and does not use its own access on the model node
+
 ### Requirement: Access changes apply to existing peer work
 
 Each protected operation, including deferred work after restart, SHALL use the current grant of its authenticated initiator. Revocation SHALL stop affected delivery and cancel affected work at the next supported boundary without undoing committed effects or interrupting unrelated work. Peers SHALL NOT take over more privileged execution or supply another peer's callback.

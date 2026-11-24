@@ -156,9 +156,10 @@ async fn legacy_router_requires_transport_bound_full_grant() {
     let actor = ActorId::new_with_peer_id(17, host);
     let store = Arc::new(TestStore::default());
     let router = InboundRouter::new(host, store.clone());
+    // An actor that is not exported, such as one from before a restart, is gone.
     assert!(matches!(
         router.ask(allowed, request(actor, allowed)).await,
-        Err(RemoteSendError::UnknownMessage { .. })
+        Err(RemoteSendError::ActorNotRunning)
     ));
     router.register::<FixtureActor, Echo, _, String, _, _>(
         actor,

@@ -334,6 +334,15 @@
   literals), `AccessEdit` has a new `Inherit` variant, `GrantStore` gains
   defaulted `grant_source` and `access_defaults`, and the grant-aware wire adds
   a trust presentation exchange.
+- **Mesh remote sessions with your own model:** a remote session bound to a
+  model on the prompting node no longer fails with `mesh_access_denied`. The
+  host sends that inference back to the prompting node, which authorizes and
+  meters it, instead of checking its own model grant and quotas. Session access
+  is enough to select such a model; other selections still need Full. Hosted
+  turns still refuse models on a third node. A request for an actor that is not
+  exported, such as one from before the host restarted, now fails as
+  `ActorNotRunning` instead of an unknown message, so clients reattach. Hosts
+  log refused mesh requests and denied turns with the reason.
 - **Mesh quotas:** Provider and model quotas apply to all shared models on Custom
   grants. Direct calls and hosted turns use the same prompt-plus-output estimate.
   Actual usage is charged even above the estimate; missing usage is charged at

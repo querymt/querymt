@@ -310,14 +310,21 @@ impl InboundRouter {
         let route_key = (actor_remote_id.as_ref(), message_remote_id.as_ref());
         let route = {
             let routes = self.routes.read();
-            let actor_routes = routes.get(&actor_id);
-            if actor_routes.is_none()
-                && actor_remote_id == <crate::ProviderHostActor as RemoteActor>::REMOTE_ID
-            {
+            let Some(actor_routes) = routes.get(&actor_id) else {
+                // No exported actor has this ID: it stopped, or the reference
+                // predates a restart of this node. Report it as gone so the
+                // caller re-resolves the actor instead of seeing a version
+                // mismatch.
+                tracing::debug!(
+                    %peer,
+                    actor = %actor_remote_id,
+                    message_id = %message_remote_id,
+                    "mesh request for an actor that is not exported"
+                );
                 return Ok(Err(RemoteSendError::ActorNotRunning));
-            }
+            };
             actor_routes
-                .and_then(|routes| routes.get(&route_key))
+                .get(&route_key)
                 .filter(|route| route.delivery.accepts(protocol, delivery))
                 .cloned()
         };
@@ -326,7 +333,7 @@ impl InboundRouter {
             tracing::warn!(
                 %peer,
                 actor = %actor_remote_id,
-                message = %message_remote_id,
+                message_id = %message_remote_id,
                 ?protocol,
                 ?delivery,
                 "mesh request has no guarded route"
@@ -351,7 +358,21 @@ impl InboundRouter {
                 changes.as_ref().map(broadcast::Receiver::resubscribe),
             )),
         };
-        origin.grant = self.authorize(&origin, route.access).await?;
+        origin.grant = match self.authorize(&origin, route.access).await {
+            Ok(grant) => grant,
+            Err(rejection) => {
+                tracing::info!(
+                    %peer,
+                    actor = %actor_remote_id,
+                    message_id = %message_remote_id,
+                    access = ?route.access,
+                    ?protocol,
+                    ?rejection,
+                    "mesh request refused"
+                );
+                return Err(rejection);
+            }
+        };
         let is_current = {
             self.routes
                 .read()

@@ -254,12 +254,50 @@ fn register_session_controls(router: &InboundRouter, actor: &ActorRef<SessionAct
     full!(
         messages::SetMode,
         messages::SetReasoningEffort,
-        messages::SetSessionModel,
         messages::SetLlmConfig,
         messages::SetPlanningContext,
         messages::Undo,
         messages::Redo,
     );
+    // Selecting a model on the caller's own node spends nothing on this host:
+    // that node authorizes and meters the calls, so the session grant is
+    // enough. Any other selection still needs full access.
+    route::<_, messages::SetSessionModel, _, _>(
+        router,
+        actor,
+        InboundDelivery::Ask,
+        InboundAccess::Sessions,
+        READ,
+        |origin, message: messages::SetSessionModel| {
+            let full = matches!(
+                origin.grant(),
+                Some(querymt_remote::peer_access::PeerGrant::Full)
+            );
+            if full || selects_caller_node(&origin, &message.selection) {
+                Ok(message)
+            } else {
+                tracing::warn!(
+                    peer = %origin.key().peer,
+                    model = %message.selection.model_id,
+                    provider_node = message.selection.provider_node_id.as_deref().unwrap_or(""),
+                    "mesh model selection denied: only full access may select a model on this host"
+                );
+                Err(AgentError::MeshAccessDenied)
+            }
+        },
+    );
+}
+
+/// Whether `selection` pins the session's model to the requesting peer's node.
+fn selects_caller_node(
+    origin: &PeerRequest,
+    selection: &crate::agent::session_control::SessionModelSelection,
+) -> bool {
+    selection
+        .provider_node_id
+        .as_deref()
+        .and_then(|node| querymt_remote::NodeId::parse(node).ok())
+        .is_some_and(|node| node == origin.key().peer)
 }
 
 fn register_session_interactions(

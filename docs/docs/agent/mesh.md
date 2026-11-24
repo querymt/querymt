@@ -978,6 +978,8 @@ Manage grants and quotas through ACP. When the mesh access store is configured, 
 
 ### Default Access
 
+Access is one-way: each node decides what it gives the nodes that call it. Running a remote session needs session access on the remote node. Running that session with a model on your own node also needs your node to give the remote node access to that model, because the remote node calls back to your node for each request. With session access below Full, you can only pick models on your own node for a remote session; the remote node's own models need Full.
+
 A peer without a saved grant gets the union of the host defaults that currently apply to it. A saved grant, including No access, always replaces the defaults. `outgoing.source` reports which applies: `{"kind":"explicit"}` or `{"kind":"default","defaults":["lan","trust:acme"]}`. `querymt/mesh/clearPeerAccess` (`version`, `peer_id`, `expected_revision`) removes a saved grant and keeps its quotas. Defaults are not saved and do not change the revision; they follow live connections and end when the peer disconnects.
 
 **LAN access (zeroconf).** `lan_access` applies to peers with a live connection from a private-network address: RFC 1918, loopback, IPv4/IPv6 link-local, or IPv6 unique-local. Public addresses, including CGNAT ranges such as Tailscale's `100.64.0.0/10`, do not qualify. The default is `"none"`. On a network you trust, turn it on with `--mesh-lan-access=full` (or `QMT_MESH_LAN_ACCESS=full`):

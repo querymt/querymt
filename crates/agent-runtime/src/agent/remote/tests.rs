@@ -2604,7 +2604,8 @@ mod node_manager_tests {
             ("querymt::GetReasoningEffort", Sessions),
             ("querymt::SetMode", Full),
             ("querymt::SetReasoningEffort", Full),
-            ("querymt::SetSessionModel", Full),
+            // Below full access, only a model on the caller's own node.
+            ("querymt::SetSessionModel", Sessions),
             ("querymt::SetLlmConfig", Full),
             ("querymt::SetPlanningContext", Full),
             ("querymt::Undo", Full),
@@ -3269,6 +3270,217 @@ mod node_manager_tests {
         );
         assert!(history.get_history(&sid).await.unwrap().is_empty());
         drop(permit);
+        mesh.shutdown().await;
+    }
+
+    /// A peer that prompts a hosted session bound to a model on its own node
+    /// spends nothing on the host: the turn is routed back to that node, which
+    /// authorizes and meters it, whatever the host grants for its own models.
+    #[tokio::test]
+    async fn peer_turn_runs_its_own_model_on_its_node_and_refuses_third_nodes() {
+        use crate::agent::session_actor::{PeerTurn, TurnAuthority};
+        use crate::error::AgentError;
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        use querymt_remote::NodeId;
+        use querymt_remote::peer_access::{ModelSelection, PeerGrant, PeerGrantKey, ProviderGrant};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        config.provider.set_mesh(Some(mesh.clone()));
+        let store = mesh.quota_store().unwrap();
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(*mesh.peer_id()),
+            peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+        };
+        let host = key.host.to_string();
+        let caller = key.peer.to_string();
+        let third = libp2p::PeerId::random().to_string();
+        let (_, sid) = spawn_test_session_with_id(config.clone(), "peer-own-model").await;
+        let history = config.provider.history_store();
+
+        let peer_turn = |grant: PeerGrant| {
+            let store = store.clone();
+            let key = key.clone();
+            let mesh = mesh.clone();
+            async move {
+                let current = store.grant(&key).await.unwrap();
+                store
+                    .replace_grant(&key, current.revision, grant)
+                    .await
+                    .unwrap();
+                let TurnAuthority::Peer(peer) = TurnAuthority::from_stored_origin(
+                    ScheduleOrigin::Peer {
+                        host: key.host.to_string(),
+                        peer: key.peer.to_string(),
+                        protocol: SchedulePeerProtocol::V1,
+                    },
+                    Some(&mesh),
+                )
+                .await
+                .unwrap() else {
+                    panic!("expected a peer turn");
+                };
+                peer
+            }
+        };
+        let prepare = |node: Option<String>, peer: Arc<PeerTurn>| {
+            let history = history.clone();
+            let config = config.clone();
+            let sid = sid.clone();
+            async move {
+                history
+                    .set_session_provider_node_id(&sid, node.as_deref())
+                    .await
+                    .unwrap();
+                let session = config.provider.with_session(&sid).await.unwrap();
+                let binding = peer
+                    .host_binding(&session)
+                    .map(|(provider, model)| (provider.to_string(), model.to_string()));
+                let grant = peer
+                    .grant_for(binding.as_ref().map(|(p, m)| (p.as_str(), m.as_str())))
+                    .await?;
+                session.for_mesh_turn(&peer, &grant, None)
+            }
+        };
+
+        // A Custom grant that shares no provider still lets the peer run
+        // its own model: only the session grant is needed on this host.
+        let custom = peer_turn(PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![],
+        })
+        .await;
+        let own = prepare(Some(caller.clone()), custom.clone())
+            .await
+            .expect("the peer's own model needs no model grant on the host");
+        assert!(
+            own.uses_explicit_mesh_provider(),
+            "the turn must stream from the peer's node"
+        );
+        // Not built from the host's mock provider: the unreachable peer
+        // node fails the remote contract negotiation instead.
+        let Err(error) = own.provider().await else {
+            panic!("the peer's model must not be built from this node's providers");
+        };
+        let error = error.to_string();
+        assert!(
+            !error.contains("profile-locked") && !error.contains("mesh access"),
+            "the turn must be routed to the peer node, got: {error}"
+        );
+
+        // The host's own models still need the grant to include them.
+        for node in [None, Some(host.clone())] {
+            assert!(matches!(
+                prepare(node, custom.clone()).await,
+                Err(AgentError::MeshAccessDenied)
+            ));
+        }
+        // A third node is never reachable through a hosted turn.
+        assert!(matches!(
+            prepare(Some(third.clone()), custom).await,
+            Err(AgentError::MeshAccessDenied)
+        ));
+
+        let shared = peer_turn(PeerGrant::Custom {
+            sessions: true,
+            filesystem: false,
+            shell: false,
+            providers: vec![ProviderGrant {
+                provider_id: "mock".into(),
+                models: ModelSelection::All,
+            }],
+        })
+        .await;
+        let hosted = prepare(Some(host.clone()), shared)
+            .await
+            .expect("a granted host model is allowed");
+        assert!(!hosted.uses_explicit_mesh_provider());
+        hosted
+            .provider()
+            .await
+            .expect("a host model is built from this node's providers");
+
+        let full = peer_turn(PeerGrant::Full).await;
+        prepare(Some(caller), full.clone())
+            .await
+            .expect("full access may run the peer's own model");
+        assert!(matches!(
+            prepare(Some(third), full).await,
+            Err(AgentError::MeshAccessDenied)
+        ));
+        mesh.shutdown().await;
+    }
+
+    /// `SetSessionModel` below full access may only pin the caller's own node.
+    #[tokio::test]
+    async fn session_grant_may_select_only_a_model_on_the_callers_node() {
+        use crate::agent::remote::remote_actor_impl::register_session_routes;
+        use crate::agent::session_control::SessionModelSelection;
+        use crate::error::AgentError;
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::NodeId;
+        use querymt_remote::mesh_ingress::MeshIngress as _;
+        use querymt_remote::peer_access::{PeerGrant, PeerGrantKey};
+
+        let (config, dir) = test_agent_config().await;
+        let mesh = bootstrap_guarded_lan(&dir).await;
+        let router = mesh.inbound_router().unwrap();
+        let store = mesh.quota_store().unwrap();
+        let peer = libp2p::PeerId::random();
+        let key = PeerGrantKey {
+            host: NodeId::from_peer_id(*mesh.peer_id()),
+            peer: NodeId::from_peer_id(peer),
+        };
+        let initial = store.grant(&key).await.unwrap();
+        store
+            .replace_grant(
+                &key,
+                initial.revision,
+                PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: false,
+                    shell: false,
+                    providers: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let (SessionActorRef::Local(session), _) =
+            spawn_test_session_with_id(config, "peer-model-selection").await
+        else {
+            panic!("expected local fixture");
+        };
+        register_session_routes(&mesh, &session);
+        let select = |node: Option<String>| {
+            node_ask::<SessionActor, _>(
+                session.id(),
+                &crate::agent::messages::SetSessionModel {
+                    selection: SessionModelSelection {
+                        model_id: "mock/peer-model".into(),
+                        provider_node_id: node,
+                    },
+                },
+            )
+        };
+
+        let Ok(SwarmResponse::Ask(Ok(_))) =
+            router.handle_v1(peer, select(Some(peer.to_string()))).await
+        else {
+            panic!("a session grant may pin the caller's own node");
+        };
+        for node in [None, Some(libp2p::PeerId::random().to_string())] {
+            let Ok(SwarmResponse::Ask(Err(kameo::error::RemoteSendError::HandlerError(error)))) =
+                router.handle_v1(peer, select(node)).await
+            else {
+                panic!("a session grant must not select another node's model");
+            };
+            assert!(matches!(
+                rmp_serde::from_slice::<AgentError>(&error).unwrap(),
+                AgentError::MeshAccessDenied
+            ));
+        }
         mesh.shutdown().await;
     }
 

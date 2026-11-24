@@ -40,6 +40,14 @@ Each peer SHALL have an independent allowance per provider and per model within 
 - **WHEN** either a provider cap or a model cap has no remaining capacity after accounting for usage and outstanding reservations, even if the other scope has capacity or is unlimited
 - **THEN** the new attempt is denied for quota at the exhausted scope, reserves nothing at either scope, and does not dispatch
 
+### Requirement: Inference under a model pass is charged to its issuer
+
+A model node SHALL reserve and settle inference admitted under a model pass against the issuer's provider and model quotas, as for a direct call from the issuer. It SHALL NOT charge the calling host's quotas, and the session host SHALL NOT charge the prompting peer's quotas for its own providers. A quota denial under a pass SHALL identify the issuer's limiting scope.
+
+#### Scenario: A pass spends the issuer's allowance
+- **WHEN** a peer with a finite model quota on a model node calls that model directly and then through a session host that presents the peer's pass
+- **THEN** both attempts draw from the same balances of that peer, the host's balances on the model node do not change, and once the peer's scope is exhausted a new attempt under the pass is denied for quota without dispatch
+
 ### Requirement: Finite quotas can renew on UTC calendar boundaries
 
 Each finite quota SHALL have one reset schedule: manual (the default), daily at 00:00 UTC, weekly on Monday at 00:00 UTC, or monthly on the first day at 00:00 UTC. The provider and model schedules MAY differ. Unused capacity SHALL NOT carry over. A new attempt SHALL use the windows current at reservation time; settlement SHALL remain in those windows even after renewal. The host SHALL NOT reopen a closed window for new reservations after restart or clock rollback.

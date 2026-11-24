@@ -1219,22 +1219,63 @@ impl SessionHandle {
         grant: &querymt_remote::peer_access::PeerGrant,
         context_fallback: Option<usize>,
     ) -> Result<Self, crate::error::AgentError> {
-        use crate::error::AgentError;
-        let config = self
-            .llm_config
-            .as_ref()
-            .ok_or(AgentError::MeshAccessDenied)?;
-        if !grant.allows_model(peer.protocol, &config.provider, &config.model)
-            || self.provider_node_id.as_deref().is_some_and(|node| {
+        let Some(config) = self.llm_config.as_ref() else {
+            return Err(self.mesh_turn_denied(peer, "the session has no model"));
+        };
+        let node = self.provider_node_id.as_deref();
+        // A model on the prompting peer's own node runs under the grant that
+        // node gives this host, not under this host's model grant.
+        if !peer.is_peer_node(node) {
+            if node.is_some_and(|node| {
                 node != LOCAL_PROVIDER_NODE && node != peer.key.host.to_string()
-            })
-        {
-            return Err(AgentError::MeshAccessDenied);
+            }) {
+                // Never route a peer's spend onward to a third node.
+                return Err(self.mesh_turn_denied(peer, "the model is on a third node"));
+            }
+            if !grant.allows_model(peer.protocol, &config.provider, &config.model) {
+                return Err(self.mesh_turn_denied(peer, "the grant does not include the model"));
+            }
         }
-        // Never reuse an unguarded provider or route a peer's spend onward.
+        // Never reuse a provider built outside this turn's route and metering.
         self.cached_llm_provider = Arc::new(tokio::sync::OnceCell::new());
         self.mesh_turn = Some((peer.clone(), context_fallback));
         Ok(self)
+    }
+
+    #[cfg(feature = "remote")]
+    fn mesh_turn_denied(
+        &self,
+        peer: &crate::agent::session_actor::PeerTurn,
+        reason: &'static str,
+    ) -> crate::error::AgentError {
+        let (provider, model) = self.llm_config.as_ref().map_or(("", ""), |config| {
+            (config.provider.as_str(), config.model.as_str())
+        });
+        tracing::warn!(
+            peer = %peer.key.peer,
+            session_id = %self.session.public_id,
+            provider,
+            model,
+            provider_node = self.provider_node_id.as_deref().unwrap_or(""),
+            reason,
+            "mesh turn denied"
+        );
+        crate::error::AgentError::MeshAccessDenied
+    }
+
+    /// The mesh node the session's model is pinned to, if any.
+    #[cfg(feature = "remote")]
+    pub(crate) fn provider_node_id(&self) -> Option<&str> {
+        self.provider_node_id.as_deref()
+    }
+
+    /// Whether this peer turn's model runs on the prompting peer's own node.
+    /// That node meters and authorizes the calls, so the host does neither.
+    #[cfg(feature = "remote")]
+    fn routes_to_peer_node(&self) -> bool {
+        self.mesh_turn
+            .as_ref()
+            .is_some_and(|(peer, _)| peer.is_peer_node(self.provider_node_id.as_deref()))
     }
 
     /// Get the session information
@@ -1245,15 +1286,17 @@ impl SessionHandle {
     pub(crate) fn uses_explicit_mesh_provider(&self) -> bool {
         #[cfg(feature = "remote")]
         {
-            self.mesh_turn.is_none()
-                && self.provider_node_id.as_deref().is_some_and(|node| {
-                    node != LOCAL_PROVIDER_NODE
-                        && self
-                            .provider
-                            .mesh_handle()
-                            .as_deref()
-                            .is_none_or(|mesh| mesh.peer_id().to_string() != node)
-                })
+            if self.mesh_turn.is_some() {
+                return self.routes_to_peer_node();
+            }
+            self.provider_node_id.as_deref().is_some_and(|node| {
+                node != LOCAL_PROVIDER_NODE
+                    && self
+                        .provider
+                        .mesh_handle()
+                        .as_deref()
+                        .is_none_or(|mesh| mesh.peer_id().to_string() != node)
+            })
         }
         #[cfg(not(feature = "remote"))]
         {
@@ -1327,6 +1370,14 @@ impl SessionHandle {
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
                 let request = request.with_provider_node_id(self.provider_node_id.as_deref());
+                // A hosted turn runs on this node's providers under the peer's
+                // grant and quotas. A turn on the peer's own model is routed
+                // back to that node, which authorizes and meters it there.
+                #[cfg(feature = "remote")]
+                let hosted = self
+                    .mesh_turn
+                    .as_ref()
+                    .filter(|_| !self.routes_to_peer_node());
                 // Only the cold build is traced: the cached path is a pointer
                 // read and must not add a span to every step.
                 let span = tracing::info_span!(
@@ -1339,7 +1390,7 @@ impl SessionHandle {
                 let built = tracing::Instrument::instrument(
                     async {
                         #[cfg(feature = "remote")]
-                        if self.mesh_turn.is_some() {
+                        if hosted.is_some() {
                             return self.provider.build_local_provider_snapshot(request).await;
                         }
                         self.provider.build_provider_snapshot(request).await
@@ -1348,7 +1399,7 @@ impl SessionHandle {
                 )
                 .await?;
                 #[cfg(feature = "remote")]
-                if let Some((peer, context_fallback)) = &self.mesh_turn {
+                if let Some((peer, context_fallback)) = hosted {
                     let mesh = self.provider.mesh_handle().ok_or_else(|| {
                         SessionError::InvalidOperation("mesh access store unavailable".into())
                     })?;
