@@ -252,6 +252,12 @@ impl SessionPane {
         });
     }
 
+    /// The composer has the keyboard focus.
+    #[cfg(test)]
+    pub(crate) fn composer_focused_for_test(&self, window: &Window, cx: &App) -> bool {
+        gpui_kit::Focusable::focus_handle(&self.prompt, cx).is_focused(window)
+    }
+
     /// Where the transcript is scrolled to.
     #[cfg(test)]
     pub(crate) fn scroll_top_for_test(&self) -> gpui_kit::ListOffset {

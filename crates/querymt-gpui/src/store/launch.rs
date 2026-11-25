@@ -46,6 +46,9 @@ pub struct LaunchRequest {
     pub model: Option<String>,
     /// Reasoning effort to start with; `None` uses the launch default.
     pub reasoning: Option<String>,
+    /// Agent mode to start in; `None` uses the launch default. The default
+    /// itself is not changed by a launch.
+    pub mode: Option<String>,
 }
 
 /// Why a launch did not produce a session.
@@ -628,6 +631,7 @@ mod tests {
             placement,
             model: None,
             reasoning: None,
+            mode: None,
         }
     }
 

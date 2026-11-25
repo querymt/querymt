@@ -344,6 +344,13 @@ pub struct QmtApp {
 }
 
 impl QmtApp {
+    /// The page shown and whether the command palette is open, for tests
+    /// that check a key left the main window alone.
+    #[cfg(test)]
+    pub(crate) fn page_for_test(&self) -> (Page, bool) {
+        (self.page, self.palette_open)
+    }
+
     pub fn new(store: Entity<AgentsStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd_value = store.read(cx).prefs.cwd.clone();
         let cwd = cx.new(|cx| {
@@ -708,6 +715,7 @@ impl QmtApp {
             placement,
             model: None,
             reasoning: None,
+            mode: None,
         };
         // The start page shows the new session in this window: the
         // placeholder takes the place of the one it showed.
