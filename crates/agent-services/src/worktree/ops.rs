@@ -181,6 +181,13 @@ impl WorkspaceTarget {
             )),
         }
     }
+
+    /// The workspace or session id the target names.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Workspace(id) | Self::Session(id) => id,
+        }
+    }
 }
 
 // ── Responses (JSON shapes are part of the ACP extension contract) ───────────
@@ -603,7 +610,7 @@ impl WorktreeOps {
                 "source session {source} does not exist or is not hosted locally"
             ))
         })?;
-        if request.cwd.is_empty() {
+        if request.cwd.is_empty() || std::path::Path::new(&request.cwd) == source_cwd {
             return Ok(source_cwd);
         }
         let cwd = PathBuf::from(&request.cwd);
@@ -640,26 +647,6 @@ impl WorktreeOps {
         request: WorktreeCreateRequest,
     ) -> Result<WorktreeCreateResponse, WorktreeOpError> {
         let cwd = self.resolve_create_cwd(spawner, &request).await?;
-        let unpinned = request.include_local_changes.is_none() && request.base_ref.is_none();
-        let will_capture_working_tree = request.include_local_changes == Some(true)
-            || (unpinned && self.service.default_baseline() == BaselineMode::CurrentWorkingTree);
-
-        let ignored_files = if will_capture_working_tree {
-            let cwd_for_resolve = cwd.clone();
-            let source = tokio::task::spawn_blocking(move || {
-                crate::worktree::resolve_repository(&cwd_for_resolve)
-            })
-            .await
-            .map_err(|err| WorktreeOpError::Internal(err.to_string()))??;
-            self.service
-                .ops()
-                .checkout_status(&source.checkout.root)
-                .await?
-                .ignored
-        } else {
-            Vec::new()
-        };
-
         let mut session_workspace = serde_json::json!({ "execution": "worktree" });
         match request.include_local_changes {
             Some(true) => session_workspace["baseline"] = "current_working_tree".into(),
@@ -687,10 +674,22 @@ impl WorktreeOps {
                 )
             })?;
 
+        // Report what the session actually got: the baseline the spawning
+        // runtime resolved (its default fills an unpinned request), and the
+        // ignored files a working-tree capture leaves behind in the source.
         let baseline_mode = record
             .baseline
             .as_ref()
             .map_or(BaselineMode::Commit, |b| b.mode);
+        let ignored_files = if baseline_mode == BaselineMode::CurrentWorkingTree {
+            self.service
+                .ops()
+                .checkout_status(&record.repository.origin_path)
+                .await?
+                .ignored
+        } else {
+            Vec::new()
+        };
         Ok(WorktreeCreateResponse {
             session_id,
             workspace_id: record.id.to_string(),

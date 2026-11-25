@@ -43,12 +43,12 @@ impl LocalAgentHandle {
             );
 
         // Additive `_meta`: delegation targets, and workspace support when (and
-        // only when) a workspace service is configured.
+        // only when) this runtime or a profile enables managed worktrees.
         let mut meta = self.build_delegation_meta().unwrap_or_default();
-        if let Some(service) = self.config.workspace_service() {
+        if let Some(workspace) = self.workspace_capability().await {
             meta.insert(
                 crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
-                serde_json::json!({ "workspace": service.capability_meta() }),
+                serde_json::json!({ "workspace": workspace }),
             );
         }
         if !meta.is_empty() {
@@ -62,6 +62,36 @@ impl LocalAgentHandle {
                 Implementation::new("querymt-agent", querymt_utils::BUILD_VERSION)
                     .title("QueryMT Agent"),
             ))
+    }
+
+    /// `_meta.querymt.workspace` for `initialize`: present when this runtime
+    /// or any profile enables managed worktrees. With profiles, `profiles`
+    /// lists the ones that do, so a client can offer worktrees per profile;
+    /// the default baseline is this runtime's, else the active profile's,
+    /// else the first enabling profile's.
+    async fn workspace_capability(&self) -> Option<serde_json::Value> {
+        let Some(profiles) = self.profiles() else {
+            return self
+                .config
+                .workspace_service()
+                .map(|service| service.capability_meta());
+        };
+        let enabled = profiles.workspace_profiles().await;
+        let default_baseline = match self.config.workspace_service() {
+            Some(service) => service.default_baseline(),
+            None => {
+                let active = profiles.active_profile_id().await;
+                enabled
+                    .iter()
+                    .find(|(id, _)| *id == active)
+                    .or(enabled.first())?
+                    .1
+                    .baseline
+            }
+        };
+        let mut meta = crate::worktree::WorkspaceService::capability_meta_for(default_baseline);
+        meta["profiles"] = enabled.into_iter().map(|(id, _)| id).collect();
+        Some(meta)
     }
 
     pub(super) async fn handle_authenticate(

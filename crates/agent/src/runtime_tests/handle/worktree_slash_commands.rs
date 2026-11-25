@@ -617,3 +617,239 @@ async fn native_worktree_interception_and_command_policy_are_preserved() {
 
     f.handle.shutdown().await;
 }
+
+/// Profile TOML enabling managed worktrees under `storage_root`.
+fn isolated_profile_toml(storage_root: &std::path::Path) -> String {
+    format!(
+        r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "isolated"
+
+[agent.workspace]
+enabled = true
+storage_root = "{}"
+baseline = "commit"
+"#,
+        storage_root.display()
+    )
+}
+
+/// Two profiles share one database: `alpha` (active, no worktrees) and
+/// `isolated` (worktrees enabled); the connection's root runtime has no
+/// workspace service of its own, as in a server hosting several profiles.
+async fn two_profile_fixture(storage_root: &std::path::Path) -> (HandleFixture, tempfile::TempDir) {
+    let profile_dir = tempfile::tempdir().expect("profile dir");
+    write_profile(profile_dir.path(), "alpha.toml", ALPHA_PROFILE_TOML);
+    write_profile(
+        profile_dir.path(),
+        "isolated.toml",
+        &isolated_profile_toml(storage_root),
+    );
+    let base = HandleFixture::new().await;
+    let storage = base.handle.config.storage.clone();
+    let f = base
+        .with_profile_storage("alpha", profile_dir.path(), storage)
+        .await;
+    assert!(
+        f.handle.config.workspace_service().is_none(),
+        "the root runtime has no workspace service"
+    );
+    (f, profile_dir)
+}
+
+fn committed_repo() -> tempfile::TempDir {
+    let repo = crate::worktree::test_support::init_repo();
+    crate::worktree::test_support::commit_files(repo.path(), "initial", &[("README.md", "hi\n")]);
+    crate::worktree::test_support::materialize(repo.path(), &[("README.md", "hi\n")]);
+    repo
+}
+
+fn new_session_in(
+    cwd: &std::path::Path,
+    profile_id: &str,
+    session_workspace: Option<serde_json::Value>,
+) -> crate::acp::protocol::NewSessionRequest {
+    let mut querymt = serde_json::json!({ "profile_id": profile_id });
+    if let Some(workspace) = session_workspace {
+        querymt[crate::worktree::SESSION_WORKSPACE_META_KEY] = workspace;
+    }
+    crate::acp::protocol::NewSessionRequest::new(cwd.to_path_buf()).meta(
+        serde_json::Map::from_iter([("querymt".to_string(), querymt)]),
+    )
+}
+
+async fn bound_profile(f: &HandleFixture, session_id: &str) -> String {
+    f.handle
+        .profiles()
+        .expect("profiles configured")
+        .session_binding(session_id)
+        .await
+        .unwrap_or_else(|| panic!("session {session_id} has no profile binding"))
+        .profile_id
+}
+
+/// A session bound to a profile runtime is administered by that runtime:
+/// its workspace service creates the checkout, and the new session is bound
+/// to the source's profile even when the active profile is another one and
+/// the connection's root runtime could not isolate at all. The catalog of
+/// such a session advertises `/worktree`, so invoking it must work.
+#[tokio::test]
+async fn worktree_create_runs_in_the_profile_runtime_hosting_the_session() {
+    let repo = committed_repo();
+    let storage_root = tempfile::tempdir().expect("storage root");
+    let (f, _profiles) = two_profile_fixture(storage_root.path()).await;
+
+    let source = f
+        .handle
+        .new_session(new_session_in(repo.path(), "isolated", None))
+        .await
+        .expect("source session");
+    let source_id = source.session_id.to_string();
+    assert_eq!(bound_profile(&f, &source_id).await, "isolated");
+    let names = advertised_names(&f.handle.slash_command_catalog(&source_id).await);
+    assert!(
+        names.contains(&"worktree".to_string()),
+        "the hosting profile advertises /worktree: {names:?}"
+    );
+
+    // Native command.
+    let created = native_command(&f.handle, &source_id, "/worktree create HEAD w1")
+        .await
+        .expect("native create answers");
+    assert!(created.get("error").is_none(), "create failed: {created}");
+    let child_id = created["session_id"].as_str().expect("child id").to_owned();
+    assert!(
+        std::path::Path::new(created["checkout_path"].as_str().unwrap()).exists(),
+        "checkout allocated: {created}"
+    );
+    assert_eq!(
+        bound_profile(&f, &child_id).await,
+        "isolated",
+        "the child keeps the source session's profile, not the active one"
+    );
+    let status = native_command(&f.handle, &child_id, "/worktree status")
+        .await
+        .expect("status answers");
+    assert!(status.get("error").is_none(), "status failed: {status}");
+
+    // Extension method used by clients' create dialogs.
+    let ext = ext_method_json(
+        &f.handle,
+        "querymt/worktree/create",
+        serde_json::json!({ "cwd": "", "source_session_id": source_id, "name": "w2" }),
+    )
+    .await;
+    let ext_child = ext["session_id"].as_str().expect("ext child id").to_owned();
+    assert_eq!(bound_profile(&f, &ext_child).await, "isolated");
+
+    // Management by workspace id reaches the owner's service.
+    let list = ext_method_json(&f.handle, "querymt/worktree/list", serde_json::json!({})).await;
+    assert_eq!(
+        list["workspaces"].as_array().map(Vec::len),
+        Some(2),
+        "{list}"
+    );
+    let ext_status = ext_method_json(
+        &f.handle,
+        "querymt/worktree/status",
+        serde_json::json!({ "workspace_id": ext["workspace_id"] }),
+    )
+    .await;
+    assert_eq!(
+        ext_status["owner_session_id"],
+        ext_child.as_str(),
+        "{ext_status}"
+    );
+
+    f.handle.shutdown().await;
+}
+
+/// A session of a profile without worktrees neither advertises `/worktree`
+/// nor administers another runtime's service: it fails closed with the
+/// stable code instead of borrowing one.
+#[tokio::test]
+async fn worktree_commands_fail_closed_in_a_profile_without_worktrees() {
+    let repo = committed_repo();
+    let storage_root = tempfile::tempdir().expect("storage root");
+    let (f, _profiles) = two_profile_fixture(storage_root.path()).await;
+    // Load the isolated runtime so a borrowable service exists.
+    f.handle
+        .new_session(new_session_in(repo.path(), "isolated", None))
+        .await
+        .expect("isolated session");
+
+    let plain = f
+        .handle
+        .new_session(new_session_in(repo.path(), "alpha", None))
+        .await
+        .expect("plain session")
+        .session_id
+        .to_string();
+    let names = advertised_names(&f.handle.slash_command_catalog(&plain).await);
+    assert!(!names.contains(&"worktree".to_string()), "names: {names:?}");
+    let reply = native_command(&f.handle, &plain, "/worktree create")
+        .await
+        .expect("native create answers");
+    assert_eq!(
+        reply["error"]["code"], "workspace_service_unavailable",
+        "{reply}"
+    );
+
+    f.handle.shutdown().await;
+}
+
+/// `session/new` in profile mode isolates in the requested profile and
+/// discloses the workspace, like a connection without profiles.
+#[tokio::test]
+async fn profile_session_new_discloses_its_workspace() {
+    let repo = committed_repo();
+    let storage_root = tempfile::tempdir().expect("storage root");
+    let (f, _profiles) = two_profile_fixture(storage_root.path()).await;
+
+    let response = f
+        .handle
+        .new_session(new_session_in(
+            repo.path(),
+            "isolated",
+            Some(serde_json::json!({ "execution": "worktree" })),
+        ))
+        .await
+        .expect("isolated session/new");
+    let querymt = &response.meta.as_ref().expect("response meta")["querymt"];
+    assert_eq!(querymt["profile_id"], "isolated");
+    let workspace = &querymt[crate::worktree::SESSION_WORKSPACE_META_KEY];
+    assert_eq!(workspace["execution"], "worktree", "{querymt}");
+    assert!(
+        workspace["workspaceId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{querymt}"
+    );
+
+    f.handle.shutdown().await;
+}
+
+/// `initialize` advertises worktrees when only a profile enables them, and
+/// names the profiles that do.
+#[tokio::test]
+async fn initialize_advertises_profile_worktree_support() {
+    let storage_root = tempfile::tempdir().expect("storage root");
+    let (f, _profiles) = two_profile_fixture(storage_root.path()).await;
+
+    let response = f
+        .handle
+        .initialize(crate::acp::protocol::InitializeRequest::new(
+            crate::acp::protocol::ProtocolVersion::LATEST,
+        ))
+        .await
+        .expect("initialize");
+    let meta = response.agent_capabilities.meta.expect("capability meta");
+    let workspace = &meta["querymt"]["workspace"];
+    assert_eq!(workspace["supported"], true, "{workspace}");
+    assert_eq!(workspace["defaultBaseline"], "commit");
+    assert_eq!(workspace["profiles"], serde_json::json!(["isolated"]));
+
+    f.handle.shutdown().await;
+}

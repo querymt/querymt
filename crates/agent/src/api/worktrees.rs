@@ -212,7 +212,9 @@ impl AgentWorktrees {
                 .display()
                 .to_string();
         }
-        self.ops.create(self.handle.as_ref(), request).await
+        // Same path as `querymt/worktree/create`: the session is created and
+        // bound in the runtime hosting its source.
+        self.handle.create_worktree_session(request).await
     }
 
     /// Hand ownership of a ready workspace to a new session in the same

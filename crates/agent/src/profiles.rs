@@ -1123,6 +1123,37 @@ where
         out
     }
 
+    /// Ids and settings of the listed profiles whose configuration enables
+    /// managed worktrees, in catalog order. Reads the catalog only, so no
+    /// runtime is built; a profile that fails to load is skipped with a
+    /// warning.
+    pub async fn workspace_profiles(&self) -> Vec<(String, crate::config::WorkspaceSettings)> {
+        let profiles = match self.catalog.list_profiles().await {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "cannot list profiles for workspace support");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for metadata in profiles {
+            match self.catalog.load_profile(&metadata.id).await {
+                Ok(document) => {
+                    let settings = document.config.workspace_settings();
+                    if settings.enabled {
+                        out.push((metadata.id, settings.clone()));
+                    }
+                }
+                Err(error) => warn!(
+                    profile_id = %metadata.id,
+                    error = %format!("{error:#}"),
+                    "skipping profile while collecting workspace support"
+                ),
+            }
+        }
+        out
+    }
+
     /// `[[mcp]]` servers of a profile configuration plus its `.agents/` ones.
     fn profile_mcp_servers(
         &self,
@@ -1348,6 +1379,10 @@ where
 
     async fn mcp_servers(&self) -> Vec<(String, crate::config::McpServerConfig)> {
         ProfileRuntimeManager::mcp_servers(self).await
+    }
+
+    async fn workspace_profiles(&self) -> Vec<(String, crate::config::WorkspaceSettings)> {
+        ProfileRuntimeManager::workspace_profiles(self).await
     }
 
     #[cfg(feature = "remote")]

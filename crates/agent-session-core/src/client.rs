@@ -366,24 +366,37 @@ impl SessionCore {
     /// carried no client prompt id: the agent's user message stands for it.
     /// The stop reason decides the run state only while the agent sends no
     /// state updates.
+    ///
+    /// A response that names no message and whose prompt was never echoed
+    /// answered without a turn (a native command such as `/worktree`): the
+    /// prompt is settled as sent and, since no run started, no state update
+    /// will end the submission, so the response does.
     pub(crate) fn prompt_completed(
         &mut self,
         client_prompt_id: Option<&str>,
         message_id: Option<&str>,
         stop_reason: &StopReason,
     ) {
-        if let (Some(prompt), Some(message)) = (client_prompt_id, message_id)
-            && let Some(user) = self.store.idx.user.get(message).copied()
-            && self
-                .store
-                .idx
-                .prompt
-                .get(prompt)
-                .is_some_and(|key| *key != user)
-        {
-            self.drop_unsent_prompt(prompt);
+        let mut answered_without_run = false;
+        match (client_prompt_id, message_id) {
+            (Some(prompt), Some(message)) => {
+                if let Some(user) = self.store.idx.user.get(message).copied()
+                    && self
+                        .store
+                        .idx
+                        .prompt
+                        .get(prompt)
+                        .is_some_and(|key| *key != user)
+                {
+                    self.drop_unsent_prompt(prompt);
+                }
+            }
+            (Some(prompt), None) => answered_without_run = self.settle_unechoed_prompt(prompt),
+            (None, _) => {}
         }
-        if self.state_updates_seen {
+        let submission_open =
+            self.header.run_state == RunState::Submitting && self.header.active_run_id.is_none();
+        if self.state_updates_seen && !(answered_without_run && submission_open) {
             return;
         }
         let text = match serde_json::to_value(stop_reason) {
@@ -397,6 +410,28 @@ impl SessionCore {
         } else {
             RunState::Idle
         });
+    }
+
+    /// Mark the still-pending prompt `client_prompt_id` as sent. Returns
+    /// whether it was pending, i.e. the agent never echoed it.
+    fn settle_unechoed_prompt(&mut self, client_prompt_id: &str) -> bool {
+        let Some(key) = self.store.idx.prompt.get(client_prompt_id).copied() else {
+            return false;
+        };
+        let pending = matches!(
+            self.store.kind(key),
+            Some(EntryKind::UserMessage(user)) if user.status == PromptStatus::Pending
+        );
+        if pending {
+            self.store.modify(key, |kind| match kind {
+                EntryKind::UserMessage(user) => {
+                    user.status = PromptStatus::Sent;
+                    true
+                }
+                _ => false,
+            });
+        }
+        pending
     }
 
     /// Remove a client-local prompt (pending or failed) and its turn. The

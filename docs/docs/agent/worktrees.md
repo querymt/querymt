@@ -246,6 +246,16 @@ Local / Worktree choice at creation. Agents without the service omit it.
   "baselines": ["commit", "current_working_tree"] }
 ```
 
+A host serving profiles also advertises support when only some profiles enable
+worktrees (`[agent.workspace]` or `[quorum.workspace]`), and adds `profiles`:
+the ids of those profiles. Offer the worktree choice only for them; elsewhere
+isolation fails with `workspace_service_unavailable`.
+
+Worktree administration runs in the runtime hosting the session. A session's
+`/worktree` commands, and `querymt/worktree/create` with a
+`source_session_id`, use that runtime's service, and the new session is bound
+to the source session's profile.
+
 For an isolated `session/new`, the response's
 `_meta.querymt.sessionWorkspace` discloses the resolved binding: `sessionCwd`
 (the directory the session actually executes in), `workspaceId`, `branch`,

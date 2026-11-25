@@ -120,9 +120,15 @@ impl WorkspaceService {
     /// Capability advertisement for `initialize` (`_meta.querymt.workspace`),
     /// so clients can offer an explicit Local/Worktree choice at creation.
     pub fn capability_meta(&self) -> serde_json::Value {
+        Self::capability_meta_for(self.default_baseline)
+    }
+
+    /// [`Self::capability_meta`] for a service with `default_baseline`, so a
+    /// host can advertise a service it has not built yet.
+    pub fn capability_meta_for(default_baseline: BaselineMode) -> serde_json::Value {
         serde_json::json!({
             "supported": true,
-            "defaultBaseline": self.default_baseline.to_string(),
+            "defaultBaseline": default_baseline.to_string(),
             "executionModes": ["local", "worktree"],
             "baselines": ["commit", "current_working_tree"],
             "sourceSession": true,
