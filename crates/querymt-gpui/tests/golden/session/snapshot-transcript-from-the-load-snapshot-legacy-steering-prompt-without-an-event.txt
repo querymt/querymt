@@ -1,0 +1,7 @@
+User { text: "hi", local: false }
+Thought("hmm")
+Tool { status: "completed", output: "ok", child: None }
+Agent("final reply")
+Tool { status: "failed", output: "Run ended before a tool result was recorded.", child: None }
+Agent("later")
+plan: a [pending]

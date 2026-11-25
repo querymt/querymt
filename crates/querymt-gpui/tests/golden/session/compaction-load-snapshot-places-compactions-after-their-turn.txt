@@ -1,0 +1,5 @@
+User { text: "hi", local: false }
+Agent("reply")
+Compaction { status: "completed", summary: "Final summary", before: Some(90000), after: Some(9000) }
+Compaction { status: "failed", summary: "", before: Some(9000), after: None }
+User { text: "next", local: false }

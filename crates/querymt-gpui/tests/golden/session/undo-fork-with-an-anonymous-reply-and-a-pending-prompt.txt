@@ -1,0 +1,7 @@
+User { text: "prompt", local: false }
+Agent("reply")
+User { text: "prompt", local: false }
+Agent("reply")
+User { text: "third", local: false }
+Agent("anonymous")
+User { text: "pending", local: true }
