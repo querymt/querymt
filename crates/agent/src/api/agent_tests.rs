@@ -5361,3 +5361,189 @@ async fn snapshot_policy_can_be_turned_off() -> Result<()> {
     }
     Ok(())
 }
+
+// ── Listed todo plans (`_meta["querymt/plans"]`) ───────────────────────────
+
+use crate::session::store::SessionStore as _;
+
+async fn write_todowrite(
+    storage: &crate::session::sqlite_storage::SqliteStorage,
+    session_id: &str,
+    todos: &str,
+) -> Result<()> {
+    storage
+        .append_durable(&NewDurableEvent {
+            session_seq: None,
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            source_node_id: None,
+            source_seq: None,
+            kind: AgentEventKind::ToolCallStart {
+                tool_call_id: "todo-call".into(),
+                tool_name: "todowrite".into(),
+                arguments: format!(r#"{{"todos":{todos}}}"#),
+            },
+        })
+        .await?;
+    Ok(())
+}
+
+async fn listed_plans(agent: &Agent, session_id: &str) -> Result<Option<serde_json::Value>> {
+    let page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    let info = page
+        .sessions
+        .into_iter()
+        .find(|info| info.session_id.to_string() == session_id)
+        .expect("session is listed");
+    Ok(info
+        .meta
+        .and_then(|meta| meta.get("querymt/plans").cloned()))
+}
+
+#[tokio::test]
+async fn listed_plan_and_resume_replay_agree() -> Result<()> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let session = storage
+        .create_session(Some("Todos".into()), None, None, None)
+        .await?;
+    write_todowrite(
+        &storage,
+        &session.public_id,
+        r#"[{"content":"old","status":"pending"}]"#,
+    )
+    .await?;
+    write_todowrite(
+        &storage,
+        &session.public_id,
+        r#"[{"content":"a","status":"completed","priority":"high"},{"content":"b","status":"in_progress"},{"content":"c","status":"cancelled"},{"content":"d","status":"pending","priority":"low"}]"#,
+    )
+    .await?;
+
+    let listed = listed_plans(&agent, &session.public_id)
+        .await?
+        .expect("plans are listed");
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["planId"], "querymt-todos");
+
+    let events: Vec<crate::events::AgentEvent> = storage
+        .load_session_stream(&session.public_id, None, None)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let replay = crate::acp::shared::replay_agent_events_materialized(
+        &session.public_id,
+        events,
+        &Default::default(),
+        &crate::acp::shared::AcpSessionUpdateCapabilities {
+            plan_operations: true,
+            ..Default::default()
+        },
+    );
+    let replayed: Vec<_> = replay
+        .iter()
+        .filter_map(|n| serde_json::to_value(&n.update).ok())
+        .filter(|update| update["sessionUpdate"] == "plan_update")
+        .collect();
+    assert_eq!(replayed.len(), 1, "one plan_update on replay");
+    assert_eq!(replayed[0]["plan"]["planId"], "querymt-todos");
+    assert_eq!(replayed[0]["plan"]["entries"], listed[0]["entries"]);
+    assert_eq!(listed[0]["entries"].as_array().unwrap().len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_plan_survives_restart_and_emptying_removes_it() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let db = dir.path().join("sessions.db");
+    let session_id;
+    let before;
+    {
+        let storage =
+            Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(db.clone()).await?);
+        let agent = test_agent_with_storage(Some(storage.clone())).await?;
+        let session = storage
+            .create_session(Some("Persist".into()), None, None, None)
+            .await?;
+        session_id = session.public_id;
+        write_todowrite(
+            &storage,
+            &session_id,
+            r#"[{"content":"keep","status":"in_progress"},{"content":"next","status":"pending"}]"#,
+        )
+        .await?;
+        before = listed_plans(&agent, &session_id).await?.expect("listed");
+    }
+
+    let storage = Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(db).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    assert_eq!(
+        listed_plans(&agent, &session_id).await?,
+        Some(before),
+        "same plan after restart"
+    );
+
+    write_todowrite(&storage, &session_id, "[]").await?;
+    assert_eq!(listed_plans(&agent, &session_id).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleted_session_plan_is_not_listed_for_a_new_session() -> Result<()> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let first = storage.create_session(None, None, None, None).await?;
+    write_todowrite(
+        &storage,
+        &first.public_id,
+        r#"[{"content":"a","status":"pending"}]"#,
+    )
+    .await?;
+    assert!(listed_plans(&agent, &first.public_id).await?.is_some());
+    storage.delete_session(&first.public_id).await?;
+
+    let second = storage.create_session(None, None, None, None).await?;
+    assert_eq!(listed_plans(&agent, &second.public_id).await?, None);
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn remote_list_entries_have_no_plans_key() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    store
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "remote-with-todos".into(),
+            node_id: "peer-a".into(),
+            peer_label: "Remote A".into(),
+            cwd: Some("/remote/work".into()),
+            created_at: 1,
+            title: Some("Remote".into()),
+            fork_origin: None,
+        })
+        .await?;
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!(["peer-a"]));
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionSource": "remote" }),
+    );
+    let page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+        .await?;
+    assert_eq!(page.sessions.len(), 1);
+    let meta = page.sessions[0].meta.as_ref().unwrap();
+    assert_eq!(meta["location"], "remote");
+    assert!(!meta.contains_key("querymt/plans"));
+    Ok(())
+}

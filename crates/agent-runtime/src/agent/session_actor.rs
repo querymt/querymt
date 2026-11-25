@@ -4081,8 +4081,8 @@ async fn execute_prompt_inner(
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
     // `get_history` / `load_working_context` only sees the surviving messages.
-    if !restricted
-        && let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
+    if !restricted {
+        match crate::agent::undo::cleanup_revert_on_prompt(
             &config.provider,
             &**config.event_sink.journal(),
             Some(&config.event_sink.session_stream(&session_id)),
@@ -4090,8 +4090,13 @@ async fn execute_prompt_inner(
             Some(&run_id.to_string()),
         )
         .await
-    {
-        warn!("Failed to clean up revert state: {}", e);
+        {
+            // The rewind changed the session's todo list: `todoread` must
+            // return the list the journal and the listed plan now report.
+            Ok(Some(todos)) => config.todo_store.replace(&session_id, todos),
+            Ok(None) => {}
+            Err(e) => warn!("Failed to clean up revert state: {}", e),
+        }
     }
 
     // Get Session Context (turn-pinned)

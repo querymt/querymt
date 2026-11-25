@@ -10,6 +10,9 @@ use querymt_agent_core::session::projection::{
     slice_history_page,
 };
 
+use querymt_agent_core::replay::todo_plan_of;
+
+use super::todo_plan::{project_todo_plan, recompute_todo_plan};
 use super::{SqliteStorage, blocking};
 
 /// Query behind [`EventJournal::last_unfinished_run`].
@@ -31,20 +34,9 @@ impl EventJournal for SqliteStorage {
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
         let event_clone = event.clone();
 
+        // One transaction, so a todowrite's plan row never lags its event.
         blocking::with_conn(&self.conn, move |conn| {
-            insert_journal_event(
-                conn,
-                &event_clone,
-                event_clone.source_node_id.as_deref(),
-                event_clone.source_seq,
-            )
-            .db()?
-            .ok_or_else(|| {
-                SessionError::Other(
-                    "duplicate source-identity event rejected by the journal unique index"
-                        .to_string(),
-                )
-            })
+            insert_single_transactional(conn, &event_clone)
         })
         .await
     }
@@ -447,6 +439,17 @@ impl EventJournal for SqliteStorage {
                      ON CONFLICT(session_id) DO UPDATE SET epoch = epoch + 1",
                     params![session_id],
                 )?;
+                // The cut may have removed the session's last todowrite.
+                let session_db_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM sessions WHERE public_id = ?1",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(session_db_id) = session_db_id {
+                    recompute_todo_plan(&tx, session_db_id)?;
+                }
             }
             tx.commit()?;
             Ok(deleted)
@@ -884,6 +887,11 @@ fn insert_journal_event(
         return Ok(None);
     }
 
+    // The tool name is matched first; arguments are parsed only for todowrite.
+    if let Some(entries) = todo_plan_of(&event.kind) {
+        project_todo_plan(conn, &event.session_id, &entries)?;
+    }
+
     Ok(Some(DurableEvent {
         event_id,
         stream_seq,
@@ -953,26 +961,39 @@ fn insert_batch(
             log::debug!("journal batch failed, retrying events individually: {batch_error}");
             events
                 .iter()
-                .map(|event| {
-                    insert_journal_event(
-                        conn,
-                        event,
-                        event.source_node_id.as_deref(),
-                        event.source_seq,
-                    )
-                    .map_err(session_db_error)
-                    .and_then(|inserted| {
-                        inserted.ok_or_else(|| {
-                            SessionError::Other(
-                                "duplicate source-identity event rejected by the journal unique index"
-                                    .to_string(),
-                            )
-                        })
-                    })
-                })
+                .map(|event| insert_single_transactional(conn, event))
                 .collect()
         }
     }
+}
+
+/// Persist one event in its own transaction. The sequence allocation, the
+/// event row and the todo-plan projection commit together or not at all, so a
+/// failed projection or a rejected duplicate leaves no partial append behind.
+fn insert_single_transactional(
+    conn: &mut rusqlite::Connection,
+    event: &NewDurableEvent,
+) -> SessionResult<DurableEvent> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(session_db_error)?;
+    let inserted = insert_journal_event(
+        &tx,
+        event,
+        event.source_node_id.as_deref(),
+        event.source_seq,
+    )
+    .map_err(session_db_error)?
+    .ok_or_else(duplicate_source_rejected)?;
+    tx.commit().map_err(session_db_error)?;
+    Ok(inserted)
+}
+
+/// The error for an append the source-identity unique index suppressed.
+fn duplicate_source_rejected() -> SessionError {
+    SessionError::Other(
+        "duplicate source-identity event rejected by the journal unique index".to_string(),
+    )
 }
 
 fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Error> {

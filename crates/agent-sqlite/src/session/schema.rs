@@ -64,6 +64,13 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS session_todo_plans (
+            session_id INTEGER PRIMARY KEY,
+            entries_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
         -- Full-text session search index (all sessions, not just loaded pages).
         -- The 'title' column is populated from intent_snapshots.summary so that
         -- session titles are searchable even though the title is derived data.

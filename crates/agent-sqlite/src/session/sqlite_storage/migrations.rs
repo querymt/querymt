@@ -197,7 +197,28 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0040_peer_session_origin",
         apply: migration_0040_peer_session_origin,
     },
+    Migration {
+        version: "0041_session_todo_plans",
+        apply: migration_0041_session_todo_plans,
+    },
 ];
+
+/// Persisted todo plan per session, for `session/list`. Existing sessions are
+/// backfilled from the last `todowrite` call in their journal, through the
+/// same recompute the runtime uses after a rewind. The DDL is an intentionally
+/// inlined, frozen copy of `init_schema`; the schema drift test keeps the two
+/// in agreement.
+fn migration_0041_session_todo_plans(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_todo_plans (
+            session_id INTEGER PRIMARY KEY,
+            entries_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );",
+    )?;
+    super::todo_plan::recompute_all_todo_plans(conn)
+}
 
 fn migration_0040_peer_session_origin(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let columns = {

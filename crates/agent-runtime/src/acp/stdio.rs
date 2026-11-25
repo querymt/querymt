@@ -1283,6 +1283,26 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         agent.subscribe_ext_notifications(),
         bridge_sender.clone(),
     ));
+    // Plan changes of sessions this client does not follow (session list).
+    let plans_announcer = tokio::spawn(crate::control::notifications::announce_session_plans(
+        agent.config.event_sink.fanout().subscribe(),
+        tokio_util::sync::CancellationToken::new(),
+        {
+            let bridge = bridge_sender.clone();
+            move |notification| {
+                let bridge = bridge.clone();
+                async move {
+                    bridge
+                        .notify_ext(notification)
+                        .await
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "failed to send the plansChanged notification");
+                        })
+                        .is_ok()
+                }
+            }
+        },
+    ));
 
     // 6. Set up stdio streams and connect ACP agent role.
     let stdin = tokio::io::stdin().compat();
@@ -1603,6 +1623,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     };
 
     mesh_access_forwarder.abort();
+    plans_announcer.abort();
     if shutdown_triggered {
         log::info!("Initiating graceful shutdown...");
         log::info!("Shutting down agent...");

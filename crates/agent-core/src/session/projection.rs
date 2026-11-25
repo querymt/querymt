@@ -322,6 +322,11 @@ pub struct SessionListItem {
     /// workspace-level lifecycle (e.g. `failed`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending_isolation: bool,
+    /// Entries of the session's current todo plan, as a `plan_update` for it
+    /// would carry them. `None` when the session has no (or an emptied) todo
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_plan: Option<Vec<crate::protocol::PlanEntry>>,
 }
 
 impl SessionListItem {
@@ -604,6 +609,7 @@ mod tests {
             has_children: false,
             fork_count: 0,
             pending_isolation: false,
+            todo_plan: None,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);

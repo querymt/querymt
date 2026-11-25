@@ -6957,3 +6957,575 @@ async fn prompt_row_decoding_to_another_part_is_skipped_but_counted() {
         (intact.len() + mismatched.len()).to_string()
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Persisted todo plans (session_todo_plans)
+// ══════════════════════════════════════════════════════════════════════
+
+fn todowrite_kind(todos: &str) -> AgentEventKind {
+    AgentEventKind::ToolCallStart {
+        tool_call_id: "call".into(),
+        tool_name: "todowrite".into(),
+        arguments: format!(r#"{{"todos":{todos}}}"#),
+    }
+}
+
+fn stored_plan(conn: &Connection, public_id: &str) -> Option<serde_json::Value> {
+    conn.query_row(
+        "SELECT p.entries_json FROM session_todo_plans p \
+         JOIN sessions s ON s.id = p.session_id WHERE s.public_id = ?1",
+        [public_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|json| serde_json::from_str(&json).unwrap())
+}
+
+fn stored_contents(conn: &Connection, public_id: &str) -> Option<Vec<String>> {
+    stored_plan(conn, public_id).map(|plan| {
+        plan.as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["content"].as_str().unwrap().to_owned())
+            .collect()
+    })
+}
+
+async fn storage_with_session() -> (SqliteStorage, String) {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("todos".into()), None, None, None)
+        .await
+        .unwrap();
+    (storage, session.public_id)
+}
+
+/// A database that has applied every migration except 0041, with the table
+/// `init_schema` created for fresh installs removed again.
+fn legacy_db_without_todo_plans() -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+             version TEXT PRIMARY KEY,
+             applied_at INTEGER NOT NULL
+         );",
+    )
+    .unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0041_session_todo_plans")
+    {
+        (migration.apply)(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 0)",
+            [migration.version],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS session_todo_plans;")
+        .unwrap();
+    conn
+}
+
+fn insert_legacy_session(conn: &Connection, public_id: &str) {
+    conn.execute(
+        "INSERT INTO sessions (public_id, created_at, updated_at) \
+         VALUES (?1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [public_id],
+    )
+    .unwrap();
+}
+
+fn insert_legacy_event(conn: &Connection, session: &str, seq: i64, kind: &AgentEventKind) {
+    conn.execute(
+        "INSERT INTO event_journal \
+         (event_id, stream_seq, session_id, timestamp, origin, kind, payload_json) \
+         VALUES (?1, ?2, ?3, 0, 'local', ?4, ?5)",
+        rusqlite::params![
+            format!("evt-{seq}"),
+            seq,
+            session,
+            kind.tag(),
+            serde_json::to_string(kind).unwrap()
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn todo_plan_migration_is_empty_on_a_fresh_install() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+    apply_migrations(&mut conn).expect("fresh install");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_todo_plans", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn todo_plan_migration_backfills_the_last_todowrite_of_each_session() {
+    let mut conn = legacy_db_without_todo_plans();
+    for id in ["with-todos", "emptied", "no-todos", "malformed-last"] {
+        insert_legacy_session(&conn, id);
+    }
+    // The last todowrite decides.
+    insert_legacy_event(
+        &conn,
+        "with-todos",
+        1,
+        &todowrite_kind(r#"[{"content":"old","status":"pending"}]"#),
+    );
+    insert_legacy_event(
+        &conn,
+        "with-todos",
+        2,
+        &todowrite_kind(
+            r#"[{"content":"done","status":"completed"},{"content":"next","status":"pending"},{"content":"dropped","status":"cancelled"}]"#,
+        ),
+    );
+    // A last todowrite with an empty list leaves no row.
+    insert_legacy_event(
+        &conn,
+        "emptied",
+        3,
+        &todowrite_kind(r#"[{"content":"gone","status":"pending"}]"#),
+    );
+    insert_legacy_event(&conn, "emptied", 4, &todowrite_kind("[]"));
+    // Other tools and other sessions' events are ignored.
+    insert_legacy_event(
+        &conn,
+        "no-todos",
+        5,
+        &AgentEventKind::ToolCallStart {
+            tool_call_id: "c".into(),
+            tool_name: "shell".into(),
+            arguments: r#"{"todos":[{"content":"x","status":"pending"}]}"#.into(),
+        },
+    );
+    // Arguments that are not a todo list do not replace the plan.
+    insert_legacy_event(
+        &conn,
+        "malformed-last",
+        6,
+        &todowrite_kind(r#"[{"content":"kept","status":"in_progress"}]"#),
+    );
+    insert_legacy_event(
+        &conn,
+        "malformed-last",
+        7,
+        &AgentEventKind::ToolCallStart {
+            tool_call_id: "c".into(),
+            tool_name: "todowrite".into(),
+            arguments: r#"{"nope":1}"#.into(),
+        },
+    );
+
+    apply_migrations(&mut conn).expect("apply 0041");
+
+    assert_eq!(
+        stored_contents(&conn, "with-todos"),
+        Some(vec!["done".to_owned(), "next".to_owned()])
+    );
+    assert_eq!(stored_contents(&conn, "emptied"), None);
+    assert_eq!(stored_contents(&conn, "no-todos"), None);
+    assert_eq!(
+        stored_contents(&conn, "malformed-last"),
+        Some(vec!["kept".to_owned()])
+    );
+}
+
+#[tokio::test]
+async fn journaled_todowrite_upserts_replaces_and_empties_the_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+
+    journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(
+                r#"[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["a".into(), "b".into()])
+    );
+
+    journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"c","status":"in_progress"}]"#),
+        ))
+        .await
+        .unwrap();
+    let plan = stored_plan(&conn.lock(), &session).unwrap();
+    assert_eq!(plan.as_array().unwrap().len(), 1);
+    assert_eq!(plan[0]["content"], "c");
+    assert_eq!(plan[0]["status"], "in_progress");
+
+    journal
+        .append_durable(&new_durable(&session, todowrite_kind("[]")))
+        .await
+        .unwrap();
+    assert_eq!(stored_plan(&conn.lock(), &session), None);
+}
+
+#[tokio::test]
+async fn malformed_or_foreign_todowrite_leaves_the_plan_unchanged() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+    journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"a","status":"pending"}]"#),
+        ))
+        .await
+        .unwrap();
+
+    for (tool_name, arguments) in [
+        ("todowrite", r#"{"nothing":true}"#),
+        ("todowrite", "not json"),
+        ("todowrite", r#"{"todos":"nope"}"#),
+        ("shell", r#"{"todos":[]}"#),
+    ] {
+        journal
+            .append_durable(&new_durable(
+                &session,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "c".into(),
+                    tool_name: tool_name.into(),
+                    arguments: arguments.into(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_contents(&conn.lock(), &session),
+            Some(vec!["a".into()]),
+            "{tool_name} {arguments}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_and_source_appends_project_todowrite_into_the_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+
+    let results = journal
+        .append_durable_batch(&[
+            new_durable(
+                &session,
+                todowrite_kind(r#"[{"content":"first","status":"pending"}]"#),
+            ),
+            new_durable(&session, AgentEventKind::Cancelled),
+            new_durable(
+                &session,
+                todowrite_kind(r#"[{"content":"second","status":"pending"}]"#),
+            ),
+        ])
+        .await;
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["second".into()])
+    );
+
+    journal
+        .append_durable_from_source(&NewDurableEvent {
+            origin: EventOrigin::Remote,
+            source_node: Some("peer".to_string()),
+            source_node_id: Some("node-a".to_string()),
+            source_seq: Some(1),
+            ..new_durable(
+                &session,
+                todowrite_kind(r#"[{"content":"remote","status":"pending"}]"#),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["remote".into()])
+    );
+}
+
+#[tokio::test]
+async fn batch_fallback_appends_each_event_atomically_with_its_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+
+    let remote = |content: &str| NewDurableEvent {
+        origin: EventOrigin::Remote,
+        source_node: Some("peer".to_string()),
+        source_node_id: Some("node-a".to_string()),
+        source_seq: Some(1),
+        ..new_durable(
+            &session,
+            todowrite_kind(&format!(
+                r#"[{{"content":"{content}","status":"pending"}}]"#
+            )),
+        )
+    };
+
+    // The duplicate source identity fails the batch, so every event is
+    // retried on its own.
+    let results = journal
+        .append_durable_batch(&[
+            new_durable(
+                &session,
+                todowrite_kind(r#"[{"content":"local","status":"pending"}]"#),
+            ),
+            remote("first-remote"),
+            remote("duplicate-remote"),
+        ])
+        .await;
+    assert!(results[0].is_ok());
+    let second = results[1].as_ref().expect("first remote append succeeds");
+    assert!(results[2].is_err(), "the duplicate is rejected");
+
+    // The rejected duplicate neither moved the plan nor consumed a sequence.
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["first-remote".into()])
+    );
+    let next = journal
+        .append_durable(&new_durable(&session, AgentEventKind::Cancelled))
+        .await
+        .unwrap();
+    assert_eq!(next.stream_seq, second.stream_seq + 1);
+}
+
+#[tokio::test]
+async fn todowrite_for_an_unknown_session_is_journaled_without_a_plan_row() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+    journal
+        .append_durable(&new_durable(
+            "no-such-session",
+            todowrite_kind(r#"[{"content":"a","status":"pending"}]"#),
+        ))
+        .await
+        .expect("the event is still journaled");
+    let rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .query_row("SELECT COUNT(*) FROM session_todo_plans", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn rewinding_past_the_last_todowrite_restores_the_previous_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+
+    journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"first","status":"pending"}]"#),
+        ))
+        .await
+        .unwrap();
+    let second = journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"second","status":"pending"}]"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["second".into()])
+    );
+
+    journal
+        .delete_session_events_range(&session, second.stream_seq, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_contents(&conn.lock(), &session),
+        Some(vec!["first".into()])
+    );
+}
+
+#[tokio::test]
+async fn rewinding_past_every_todowrite_removes_the_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+
+    let first = journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"only","status":"pending"}]"#),
+        ))
+        .await
+        .unwrap();
+    assert!(stored_plan(&conn.lock(), &session).is_some());
+
+    journal
+        .delete_session_events_range(&session, first.stream_seq, None)
+        .await
+        .unwrap();
+    assert_eq!(stored_plan(&conn.lock(), &session), None);
+}
+
+#[tokio::test]
+async fn deleting_a_session_removes_its_todo_plan() {
+    let (storage, session) = storage_with_session().await;
+    let journal: &dyn EventJournal = &storage;
+    let conn = storage.conn_for_test();
+    journal
+        .append_durable(&new_durable(
+            &session,
+            todowrite_kind(r#"[{"content":"a","status":"pending"}]"#),
+        ))
+        .await
+        .unwrap();
+    assert!(stored_plan(&conn.lock(), &session).is_some());
+
+    let store: &dyn SessionStore = &storage;
+    store.delete_session(&session).await.unwrap();
+    let rows: i64 = conn
+        .lock()
+        .query_row("SELECT COUNT(*) FROM session_todo_plans", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "session deletion cascades the plan");
+
+    let recreated = storage
+        .create_session(Some("again".into()), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(stored_plan(&conn.lock(), &recreated.public_id), None);
+}
+
+#[tokio::test]
+async fn every_session_listing_carries_the_todo_plan() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let root = storage
+        .create_session(Some("root".into()), Some("/workspace".into()), None, None)
+        .await
+        .unwrap();
+    let fork = storage
+        .create_session(
+            Some("fork".into()),
+            Some("/workspace".into()),
+            Some(root.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+    let bare = storage
+        .create_session(Some("bare".into()), Some("/workspace".into()), None, None)
+        .await
+        .unwrap();
+    let journal: &dyn EventJournal = &storage;
+    for (session, todos) in [
+        (
+            &root.public_id,
+            r#"[{"content":"done","status":"completed"},{"content":"next","status":"pending"}]"#,
+        ),
+        (
+            &fork.public_id,
+            r#"[{"content":"fork step","status":"in_progress","priority":"high"}]"#,
+        ),
+    ] {
+        journal
+            .append_durable(&new_durable(session, todowrite_kind(todos)))
+            .await
+            .unwrap();
+    }
+    let view: &dyn ViewStore = &storage;
+    let store: &dyn SessionStore = &storage;
+    store
+        .set_session_pinned(&root.public_id, true)
+        .await
+        .unwrap();
+
+    type Plan = Option<Vec<String>>;
+    fn plan_of(
+        items: impl IntoIterator<Item = querymt_agent_core::session::projection::SessionListItem>,
+        id: &str,
+    ) -> Plan {
+        items
+            .into_iter()
+            .find(|item| item.session_id == id)
+            .unwrap_or_else(|| panic!("{id} is listed"))
+            .todo_plan
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{}:{:?}", entry.content, entry.status))
+                    .collect()
+            })
+    }
+    let root_plan: Plan = Some(vec!["done:Completed".into(), "next:Pending".into()]);
+    let fork_plan: Plan = Some(vec!["fork step:InProgress".into()]);
+
+    // Flat view with filter (raw-row path).
+    let flat = view.get_session_list_view(None).await.unwrap();
+    let flat: Vec<_> = flat.groups.into_iter().flat_map(|g| g.sessions).collect();
+    assert_eq!(plan_of(flat.clone(), &root.public_id), root_plan);
+    assert_eq!(plan_of(flat.clone(), &fork.public_id), fork_plan);
+    assert_eq!(plan_of(flat, &bare.public_id), None);
+
+    // Grouped browse.
+    let (groups, _, _) = view
+        .browse_session_groups(None, 20, 20, SessionScope::All)
+        .await
+        .unwrap();
+    let grouped: Vec<_> = groups.into_iter().flat_map(|g| g.sessions).collect();
+    assert_eq!(plan_of(grouped.clone(), &root.public_id), root_plan);
+    assert_eq!(plan_of(grouped.clone(), &fork.public_id), fork_plan);
+    assert_eq!(plan_of(grouped, &bare.public_id), None);
+
+    // One group, cwd-filtered.
+    let (group, _) = view
+        .list_group_sessions(Some("/workspace".into()), None, 20, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(plan_of(group.sessions.clone(), &root.public_id), root_plan);
+    assert_eq!(plan_of(group.sessions, &bare.public_id), None);
+
+    // Paged flat items, with and without the cwd filter.
+    for cwd in [None, Some("/workspace".to_string())] {
+        let (items, _, _) = view
+            .list_session_items(cwd, None, 20, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(plan_of(items.clone(), &root.public_id), root_plan);
+        assert_eq!(plan_of(items, &bare.public_id), None);
+    }
+
+    // Children of the root.
+    let (children, _) = view
+        .list_session_children(root.public_id.clone(), None, 20)
+        .await
+        .unwrap();
+    assert_eq!(plan_of(children.sessions, &fork.public_id), fork_plan);
+
+    // Pinned listing.
+    let (pinned, _, _) = view
+        .list_session_items_with_pins(
+            None,
+            None,
+            20,
+            SessionScope::All,
+            SessionLifecycleFilter::default(),
+            Some(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(plan_of(pinned, &root.public_id), root_plan);
+}

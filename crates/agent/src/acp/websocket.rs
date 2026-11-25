@@ -1592,6 +1592,23 @@ fn spawn_global_notification_forwarders(state: WsServerState, connection: Connec
         }
     });
 
+    // Plan changes of sessions this connection does not follow (session list).
+    let plans_tx = connection.tx.clone();
+    tokio::spawn(
+        querymt_agent_runtime::control::notifications::announce_session_plans(
+            state.agent.config.event_sink.fanout().subscribe(),
+            connection.connection_cancel.clone(),
+            move |notification| {
+                let tx = plans_tx.clone();
+                async move {
+                    send_websocket_ext_notification(&tx, notification)
+                        .await
+                        .is_ok()
+                }
+            },
+        ),
+    );
+
     let mut model_updates = state.agent.model_inventory.subscribe_updates();
     let tx = connection.tx.clone();
     let cancel = connection.connection_cancel.clone();

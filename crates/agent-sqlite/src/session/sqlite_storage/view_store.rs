@@ -58,6 +58,7 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         has_children: fork_count > 0,
         fork_count,
         pending_isolation: false,
+        todo_plan: None,
     })
 }
 
@@ -157,14 +158,66 @@ fn enrich_fork_isolation_state(
     Ok(())
 }
 
-/// Enrich items with durable workspace provenance and pending fork-isolation
-/// state.
+/// Current todo plan of the given sessions, from `session_todo_plans`. The
+/// query is restricted to `session_ids` before any JSON is decoded, so the cost
+/// follows the size of the listed page, not the number of stored plans.
+/// Malformed and empty plans are omitted.
+fn load_todo_plans(
+    conn: &rusqlite::Connection,
+    session_ids: &[&str],
+) -> rusqlite::Result<HashMap<String, Vec<querymt_agent_core::protocol::PlanEntry>>> {
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(session_ids)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let mut stmt = conn.prepare(
+        "SELECT s.public_id, p.entries_json FROM session_todo_plans p \
+         JOIN sessions s ON s.id = p.session_id \
+         WHERE s.public_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let mut rows = stmt.query(params![ids_json])?;
+    let mut plans = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let (public_id, json): (String, String) = (row.get(0)?, row.get(1)?);
+        match serde_json::from_str::<Vec<querymt_agent_core::protocol::PlanEntry>>(&json) {
+            Ok(entries) if !entries.is_empty() => {
+                plans.insert(public_id, entries);
+            }
+            Ok(_) => {}
+            // A corrupt row is left out of the list, never fails it.
+            Err(error) => {
+                tracing::warn!(session_id = %public_id, %error, "skipping unreadable todo plan");
+            }
+        }
+    }
+    Ok(plans)
+}
+
+fn enrich_todo_plans(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    let ids: Vec<&str> = items.iter().map(|item| item.session_id.as_str()).collect();
+    let mut plans = load_todo_plans(conn, &ids)?;
+    if plans.is_empty() {
+        return Ok(());
+    }
+    for item in items.iter_mut() {
+        item.todo_plan = plans.remove(&item.session_id);
+    }
+    Ok(())
+}
+
+/// Enrich items with durable workspace provenance, pending fork-isolation
+/// state and the current todo plan.
 fn enrich_workspace_and_isolation_views(
     conn: &rusqlite::Connection,
     items: &mut [SessionListItem],
 ) -> rusqlite::Result<()> {
     enrich_workspace_views(conn, items)?;
-    enrich_fork_isolation_state(conn, items)
+    enrich_fork_isolation_state(conn, items)?;
+    enrich_todo_plans(conn, items)
 }
 
 fn parse_finish_reason(value: &str) -> Option<FinishReason> {
@@ -697,27 +750,15 @@ impl ViewStore for SqliteStorage {
                 session_kind,
                 has_children: row.fork_count > 0,
                 fork_count: row.fork_count,
+                todo_plan: None,
             });
         }
-        let workspace_views = self.run_blocking(|conn| load_workspace_views(conn)).await?;
-        let pending_isolation: std::collections::HashSet<String> = self
-            .run_blocking(|conn| {
-                conn.prepare(
-                    "SELECT s.public_id FROM session_fork_isolation_intents i
-                         JOIN sessions s ON s.id = i.session_id",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()
+        let items = self
+            .run_blocking(move |conn| {
+                enrich_workspace_and_isolation_views(conn, &mut items)?;
+                Ok(items)
             })
-            .await?
-            .into_iter()
-            .collect();
-        for item in &mut items {
-            item.workspace = workspace_views.get(&item.session_id).cloned();
-            if pending_isolation.contains(&item.session_id) {
-                item.pending_isolation = true;
-            }
-        }
+            .await?;
         let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
 
         // Build a parent-child map to organize sessions hierarchically

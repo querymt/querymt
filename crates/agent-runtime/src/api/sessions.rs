@@ -1935,6 +1935,8 @@ fn acp_parent_session_id_from_meta(meta: Option<&Meta>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Project a local list row to ACP. Peer entries are built separately and
+/// never carry `querymt/plans`.
 fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
     let mut info = SessionInfo::new(
         SessionId::from(item.session_id),
@@ -1978,6 +1980,15 @@ fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
         meta.insert(
             crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
             querymt.into(),
+        );
+    }
+    if let Some(plans) = item
+        .todo_plan
+        .and_then(querymt_agent_core::replay::todo_plans_meta)
+    {
+        meta.insert(
+            querymt_agent_core::replay::QUERYMT_PLANS_META_KEY.to_string(),
+            plans,
         );
     }
     info.meta = Some(meta);
@@ -2474,6 +2485,171 @@ mod remote_page_tests {
                 "slow".to_string(),
                 "after-timeout".to_string(),
             ])
+        );
+    }
+}
+
+#[cfg(test)]
+mod listed_plans_tests {
+    use super::*;
+    use crate::acp::protocol::PlanEntry;
+    use crate::session::backend::StorageBackend;
+    use crate::session::projection::{EventJournal, NewDurableEvent};
+    use querymt_agent_core::events::{AgentEventKind, EventOrigin};
+
+    fn item(todo_plan: Option<Vec<PlanEntry>>) -> SessionListItem {
+        SessionListItem {
+            session_id: "s1".into(),
+            workspace: None,
+            name: None,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            parent_session_id: None,
+            fork_origin: None,
+            session_kind: None,
+            has_children: false,
+            fork_count: 0,
+            pending_isolation: false,
+            todo_plan,
+        }
+    }
+
+    fn entries(arguments: &str) -> Vec<PlanEntry> {
+        querymt_agent_core::replay::todo_entries_from_arguments(arguments).unwrap()
+    }
+
+    async fn write_todos(fixture: &crate::test_utils::TestAgent, session: &str, todos: &str) {
+        fixture
+            .storage
+            .append_durable(&NewDurableEvent {
+                session_seq: None,
+                session_id: session.to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                kind: AgentEventKind::ToolCallStart {
+                    tool_call_id: "call".into(),
+                    tool_name: "todowrite".into(),
+                    arguments: format!(r#"{{"todos":{todos}}}"#),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn listed_meta(fixture: &crate::test_utils::TestAgent, session: &str) -> Meta {
+        let page = AgentSessions::list_for_acp_with_runtime(
+            &fixture.handle,
+            fixture.storage.view_store().unwrap(),
+            AcpListSessionsRequest::new(),
+        )
+        .await
+        .unwrap();
+        page.sessions
+            .into_iter()
+            .find(|info| info.session_id.to_string() == session)
+            .unwrap_or_else(|| panic!("{session} is listed"))
+            .meta
+            .unwrap()
+    }
+
+    #[test]
+    fn plans_key_holds_one_items_plan_with_the_todo_entries() {
+        let info = session_list_item_to_acp_info(item(Some(entries(
+            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"},{"content":"c","status":"pending"}]}"#,
+        ))));
+        let plans = &info.meta.unwrap()["querymt/plans"];
+        let plans = plans.as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["type"], "items");
+        assert_eq!(plans[0]["planId"], "querymt-todos");
+        let statuses: Vec<_> = plans[0]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["completed", "pending", "pending"]);
+    }
+
+    #[test]
+    fn sessions_without_or_with_an_empty_plan_omit_the_key() {
+        for todo_plan in [None, Some(Vec::new())] {
+            let meta = session_list_item_to_acp_info(item(todo_plan)).meta.unwrap();
+            assert!(!meta.contains_key("querymt/plans"));
+        }
+    }
+
+    #[test]
+    fn plans_key_is_top_level_and_leaves_the_querymt_namespace_alone() {
+        let meta = session_list_item_to_acp_info(item(Some(entries(
+            r#"{"todos":[{"content":"a","status":"pending"}]}"#,
+        ))))
+        .meta
+        .unwrap();
+        assert!(meta.contains_key("querymt/plans"));
+        assert!(
+            meta.get("querymt")
+                .is_none_or(|ns| ns.get("plans").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_with_todos_lists_its_plan_and_cancelled_todos_are_left_out() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session = fixture
+            .storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        write_todos(
+            &fixture,
+            &session.public_id,
+            r#"[{"content":"a","status":"in_progress"},{"content":"b","status":"cancelled"}]"#,
+        )
+        .await;
+
+        let meta = listed_meta(&fixture, &session.public_id).await;
+        let plans = meta["querymt/plans"].as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        let listed = plans[0]["entries"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["status"], "in_progress");
+        assert_eq!(listed[0]["content"], "a");
+    }
+
+    #[tokio::test]
+    async fn session_without_todos_and_emptied_list_omit_the_key() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let store = fixture.storage.session_store();
+        let never = store.create_session(None, None, None, None).await.unwrap();
+        let emptied = store.create_session(None, None, None, None).await.unwrap();
+        write_todos(
+            &fixture,
+            &emptied.public_id,
+            r#"[{"content":"a","status":"pending"}]"#,
+        )
+        .await;
+        assert!(
+            listed_meta(&fixture, &emptied.public_id)
+                .await
+                .contains_key("querymt/plans")
+        );
+        write_todos(&fixture, &emptied.public_id, "[]").await;
+
+        assert!(
+            !listed_meta(&fixture, &never.public_id)
+                .await
+                .contains_key("querymt/plans")
+        );
+        assert!(
+            !listed_meta(&fixture, &emptied.public_id)
+                .await
+                .contains_key("querymt/plans")
         );
     }
 }

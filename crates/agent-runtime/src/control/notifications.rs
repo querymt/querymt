@@ -42,6 +42,117 @@ pub use querymt_agent_protocol_types::session::input_state::{
     SessionInputStateNotification,
 };
 
+/// Params of the `querymt/session/plansChanged` notification: a session's
+/// current plans, the value `session/list` reports under `_meta["querymt/plans"]`
+/// (`[]` when the session has none).
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPlansChangedNotification {
+    pub session_id: String,
+    #[serde(default)]
+    #[typeshare(serialized_as = "Array<any>")]
+    pub plans: Vec<serde_json::Value>,
+}
+
+/// The `plansChanged` notification for a session whose todo plan is `entries`
+/// (empty for an emptied list).
+pub(crate) fn session_plans_changed_notification(
+    session_id: &str,
+    entries: Vec<crate::acp::protocol::PlanEntry>,
+) -> Option<crate::acp::protocol::ExtNotification> {
+    let plans = match querymt_agent_core::replay::todo_plans_meta(entries) {
+        Some(serde_json::Value::Array(plans)) => plans,
+        _ => Vec::new(),
+    };
+    let params = SessionPlansChangedNotification {
+        session_id: session_id.to_string(),
+        plans,
+    };
+    let raw = serde_json::value::to_raw_value(&params)
+        .inspect_err(|error| {
+            tracing::error!(%error, "failed to serialize the plansChanged params");
+        })
+        .ok()?;
+    Some(crate::acp::protocol::ExtNotification::new(
+        crate::acp::shared::QMT_NOTIFICATION_SESSION_PLANS_CHANGED,
+        std::sync::Arc::from(raw),
+    ))
+}
+
+/// Announce todo-plan changes to one connection as
+/// `querymt/session/plansChanged`, for the sessions the connection does not
+/// otherwise follow (a session list sees every session; only the active
+/// session's updates reach a connection).
+///
+/// Watches the agent's event stream: when a journaled `todowrite` call changes
+/// a session's plans compared with what this connection was last told, the new
+/// plans go to `deliver`. Events are published after they are journaled, so a
+/// `session/list` already reports the plans when the client hears about them.
+/// Each connection runs its own announcer, so a slow connection only delays
+/// itself and the last-announced state dies with the connection.
+///
+/// Returns when `cancel` fires, the stream closes or `deliver` returns `false`
+/// (the connection is gone). If the announcer falls behind the stream, the
+/// plans that changed meanwhile are not announced; the session list reports
+/// them, and the next `todowrite` of such a session is announced again.
+///
+/// `deliver` is a plain `FnMut` returning a future, not an `AsyncFnMut`, so
+/// that the returned future can be proven `Send` and spawned.
+pub async fn announce_session_plans<F, Fut>(
+    mut events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    cancel: tokio_util::sync::CancellationToken,
+    mut deliver: F,
+) where
+    F: FnMut(crate::acp::protocol::ExtNotification) -> Fut,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut announced: std::collections::HashMap<String, Vec<crate::acp::protocol::PlanEntry>> =
+        std::collections::HashMap::new();
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => break,
+            received = events.recv() => match received {
+                Ok(event) => event,
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "plans announcer fell behind the event stream; plans changed meanwhile are not announced"
+                    );
+                    announced.clear();
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            },
+        };
+        // Only journaled events change what `session/list` reports, plus the
+        // rewind hint, which is emitted after the stored plan was recomputed.
+        if !event.is_durable()
+            && !matches!(
+                event.kind(),
+                querymt_agent_core::events::AgentEventKind::TodoPlanRestored { .. }
+            )
+        {
+            continue;
+        }
+        let Some(entries) = querymt_agent_core::replay::todo_plan_of(event.kind()) else {
+            continue;
+        };
+        let session_id = event.session_id();
+        if announced.get(session_id) == Some(&entries) {
+            continue;
+        }
+        announced.insert(session_id.to_owned(), entries.clone());
+        let Some(notification) = session_plans_changed_notification(session_id, entries) else {
+            continue;
+        };
+        if !deliver(notification).await {
+            break;
+        }
+    }
+}
+
 pub(crate) async fn emit_session_pins_changed_notification(
     agent: &crate::LocalAgentHandle,
     session_id: &str,
@@ -163,6 +274,266 @@ mod mcp_auth_tests {
             serde_json::json!({
                 "server_name": "corp", "provider_id": "mcp:corp", "error": "down"
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod plans_changed_tests {
+    use super::*;
+    use crate::test_utils::TestAgent;
+    use querymt_agent_core::events::AgentEventKind;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn todowrite(arguments: &str) -> AgentEventKind {
+        AgentEventKind::ToolCallStart {
+            tool_call_id: "call".into(),
+            tool_name: "todowrite".into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    fn todos(items: &[(&str, &str)]) -> String {
+        let todos: Vec<_> = items
+            .iter()
+            .map(|(content, status)| serde_json::json!({"content": content, "status": status}))
+            .collect();
+        serde_json::json!({ "todos": todos }).to_string()
+    }
+
+    /// An announcer on the agent's event stream, delivering into a channel.
+    struct Announced {
+        rx: mpsc::UnboundedReceiver<SessionPlansChangedNotification>,
+        cancel: CancellationToken,
+    }
+
+    impl Announced {
+        fn start(fixture: &TestAgent) -> Self {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            tokio::spawn(announce_session_plans(
+                fixture.config.event_sink.fanout().subscribe(),
+                cancel.clone(),
+                move |notification| {
+                    assert_eq!(
+                        notification.method.as_ref(),
+                        crate::acp::shared::QMT_NOTIFICATION_SESSION_PLANS_CHANGED
+                    );
+                    let params = serde_json::from_str(notification.params.get()).unwrap();
+                    let delivered = tx.send(params).is_ok();
+                    async move { delivered }
+                },
+            ));
+            Self { rx, cancel }
+        }
+
+        async fn next(&mut self) -> SessionPlansChangedNotification {
+            tokio::time::timeout(Duration::from_secs(2), self.rx.recv())
+                .await
+                .expect("a plansChanged notification")
+                .expect("the announcer is running")
+        }
+    }
+
+    impl Drop for Announced {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_plans_are_announced_once_and_repeats_are_skipped() {
+        let fixture = TestAgent::new().await;
+        let mut announced = Announced::start(&fixture);
+
+        let two = todos(&[("a", "completed"), ("b", "pending")]);
+        fixture.config.emit_event("s1", todowrite(&two));
+        let first = announced.next().await;
+        assert_eq!(first.session_id, "s1");
+        assert_eq!(first.plans.len(), 1);
+        assert_eq!(first.plans[0]["planId"], "querymt-todos");
+        assert_eq!(first.plans[0]["entries"].as_array().unwrap().len(), 2);
+
+        // The same plans again, then a different list: events are delivered in
+        // order, so the next announcement being the different list proves the
+        // repeat produced none.
+        fixture.config.emit_event("s1", todowrite(&two));
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("a", "completed")])));
+        let next = announced.next().await;
+        assert_eq!(next.plans[0]["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn each_session_is_announced_independently() {
+        let fixture = TestAgent::new().await;
+        let mut announced = Announced::start(&fixture);
+        let same = todos(&[("a", "pending")]);
+        fixture.config.emit_event("s1", todowrite(&same));
+        fixture.config.emit_event("s2", todowrite(&same));
+        // Sessions have separate ordered streams, so their order is open.
+        let mut sessions = [
+            announced.next().await.session_id,
+            announced.next().await.session_id,
+        ];
+        sessions.sort();
+        assert_eq!(sessions, ["s1", "s2"]);
+    }
+
+    #[tokio::test]
+    async fn emptying_the_list_announces_empty_plans() {
+        let fixture = TestAgent::new().await;
+        let mut announced = Announced::start(&fixture);
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("a", "pending")])));
+        assert_eq!(announced.next().await.plans.len(), 1);
+
+        fixture.config.emit_event("s1", todowrite(&todos(&[])));
+        let emptied = announced.next().await;
+        assert_eq!(emptied.session_id, "s1");
+        assert!(emptied.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_that_are_not_a_todo_list_announce_nothing() {
+        let fixture = TestAgent::new().await;
+        let mut announced = Announced::start(&fixture);
+        for bad in ["not json", r#"{"nothing":true}"#] {
+            fixture.config.emit_event("s1", todowrite(bad));
+        }
+        fixture.config.emit_event("s1", AgentEventKind::Cancelled);
+        // Ephemeral events never change the list, whatever they carry.
+        fixture
+            .config
+            .event_sink
+            .emit_ephemeral("s1", todowrite(&todos(&[("ephemeral", "pending")])));
+        // A real change behind them is the first announcement.
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("real", "pending")])));
+        let first = announced.next().await;
+        assert_eq!(first.plans[0]["entries"][0]["content"], "real");
+    }
+
+    #[tokio::test]
+    async fn a_rewind_is_announced_even_though_its_event_is_ephemeral() {
+        let fixture = TestAgent::new().await;
+        let mut announced = Announced::start(&fixture);
+        let before = todos(&[("a", "completed"), ("b", "pending")]);
+        fixture.config.emit_event("s1", todowrite(&before));
+        assert_eq!(
+            announced.next().await.plans[0]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let restored =
+            querymt_agent_core::replay::todo_entries_from_arguments(&todos(&[("a", "completed")]))
+                .unwrap();
+        fixture.config.event_sink.emit_ephemeral(
+            "s1",
+            AgentEventKind::TodoPlanRestored {
+                entries: restored.clone(),
+            },
+        );
+        let announcement = announced.next().await;
+        assert_eq!(announcement.session_id, "s1");
+        assert_eq!(
+            announcement.plans[0]["entries"].as_array().unwrap().len(),
+            1
+        );
+
+        // The same rewind again changes nothing.
+        fixture
+            .config
+            .event_sink
+            .emit_ephemeral("s1", AgentEventKind::TodoPlanRestored { entries: restored });
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("z", "pending")])));
+        assert_eq!(
+            announced.next().await.plans[0]["entries"][0]["content"],
+            "z"
+        );
+    }
+
+    #[tokio::test]
+    async fn announcer_stops_when_delivery_fails_or_it_is_cancelled() {
+        let fixture = TestAgent::new().await;
+        let events = fixture.config.event_sink.fanout().subscribe();
+        let failing = tokio::spawn(announce_session_plans(
+            events,
+            CancellationToken::new(),
+            |_| async { false },
+        ));
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("a", "pending")])));
+        tokio::time::timeout(Duration::from_secs(2), failing)
+            .await
+            .expect("stops after a failed delivery")
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancelled = tokio::spawn(announce_session_plans(
+            fixture.config.event_sink.fanout().subscribe(),
+            cancel.clone(),
+            |_| async { true },
+        ));
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), cancelled)
+            .await
+            .expect("stops when cancelled")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_connection_patch_and_notification_carry_the_same_plans() {
+        use crate::acp::shared::{AcpLiveEventTranslator, AcpSessionUpdateCapabilities};
+
+        let fixture = TestAgent::new().await;
+        let mut events = fixture.handle.subscribe_events();
+        let mut announced = Announced::start(&fixture);
+        let mut active = AcpLiveEventTranslator::new();
+        active.set_capabilities(AcpSessionUpdateCapabilities::default());
+
+        fixture
+            .config
+            .emit_event("s1", todowrite(&todos(&[("a", "pending")])));
+        let envelope = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event published")
+            .unwrap();
+        let patched = active
+            .translate_updates(&envelope)
+            .into_iter()
+            .filter_map(|update| serde_json::to_value(update).ok())
+            .find(|update| update["sessionUpdate"] == "session_info_update")
+            .expect("the active connection gets session_info_update");
+
+        let announced = announced.next().await;
+        assert_eq!(
+            patched["_meta"]["querymt/plans"],
+            serde_json::Value::Array(announced.plans),
+            "patch and notification carry the same plans"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_is_advertised() {
+        let fixture = TestAgent::new().await;
+        let capabilities = crate::control::capabilities::get_capabilities(&fixture.handle);
+        assert!(
+            capabilities
+                .notifications
+                .iter()
+                .any(|method| method == "querymt/session/plansChanged")
         );
     }
 }

@@ -2585,3 +2585,230 @@ mod turn_records {
         Ok(())
     }
 }
+
+// ==================== Test Suite: a rewind restores the todo list ====================
+
+mod todo_rewind {
+    use super::*;
+    use crate::session::ViewStore as _;
+    use crate::tools::builtins::todo::{TodoItem, TodoPriority, TodoStatus};
+    use querymt_agent_core::events::EventEnvelope;
+    use querymt_agent_core::protocol::PlanEntry;
+    use std::time::Duration;
+
+    fn todowrite(todos: &[(&str, &str)]) -> AgentEventKind {
+        let todos: Vec<_> = todos
+            .iter()
+            .map(|(id, status)| {
+                serde_json::json!({
+                    "id": id, "content": id, "status": status, "priority": "medium"
+                })
+            })
+            .collect();
+        AgentEventKind::ToolCallStart {
+            tool_call_id: "call".into(),
+            tool_name: "todowrite".into(),
+            arguments: serde_json::json!({ "todos": todos }).to_string(),
+        }
+    }
+
+    fn item(id: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: id.into(),
+            content: id.into(),
+            status,
+            priority: TodoPriority::Medium,
+        }
+    }
+
+    /// One turn: a user message, its prompt event, then `events`. Returns the
+    /// message id, which is the undo target.
+    async fn turn(
+        fixture: &UndoTestFixture,
+        session: &str,
+        prompt: &str,
+        events: Vec<AgentEventKind>,
+    ) -> Result<String> {
+        let journal = fixture.storage.event_journal();
+        let message_id = fixture.add_user_message(session, prompt).await?;
+        append_prompt_event(&*journal, session, &message_id).await;
+        for kind in events {
+            append_kind(&*journal, session, kind).await;
+        }
+        Ok(message_id)
+    }
+
+    /// The plan `session/list` reports for the session.
+    async fn listed_plan(fixture: &UndoTestFixture, session: &str) -> Option<Vec<PlanEntry>> {
+        let view = fixture.storage.get_session_list_view(None).await.unwrap();
+        view.groups
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .find(|item| item.session_id == session)
+            .expect("the session is listed")
+            .todo_plan
+            .clone()
+    }
+
+    /// Undo `target`, then run the cleanup a new prompt triggers, announcing
+    /// on the agent's event stream.
+    async fn rewind(
+        fixture: &UndoTestFixture,
+        session: &str,
+        target: &str,
+    ) -> Result<Option<Vec<TodoItem>>> {
+        fixture.undo(session, target).await?;
+        let config = &fixture.handle.config;
+        Ok(crate::agent::undo::cleanup_revert_on_prompt(
+            &config.provider,
+            &**config.event_sink.journal(),
+            Some(&config.event_sink.session_stream(session)),
+            session,
+            None,
+        )
+        .await?)
+    }
+
+    /// The next `TodoPlanRestored` entries on the stream, `None` when the next
+    /// event after a sentinel is the sentinel itself.
+    async fn next_restored(
+        events: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+        fixture: &UndoTestFixture,
+        session: &str,
+    ) -> Option<Vec<PlanEntry>> {
+        // Events arrive in order, so reaching the sentinel without a restored
+        // event proves none was sent.
+        fixture.handle.config.event_sink.emit_ephemeral(
+            session,
+            AgentEventKind::McpServerAuthRequired {
+                server_name: "sentinel".into(),
+                provider_id: "mcp:sentinel".into(),
+                error: None,
+            },
+        );
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("an event on the stream")
+                .expect("the stream is open");
+            match envelope.kind() {
+                AgentEventKind::TodoPlanRestored { entries } => return Some(entries.clone()),
+                AgentEventKind::McpServerAuthRequired { .. } => return None,
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rewinding_past_a_todowrite_restores_the_earlier_list_everywhere() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        let session = fixture.create_session().await?;
+        turn(
+            &fixture,
+            &session,
+            "first",
+            vec![todowrite(&[("a", "completed")])],
+        )
+        .await?;
+        let second = turn(
+            &fixture,
+            &session,
+            "second",
+            vec![todowrite(&[("a", "completed"), ("b", "pending")])],
+        )
+        .await?;
+        let mut events = fixture.handle.config.event_sink.fanout().subscribe();
+        assert_eq!(listed_plan(&fixture, &session).await.unwrap().len(), 2);
+
+        let restored = rewind(&fixture, &session, &second).await?;
+
+        // The todo store `todoread` reads gets the earlier list, with its ids.
+        assert_eq!(restored, Some(vec![item("a", TodoStatus::Completed)]));
+        // The listed plan was recomputed with the prune.
+        assert_eq!(listed_plan(&fixture, &session).await.unwrap().len(), 1);
+        // Live observers are told the same plan.
+        let announced = next_restored(&mut events, &fixture, &session)
+            .await
+            .expect("the rewind is announced");
+        assert_eq!(Some(announced), listed_plan(&fixture, &session).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewinding_past_the_only_todowrite_empties_the_list() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        let session = fixture.create_session().await?;
+        turn(&fixture, &session, "first", vec![]).await?;
+        let second = turn(
+            &fixture,
+            &session,
+            "second",
+            vec![todowrite(&[("a", "pending")])],
+        )
+        .await?;
+        let mut events = fixture.handle.config.event_sink.fanout().subscribe();
+        assert!(listed_plan(&fixture, &session).await.is_some());
+
+        let restored = rewind(&fixture, &session, &second).await?;
+
+        assert_eq!(restored, Some(Vec::new()));
+        assert_eq!(listed_plan(&fixture, &session).await, None);
+        assert_eq!(
+            next_restored(&mut events, &fixture, &session).await,
+            Some(Vec::new()),
+            "an emptied plan is announced as empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewinding_a_turn_without_a_todowrite_leaves_the_list_alone() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        let session = fixture.create_session().await?;
+        turn(
+            &fixture,
+            &session,
+            "first",
+            vec![todowrite(&[("a", "pending")])],
+        )
+        .await?;
+        let second = turn(&fixture, &session, "second", vec![]).await?;
+        let mut events = fixture.handle.config.event_sink.fanout().subscribe();
+
+        let restored = rewind(&fixture, &session, &second).await?;
+
+        assert_eq!(restored, None, "the todo store keeps its list");
+        assert_eq!(listed_plan(&fixture, &session).await.unwrap().len(), 1);
+        assert_eq!(next_restored(&mut events, &fixture, &session).await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rewound_todowrite_that_changed_only_cancelled_items_resets_the_store_quietly()
+    -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        let session = fixture.create_session().await?;
+        turn(
+            &fixture,
+            &session,
+            "first",
+            vec![todowrite(&[("a", "pending")])],
+        )
+        .await?;
+        // Cancelled items are not part of the plan: the listed plan is the same.
+        let second = turn(
+            &fixture,
+            &session,
+            "second",
+            vec![todowrite(&[("a", "pending"), ("b", "cancelled")])],
+        )
+        .await?;
+        let mut events = fixture.handle.config.event_sink.fanout().subscribe();
+
+        let restored = rewind(&fixture, &session, &second).await?;
+
+        assert_eq!(restored, Some(vec![item("a", TodoStatus::Pending)]));
+        assert_eq!(next_restored(&mut events, &fixture, &session).await, None);
+        Ok(())
+    }
+}
