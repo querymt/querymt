@@ -44,7 +44,12 @@ pub struct HeaderFields {
     pub phase: String,
     pub run_id: Option<String>,
     pub plan: Vec<PlanEntry>,
+    /// The core's context measurement `(used, size)`; `None` also after a
+    /// model change made the last one stale.
     pub usage: Option<(u64, u64)>,
+    /// Context size of the session's current model, when the agent named it
+    /// (load summary or the model-change signal).
+    pub context_limit: Option<u64>,
     pub breakdown: Option<Breakdown>,
     pub accounting: Option<Accounting>,
     /// Run time of the ended runs, in milliseconds (the core's `active_time`).
@@ -875,6 +880,11 @@ fn map_header(header: &SessionHeader) -> HeaderFields {
         run_id: header.active_run_id.clone(),
         plan,
         usage: header.context.as_ref().map(|c| (c.used, c.size)),
+        context_limit: header
+            .provider
+            .as_ref()
+            .and_then(|p| p.context_limit)
+            .filter(|size| *size > 0),
         breakdown,
         accounting,
         active_ms: header
@@ -1355,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn model_change_hides_stale_context() {
+    fn model_change_keeps_the_new_limit() {
         let context = |context_position: i64, model_position: i64| {
             snapshot(
                 vec![history_event(
@@ -1384,11 +1394,13 @@ mod tests {
                 } }),
             )
         };
-        // The measurement predates the model change: no context shown.
+        // The measurement predates the model change: the core drops it, the
+        // new model's size stays known (the view shows the last usage).
         let mut stale = Projection::new("s1");
         let report = stale.feed(&[context(3, 7)]);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(stale.header_fields().usage, None);
+        assert_eq!(stale.header_fields().context_limit, Some(200_000));
 
         // The measurement follows the model change: kept.
         let mut fresh = Projection::new("s1");

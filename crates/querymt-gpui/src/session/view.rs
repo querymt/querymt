@@ -44,6 +44,18 @@ pub fn next_client_id() -> String {
 /// The parts of a load response the view handles itself.
 struct LoadParts {
     options: Option<Value>,
+    /// The summary's last context measurement (`usage.contextTokens`). The
+    /// core drops it when a model change made it stale; the view keeps it.
+    context_used: Option<u64>,
+}
+
+/// `summary.usage.contextTokens` of a load response's snapshot.
+fn summary_context_used(response: &Value) -> Option<u64> {
+    response
+        .get("_meta")?
+        .get("querymt/sessionLoadSnapshot.v1")?
+        .pointer("/summary/usage/contextTokens")?
+        .as_u64()
 }
 
 /// A `session/load` response whose snapshot is decoded off the UI thread.
@@ -194,7 +206,12 @@ impl SessionView {
         self.phase = f.phase;
         self.run_id = f.run_id;
         self.plan = f.plan;
-        self.usage = f.usage;
+        self.measured = f.usage;
+        self.context_limit = f.context_limit;
+        if let Some((used, _)) = f.usage {
+            self.last_used = Some(used);
+        }
+        self.show_context();
         self.breakdown = f.breakdown;
         self.accounting = f.accounting;
         self.active_work_ms = f.active_ms;
@@ -214,6 +231,16 @@ impl SessionView {
         self.history_before = f.history_before;
         self.undo_stack = f.undo_stack;
         self.pending_inputs = f.pending_inputs;
+    }
+
+    /// The context shown: the core's measurement, else the last measured
+    /// `used` against the current model's size. A model change makes the
+    /// core drop its measurement, but the conversation is the same: the last
+    /// value stands until a request with the new model reports its own.
+    fn show_context(&mut self) {
+        self.usage = self
+            .measured
+            .or_else(|| self.last_used.zip(self.context_limit));
     }
 
     /// Only the merged list of pending inputs.
@@ -244,10 +271,17 @@ impl SessionView {
         self.apply_modes(response.get("modes"));
         LoadParts {
             options: response.get("configOptions").cloned(),
+            context_used: summary_context_used(response),
         }
     }
 
     fn after_load(&mut self, parts: LoadParts) {
+        // After the core's header: a fresh measurement is the same value, a
+        // stale one only lives here.
+        if parts.context_used.is_some() {
+            self.last_used = parts.context_used;
+            self.show_context();
+        }
         self.apply_config(parts.options.as_ref());
         self.sync_inputs();
         if let Some(notice) = self.after_load_notice.take() {
@@ -647,6 +681,9 @@ impl SessionView {
             prompting: self.prompting,
             plan: Vec::new(),
             usage: self.usage,
+            last_used: self.last_used,
+            measured: self.measured,
+            context_limit: self.context_limit,
             breakdown: self.breakdown,
             accounting: self.accounting.clone(),
             active_work_ms: self.active_work_ms,
