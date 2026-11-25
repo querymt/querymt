@@ -182,21 +182,39 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 })));
             }
-            self.ensure_remote_session_connected(
-                &session_id,
-                Some(&bookmark.node_id),
-                crate::agent::handle::remote_connect::RemoteConnectReason::Open,
-            )
-            .await
-            .map_err(|error| error.to_acp_error())?;
-            let session_ref = self
-                .registry
-                .lock()
+            let connected = self
+                .ensure_remote_session_connected(
+                    &session_id,
+                    Some(&bookmark.node_id),
+                    crate::agent::handle::remote_connect::RemoteConnectReason::Open,
+                )
                 .await
-                .get(&session_id)
-                .cloned()
-                .ok_or_else(|| Error::internal_error().data("remote session was not attached"))?;
-            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+                .map_err(|error| error.to_acp_error())?;
+            // The first call through a reused attachment shows whether it
+            // still reaches a live actor; a dead one is replaced once.
+            let current_mode = match connected.session_ref.get_mode().await {
+                Ok(mode) => mode,
+                Err(error) if connected.reused_attachment_failed(&error) => {
+                    log::info!(
+                        "remote session {session_id} resume: reused attachment_id={} failed \
+                         ({error}); replacing it",
+                        connected.attachment_id,
+                    );
+                    self.replace_failed_remote_attachment(
+                        &session_id,
+                        connected.attachment_id,
+                        connected.session_ref.remote_node_id(),
+                        false,
+                    )
+                    .await
+                    .map_err(|error| error.to_acp_error())?
+                    .session_ref
+                    .get_mode()
+                    .await
+                    .map_err(Error::from)?
+                }
+                Err(error) => return Err(Error::from(error)),
+            };
             return Ok(ResumeSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(self.remote_session_config_options(&session_id).await?));

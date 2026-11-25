@@ -170,6 +170,21 @@ pub(crate) struct ConnectedRemoteSession {
     pub(crate) outcome: RemoteConnectOutcome,
 }
 
+impl ConnectedRemoteSession {
+    /// Whether `error`, returned by a call through this attachment, shows that
+    /// a reused attachment no longer reaches a live actor (for example after
+    /// the owner restarted) so that replacing it may help.
+    ///
+    /// A freshly installed attachment passed its health check moments ago;
+    /// its failures are reported as they are instead of reconnecting again.
+    pub(crate) fn reused_attachment_failed(&self, error: &AgentError) -> bool {
+        self.outcome == RemoteConnectOutcome::Reused
+            && error
+                .transport_failure()
+                .is_some_and(RemoteTransportFailure::is_retryable_kind)
+    }
+}
+
 // ── Connect error ───────────────────────────────────────────────────────
 
 /// Typed connect failure. Codes are stable strings aligned with plan §13 so
@@ -566,6 +581,43 @@ impl LocalAgentHandle {
                 replace: reason.default_replace_policy(),
                 handoff: None,
                 windowed: false,
+                fork_origin: None,
+            },
+        )
+        .await
+    }
+
+    /// Replace an attachment that failed at the transport level.
+    ///
+    /// Removes generation `attachment_id` (if it is still the installed one)
+    /// and connects again with [`RemoteReplacePolicy::ReplaceIfMatches`], so
+    /// a newer generation installed meanwhile by another caller is reused
+    /// instead of being torn down. Callers decide whether to repeat their
+    /// request on the returned attachment.
+    pub(crate) async fn replace_failed_remote_attachment(
+        &self,
+        session_id: &str,
+        attachment_id: u64,
+        node_hint: Option<&str>,
+        windowed: bool,
+    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        let stale = {
+            let mut registry = self.registry.lock().await;
+            registry.invalidate_remote_attachment_if_current(session_id, attachment_id)
+        };
+        if let Some(stale) = stale {
+            crate::agent::session_registry::cleanup_installed_remote_attachment(stale, false).await;
+        }
+        self.connect_remote_session(
+            session_id,
+            RemoteConnectOptions {
+                node_hint,
+                peer_label: None,
+                preferred_scope: None,
+                reason: RemoteConnectReason::OperationRecovery,
+                replace: RemoteReplacePolicy::ReplaceIfMatches(attachment_id),
+                handoff: None,
+                windowed,
                 fork_origin: None,
             },
         )
@@ -2369,6 +2421,157 @@ mod tests {
         crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
         mesh.deregister_actor(&scoped_session(&scope, &session_id));
         mesh.deregister_actor(&manager_name);
+    }
+
+    /// The owner restarts while this node still holds an attachment to the
+    /// old session actor. Loading through that reused attachment must replace
+    /// it and load again instead of failing with `remote_transfer_failed`.
+    #[tokio::test]
+    async fn load_replaces_reused_attachment_whose_owner_actor_is_gone() {
+        use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+        use crate::session::projection::NewDurableEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The owner's session is found through its DHT publication only, so
+        // the test does not depend on the node-manager name that every test
+        // on the shared mesh registers under the same peer id.
+        let mesh = get_test_mesh().await;
+        let (owner, _owner_storage, _t1) = handle_with_real_storage().await;
+        let (viewer, storage, _t2) = handle_with_real_storage().await;
+        viewer.set_mesh(mesh.clone());
+        let node_id = mesh.peer_id().to_string();
+        let session_id = format!("owner-restart-{}", uuid::Uuid::now_v7());
+        let published = scoped_session(&MeshScopeId::lan_default(), &session_id);
+        owner
+            .config
+            .event_sink
+            .journal()
+            .append_durable(&NewDurableEvent {
+                session_id: session_id.clone(),
+                origin: querymt_agent_core::events::EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                session_seq: None,
+                kind: AgentEventKind::PromptReceived {
+                    content: "before owner restart".into(),
+                    message_id: None,
+                },
+            })
+            .await
+            .unwrap();
+        let spawn_owner_actor = || {
+            SessionActor::spawn(
+                SessionActor::new(
+                    owner.config.clone(),
+                    session_id.clone(),
+                    SessionRuntime::new(
+                        None,
+                        Default::default(),
+                        crate::agent::core::McpToolState::empty(),
+                    ),
+                )
+                .with_mesh(Some(mesh.clone())),
+            )
+        };
+        let before_restart = spawn_owner_actor();
+        mesh.register_actor(before_restart.clone(), published.clone())
+            .await;
+        storage
+            .session_store()
+            .save_remote_session_bookmark(&test_bookmark(&session_id, &node_id))
+            .await
+            .unwrap();
+
+        let first = viewer
+            .ensure_remote_session_connected(&session_id, None, RemoteConnectReason::Open)
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, RemoteConnectOutcome::Reattached);
+        viewer
+            .sync_remote_for_load(&session_id, &first, false)
+            .await
+            .unwrap();
+
+        // "Restart" the owner: the old session actor is gone and a new one
+        // is published under the session's name.
+        mesh.deregister_actor(&published);
+        before_restart.kill();
+        before_restart.wait_for_shutdown().await;
+        let after_restart = spawn_owner_actor();
+        mesh.register_actor(after_restart.clone(), published.clone())
+            .await;
+
+        // The viewer still believes in the old generation (the link death
+        // may never be observed across a fast restart).
+        let stale = ConnectedRemoteSession {
+            session_ref: first.session_ref.clone(),
+            attachment_id: first.attachment_id,
+            bookmark: first.bookmark.clone(),
+            outcome: RemoteConnectOutcome::Reused,
+        };
+        let dead = stale.session_ref.get_mode().await.unwrap_err();
+        assert_eq!(
+            dead.transport_failure().map(|failure| failure.kind),
+            Some(querymt_remote::RemoteTransportFailureKind::ActorUnavailable),
+        );
+        assert!(stale.reused_attachment_failed(&dead));
+        let fresh = ConnectedRemoteSession {
+            outcome: RemoteConnectOutcome::Resumed,
+            ..stale
+        };
+        assert!(
+            !fresh.reused_attachment_failed(&dead),
+            "a freshly verified attachment is not replaced again"
+        );
+        assert!(!fresh.reused_attachment_failed(&AgentError::MeshAccessDenied));
+        let stale = ConnectedRemoteSession {
+            outcome: RemoteConnectOutcome::Reused,
+            ..fresh
+        };
+
+        let config_calls = AtomicUsize::new(0);
+        let (snapshot, (), config) = viewer
+            .load_connected_remote_session(
+                &session_id,
+                stale,
+                None,
+                || async {},
+                || async {
+                    config_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Vec<u8>, agent_client_protocol::Error>(vec![1])
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("load after owner restart failed: {error:?}"));
+        assert!(
+            snapshot.to_string().contains("before owner restart"),
+            "the snapshot carries the owner's history"
+        );
+        assert_eq!(config, vec![1]);
+        assert_eq!(
+            config_calls.load(Ordering::SeqCst),
+            2,
+            "the whole load is repeated on the replacement attachment"
+        );
+        let current = viewer
+            .registry
+            .lock()
+            .await
+            .remote_attachment_id(&session_id)
+            .expect("a replacement attachment is installed");
+        assert_ne!(current, first.attachment_id);
+
+        let attachment = viewer
+            .registry
+            .lock()
+            .await
+            .take_remote_attachment(&session_id)
+            .unwrap();
+        crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
+        mesh.deregister_actor(&published);
+        after_restart.kill();
     }
 
     #[tokio::test]

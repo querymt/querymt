@@ -94,6 +94,74 @@ impl LocalAgentHandle {
         }
     }
 
+    /// Load a connected remote session: its snapshot, profile and
+    /// configuration, requested concurrently (see [`join_remote_load_requests`]).
+    ///
+    /// A reused attachment can outlive the actor it points to (the owner
+    /// restarted before the link was seen to die). When the snapshot fails
+    /// because of that, the attachment is replaced once and the whole load
+    /// is repeated on the new one. `profile` and `config` are called again
+    /// for the repeated load.
+    ///
+    /// Failing to replace the attachment returns [`RemoteLoadError::Connect`],
+    /// so callers handle it like a failed initial connect (for example by
+    /// serving a stale local snapshot when the owner is unreachable).
+    #[cfg(feature = "remote")]
+    pub(crate) async fn load_connected_remote_session<P, C, Pf, Cf>(
+        &self,
+        session_id: &str,
+        connected: super::remote_connect::ConnectedRemoteSession,
+        window: Option<crate::session::history_window::LoadWindow>,
+        profile: impl Fn() -> Pf,
+        config: impl Fn() -> Cf,
+    ) -> Result<(serde_json::Value, P, C), RemoteLoadError>
+    where
+        Pf: std::future::Future<Output = P>,
+        Cf: std::future::Future<Output = Result<C, agent_client_protocol::Error>>,
+        C: Default,
+    {
+        let first = join_remote_load_requests(
+            session_id,
+            self.load_remote_snapshot(session_id, &connected, window),
+            profile(),
+            config(),
+        )
+        .await;
+        let error = match first {
+            Ok(loaded) => return Ok(loaded),
+            Err(RemoteSnapshotError::Failed(error)) => return Err(RemoteLoadError::Failed(error)),
+            Err(RemoteSnapshotError::DeadAttachment(error)) => error,
+        };
+        log::info!(
+            "remote session {session_id} load: reused attachment_id={} failed ({error}); \
+             replacing it and loading again",
+            connected.attachment_id,
+        );
+        let recovered = self
+            .replace_failed_remote_attachment(
+                session_id,
+                connected.attachment_id,
+                connected.session_ref.remote_node_id(),
+                window.is_some(),
+            )
+            .await
+            .map_err(RemoteLoadError::Connect)?;
+        // `recovered` may itself be `Reused` when another caller installed a
+        // newer generation meanwhile; this load is not repeated a second time.
+        join_remote_load_requests(
+            session_id,
+            async {
+                self.load_remote_snapshot(session_id, &recovered, window)
+                    .await
+                    .map_err(|error| error.into_acp(session_id))
+            },
+            profile(),
+            config(),
+        )
+        .await
+        .map_err(RemoteLoadError::Failed)
+    }
+
     /// Make a connected remote session's history local, then build its load
     /// snapshot from the local journal (the same builder local sessions use).
     ///
@@ -101,13 +169,17 @@ impl LocalAgentHandle {
     /// unreachable owner may be served from a complete local copy, marked
     /// stale, unless access is known to be denied. A transfer that exceeds
     /// its budget fails with a retryable `remote_transfer_failed` error.
+    ///
+    /// A reused attachment whose actor cannot be reached is reported as
+    /// [`RemoteSnapshotError::DeadAttachment`] before anything is built, so
+    /// the caller can replace it (see [`Self::load_connected_remote_session`]).
     #[cfg(feature = "remote")]
     pub(crate) async fn load_remote_snapshot(
         &self,
         session_id: &str,
         connected: &super::remote_connect::ConnectedRemoteSession,
         window: Option<crate::session::history_window::LoadWindow>,
-    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    ) -> Result<serde_json::Value, RemoteSnapshotError> {
         // One deadline for the sync and the snapshot's own backfill.
         let deadline = tokio::time::Instant::now() + remote_transfer_budget();
         let sync = match tokio::time::timeout_at(
@@ -122,12 +194,22 @@ impl LocalAgentHandle {
                 message: "history transfer timed out".into(),
             }),
         };
-        if let Err(error) = &sync {
-            log::warn!("remote history sync before load failed: session_id={session_id}: {error}");
-        }
+        let sync = match sync {
+            Err(error) if connected.reused_attachment_failed(&error) => {
+                return Err(RemoteSnapshotError::DeadAttachment(error));
+            }
+            Err(error) => {
+                log::warn!(
+                    "remote history sync before load failed: session_id={session_id}: {error}"
+                );
+                Err(error)
+            }
+            Ok(()) => Ok(()),
+        };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         self.build_remote_attach_snapshot_with_budget(session_id, window, sync, remaining)
             .await
+            .map_err(RemoteSnapshotError::Failed)
     }
 
     /// The full event history of an attached remote session, read from the
@@ -461,6 +543,44 @@ impl LocalAgentHandle {
     }
 }
 
+/// Why the snapshot of a connected remote session could not be built.
+#[cfg(feature = "remote")]
+#[derive(Debug)]
+pub(crate) enum RemoteSnapshotError {
+    /// The reused attachment no longer reaches a live actor; nothing was
+    /// built. Replacing the attachment may help.
+    DeadAttachment(crate::error::AgentError),
+    /// Any other failure, already in its client-facing form.
+    Failed(agent_client_protocol::Error),
+}
+
+#[cfg(feature = "remote")]
+impl RemoteSnapshotError {
+    /// The client-facing error. A dead attachment that cannot be replaced
+    /// any more is a failed history transfer (retryable).
+    pub(crate) fn into_acp(self, session_id: &str) -> agent_client_protocol::Error {
+        match self {
+            Self::DeadAttachment(error) => {
+                agent_client_protocol::Error::from(crate::error::AgentError::RemoteTransferFailed {
+                    session_id: session_id.to_owned(),
+                    message: error.to_string(),
+                })
+            }
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// Why loading a connected remote session failed.
+#[cfg(feature = "remote")]
+#[derive(Debug)]
+pub(crate) enum RemoteLoadError {
+    /// Replacing a dead attachment failed; handled like a failed connect.
+    Connect(super::remote_connect::RemoteSessionConnectError),
+    /// The load failed for another reason.
+    Failed(agent_client_protocol::Error),
+}
+
 #[cfg(feature = "remote")]
 const DEFAULT_REMOTE_TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -521,14 +641,14 @@ fn missing_older_range(
 /// best-effort, and a failed configuration request yields an empty default
 /// (logged). Total latency is the slowest request, not their sum.
 #[cfg(feature = "remote")]
-pub(crate) async fn join_remote_load_requests<T, P, C, Sf, Pf, Cf>(
+pub(crate) async fn join_remote_load_requests<T, E, P, C, Sf, Pf, Cf>(
     session_id: &str,
     snapshot: Sf,
     profile: Pf,
     config: Cf,
-) -> Result<(T, P, C), agent_client_protocol::Error>
+) -> Result<(T, P, C), E>
 where
-    Sf: std::future::Future<Output = Result<T, agent_client_protocol::Error>>,
+    Sf: std::future::Future<Output = Result<T, E>>,
     Pf: std::future::Future<Output = P>,
     Cf: std::future::Future<Output = Result<C, agent_client_protocol::Error>>,
     C: Default,
