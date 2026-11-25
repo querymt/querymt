@@ -496,6 +496,34 @@ impl LocalAgentHandle {
         let _ = self.ext_notifications.send(notification);
     }
 
+    /// Sends an agent-wide extension notification to every client: WebSocket
+    /// connections through the broadcast, the stdio client through the
+    /// bridge. The two reach different clients, so nothing arrives twice.
+    ///
+    /// Failures are logged: the change being announced already happened.
+    pub(crate) async fn notify_all_clients(
+        &self,
+        method: &'static str,
+        params: &impl serde::Serialize,
+    ) {
+        let raw = match serde_json::value::to_raw_value(params) {
+            Ok(raw) => raw,
+            Err(error) => {
+                log::warn!("Failed to encode {method} notification: {error}");
+                return;
+            }
+        };
+        let notification = ExtNotification::new(method, std::sync::Arc::from(raw));
+        self.broadcast_ext_notification(notification.clone());
+
+        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+        if let Some(bridge) = bridge
+            && let Err(error) = bridge.notify_ext(notification).await
+        {
+            log::warn!("Failed to send {method} notification: {error}");
+        }
+    }
+
     /// Records the active ACP connection for one materialized session.
     ///
     /// The route is transport-owned state used only for the editor workspace
@@ -1324,5 +1352,54 @@ mod skipped_mcp_meta_tests {
         assert_eq!(skipped[0]["provider_id"], "mcp:linear");
         assert!(skipped[0].get("error").is_none());
         assert_eq!(skipped[1]["error"], "idp unreachable");
+    }
+}
+
+#[cfg(test)]
+mod notify_all_clients_tests {
+    use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
+    use crate::test_utils::TestAgent;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    const METHOD: &str = "querymt/test/changed";
+
+    #[tokio::test]
+    async fn reaches_the_broadcast_and_the_bridge_once_each() {
+        let fixture = TestAgent::new().await;
+        let mut broadcast = fixture.handle.subscribe_ext_notifications();
+        let (tx, mut bridge) = tokio::sync::mpsc::channel(8);
+        fixture.handle.set_bridge(ClientBridgeSender::new(tx)).await;
+
+        fixture
+            .handle
+            .notify_all_clients(METHOD, &serde_json::json!({ "n": 1 }))
+            .await;
+
+        let global = broadcast.recv().await.expect("broadcast notification");
+        assert_eq!(global.method.as_ref(), METHOD);
+        assert_eq!(global.params.get(), r#"{"n":1}"#);
+        match bridge.recv().await.expect("bridge notification") {
+            ClientBridgeMessage::ExtNotification(notification) => {
+                assert_eq!(notification.method.as_ref(), METHOD);
+                assert_eq!(notification.params.get(), r#"{"n":1}"#);
+            }
+            other => panic!("expected an extension notification, got {other:?}"),
+        }
+        assert!(matches!(broadcast.try_recv(), Err(TryRecvError::Empty)));
+        assert!(bridge.try_recv().is_err(), "the bridge got it once");
+    }
+
+    #[tokio::test]
+    async fn without_a_bridge_it_still_broadcasts() {
+        let fixture = TestAgent::new().await;
+        let mut broadcast = fixture.handle.subscribe_ext_notifications();
+
+        fixture
+            .handle
+            .notify_all_clients(METHOD, &serde_json::json!({}))
+            .await;
+
+        let global = broadcast.recv().await.expect("broadcast notification");
+        assert_eq!(global.method.as_ref(), METHOD);
     }
 }

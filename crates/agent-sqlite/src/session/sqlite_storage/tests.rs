@@ -7305,6 +7305,52 @@ async fn batch_fallback_appends_each_event_atomically_with_its_plan() {
 }
 
 #[tokio::test]
+async fn view_store_reports_the_current_plans_of_the_asked_sessions_only() {
+    let (storage, with_plan) = storage_with_session().await;
+    let emptied = storage
+        .create_session(Some("emptied".into()), None, None, None)
+        .await
+        .unwrap()
+        .public_id;
+    let never = storage
+        .create_session(Some("never".into()), None, None, None)
+        .await
+        .unwrap()
+        .public_id;
+    let other = storage
+        .create_session(Some("other".into()), None, None, None)
+        .await
+        .unwrap()
+        .public_id;
+    let journal: &dyn EventJournal = &storage;
+    for (session, todos) in [
+        (&with_plan, r#"[{"content":"a","status":"pending"}]"#),
+        (&emptied, r#"[{"content":"a","status":"pending"}]"#),
+        (&emptied, "[]"),
+        (&other, r#"[{"content":"z","status":"pending"}]"#),
+    ] {
+        journal
+            .append_durable(&new_durable(session, todowrite_kind(todos)))
+            .await
+            .unwrap();
+    }
+
+    let view_store: &dyn ViewStore = &storage;
+    let ask = vec![with_plan.clone(), emptied, never, "unknown".to_string()];
+    let plans = view_store.get_session_todo_plans(&ask).await.unwrap();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(plans[&with_plan][0].content, "a");
+
+    assert!(
+        view_store
+            .get_session_todo_plans(&[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn todowrite_for_an_unknown_session_is_journaled_without_a_plan_row() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let journal: &dyn EventJournal = &storage;

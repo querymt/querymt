@@ -1598,6 +1598,7 @@ fn spawn_global_notification_forwarders(state: WsServerState, connection: Connec
         querymt_agent_runtime::control::notifications::announce_session_plans(
             state.agent.config.event_sink.fanout().subscribe(),
             connection.connection_cancel.clone(),
+            state.agent.config.storage.view_store(),
             move |notification| {
                 let tx = plans_tx.clone();
                 async move {
@@ -1821,6 +1822,22 @@ async fn refresh_session_observations(
                 continue;
             }
             if connection.tx.send(notification.to_string()).await.is_err() {
+                return false;
+            }
+        }
+        // A lagged stream also drops the ephemeral rewind hint; the stored
+        // plans say what the connection missed.
+        for (session_id, update) in
+            crate::acp::shared::reconcile_session_plans(&state.agent, &session_ids, translator)
+                .await
+        {
+            let json = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id, "update": update},
+            })
+            .to_string();
+            if connection.tx.send(json).await.is_err() {
                 return false;
             }
         }

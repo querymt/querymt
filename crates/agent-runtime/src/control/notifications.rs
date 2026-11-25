@@ -92,15 +92,22 @@ pub(crate) fn session_plans_changed_notification(
 /// itself and the last-announced state dies with the connection.
 ///
 /// Returns when `cancel` fires, the stream closes or `deliver` returns `false`
-/// (the connection is gone). If the announcer falls behind the stream, the
-/// plans that changed meanwhile are not announced; the session list reports
-/// them, and the next `todowrite` of such a session is announced again.
+/// (the connection is gone).
+///
+/// If the announcer falls behind the stream, it drops what was queued (the
+/// store already reflects it) and asks `plan_source` for the plans of the
+/// sessions it announced before, announcing those that changed meanwhile. A
+/// session it never announced is not covered: the session list reports its
+/// plans, and its next `todowrite` is announced. Without a `plan_source`, or
+/// when it cannot answer, the announced state is forgotten instead, so the
+/// next change of each session is announced even if it equals an old value.
 ///
 /// `deliver` is a plain `FnMut` returning a future, not an `AsyncFnMut`, so
 /// that the returned future can be proven `Send` and spawned.
 pub async fn announce_session_plans<F, Fut>(
     mut events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
     cancel: tokio_util::sync::CancellationToken,
+    plan_source: Option<std::sync::Arc<dyn crate::session::projection::ViewStore>>,
     mut deliver: F,
 ) where
     F: FnMut(crate::acp::protocol::ExtNotification) -> Fut,
@@ -118,9 +125,14 @@ pub async fn announce_session_plans<F, Fut>(
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,
-                        "plans announcer fell behind the event stream; plans changed meanwhile are not announced"
+                        "plans announcer fell behind the event stream; reconciling with the stored plans"
                     );
-                    announced.clear();
+                    // Replaying the retained events after the stored plans
+                    // would announce older plans again.
+                    events = events.resubscribe();
+                    if !reconcile_announced(plan_source.as_deref(), &mut announced, &mut deliver).await {
+                        break;
+                    }
                     continue;
                 }
                 Err(RecvError::Closed) => break,
@@ -153,28 +165,55 @@ pub async fn announce_session_plans<F, Fut>(
     }
 }
 
+/// After the announcer fell behind: announce the plans of the sessions it
+/// announced before that differ from the stored ones. Forgets the announced
+/// state when the store cannot answer. Returns `false` when `deliver` did.
+async fn reconcile_announced<F, Fut>(
+    plan_source: Option<&dyn crate::session::projection::ViewStore>,
+    announced: &mut std::collections::HashMap<String, Vec<crate::acp::protocol::PlanEntry>>,
+    deliver: &mut F,
+) -> bool
+where
+    F: FnMut(crate::acp::protocol::ExtNotification) -> Fut,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    let session_ids: Vec<String> = announced.keys().cloned().collect();
+    let stored = match plan_source {
+        Some(store) if !session_ids.is_empty() => {
+            store.get_session_todo_plans(&session_ids).await.ok()
+        }
+        _ => None,
+    };
+    let Some(mut stored) = stored else {
+        announced.clear();
+        return true;
+    };
+    for session_id in session_ids {
+        let entries = stored.remove(&session_id).unwrap_or_default();
+        if announced.get(&session_id) == Some(&entries) {
+            continue;
+        }
+        announced.insert(session_id.clone(), entries.clone());
+        let Some(notification) = session_plans_changed_notification(&session_id, entries) else {
+            continue;
+        };
+        if !deliver(notification).await {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) async fn emit_session_pins_changed_notification(
     agent: &crate::LocalAgentHandle,
     session_id: &str,
 ) {
-    let params = match serde_json::value::RawValue::from_string(
-        serde_json::json!({ "session_id": session_id }).to_string(),
-    ) {
-        Ok(raw) => std::sync::Arc::from(raw),
-        Err(_) => return,
-    };
-    let notification = crate::acp::protocol::ExtNotification::new(
-        crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED,
-        params,
-    );
-    agent.broadcast_ext_notification(notification.clone());
-
-    let bridge = agent.bridge.lock().ok().and_then(|guard| guard.clone());
-    if let Some(bridge) = bridge
-        && let Err(error) = bridge.notify_ext(notification).await
-    {
-        log::warn!("Failed to send session-pins-changed notification: {error}");
-    }
+    agent
+        .notify_all_clients(
+            crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED,
+            &serde_json::json!({ "session_id": session_id }),
+        )
+        .await;
 }
 
 /// An MCP server that was left out of a session because its authorization is
@@ -316,6 +355,7 @@ mod plans_changed_tests {
             tokio::spawn(announce_session_plans(
                 fixture.config.event_sink.fanout().subscribe(),
                 cancel.clone(),
+                None,
                 move |notification| {
                     assert_eq!(
                         notification.method.as_ref(),
@@ -470,6 +510,7 @@ mod plans_changed_tests {
         let failing = tokio::spawn(announce_session_plans(
             events,
             CancellationToken::new(),
+            None,
             |_| async { false },
         ));
         fixture
@@ -484,6 +525,7 @@ mod plans_changed_tests {
         let cancelled = tokio::spawn(announce_session_plans(
             fixture.config.event_sink.fanout().subscribe(),
             cancel.clone(),
+            None,
             |_| async { true },
         ));
         cancel.cancel();
@@ -491,6 +533,153 @@ mod plans_changed_tests {
             .await
             .expect("stops when cancelled")
             .unwrap();
+    }
+
+    type Notifications = mpsc::UnboundedReceiver<SessionPlansChangedNotification>;
+
+    /// An announcer held inside its first delivery until the returned gate is
+    /// released, so the event stream can overflow while it waits.
+    fn start_held(
+        fixture: &TestAgent,
+        plan_source: Option<std::sync::Arc<dyn crate::session::projection::ViewStore>>,
+    ) -> (Notifications, std::sync::Arc<tokio::sync::Notify>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let mut held = false;
+        tokio::spawn(announce_session_plans(
+            fixture.config.event_sink.fanout().subscribe(),
+            CancellationToken::new(),
+            plan_source,
+            move |notification| {
+                let params = serde_json::from_str(notification.params.get()).unwrap();
+                let delivered = tx.send(params).is_ok();
+                let hold = !std::mem::replace(&mut held, true);
+                let gate = gate.clone();
+                async move {
+                    if hold {
+                        gate.notified().await;
+                    }
+                    delivered
+                }
+            },
+        ));
+        (rx, release)
+    }
+
+    async fn next_of(rx: &mut Notifications) -> SessionPlansChangedNotification {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a plansChanged notification")
+            .expect("the announcer is running")
+    }
+
+    /// Overflow the live stream so a receiver that is not reading lags. The
+    /// noise goes to a session that has journaled events: only then is an
+    /// ephemeral event published at once.
+    fn overflow_stream(fixture: &TestAgent, session: &str) {
+        for _ in 0..=querymt_agent_services::event_fanout::LIVE_EVENT_CAPACITY {
+            fixture
+                .config
+                .event_sink
+                .emit_ephemeral(session, AgentEventKind::Cancelled);
+        }
+    }
+
+    async fn session_with_plan(fixture: &TestAgent, items: &[(&str, &str)]) -> String {
+        let session = fixture
+            .config
+            .provider
+            .history_store()
+            .create_session(Some("plans".into()), None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        fixture
+            .config
+            .emit_event_persisted(&session, todowrite(&todos(items)))
+            .await
+            .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn lag_announces_the_plan_that_changed_meanwhile_and_not_the_replayed_past() {
+        let fixture = TestAgent::new().await;
+        let (mut rx, release) = start_held(&fixture, fixture.config.storage.view_store());
+        let session = session_with_plan(&fixture, &[("a", "pending")]).await;
+        let first = next_of(&mut rx).await;
+        assert_eq!(first.session_id, session);
+
+        // While the announcer is held: two more lists, then an overflow.
+        for list in [&[("b", "pending")][..], &[("c", "pending")][..]] {
+            fixture
+                .config
+                .emit_event_persisted(&session, todowrite(&todos(list)))
+                .await
+                .unwrap();
+        }
+        overflow_stream(&fixture, &session);
+        release.notify_one();
+
+        let caught_up = next_of(&mut rx).await;
+        assert_eq!(caught_up.session_id, session);
+        assert_eq!(caught_up.plans[0]["entries"][0]["content"], "c");
+
+        // Nothing of the skipped past is announced afterwards: the next
+        // announcement is the next real change.
+        fixture
+            .config
+            .emit_event_persisted(&session, todowrite(&todos(&[("d", "pending")])))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_of(&mut rx).await.plans[0]["entries"][0]["content"],
+            "d"
+        );
+    }
+
+    #[tokio::test]
+    async fn lag_announces_a_plan_emptied_meanwhile() {
+        let fixture = TestAgent::new().await;
+        let (mut rx, release) = start_held(&fixture, fixture.config.storage.view_store());
+        let session = session_with_plan(&fixture, &[("a", "pending")]).await;
+        next_of(&mut rx).await;
+
+        fixture
+            .config
+            .emit_event_persisted(&session, todowrite(&todos(&[])))
+            .await
+            .unwrap();
+        overflow_stream(&fixture, &session);
+        release.notify_one();
+
+        let emptied = next_of(&mut rx).await;
+        assert_eq!(emptied.session_id, session);
+        assert!(emptied.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lag_without_a_plan_source_forgets_what_was_announced() {
+        let fixture = TestAgent::new().await;
+        let (mut rx, release) = start_held(&fixture, None);
+        let session = session_with_plan(&fixture, &[("a", "pending")]).await;
+        next_of(&mut rx).await;
+
+        overflow_stream(&fixture, &session);
+        release.notify_one();
+        // Give the announcer time to observe the lag before the next write.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The same list is announced again: the announced state was dropped.
+        fixture
+            .config
+            .emit_event_persisted(&session, todowrite(&todos(&[("a", "pending")])))
+            .await
+            .unwrap();
+        let again = next_of(&mut rx).await;
+        assert_eq!(again.session_id, session);
+        assert_eq!(again.plans[0]["entries"][0]["content"], "a");
     }
 
     #[tokio::test]

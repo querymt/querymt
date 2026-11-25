@@ -38,6 +38,15 @@ QueryMT SHALL emit `session_info_update` when mutable, persisted session metadat
 - **WHEN** QueryMT intentionally clears a mutable nullable metadata field
 - **THEN** it emits that field as `null` rather than omitting it
 
+#### Scenario: Todo plan changes on an active session
+- **WHEN** QueryMT persists a new non-empty todo plan for a session active on a connection
+- **THEN** it emits `session_info_update` on that connection whose `_meta` sets only the top-level key `querymt/plans`, to the value a later session-list response reports
+- **AND** it does not send title, `updatedAt` or other `_meta` keys in that update
+
+#### Scenario: Todo plan is emptied on an active session
+- **WHEN** a session active on a connection empties its todo plan
+- **THEN** QueryMT emits `session_info_update` on that connection with `_meta: {"querymt/plans": null}`
+
 ### Requirement: Context usage and cumulative cost reporting
 QueryMT SHALL emit `usage_update` whenever reliable current context utilization becomes available or materially changes. `used` SHALL represent tokens currently occupying model context, including cached tokens, and `size` SHALL represent the active model's effective context limit. QueryMT SHALL include cumulative session USD cost only for a complete supported token-cost estimate and SHALL omit standard cost otherwise. Session cost SHALL span execution cycles and remain independent of context occupancy.
 
