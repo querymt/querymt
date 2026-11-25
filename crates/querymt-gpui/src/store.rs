@@ -1222,7 +1222,8 @@ pub struct AgentRuntime {
     pub failed_plugins: Vec<(String, String)>,
     /// The plugin update step in progress.
     pub plugin_progress: Option<plugins::PluginProgress>,
-    /// Names of actions in flight (e.g. `invite`, `key:xai`).
+    /// Names of actions in flight on the current connection (e.g. `invite`,
+    /// `key:xai`); a connect or disconnect clears them.
     pub pending: std::collections::HashSet<String>,
     pub log: agent_log::AgentLog,
     /// JSON-RPC traffic across reconnects (debug events, Developer mode).
@@ -1489,6 +1490,19 @@ pub struct QuickPrefs {
     /// How the session picker lays its sessions out.
     #[serde(default)]
     pub picker_layout: PickerLayout,
+    /// Where the user left the panel, per display (its uuid, else its id).
+    #[serde(default)]
+    pub positions: std::collections::BTreeMap<String, QuickPosition>,
+}
+
+/// Where the user left the quick panel on one display: its edges in logical
+/// pixels from the display's top-left corner. Which edge is kept on reopening
+/// is the one the platform keeps while the panel grows (design D18).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickPosition {
+    pub left: i32,
+    pub top: i32,
+    pub bottom: i32,
 }
 
 /// The quick panel's session picker: one line per session, or cards in two
@@ -2045,6 +2059,13 @@ impl AgentsStore {
         }
     }
 
+    /// Remember where the quick panel was left on `display`, in memory: the
+    /// panel writes it to disk once the window stops moving.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn remember_quick_position(&mut self, display: String, position: QuickPosition) {
+        self.prefs.quick.positions.insert(display, position);
+    }
+
     /// The layout of the quick panel's session picker.
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
     pub fn set_quick_picker_layout(&mut self, layout: PickerLayout, cx: &mut Context<Self>) {
@@ -2351,7 +2372,9 @@ impl AgentsStore {
 
     // ---- extension calls (mesh, auth) --------------------------------------
 
-    /// Call an agent extension method; `then` runs on the store with the result.
+    /// Call an agent extension method; `then` runs on the store with the
+    /// result. A connect or disconnect in between makes the answer moot: it
+    /// then changes nothing (the new generation cleared the pending tag).
     fn ext(
         &mut self,
         id: &str,
@@ -2371,16 +2394,17 @@ impl AgentsStore {
         };
         rt.action_error = None;
         rt.pending.insert(tag.to_string());
+        let (generation, id, tag) = (rt.generation, id.to_string(), tag.to_string());
         cx.notify();
-        let (id, tag) = (id.to_string(), tag.to_string());
         cx.spawn(async move |this, cx| {
             let result = rpc.request(method, params).await;
             let _ = this.update(cx, |s, cx| {
-                if let Some(rt) = s.runtime.get_mut(&id) {
-                    rt.pending.remove(&tag);
-                    if let Err(err) = &result {
-                        rt.action_error = Some(err.clone());
-                    }
+                let Some(rt) = s.live(&id, generation) else {
+                    return;
+                };
+                rt.pending.remove(&tag);
+                if let Err(err) = &result {
+                    rt.action_error = Some(err.clone());
                 }
                 then(s, &id, result, cx);
                 cx.notify();
@@ -2662,6 +2686,8 @@ impl AgentsStore {
         }
         rt.tasks.clear();
         rt.generation += 1;
+        // Actions in flight belonged to the old connection.
+        rt.pending.clear();
         let generation = rt.generation;
         rt.schedules = Default::default();
         rt.providers_loaded = false;
@@ -2815,6 +2841,8 @@ impl AgentsStore {
         self.early_commands.clear_agent(id);
         if let Some(rt) = self.runtime.get_mut(id) {
             rt.generation += 1;
+            // Actions in flight belonged to the old connection.
+            rt.pending.clear();
             rt.reconnect_attempt = 0;
             if let Some(rpc) = rt.rpc.take() {
                 rpc.close();
@@ -4773,6 +4801,60 @@ mod tests {
         assert_eq!(ms, [250, 500, 1000, 2000, 4000, 8000, 8000, 8000]);
     }
 
+    /// An extension call answered after its connection was replaced changes
+    /// nothing: no error, no `then`, and the same action started on the new
+    /// connection stays pending.
+    #[gpui_kit::test]
+    fn ext_answer_from_an_old_connection_is_ignored(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| automations::schedule_ui_fixture());
+        let (old_rpc, old_requests) =
+            cx.update(|cx| store.update(cx, |s, _| s.rpc_for_test("test-agent")));
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.create_invite("test-agent", "1h", None, None, cx)
+            })
+        });
+        cx.run_until_parked();
+        let old_invite: Value = serde_json::from_str(&old_requests.try_recv().unwrap()).unwrap();
+
+        // Reconnect: the old request fails as the old client closes, and the
+        // same action starts on the new connection before that failure lands.
+        let (rpc, requests) = cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.disconnect("test-agent", cx);
+                let link = s.rpc_for_test("test-agent");
+                s.runtime_mut_for_test("test-agent").state = ConnState::Connected;
+                s.create_invite("test-agent", "1h", None, None, cx);
+                link
+            })
+        });
+        cx.run_until_parked();
+        // A late answer to the old request cannot reach the new client either.
+        old_rpc.handle(&json!({ "id": old_invite["id"], "result": { "url": "old" } }).to_string());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let rt = store.read(cx).runtime("test-agent").unwrap();
+            assert_eq!(rt.action_error, None, "the old failure is not reported");
+            assert!(
+                rt.pending.contains("invite"),
+                "the new call is still in flight"
+            );
+            assert_eq!(rt.last_invite, None);
+        });
+
+        // The current connection's answer applies as usual.
+        let invite: Value = serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(invite["method"], "_querymt/mesh/createInvite");
+        rpc.handle(&json!({ "id": invite["id"], "result": { "url": "new" } }).to_string());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let rt = store.read(cx).runtime("test-agent").unwrap();
+            assert!(!rt.pending.contains("invite"));
+            assert_eq!(rt.last_invite.as_deref(), Some("new"));
+        });
+    }
+
     #[test]
     fn applied_reasoning_level_reaches_the_new_session_options() {
         let option = |current: &str| {
@@ -4957,6 +5039,15 @@ mod tests {
                 enabled: true,
                 shortcut: "alt+KeyK".into(),
                 picker_layout: PickerLayout::Grid,
+                positions: [(
+                    "display-1".to_string(),
+                    QuickPosition {
+                        left: 10,
+                        top: 20,
+                        bottom: 84,
+                    },
+                )]
+                .into(),
             },
             ..prefs
         })
@@ -4966,6 +5057,8 @@ mod tests {
         assert!(back.quick.enabled);
         assert_eq!(back.quick.shortcut, "alt+KeyK");
         assert_eq!(back.quick.picker_layout, PickerLayout::Grid);
+        // A place left on a display survives a restart.
+        assert_eq!(back.quick.positions["display-1"].bottom, 84);
         // A partial `quick` object fills in the rest.
         let partial: Prefs =
             serde_json::from_str(r#"{"dark":null,"primary_agent":null,"quick":{"enabled":true}}"#)

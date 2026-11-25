@@ -8,12 +8,31 @@ use crate::theme::Palette;
 /// How much black the panel lays over a material **the desktop picks** (Mica,
 /// compositor blur). Such a material can be light, so this is enough that text
 /// keeps its contrast over a white backdrop.
-pub(crate) const TINT: f32 = 0.58;
+pub(crate) const TINT: f32 = 0.68;
 
-/// How much black the panel lays over a material that is **already dark**
-/// (macOS, where the panel sets it to dark aqua). None: the material is the
-/// panel's surface, and a fill of our own would only hide it.
-pub(crate) const DARK_MATERIAL_TINT: f32 = 0.;
+/// How much black the panel lays over Liquid Glass and over the macOS
+/// visual-effect material. Set to dark aqua, they still come out light grey
+/// over a bright window, and our text, drawn by GPUI, cannot adapt to that as
+/// AppKit's own text does: the panel keeps its own background dark. 0.6 is
+/// about the least that keeps `muted` on a chip at 4.5:1 over a white window
+/// (0.55 gives 4.46:1).
+pub(crate) const LIQUID_GLASS_TINT: f32 = 0.6;
+pub(crate) const VFX_TINT: f32 = 0.6;
+
+/// What overlays are painted with: a neutral grey (the bluish `surface` read
+/// as a dark blue box over the material), see-through over a material and
+/// opaque without one.
+const POPOVER: u32 = 0x161616;
+const POPOVER_GLASS_ALPHA: f32 = 0.72;
+
+/// The most of a white window behind the panel that each macOS material
+/// shows through, as a grey level (0 black, 1 white): what the legibility
+/// contract is held against. Liquid Glass measured about 0.66 over a white
+/// window on macOS 27 (task 7.19's screenshot), brighter where it bends the
+/// light at the edge, hence 0.75. The visual-effect material is not measured
+/// yet and is taken to be the same.
+pub(crate) const LIQUID_GLASS_WHITE_THROUGH: f32 = 0.75;
+pub(crate) const VFX_WHITE_THROUGH: f32 = 0.75;
 
 /// Lightness an accent is raised to, so it reads on dark glass.
 const ACCENT_MIN_LIGHTNESS: f32 = 0.66;
@@ -45,10 +64,11 @@ fn lightened(accent: Hsla) -> Hsla {
 /// Without a material every token is opaque.
 pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
     let accent = lightened(user.accent);
-    let (bg, surface, card, card_hover, border, border_strong) = if glass {
+    let (bg, surface, popover, card, card_hover, border, border_strong) = if glass {
         (
             black().opacity(0.24),
             hex(0x1b1e23).opacity(0.86),
+            hex(POPOVER).opacity(POPOVER_GLASS_ALPHA),
             white().opacity(0.09),
             white().opacity(0.14),
             white().opacity(0.12),
@@ -58,6 +78,7 @@ pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
         (
             hex(0x14161a),
             hex(0x1b1e23),
+            hex(POPOVER),
             hex(0x22252b),
             hex(0x2a2e35),
             hex(0x30343b),
@@ -68,12 +89,13 @@ pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
         dark: true,
         bg,
         surface,
+        popover,
         card,
         card_hover,
         border,
         border_strong,
         text: hex(0xf5f5f5),
-        muted: hex(0xd0d0d4),
+        muted: hex(0xdedee2),
         dim: hex(0xa4a8af),
         accent,
         accent_hover: Hsla {
@@ -113,7 +135,7 @@ pub(crate) fn progress_colour(p: &Palette, finished: bool, running: bool) -> Hsl
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
-    use super::{DARK_MATERIAL_TINT, PROGRESS_FILL_ALPHA, TINT, hud_palette, progress_colour};
+    use super::{PROGRESS_FILL_ALPHA, TINT, hud_palette, progress_colour};
     use crate::quick::chrome::Chrome;
     use crate::theme::Palette;
     use gpui_kit::{Hsla, Rgba};
@@ -169,6 +191,36 @@ mod tests {
         }
     }
 
+    // quick-panel / Overlays sit on the panel
+    #[test]
+    fn the_popover_is_neutral_see_through_over_a_material_and_opaque_without() {
+        for user in [Palette::light(), Palette::dark()] {
+            let (glass, solid) = (hud_palette(&user, true), hud_palette(&user, false));
+            for p in [glass.popover, solid.popover] {
+                assert!(p.s < 0.05, "no blue cast: {p:?}");
+                assert!(p.l < 0.2, "dark: {p:?}");
+            }
+            assert!(glass.popover.a < 1., "the material shows through");
+            assert_eq!(solid.popover.a, 1.);
+        }
+        // The app's own popover is its surface.
+        for p in [Palette::light(), Palette::dark()] {
+            assert_eq!(p.popover, p.surface);
+        }
+    }
+
+    // quick-panel / Overlays sit on the panel: the model picker, the folder
+    // chooser and the command list all ask the palette whether to cast a
+    // shadow.
+    #[test]
+    fn no_overlay_casts_a_shadow_over_a_material() {
+        for user in [Palette::light(), Palette::dark()] {
+            assert!(!hud_palette(&user, true).overlay_shadow());
+            assert!(hud_palette(&user, false).overlay_shadow());
+            assert!(user.overlay_shadow(), "the main window keeps its shadow");
+        }
+    }
+
     #[test]
     fn the_palette_is_dark_whatever_the_app_theme() {
         for user in [Palette::light(), Palette::dark()] {
@@ -216,12 +268,47 @@ mod tests {
         assert!(ratio > 4.5, "text over a white backdrop: {ratio}");
     }
 
+    /// Every kind of chrome the panel can have, with the palette it paints.
+    fn every_chrome() -> Vec<(&'static str, Chrome)> {
+        vec![
+            ("solid", Chrome::solid()),
+            ("desktop's material", Chrome::glass()),
+            ("dark material", Chrome::dark_material(false)),
+            ("liquid glass", Chrome::dark_material(true)),
+        ]
+    }
+
+    // quick-panel / Bright window behind the panel: the essential text keeps
+    // 4.5:1 over the worst backdrop the material lets through.
     #[test]
-    fn a_dark_material_is_left_to_show() {
-        let p = hud_palette(&Palette::light(), true);
-        let s = Chrome::dark_material(true).surfaces(&p);
-        assert_eq!(s.bg.a, DARK_MATERIAL_TINT);
-        assert!(s.bg.a < 0.2, "the material is the panel's surface");
+    fn text_passes_over_a_white_backdrop() {
+        for user in [Palette::light(), Palette::dark()] {
+            for (kind, chrome) in every_chrome() {
+                let p = hud_palette(&user, chrome.glass);
+                // What shows through, then the panel's tint over it.
+                let backdrop = Hsla {
+                    a: 1.,
+                    ..gpui_kit::hsla(0., 0., chrome.white_through, 1.)
+                };
+                let surface = over(chrome.surfaces(&p).bg, backdrop);
+                // What labels sit on: the surface, a chip, the user's pill.
+                let grounds = [
+                    ("surface", surface),
+                    ("chip", over(p.chip, surface)),
+                    ("user message", over(p.accent_dim, surface)),
+                ];
+                for (ground, under) in grounds {
+                    for (name, colour) in [("text", p.text), ("muted", p.muted)] {
+                        // The user's pill holds message text, never labels.
+                        if ground == "user message" && name == "muted" {
+                            continue;
+                        }
+                        let ratio = contrast(colour, under);
+                        assert!(ratio >= 4.5, "{kind}: {name} on {ground} is {ratio:.2}:1");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -59,6 +59,40 @@ fn glass_available() -> bool {
             >= 26
 }
 
+/// System Settings > Accessibility > Display > Reduce transparency
+/// (`NSWorkspace.accessibilityDisplayShouldReduceTransparency`). Called
+/// through the runtime: the typed binding needs two more `objc2-app-kit`
+/// features for one getter.
+pub(super) fn reduce_transparency() -> bool {
+    let Some(class) = AnyClass::get(c"NSWorkspace") else {
+        return false;
+    };
+    // SAFETY: `sharedWorkspace` returns the shared instance, and the getter
+    // returns a `BOOL`; both exist since macOS 10.10.
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class, sharedWorkspace];
+        if workspace.is_null() {
+            return false;
+        }
+        msg_send![workspace, accessibilityDisplayShouldReduceTransparency]
+    }
+}
+
+/// Turn off the window's system shadow, with or without a material.
+///
+/// GPUI makes every window titled (`Titled | FullSizeContentView`) and gives a
+/// transparent one a background of black at 0.0001 alpha, so the system
+/// shadows the **whole window** in the system's own rounded outline, not what
+/// the panel draws in it. Over a bright window that outline shows: during the
+/// opening as a fixed light shape the panel grows into, and at rest as a sliver
+/// at each corner, where the system's corner is squarer than the panel's
+/// [`RADIUS`]. A no-op when it is not an AppKit window (a test window).
+pub(super) fn drop_window_shadow(window: &Window) {
+    if let Some(ns_window) = ns_window(window) {
+        ns_window.setHasShadow(false);
+    }
+}
+
 /// Add the material below GPUI's view and fix it to dark aqua. `animate`: the
 /// window starts invisible, for [`open_step`] to bring in.
 pub(super) fn install(window: &mut Window, animate: bool) -> Chrome {
@@ -124,8 +158,9 @@ pub(super) fn scaled(bounds: NSRect, scale: f64) -> NSRect {
 }
 
 /// One step of the opening animation (design D14): the window, and so the
-/// material, the content and the shadow together, at `opacity`, and the
-/// material at `scale` of the window, as GPUI insets the content.
+/// material and the content together, at `opacity`, and the material at
+/// `scale` of the window, as GPUI insets the content. The window has no
+/// shadow to follow ([`drop_window_shadow`]).
 ///
 /// Called while GPUI paints. None of these calls resizes the window, so AppKit
 /// does not call back into GPUI (see [`set_height`]).
@@ -145,10 +180,6 @@ pub(super) fn open_step(window: &Window, opacity: f32, scale: f32) {
     }
     // The light's view goes with the material.
     super::rim::open_step(scale.min(1.) as f64);
-    if opacity >= 1. && scale >= 1. {
-        // The shadow was cut for the smaller material.
-        ns_window.invalidateShadow();
-    }
 }
 
 /// Make the material (and so everything in the window that AppKit themes)
@@ -180,6 +211,11 @@ fn target_frame(frame: NSRect, visible: Option<NSRect>, width: f64, height: f64)
     NSRect::new(origin, NSSize::new(width, height))
 }
 
+/// Low Power Mode is on.
+pub(super) fn low_power() -> bool {
+    NSProcessInfo::processInfo().isLowPowerModeEnabled()
+}
+
 /// Give the window `size`; false when it is not an AppKit window (a test
 /// window), so the caller resizes it the generic way.
 ///
@@ -191,11 +227,6 @@ fn target_frame(frame: NSRect, visible: Option<NSRect>, width: f64, height: f64)
 /// are already bigger: an empty blurred area. It is not animated for the same
 /// reason: AppKit's animation runs the handler for every step, nested inside
 /// whatever called us.
-/// Low Power Mode is on.
-pub(super) fn low_power() -> bool {
-    NSProcessInfo::processInfo().isLowPowerModeEnabled()
-}
-
 pub(super) fn set_height(window: &Window, size: Size<Pixels>, cx: &App) -> bool {
     let Some(ns_window) = ns_window(window) else {
         return false;
@@ -214,7 +245,6 @@ pub(super) fn set_height(window: &Window, size: Size<Pixels>, cx: &App) -> bool 
             ns_window.setFrame_display(target, true);
             // The light's paths follow the new size.
             super::rim::relayout();
-            ns_window.invalidateShadow();
         })
         .detach();
     true

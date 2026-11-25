@@ -240,6 +240,24 @@ impl SessionPane {
         )
     }
 
+    /// Scroll the transcript to `item_ix`, with no following of the tail, so
+    /// a test can tell that the position was kept.
+    #[cfg(test)]
+    pub(crate) fn scroll_to_item_for_test(&mut self, item_ix: usize) {
+        let list = &self.transcript.list;
+        list.set_follow_mode(gpui_kit::FollowMode::Normal);
+        list.scroll_to(gpui_kit::ListOffset {
+            item_ix,
+            offset_in_item: gpui_kit::px(0.),
+        });
+    }
+
+    /// Where the transcript is scrolled to.
+    #[cfg(test)]
+    pub(crate) fn scroll_top_for_test(&self) -> gpui_kit::ListOffset {
+        self.transcript.list.logical_scroll_top()
+    }
+
     /// The pane sits on a translucent material.
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
     pub(crate) fn set_glass(&mut self, glass: bool, cx: &mut Context<Self>) {

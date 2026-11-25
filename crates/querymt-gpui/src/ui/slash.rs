@@ -306,10 +306,12 @@ impl SessionPane {
             .w_full()
             .max_w(px(560.))
             .rounded(px(12.))
-            .bg(p.surface)
+            .bg(p.popover)
             .border_1()
             .border_color(p.border)
-            .shadow_lg()
+            // Over the quick panel's material it is part of the panel's
+            // surface: no shadow (design D17).
+            .when(p.overlay_shadow(), |el| el.shadow_lg())
             .occlude()
             .child(
                 v_flex()

@@ -5255,6 +5255,9 @@ impl SessionPane {
                 cx.stop_propagation();
                 this.cycle_session_mode(true, cx);
             }))
+            // The compact composer is the quick panel's, in its palette:
+            // placeholder, selection and caret too.
+            .when(compact, |el| el.child(kit::input_colours(&self.prompt, p)))
             .child(
                 Textarea::new(&self.prompt)
                     .appearance(false)

@@ -93,6 +93,11 @@ impl Rig {
         cx.run_until_parked();
     }
 
+    fn hide(&self, cx: &mut TestAppContext) {
+        cx.update(|cx| self.host.update(cx, |h, cx| h.hide(cx)));
+        cx.run_until_parked();
+    }
+
     fn panel(&self, cx: &mut TestAppContext) -> Option<(AnyWindowHandle, Entity<QuickPanel>)> {
         self.host.read_with(cx, |h, _| h.panel_for_test())
     }
@@ -565,6 +570,12 @@ fn settle(cx: &mut TestAppContext, window: AnyWindowHandle) {
         })
         .unwrap();
         cx.run_until_parked();
+        // A real platform reports a resize back to GPUI, which then lays out
+        // at the new size; the test platform only stores it.
+        let bounds = cx
+            .update_window(window, |_, window, _| window.bounds())
+            .unwrap();
+        cx.simulate_window_resize(window, bounds.size);
     }
 }
 
@@ -709,7 +720,9 @@ fn panel_grows_with_its_transcript_and_stops_at_the_cap(cx: &mut TestAppContext)
     settle(cx, window);
     let short = panel_height(cx, &panel);
     assert!(short >= MIN_HEIGHT, "room for a turn, got {short}");
-    assert!(short <= 300., "a short chat needs little room, got {short}");
+    // (The window now reports its resizes back, as a real one does, so this
+    // is the height one turn really takes.)
+    assert!(short <= 320., "a short chat needs little room, got {short}");
 
     // A conversation that overflows grows it, one step at a time, to the cap.
     show_view(cx, &rig, &panel, long_view("long", 80, "idle"));
@@ -810,6 +823,13 @@ fn glow_renders_only_while_the_session_runs(cx: &mut TestAppContext) {
     after_the_delay(cx, window);
     after_the_delay(cx, window);
     assert_eq!(panel.read_with(cx, |p, _| p.ring_frame_for_test()), None);
+}
+
+/// Let the opening animation end: while it runs the panel is laid out a
+/// little smaller than its window.
+fn finish_opening(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.executor().advance_clock(Duration::from_millis(400));
+    settle(cx, window);
 }
 
 /// Let the clock pass the light's delay (and a fade), and render.
@@ -1255,10 +1275,29 @@ fn escape_closes_the_model_picker_before_the_panel(cx: &mut TestAppContext) {
     assert!(!picker.read_with(cx, |p, _| p.is_open()));
 }
 
+fn with_many_models(rig: &Rig, cx: &mut TestAppContext, n: usize) {
+    cx.update(|cx| {
+        rig.store.update(cx, |s, _| {
+            s.runtime_mut_for_test("test-agent").models = (0..n)
+                .map(|i| model(&format!("m-{i}"), &format!("Model {i}")))
+                .collect();
+        })
+    });
+}
+
+/// Every model row is shown: the rows' box does not scroll.
+fn every_model_shown(cx: &mut TestAppContext, panel: &Entity<QuickPanel>) -> bool {
+    panel.read_with(cx, |p, cx| {
+        p.models_for_test().read(cx).rows_scroll().max_offset().y <= gpui_kit::px(0.5)
+    })
+}
+
+// quick-panel / Picker in a small panel: the floor is what the picker lays
+// out to (design D13), not an estimate.
 #[gpui_kit::test]
 fn open_model_picker_raises_the_height_floor(cx: &mut TestAppContext) {
     let rig = rig(cx);
-    with_models(&rig, cx);
+    with_many_models(&rig, cx, 10);
     let (window, panel) = rig.open_panel(cx);
     panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
     cx.update_window(window, |_, window, cx| {
@@ -1266,7 +1305,49 @@ fn open_model_picker_raises_the_height_floor(cx: &mut TestAppContext) {
     })
     .unwrap();
     settle(cx, window);
-    assert!(panel_height(cx, &panel) >= 520.);
+    finish_opening(cx, window);
+    let height = panel_height(cx, &panel);
+    let done = bounds_of(cx, window, "model-done").expect("the Done button");
+    assert!(bottom(done) <= height + 0.5, "{done:?} in {height}");
+    assert!(every_model_shown(cx, &panel), "the rows do not scroll");
+    // In a new quick chat it lies above the bar.
+    let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
+    let sheet = bounds_of(cx, window, "quick-models").expect("the picker");
+    assert!(bottom(sheet) <= top(bar) + 0.5, "{sheet:?} above {bar:?}");
+}
+
+// quick-panel / List in place of the conversation: the model picker
+#[gpui_kit::test]
+fn the_model_picker_replaces_the_conversation(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    with_many_models(&rig, cx, 6);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    show_view(cx, &rig, &panel, long_view("long", 20, "idle"));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "composer-highlight").is_some());
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_model_picker(window, cx))
+    })
+    .unwrap();
+    settle(cx, window);
+    finish_opening(cx, window);
+    assert!(
+        bounds_of(cx, window, "composer-highlight").is_none(),
+        "the conversation gave its place to the picker"
+    );
+    let header = bounds_of(cx, window, "quick-header").expect("the header stays");
+    let sheet = bounds_of(cx, window, "quick-models").expect("the picker");
+    assert!(
+        top(sheet) >= bottom(header) - 0.5,
+        "{sheet:?} under {header:?}"
+    );
+    assert!(every_model_shown(cx, &panel));
+    press(cx, window, "escape");
+    assert!(
+        bounds_of(cx, window, "composer-highlight").is_some(),
+        "back"
+    );
 }
 
 // ---- keyboard (design D16) ----------------------------------------------------
@@ -1379,7 +1460,9 @@ fn the_folder_is_the_panels_choice_and_the_quick_chat_starts_in_it(cx: &mut Test
     .unwrap();
     assert!(panel.read_with(cx, |p, _| p.folder_open_for_test()));
     settle(cx, window);
-    assert!(panel_height(cx, &panel) >= 440., "room for the suggestions");
+    let sheet = bounds_of(cx, window, "quick-folders").expect("the chooser");
+    let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
+    assert!(bottom(sheet) <= top(bar) + 0.5, "above the bar");
 
     // Esc closes the chooser and not the panel.
     press(cx, window, "escape");
@@ -1856,8 +1939,8 @@ fn the_grid_of_eight_cards_fits_without_scrolling(cx: &mut TestAppContext) {
     settle(cx, window);
     assert_eq!(panel_height(cx, &panel), BAR_HEIGHT);
     show_picker(cx, window, &panel);
+    finish_opening(cx, window);
     let height = panel_height(cx, &panel);
-    assert!(height >= picker_height(PickerLayout::Grid, 8), "{height}");
     let cards = bounds_of(cx, window, "quick-picker-cards").expect("the cards");
     let last = bounds_dyn(cx, window, "quick-pick-card:7".into()).expect("eight cards");
     assert!(
@@ -1870,7 +1953,9 @@ fn the_grid_of_eight_cards_fits_without_scrolling(cx: &mut TestAppContext) {
 // quick-panel / Grid picker fits the panel: Grid on a small display
 #[gpui_kit::test]
 fn on_a_small_display_the_grid_stops_at_the_limit_and_scrolls(cx: &mut TestAppContext) {
-    for (display, scrolls) in [(800., false), (600., true)] {
+    // Eight cards lay out to about 650 px with the bar: the old estimate
+    // (746) said an 800 px display scrolled, the measured height says it fits.
+    for (display, scrolls) in [(1200., false), (800., false), (600., true)] {
         let rig = rig(cx);
         eight_idle_sessions(&rig, cx);
         set_layout(cx, &rig, PickerLayout::Grid);
@@ -1878,6 +1963,7 @@ fn on_a_small_display_the_grid_stops_at_the_limit_and_scrolls(cx: &mut TestAppCo
         panel.update(cx, |p, _| p.set_display_height_for_test(display));
         settle(cx, window);
         show_picker(cx, window, &panel);
+        finish_opening(cx, window);
         let height = panel_height(cx, &panel);
         // Never past what the display leaves the panel, and short of the
         // 746 px eight cards want.
@@ -1899,4 +1985,523 @@ fn on_a_small_display_the_grid_stops_at_the_limit_and_scrolls(cx: &mut TestAppCo
             "{display}: {last:?} in {cards:?}"
         );
     }
+}
+
+// ---- the session list opens in place (design D17) ----------------------------
+
+fn list_sessions(rig: &Rig, cx: &mut TestAppContext, n: usize) {
+    let sessions = (0..n)
+        .map(|i| {
+            summary(
+                &format!("s{i}"),
+                &format!("Session {i}"),
+                "idle",
+                &i.to_string(),
+            )
+        })
+        .collect();
+    rig.summaries(cx, sessions);
+    set_layout(cx, rig, PickerLayout::List);
+}
+
+// quick-panel / List in place of the conversation
+#[gpui_kit::test]
+fn the_session_list_replaces_the_conversation(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    list_sessions(&rig, cx, 4);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    show_view(cx, &rig, &panel, long_view("long", 20, "idle"));
+    settle(cx, window);
+    assert!(
+        bounds_of(cx, window, "composer-highlight").is_some(),
+        "the conversation is shown"
+    );
+    assert!(bounds_of(cx, window, "quick-picker").is_none());
+
+    show_picker(cx, window, &panel);
+    // No transcript row is drawn under the list, and the list is a plain
+    // column, not a floating card laid over it.
+    assert!(
+        bounds_of(cx, window, "composer-highlight").is_none(),
+        "the conversation gave its place to the list"
+    );
+    let header = bounds_of(cx, window, "quick-header").expect("the header stays");
+    let list = bounds_of(cx, window, "quick-picker").expect("the list");
+    let search = bounds_of(cx, window, "quick-picker-search").expect("the search row");
+    assert!(
+        top(list) >= bottom(header) - 0.5,
+        "{list:?} under {header:?}"
+    );
+    assert!(top(search) >= bottom(header) - 0.5);
+    for i in 0..4 {
+        let row = bounds_dyn(cx, window, format!("quick-pick-row:{i}")).expect("a row");
+        assert!(top(row) >= bottom(search) - 0.5, "row {i} under the search");
+        assert!(bottom(row) <= bottom(list) + 0.5, "row {i} inside the list");
+    }
+}
+
+// quick-panel / List in place of the conversation: back where it was
+#[gpui_kit::test]
+fn closing_the_list_restores_the_scroll_position(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    list_sessions(&rig, cx, 4);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    show_view(cx, &rig, &panel, long_view("long", 80, "idle"));
+    settle(cx, window);
+    let pane = panel.read_with(cx, |p, _| p.pane_for_test().clone());
+    pane.update(cx, |pane, _| pane.scroll_to_item_for_test(12));
+    settle(cx, window);
+    let before = pane.read_with(cx, |pane, _| pane.scroll_top_for_test());
+    assert_eq!(before.item_ix, 12);
+
+    show_picker(cx, window, &panel);
+    show_picker(cx, window, &panel);
+    assert!(bounds_of(cx, window, "quick-picker").is_none(), "closed");
+    assert!(bounds_of(cx, window, "composer-highlight").is_some());
+    let after = pane.read_with(cx, |pane, _| pane.scroll_top_for_test());
+    assert_eq!(after, before);
+}
+
+fn set_rem(cx: &mut TestAppContext, window: AnyWindowHandle, rem: f32) {
+    cx.update_window(window, |_, window, _| window.set_rem_size(rem))
+        .unwrap();
+}
+
+// quick-panel / Every listed session is visible
+#[gpui_kit::test]
+fn the_last_listed_session_is_inside_the_window(cx: &mut TestAppContext) {
+    for rem in [16., 20.] {
+        let rig = rig(cx);
+        list_sessions(&rig, cx, 8);
+        let (window, panel) = rig.open_panel(cx);
+        panel.update(cx, |p, _| p.set_display_height_for_test(1200.));
+        set_rem(cx, window, rem);
+        settle(cx, window);
+        show_picker(cx, window, &panel);
+        finish_opening(cx, window);
+        let height = panel_height(cx, &panel);
+        let last = bounds_dyn(cx, window, "quick-pick-row:7".into()).expect("eight rows");
+        assert!(
+            bottom(last) <= height + 0.5,
+            "rem {rem}: {last:?} in a window {height} tall"
+        );
+        // Not by luck of a generous estimate: the window is as tall as the
+        // list needs.
+        let list = bounds_of(cx, window, "quick-picker-list").expect("the rows' box");
+        assert!(bottom(last) >= bottom(list) - 16.5, "rem {rem}: no slack");
+    }
+}
+
+// quick-panel / Every listed session is visible: a short display
+#[gpui_kit::test]
+fn on_a_short_display_the_rows_scroll_under_the_search_row(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    list_sessions(&rig, cx, 8);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(400.));
+    settle(cx, window);
+    show_picker(cx, window, &panel);
+    finish_opening(cx, window);
+    let height = panel_height(cx, &panel);
+    assert!(height <= 400. * 0.9 + 0.5, "{height}");
+    let search = bounds_of(cx, window, "quick-picker-search").expect("the search row");
+    let rows = bounds_of(cx, window, "quick-picker-list").expect("the rows' box");
+    assert!(
+        bottom(search) <= top(rows) + 0.5,
+        "the search row stays above"
+    );
+    assert!(bottom(search) <= height, "and in view");
+    let last = bounds_dyn(cx, window, "quick-pick-row:7".into()).expect("eight rows");
+    assert!(
+        bottom(last) > bottom(rows) + 0.5,
+        "the rows scroll: {last:?} {rows:?}"
+    );
+}
+
+// ---- typed text in the panel's colours (gpui-kit 0.11) -----------------------
+
+/// The colour typed text is painted in, in the field `state`: mark `text` as
+/// IME composition, whose underline is drawn in the typed-text colour, and
+/// read that underline back.
+fn typed_colour<S: gpui_kit::EntityInputHandler>(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    state: &Entity<S>,
+) -> Option<gpui_kit::Hsla> {
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "typed", None, window, cx)
+        })
+    })
+    .unwrap();
+    settle(cx, window);
+    let underlines = cx
+        .update_window(window, |_, window, _| window.painted_underlines())
+        .unwrap();
+    let colour = underlines.last().map(|u| u.color);
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.unmark_text(window, cx))
+    })
+    .unwrap();
+    colour
+}
+
+// quick-panel / Typed text in a light app theme: the text itself. The kit's
+// input paints in the app theme's foreground unless told otherwise.
+#[gpui_kit::test]
+fn typed_text_is_the_panels_text_colour_in_a_light_app_theme(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    with_models(&rig, cx);
+    cx.update(|cx| crate::theme::apply(false, "orange", cx));
+    let (window, panel) = rig.open_panel(cx);
+    // Until the opening animation ends the panel is drawn see-through.
+    finish_opening(cx, window);
+    let hud = panel.read_with(cx, |p, cx| p.hud_for_test(cx));
+    let app = cx.update(|cx| crate::theme::palette(cx).text);
+    assert_ne!(hud.text, app, "the test needs the two to differ");
+
+    let composer = panel.read_with(cx, |p, cx| {
+        p.pane_for_test().read(cx).prompt_input().clone()
+    });
+    assert_eq!(
+        typed_colour(cx, window, &composer),
+        Some(hud.text),
+        "composer"
+    );
+
+    show_picker(cx, window, &panel);
+    let query = panel.read_with(cx, |p, _| p.picker_query_for_test().clone());
+    assert_eq!(
+        typed_colour(cx, window, &query),
+        Some(hud.text),
+        "session search"
+    );
+    show_picker(cx, window, &panel);
+
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_model_picker(window, cx))
+    })
+    .unwrap();
+    settle(cx, window);
+    let query = panel.read_with(cx, |p, cx| {
+        p.models_for_test().read(cx).query_for_test().clone()
+    });
+    assert_eq!(
+        typed_colour(cx, window, &query),
+        Some(hud.text),
+        "model search"
+    );
+    press(cx, window, "escape");
+
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_folder_chooser(window, cx))
+    })
+    .unwrap();
+    settle(cx, window);
+    let field = panel.read_with(cx, |p, cx| p.folder_input_for_test(cx));
+    assert_eq!(
+        typed_colour(cx, window, &field),
+        Some(hud.text),
+        "folder field"
+    );
+}
+
+// quick-panel / Every folder suggestion is visible
+#[gpui_kit::test]
+fn every_folder_suggestion_is_inside_the_window(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    // Six sessions, six workspaces (`/work/s0` …) to suggest.
+    list_sessions(&rig, cx, 6);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_folder_chooser(window, cx))
+    })
+    .unwrap();
+    let field = panel.read_with(cx, |p, cx| p.folder_input_for_test(cx));
+    cx.update_window(window, |_, window, cx| {
+        field.update(cx, |f, cx| {
+            gpui_kit::EntityInputHandler::replace_text_in_range(f, None, "/work/s", window, cx)
+        })
+    })
+    .unwrap();
+    settle(cx, window);
+    finish_opening(cx, window);
+    let height = panel_height(cx, &panel);
+    let last = bounds_dyn(cx, window, "ws-suggestion:5".into()).expect("six suggestions");
+    assert!(
+        bottom(last) <= height + 0.5,
+        "{last:?} in a window {height} tall"
+    );
+    // Laid out in the chooser, not over the panel.
+    let sheet = bounds_of(cx, window, "quick-folders").expect("the chooser");
+    assert!(bottom(last) <= bottom(sheet) + 0.5, "inside the chooser");
+}
+
+// ---- moving the panel (design D18) -------------------------------------------
+
+mod placement {
+    use gpui_kit::{Bounds, point, px, size};
+
+    use crate::quick::panel::{placed, position_of};
+    use crate::store::QuickPosition;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<gpui_kit::Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    const WIDTH: f32 = crate::quick::panel::WIDTH;
+
+    #[test]
+    fn a_place_left_on_a_display_comes_back_on_it() {
+        // A second display to the right of the first, under a menu bar.
+        let display = rect(1440., 0., 1920., 1080.);
+        let visible = rect(1440., 25., 1920., 1055.);
+        let left_at = rect(1700., 300., WIDTH, 200.);
+        let position = position_of(left_at, display);
+        assert_eq!(
+            position,
+            QuickPosition {
+                left: 260,
+                top: 300,
+                bottom: 500,
+            }
+        );
+        // macOS keeps the bottom edge: a compact bar comes back on it.
+        let bar = placed(display, visible, position, 64., true);
+        assert_eq!(bar, rect(1700., 436., WIDTH, 64.));
+        // Windows and X11 keep the top edge.
+        let bar = placed(display, visible, position, 64., false);
+        assert_eq!(bar, rect(1700., 300., WIDTH, 64.));
+    }
+
+    #[test]
+    fn a_place_off_a_smaller_display_is_moved_inside_it() {
+        // Left near the bottom right of a big display, which is now smaller.
+        let position = QuickPosition {
+            left: 2400,
+            top: 1300,
+            bottom: 1400,
+        };
+        let display = rect(0., 0., 1440., 900.);
+        let visible = rect(0., 25., 1440., 875.);
+        for bottom_anchored in [true, false] {
+            let b = placed(display, visible, position, 100., bottom_anchored);
+            assert_eq!(b.right(), visible.right(), "inside on the right");
+            assert_eq!(b.bottom(), visible.bottom(), "inside at the bottom");
+        }
+        // And never above the visible area (under the menu bar).
+        let high = QuickPosition {
+            left: -50,
+            top: -40,
+            bottom: 10,
+        };
+        let b = placed(display, visible, high, 200., true);
+        assert_eq!((b.left(), b.top()), (visible.left(), visible.top()));
+    }
+}
+
+/// The primary display's key and bounds, and the panel's bounds.
+fn display_and_panel(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+) -> (
+    String,
+    gpui_kit::Bounds<gpui_kit::Pixels>,
+    gpui_kit::Bounds<gpui_kit::Pixels>,
+) {
+    cx.update_window(window, |_, window, cx| {
+        let display = cx.primary_display().expect("a display");
+        (
+            super::panel::display_key(&*display),
+            display.bounds(),
+            window.bounds(),
+        )
+    })
+    .unwrap()
+}
+
+// quick-panel / Reopen where it was left
+#[gpui_kit::test]
+fn the_panel_reopens_where_it_was_left_on_its_display(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, _) = rig.open_panel(cx);
+    let (key, display, centred) = display_and_panel(cx, window);
+    rig.hide(cx);
+    assert!(closed(cx, &rig));
+
+    // Left 120 px left of and 80 px above where it opened.
+    let moved = gpui_kit::Bounds::new(
+        centred.origin - gpui_kit::point(gpui_kit::px(120.), gpui_kit::px(80.)),
+        centred.size,
+    );
+    let position = super::panel::position_of(moved, display);
+    cx.update(|cx| {
+        rig.store
+            .update(cx, |s, _| s.remember_quick_position(key.clone(), position))
+    });
+    let (window, _) = rig.open_panel(cx);
+    let (_, _, bounds) = display_and_panel(cx, window);
+    assert_eq!(bounds.origin, moved.origin, "where it was left");
+    rig.hide(cx);
+
+    // A place left on another display is not used here.
+    cx.update(|cx| {
+        rig.store.update(cx, |s, _| {
+            s.prefs.quick.positions.clear();
+            s.remember_quick_position("another-display".into(), position);
+        })
+    });
+    let (window, _) = rig.open_panel(cx);
+    let (_, _, bounds) = display_and_panel(cx, window);
+    assert_eq!(bounds.origin, centred.origin, "centred as before");
+}
+
+// quick-panel / Drag the panel: whenever the window moves or grows, where it
+// is on its display is remembered.
+#[gpui_kit::test]
+fn the_panel_remembers_where_it_is(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, _) = rig.open_panel(cx);
+    let (key, display, bounds) = display_and_panel(cx, window);
+    // The platform reports a new frame (the test window can only resize).
+    let taller = gpui_kit::size(bounds.size.width, bounds.size.height + gpui_kit::px(40.));
+    cx.simulate_window_resize(window, taller);
+    cx.run_until_parked();
+    let (_, _, now) = display_and_panel(cx, window);
+    assert_eq!(now.size, taller);
+    let stored = cx.update(|cx| rig.store.read(cx).prefs.quick.positions.get(&key).copied());
+    assert_eq!(stored, Some(super::panel::position_of(now, display)));
+}
+
+fn press_at(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    at: gpui_kit::Point<gpui_kit::Pixels>,
+) {
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_mouse_move(at, None, gpui_kit::Modifiers::none());
+    vcx.simulate_mouse_down(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::none());
+    vcx.simulate_mouse_up(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+}
+
+fn drags(cx: &mut TestAppContext, panel: &Entity<QuickPanel>) -> usize {
+    panel.read_with(cx, |p, _| p.drags_for_test())
+}
+
+fn centre(b: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
+    b.center()
+}
+
+// quick-panel / Typing is not dragging; Drag the panel
+#[gpui_kit::test]
+fn the_bar_drags_around_its_controls_only(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
+    let composer = bounds_of(cx, window, "quick-composer").expect("the composer");
+
+    press_at(cx, window, centre(composer));
+    assert_eq!(drags(cx, &panel), 0, "pressing in the text does not drag");
+    let chip = bounds_of(cx, window, "quick-model").expect("the model chip");
+    press_at(cx, window, centre(chip));
+    assert_eq!(drags(cx, &panel), 0, "a chip is a button");
+
+    // The bar's padding, left of the text.
+    let edge = gpui_kit::point(bar.left() + gpui_kit::px(4.), centre(bar).y);
+    assert!(edge.x < composer.left());
+    press_at(cx, window, edge);
+    assert_eq!(drags(cx, &panel), 1, "the bar around its controls drags");
+}
+
+// quick-panel / Drag the panel: the header
+#[gpui_kit::test]
+fn the_header_drags_outside_its_buttons(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    show_view(cx, &rig, &panel, long_view("long", 3, "idle"));
+    settle(cx, window);
+    finish_opening(cx, window);
+
+    let free = bounds_of(cx, window, "quick-drag").expect("free header space");
+    assert!(
+        free.size.width > gpui_kit::px(100.),
+        "room to grab: {free:?}"
+    );
+    press_at(cx, window, centre(free));
+    assert_eq!(drags(cx, &panel), 1);
+
+    // The title opens the session list and does not drag.
+    let title = bounds_of(cx, window, "quick-title").expect("the title");
+    press_at(cx, window, centre(title));
+    assert_eq!(drags(cx, &panel), 1);
+    assert!(panel.read_with(cx, |p, _| p.picker_open_for_test()));
+}
+
+/// Colours of the thin quads (carets) painted in the last frame.
+fn caret_colours(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<gpui_kit::Hsla> {
+    cx.update_window(window, |_, window, _| {
+        window
+            .painted_quads()
+            .iter()
+            .filter(|q| q.bounds.size.width.0 <= 4. && q.bounds.size.height.0 >= 8.)
+            .filter_map(|q| q.background.as_solid())
+            .collect()
+    })
+    .unwrap()
+}
+
+// quick-panel / Typed text in a light app theme: the caret, selection and
+// placeholder are the panel's too. The caret is what a test can read back;
+// the placeholder and the selection are set by the same style.
+#[gpui_kit::test]
+fn the_composers_caret_is_the_panels_in_a_light_app_theme(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.update(|cx| crate::theme::apply(false, "orange", cx));
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let hud = panel.read_with(cx, |p, cx| p.hud_for_test(cx));
+    let theme_caret = cx.update(|cx| gpui_kit::component::ActiveTheme::theme(cx).caret);
+    assert_ne!(hud.accent, theme_caret, "the test needs the two to differ");
+    let carets = caret_colours(cx, window);
+    assert!(
+        carets.contains(&hud.accent),
+        "the panel's caret: {carets:?}"
+    );
+    assert!(
+        !carets.contains(&theme_caret),
+        "not the app theme's: {carets:?}"
+    );
+
+    // The composer of a conversation is the pane's.
+    show_view(cx, &rig, &panel, long_view("long", 3, "idle"));
+    cx.update_window(window, |_, window, cx| {
+        let pane = panel.read(cx).pane_for_test().clone();
+        pane.update(cx, |pane, cx| pane.focus_composer(window, cx));
+    })
+    .unwrap();
+    settle(cx, window);
+    let carets = caret_colours(cx, window);
+    assert!(
+        carets.contains(&hud.accent),
+        "in a conversation: {carets:?}"
+    );
+    assert!(!carets.contains(&theme_caret), "{carets:?}");
+}
+
+// The style the panel's fields get.
+#[gpui_kit::test]
+fn the_panels_fields_use_its_palette(cx: &mut TestAppContext) {
+    let _rig = rig(cx);
+    let p = super::hud::hud_palette(&crate::theme::Palette::light(), true);
+    let style = cx.update(|cx| crate::ui::kit::editor_style(&p, cx));
+    assert_eq!(style.foreground, p.text);
+    assert_eq!(style.muted_foreground, p.muted, "the placeholder");
+    assert_eq!(style.caret, p.accent);
+    assert_eq!(style.selection, p.accent.opacity(0.32));
 }

@@ -52,6 +52,23 @@ pub(crate) enum ModelPickerEvent {
     Picked { key: String },
 }
 
+/// How [`ModelPicker::card`] is framed.
+pub(crate) enum PickerFrame {
+    /// A card of its own, `width` wide and at most `max_h` tall (the main
+    /// window's modal).
+    Card { width: Pixels, max_h: Pixels },
+    /// No frame: it fills what it is placed in and lies on that surface (the
+    /// quick panel, design D17). `probe` (a measuring canvas of the host,
+    /// absolutely placed) goes over the whole sheet; see
+    /// [`ModelPicker::sheet_height`].
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    // used by the desktop-only quick panel
+    Sheet { probe: AnyElement },
+}
+
+/// Space under the last row, inside the rows' scrolling box.
+const LIST_PAD_BOTTOM: f32 = 8.;
+
 /// Presentation snapshot of the reasoning-effort control.
 struct ReasoningControl {
     /// Session config option to update; `None` edits the launch preference.
@@ -101,6 +118,12 @@ struct Group {
 impl EventEmitter<ModelPickerEvent> for ModelPicker {}
 
 impl ModelPicker {
+    /// The search field.
+    #[cfg(test)]
+    pub(crate) fn query_for_test(&self) -> &Entity<InputState> {
+        &self.query
+    }
+
     pub(crate) fn new(
         store: Entity<AgentsStore>,
         smooth_scroll: SmoothScroll,
@@ -633,7 +656,17 @@ impl ModelPicker {
                 }
             }))
             .child(kit::icon(IconName::Search, 15., p.dim))
-            .child(Input::new(&self.query).appearance(false).flex_1())
+            // In the palette it is drawn in, not the app theme's: the quick
+            // panel's is dark whatever the app theme.
+            .when(self.palette.is_some(), |el| {
+                el.child(kit::input_colours(&self.query, p))
+            })
+            .child(
+                Input::new(&self.query)
+                    .appearance(false)
+                    .text_color(p.text)
+                    .flex_1(),
+            )
             .child(if refreshing {
                 div()
                     .p_1()
@@ -751,8 +784,7 @@ impl ModelPicker {
     /// provider, the reasoning-effort control and Done.
     pub(crate) fn card(
         &mut self,
-        width: Pixels,
-        max_h: Pixels,
+        frame: PickerFrame,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
         let p = self.colours(cx);
@@ -762,17 +794,34 @@ impl ModelPicker {
         let search = self.search(&agent, &p, cx);
         let footer = self.reasoning_footer(&p, cx);
         let smooth_scroll = self.smooth_scroll.clone();
+        let (framed, probe) = match frame {
+            PickerFrame::Card { width, max_h } => (
+                v_flex()
+                    .id("model-card")
+                    .w(width)
+                    .max_h(max_h)
+                    .rounded(px(16.))
+                    .bg(p.popover)
+                    .border_1()
+                    .border_color(p.border)
+                    .when(p.overlay_shadow(), |el| el.shadow_lg()),
+                None,
+            ),
+            // No frame of its own: it lies on the host's surface (design D17).
+            PickerFrame::Sheet { probe } => (
+                v_flex()
+                    .id("model-card")
+                    .relative()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0(),
+                Some(probe),
+            ),
+        };
         Some(
-            v_flex()
-                .id("model-card")
-                .w(width)
-                .max_h(max_h)
-                .rounded(px(16.))
-                .bg(p.surface)
-                .border_1()
-                .border_color(p.border)
-                .shadow_lg()
+            framed
                 .on_click(|_, _, cx| cx.stop_propagation())
+                .children(probe)
                 .child(
                     h_flex()
                         .px_4()
@@ -804,6 +853,8 @@ impl ModelPicker {
                 )
                 .child(div().px_4().child(search))
                 .child(
+                    // The rows are the box's direct children: the keyboard
+                    // cursor scrolls to them by index.
                     v_flex()
                         .id("model-list")
                         .flex_1()
@@ -811,7 +862,7 @@ impl ModelPicker {
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
                         .px_2()
-                        .pb_2()
+                        .pb(px(LIST_PAD_BOTTOM))
                         .children(rows)
                         .map(|el| smooth_scroll.region("model-list", el)),
                 )
@@ -819,6 +870,7 @@ impl ModelPicker {
                 .child(
                     h_flex().px_4().py_3().justify_end().child(
                         kit::flat_btn("model-done", true, true, &p)
+                            .debug_selector(|| "model-done".into())
                             .child("Done")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close(cx);
@@ -826,6 +878,29 @@ impl ModelPicker {
                     ),
                 ),
         )
+    }
+
+    /// The rows' scrolling box, for [`Self::sheet_height`].
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn rows_scroll(&self) -> ScrollHandle {
+        self.scroll.clone()
+    }
+
+    /// How tall a sheet laid out `whole` tall needs to be to show every row
+    /// without scrolling: `whole`, less the rows' box, plus what the rows and
+    /// their padding take. Read after the sheet's layout (`rows` holds the
+    /// bounds of the last one).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn sheet_height(rows: &ScrollHandle, whole: f32) -> f32 {
+        let count = rows.children_count();
+        let extent = match (
+            rows.bounds_for_item(0),
+            count.checked_sub(1).and_then(|l| rows.bounds_for_item(l)),
+        ) {
+            (Some(first), Some(last)) => f32::from(last.bottom() - first.top()),
+            _ => 0.,
+        };
+        whole - f32::from(rows.bounds().size.height) + extent + LIST_PAD_BOTTOM
     }
 
     /// The picker over the whole window, as a modal with a scrim.
@@ -838,7 +913,13 @@ impl ModelPicker {
             return None;
         }
         let p = self.colours(cx);
-        let card = self.card(px(620.), px(640.), cx)?;
+        let card = self.card(
+            PickerFrame::Card {
+                width: px(620.),
+                max_h: px(640.),
+            },
+            cx,
+        )?;
         Some(
             div()
                 .id("scrim-model")

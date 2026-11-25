@@ -215,6 +215,9 @@ pub(crate) struct WorkspaceField {
     disabled: bool,
     /// Colours in place of the app's, for a host with a look of its own.
     palette: Option<Palette>,
+    /// Suggestions laid out under the field, on the host's surface, instead
+    /// of in a dropdown over it (the quick panel, design D17).
+    inline: bool,
     smooth_scroll: SmoothScroll,
     open: bool,
     cursor: usize,
@@ -230,6 +233,12 @@ pub(crate) struct WorkspaceField {
 impl EventEmitter<WorkspaceEvent> for WorkspaceField {}
 
 impl WorkspaceField {
+    /// The text field.
+    #[cfg(test)]
+    pub(crate) fn input_for_test(&self) -> &Entity<InputState> {
+        &self.input
+    }
+
     pub(crate) fn new(
         store: Entity<AgentsStore>,
         input: Entity<InputState>,
@@ -266,6 +275,7 @@ impl WorkspaceField {
             dialog,
             disabled: false,
             palette: None,
+            inline: false,
             smooth_scroll,
             open: false,
             cursor: 0,
@@ -284,6 +294,14 @@ impl WorkspaceField {
             self.palette = palette;
             cx.notify();
         }
+    }
+
+    /// Lay the suggestions out under the field, taking room in the host's
+    /// layout, rather than in a dropdown that takes none: a host that sizes
+    /// itself to what it lays out (the quick panel) then has room for them.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn set_inline(&mut self, inline: bool) {
+        self.inline = inline;
     }
 
     pub(super) fn set_agent(&mut self, agent: Option<String>, cx: &mut Context<Self>) {
@@ -485,9 +503,17 @@ impl Render for WorkspaceField {
                 }
             }))
             .child(kit::icon(IconName::FolderSearch, 15., p.dim))
+            // A host with a look of its own: the field's placeholder,
+            // selection and caret in its colours too.
+            .when(self.palette.is_some(), |el| {
+                el.child(kit::input_colours(&self.input, &p))
+            })
             .child(
                 Input::new(&self.input)
                     .appearance(false)
+                    // The palette it is drawn in (the quick panel's is dark
+                    // whatever the app theme), not the app theme's.
+                    .text_color(p.text)
                     .aria_label("Workspace")
                     .disabled(self.disabled)
                     .flex_1(),
@@ -502,6 +528,7 @@ impl Render for WorkspaceField {
                     let path = item.path.clone();
                     h_flex()
                         .id(kit::keyed("ws-suggestion", item.path.clone()))
+                        .debug_selector(move || format!("ws-suggestion:{ix}"))
                         .flex_none()
                         .h(px(30.))
                         .px_2()
@@ -553,6 +580,21 @@ impl Render for WorkspaceField {
                         .into_any_element()
                 })
                 .collect();
+            if self.inline {
+                // On the host's surface: no box, border or shadow of its own.
+                return v_flex()
+                    .id("ws-suggestions")
+                    .debug_selector(|| "ws-suggestions".into())
+                    .mt_1()
+                    .max_h(px(LIST_MAX_H))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    // Keep focus in the field, as the dropdown does.
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .children(rows)
+                    .map(|el| self.smooth_scroll.region("workspace-list", el))
+                    .into_any_element();
+            }
             deferred(
                 v_flex()
                     .id("ws-suggestions")
@@ -578,6 +620,7 @@ impl Render for WorkspaceField {
                     .map(|el| self.smooth_scroll.region("workspace-list", el)),
             )
             .with_priority(3)
+            .into_any_element()
         });
         div().relative().w_full().child(field).children(popover)
     }

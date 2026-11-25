@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 # gpui-kit pins a matching GPUI snapshot and re-exports gpui, gpui-base,
 # gpui-component and the Lucide icon assets, keeping their versions in sync.
-gpui-kit = { version = "0.9.1", features = ["syntect"] }
+gpui-kit = { version = "0.11.0", features = ["syntect"] }
 # Standalone tool-output highlighting uses the same backend and features as the
 # component library, without depending on its private highlighting API.
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
@@ -20,7 +20,7 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 # (branch feat/agent-session-core). Bumping it means: change `rev` here and in
 # [dev-dependencies], refresh `cargoLock.outputHashes` in flake.nix, and run
 # the tests (they read the core's golden cases from the pinned rev).
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "0e9e2164b9cfcc3a454a7c5aa26b417e1209fa8d" }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73" }
 async-channel = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -104,10 +104,10 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.9.1", features = ["test-support"] }
+gpui-kit = { version = "0.11.0", features = ["test-support"] }
 # Same rev as above: tests replay the core's seeded golden cases
 # (`testing::golden_cases()`) instead of storing trace files.
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "0e9e2164b9cfcc3a454a7c5aa26b417e1209fa8d", features = ["test-support"] }
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73", features = ["test-support"] }
 
 [build-dependencies]
 dirs = "6"
