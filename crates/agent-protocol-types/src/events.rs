@@ -593,6 +593,15 @@ pub enum AgentEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// A rewind pruned the journal past the session's last `todowrite`, so
+    /// the session's current todo plan is now `entries` (empty: no plan).
+    /// Transient: the stored plan and the journal are already correct when
+    /// this is emitted, so it only tells live observers (clients, plan
+    /// announcements) what a new `session/list` would report.
+    TodoPlanRestored {
+        #[typeshare(serialized_as = "any")]
+        entries: Vec<crate::protocol::PlanEntry>,
+    },
     HookNotice {
         event_name: String,
         message: String,
@@ -1093,6 +1102,7 @@ impl AgentEventKind {
             Self::ToolCallEnd { .. } => "tool_call_end",
             Self::ToolCallProgress { .. } => "tool_call_progress",
             Self::McpServerAuthRequired { .. } => "mcp_server_auth_required",
+            Self::TodoPlanRestored { .. } => "todo_plan_restored",
             Self::HookNotice { .. } => "hook_notice",
             Self::SnapshotStart { .. } => "snapshot_start",
             Self::SnapshotEnd { .. } => "snapshot_end",
@@ -1378,6 +1388,10 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // Rationale: live login prompt; authoritative state is the credential
         // store (`auth_status`), so it must not be journaled or replayed.
         AgentEventKind::McpServerAuthRequired { .. } => Durability::Ephemeral,
+        // Rationale: live hint after a rewind. The recomputed plan and the
+        // pruned journal are authoritative, and a durable kind older journal
+        // loaders do not know would make rewound sessions unreadable there.
+        AgentEventKind::TodoPlanRestored { .. } => Durability::Ephemeral,
 
         // ── Durable: accounting ledger ──────────────────────────────
         // Rationale: the start must survive a crash to expose unresolved
@@ -1848,6 +1862,12 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "type": "todo_plan_restored",
+                "data": {
+                    "entries": [{"content": "a", "priority": "high", "status": "pending"}]
+                }
+            }),
+            serde_json::json!({
                 "type": "worktree_command_output",
                 "data": {
                     "text": "x"
@@ -2162,7 +2182,7 @@ mod tests {
         let samples = one_value_per_variant();
         // Update when a variant is added: `tag()`'s exhaustive match forces
         // the new tag, and this count forces a sample for it.
-        assert_eq!(samples.len(), 103, "one sample per AgentEventKind variant");
+        assert_eq!(samples.len(), 104, "one sample per AgentEventKind variant");
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
@@ -2198,6 +2218,18 @@ mod tests {
             error: None,
         };
         assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn todo_plan_restored_is_ephemeral_and_keeps_its_wire_shape() {
+        let kind = AgentEventKind::TodoPlanRestored {
+            entries: Vec::new(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!({"type": "todo_plan_restored", "data": {"entries": []}})
+        );
     }
 
     // ── StopType -> StopReason conversion ──────────────────────────────────

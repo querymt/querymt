@@ -29,6 +29,46 @@ pub fn todo_plan_update(entries: Vec<PlanEntry>) -> SessionUpdate {
     )))
 }
 
+/// Top-level `_meta` key of `session/list` entries (and of
+/// `session_info_update` patches) holding a session's current plans: an array
+/// of ACP plan content objects. Top level, because ACP v2 metadata patches
+/// replace a top-level key whole.
+pub const QUERYMT_PLANS_META_KEY: &str = "querymt/plans";
+
+/// The [`QUERYMT_PLANS_META_KEY`] value for a todo list: one `items` plan
+/// under [`QUERYMT_TODO_PLAN_ID`], built from the same plan content as
+/// [`todo_plan_update`]. `None` when there are no entries, in which case the
+/// key is omitted.
+#[must_use]
+pub fn todo_plans_meta(entries: Vec<PlanEntry>) -> Option<serde_json::Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let content = PlanUpdateContent::items(PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()), entries);
+    // Plan content is plain strings and enums: serializing it cannot fail.
+    Some(serde_json::to_value([content]).expect("plan content serializes to JSON"))
+}
+
+/// The todo plan an event sets: the entries of a `todowrite` `ToolCallStart`
+/// whose arguments are a todo list, or of a `TodoPlanRestored` after a
+/// rewind. Empty when the list was emptied. `None` for every other event,
+/// including a `todowrite` whose arguments are not a todo list.
+///
+/// The one place that decides what plan an event projects to; the journal,
+/// the live translator, the materialized state and the announcer all use it.
+#[must_use]
+pub fn todo_plan_of(kind: &AgentEventKind) -> Option<Vec<PlanEntry>> {
+    match kind {
+        AgentEventKind::ToolCallStart {
+            tool_name,
+            arguments,
+            ..
+        } if is_todo_write_tool(tool_name) => todo_entries_from_arguments(arguments),
+        AgentEventKind::TodoPlanRestored { entries } => Some(entries.clone()),
+        _ => None,
+    }
+}
+
 /// QueryMT extension namespace inside ACP's `_meta` escape hatch.
 pub const QUERYMT_META_NAMESPACE: &str = "querymt";
 
@@ -182,9 +222,12 @@ pub fn tool_kind_for_tool(name: &str) -> ToolKind {
     }
 }
 
+/// Names the todo-list tool is journaled under (native and MCP).
+pub const TODO_WRITE_TOOL_NAMES: [&str; 2] = ["todowrite", "mcp_todowrite"];
+
 /// True for the todo-list tool, which projects to a plan and not a tool call.
 pub fn is_todo_write_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "todowrite" | "mcp_todowrite")
+    TODO_WRITE_TOOL_NAMES.contains(&tool_name)
 }
 
 /// The plan entries of a `todowrite` call. `None` when the arguments are not
@@ -375,7 +418,7 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
             if is_todo_write_tool(tool_name) {
                 // Ungated contexts receive the legacy full-replacement plan;
                 // plan-operations connections intercept todowrite earlier.
-                return todo_entries_from_arguments(arguments)
+                return todo_plan_of(kind)
                     .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
                     .unwrap_or_default();
             }
@@ -1038,6 +1081,95 @@ mod tests {
         };
         assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
         assert_eq!(items.entries.len(), 1);
+    }
+
+    #[test]
+    fn todo_plans_meta_serialises_one_items_plan() {
+        let entries = todo_entries_from_arguments(
+            r#"{"todos":[{"content":"Add table","status":"completed","priority":"high"}]}"#,
+        )
+        .unwrap();
+        let value = todo_plans_meta(entries).expect("non-empty entries");
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "type": "items",
+                "planId": "querymt-todos",
+                "entries": [{
+                    "content": "Add table",
+                    "priority": "high",
+                    "status": "completed"
+                }]
+            }])
+        );
+    }
+
+    fn tool_start(tool_name: &str, arguments: &str) -> AgentEventKind {
+        AgentEventKind::ToolCallStart {
+            tool_call_id: "call".into(),
+            tool_name: tool_name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    #[test]
+    fn todo_plan_of_projects_todowrite_calls_under_both_tool_names() {
+        let args = r#"{"todos":[{"content":"a","status":"pending"}]}"#;
+        for tool_name in TODO_WRITE_TOOL_NAMES {
+            let entries = todo_plan_of(&tool_start(tool_name, args)).expect("a todo plan");
+            assert_eq!(entries.len(), 1, "{tool_name}");
+        }
+    }
+
+    #[test]
+    fn todo_plan_of_projects_a_restored_plan_as_is() {
+        let entries =
+            todo_entries_from_arguments(r#"{"todos":[{"content":"a","status":"pending"}]}"#)
+                .unwrap();
+        assert_eq!(
+            todo_plan_of(&AgentEventKind::TodoPlanRestored {
+                entries: entries.clone()
+            }),
+            Some(entries)
+        );
+        assert_eq!(
+            todo_plan_of(&AgentEventKind::TodoPlanRestored {
+                entries: Vec::new()
+            }),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn todo_plan_of_is_empty_for_an_emptied_list_and_none_otherwise() {
+        assert_eq!(
+            todo_plan_of(&tool_start("todowrite", r#"{"todos":[]}"#)),
+            Some(Vec::new())
+        );
+        // Not a todo list, not the todo tool, not a tool call.
+        assert!(todo_plan_of(&tool_start("todowrite", "not json")).is_none());
+        assert!(todo_plan_of(&tool_start("todowrite", r#"{"nothing":true}"#)).is_none());
+        assert!(todo_plan_of(&tool_start("shell", r#"{"todos":[]}"#)).is_none());
+        assert!(todo_plan_of(&AgentEventKind::Cancelled).is_none());
+    }
+
+    #[test]
+    fn todo_plans_meta_is_none_for_empty_entries() {
+        assert!(todo_plans_meta(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn todo_plans_meta_and_plan_update_agree_on_entries() {
+        let args = r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"cancelled"},{"content":"c","status":"pending","priority":"low"}]}"#;
+        let SessionUpdate::PlanUpdate(update) =
+            todo_plan_update(todo_entries_from_arguments(args).unwrap())
+        else {
+            panic!("expected a plan update");
+        };
+        let expected = serde_json::to_value([update.plan]).unwrap();
+        let listed = todo_plans_meta(todo_entries_from_arguments(args).unwrap()).unwrap();
+        assert_eq!(listed, expected);
+        assert_eq!(listed[0]["entries"].as_array().unwrap().len(), 2);
     }
 
     #[test]

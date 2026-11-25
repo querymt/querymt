@@ -755,6 +755,54 @@ A client that advertises the top-level `clientCapabilities.subagents` capability
 
 Clients without the capability receive no `subagent_update`, no session reference and no failed status update. They still receive the delegate tool call and the child session's events.
 
+### Session plans in `session/list`
+
+A session picker can show each session's todo progress without loading the session. `session/list` entries for local sessions carry the session's current plans under the top-level `_meta` key `querymt/plans`, an array of ACP plan content objects. Today it holds one `items` plan, the todo list:
+
+```json
+{"sessionId": "…", "title": "…",
+ "_meta": {
+   "querymt/plans": [
+     {"type": "items", "planId": "querymt-todos",
+      "entries": [{"content": "Add table", "priority": "high", "status": "completed"},
+                  {"content": "Wire list query", "priority": "medium", "status": "in_progress"}]}
+   ]
+ }}
+```
+
+- **Same entries as `plan_update`.** The entries are what a `plan_update` for the same todo list carries: same order, `content`, `priority` and `status`. `cancelled` todos and todos with an unknown status are left out.
+- **Absent when empty.** A session that never called `todowrite`, or whose last `todowrite` stored an empty list, has no `querymt/plans` key. Entries for sessions listed from mesh peers (`_meta.location` `remote`) never carry it.
+- **Top-level key.** The key is not nested under `_meta.querymt`: ACP metadata patches replace a top-level key whole, so a plans patch cannot overwrite the workspace, pin or lifecycle values nested there.
+- **Persisted.** The current plan is stored per session, so the list reports it after an agent restart. Sessions that wrote todos before this existed report the plan of their last `todowrite` once the session database is upgraded. Deleting a session discards its plan. Rewinding history past the last `todowrite` restores the previous plan, or removes it when no call remains. The prune happens when the next prompt starts, and that is when the change is announced (see below). `todoread` then returns the restored list too.
+- **`todoread`.** It still reads the in-memory todo list, which starts empty after a restart.
+
+To keep a listed row current:
+
+```mermaid
+sequenceDiagram
+    participant S as Session
+    participant A as Agent
+    participant Active as Connection with the session active
+    participant Other as Any other connection
+    S->>A: todowrite (journaled)
+    A->>A: per connection, compare plans with the last announced value
+    alt plans changed
+        A-->>Active: session_info_update, _meta {"querymt/plans": [...]}
+        A-->>Other: querymt/session/plansChanged {session_id, plans}
+        A-->>Active: querymt/session/plansChanged {session_id, plans}
+    else unchanged
+        A->>A: nothing sent
+    end
+```
+
+- **`session_info_update` patch.** On connections where the session is active, the update's `_meta` sets only `querymt/plans`, to the value `session/list` now reports, or to `null` when the list was emptied. It carries no `title`, `updatedAt` or other `_meta` key.
+- **`querymt/session/plansChanged`.** An extension notification sent to every connection, listed in the control capabilities' `notifications`. Params: `{"session_id": "…", "plans": [...]}`, where `plans` is what `session/list` would report (`[]` when the key is omitted). Clients use it to update a listed session mid-turn without calling `session/list` again. The Rust type is `SessionPlansChangedNotification`.
+- **Both reach the active connection.** A connection where the session is active receives the patch and the notification for the same change, carrying the same plans. Both set the whole value, so applying either or both leaves the same result.
+- **When it is sent.** After a journaled `todowrite` call whose arguments are a todo list and whose plans differ from the last ones announced to that connection for that session. A repeat of the listed entries and a `todowrite` with arguments that are not a todo list send nothing. Each connection keeps its own last announced value in memory, so the first `todowrite` of a session on a connection is always announced.
+- **After a rewind.** When the prompt that follows an undo removes the session's last `todowrite`, the change is announced like a `todowrite`: the patch and `plan_update` or `plan_removed` on connections where the session is active, and `plansChanged` on every connection. A rewind that leaves the plan as it was announces nothing.
+- **Falling behind.** A connection that falls behind the agent's event stream is not told about the plans that changed meanwhile; the next `todowrite` of such a session is announced again, and `session/list` always reports the current plans. The rewind announcement is a live hint with the same limit.
+- **Rejected calls.** Plans are projected when the `todowrite` call starts, like `plan_update`, so a call the tool later rejects still changes the listed plan.
+
 ## Remote/Mesh API
 
 ### Mesh Configuration

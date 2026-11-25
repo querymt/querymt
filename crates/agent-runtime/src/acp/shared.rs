@@ -23,7 +23,7 @@ use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use querymt_agent_core::replay::{
-    CompactionIds, is_todo_write_tool, stored_summary_updates, todo_entries_from_arguments,
+    CompactionIds, is_todo_write_tool, stored_summary_updates, todo_plan_of,
 };
 use querymt_agent_protocol_types::session::state_update::stop_reason_for_outcome;
 pub use querymt_agent_protocol_types::session::state_update::{
@@ -786,6 +786,7 @@ pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
 pub const QMT_NOTIFICATION_AGENTS_CHANGED: &str = "querymt/agents/changed";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
+pub const QMT_NOTIFICATION_SESSION_PLANS_CHANGED: &str = "querymt/session/plansChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -1543,12 +1544,8 @@ fn materialize_replay_state(
                 // replayed and summary chunks would duplicate the materialized
                 // terminal summary.
             }
-            AgentEventKind::ToolCallStart {
-                ref tool_name,
-                ref arguments,
-                ..
-            } if is_todo_write_tool(tool_name) => {
-                if let Some(entries) = todo_entries_from_arguments(arguments) {
+            AgentEventKind::ToolCallStart { .. } => {
+                if let Some(entries) = todo_plan_of(&event.kind) {
                     state.todo_entries = Some(entries);
                 }
             }
@@ -2163,9 +2160,11 @@ pub struct AcpLiveEventTranslator {
     capabilities: AcpSessionUpdateCapabilities,
     usage: HashMap<String, SessionUsageProjection>,
     config: HashMap<String, SessionConfigProjection>,
-    /// Sessions whose deterministic todo plan is currently announced to a
-    /// plan-operations client, so an empty snapshot removes it exactly once.
-    announced_todo_plans: HashSet<String>,
+    /// Todo plan last announced to this connection per session; empty means
+    /// announced as emptied, and an absent session has not been announced yet.
+    /// Decides when a plan-operations client is sent `plan_removed` (once, for
+    /// a plan it holds) and when the `querymt/plans` metadata patch is a repeat.
+    announced_plans: HashMap<String, Vec<crate::acp::protocol::PlanEntry>>,
     /// Current run and blocking waits per session, for run state updates and
     /// the run id stamped on session updates.
     runs: HashMap<String, RunTracking>,
@@ -2330,7 +2329,7 @@ impl AcpLiveEventTranslator {
             capabilities: AcpSessionUpdateCapabilities::default(),
             usage: HashMap::new(),
             config: HashMap::new(),
-            announced_todo_plans: HashSet::new(),
+            announced_plans: HashMap::new(),
             runs: HashMap::new(),
             announced_children: HashSet::new(),
             announced_cursors: HashSet::new(),
@@ -2726,7 +2725,7 @@ impl AcpLiveEventTranslator {
     pub fn forget_session(&mut self, session_id: &str) {
         self.usage.remove(session_id);
         self.config.remove(session_id);
-        self.announced_todo_plans.remove(session_id);
+        self.announced_plans.remove(session_id);
         self.runs.remove(session_id);
         self.announced_children.remove(session_id);
         self.announced_cursors
@@ -3143,12 +3142,14 @@ impl AcpLiveEventTranslator {
                     ),
                 ))]
             }
-            AgentEventKind::ToolCallStart {
-                tool_name,
-                arguments,
-                ..
-            } if is_todo_write_tool(tool_name) => {
-                self.translate_todo_updates(&session_id, arguments)
+            todo_call @ AgentEventKind::ToolCallStart { tool_name, .. }
+                if is_todo_write_tool(tool_name) =>
+            {
+                self.translate_todo_updates(&session_id, todo_plan_of(todo_call))
+            }
+            // A rewind changed the plan without a todowrite.
+            restored @ AgentEventKind::TodoPlanRestored { .. } => {
+                self.translate_todo_updates(&session_id, todo_plan_of(restored))
             }
             AgentEventKind::CompactionStart {
                 compaction_id,
@@ -3287,26 +3288,54 @@ impl AcpLiveEventTranslator {
     /// per-session plan ID and a single `plan_removed` for dismissal; legacy
     /// clients retain the full-replacement `plan` update (an empty snapshot
     /// stays an empty replacement because legacy v1 has no removal variant).
-    fn translate_todo_updates(&mut self, session_id: &str, arguments: &str) -> Vec<SessionUpdate> {
-        // Malformed snapshots emit nothing; an empty entry list is a valid,
-        // explicitly-dismissed snapshot.
-        let Some(entries) = todo_entries_from_arguments(arguments) else {
+    ///
+    /// `plan` is the snapshot's entries (`todo_plan_of`): `None` for a
+    /// malformed snapshot, which emits nothing, and empty for an
+    /// explicitly-dismissed one. Every session update that follows a todowrite
+    /// also carries the `querymt/plans` metadata patch, unless this connection
+    /// was already told these plans.
+    fn translate_todo_updates(
+        &mut self,
+        session_id: &str,
+        plan: Option<Vec<crate::acp::protocol::PlanEntry>>,
+    ) -> Vec<SessionUpdate> {
+        let Some(entries) = plan else {
             return Vec::new();
         };
-        if self.capabilities.plan_operations {
-            if entries.is_empty() {
-                if self.announced_todo_plans.remove(session_id) {
-                    return vec![SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
-                        QUERYMT_TODO_PLAN_ID.to_string(),
-                    )))];
-                }
-                return Vec::new();
-            }
-            self.announced_todo_plans.insert(session_id.to_owned());
-            return vec![querymt_agent_core::replay::todo_plan_update(entries)];
+        let previous = self
+            .announced_plans
+            .insert(session_id.to_owned(), entries.clone());
+        let repeats_announced = previous.as_deref() == Some(entries.as_slice());
+        let had_plan = previous.is_some_and(|previous| !previous.is_empty());
+
+        let mut updates = Vec::with_capacity(2);
+        if !self.capabilities.plan_operations {
+            updates.push(SessionUpdate::Plan(Plan::new(entries.clone())));
+        } else if !entries.is_empty() {
+            updates.push(querymt_agent_core::replay::todo_plan_update(
+                entries.clone(),
+            ));
+        } else if had_plan {
+            updates.push(SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
+                QUERYMT_TODO_PLAN_ID.to_string(),
+            ))));
         }
-        vec![SessionUpdate::Plan(Plan::new(entries))]
+        if !repeats_announced {
+            updates.push(plans_meta_patch(entries));
+        }
+        updates
     }
+}
+
+/// The `session_info_update` that moves a session's listed plans on a
+/// connection: `_meta` sets only the top-level `querymt/plans` key, to the
+/// value `session/list` reports, or to `null` when the plan is emptied.
+fn plans_meta_patch(entries: Vec<crate::acp::protocol::PlanEntry>) -> SessionUpdate {
+    let patch = crate::acp::protocol::Meta::from_iter([(
+        querymt_agent_core::replay::QUERYMT_PLANS_META_KEY.to_owned(),
+        querymt_agent_core::replay::todo_plans_meta(entries).unwrap_or(serde_json::Value::Null),
+    )]);
+    SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(patch))
 }
 
 /// Text shown for an MCP progress report: `"{message} ({pct}%)"`,
@@ -8553,11 +8582,11 @@ mod session_update_tests {
 
         let plan = todo_start(&todo_args(&[("a", "pending")]));
         assert!(matches!(
-            full.translate_updates(&plan).as_slice(),
+            plans_patch_removed(full.translate_updates(&plan)).as_slice(),
             [SessionUpdate::PlanUpdate(_)]
         ));
         assert!(matches!(
-            narrow.translate_updates(&plan).as_slice(),
+            plans_patch_removed(narrow.translate_updates(&plan)).as_slice(),
             [SessionUpdate::Plan(_)]
         ));
     }
@@ -8648,11 +8677,11 @@ mod session_update_tests {
 
         let args = todo_args(&[("a", "pending")]);
         assert!(matches!(
-            capable.translate_updates(&todo_start(&args)).as_slice(),
+            plans_patch_removed(capable.translate_updates(&todo_start(&args))).as_slice(),
             [SessionUpdate::PlanUpdate(_)]
         ));
         assert!(matches!(
-            legacy.translate_updates(&todo_start(&args)).as_slice(),
+            plans_patch_removed(legacy.translate_updates(&todo_start(&args))).as_slice(),
             [SessionUpdate::Plan(_)]
         ));
     }
@@ -8687,12 +8716,12 @@ mod session_update_tests {
 
         let plan = todo_start(&todo_args(&[("a", "pending")]));
         assert!(matches!(
-            full.translate_updates(&plan).as_slice(),
+            plans_patch_removed(full.translate_updates(&plan)).as_slice(),
             [SessionUpdate::PlanUpdate(_)]
         ));
         // Compaction-only clients fall back to the legacy plan replacement.
         assert!(matches!(
-            compaction_only.translate_updates(&plan).as_slice(),
+            plans_patch_removed(compaction_only.translate_updates(&plan)).as_slice(),
             [SessionUpdate::Plan(_)]
         ));
 
@@ -10167,6 +10196,150 @@ mod session_update_tests {
         assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
     }
 
+    /// The updates minus the `querymt/plans` metadata patch a todowrite also
+    /// causes, so plan-lifecycle tests keep asserting on the plan updates.
+    fn plans_patch_removed(updates: Vec<SessionUpdate>) -> Vec<SessionUpdate> {
+        updates
+            .into_iter()
+            .filter(|update| plans_patch_of(update).is_none())
+            .collect()
+    }
+
+    /// The `_meta` patch of a `session_info_update` that carries the
+    /// `querymt/plans` key, or `None` for any other update.
+    fn plans_patch_of(update: &SessionUpdate) -> Option<serde_json::Value> {
+        let SessionUpdate::SessionInfoUpdate(_) = update else {
+            return None;
+        };
+        let json = serde_json::to_value(update).ok()?;
+        json.get("_meta")?.get("querymt/plans")?;
+        Some(json)
+    }
+
+    fn plans_patches(updates: &[SessionUpdate]) -> Vec<serde_json::Value> {
+        updates.iter().filter_map(plans_patch_of).collect()
+    }
+
+    #[test]
+    fn todowrite_patches_only_the_plans_key_on_an_active_session() {
+        // Both capability kinds get the patch: it is session metadata, not a plan.
+        for capabilities in [plan_ops(), AcpSessionUpdateCapabilities::default()] {
+            let mut translator = AcpLiveEventTranslator::new();
+            translator.set_capabilities(capabilities);
+            let updates = translator.translate_updates(&todo_start(&todo_args(&[
+                ("a", "completed"),
+                ("b", "pending"),
+            ])));
+            let patches = plans_patches(&updates);
+            assert_eq!(patches.len(), 1, "{updates:?}");
+            let patch = &patches[0];
+            assert_eq!(patch["sessionUpdate"], "session_info_update");
+            let meta = patch["_meta"].as_object().unwrap();
+            assert_eq!(meta.len(), 1, "only the plans key is patched: {patch}");
+            assert!(patch.get("title").is_none());
+            assert!(patch.get("updatedAt").is_none());
+            let plans = meta["querymt/plans"].as_array().unwrap();
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0]["planId"], "querymt-todos");
+            assert_eq!(plans[0]["entries"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn emptied_todo_plan_patches_plans_to_null_and_unchanged_is_not_repeated() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let args = todo_args(&[("a", "pending")]);
+        assert_eq!(
+            plans_patches(&translator.translate_updates(&todo_start(&args))).len(),
+            1
+        );
+        assert!(
+            plans_patches(&translator.translate_updates(&todo_start(&args))).is_empty(),
+            "the same plan is not patched again"
+        );
+
+        let emptied = plans_patches(&translator.translate_updates(&todo_start(&todo_args(&[]))));
+        assert_eq!(emptied.len(), 1);
+        assert_eq!(
+            emptied[0]["_meta"],
+            serde_json::json!({ "querymt/plans": null })
+        );
+        assert!(
+            plans_patches(&translator.translate_updates(&todo_start(&todo_args(&[])))).is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_todowrite_does_not_patch_plans() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        for bad in ["not json", r#"{"nothing":true}"#, r#"{"todos":"x"}"#] {
+            assert!(translator.translate_updates(&todo_start(bad)).is_empty());
+        }
+    }
+
+    fn plan_restored(seq: i64, args: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::TodoPlanRestored {
+                entries: querymt_agent_core::replay::todo_entries_from_arguments(args).unwrap(),
+            },
+        )
+    }
+
+    #[test]
+    fn rewound_plan_replaces_the_plan_and_patches_plans_like_a_todowrite() {
+        for capabilities in [plan_ops(), AcpSessionUpdateCapabilities::default()] {
+            let mut translator = AcpLiveEventTranslator::new();
+            translator.set_capabilities(capabilities);
+            translator.translate_updates(&todo_start(&todo_args(&[
+                ("a", "completed"),
+                ("b", "pending"),
+            ])));
+
+            let updates =
+                translator.translate_updates(&plan_restored(2, &todo_args(&[("a", "completed")])));
+            let patches = plans_patches(&updates);
+            assert_eq!(patches.len(), 1, "{updates:?}");
+            let plans = patches[0]["_meta"]["querymt/plans"].as_array().unwrap();
+            assert_eq!(plans[0]["entries"].as_array().unwrap().len(), 1);
+            let plan_updates = plans_patch_removed(updates);
+            assert_eq!(plan_updates.len(), 1, "{plan_updates:?}");
+            assert!(matches!(
+                plan_updates[0],
+                SessionUpdate::PlanUpdate(_) | SessionUpdate::Plan(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn rewind_to_no_plan_removes_it_and_clears_the_patch() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+
+        let updates = translator.translate_updates(&plan_restored(2, &todo_args(&[])));
+        assert_eq!(
+            plans_patches(&updates)[0]["_meta"],
+            serde_json::json!({ "querymt/plans": null })
+        );
+        assert!(matches!(
+            plans_patch_removed(updates).as_slice(),
+            [SessionUpdate::PlanRemoved(_)]
+        ));
+    }
+
+    #[test]
+    fn rewind_to_the_plan_the_connection_already_has_is_not_patched_again() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let args = todo_args(&[("a", "pending")]);
+        translator.translate_updates(&todo_start(&args));
+        assert!(plans_patches(&translator.translate_updates(&plan_restored(2, &args))).is_empty());
+    }
+
     // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────
 
     #[test]
@@ -10174,7 +10347,9 @@ mod session_update_tests {
         let mut translator = AcpLiveEventTranslator::new();
         translator.set_capabilities(plan_ops());
 
-        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let created = plans_patch_removed(
+            translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")]))),
+        );
         let [SessionUpdate::PlanUpdate(update)] = created.as_slice() else {
             panic!("expected plan update");
         };
@@ -10184,10 +10359,11 @@ mod session_update_tests {
         assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
         assert_eq!(items.entries.len(), 1);
 
-        let updated = translator.translate_updates(&todo_start(&todo_args(&[
-            ("a", "completed"),
-            ("b", "in_progress"),
-        ])));
+        let updated =
+            plans_patch_removed(translator.translate_updates(&todo_start(&todo_args(&[
+                ("a", "completed"),
+                ("b", "in_progress"),
+            ]))));
         let [SessionUpdate::PlanUpdate(update)] = updated.as_slice() else {
             panic!("expected plan update");
         };
@@ -10196,7 +10372,8 @@ mod session_update_tests {
         };
         assert_eq!(items.entries.len(), 2);
 
-        let removed = translator.translate_updates(&todo_start(&todo_args(&[])));
+        let removed =
+            plans_patch_removed(translator.translate_updates(&todo_start(&todo_args(&[]))));
         assert!(matches!(
             removed.as_slice(),
             [SessionUpdate::PlanRemoved(_)]
@@ -10204,13 +10381,14 @@ mod session_update_tests {
 
         // Repeated empty snapshots do not emit duplicate removals.
         assert!(
-            translator
-                .translate_updates(&todo_start(&todo_args(&[])))
+            plans_patch_removed(translator.translate_updates(&todo_start(&todo_args(&[]))))
                 .is_empty()
         );
 
         // Recreating the plan works after removal.
-        let recreated = translator.translate_updates(&todo_start(&todo_args(&[("c", "pending")])));
+        let recreated = plans_patch_removed(
+            translator.translate_updates(&todo_start(&todo_args(&[("c", "pending")]))),
+        );
         assert!(matches!(
             recreated.as_slice(),
             [SessionUpdate::PlanUpdate(_)]
@@ -10221,13 +10399,16 @@ mod session_update_tests {
     fn legacy_client_keeps_full_replacement_plan_and_empty_plan() {
         let mut translator = AcpLiveEventTranslator::new();
 
-        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let created = plans_patch_removed(
+            translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")]))),
+        );
         let [SessionUpdate::Plan(plan)] = created.as_slice() else {
             panic!("expected legacy plan");
         };
         assert_eq!(plan.entries.len(), 1);
 
-        let emptied = translator.translate_updates(&todo_start(&todo_args(&[])));
+        let emptied =
+            plans_patch_removed(translator.translate_updates(&todo_start(&todo_args(&[]))));
         let [SessionUpdate::Plan(plan)] = emptied.as_slice() else {
             panic!("expected legacy empty replacement");
         };
@@ -10241,7 +10422,8 @@ mod session_update_tests {
         assert!(
             translator
                 .translate_updates(&todo_start("not json"))
-                .is_empty()
+                .is_empty(),
+            "neither a plan update nor a plans patch"
         );
     }
 

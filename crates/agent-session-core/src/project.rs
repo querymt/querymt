@@ -10,8 +10,8 @@ use querymt_agent_protocol_types::protocol::{
     PlanRemoved, SessionUpdate, TextContent,
 };
 use querymt_agent_protocol_types::replay::{
-    CompactionIds, QUERYMT_TODO_PLAN_ID, is_todo_write_tool, replayable_updates,
-    stamp_compaction_tokens, stored_summary_updates, todo_entries_from_arguments, todo_plan_update,
+    CompactionIds, QUERYMT_TODO_PLAN_ID, replayable_updates, stamp_compaction_tokens,
+    stored_summary_updates, todo_plan_of, todo_plan_update,
 };
 
 /// The updates one journal event stands for. Events that carry no
@@ -94,22 +94,17 @@ fn event_updates_inner(event: &Event, ids: &mut CompactionIds) -> Vec<SessionUpd
         }
         // The reducer always supports plan operations, so a todo list is the
         // `plan_update` under the shared plan id, as the agent sends it live.
-        AgentEventKind::ToolCallStart {
-            tool_name,
-            arguments,
-            ..
-        } if is_todo_write_tool(tool_name) => todo_entries_from_arguments(arguments)
-            .map(|entries| {
-                // An empty list dismisses the plan, as it does live.
-                if entries.is_empty() {
-                    vec![SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
-                        QUERYMT_TODO_PLAN_ID.to_string(),
-                    )))]
-                } else {
-                    vec![todo_plan_update(entries)]
-                }
-            })
-            .unwrap_or_default(),
-        kind => replayable_updates(kind),
+        // A malformed todowrite projects to nothing, here and in
+        // `replayable_updates`.
+        kind => match todo_plan_of(kind) {
+            // An empty list dismisses the plan, as it does live.
+            Some(entries) if entries.is_empty() => {
+                vec![SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
+                    QUERYMT_TODO_PLAN_ID.to_string(),
+                )))]
+            }
+            Some(entries) => vec![todo_plan_update(entries)],
+            None => replayable_updates(kind),
+        },
     }
 }

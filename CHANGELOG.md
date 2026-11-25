@@ -84,6 +84,26 @@
 
 ### Behavior changes
 
+- **BREAKING (ACP wire shape, additive): `session/list` reports each session's
+  plans.** Entries for local sessions with a todo list carry the top-level
+  `_meta` key `querymt/plans`, an array with one `items` plan
+  (`planId: "querymt-todos"`) holding the same entries a `plan_update` would
+  carry; sessions without a todo list omit it. The current todo plan is now
+  persisted per session (session database migration `0041_session_todo_plans`,
+  which backfills existing sessions from their last `todowrite`). After a
+  `todowrite` changes it, connections where the session is active get a
+  `session_info_update` whose `_meta` sets `querymt/plans` (`null` when
+  emptied), and every connection gets the new extension notification
+  `querymt/session/plansChanged` (`session_id`, `plans`), listed in the control
+  capabilities. Each connection announces independently and skips plans it
+  already announced. A rewind that removes the session's last `todowrite` (when
+  the prompt after an undo starts) restores the earlier plan and announces it
+  the same way, through the new transient event
+  `AgentEventKind::TodoPlanRestored`, and `todoread` returns the restored
+  list. New field `SessionListItem::todo_plan`; new typeshare type
+  `SessionPlansChangedNotification` (follow-up for querymt-desktop). Clients
+  that ignore unknown `_meta` keys and notifications are unaffected.
+
 - **BREAKING (ACP): a delegation that fails or is cancelled fails its delegate
   tool call.** The delegate tool call ends `completed` when the delegation is
   accepted. For a client that advertises `subagents`, a delegation that later

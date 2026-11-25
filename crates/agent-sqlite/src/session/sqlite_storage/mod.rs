@@ -17,6 +17,7 @@ mod event_journal;
 mod migrations;
 mod row_parsers;
 mod session_store;
+mod todo_plan;
 mod view_store;
 
 #[cfg(test)]

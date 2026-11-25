@@ -4,9 +4,11 @@
 //! the git-based snapshot backend. When undoing, it reverts all filesystem changes
 //! made after a specific message. Redo restores the pre-undo state.
 
+use crate::tools::builtins::todo::TodoItem;
 use log::{debug, warn};
-use querymt_agent_core::events::{AgentEventKind, EventOrigin};
+use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventOrigin};
 use querymt_agent_core::model::{MessagePart, TurnId};
+use querymt_agent_core::replay::{todo_entries_from_arguments, todo_plan_of};
 use querymt_agent_services::snapshot::SnapshotId;
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -765,6 +767,13 @@ fn is_copied_fork_message(
 /// the prune stops right before it, removing only events of the undone turns.
 /// Run lifecycle events are never pruned (see
 /// `EventJournal::delete_session_events_range`).
+///
+/// The prune can remove the session's last `todowrite`; the journal then
+/// recomputes the stored todo plan. When the prune changed the session's todo
+/// list, the list that is current afterwards is returned (empty: none), for the
+/// caller to put back in the in-memory todo store `todoread` reads. When it
+/// changed the plan clients see, `event_stream` also announces it with a
+/// `TodoPlanRestored` event. `None` when the todo list is untouched.
 #[instrument(
     name = "undo.cleanup",
     skip(provider, event_journal, event_stream),
@@ -780,7 +789,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
     event_stream: Option<&querymt_agent_services::session_event_stream::SessionEventStream>,
     session_id: &str,
     current_run_id: Option<&str>,
-) -> Result<(), UndoError> {
+) -> Result<Option<Vec<TodoItem>>, UndoError> {
     let revert_state = provider
         .history_store()
         .peek_revert_state(session_id)
@@ -788,7 +797,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
         .map_err(|e| UndoError::Store(format!("Failed to get revert state: {}", e)))?;
 
     if revert_state.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Frames whose restore failed never committed an undo, so they must not
@@ -814,7 +823,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
             .clear_revert_states(session_id)
             .await
             .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
-        return Ok(());
+        return Ok(None);
     };
 
     let span = tracing::Span::current();
@@ -837,6 +846,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
     if let Some(stream) = event_stream {
         stream.flush().await;
     }
+    let mut todo_rewind = None;
     if let Ok(events) = event_journal
         .load_session_stream(session_id, None, None)
         .await
@@ -872,10 +882,21 @@ pub(crate) async fn cleanup_revert_on_prompt(
             {
                 Ok(n) => {
                     span.record("pruned_events", n);
+                    todo_rewind = TodoRewind::of_prune(&events, seq, run_start_seq);
                 }
                 Err(e) => warn!("Failed to prune event journal: {}", e),
             }
         }
+    }
+
+    // The stored plan was recomputed with the prune; tell live observers.
+    if let Some(rewind) = &todo_rewind
+        && rewind.plan_changed
+        && let Some(stream) = event_stream
+    {
+        stream.emit_ephemeral(AgentEventKind::TodoPlanRestored {
+            entries: rewind.entries.clone(),
+        });
     }
 
     provider
@@ -884,5 +905,62 @@ pub(crate) async fn cleanup_revert_on_prompt(
         .await
         .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
 
-    Ok(())
+    Ok(todo_rewind.map(|rewind| rewind.items))
+}
+
+/// How pruning the journal range `[from_seq, before_seq)` changes a session's
+/// todo list.
+struct TodoRewind {
+    /// The todo list that is current after the prune, for the todo store.
+    items: Vec<TodoItem>,
+    /// The plan clients see after the prune (`todo_plan_of`).
+    entries: Vec<querymt_agent_core::protocol::PlanEntry>,
+    /// Whether that plan differs from the one before the prune.
+    plan_changed: bool,
+}
+
+impl TodoRewind {
+    /// `None` when the prune leaves the last `todowrite` call as it was.
+    fn of_prune(events: &[DurableEvent], from_seq: i64, before_seq: Option<i64>) -> Option<Self> {
+        let pruned = |event: &DurableEvent| {
+            event.stream_seq >= from_seq && before_seq.is_none_or(|end| event.stream_seq < end)
+        };
+        let before = last_todo_write(events.iter());
+        let after = last_todo_write(events.iter().filter(|event| !pruned(event)));
+        if before == after {
+            return None;
+        }
+        let plan = |arguments: Option<&str>| {
+            arguments
+                .and_then(todo_entries_from_arguments)
+                .unwrap_or_default()
+        };
+        let (entries, previous) = (plan(after), plan(before));
+        Some(Self {
+            items: after
+                .and_then(todo_items_from_arguments)
+                .unwrap_or_default(),
+            plan_changed: entries != previous,
+            entries,
+        })
+    }
+}
+
+/// The arguments of the latest `todowrite` call among `events` that are a todo
+/// list: the call the session's current todo plan comes from.
+fn last_todo_write<'a>(
+    events: impl DoubleEndedIterator<Item = &'a DurableEvent>,
+) -> Option<&'a str> {
+    events.rev().find_map(|event| match &event.kind {
+        AgentEventKind::ToolCallStart { arguments, .. } if todo_plan_of(&event.kind).is_some() => {
+            Some(arguments.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// The todo items of a `todowrite` call, as the tool stores them.
+fn todo_items_from_arguments(arguments: &str) -> Option<Vec<TodoItem>> {
+    let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    serde_json::from_value(arguments.get("todos")?.clone()).ok()
 }
