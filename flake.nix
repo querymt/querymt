@@ -63,6 +63,7 @@
         commonInputs = with pkgs; [
           rustToolchain
           openssl
+          openspec
           cmake
           ninja
           gnumake
