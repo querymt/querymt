@@ -1,0 +1,5 @@
+User { text: "go", local: false }
+Tool { status: "completed", output: "", child: None }
+Thought("late")
+Agent("Done")
+Tool { status: "completed", output: "", child: None }

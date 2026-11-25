@@ -1,0 +1,1 @@
+Compaction { status: "completed", summary: "Summary text", before: None, after: None }
