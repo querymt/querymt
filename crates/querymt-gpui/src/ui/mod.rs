@@ -12,6 +12,7 @@ pub(crate) mod keys;
 pub(crate) mod kit;
 mod log_view;
 mod md;
+mod mermaid;
 mod mesh;
 pub(crate) mod model_picker;
 mod preview;

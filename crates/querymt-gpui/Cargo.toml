@@ -36,6 +36,7 @@ tracing = "0.1"
 iana-time-zone = "0.1"
 # Fuzzy, typo-tolerant matching behind every search box (src/search.rs).
 frizbee = "0.13"
+limu = "~0.2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dirs = "6"

@@ -4313,6 +4313,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "limu"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d772f75c00ace019ab37de5b2957fede57f4108050d64e27551246bcdb8ef06e"
+dependencies = [
+ "limu-scene",
+]
+
+[[package]]
+name = "limu-scene"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ef98422626b58004c49b1175cf428a2a99842a56f7687a8b15e51c55b7456c"
+
+[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6049,6 +6064,7 @@ dependencies = [
  "iana-time-zone",
  "interprocess",
  "js-sys",
+ "limu",
  "markdown",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",

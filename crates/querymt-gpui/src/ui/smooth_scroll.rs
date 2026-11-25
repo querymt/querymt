@@ -358,6 +358,15 @@ impl SmoothScroll {
             if state.borrow().injecting {
                 return;
             }
+            // Cmd/Ctrl+wheel is a zoom, not a scroll (Mermaid diagrams). It
+            // must reach its target untouched: replayed later, the modifiers
+            // held at that moment would decide what the rest of it does. A
+            // scroll tail already running is dropped so it does not carry on
+            // under the zoom.
+            if event.modifiers.platform || event.modifiers.control {
+                state.borrow_mut().reset_motion();
+                return;
+            }
             // Native precise scrolling takes over without adding a wheel tail.
             if event.delta.precise() || event.source != ScrollSource::Pointer {
                 state.borrow_mut().reset_motion();
@@ -748,6 +757,89 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(smooth.0.borrow().remaining, Default::default());
             assert_eq!(b.offset(), before);
+        })
+        .unwrap();
+    }
+
+    /// Mermaid zoom: a Cmd/Ctrl+wheel notch reaches its target as it is, not
+    /// swallowed and replayed as injected scroll steps; a plain notch is
+    /// still smoothed.
+    #[gpui_kit::test]
+    fn modifier_wheel_passes_through_untouched(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::{TestSupportExt as _, TestWindowExt as _};
+        use gpui_kit::{
+            AppContext as _, Context, InputEvent as _, InteractiveElement as _, IntoElement,
+            Modifiers, ParentElement as _, Render, ScrollDelta, ScrollEvent, Styled as _, Window,
+            div, px,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Fixture {
+            smooth: SmoothScroll,
+            seen: Rc<Cell<usize>>,
+        }
+        impl Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let seen = self.seen.clone();
+                div().size_full().child(self.smooth.element()).child(
+                    self.smooth.region(
+                        "area",
+                        div()
+                            .id("area")
+                            .test_support()
+                            .w(px(200.))
+                            .h(px(120.))
+                            .on_scroll(move |_, _, _| seen.set(seen.get() + 1)),
+                    ),
+                )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let smooth = SmoothScroll::default();
+        smooth.set_preset("smooth", "ease_out", "off");
+        let seen = Rc::new(Cell::new(0));
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| {
+                cx.new(|_| Fixture {
+                    smooth: smooth.clone(),
+                    seen: seen.clone(),
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("area", cx);
+            let position = window.find("area").bounds().center();
+            let notch = |modifiers| {
+                ScrollEvent {
+                    position,
+                    delta: ScrollDelta::Lines(gpui_kit::point(0., -3.)),
+                    modifiers,
+                    ..Default::default()
+                }
+                .to_platform_input()
+            };
+
+            // A plain notch is swallowed and smoothed.
+            window.dispatch_event(notch(Modifiers::default()), cx);
+            assert_eq!(seen.get(), 0, "a plain notch never reaches the target");
+            assert!(smooth.0.borrow().remaining.y < 0.);
+
+            // Cmd or Ctrl goes through untouched and drops the running tail.
+            for modifiers in [Modifiers::command(), Modifiers::control()] {
+                seen.set(0);
+                window.dispatch_event(notch(Modifiers::default()), cx);
+                window.dispatch_event(notch(modifiers), cx);
+                assert_eq!(seen.get(), 1, "{modifiers:?} reaches the target as it is");
+                assert_eq!(
+                    smooth.0.borrow().remaining,
+                    Default::default(),
+                    "{modifiers:?} is not turned into injected scroll steps"
+                );
+                window.render_frame(cx);
+                assert_eq!(smooth.0.borrow().remaining, Default::default());
+            }
         })
         .unwrap();
     }
