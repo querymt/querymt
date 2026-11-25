@@ -1,0 +1,143 @@
+{
+  "document": "knowledge/quick-panel.md",
+  "entries": {
+    "row:src/quick/activity.rs": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29"
+      },
+      "text": "sha256-v1:12d326daabf041cdf4c22a2a0699ce5852b52a12675c68e1b9161e9708ef3bab"
+    },
+    "row:src/quick/chrome/mod.rs": {
+      "dependencies": {
+        "src/quick/chrome/mod.rs": "sha256-v1:19e3292ad6171cf4b560acd43a73ecb03f59ed97aababe2529eb0c221fe74308"
+      },
+      "text": "sha256-v1:466e73500b3ac1b26e8f820d40e62823375f3192dccf27e0bcd8340d114fca94"
+    },
+    "row:src/quick/edge.rs": {
+      "dependencies": {
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8"
+      },
+      "text": "sha256-v1:2ab80c47bd449ee5f019517816a901726a42139595d82f9c86cd1052cab48bdc"
+    },
+    "row:src/quick/edge_plan.rs": {
+      "dependencies": {
+        "src/quick/edge_plan.rs": "sha256-v1:48e803990b9f6ace9455af8f49d2d6a069388fa58f0334cbba5767854d1a195d"
+      },
+      "text": "sha256-v1:2af3cb00ef304573d1a32bf63e31e1a125accad2b625afbdfa3680ac0b77382e"
+    },
+    "row:src/quick/hotkey.rs": {
+      "dependencies": {
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b"
+      },
+      "text": "sha256-v1:837a1f155de73e6203d6f3879a8e3fab790d3de8f9b4284cd2422062f1998728"
+    },
+    "row:src/quick/hud.rs": {
+      "dependencies": {
+        "src/quick/hud.rs": "sha256-v1:df23ad6caf5741edd461ab52a42f76359750c4f16acbe1ce3c4454ea4cb7b19b"
+      },
+      "text": "sha256-v1:c30c32647607a6ed92ae7530d2488c05eae9e101818850108e906777edf2c631"
+    },
+    "row:src/quick/instance.rs": {
+      "dependencies": {
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85"
+      },
+      "text": "sha256-v1:dc1ebb4824f4d9137da2e7f3292f85da026304319f3c041304fbb6d9a6bc6b64"
+    },
+    "row:src/quick/mod.rs": {
+      "dependencies": {
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da"
+      },
+      "text": "sha256-v1:4a37af8a8a91ea1514defd113086ef5f805c58387b7960498882f3b87ceaa910"
+    },
+    "row:src/quick/panel.rs": {
+      "dependencies": {
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:77cda26f6bad6baf5cc018628677fb964d0104167cbffdc4480f80bf0438fd31"
+    },
+    "row:src/quick/tray.rs": {
+      "dependencies": {
+        "src/quick/tray.rs": "sha256-v1:2b7e7c60e41b7f46078f07aeb885982ff04afda1073d05ea48a8dc4d5d5c3fff"
+      },
+      "text": "sha256-v1:81dfeb1da15ad35add850d9af749bb16deea577f509947ab95e8b297c462a40a"
+    },
+    "section:[\"Quick panel\",\"Files\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:21716c36f39ac6605c8240514eb832078a10fe47d51a89da46b5a56544d12cc5"
+    },
+    "section:[\"Quick panel\",\"Look and motion\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:75703c3dd8aabc1558f8d3df072e7709a67f690cfa0f504ed190e7d8656b2a02"
+    },
+    "section:[\"Quick panel\",\"Shortcut, instance, tray\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:2fcb1559d7a70c23e43c051aaa7fda935ac420e8f77b982237168a74fb2f8c19"
+    },
+    "section:[\"Quick panel\",\"State and lifetime\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:861a63c6ccb03e6ab4696461626b4f7f3ca20cef14f44760f23179b7628afd0c"
+    },
+    "section:[\"Quick panel\",\"Testing\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:7392a885a52e9270f35bdb5867f93d2ac0dbadffc393da3b995e6f514a0f42af"
+    },
+    "section:[\"Quick panel\",\"Windows per platform\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:63ffda6f84cf264440deeb99fc8f93644df3d72d72c2f294165d5003f389eed8"
+    },
+    "section:[\"Quick panel\"]": {
+      "dependencies": {
+        "src/quick/activity.rs": "sha256-v1:95f92595b5620a6f906f5924b7e4e397bc133867736e661e963aed4cc35a0d29",
+        "src/quick/edge.rs": "sha256-v1:45f33867a7dd9669a34fc02308a460a72616578e8cd0cb546e2a4f6ccd56edd8",
+        "src/quick/hotkey.rs": "sha256-v1:38b0e45aafd8b61719b09e106bd3b592d442fe31258697178005340aa32d160b",
+        "src/quick/instance.rs": "sha256-v1:4cfb3cabd2bbebcdbe5355b3acabeecdafc3356240d887e3c774f7eee9d95d85",
+        "src/quick/mod.rs": "sha256-v1:f0732897bce8e1343512cca39a29d2a3ab3cea2ef136489ee44eaa87719d20da",
+        "src/quick/panel.rs": "sha256-v1:3056bed372ff9d8b3996525bc2b357f01bd82b8c1a7b83ac481fc17de57d5143"
+      },
+      "text": "sha256-v1:1c42de857d957b53fbb473ff6b9b979894b6a14ed25f4fd7cc7928809617f492"
+    }
+  },
+  "version": 1
+}
