@@ -37,7 +37,7 @@ A successful `todowrite` SHALL return `success: true`, `total_todos`, and one co
 - **THEN** the result reports `total_todos: 4`, `pending: 1`, `in_progress: 2`, `completed: 0`, `cancelled: 1`
 
 ### Requirement: Deleting a session discards its todo list
-When a session is deleted, QueryMT SHALL discard that session's todo list. Todo lists SHALL NOT be retained for sessions that no longer exist.
+When a session is deleted, QueryMT SHALL discard that session's todo list, including the persisted todo plan that `session/list` reports. Todo lists SHALL NOT be retained for sessions that no longer exist.
 
 #### Scenario: Recreated session id starts with an empty list
 - **WHEN** a session writes todos, is deleted, and a session with the same id later calls `todoread`

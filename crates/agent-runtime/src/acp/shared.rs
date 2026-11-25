@@ -917,6 +917,41 @@ pub async fn current_session_observations(
     (notifications, updates)
 }
 
+/// Plan updates, as `(session id, update)`, that bring a lagged connection's
+/// view of `session_ids` in line with the stored plans. Lag can drop the
+/// ephemeral rewind hint, which no journal recovery brings back; the stored
+/// plan is always current. Yields nothing when the store cannot report plans.
+pub async fn reconcile_session_plans(
+    agent: &AgentHandle,
+    session_ids: &[String],
+    translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+) -> Vec<(String, SessionUpdate)> {
+    let Some(view_store) = agent.config.storage.view_store() else {
+        return Vec::new();
+    };
+    let mut stored = match view_store.get_session_todo_plans(session_ids).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::debug!(%error, "cannot reconcile todo plans after lag");
+            return Vec::new();
+        }
+    };
+    let mut translator = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut updates = Vec::new();
+    for session_id in session_ids {
+        let plan = stored.remove(session_id).unwrap_or_default();
+        updates.extend(
+            translator
+                .reconcile_todo_plan(session_id, plan)
+                .into_iter()
+                .map(|update| (session_id.clone(), update)),
+        );
+    }
+    updates
+}
+
 pub fn delegation_update_notification(
     payload: crate::control::delegation_notifications::DelegationUpdateNotification,
 ) -> serde_json::Value {
@@ -2551,6 +2586,19 @@ impl AcpLiveEventTranslator {
         session_id: &str,
         events: &[AgentEvent],
     ) -> Vec<DelegationUpdateNotification> {
+        // Replay sends the plan the history ends with, so the connection holds
+        // it. Remember that: a later emptied list must remove it, and an
+        // unchanged one need not be announced again. A value observed live
+        // is newer than history and stays.
+        if let Some(entries) = events
+            .iter()
+            .rev()
+            .find_map(|event| querymt_agent_core::replay::todo_plan_of(&event.kind))
+        {
+            self.announced_plans
+                .entry(session_id.to_owned())
+                .or_insert(entries);
+        }
         let previous: HashMap<_, _> = self
             .delegation_updates
             .snapshots()
@@ -3294,6 +3342,23 @@ impl AcpLiveEventTranslator {
     /// explicitly-dismissed one. Every session update that follows a todowrite
     /// also carries the `querymt/plans` metadata patch, unless this connection
     /// was already told these plans.
+    /// Bring this connection's view of a session's plan in line with the
+    /// stored plan, after events may have been lost (a lagged stream drops
+    /// the ephemeral rewind hint). Nothing is sent when the connection already
+    /// has the stored plan, or the session has none and none was announced.
+    pub(crate) fn reconcile_todo_plan(
+        &mut self,
+        session_id: &str,
+        stored: Vec<crate::acp::protocol::PlanEntry>,
+    ) -> Vec<SessionUpdate> {
+        match self.announced_plans.get(session_id) {
+            Some(announced) if *announced == stored => return Vec::new(),
+            None if stored.is_empty() => return Vec::new(),
+            _ => {}
+        }
+        self.translate_todo_updates(session_id, Some(stored))
+    }
+
     fn translate_todo_updates(
         &mut self,
         session_id: &str,
@@ -10338,6 +10403,104 @@ mod session_update_tests {
         let args = todo_args(&[("a", "pending")]);
         translator.translate_updates(&todo_start(&args));
         assert!(plans_patches(&translator.translate_updates(&plan_restored(2, &args))).is_empty());
+    }
+
+    fn todo_history(seq: i64, args: &str) -> AgentEvent {
+        agent_event(
+            seq,
+            AgentEventKind::ToolCallStart {
+                tool_call_id: format!("tc-{seq}"),
+                tool_name: "todowrite".to_string(),
+                arguments: args.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn plan_replayed_from_history_is_removed_when_the_list_is_emptied() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.seed_history("s-1", &[todo_history(1, &todo_args(&[("a", "pending")]))]);
+
+        let updates = translator.translate_updates(&todo_start(&todo_args(&[])));
+        assert!(matches!(
+            plans_patch_removed(updates).as_slice(),
+            [SessionUpdate::PlanRemoved(_)]
+        ));
+    }
+
+    #[test]
+    fn history_ending_with_an_emptied_list_has_no_plan_to_remove_or_patch() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.seed_history(
+            "s-1",
+            &[
+                todo_history(1, &todo_args(&[("a", "pending")])),
+                todo_history(2, &todo_args(&[])),
+            ],
+        );
+
+        let updates = translator.translate_updates(&todo_start(&todo_args(&[])));
+        assert!(updates.is_empty(), "{updates:?}");
+    }
+
+    #[test]
+    fn seeding_history_keeps_a_plan_already_observed_live() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let live = todo_args(&[("live", "pending")]);
+        translator.translate_updates(&todo_start(&live));
+        translator.seed_history("s-1", &[todo_history(1, &todo_args(&[("old", "pending")]))]);
+
+        assert!(
+            plans_patches(&translator.translate_updates(&todo_start(&live))).is_empty(),
+            "the live plan is still the announced one"
+        );
+    }
+
+    #[test]
+    fn reconcile_announces_a_changed_plan_and_nothing_else() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let entries = |items: &[(&str, &str)]| {
+            querymt_agent_core::replay::todo_entries_from_arguments(&todo_args(items)).unwrap()
+        };
+        translator.translate_updates(&todo_start(&todo_args(&[
+            ("a", "completed"),
+            ("b", "pending"),
+        ])));
+
+        // The plan was rewound while the connection lagged.
+        let rewound = translator.reconcile_todo_plan("s-1", entries(&[("a", "completed")]));
+        assert_eq!(plans_patches(&rewound).len(), 1, "{rewound:?}");
+        assert!(matches!(
+            plans_patch_removed(rewound).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        assert!(
+            translator
+                .reconcile_todo_plan("s-1", entries(&[("a", "completed")]))
+                .is_empty(),
+            "an unchanged plan is not announced again"
+        );
+
+        let emptied = translator.reconcile_todo_plan("s-1", Vec::new());
+        assert_eq!(
+            plans_patches(&emptied)[0]["_meta"],
+            serde_json::json!({ "querymt/plans": null })
+        );
+        assert!(matches!(
+            plans_patch_removed(emptied).as_slice(),
+            [SessionUpdate::PlanRemoved(_)]
+        ));
+    }
+
+    #[test]
+    fn reconcile_says_nothing_for_a_session_without_a_plan() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        assert!(translator.reconcile_todo_plan("s-1", Vec::new()).is_empty());
     }
 
     // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────

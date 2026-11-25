@@ -278,25 +278,10 @@ impl LocalAgentHandle {
         change: &RosterChange,
         profile_id: Option<&str>,
     ) {
-        let params = RosterChanged::of(change, profile_id);
-        let raw = match serde_json::value::to_raw_value(&params) {
-            Ok(raw) => raw,
-            Err(error) => {
-                log::warn!("Failed to encode agents-changed notification: {error}");
-                return;
-            }
-        };
-        let notification = crate::acp::protocol::ExtNotification::new(
+        self.notify_all_clients(
             crate::acp::shared::QMT_NOTIFICATION_AGENTS_CHANGED,
-            Arc::from(raw),
-        );
-        self.broadcast_ext_notification(notification.clone());
-
-        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-        if let Some(bridge) = bridge
-            && let Err(error) = bridge.notify_ext(notification).await
-        {
-            log::warn!("Failed to send agents-changed notification: {error}");
-        }
+            &RosterChanged::of(change, profile_id),
+        )
+        .await;
     }
 }

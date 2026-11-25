@@ -100,7 +100,10 @@
   the prompt after an undo starts) restores the earlier plan and announces it
   the same way, through the new transient event
   `AgentEventKind::TodoPlanRestored`, and `todoread` returns the restored
-  list. New field `SessionListItem::todo_plan`; new typeshare type
+  list. A connection that loaded a session by replay is sent `plan_removed`
+  when the list is later emptied, and a connection that falls behind the event
+  stream catches up from the stored plans (new `ViewStore::get_session_todo_plans`,
+  default unsupported). New field `SessionListItem::todo_plan`; new typeshare type
   `SessionPlansChangedNotification` (follow-up for querymt-desktop). Clients
   that ignore unknown `_meta` keys and notifications are unaffected.
 

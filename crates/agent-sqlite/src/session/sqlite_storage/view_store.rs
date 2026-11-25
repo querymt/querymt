@@ -1802,6 +1802,18 @@ impl ViewStore for SqliteStorage {
     ) -> SessionResult<HashMap<String, SessionLifecycle>> {
         SessionStore::get_session_lifecycles(self, session_ids).await
     }
+
+    async fn get_session_todo_plans(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, Vec<querymt_agent_core::protocol::PlanEntry>>> {
+        let session_ids = session_ids.to_vec();
+        Ok(super::blocking::with_conn_sqlite(&self.conn, move |conn| {
+            let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+            load_todo_plans(conn, &ids)
+        })
+        .await?)
+    }
 }
 
 // ============================================================================

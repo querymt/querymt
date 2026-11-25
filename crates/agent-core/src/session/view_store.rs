@@ -133,6 +133,19 @@ pub trait ViewStore: Send + Sync {
         ))
     }
 
+    /// Current todo plan of each listed session, keyed by session id. A
+    /// session without a plan (never had one, or emptied it) is absent from
+    /// the map. An `Err` means the store cannot say, which callers must not
+    /// read as "no plans".
+    async fn get_session_todo_plans(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, Vec<crate::protocol::PlanEntry>>> {
+        Err(SessionError::InvalidOperation(
+            "Session todo plans are unsupported by this view store".into(),
+        ))
+    }
+
     /// Lifecycle-aware variant of [`ViewStore::get_session_list_view`].
     async fn get_session_list_view_with_lifecycle(
         &self,

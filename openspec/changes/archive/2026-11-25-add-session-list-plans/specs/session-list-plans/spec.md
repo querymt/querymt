@@ -95,6 +95,28 @@ When the next prompt after an undo removes the session's last `todowrite` from i
 - **WHEN** a turn without a `todowrite` is undone and a new prompt starts
 - **THEN** no `querymt/session/plansChanged` notification is sent and the plan is as before
 
+### Requirement: A replayed plan is removed when the list is emptied
+A connection that loaded a session by replay holds the plan the history ends with. When the list is later emptied, QueryMT SHALL send that connection `plan_removed`, as it does for a plan it announced live.
+
+#### Scenario: Emptying the list after a load
+- **WHEN** a plan-operations client loads a session whose last `todowrite` has items, and a later `todowrite` empties the list
+- **THEN** the client receives `plan_removed` for the `querymt-todos` plan
+
+#### Scenario: History that ends with an emptied list
+- **WHEN** a client loads a session whose last `todowrite` emptied the list, and a later `todowrite` empties it again
+- **THEN** the client receives no `plan_removed` and no metadata patch
+
+### Requirement: A connection that fell behind catches up
+When a connection falls behind the agent's event stream, QueryMT SHALL compare the stored plans of the sessions it holds a plan for with what it announced, and announce the ones that differ. If the store cannot report plans, the connection SHALL forget what it announced instead.
+
+#### Scenario: Plan changed during the lag
+- **WHEN** a connection that announced a session's plan falls behind and the stored plan changes meanwhile
+- **THEN** it receives one `plansChanged` with the stored plan and none for the plans in between
+
+#### Scenario: Plan emptied during the lag
+- **WHEN** a connection that announced a plan falls behind and the list is emptied meanwhile
+- **THEN** it receives `plansChanged` with `plans: []`
+
 ### Requirement: A rewind restores the in-memory todo list
 When the next prompt after an undo removes the session's last `todowrite` from its history, the list `todoread` returns SHALL become the list of the last remaining `todowrite` (empty when none remains), whether or not the plan clients see changed.
 

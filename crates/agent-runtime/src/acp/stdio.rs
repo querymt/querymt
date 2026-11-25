@@ -1174,6 +1174,26 @@ fn spawn_event_bridge_forwarder(
                     if closed {
                         break;
                     }
+                    // A lagged stream also drops the ephemeral rewind hint;
+                    // the stored plans say what the connection missed.
+                    for (session_id, update) in
+                        crate::acp::shared::reconcile_session_plans(&agent, &ids, &translator).await
+                    {
+                        if bridge
+                            .notify(SessionNotification::new(
+                                SessionId::from(session_id),
+                                update,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if closed {
+                        break;
+                    }
                 }
             }
         }
@@ -1287,6 +1307,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     let plans_announcer = tokio::spawn(crate::control::notifications::announce_session_plans(
         agent.config.event_sink.fanout().subscribe(),
         tokio_util::sync::CancellationToken::new(),
+        agent.config.storage.view_store(),
         {
             let bridge = bridge_sender.clone();
             move |notification| {
