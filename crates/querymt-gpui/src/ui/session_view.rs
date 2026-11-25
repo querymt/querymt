@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
-use super::md;
+use super::{find, md};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::clipboard::Clipboard;
@@ -259,7 +259,7 @@ pub struct Transcript {
     /// Previous frame's telemetry sample (only used while export is on).
     probe: Rc<RefCell<ScrollProbe>>,
     /// Parsed Markdown of the rows, kept while they are off screen.
-    md: md::Kept,
+    pub(super) md: md::Kept,
 }
 
 /// Last transcript frame seen by the telemetry sampler.
@@ -714,6 +714,17 @@ impl Transcript {
         }
         self.sigs = sigs;
         self.keys = keys;
+    }
+
+    /// Index, in the view's items, of the item at the top of the viewport.
+    pub(super) fn top_item(&self) -> usize {
+        let row = self.list.logical_scroll_top().item_ix;
+        self.items.borrow().get(row).map_or(0, |r| r.ix)
+    }
+
+    /// The first list row of the item `key`.
+    pub(super) fn row_of_item(&self, key: &str) -> Option<usize> {
+        self.items.borrow().iter().position(|r| r.item.key == key)
     }
 
     /// Tail-following stops when the user scrolls up and re-engages at the
@@ -3237,13 +3248,12 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             // Front matter (often from automated messages) stays out of the
             // bubble; a toggle beside Copy shows it as YAML.
             // The toggle is a developer tool (desktop `SessionTurn`).
-            let (front, body) = match crate::util::split_front_matter(text) {
-                Some((front, body)) => (rc.developer.then_some(front), body),
-                None => (None, text.as_str()),
-            };
+            let front = crate::util::split_front_matter(text)
+                .and_then(|(front, _)| rc.developer.then_some(front));
             let fm_key = front_matter_key(&item.key);
             let fm_open = front.is_some() && rc.expanded.contains(&fm_key);
-            let text = body.trim().to_string();
+            // The same text find searches (`find::views_of`).
+            let text = find::user_body(text).to_string();
             v_flex()
                 .group(group.clone())
                 .w_full()
@@ -3311,7 +3321,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                                             !text.is_empty(),
                                             |el| {
                                                 el.min_w_0().child(rc.md.markdown(
-                                                    format!("umd-{}", item.key),
+                                                    find::user_view_id(&item.key),
                                                     text.clone(),
                                                     p,
                                                 ))
@@ -3421,7 +3431,7 @@ fn agent_message(
         .when(rc.density.hover_actions(), |el| el.group(turn_group(ix)))
         .child(
             rc.md
-                .markdown(format!("md-{}", item.key), text.to_owned(), &rc.p)
+                .markdown(find::reply_view_id(&item.key), text.to_owned(), &rc.p)
                 .motion(md::stream_motion(rc.stream_fade)),
         )
         .when_some(actions, |el, stats| {
@@ -5503,6 +5513,7 @@ impl SessionPane {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = self.palette(cx);
+        let find_bar = self.find_bar(&p, cx);
         let store = self.store.read(cx);
         let Some(session) = self.session.clone() else {
             return div().into_any_element();
@@ -5843,7 +5854,9 @@ impl SessionPane {
                                                 ))
                                         },
                                     ),
-                                ),
+                                )
+                                // Over the fade, so nothing covers it.
+                                .when_some(find_bar, |el, bar| el.child(bar)),
                         ),
                 )
                 .into_any_element()
@@ -7381,5 +7394,64 @@ mod more_lines_tests {
         assert_eq!(clipped(text, 4), "a\nb\nc\nd");
         assert_eq!(clipped(text, usize::MAX), "a\nb\nc\nd");
         assert_eq!(clipped("one", 1), "one");
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use serde_json::json;
+
+    use super::super::find;
+    use super::super::session_pane::{SessionPane, open_pane_for_test};
+    use crate::session::SessionView;
+
+    /// A user message with front matter, then a reply.
+    fn conversation() -> SessionView {
+        let mut view = SessionView::new("test-agent", "s", "/w", "find");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text",
+                "text": "---\nsource: cron\n---\n\n  check the **token**  \n" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "agent_message_chunk", "messageId": "a1",
+            "content": { "type": "text", "text": "the token is *fine*" } }),
+        );
+        view
+    }
+
+    fn open(
+        cx: &mut gpui_kit::TestAppContext,
+        view: SessionView,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<SessionPane>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, pane) =
+            open_pane_for_test(cx, crate::store::automations::schedule_ui_fixture(), view);
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        (handle, pane)
+    }
+
+    // add-session-find: the index reads what the renderers build.
+    #[gpui_kit::test]
+    fn views_of_matches_what_the_rows_build(cx: &mut gpui_kit::TestAppContext) {
+        let (_handle, pane) = open(cx, conversation());
+        let (mut built, mut expected) = cx.update(|cx| {
+            let pane = pane.read(cx);
+            let items = &pane.view(cx).expect("a session").items;
+            let expected: Vec<(String, String)> = items.iter().flat_map(find::views_of).collect();
+            (pane.transcript.md.built(), expected)
+        });
+        built.sort();
+        expected.sort();
+        assert_eq!(expected.len(), 2, "a user message and a reply");
+        assert_eq!(built, expected);
+        let user = expected.iter().find(|(id, _)| id == "umd-user-u1").unwrap();
+        assert_eq!(user.1, "check the **token**", "front matter is split off");
     }
 }

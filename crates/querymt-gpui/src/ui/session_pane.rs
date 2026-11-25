@@ -77,6 +77,8 @@ pub(crate) struct SessionPane {
     pub(super) back: Vec<SessionRef>,
     pub(super) prompt: Entity<TextareaState>,
     pub(super) transcript: Transcript,
+    /// The find bar over the transcript, while it is open.
+    pub(super) find: Option<super::find::FindBar>,
     pub(super) attachments: Vec<Attachment>,
     pub(super) attach_error: Option<String>,
     pub(super) options_open: bool,
@@ -163,6 +165,7 @@ impl SessionPane {
             back: Vec::new(),
             prompt,
             transcript: Transcript::new(),
+            find: None,
             attachments: Vec::new(),
             attach_error: None,
             options_open: false,
@@ -333,7 +336,11 @@ impl SessionPane {
     /// Show `session`, keeping the back stack.
     pub(crate) fn show(&mut self, session: Entity<OpenSession>, cx: &mut Context<Self>) {
         self.close_panels();
-        self._session = Some(cx.observe(&session, |_, _, cx| cx.notify()));
+        self.close_find(cx);
+        self._session = Some(cx.observe(&session, |this, _, cx| {
+            this.sync_find(cx);
+            cx.notify()
+        }));
         self.session = Some(session);
         cx.notify();
     }
@@ -341,6 +348,7 @@ impl SessionPane {
     /// Show nothing; the session closes when no other surface holds it.
     pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
         self.close_panels();
+        self.close_find(cx);
         self._session = None;
         self.session = None;
         self.back.clear();
