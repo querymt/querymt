@@ -4,6 +4,11 @@
 //! tracks the app focus handle so they work even when no control is focused.
 //! Text inputs keep their own bindings (their context is deeper), so Ctrl/Cmd+Z
 //! edits text while typing and undoes the workspace elsewhere.
+//!
+//! Shortcuts (Cmd on macOS, Ctrl elsewhere): N new session, P command
+//! palette, B sidebar, Z / Shift+Z undo / redo, M model picker, T reasoning,
+//! 1 to 0 sidebar sessions, F find in the open session. O and K belong to the
+//! quick panel.
 
 use std::rc::Rc;
 
@@ -29,6 +34,7 @@ gpui_kit::actions!(
         CycleReasoning,
         ChooseFolder,
         ToggleSessionList,
+        FindInSession,
     ]
 );
 
@@ -65,6 +71,9 @@ pub fn bind_keys(cx: &mut App) {
         // Handled by the quick panel only; the main window ignores it. A
         // future main-window use of this key needs a key context on one side.
         KeyBinding::new(k("cmd-k", "ctrl-k"), ToggleSessionList, None),
+        // Find in the open session (main window only). A composer input is
+        // not searchable, so its own `cmd-f` binding propagates to this one.
+        KeyBinding::new(k("cmd-f", "ctrl-f"), FindInSession, None),
     ];
     let digits = if mac { DIGITS_CMD } else { DIGITS_CTRL };
     bindings.extend(
@@ -222,6 +231,11 @@ impl QmtApp {
             }
         }))
         .on_action(cx.listener(|this, _: &CycleReasoning, _, cx| this.cycle_reasoning(cx)))
+        .on_action(cx.listener(|this, _: &FindInSession, window, cx| {
+            if this.page == Page::Session && !this.palette_open {
+                this.pane.update(cx, |pane, cx| pane.open_find(window, cx));
+            }
+        }))
     }
 
     /// Ctrl/Cmd+T: next reasoning effort, for the open session or new sessions.

@@ -2,7 +2,7 @@
 id: gpui-ui
 title: UI shell, pages and the session pane
 description: How the main window is put together (QmtApp, pages, sidebar, modals), how one SessionPane renders a session in both the main window and the quick panel (density, RenderCtx, row cache), and the shared pieces (model picker, keys, palette, fuzzy search).
-tags: ui, gpui, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
+tags: ui, gpui, find, search in session, cmd-f, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
 knowledge_paths: ["src/ui/**", "src/theme.rs", "src/search.rs"]
 knowledge_sources: ["src/ui/mod.rs", "src/ui/session_pane.rs", "src/ui/model_picker.rs", "src/ui/keys.rs#bind_keys"]
 ---
@@ -124,6 +124,63 @@ Closed `mermaid` fences in transcript Markdown are drawn as diagrams (spec:
 - **Find**: a diagram's text is its body (`.text(body)`), so `add-session-find` counts matches
   in it but cannot paint highlights inside the card.
 
+## Find in session
+
+Cmd+F (Ctrl+F elsewhere) opens a find bar over the main window's transcript (OpenSpec change
+`add-session-find`; "design Dn" below is that change's `design.md`). Tier 1 searches user messages and agent replies. Tier 2 (reasoning, tool output,
+auto-expansion) is not built yet.
+
+Two layers, because the transcript is virtualized and rows outside the viewport have no
+elements (D1):
+
+- **Data** (`src/ui/find.rs`): `FindIndex` counts and orders matches from the session's
+  `Item`s without building any element. `views_of(item)` lists the Markdown views an item
+  shows (`umd-{key}` for a user message with front matter split off and trimmed, `md-{key}`
+  for a reply) and the row renderers take their ids and text from the same helpers
+  (`user_view_id`, `reply_view_id`, `user_body`), so search cannot drift from rendering (D2).
+  `searchable_text` rebuilds `TextViewState::rendered_text()` from the Markdown tree (soft
+  breaks become spaces, inline tags vanish, tables and Mermaid keep their source because they
+  are custom blocks); a corpus test in `md.rs` renders fixtures and requires equal match
+  counts. `FindIndex` caches each item's `(rev, counts)`, so a streaming notify re-reads only
+  the item whose `rev` changed (D3). The current match is a `FindMatch { item_key, view_id,
+  occurrence }`, found again after every recompute; if it is gone the next match in order
+  takes over.
+- **Paint** (`src/ui/md.rs`): `Kept::set_find` holds a `FindQuery` (query, current match,
+  two accent alphas). `Kept::state` runs the same `Matcher` over a built view's
+  `rendered_text()` and calls `set_range_highlights` and `reveal_range`. A per-view stamp
+  (find generation, `RenderedText`) makes this idempotent, so render never notifies in a
+  loop. A missing occurrence paints without a current match and reveals the first one (D2).
+  Tables and Mermaid blocks are counted but not painted (gpui-base leaves custom blocks
+  unpainted); the reveal still scrolls to them.
+
+The matcher (`Matcher`, `match_ranges`) is a case-insensitive literal match. A whitespace run
+in the query matches spaces and tabs, never a newline, so a match stays in one block. Case
+folding is per char with a byte map back into the text, so offsets stay on char boundaries.
+
+The bar and its state live on `SessionPane` (`find: Option<FindBar>`, in `find.rs`):
+
+- **Keys** (D5): `FindInSession` in `keys.rs` is bound to `cmd-f` / `ctrl-f` with no context.
+  `QmtApp` handles it only for `Page::Session` with the palette closed. The composer is not
+  searchable, so gpui-base's `Input` binding for the same key propagates to it. The quick
+  panel's root does not handle the action, so the shortcut does nothing there.
+- **Bar**: a popover-class surface (`popover` fill, hairline, overlay shadow) at the
+  transcript's top right, with the query `Input`, `n of m` / `No results`, previous, next and
+  close buttons (ids `find-bar`, `find-label`, `find-prev`, `find-next`, `find-close`). The
+  arrows are disabled with no matches. Enter and Shift+Enter step (`InputEvent::PressEnter {
+  shift }`). Enter also reports a `Change` with the text unchanged, so `find_query_changed`
+  ignores a change that does not alter the query.
+- **Navigation** (D4): `scroll_to_reveal_item` for the current match's row, then
+  `pause_following_tail`; the highlight pass reveals the line inside a tall reply. On a query
+  change the current match is the first one at or below the item at the viewport's top (else
+  the first overall). Typing therefore picks a match near the reading position, and a
+  transcript that is following its tail starts from the first match overall.
+- **Closing**: the bar's `capture_action(Escape)` closes it and stops the key, so the app's
+  double-Escape tracker in `mod.rs` never counts that press. Closing clears every highlight
+  (`Kept::set_find(None)`), keeps the scroll position and returns focus to the composer, or
+  blurs the window when the session takes no input. `SessionPane::show` and `clear` close it.
+- **Streaming**: the pane's session observer calls `sync_find`, which only runs while the bar
+  is open and never scrolls.
+
 ## Shared pieces
 
 - **Model picker** (`src/ui/model_picker.rs`): one `ModelPicker` entity for the main
@@ -158,7 +215,8 @@ Closed `mermaid` fences in transcript Markdown are drawn as diagrams (spec:
 | `../src/ui/model_picker.rs` | Shared model picker with reasoning effort. |
 | `../src/ui/keys.rs` | Key bindings and the command palette. |
 | `../src/ui/kit.rs` | Small shared presentational helpers. |
-| `../src/ui/md.rs` | Transcript Markdown: styling, code and table cards, the Mermaid card, `Kept`. |
+| `../src/ui/md.rs` | Transcript Markdown: styling, code and table cards, the Mermaid card, `Kept` (and its find highlights). |
+| `../src/ui/find.rs` | Find in session: matcher, searchable text, `FindIndex`, and the find bar on `SessionPane`. |
 | `../src/ui/mermaid.rs` | Mermaid layout cache, `DiagramElement` (fit, zoom, pan), viewport maths, palette look; `mermaid/paint.rs` and `svg.rs` paint limu scenes with GPUI. |
 
 Related: [quick-panel.md](quick-panel.md) for the compact surface.

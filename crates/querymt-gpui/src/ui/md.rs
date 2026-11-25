@@ -13,14 +13,15 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::component::text::{
-    MarkdownNode, TextView, TextViewMotion, TextViewState, TextViewStyle, markdown_ast,
+    MarkdownNode, RangeHighlight, RenderedText, TextView, TextViewMotion, TextViewState,
+    TextViewStyle, markdown_ast,
 };
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
-use super::{kit, mermaid};
+use super::{find, kit, mermaid};
 use crate::theme::Palette;
 
 /// Name of the custom markdown block that wraps tables (adds a copy button).
@@ -242,10 +243,54 @@ struct KeptInner {
     row: Option<String>,
     /// Mermaid blocks shown as source (survives rows being rebuilt).
     sources: SourceShown,
+    /// The find in session query painted into every view, while find is open.
+    find: Option<FindQuery>,
+    /// Bumped whenever `find` changes, so views repaint their highlights.
+    find_generation: u64,
+}
+
+/// What find in session paints into the kept views (design D1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FindQuery {
+    pub text: String,
+    /// The current match: the view and which occurrence in its text.
+    pub current: Option<(String, usize)>,
+    /// Background of the other matches.
+    pub weak: Hsla,
+    /// Background of the current match.
+    pub strong: Hsla,
+}
+
+impl FindQuery {
+    /// The two highlight colours of `p`: the accent at low and at higher
+    /// alpha, so text stays readable in both themes (design D5).
+    pub fn new(text: impl Into<String>, current: Option<(String, usize)>, p: &Palette) -> Self {
+        Self {
+            text: text.into(),
+            current,
+            weak: p.accent.opacity(0.28),
+            strong: p.accent.opacity(0.62),
+        }
+    }
+}
+
+/// When a view last painted find: the generation of the query and the
+/// rendered text it searched.
+#[derive(PartialEq)]
+struct FindStamp {
+    generation: u64,
+    text: RenderedText,
 }
 
 struct KeptView {
     state: Entity<TextViewState>,
+    stamp: Option<FindStamp>,
+    /// Ranges last handed to the view and whether each is the current match
+    /// (tests read what was painted).
+    #[cfg(test)]
+    painted: Vec<(std::ops::Range<usize>, bool)>,
+    #[cfg(test)]
+    paints: usize,
     text: SharedString,
     /// Set while the list was told the row is not ready; the next parse
     /// commit then asks for a frame so the list measures the row again.
@@ -329,7 +374,166 @@ impl Kept {
         }
     }
 
+    /// Paint `query` into every view, or remove every highlight with
+    /// `None`. Views that are not built are painted when they are.
+    pub fn set_find(&self, query: Option<FindQuery>, cx: &mut App) {
+        let clear: Vec<Entity<TextViewState>> = {
+            let mut inner = self.0.borrow_mut();
+            if inner.find == query {
+                return;
+            }
+            inner.find_generation += 1;
+            let clearing = query.is_none();
+            inner.find = query;
+            if !clearing {
+                return;
+            }
+            inner
+                .views
+                .values_mut()
+                .filter_map(|view| {
+                    #[cfg(test)]
+                    view.painted.clear();
+                    view.stamp.take().map(|_| view.state.clone())
+                })
+                .collect()
+        };
+        for state in clear {
+            state.update(cx, |state, cx| state.clear_range_highlights(cx));
+        }
+    }
+
+    /// The query being painted (tests).
+    #[cfg(test)]
+    pub fn find(&self) -> Option<FindQuery> {
+        self.0.borrow().find.clone()
+    }
+
+    /// How many times view `id` was handed highlights, each of which
+    /// notifies it (tests).
+    #[cfg(test)]
+    pub fn paints(&self, id: &str) -> usize {
+        self.0.borrow().views.get(id).map_or(0, |v| v.paints)
+    }
+
+    /// Highlights `id` last painted, as `(range, is current)` (tests).
+    #[cfg(test)]
+    pub fn painted(&self, id: &str) -> Vec<(std::ops::Range<usize>, bool)> {
+        self.0
+            .borrow()
+            .views
+            .get(id)
+            .map(|v| v.painted.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every kept view as `(id, text)` (tests).
+    #[cfg(test)]
+    pub fn built(&self) -> Vec<(String, String)> {
+        let mut views: Vec<_> = self
+            .0
+            .borrow()
+            .views
+            .iter()
+            .map(|(id, v)| (id.clone(), v.text.to_string()))
+            .collect();
+        views.sort();
+        views
+    }
+
+    /// The text view `id` renders (tests).
+    #[cfg(test)]
+    pub fn rendered(&self, id: &str, cx: &App) -> Option<String> {
+        let state = self.0.borrow().views.get(id)?.state.clone();
+        Some(state.read(cx).rendered_text().as_str().to_string())
+    }
+
+    /// Highlight the matches of the find query in view `id` and reveal the
+    /// current one. A view paints once per query, current match and text
+    /// revision, so rendering it again does not notify it again.
+    fn paint_find(&self, id: &str, state: &Entity<TextViewState>, cx: &mut App) {
+        let (query, generation) = {
+            let inner = self.0.borrow();
+            let Some(query) = inner.find.clone() else {
+                return;
+            };
+            (query, inner.find_generation)
+        };
+        let rendered = state.read(cx).rendered_text();
+        let stamp = FindStamp {
+            generation,
+            text: rendered.clone(),
+        };
+        if self
+            .0
+            .borrow()
+            .views
+            .get(id)
+            .is_none_or(|view| view.stamp.as_ref() == Some(&stamp))
+        {
+            return;
+        }
+        let ranges = find::Matcher::new(&query.text)
+            .map(|m| m.ranges(rendered.as_str()))
+            .unwrap_or_default();
+        let wanted = query
+            .current
+            .as_ref()
+            .filter(|(view, _)| view == id)
+            .map(|(_, k)| *k);
+        // An occurrence the rendered text does not have (the index and the
+        // view disagree) paints without a current match and reveals the
+        // first one (design D2).
+        let current = wanted.filter(|k| *k < ranges.len());
+        let reveal = match wanted {
+            Some(_) => current.or(Some(0)).and_then(|k| ranges.get(k).cloned()),
+            None => None,
+        };
+        let highlights: Vec<RangeHighlight> = ranges
+            .iter()
+            .enumerate()
+            .map(|(k, range)| {
+                let colour = if Some(k) == current {
+                    query.strong
+                } else {
+                    query.weak
+                };
+                RangeHighlight::new(range.clone(), colour)
+            })
+            .collect();
+        let applied = state.update(cx, |state, cx| {
+            let ok = state.set_range_highlights(highlights, cx).is_ok();
+            if ok && let Some(range) = reveal {
+                let _ = state.reveal_range(range, cx);
+            }
+            ok
+        });
+        if let Some(view) = self.0.borrow_mut().views.get_mut(id) {
+            // A rejected set is retried when the text next changes.
+            view.stamp = applied.then_some(stamp);
+            #[cfg(test)]
+            {
+                view.paints += 1;
+                view.painted = if applied {
+                    ranges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, r)| (r, Some(k) == current))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+    }
+
     fn state(&self, id: &str, text: &SharedString, cx: &mut App) -> Entity<TextViewState> {
+        let state = self.resolve(id, text, cx);
+        self.paint_find(id, &state, cx);
+        state
+    }
+
+    fn resolve(&self, id: &str, text: &SharedString, cx: &mut App) -> Entity<TextViewState> {
         let existing = self.0.borrow_mut().views.get_mut(id).map(|view| {
             let same = view.text.as_ptr() == text.as_ptr() && view.text.len() == text.len();
             let changed = !same && view.text != *text;
@@ -358,6 +562,11 @@ impl Kept {
             id.to_string(),
             KeptView {
                 state: state.clone(),
+                stamp: None,
+                #[cfg(test)]
+                painted: Vec::new(),
+                #[cfg(test)]
+                paints: 0,
                 text: text.clone(),
                 awaited,
                 _observe: observe,
@@ -1775,5 +1984,176 @@ mod tests {
         assert_eq!(code_lang(None), DEFAULT_LANG);
         assert_eq!(code_lang(Some("  ")), DEFAULT_LANG);
         assert_eq!(code_lang(Some("rust")), "rust");
+    }
+
+    // add-session-find: the searchable text agrees with the rendered text.
+    #[gpui_kit::test]
+    fn searchable_text_finds_what_the_view_renders(cx: &mut gpui_kit::TestAppContext) {
+        use crate::ui::find::{match_ranges, searchable_text};
+        let corpus: &[(&str, &[&str])] = &[
+            (
+                "the **retry** loop and _soft_ *word* ~~gone~~",
+                &[
+                    "retry loop",
+                    "retry",
+                    "soft",
+                    "word",
+                    "**",
+                    "loop and",
+                    "gone",
+                ],
+            ),
+            (
+                "see [the docs](http://x.io/a) now",
+                &["see the docs now", "docs", "http", "the docs", "now"],
+            ),
+            (
+                "run `cargo test` now",
+                &["cargo test", "run cargo", "test now", "`"],
+            ),
+            (
+                "- one two\n- three\n  - four five\n\n1. six\n2. seven",
+                &["one", "two", "four five", "six", "three", "-", "seven"],
+            ),
+            (
+                "# Title here\n\nbody text",
+                &["title here", "body", "here body", "#"],
+            ),
+            (
+                "```rust\nlet x = 1;\nlet y = 2;\n```",
+                &["let", "x = 1", "let y", "1; let", "rust", "```"],
+            ),
+            (
+                "| a | b |\n|---|---|\n| c | d |",
+                &["a", "c | d", "| a", "c d", "a b", "---"],
+            ),
+            (
+                "line one\nline two\n\nnext",
+                &["one line", "one", "line two", "two", "next"],
+            ),
+            ("first  \nsecond", &["first second", "second", "first"]),
+            ("中文字符 和 English", &["中文", "字符 和", "english", "和"]),
+            (
+                "> quoted text\n> more\n\nafter",
+                &["quoted", "text more", "more", ">"],
+            ),
+            ("x <b>bold</b> y", &["bold", "x bold", "<b>", "y"]),
+            (
+                "```mermaid\nflowchart LR; a --> b\n```",
+                &["flowchart", "a --> b", "mermaid"],
+            ),
+            ("![alt text](u.png) after", &["alt", "after", "u.png"]),
+            ("Straße and STRASSE", &["straße", "strasse", "and"]),
+        ];
+        for (source, queries) in corpus {
+            let (_handle, view) = open_doc(cx, source);
+            let rendered = cx
+                .update(|cx| view.read(cx).kept.rendered("m", cx))
+                .expect("the view is kept");
+            let searchable = searchable_text(source);
+            for query in *queries {
+                assert_eq!(
+                    match_ranges(&searchable, query).len(),
+                    match_ranges(&rendered, query).len(),
+                    "{query:?} in {source:?}: searchable {searchable:?}, rendered {rendered:?}"
+                );
+            }
+        }
+    }
+
+    /// A kept view with `text`, and the palette it is painted with.
+    fn found(
+        cx: &mut gpui_kit::TestAppContext,
+        text: &str,
+    ) -> (
+        gpui_kit::AnyWindowHandle,
+        gpui_kit::Entity<Doc>,
+        super::Kept,
+        crate::theme::Palette,
+    ) {
+        let (handle, view) = open_doc(cx, text);
+        let kept = cx.update(|cx| view.read(cx).kept.clone());
+        let p = cx.update(|cx| *crate::theme::palette(cx));
+        (handle, view, kept, p)
+    }
+
+    fn redraw(
+        cx: &mut gpui_kit::TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        view: &gpui_kit::Entity<Doc>,
+    ) {
+        cx.update(|cx| view.update(cx, |_, cx| cx.notify()));
+        frames(cx, handle);
+    }
+
+    // add-session-find / Matches are highlighted
+    #[gpui_kit::test]
+    fn a_kept_view_paints_matches_and_the_current_one_stronger(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, view, kept, p) = found(cx, "alpha beta Alpha");
+        let query = super::FindQuery::new("alpha", Some(("m".into(), 1)), &p);
+        cx.update(|cx| kept.set_find(Some(query), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m"), [(0..5, false), (11..16, true)]);
+        // A current match in another view leaves this one with weak matches.
+        let other = super::FindQuery::new("alpha", Some(("elsewhere".into(), 0)), &p);
+        cx.update(|cx| kept.set_find(Some(other), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m"), [(0..5, false), (11..16, false)]);
+    }
+
+    // add-session-find: a stamp keeps render from notifying the view again.
+    #[gpui_kit::test]
+    fn painting_the_same_stamp_does_not_notify_again(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, view, kept, p) = found(cx, "alpha beta alpha");
+        assert_eq!(kept.paints("m"), 0);
+        let query = super::FindQuery::new("alpha", Some(("m".into(), 0)), &p);
+        cx.update(|cx| kept.set_find(Some(query.clone()), cx));
+        redraw(cx, handle, &view);
+        // Each paint notifies the view once; a stamp stops the rest.
+        assert_eq!(kept.paints("m"), 1);
+        redraw(cx, handle, &view);
+        redraw(cx, handle, &view);
+        assert_eq!(kept.paints("m"), 1);
+        // The same query again changes nothing either.
+        cx.update(|cx| kept.set_find(Some(query), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.paints("m"), 1);
+    }
+
+    #[gpui_kit::test]
+    fn clearing_the_query_removes_the_highlights(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, view, kept, p) = found(cx, "alpha beta alpha");
+        let query = super::FindQuery::new("alpha", None, &p);
+        cx.update(|cx| kept.set_find(Some(query), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m").len(), 2);
+        cx.update(|cx| kept.set_find(None, cx));
+        redraw(cx, handle, &view);
+        assert!(kept.painted("m").is_empty());
+        assert!(kept.find().is_none());
+    }
+
+    // add-session-find D2: the fallback for an occurrence the view lacks.
+    #[gpui_kit::test]
+    fn a_missing_occurrence_paints_without_a_current_match(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, view, kept, p) = found(cx, "alpha beta alpha");
+        let query = super::FindQuery::new("alpha", Some(("m".into(), 7)), &p);
+        cx.update(|cx| kept.set_find(Some(query), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m"), [(0..5, false), (11..16, false)]);
+    }
+
+    // add-session-find: appended text gets highlighted as it streams in.
+    #[gpui_kit::test]
+    fn streamed_text_is_searched_as_it_arrives(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, view, kept, p) = found(cx, "test one");
+        let query = super::FindQuery::new("test", Some(("m".into(), 0)), &p);
+        cx.update(|cx| kept.set_find(Some(query), cx));
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m"), [(0..4, true)]);
+        set_text(cx, &view, "test one, test two");
+        frames(cx, handle);
+        redraw(cx, handle, &view);
+        assert_eq!(kept.painted("m"), [(0..4, true), (10..14, false)]);
     }
 }
