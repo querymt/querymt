@@ -47,11 +47,24 @@ Before a conversation is shown, the panel SHALL be a single bar holding the inpu
 
 #### Scenario: New quick chat
 - **GIVEN** the panel is open and shows no session
-- **THEN** it is one bar with the input, the agent, model and directory, and a button for the session picker, and it has no header
+- **THEN** it is one bar with the input, the agent, the directory, the model with the agent mode and the reasoning effort on it, and a button for the session picker, and it has no header
 
 #### Scenario: Conversation shown
 - **WHEN** a quick chat starts or a session is picked
 - **THEN** the panel grows around the conversation and shows its header
+
+### Requirement: The bar's controls
+In a new quick chat's bar, the agent mode and the reasoning effort SHALL be shown on the model control, each as a text label that can be clicked to change it, not as controls of their own. While the input is at most two lines, the bar's controls SHALL share the input's centre line; past two lines they SHALL stack beside the input.
+
+#### Scenario: Mode and reasoning on the model
+- **GIVEN** the panel is on an empty quick chat
+- **WHEN** the user clicks the mode label on the model control, or its reasoning label
+- **THEN** the next quick chat moves to the next mode, or the next reasoning effort, and the model picker does not open
+
+#### Scenario: Long prompt in the bar
+- **GIVEN** the panel is on an empty quick chat
+- **WHEN** the prompt typed in the bar grows past two lines
+- **THEN** the directory, the model and the session-picker button stack beside the input instead of sharing one line, and they return to one line when the prompt is one line again or is cleared
 
 ### Requirement: Uses its desktop's material
 The panel SHALL use the translucent material its desktop offers, drawn dark where the desktop allows it and in its active state even though the panel never becomes the desktop's active window. The material SHALL be visible through the panel's surfaces. Where it can be light, the panel SHALL tint it dark enough for text to stay legible; where there is none, the panel SHALL be near-opaque dark. The panel is not required to look the same on every desktop.
