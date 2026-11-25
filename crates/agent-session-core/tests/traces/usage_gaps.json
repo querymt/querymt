@@ -1,0 +1,2512 @@
+{
+  "name": "usage_gaps",
+  "batches": [
+    [
+      {
+        "type": "snapshot_loaded",
+        "data": {
+          "response": {
+            "_meta": {
+              "querymt/sessionLoadSnapshot.v1": {
+                "runtimeStatus": {
+                  "phase": "idle",
+                  "active_run_id": null,
+                  "steerable": false,
+                  "pending_steering_count": 0,
+                  "queued_input_count": 0,
+                  "run_started_at_ms": null,
+                  "observation": {
+                    "availability": "live"
+                  }
+                },
+                "audit": {
+                  "session_id": "s1",
+                  "events": [
+                    {
+                      "seq": 1,
+                      "session_seq": 1,
+                      "timestamp": 1000001,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "provider_changed",
+                        "data": {
+                          "provider": "mock",
+                          "model": "mock-model",
+                          "config_id": 1,
+                          "context_limit": 200000
+                        }
+                      }
+                    },
+                    {
+                      "seq": 2,
+                      "session_seq": 2,
+                      "timestamp": 1000002,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r0",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 3,
+                      "session_seq": 3,
+                      "timestamp": 1000003,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "amet sed aliqua amet eiusmod dolore labore do consectetur",
+                          "message_id": "u0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 4,
+                      "session_seq": 4,
+                      "timestamp": 1000004,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op0",
+                              "attempt_id": "att0",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle0",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 5,
+                      "session_seq": 5,
+                      "timestamp": 1000005,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op0",
+                              "attempt_id": "att0",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle0",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1000,
+                              "output_tokens": 50,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.003,
+                                "output_usd": 0.00075,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.00375,
+                              "complete_total_usd": 0.00375,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 6,
+                      "session_seq": 6,
+                      "timestamp": 1000006,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 50,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.00375,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1050,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op0",
+                            "attempt_ids": [
+                              "att0"
+                            ],
+                            "known_subtotal_usd": 0.00375,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 7,
+                      "session_seq": 7,
+                      "timestamp": 1000007,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "do tempor magna sit ut sed sed consectetur adipiscing tempor aliqua dolore et do adipiscing elit ut do ipsum do sit dolore dolore eiusmod ut aliqua ut dolor sed et dolor dolor labore do adipiscing consectetur dolor amet magna do elit tempor sit amet tempor eiusmod et adipiscing magna incididunt sed dolore dolor sed incididunt amet elit labore magna adipiscing",
+                          "reasoning_parts": [
+                            {
+                              "id": "a0:summary:0",
+                              "text": "aliqua consectetur amet consectetur amet sed consectetur"
+                            }
+                          ],
+                          "message_id": "a0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 8,
+                      "session_seq": 8,
+                      "timestamp": 1000008,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t0-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 9,
+                      "session_seq": 9,
+                      "timestamp": 1000009,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p0",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t0-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 10,
+                      "session_seq": 10,
+                      "timestamp": 1000010,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p0",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 11,
+                      "session_seq": 11,
+                      "timestamp": 1000011,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t0-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "dolore dolor eiusmod sed dolor magna et amet do amet consectetur sit labore incididunt consectetur adipiscing incididunt sit labore ut do amet do labore sed ipsum magna aliqua adipiscing adipiscing et amet sit tempor dolore do lorem lorem dolore lorem"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 12,
+                      "session_seq": 12,
+                      "timestamp": 1000012,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r0",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 13,
+                      "session_seq": 13,
+                      "timestamp": 1000013,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r1",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 14,
+                      "session_seq": 14,
+                      "timestamp": 1000014,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "sed sed dolore sit do aliqua incididunt sed sed",
+                          "message_id": "u1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 15,
+                      "session_seq": 15,
+                      "timestamp": 1000015,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r1",
+                          "input_id": "i1",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 16,
+                      "session_seq": 16,
+                      "timestamp": 1000016,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s1",
+                          "block": {
+                            "type": "text",
+                            "text": "eiusmod ipsum consectetur"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 17,
+                      "session_seq": 17,
+                      "timestamp": 1000017,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "eiusmod ipsum consectetur",
+                          "message_id": "s1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 18,
+                      "session_seq": 18,
+                      "timestamp": 1000018,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r1",
+                          "input_id": "i1",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 19,
+                      "session_seq": 19,
+                      "timestamp": 1000019,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op1",
+                              "attempt_id": "att1",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle1",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 20,
+                      "session_seq": 20,
+                      "timestamp": 1000020,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op1",
+                              "attempt_id": "att1",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle1",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1300,
+                              "output_tokens": 51,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0039000000000000003,
+                                "output_usd": 0.0007650000000000001,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.004665000000000001,
+                              "complete_total_usd": 0.004665000000000001,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 21,
+                      "session_seq": 21,
+                      "timestamp": 1000021,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1300,
+                            "output_tokens": 51,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.004665000000000001,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1351,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op1",
+                            "attempt_ids": [
+                              "att1"
+                            ],
+                            "known_subtotal_usd": 0.004665000000000001,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 22,
+                      "session_seq": 22,
+                      "timestamp": 1000022,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "lorem et eiusmod consectetur incididunt adipiscing sit incididunt consectetur eiusmod et et do et elit adipiscing do elit lorem consectetur consectetur dolor sed adipiscing dolor ipsum dolore aliqua do labore sed sit elit consectetur dolore amet adipiscing aliqua dolor tempor lorem consectetur dolore eiusmod sit et tempor magna dolor adipiscing ipsum eiusmod tempor tempor eiusmod eiusmod aliqua ut tempor amet dolor sit sed adipiscing sit et ipsum dolor sit aliqua lorem ipsum labore magna",
+                          "reasoning_parts": [
+                            {
+                              "id": "a1:summary:0",
+                              "text": "sit tempor elit do dolore amet tempor dolore incididunt"
+                            }
+                          ],
+                          "message_id": "a1"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 23,
+                      "session_seq": 23,
+                      "timestamp": 1000023,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t1-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 24,
+                      "session_seq": 24,
+                      "timestamp": 1000024,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t1-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "elit dolore adipiscing dolor dolor ipsum aliqua dolor labore consectetur et amet elit magna et elit dolore elit dolore do eiusmod incididunt incididunt tempor et do ut aliqua adipiscing aliqua do et adipiscing incididunt amet dolore sed ipsum amet eiusmod"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 25,
+                      "session_seq": 25,
+                      "timestamp": 1000025,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r1",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 26,
+                      "session_seq": 26,
+                      "timestamp": 1000026,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r2",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 27,
+                      "session_seq": 27,
+                      "timestamp": 1000027,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "ut dolor do elit dolore amet adipiscing tempor",
+                          "message_id": "u2"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 28,
+                      "session_seq": 28,
+                      "timestamp": 1000028,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op2",
+                              "attempt_id": "att2",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle2",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 29,
+                      "session_seq": 29,
+                      "timestamp": 1000029,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op2",
+                              "attempt_id": "att2",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle2",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "unavailable",
+                            "outcome": "succeeded",
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": null,
+                                "output_usd": null,
+                                "cache_read_usd": null,
+                                "cache_write_usd": null,
+                                "cache_write_1h_usd": null
+                              },
+                              "known_subtotal_usd": -0.0,
+                              "complete_total_usd": null,
+                              "incomplete": [
+                                {
+                                  "kind": "usage_unavailable"
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 30,
+                      "session_seq": 30,
+                      "timestamp": 1000030,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": null,
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": null,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1640,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op2",
+                            "attempt_ids": [
+                              "att2"
+                            ],
+                            "known_subtotal_usd": -0.0,
+                            "complete": false,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 31,
+                      "session_seq": 31,
+                      "timestamp": 1000031,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "sit consectetur elit tempor adipiscing labore et elit lorem dolor amet tempor sit dolor ipsum dolor et lorem dolore elit elit adipiscing aliqua amet ipsum consectetur ut do amet adipiscing magna consectetur lorem labore sed",
+                          "reasoning_parts": [
+                            {
+                              "id": "a2:summary:0",
+                              "text": "magna sed incididunt do do aliqua sit tempor aliqua"
+                            }
+                          ],
+                          "message_id": "a2"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 32,
+                      "session_seq": 32,
+                      "timestamp": 1000032,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "todo2",
+                          "tool_name": "todowrite",
+                          "arguments": "{\"todos\":[{\"content\":\"lorem\",\"status\":\"in_progress\",\"priority\":\"high\"}]}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 33,
+                      "session_seq": 33,
+                      "timestamp": 1000033,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "todo2",
+                          "tool_name": "todowrite",
+                          "is_error": false,
+                          "result": "ok"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 34,
+                      "session_seq": 34,
+                      "timestamp": 1000034,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t2-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 35,
+                      "session_seq": 35,
+                      "timestamp": 1000035,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p2",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t2-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 36,
+                      "session_seq": 36,
+                      "timestamp": 1000036,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p2",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 37,
+                      "session_seq": 37,
+                      "timestamp": 1000037,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t2-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "do eiusmod sit sit et ut lorem ipsum sed consectetur sed do adipiscing dolor ut ipsum sed lorem aliqua ut elit ipsum do ipsum magna tempor magna elit aliqua eiusmod sit sed ut dolore labore labore do incididunt do adipiscing"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 38,
+                      "session_seq": 38,
+                      "timestamp": 1000038,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r2",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 39,
+                      "session_seq": 39,
+                      "timestamp": 1000039,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "provider_changed",
+                        "data": {
+                          "provider": "mock",
+                          "model": "mock-model-2",
+                          "config_id": 2,
+                          "context_limit": 100000
+                        }
+                      }
+                    },
+                    {
+                      "seq": 40,
+                      "session_seq": 40,
+                      "timestamp": 1000040,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r3",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 41,
+                      "session_seq": 41,
+                      "timestamp": 1000041,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "sit adipiscing magna elit sit dolore tempor labore",
+                          "message_id": "u3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 42,
+                      "session_seq": 42,
+                      "timestamp": 1000042,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r3",
+                          "input_id": "i3",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 43,
+                      "session_seq": 43,
+                      "timestamp": 1000043,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s3",
+                          "block": {
+                            "type": "text",
+                            "text": "amet dolor consectetur"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 44,
+                      "session_seq": 44,
+                      "timestamp": 1000044,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "amet dolor consectetur",
+                          "message_id": "s3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 45,
+                      "session_seq": 45,
+                      "timestamp": 1000045,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r3",
+                          "input_id": "i3",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 46,
+                      "session_seq": 46,
+                      "timestamp": 1000046,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op3",
+                              "attempt_id": "att3",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle3",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model-2",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 47,
+                      "session_seq": 47,
+                      "timestamp": 1000047,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op3",
+                              "attempt_id": "att3",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle3",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 1900,
+                              "output_tokens": 53,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0057,
+                                "output_usd": 0.000795,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.006495,
+                              "complete_total_usd": 0.006495,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 48,
+                      "session_seq": 48,
+                      "timestamp": 1000048,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 1900,
+                            "output_tokens": 53,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.006495,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 1953,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op3",
+                            "attempt_ids": [
+                              "att3"
+                            ],
+                            "known_subtotal_usd": 0.006495,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 49,
+                      "session_seq": 49,
+                      "timestamp": 1000049,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "consectetur incididunt sit consectetur dolore sit adipiscing elit amet eiusmod et elit tempor sit incididunt sed consectetur ut aliqua incididunt lorem et do tempor dolor ipsum adipiscing sed eiusmod sit do magna aliqua tempor ut ipsum dolore consectetur dolore tempor consectetur dolor labore et adipiscing sit labore sed adipiscing lorem ipsum lorem labore aliqua",
+                          "reasoning_parts": [
+                            {
+                              "id": "a3:summary:0",
+                              "text": "dolor et ut ipsum adipiscing incididunt incididunt incididunt"
+                            }
+                          ],
+                          "message_id": "a3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 50,
+                      "session_seq": 50,
+                      "timestamp": 1000050,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t3-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 51,
+                      "session_seq": 51,
+                      "timestamp": 1000051,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t3-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "consectetur et lorem incididunt adipiscing dolor ut et sit sit consectetur incididunt sed magna amet ut ipsum lorem adipiscing adipiscing sed et tempor et do magna ut adipiscing eiusmod lorem sed et elit dolore magna et sed magna sit sit"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 52,
+                      "session_seq": 52,
+                      "timestamp": 1000052,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "compaction_start",
+                        "data": {
+                          "token_estimate": 1030,
+                          "compaction_id": "c3"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 53,
+                      "session_seq": 53,
+                      "timestamp": 1000053,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "compaction_end",
+                        "data": {
+                          "summary": "sed consectetur ut ut ut do adipiscing eiusmod elit do magna magna",
+                          "summary_len": 12,
+                          "compaction_id": "c3",
+                          "context_tokens": 203
+                        }
+                      }
+                    },
+                    {
+                      "seq": 54,
+                      "session_seq": 54,
+                      "timestamp": 1000054,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r3",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 55,
+                      "session_seq": 55,
+                      "timestamp": 1000055,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r4",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 56,
+                      "session_seq": 56,
+                      "timestamp": 1000056,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "sit ipsum lorem amet sit elit tempor aliqua ipsum ut",
+                          "message_id": "u4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 57,
+                      "session_seq": 57,
+                      "timestamp": 1000057,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op4",
+                              "attempt_id": "att4",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle4",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model-2",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 58,
+                      "session_seq": 58,
+                      "timestamp": 1000058,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op4",
+                              "attempt_id": "att4",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle4",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 2200,
+                              "output_tokens": 54,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.0066,
+                                "output_usd": 0.0008100000000000001,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.00741,
+                              "complete_total_usd": 0.00741,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 59,
+                      "session_seq": 59,
+                      "timestamp": 1000059,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 2200,
+                            "output_tokens": 54,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.00741,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 2254,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op4",
+                            "attempt_ids": [
+                              "att4"
+                            ],
+                            "known_subtotal_usd": 0.00741,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 60,
+                      "session_seq": 60,
+                      "timestamp": 1000060,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "dolor magna magna aliqua magna labore elit magna ipsum consectetur tempor elit ipsum tempor consectetur sed sit aliqua tempor ipsum amet do aliqua incididunt amet magna consectetur tempor amet adipiscing magna amet eiusmod tempor adipiscing adipiscing ipsum dolor elit do lorem amet sit lorem do incididunt eiusmod sed ipsum dolore eiusmod elit eiusmod dolor elit amet aliqua et dolore lorem dolor do labore dolore amet dolore do lorem dolor elit ut sit dolore elit do elit",
+                          "reasoning_parts": [
+                            {
+                              "id": "a4:summary:0",
+                              "text": "dolor sit do et lorem"
+                            }
+                          ],
+                          "message_id": "a4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 61,
+                      "session_seq": 61,
+                      "timestamp": 1000061,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 62,
+                      "session_seq": 62,
+                      "timestamp": 1000062,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_requested",
+                        "data": {
+                          "permission_id": "p4",
+                          "task_id": null,
+                          "tool_name": "shell",
+                          "reason": "needs approval",
+                          "tool_call_id": "t4-0"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 63,
+                      "session_seq": 63,
+                      "timestamp": 1000063,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "permission_granted",
+                        "data": {
+                          "permission_id": "p4",
+                          "granted": true
+                        }
+                      }
+                    },
+                    {
+                      "seq": 64,
+                      "session_seq": 64,
+                      "timestamp": 1000064,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "incididunt consectetur et amet et dolore dolor tempor magna do dolore incididunt amet magna sit ut ipsum ipsum sed tempor eiusmod ut elit incididunt labore lorem eiusmod incididunt aliqua sed amet et ut dolore do ut aliqua eiusmod amet dolore"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 65,
+                      "session_seq": 65,
+                      "timestamp": 1000065,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 66,
+                      "session_seq": 66,
+                      "timestamp": 1000066,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t4-1",
+                          "tool_name": "shell",
+                          "is_error": true,
+                          "result": "ipsum adipiscing lorem dolore adipiscing do sit lorem amet consectetur et consectetur aliqua elit ut elit aliqua dolor dolore elit dolore elit do amet et labore eiusmod ipsum incididunt adipiscing tempor incididunt adipiscing magna amet incididunt ipsum aliqua aliqua et"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 67,
+                      "session_seq": 67,
+                      "timestamp": 1000067,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r4",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 68,
+                      "session_seq": 68,
+                      "timestamp": 1000068,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "sched4",
+                          "origin": "scheduled:s1:t4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 69,
+                      "session_seq": 69,
+                      "timestamp": 1000069,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "lorem sit aliqua amet elit adipiscing magna sed aliqua incididunt adipiscing dolore ut eiusmod",
+                          "message_id": "sa4"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 70,
+                      "session_seq": 70,
+                      "timestamp": 1000070,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "sched4",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 71,
+                      "session_seq": 71,
+                      "timestamp": 1000071,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_started",
+                        "data": {
+                          "run_id": "r5",
+                          "origin": "interactive"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 72,
+                      "session_seq": 72,
+                      "timestamp": 1000072,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "sed tempor labore labore aliqua",
+                          "message_id": "u5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 73,
+                      "session_seq": 73,
+                      "timestamp": 1000073,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_accepted",
+                        "data": {
+                          "run_id": "r5",
+                          "input_id": "i5",
+                          "position": 0,
+                          "accepted_at_ms": 1
+                        }
+                      }
+                    },
+                    {
+                      "seq": 74,
+                      "session_seq": 74,
+                      "timestamp": 1000074,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "user_prompt_block",
+                        "data": {
+                          "message_id": "s5",
+                          "block": {
+                            "type": "text",
+                            "text": "dolore et sit"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 75,
+                      "session_seq": 75,
+                      "timestamp": 1000075,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "prompt_received",
+                        "data": {
+                          "content": "dolore et sit",
+                          "message_id": "s5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 76,
+                      "session_seq": 76,
+                      "timestamp": 1000076,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "steering_applied",
+                        "data": {
+                          "run_id": "r5",
+                          "input_id": "i5",
+                          "boundary": "before_model_request",
+                          "latency_ms": 5
+                        }
+                      }
+                    },
+                    {
+                      "seq": 77,
+                      "session_seq": 77,
+                      "timestamp": 1000077,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_started",
+                        "data": {
+                          "start": {
+                            "attempt": {
+                              "operation_id": "op5",
+                              "attempt_id": "att5",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle5",
+                              "purpose": "main_response"
+                            },
+                            "mode": "streaming",
+                            "provider": "mock",
+                            "model": "mock-model-2",
+                            "billing": "metered",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 78,
+                      "session_seq": 78,
+                      "timestamp": 1000078,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_attempt_settled",
+                        "data": {
+                          "settlement": {
+                            "attempt": {
+                              "operation_id": "op5",
+                              "attempt_id": "att5",
+                              "attempt_index": 0,
+                              "session_id": "s1",
+                              "cycle_id": "cycle5",
+                              "purpose": "main_response"
+                            },
+                            "disposition": "final",
+                            "outcome": "succeeded",
+                            "usage": {
+                              "input_tokens": 2500,
+                              "output_tokens": 55,
+                              "reasoning_tokens": 0,
+                              "cache_read": 0,
+                              "cache_write": 0
+                            },
+                            "pricing_applicability": "selected",
+                            "pricing": {
+                              "input": 3.0,
+                              "output": 15.0,
+                              "cache_read": 0.3,
+                              "cache_write": 3.75
+                            },
+                            "valuation": {
+                              "billing": "metered",
+                              "components": {
+                                "input_usd": 0.007500000000000001,
+                                "output_usd": 0.000825,
+                                "cache_read_usd": 0.0,
+                                "cache_write_usd": 0.0,
+                                "cache_write_1h_usd": 0.0
+                              },
+                              "known_subtotal_usd": 0.008325,
+                              "complete_total_usd": 0.008325,
+                              "incomplete": []
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 79,
+                      "session_seq": 79,
+                      "timestamp": 1000079,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "llm_request_end",
+                        "data": {
+                          "usage": {
+                            "input_tokens": 2500,
+                            "output_tokens": 55,
+                            "reasoning_tokens": 0,
+                            "cache_read": 0,
+                            "cache_write": 0
+                          },
+                          "tool_calls": 0,
+                          "finish_reason": null,
+                          "cost_usd": 0.008325,
+                          "cumulative_cost_usd": null,
+                          "context_tokens": 2555,
+                          "metrics": {
+                            "steps": 1,
+                            "turns": 1
+                          },
+                          "accounting": {
+                            "operation_id": "op5",
+                            "attempt_ids": [
+                              "att5"
+                            ],
+                            "known_subtotal_usd": 0.008325,
+                            "complete": true,
+                            "reasons": []
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "seq": 80,
+                      "session_seq": 80,
+                      "timestamp": 1000080,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "assistant_message_stored",
+                        "data": {
+                          "content": "consectetur dolore elit ut sed amet do et ipsum lorem ut lorem lorem magna incididunt adipiscing dolor consectetur adipiscing sit magna ut dolore amet ut labore et sed et do",
+                          "reasoning_parts": [
+                            {
+                              "id": "a5:summary:0",
+                              "text": "et adipiscing ipsum magna"
+                            }
+                          ],
+                          "message_id": "a5"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 81,
+                      "session_seq": 81,
+                      "timestamp": 1000081,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "todo5",
+                          "tool_name": "todowrite",
+                          "arguments": "{\"todos\":[{\"content\":\"lorem\",\"status\":\"in_progress\",\"priority\":\"high\"}]}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 82,
+                      "session_seq": 82,
+                      "timestamp": 1000082,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "todo5",
+                          "tool_name": "todowrite",
+                          "is_error": false,
+                          "result": "ok"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 83,
+                      "session_seq": 83,
+                      "timestamp": 1000083,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_start",
+                        "data": {
+                          "tool_call_id": "t5-0",
+                          "tool_name": "shell",
+                          "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 84,
+                      "session_seq": 84,
+                      "timestamp": 1000084,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "tool_call_end",
+                        "data": {
+                          "tool_call_id": "t5-0",
+                          "tool_name": "shell",
+                          "is_error": false,
+                          "result": "incididunt tempor sed aliqua lorem labore elit magna do ut dolor adipiscing dolore amet sit consectetur dolore ut incididunt elit ipsum sit elit tempor aliqua lorem sit sit aliqua consectetur consectetur eiusmod ipsum labore dolore labore sed elit tempor et"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 85,
+                      "session_seq": 85,
+                      "timestamp": 1000085,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "run_completed",
+                        "data": {
+                          "run_id": "r5",
+                          "outcome": "completed"
+                        }
+                      }
+                    },
+                    {
+                      "seq": 86,
+                      "session_seq": 86,
+                      "timestamp": 1000086,
+                      "session_id": "s1",
+                      "origin": "local",
+                      "kind": {
+                        "type": "provider_changed",
+                        "data": {
+                          "provider": "mock",
+                          "model": "mock-model-3",
+                          "config_id": 3,
+                          "context_limit": 50000
+                        }
+                      }
+                    }
+                  ],
+                  "tasks": [],
+                  "intent_snapshots": [],
+                  "decisions": [],
+                  "progress_entries": [],
+                  "artifacts": [],
+                  "delegations": [],
+                  "generated_at": "2026-01-01T00:00:00Z"
+                },
+                "cursor": {
+                  "local_seq": 0,
+                  "remote_seq_by_source": {}
+                },
+                "accounting": {
+                  "version": 1,
+                  "session": {
+                    "knownSubtotalUsd": 0.0,
+                    "completeTotalUsd": 0.0,
+                    "complete": true,
+                    "billing": "empty",
+                    "reasons": [],
+                    "pricedAttempts": 0,
+                    "excludedAttempts": 0,
+                    "unresolvedAttempts": 0,
+                    "incompleteAttempts": 0,
+                    "unaccountedGenerations": 0
+                  },
+                  "cycle": null
+                },
+                "subagentUpdates": []
+              }
+            }
+          }
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "run-r0",
+          "run-r1",
+          "run-r2",
+          "run-r3",
+          "run-r4",
+          "run-sched4",
+          "run-r5"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 2,
+      "runState": "idle",
+      "activeRunId": null,
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "accounting": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "availableCommands": [],
+      "plan": {
+        "planId": "querymt-todos",
+        "entries": [
+          {
+            "content": "lorem",
+            "priority": "high",
+            "status": "in_progress"
+          }
+        ],
+        "markdown": null
+      },
+      "undoStack": [],
+      "pendingInputs": [],
+      "subagents": [],
+      "cursors": [],
+      "runtime": {
+        "phase": "idle",
+        "active_run_id": null,
+        "steerable": false,
+        "pending_steering_count": 0,
+        "queued_input_count": 0,
+        "run_started_at_ms": null,
+        "observation": {
+          "availability": "live"
+        },
+        "delegation_activity": []
+      },
+      "activeTime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "run-r0",
+      "run-r1",
+      "run-r2",
+      "run-r3",
+      "run-r4",
+      "run-sched4",
+      "run-r5"
+    ],
+    "turns": [
+      {
+        "id": "run-r0",
+        "revision": 5,
+        "entries": [
+          {
+            "id": "user-u0",
+            "revision": 1,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u0",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "amet sed aliqua amet eiusmod dolore labore do consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a0-a0:summary:0",
+            "revision": 2,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a0",
+                "partId": "a0:summary:0",
+                "text": "aliqua consectetur amet consectetur amet sed consectetur"
+              }
+            }
+          },
+          {
+            "id": "assistant-a0",
+            "revision": 3,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a0",
+                "text": "do tempor magna sit ut sed sed consectetur adipiscing tempor aliqua dolore et do adipiscing elit ut do ipsum do sit dolore dolore eiusmod ut aliqua ut dolor sed et dolor dolor labore do adipiscing consectetur dolor amet magna do elit tempor sit amet tempor eiusmod et adipiscing magna incididunt sed dolore dolor sed incididunt amet elit labore magna adipiscing"
+              }
+            }
+          },
+          {
+            "id": "tool-t0-0",
+            "revision": 5,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t0-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "dolore dolor eiusmod sed dolor magna et amet do amet consectetur sit labore incididunt consectetur adipiscing incididunt sit labore ut do amet do labore sed ipsum magna aliqua adipiscing adipiscing et amet sit tempor dolore do lorem lorem dolore lorem"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r1",
+        "revision": 11,
+        "entries": [
+          {
+            "id": "user-u1",
+            "revision": 6,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u1",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "sed sed dolore sit do aliqua incididunt sed sed"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s1",
+            "revision": 7,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s1",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "eiusmod ipsum consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a1-a1:summary:0",
+            "revision": 8,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a1",
+                "partId": "a1:summary:0",
+                "text": "sit tempor elit do dolore amet tempor dolore incididunt"
+              }
+            }
+          },
+          {
+            "id": "assistant-a1",
+            "revision": 9,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a1",
+                "text": "lorem et eiusmod consectetur incididunt adipiscing sit incididunt consectetur eiusmod et et do et elit adipiscing do elit lorem consectetur consectetur dolor sed adipiscing dolor ipsum dolore aliqua do labore sed sit elit consectetur dolore amet adipiscing aliqua dolor tempor lorem consectetur dolore eiusmod sit et tempor magna dolor adipiscing ipsum eiusmod tempor tempor eiusmod eiusmod aliqua ut tempor amet dolor sit sed adipiscing sit et ipsum dolor sit aliqua lorem ipsum labore magna"
+              }
+            }
+          },
+          {
+            "id": "tool-t1-0",
+            "revision": 11,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t1-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "elit dolore adipiscing dolor dolor ipsum aliqua dolor labore consectetur et amet elit magna et elit dolore elit dolore do eiusmod incididunt incididunt tempor et do ut aliqua adipiscing aliqua do et adipiscing incididunt amet dolore sed ipsum amet eiusmod"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r2",
+        "revision": 16,
+        "entries": [
+          {
+            "id": "user-u2",
+            "revision": 12,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u2",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "ut dolor do elit dolore amet adipiscing tempor"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a2-a2:summary:0",
+            "revision": 13,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a2",
+                "partId": "a2:summary:0",
+                "text": "magna sed incididunt do do aliqua sit tempor aliqua"
+              }
+            }
+          },
+          {
+            "id": "assistant-a2",
+            "revision": 14,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a2",
+                "text": "sit consectetur elit tempor adipiscing labore et elit lorem dolor amet tempor sit dolor ipsum dolor et lorem dolore elit elit adipiscing aliqua amet ipsum consectetur ut do amet adipiscing magna consectetur lorem labore sed"
+              }
+            }
+          },
+          {
+            "id": "tool-t2-0",
+            "revision": 16,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t2-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "do eiusmod sit sit et ut lorem ipsum sed consectetur sed do adipiscing dolor ut ipsum sed lorem aliqua ut elit ipsum do ipsum magna tempor magna elit aliqua eiusmod sit sed ut dolore labore labore do incididunt do adipiscing"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r3",
+        "revision": 25,
+        "entries": [
+          {
+            "id": "user-u3",
+            "revision": 17,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u3",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "sit adipiscing magna elit sit dolore tempor labore"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s3",
+            "revision": 18,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s3",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "amet dolor consectetur"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a3-a3:summary:0",
+            "revision": 19,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a3",
+                "partId": "a3:summary:0",
+                "text": "dolor et ut ipsum adipiscing incididunt incididunt incididunt"
+              }
+            }
+          },
+          {
+            "id": "assistant-a3",
+            "revision": 20,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a3",
+                "text": "consectetur incididunt sit consectetur dolore sit adipiscing elit amet eiusmod et elit tempor sit incididunt sed consectetur ut aliqua incididunt lorem et do tempor dolor ipsum adipiscing sed eiusmod sit do magna aliqua tempor ut ipsum dolore consectetur dolore tempor consectetur dolor labore et adipiscing sit labore sed adipiscing lorem ipsum lorem labore aliqua"
+              }
+            }
+          },
+          {
+            "id": "tool-t3-0",
+            "revision": 22,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t3-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "consectetur et lorem incididunt adipiscing dolor ut et sit sit consectetur incididunt sed magna amet ut ipsum lorem adipiscing adipiscing sed et tempor et do magna ut adipiscing eiusmod lorem sed et elit dolore magna et sed magna sit sit"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "compaction-c3",
+            "revision": 25,
+            "kind": {
+              "type": "compaction",
+              "data": {
+                "compactionId": "c3",
+                "state": "completed",
+                "otherStatus": null,
+                "summary": [
+                  {
+                    "type": "text",
+                    "text": "sed consectetur ut ut ut do adipiscing eiusmod elit do magna magna"
+                  }
+                ],
+                "error": null,
+                "meta": {
+                  "querymt": {
+                    "compaction": {
+                      "tokensBefore": 1953,
+                      "tokensAfter": 203
+                    },
+                    "runId": "r3"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r4",
+        "revision": 32,
+        "entries": [
+          {
+            "id": "user-u4",
+            "revision": 26,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u4",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "sit ipsum lorem amet sit elit tempor aliqua ipsum ut"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a4-a4:summary:0",
+            "revision": 27,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a4",
+                "partId": "a4:summary:0",
+                "text": "dolor sit do et lorem"
+              }
+            }
+          },
+          {
+            "id": "assistant-a4",
+            "revision": 28,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a4",
+                "text": "dolor magna magna aliqua magna labore elit magna ipsum consectetur tempor elit ipsum tempor consectetur sed sit aliqua tempor ipsum amet do aliqua incididunt amet magna consectetur tempor amet adipiscing magna amet eiusmod tempor adipiscing adipiscing ipsum dolor elit do lorem amet sit lorem do incididunt eiusmod sed ipsum dolore eiusmod elit eiusmod dolor elit amet aliqua et dolore lorem dolor do labore dolore amet dolore do lorem dolor elit ut sit dolore elit do elit"
+              }
+            }
+          },
+          {
+            "id": "tool-t4-0",
+            "revision": 30,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t4-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "incididunt consectetur et amet et dolore dolor tempor magna do dolore incididunt amet magna sit ut ipsum ipsum sed tempor eiusmod ut elit incididunt labore lorem eiusmod incididunt aliqua sed amet et ut dolore do ut aliqua eiusmod amet dolore"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          },
+          {
+            "id": "tool-t4-1",
+            "revision": 32,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t4-1",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "failed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "ipsum adipiscing lorem dolore adipiscing do sit lorem amet consectetur et consectetur aliqua elit ut elit aliqua dolor dolore elit dolore elit do amet et labore eiusmod ipsum incididunt adipiscing tempor incididunt adipiscing magna amet incididunt ipsum aliqua aliqua et"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-sched4",
+        "revision": 33,
+        "entries": [
+          {
+            "id": "assistant-sa4",
+            "revision": 33,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "sa4",
+                "text": "lorem sit aliqua amet elit adipiscing magna sed aliqua incididunt adipiscing dolore ut eiusmod"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-r5",
+        "revision": 39,
+        "entries": [
+          {
+            "id": "user-u5",
+            "revision": 34,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "sed tempor labore labore aliqua"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "user-s5",
+            "revision": 35,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "s5",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "dolore et sit"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "reasoning-a5-a5:summary:0",
+            "revision": 36,
+            "kind": {
+              "type": "reasoning",
+              "data": {
+                "messageId": "a5",
+                "partId": "a5:summary:0",
+                "text": "et adipiscing ipsum magna"
+              }
+            }
+          },
+          {
+            "id": "assistant-a5",
+            "revision": 37,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "a5",
+                "text": "consectetur dolore elit ut sed amet do et ipsum lorem ut lorem lorem magna incididunt adipiscing dolor consectetur adipiscing sit magna ut dolore amet ut labore et sed et do"
+              }
+            }
+          },
+          {
+            "id": "tool-t5-0",
+            "revision": 39,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t5-0",
+                "title": "Run shell",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": {
+                  "cmd": "ls"
+                },
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "content",
+                    "content": {
+                      "type": "text",
+                      "text": "incididunt tempor sed aliqua lorem labore elit magna do ut dolor adipiscing dolore amet sit consectetur dolore ut incididunt elit ipsum sit elit tempor aliqua lorem sit sit aliqua consectetur consectetur eiusmod ipsum labore dolore labore sed elit tempor et"
+                    }
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

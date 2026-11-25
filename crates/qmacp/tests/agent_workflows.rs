@@ -1407,48 +1407,59 @@ async fn idle_observation_does_not_replay_history_or_claim_task_completion() {
     server.finish().await;
 }
 
-fn delegation(state: &str, seq: u64) -> Value {
+fn subagent(child: &str, state: &str, stage: Option<&str>) -> Value {
+    let mut querymt = json!({"delegationId": format!("delegation-{child}"), "requestedAt": 1});
+    if let Some(stage) = stage {
+        querymt["stage"] = json!(stage);
+    }
     json!({
-        "version": 1, "sessionId": "parent", "delegationId": "delegation-1",
-        "toolCallId": "dispatch-1", "childSessionId": "child-1", "targetAgentId": "coder",
-        "objective": "fixture task", "state": state, "activity": "historical",
-        "requestedAt": 1, "forkedAt": 2, "updatedAt": seq,
-        "sourceEpoch": "workflow-1", "sessionSeq": seq,
+        "sessionUpdate": "subagent_update",
+        "sessionId": child, "title": "coder", "description": "fixture task",
+        "state": {"state": state},
+        "capabilities": if state == "running" { json!({"cancel": {}}) } else { Value::Null },
+        "_meta": {"querymt": querymt},
     })
 }
 
-fn delegation_notification(method: &str, update: &Value) -> Value {
-    json!({"jsonrpc": "2.0", "method": method, "params": update})
+fn subagent_notification(parent: &str, update: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": parent, "update": update,
+    }})
 }
 
-fn assert_delegation_event(event: &Value, update: &Value) {
-    assert_eq!(event["type"], "delegation");
-    for (key, value) in update.as_object().unwrap() {
-        assert_eq!(&event[key], value, "lost delegation field {key}");
-    }
+fn assert_subagent_event(event: &Value, parent: &str, child: &str, state: &str) {
+    assert_eq!(event["type"], "delegation", "{event}");
+    assert_eq!(event["sessionId"], parent);
+    assert_eq!(event["childSessionId"], child);
+    assert_eq!(event["title"], "coder");
+    assert_eq!(event["description"], "fixture task");
+    assert_eq!(event["state"], state);
+    assert_eq!(event["delegationId"], format!("delegation-{child}"));
 }
 
 #[tokio::test]
-async fn follow_streams_delegation_lifecycle_separately_from_tool_dispatch_during_load() {
-    let mut verifying = delegation("forked", 3);
-    verifying["activity"] = json!("live");
-    verifying["stage"] = json!("verifying");
-    let mut terminal = delegation("completed", 4);
-    terminal["finishedAt"] = json!(4);
-    terminal["resultSummary"] = json!("verified");
-    let expected = [verifying.clone(), terminal.clone()];
+async fn live_subagent_update_is_reported() {
+    let running = subagent("child-1", "running", Some("verifying"));
+    let idle = subagent("child-1", "idle", None);
+    let (first, second) = (running.clone(), idle.clone());
     let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
         "session/resume" => Reply::Error(-32601, "resume unsupported"),
-        "session/load" => Reply::WithNotifications(vec![
-            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
-                "sessionId": "parent", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "dispatch-1", "status": "completed"},
-            }}),
-            delegation_notification("querymt/session/delegationUpdate", &verifying),
-            delegation_notification("querymt/session/delegationUpdate", &terminal),
-        ], json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {"delegationUpdates": [verifying]}}})),
+        "session/load" => Reply::WithNotifications(
+            vec![
+                // The dispatch tool call completes on its own; the child's
+                // lifecycle is reported separately from it.
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": "parent", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "dispatch-1", "status": "completed"},
+                }}),
+                subagent_notification("parent", &first),
+                subagent_notification("parent", &second),
+            ],
+            json!({}),
+        ),
         "_querymt/session/runtimeState" => runtime("idle", false),
         _ => unexpected(request),
-    }).await;
+    })
+    .await;
     let output = invoke(
         cli().args(["--url", &server.url, "--quiet", "follow", "parent"]),
         None,
@@ -1464,27 +1475,61 @@ async fn follow_streams_delegation_lifecycle_separately_from_tool_dispatch_durin
         .filter(|event| event["type"] == "delegation")
         .collect();
     assert_eq!(updates.len(), 2, "{events:?}");
-    for (event, update) in updates.iter().zip(&expected) {
-        assert_delegation_event(event, update);
-    }
+    assert_subagent_event(updates[0], "parent", "child-1", "running");
+    assert_eq!(updates[0]["stage"], "verifying");
+    assert_eq!(updates[0]["cancellable"], true);
+    assert_subagent_event(updates[1], "parent", "child-1", "idle");
+    assert!(updates[1].get("stage").is_none());
+    assert_eq!(updates[1]["cancellable"], false);
     assert_eq!(events.last().unwrap()["observationState"], "idle");
     server.finish().await;
 }
 
 #[tokio::test]
-async fn exported_event_channel_delivers_terminal_delegation_update_buffered_during_load() {
-    let historical = delegation("forked", 2);
-    let mut terminal = delegation("cancelled", 4);
-    terminal["finishedAt"] = json!(4);
-    terminal["error"] = json!("fixture cancellation");
-    let expected = terminal.clone();
+async fn delegate_tool_call_references_the_child_session() {
+    let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+        "session/resume" => Reply::Error(-32601, "resume unsupported"),
+        "session/load" => Reply::WithNotifications(
+            vec![
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": "parent", "update": {
+                        "sessionUpdate": "tool_call_update", "toolCallId": "dispatch-1",
+                        "content": [{"type": "session", "sessionId": "child-1"}],
+                    },
+                }}),
+            ],
+            json!({}),
+        ),
+        "_querymt/session/runtimeState" => runtime("idle", false),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "follow", "parent"]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let events = events(&output);
+    let tool = events.iter().find(|event| event["type"] == "tool").unwrap();
+    assert_eq!(tool["id"], "dispatch-1");
+    assert_eq!(tool["childSessionId"], "child-1");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn exported_event_channel_delivers_terminal_subagent_update_buffered_during_load() {
+    let historical = subagent("child-1", "running", None);
+    let terminal = subagent("child-1", "idle", None);
+    let notification = subagent_notification("parent", &terminal);
     let server = MockServer::start(move |request| {
         assert_eq!(request["method"], "session/load");
         Reply::WithNotifications(
-            vec![delegation_notification("_querymt/session/delegationUpdate", &terminal)],
-            json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {"delegationUpdates": [historical]}}}),
+            vec![notification.clone()],
+            json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {"subagentUpdates": [historical]}}}),
         )
-    }).await;
+    })
+    .await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let client = qmacp::client::AcpClient::connect_with_events(
         &server.url,
@@ -1500,33 +1545,28 @@ async fn exported_event_channel_delivers_terminal_delegation_update_buffered_dur
         .await
         .unwrap();
     assert_eq!(
-        raw["_meta"]["querymt/sessionLoadSnapshot.v1"]["delegationUpdates"][0]["state"],
-        "forked"
+        raw["_meta"]["querymt/sessionLoadSnapshot.v1"]["subagentUpdates"][0]["state"]["state"],
+        "running"
     );
     let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_delegation_event(&event, &expected);
+    assert_subagent_event(&event, "parent", "child-1", "idle");
     drop(client);
     server.finish().await;
 }
 
-fn enriched_remote_load(update: &Value) -> Value {
-    let activity = if update["activity"] == "live" {
-        vec![update.clone()]
-    } else {
-        Vec::new()
-    };
+fn enriched_remote_load(updates: &[Value]) -> Value {
     json!({"_meta": {
         "location": "remote", "nodeId": "fixture-peer",
         "querymt/sessionLoadSnapshot.v1": {
             "runtimeStatus": {
                 "phase": "idle", "steerable": false, "active_run_id": null,
                 "observation": {"availability": "live", "epoch": "remote-actor", "revision": 9},
-                "delegation_activity": activity,
+                "delegation_activity": [],
             },
-            "delegationUpdates": [update],
+            "subagentUpdates": updates,
             "audit": {"events": [{"kind": {"type": "tool_call_end", "data": {
                 "tool_call_id": "dispatch-1", "tool_name": "delegate", "is_error": false, "result": "dispatched",
             }}}]},
@@ -1536,10 +1576,7 @@ fn enriched_remote_load(update: &Value) -> Value {
 
 #[tokio::test]
 async fn exported_load_preserves_enriched_initial_snapshot_without_notifications() {
-    let mut verifying = delegation("forked", 3);
-    verifying["activity"] = json!("live");
-    verifying["stage"] = json!("verifying");
-    let expected = enriched_remote_load(&verifying);
+    let expected = enriched_remote_load(&[subagent("child-1", "running", Some("verifying"))]);
     let response = expected.clone();
     let server = MockServer::start(move |request| {
         assert_eq!(request["method"], "session/load");
@@ -1579,51 +1616,47 @@ async fn exported_load_preserves_enriched_initial_snapshot_without_notifications
 }
 
 #[tokio::test]
-async fn inspect_keeps_initial_remote_delegation_separate_from_dispatch_on_reconnect() {
-    for state in ["forked", "failed"] {
-        let mut update = delegation(state, if state == "forked" { 3 } else { 4 });
-        if state == "forked" {
-            update["activity"] = json!("live");
-            update["stage"] = json!("verifying");
+async fn load_snapshot_delegations_come_from_subagent_updates() {
+    let updates = [
+        subagent("child-1", "running", Some("verifying")),
+        subagent("child-2", "idle", None),
+    ];
+    let expected = enriched_remote_load(&updates);
+    for full in [false, true] {
+        let response = expected.clone();
+        let server = MockServer::start(move |request| {
+            assert_eq!(request["method"], "session/load");
+            Reply::Result(response.clone())
+        })
+        .await;
+        let mut command = cli();
+        command.args(["--url", &server.url, "--quiet", "inspect", "parent"]);
+        if full {
+            command.arg("--full");
+        }
+        let output = invoke(&mut command, None).await;
+        assert!(output.status.success(), "{output:?}");
+        let result_events = events(&output);
+        assert_eq!(
+            result_events.len(),
+            1,
+            "snapshot only, no live notifications"
+        );
+        let result = &result_events[0];
+        if full {
+            assert_eq!(result["raw"], expected);
         } else {
-            update["finishedAt"] = json!(4);
-            update["error"] = json!("verification failed");
+            assert_eq!(result["tools"][0]["id"], "dispatch-1");
+            assert_eq!(result["tools"][0]["status"], "ok");
+            let delegations = result["delegations"]
+                .as_array()
+                .expect("compact delegation snapshot");
+            assert_eq!(delegations.len(), 2);
+            assert_subagent_event(&delegations[0], "parent", "child-1", "running");
+            assert_eq!(delegations[0]["stage"], "verifying");
+            assert_subagent_event(&delegations[1], "parent", "child-2", "idle");
         }
-        let expected = enriched_remote_load(&update);
-        for full in [false, true] {
-            let response = expected.clone();
-            let server = MockServer::start(move |request| {
-                assert_eq!(request["method"], "session/load");
-                Reply::Result(response.clone())
-            })
-            .await;
-            let mut command = cli();
-            command.args(["--url", &server.url, "--quiet", "inspect", "parent"]);
-            if full {
-                command.arg("--full");
-            }
-            let output = invoke(&mut command, None).await;
-            assert!(output.status.success(), "{output:?}");
-            let result_events = events(&output);
-            assert_eq!(
-                result_events.len(),
-                1,
-                "snapshot only, no live notifications"
-            );
-            let result = &result_events[0];
-            if full {
-                assert_eq!(result["raw"], expected);
-            } else {
-                assert_eq!(result["tools"][0]["id"], "dispatch-1");
-                assert_eq!(result["tools"][0]["status"], "ok");
-                let updates = result["delegations"]
-                    .as_array()
-                    .expect("compact delegation snapshot");
-                assert_eq!(updates.len(), 1);
-                assert_delegation_event(&updates[0], &update);
-            }
-            assert_eq!(server.finish().await.len(), 2, "no catchup runtime query");
-        }
+        assert_eq!(server.finish().await.len(), 2, "no catchup runtime query");
     }
 }
 
@@ -2076,5 +2109,211 @@ async fn find_distinguishes_the_result_limit_from_the_page_cap() {
     assert_eq!(result["truncated"], true);
     assert_eq!(result["stopReason"], "limit");
     assert_eq!(result["pageCapReached"], false);
+    server.finish().await;
+}
+
+/// Runs `qmacp prompt` against an agent whose `session/prompt` response is
+/// `prompt_result`, and returns the final `done` event.
+async fn prompt_done(prompt_result: Value) -> Value {
+    let server = MockServer::start(move |request| match request["method"].as_str() {
+        Some("session/resume" | "session/load") => Reply::Result(json!({})),
+        Some("session/prompt") => Reply::Result(prompt_result.clone()),
+        Some("_querymt/session/runtimeState") => runtime("idle", false),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "prompt",
+            "--delivery",
+            "prompt",
+            "session-1",
+            "text",
+        ]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    server.finish().await;
+    events(&output).last().unwrap().clone()
+}
+
+#[tokio::test]
+async fn prompt_result_shows_turn_usage() {
+    let done = prompt_done(json!({
+        "stopReason": "end_turn",
+        "usage": {
+            "totalTokens": 1500, "inputTokens": 1200, "outputTokens": 300,
+            "cachedReadTokens": 40,
+        },
+    }))
+    .await;
+    assert_eq!(done["type"], "done");
+    assert_eq!(
+        done["usage"],
+        json!({
+            "available": true,
+            "totalTokens": 1500, "inputTokens": 1200, "outputTokens": 300,
+            "cachedReadTokens": 40,
+        })
+    );
+}
+
+#[tokio::test]
+async fn prompt_result_without_usage() {
+    let done = prompt_done(json!({"stopReason": "end_turn"})).await;
+    assert_eq!(done["type"], "done");
+    // Absent, not zero counts.
+    assert_eq!(done["usage"], json!({"available": false}));
+}
+
+fn cursor_notification(session: &str, cursor: &str, forkable: bool) -> Value {
+    let mut update = json!({
+        "sessionUpdate": "cursor_update", "cursorId": cursor,
+        "anchor": {"type": "agent_message", "messageId": "msg-1", "position": "after"},
+    });
+    if forkable {
+        update["capabilities"] = json!({"fork": {}});
+    }
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session, "update": update,
+    }})
+}
+
+#[tokio::test]
+async fn announced_cursors_are_reported_and_recorded() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/load" => Reply::WithNotifications(
+            vec![
+                cursor_notification("s", "cur-1", true),
+                // The same anchor announced again is recorded once.
+                cursor_notification("s", "cur-1", true),
+                cursor_notification("s", "cur-2", false),
+            ],
+            json!({}),
+        ),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "inspect", "s"]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let result = events(&output).pop().unwrap();
+    let cursors = result["cursors"].as_array().expect("recorded cursors");
+    assert_eq!(cursors.len(), 2, "{cursors:?}");
+    assert_eq!(cursors[0]["type"], "cursor");
+    assert_eq!(cursors[0]["sessionId"], "s");
+    assert_eq!(cursors[0]["cursorId"], "cur-1");
+    assert_eq!(cursors[0]["forkable"], true);
+    assert_eq!(cursors[0]["anchor"]["messageId"], "msg-1");
+    assert_eq!(cursors[1]["cursorId"], "cur-2");
+    assert_eq!(cursors[1]["forkable"], false);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn fork_at_a_cursor() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/fork" => {
+            assert_eq!(request["params"]["sessionId"], "s");
+            assert_eq!(request["params"]["cursorId"], "cur-1");
+            Reply::Result(json!({"sessionId": "forked-1"}))
+        }
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "fork",
+            "s",
+            "--cursor",
+            "cur-1",
+            "--cwd",
+            "/tmp",
+        ]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let result = events(&output).pop().unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["sessionId"], "forked-1");
+    assert_eq!(result["forkedFrom"], "s");
+    assert_eq!(result["cursorId"], "cur-1");
+    let requests = server.finish().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "session/fork")
+    );
+}
+
+#[tokio::test]
+async fn fork_without_a_cursor_sends_none() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/fork" => {
+            assert!(request["params"].get("cursorId").is_none(), "{request}");
+            Reply::Result(json!({"sessionId": "forked-2"}))
+        }
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "fork",
+            "s",
+            "--cwd",
+            "/tmp",
+        ]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(events(&output).pop().unwrap()["sessionId"], "forked-2");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_cursor_error_is_surfaced() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/fork" => Reply::Error(-32602, "cursor is not forkable"),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "fork",
+            "s",
+            "--cursor",
+            "bad",
+            "--cwd",
+            "/tmp",
+        ]),
+        None,
+    )
+    .await;
+    // The RPC error classification, with the agent's code in the report.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let report = events(&output).pop().unwrap();
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["code"], 3);
+    let message = report["error"].as_str().unwrap();
+    assert!(message.contains("-32602"), "{message}");
+    assert!(message.contains("cursor is not forkable"), "{message}");
     server.finish().await;
 }

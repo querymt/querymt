@@ -1,0 +1,280 @@
+{
+  "name": "run_state",
+  "batches": [
+    [
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "running",
+            "runId": "r1"
+          },
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "user_message_chunk",
+              "messageId": "u1",
+              "content": {
+                "type": "text",
+                "text": "lorem"
+              },
+              "_meta": {
+                "querymt": {
+                  "runId": "r1"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "t1",
+              "title": "shell",
+              "status": "in_progress",
+              "_meta": {
+                "querymt": {
+                  "runId": "r1"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ],
+    [
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "requires_action",
+            "runId": "r1"
+          },
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "running",
+            "runId": "r1"
+          },
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "idle",
+            "runId": "r1",
+            "stopReason": "end_turn"
+          },
+          "at_ms": 0
+        }
+      }
+    ],
+    [
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "running",
+            "runId": "sched-1"
+          },
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-sched",
+              "content": {
+                "type": "text",
+                "text": "ipsum"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "state_update",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "state": "idle",
+            "runId": "sched-1",
+            "stopReason": "end_turn"
+          },
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "run-r1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      },
+      {
+        "added": [],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      },
+      {
+        "added": [
+          "run-sched-1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": false,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 2,
+      "runState": "idle",
+      "activeRunId": null,
+      "activeToolCallId": null,
+      "lastStopReason": "end_turn",
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "accounting": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "availableCommands": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "subagents": [],
+      "cursors": [],
+      "runtime": null,
+      "activeTime": {
+        "totalMs": 0,
+        "activeSinceMs": null
+      },
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "run-r1",
+      "run-sched-1"
+    ],
+    "turns": [
+      {
+        "id": "run-r1",
+        "revision": 2,
+        "entries": [
+          {
+            "id": "user-u1",
+            "revision": 1,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u1",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "lorem"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          },
+          {
+            "id": "tool-t1",
+            "revision": 2,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t1",
+                "title": "shell",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": null,
+                "rawOutput": null,
+                "content": [],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": null
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "run-sched-1",
+        "revision": 3,
+        "entries": [
+          {
+            "id": "assistant-m-sched",
+            "revision": 3,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "m-sched",
+                "text": "ipsum"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

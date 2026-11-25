@@ -1,50 +1,56 @@
 use crate::agent::LocalAgentHandle;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::history_window::{
-    HistoryInfo, LoadWindow, SessionHistorySummary, TruncatedEntry, read_window, summarize_history,
+    LoadWindow, read_window, summarize_events, summarize_history,
 };
 use crate::session::projection::{AuditView, ViewStore};
+use crate::session::store::RemoteSessionBookmark;
 use querymt_agent_core::events::AgentEvent;
 pub use querymt_agent_core::session::prompt_records::UserPromptRecord;
 pub(crate) use querymt_agent_core::session::prompt_records::{
     filter_prompt_records, user_prompt_records,
 };
 pub use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use typeshare::typeshare;
 
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionLoadSnapshot {
-    #[serde(rename = "runtimeStatus")]
-    pub runtime_status: crate::agent::messages::SessionRuntimeStatus,
-    pub audit: AuditView,
-    pub cursor: StreamCursor,
-    /// Authoritative replacement accounting at `cursor`, reduced from the same
-    /// audit events by the shared accounting reducer. Present even when
-    /// historical replay is skipped or the context limit is unknown.
-    #[typeshare(serialized_as = "AccountingSnapshot")]
-    pub accounting: querymt_agent_services::accounting::AccountingSnapshot,
-    #[serde(rename = "delegationUpdates")]
-    pub delegation_updates:
-        Vec<querymt_agent_core::delegation_update::DelegationUpdateNotification>,
-    #[serde(
-        default,
-        rename = "userPrompts",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub user_prompts: Option<Vec<UserPromptRecord>>,
-    /// Present only for windowed loads: where the returned events sit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history: Option<HistoryInfo>,
-    /// Present only for windowed loads: whole-session state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<SessionHistorySummary>,
-    /// Present only for windowed loads that shortened tool content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<Vec<TruncatedEntry>>,
+pub use querymt_agent_protocol_types::session::load_snapshot::SessionLoadSnapshot;
+
+/// The ACP `subagent_update` of each delegation that has a child session.
+fn subagent_updates(
+    delegation_updates: &[crate::control::delegation_notifications::DelegationUpdateNotification],
+) -> Vec<crate::acp::protocol::SubagentUpdate> {
+    delegation_updates
+        .iter()
+        .filter_map(crate::acp::shared::subagent_update_from_snapshot)
+        .collect()
+}
+
+/// The `cursor_update`s of the snapshot's events, announced once each.
+///
+/// Always computed with compaction cursors: the transport narrows them to the
+/// connection's negotiated capabilities before the snapshot leaves the agent
+/// (see `acp::shared::scope_cursor_updates`).
+fn cursor_updates(events: &[AgentEvent]) -> Vec<crate::acp::protocol::CursorUpdate> {
+    querymt_agent_core::replay::session_cursor_updates(events, true)
+}
+
+/// Fold the delegation state the runtime observes right now into the
+/// journal-derived `updates`: a live delegation replaces its journaled state,
+/// a new one is appended.
+fn merge_live_delegations(
+    updates: &mut Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
+    live: &[crate::control::delegation_notifications::DelegationUpdateNotification],
+) {
+    for live in live {
+        match updates
+            .iter_mut()
+            .find(|entry| entry.delegation_id == live.delegation_id)
+        {
+            Some(previous) => *previous = live.clone(),
+            None => updates.push(live.clone()),
+        }
+    }
 }
 
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
@@ -106,15 +112,27 @@ pub async fn load_session_snapshot_windowed(
     session_id: &str,
     window: Option<LoadWindow>,
 ) -> SessionResult<SessionLoadSnapshot> {
-    if let Some(window) = window {
-        return windowed_snapshot(agent, view_store, session_id, window.clamped()).await;
-    }
     let bookmark = agent
         .config
         .provider
         .history_store()
         .get_remote_session_bookmark(session_id)
         .await?;
+    load_session_snapshot_with_bookmark(agent, view_store, session_id, window, bookmark).await
+}
+
+/// [`load_session_snapshot_windowed`] for a caller that already read the
+/// session's remote bookmark (`None` for a local session).
+pub(crate) async fn load_session_snapshot_with_bookmark(
+    agent: &LocalAgentHandle,
+    view_store: Arc<dyn ViewStore>,
+    session_id: &str,
+    window: Option<LoadWindow>,
+    bookmark: Option<RemoteSessionBookmark>,
+) -> SessionResult<SessionLoadSnapshot> {
+    if let Some(window) = window {
+        return windowed_snapshot(agent, view_store, session_id, window.clamped(), bookmark).await;
+    }
     let journal_backed = bookmark.is_some();
     let mut positions = None;
     let audit = if let Some(bookmark) = bookmark {
@@ -137,7 +155,16 @@ pub async fn load_session_snapshot_windowed(
             event.seq = position;
         }
     }
-    let accounting = querymt_agent_services::accounting::AccountingSnapshot::from_events(
+    // The whole-session summary is part of every snapshot, windowed or not.
+    // It is the same pass the windowed path runs (no window start), over the
+    // events this snapshot already holds, each at its history position: one
+    // read, so the summary and the events describe the same cut.
+    let summary = summarize_events(
+        session_id,
+        audit.events.iter().map(|event| (event.seq, event)),
+    )
+    .summary;
+    let accounting = querymt_agent_services::accounting::snapshot_from_events(
         session_id,
         audit.events.iter().map(|event| &event.kind),
     );
@@ -150,16 +177,7 @@ pub async fn load_session_snapshot_windowed(
         .unwrap_or_else(|| {
             crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
         });
-    for live in &runtime_status.delegation_activity {
-        if let Some(previous) = delegation_updates
-            .iter_mut()
-            .find(|entry| entry.delegation_id == live.delegation_id)
-        {
-            *previous = live.clone();
-        } else {
-            delegation_updates.push(live.clone());
-        }
-    }
+    merge_live_delegations(&mut delegation_updates, &runtime_status.delegation_activity);
     // Journal-backed sessions (remote attached, or merely bookmarked while
     // offline) live on their peer and have no local history rows, so
     // the prompt read reports `SessionNotFound`. Treat that as no user prompt
@@ -183,13 +201,15 @@ pub async fn load_session_snapshot_windowed(
     };
     Ok(SessionLoadSnapshot {
         runtime_status,
-        audit,
         cursor,
         accounting,
+        subagent_updates: subagent_updates(&delegation_updates),
         delegation_updates,
+        cursor_updates: cursor_updates(&audit.events),
+        audit,
         user_prompts: Some(prompts),
         history: None,
-        summary: None,
+        summary: Some(summary),
         truncated: None,
     })
 }
@@ -199,11 +219,9 @@ async fn windowed_snapshot(
     view_store: Arc<dyn ViewStore>,
     session_id: &str,
     window: LoadWindow,
+    bookmark: Option<RemoteSessionBookmark>,
 ) -> SessionResult<SessionLoadSnapshot> {
     let history_store = agent.config.provider.history_store();
-    let bookmark = history_store
-        .get_remote_session_bookmark(session_id)
-        .await?;
     let journal_backed = bookmark.is_some();
     let journal = agent.config.event_sink.journal().clone();
     let source_node = bookmark.as_ref().map(|bookmark| bookmark.node_id.clone());
@@ -271,16 +289,7 @@ async fn windowed_snapshot(
     audit.events = read.events;
 
     let mut delegation_updates = pass.delegation_updates;
-    for live in &runtime_status.delegation_activity {
-        if let Some(previous) = delegation_updates
-            .iter_mut()
-            .find(|entry| entry.delegation_id == live.delegation_id)
-        {
-            *previous = live.clone();
-        } else {
-            delegation_updates.push(live.clone());
-        }
-    }
+    merge_live_delegations(&mut delegation_updates, &runtime_status.delegation_activity);
     // A window that covers the whole session carries every prompt; otherwise
     // only the prompts of the window's own prompt events (older ones arrive
     // with their events).
@@ -295,10 +304,12 @@ async fn windowed_snapshot(
     };
     Ok(SessionLoadSnapshot {
         runtime_status,
-        audit,
         cursor: pass.cursor,
         accounting: pass.accounting,
+        subagent_updates: subagent_updates(&delegation_updates),
         delegation_updates,
+        cursor_updates: cursor_updates(&audit.events),
+        audit,
         user_prompts: Some(prompts),
         history: Some(read.history),
         summary: Some(pass.summary),
@@ -862,6 +873,164 @@ mod tests {
             .unwrap();
         let expected: Vec<String> = (0..30).map(|i| format!("prompt-{i}")).collect();
         assert_eq!(prompt_ids(&snapshot), expected);
+    }
+
+    fn cursor_ids(snapshot: &SessionLoadSnapshot) -> Vec<String> {
+        snapshot
+            .cursor_updates
+            .iter()
+            .map(|update| update.cursor_id.to_string())
+            .collect()
+    }
+
+    /// The cursor ids history replay announces for `events`.
+    fn replayed_cursor_ids(events: &[querymt_agent_core::events::AgentEvent]) -> Vec<String> {
+        let capabilities = crate::acp::shared::AcpSessionUpdateCapabilities {
+            cursors: true,
+            compaction: true,
+            ..Default::default()
+        };
+        crate::acp::shared::replay_agent_events_materialized(
+            "s",
+            events.to_vec(),
+            &Default::default(),
+            &capabilities,
+        )
+        .into_iter()
+        .filter_map(|notification| match notification.update {
+            crate::acp::protocol::SessionUpdate::CursorUpdate(update) => {
+                Some(update.cursor_id.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_carries_the_cursors_history_replay_announces() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 5, None).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        let expected: Vec<String> = (0..5).map(|i| format!("m:prompt-{i}")).collect();
+        assert_eq!(cursor_ids(&snapshot), expected);
+        assert_eq!(
+            cursor_ids(&snapshot),
+            replayed_cursor_ids(&snapshot.audit.events)
+        );
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["cursorUpdates"][0]["cursorId"], "m:prompt-0");
+        assert!(value["cursorUpdates"][0].get("sessionUpdate").is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_the_windows_cursors() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 30, None).await;
+        let snapshot = windowed(&f, &sid, 3).await;
+        let in_window: Vec<String> = super::prompt_message_ids(&snapshot.audit.events)
+            .into_iter()
+            .map(|id| format!("m:{id}"))
+            .collect();
+        assert!(!in_window.is_empty() && in_window.len() < 30);
+        assert_eq!(cursor_ids(&snapshot), in_window);
+        assert_eq!(
+            cursor_ids(&snapshot),
+            replayed_cursor_ids(&snapshot.audit.events)
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_history_has_no_cursor_key() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 0, None).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert!(value.get("cursorUpdates").is_none(), "{value}");
+    }
+
+    /// Add a model selection and one request with usage to a session.
+    async fn seed_usage(f: &crate::session::run_reconcile::tests::Fixture, sid: &str) {
+        use crate::session::run_reconcile::tests::seed;
+        use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics};
+
+        seed(
+            &f.storage,
+            sid,
+            AgentEventKind::ProviderChanged {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                config_id: 1,
+                context_limit: Some(200_000),
+                provider_node_id: None,
+            },
+        )
+        .await;
+        seed(
+            &f.storage,
+            sid,
+            AgentEventKind::LlmRequestEnd {
+                usage: Some(querymt::Usage {
+                    input_tokens: 1_200,
+                    output_tokens: 80,
+                    reasoning_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_tiers: None,
+                }),
+                tool_calls: 0,
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: 1_280,
+                metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                accounting: None,
+                prefix_change: None,
+                idle_secs: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn load_without_a_window_has_a_summary() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 3, None).await;
+        seed_usage(&f, &sid).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        assert!(snapshot.history.is_none(), "no window was requested");
+        let summary = snapshot.summary.expect("every snapshot has a summary");
+        assert_eq!(summary.usage.request_count, 1);
+        assert_eq!(summary.usage.context_tokens, Some(1_280));
+        let totals = summary.usage.session_totals.expect("token totals");
+        assert_eq!(totals.input_tokens, 1_200);
+        let provider = summary.provider.expect("current model");
+        assert_eq!(provider.model, "mock-model");
+        assert_eq!(provider.context_limit, Some(200_000));
+    }
+
+    #[tokio::test]
+    async fn same_summary_with_and_without_a_window() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 3, None).await;
+        seed_usage(&f, &sid).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let plain = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        // A window that covers the whole session.
+        let windowed = windowed(&f, &sid, 20).await;
+        assert!(windowed.history.as_ref().unwrap().complete);
+        assert_eq!(plain.summary, windowed.summary);
+        assert!(plain.summary.is_some());
     }
 
     #[tokio::test]

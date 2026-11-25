@@ -1683,6 +1683,12 @@ pub(crate) fn spawn_event_forwarders(
         loop {
             let batch = tokio::select! {
                 _ = connection_cancel.cancelled() => break,
+                _ = delivery.released_load() => {
+                    if forward_released_loads(&state, &connection, &translator).await {
+                        continue;
+                    }
+                    break;
+                }
                 result = events.recv() => match result {
                     Ok(event) => delivery.admit(event).await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1713,6 +1719,45 @@ pub(crate) fn spawn_event_forwarders(
             }
         }
     });
+}
+
+/// Deliver what finished loads held back: the current run state and the
+/// in-flight text first, then the held events the load's answer does not
+/// contain, in order.
+async fn forward_released_loads(
+    state: &WsServerState,
+    connection: &ConnectionEventState,
+    translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
+) -> bool {
+    for released in connection.delivery.take_released() {
+        let (state_update, updates) = translator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released_load_prelude(&released.session_id, released.inflight.as_ref());
+        if let Some(update) = state_update {
+            let json =
+                serde_json::to_string(&crate::acp::shared::state_update_notification(&update))
+                    .unwrap_or_default();
+            if connection.tx.send(json).await.is_err() {
+                return false;
+            }
+        }
+        for update in updates {
+            let json = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": released.session_id, "update": update},
+            })
+            .to_string();
+            if connection.tx.send(json).await.is_err() {
+                return false;
+            }
+        }
+        if !forward_admitted(state, connection, translator, released.events).await {
+            return false;
+        }
+    }
+    true
 }
 
 async fn refresh_session_observations(
@@ -1780,6 +1825,11 @@ async fn forward_admitted(
     batch: Vec<crate::acp::delivery::Admitted>,
 ) -> bool {
     for admitted in batch {
+        // A load in progress holds the event; a finished load's answer may
+        // already contain it.
+        let Some(admitted) = connection.delivery.intercept(admitted) else {
+            continue;
+        };
         let crate::acp::delivery::Admitted { event, guard } = admitted;
         let keep_going = forward_session_event(state, connection, translator, event).await;
         drop(guard);
@@ -1813,6 +1863,20 @@ pub(super) async fn forward_session_event(
     }
     if !is_event_owned(&state.session_owners, &connection.conn_id, &event).await {
         return true;
+    }
+
+    // Run state first: it orders with the session updates of the same run and
+    // is derived from every event, including the waits handled below.
+    let state_update = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .translate_state_update(&event);
+    if let Some(update) = state_update {
+        let json = serde_json::to_string(&crate::acp::shared::state_update_notification(&update))
+            .unwrap_or_default();
+        if connection.tx.send(json).await.is_err() {
+            return false;
+        }
     }
 
     if matches!(

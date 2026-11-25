@@ -1,0 +1,343 @@
+{
+  "name": "delegation",
+  "batches": [
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "del0",
+              "title": "delegate",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child0",
+              "title": "coder",
+              "description": "lorem d0",
+              "state": {
+                "state": "running"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d0",
+                  "stage": "verifying"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del0",
+              "content": [
+                {
+                  "type": "session",
+                  "sessionId": "child0"
+                }
+              ]
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child0",
+              "title": "coder",
+              "description": "lorem d0",
+              "state": {
+                "state": "idle"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d0"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del0",
+              "status": "completed"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "del1",
+              "title": "delegate",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child1",
+              "title": "coder",
+              "description": "lorem d1",
+              "state": {
+                "state": "running"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d1",
+                  "stage": "verifying"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del1",
+              "content": [
+                {
+                  "type": "session",
+                  "sessionId": "child1"
+                }
+              ]
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "subagent_update",
+              "sessionId": "child1",
+              "title": "coder",
+              "description": "lorem d1",
+              "state": {
+                "state": "idle"
+              },
+              "_meta": {
+                "querymt": {
+                  "delegationId": "d1"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "del1",
+              "status": "failed"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "turn-live-1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 2,
+      "runState": "thinking",
+      "activeRunId": null,
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "accounting": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "availableCommands": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "subagents": [
+        {
+          "sessionId": "child0",
+          "title": "coder",
+          "description": "lorem d0",
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": {
+            "querymt": {
+              "delegationId": "d0"
+            }
+          }
+        },
+        {
+          "sessionId": "child1",
+          "title": "coder",
+          "description": "lorem d1",
+          "state": "idle",
+          "stage": null,
+          "capabilities": null,
+          "cwd": null,
+          "additionalDirectories": null,
+          "meta": {
+            "querymt": {
+              "delegationId": "d1"
+            }
+          }
+        }
+      ],
+      "cursors": [],
+      "runtime": null,
+      "activeTime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "turn-live-1"
+    ],
+    "turns": [
+      {
+        "id": "turn-live-1",
+        "revision": 8,
+        "entries": [
+          {
+            "id": "tool-del0",
+            "revision": 4,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "del0",
+                "title": "delegate",
+                "kind": "other",
+                "status": "completed",
+                "rawInput": null,
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "session",
+                    "sessionId": "child0"
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child0"
+              }
+            }
+          },
+          {
+            "id": "tool-del1",
+            "revision": 8,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "del1",
+                "title": "delegate",
+                "kind": "other",
+                "status": "failed",
+                "rawInput": null,
+                "rawOutput": null,
+                "content": [
+                  {
+                    "type": "session",
+                    "sessionId": "child1"
+                  }
+                ],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child1"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -9,6 +9,7 @@
 #                    tests everything when F_ANY is true; a pull_request tests only
 #                    the packages its changes reach
 #   F_SHARED         a shared input changed (querymt, utils, Cargo.lock, CI config, ...)
+#   F_PROTOCOL       crates/agent-protocol-types
 #   F_CORE           crates/agent-core
 #   F_INDEX          crates/agent-index
 #   F_KNOWLEDGE      crates/agent-knowledge
@@ -21,6 +22,7 @@
 #   F_DOCS           docs and test data that services/runtime tests read by path
 #
 # Dependency edges (Cargo.toml, dev-dependencies included):
+#   protocol  <- everything (core re-exports it)
 #   core      <- everything
 #   index     <- knowledge, services, runtime, agent
 #   knowledge <- services, runtime, agent
@@ -35,7 +37,7 @@ set -euo pipefail
 AGENT_FEATURES="dashboard,oauth,zbus-secret-service,systemd-credentials,remote"
 RUNTIME_FEATURES="remote,oauth,plugin-loaders,api"
 
-PKGS="core index knowledge sqlite services runtime agent"
+PKGS="protocol core index knowledge sqlite services runtime agent"
 
 # flag NAME -> true when the F_NAME input is "true"
 flag() {
@@ -53,13 +55,13 @@ mark() {
 
 event="${EVENT_NAME:-pull_request}"
 anything=false
-for n in SHARED CORE INDEX KNOWLEDGE SQLITE SERVICES RUNTIME AGENT AGENT_READ CORPUS DOCS; do
+for n in SHARED PROTOCOL CORE INDEX KNOWLEDGE SQLITE SERVICES RUNTIME AGENT AGENT_READ CORPUS DOCS; do
   if flag "$n"; then anything=true; fi
 done
 everything=false
 if [[ $event == workflow_dispatch ]]; then everything=true; fi
 if [[ $event != pull_request && $anything == true ]]; then everything=true; fi
-if flag SHARED || flag CORE; then everything=true; fi
+if flag SHARED || flag PROTOCOL || flag CORE; then everything=true; fi
 if [[ $everything == true ]]; then
   # shellcheck disable=SC2086
   mark $PKGS
@@ -74,8 +76,20 @@ if flag AGENT_READ; then mark runtime agent; fi
 if flag CORPUS; then mark agent; fi
 if flag DOCS; then mark services runtime agent; fi
 
-pkg_name() { if [[ $1 == agent ]]; then echo querymt-agent; else echo "querymt-agent-$1"; fi; }
-pkg_dir() { if [[ $1 == agent ]]; then echo crates/agent/; else echo "crates/agent-$1/"; fi; }
+pkg_name() {
+  case $1 in
+    agent) echo querymt-agent ;;
+    protocol) echo querymt-agent-protocol-types ;;
+    *) echo "querymt-agent-$1" ;;
+  esac
+}
+pkg_dir() {
+  case $1 in
+    agent) echo crates/agent/ ;;
+    protocol) echo crates/agent-protocol-types/ ;;
+    *) echo "crates/agent-$1/" ;;
+  esac
+}
 
 # "a,b,c" -> "pkg/a,pkg/b,pkg/c"
 qualify() {
@@ -94,7 +108,7 @@ for p in $PKGS; do
   any=true
   test_args+=" -p $(pkg_name "$p")"
   codecov_specs+=" $(pkg_name "$p")=$(pkg_dir "$p")"
-  case $p in core | index | knowledge | sqlite | services) lower_args+=" -p $(pkg_name "$p")" ;; esac
+  case $p in protocol | core | index | knowledge | sqlite | services) lower_args+=" -p $(pkg_name "$p")" ;; esac
 done
 
 # `pkg/feature` keeps --features valid for a multi-package selection.
@@ -121,6 +135,9 @@ sa() {
   for c in "${@:2}"; do joined+="${joined:+|}$c"; done
   standalone="$(jq -c --arg n "$1" --arg c "$joined" '. + [{name: $n, checks: $c}]' <<<"$standalone")"
 }
+# The protocol types also build for the browser (wasm32-unknown-unknown).
+sa protocol "-p querymt-agent-protocol-types --no-default-features" "-p querymt-agent-protocol-types --features test-support" \
+  "-p querymt-agent-protocol-types --target wasm32-unknown-unknown"
 sa core "-p querymt-agent-core --no-default-features" "-p querymt-agent-core --features test-support"
 sa index "-p querymt-agent-index --no-default-features"
 sa knowledge "-p querymt-agent-knowledge --no-default-features"

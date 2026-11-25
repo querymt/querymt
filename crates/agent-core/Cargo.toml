@@ -11,13 +11,14 @@ path = "src/lib.rs"
 
 [features]
 # Mocks and sample values for tests in the layers above (design D6).
-test-support = ["dep:mockall"]
+test-support = ["dep:mockall", "querymt-agent-protocol-types/test-support"]
 
 [dependencies]
 # `default-features = false`: core uses only `chat`, `providers` and `error`,
 # so this keeps `querymt/mcp` and `rmcp` out of the bottom layer.
 querymt = { path = "../querymt", default-features = false }
 agent-client-protocol = { workspace = true }
+querymt-agent-protocol-types = { path = "../agent-protocol-types" }
 anyhow = { workspace = true }
 async-trait.workspace = true
 base64.workspace = true

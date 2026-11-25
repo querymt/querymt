@@ -101,6 +101,14 @@ impl EventSink {
         self.fanout.live_delegation_activity(session_id)
     }
 
+    #[doc(hidden)]
+    pub fn running_delegation_for_child(
+        &self,
+        child_session_id: &str,
+    ) -> Option<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.fanout.running_delegation_for_child(child_session_id)
+    }
+
     /// The ordered emit handle of a session, created on first use.
     ///
     /// All emitters of one session (actor, execution task, delegation,

@@ -49,7 +49,81 @@
   providers implement it. The plugin contract is unchanged, so an Extism
   provider reports `None`.
 
+- **ACP: subagent updates for delegations.** For a client that advertises
+  `clientCapabilities.subagents`, a delegated child session is announced on the
+  parent session with a `subagent_update` (title = target agent, description =
+  objective, `running` while the delegation executes, verifies or finalizes,
+  `idle` once it ends, `_meta.querymt.stage`, model, node and timestamps), before
+  any event of the child. The delegate tool call gains a `session` reference to
+  the child. Load snapshots carry `subagentUpdates` and `session/load` replays one
+  `subagent_update` per child. The `querymt/session/delegationUpdate`
+  notification and `delegationUpdates` are still sent for now, and are removed
+  with the desktop switch.
+
+- **ACP: session cursors and fork at a cursor.** For a client that advertises
+  `clientCapabilities.session.cursors`, the agent sends a `cursor_update` after
+  each user message, agent message, thought, tool call and compaction, live and
+  on replay. Ids are derived from the anchor, so they are the same after a
+  reconnect or restart. `session/fork` accepts `cursorId` (messages only; an
+  unknown, foreign or non-forkable cursor is `-32602` and creates no session),
+  which takes precedence over `_meta.querymt.message_id`. Forking a remote-hosted
+  session is now done by its owner node. The load snapshot
+  (`querymt/sessionLoadSnapshot.v1`) and each `querymt/session/history` page
+  carry the cursors of the events they hold in `cursorUpdates`, with the ids
+  replay announces; a client without `session.cursors` gets no `cursorUpdates`,
+  and one without `compaction` gets no compaction cursors.
+
+- **ACP: `PromptResponse.usage`.** `session/prompt` reports the token counts of
+  the execution cycle that answered the prompt (input, output, reasoning, cache
+  read and write, and their sum), on every stop reason, and omits it when no
+  provider reported usage.
+
+- **ACP: `session/cancel` on a delegation child.** Cancelling a child session
+  while its delegation runs cancels that delegation, as a cancel requested by the
+  agent does.
+
 ### Behavior changes
+
+- **BREAKING (ACP): a delegation that fails or is cancelled fails its delegate
+  tool call.** The delegate tool call ends `completed` when the delegation is
+  accepted. For a client that advertises `subagents`, a delegation that later
+  fails or is cancelled now sends a final `tool_call_update` with status
+  `failed` for that call, live and on replay. Clients without the capability see
+  no change.
+
+- **BREAKING (ACP): a `session/fork` of a remote-hosted session, and a fork
+  `message_id` that is not in the source session.** A fork of a session hosted
+  on another mesh node is created by that node and recorded locally as a remote
+  session; it used to fail with `source session not found`. Workspace options in
+  the fork's `_meta.querymt.sessionWorkspace` are rejected with `-32602` for a
+  remote source. A `_meta.querymt.message_id` that is not a message of the source
+  session is rejected with `-32602`; before, the store accepted a message of
+  another session.
+
+- **Active time is run time, in the summary and on state updates.** The
+  whole-session summary of a load snapshot carries `activeMs`: the sum, over
+  the session's ended runs, of the time from `RunStarted` to `RunCompleted`
+  (paired by run id, over the whole journal; a run still active is reported
+  by the runtime status's `run_started_at_ms`). `querymt/session/stateUpdate`
+  carries `atMs`, the event's timestamp in milliseconds, on every transition
+  the agent derives from an event; the current-state sync after a load has
+  none. The session reducer reports both as `SessionHeader.active_time`.
+
+- **A replayed compaction is sent where it happened.** On a load without a
+  snapshot the agent used to send every finished compaction before the whole
+  conversation. It now sends each one at the position of the event that
+  settled it, between the messages around it. A compaction without an id is
+  still paired with its start, and the todo-list, tool-kind and workspace
+  announcement rules are one projection
+  (`querymt_agent_protocol_types::replay`) shared with the session reducer.
+
+- **Compaction updates carry their token counts.** Live, in a history replay
+  and in a load snapshot's projection, a `compaction_update` has
+  `_meta.querymt.compaction.tokensBefore` (the last context measurement before
+  the compaction started, or its token estimate when there is none) and, once
+  known, `tokensAfter`. A count that is not known is omitted. The session
+  reducer merges `_meta` key by key, so a later update that adds `tokensAfter`
+  keeps `tokensBefore` and the run id.
 
 - **The replay identity of a stored reply comes from the provider.** The agent
   used to complete the protocol and endpoint a reply is replayed against from

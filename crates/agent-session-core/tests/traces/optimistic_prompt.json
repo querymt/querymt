@@ -1,0 +1,136 @@
+{
+  "name": "optimistic_prompt",
+  "batches": [
+    [
+      {
+        "type": "prompt_optimistic",
+        "data": {
+          "client_prompt_id": "c1",
+          "blocks": [
+            {
+              "type": "text",
+              "text": "lorem ipsum"
+            }
+          ],
+          "at_ms": 10
+        }
+      }
+    ],
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "user_message_chunk",
+              "messageId": "u-echo",
+              "content": {
+                "type": "text",
+                "text": "lorem ipsum"
+              },
+              "_meta": {
+                "querymt": {
+                  "client_prompt_id": "c1"
+                }
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "pending-c1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      },
+      {
+        "added": [
+          "turn-u-echo"
+        ],
+        "updated": [],
+        "removed": [
+          "pending-c1"
+        ],
+        "headerChanged": false,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 2,
+      "runState": "submitting",
+      "activeRunId": null,
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "accounting": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "availableCommands": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "subagents": [],
+      "cursors": [],
+      "runtime": null,
+      "activeTime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "turn-u-echo"
+    ],
+    "turns": [
+      {
+        "id": "turn-u-echo",
+        "revision": 3,
+        "entries": [
+          {
+            "id": "user-u-echo",
+            "revision": 3,
+            "kind": {
+              "type": "user_message",
+              "data": {
+                "messageId": "u-echo",
+                "clientPromptId": null,
+                "blocks": [
+                  {
+                    "type": "text",
+                    "text": "lorem ipsum"
+                  }
+                ],
+                "status": "sent",
+                "error": null,
+                "atMs": null
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

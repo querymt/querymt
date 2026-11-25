@@ -1095,6 +1095,12 @@ let response = agent
     .await?;
 ```
 
+The fork is created on the node that owns the source session, so it is a remote session too. The owner resolves the target with the same rules as a local fork: an explicit message must belong to the source session, otherwise the request fails with `-32602` and nothing is created.
+
+ACP clients get the same behaviour from `session/fork`: for a session hosted on another node the request is sent to its owner (with `cursorId`, when given), and the returned fork is attached on the forking node, so it can be loaded like any remote session. The owner's refusals (an invalid target, a read-only source) come back with the same error code and data as a local fork. Workspace options in the request's `_meta` are not carried over the mesh and the request is rejected with `-32602` instead of silently forking without them. See [session cursors and fork at a cursor](api_reference.md#session-cursors-and-fork-at-a-cursor).
+
+A node that runs an older build cannot decode a fork request that has a cursor or no target, so such a request fails instead of forking elsewhere; a request with only a message id works with both.
+
 **Use cases:**
 - **Branching conversations**: Try different approaches from same starting point
 - **Experimentation**: Fork to test risky changes without affecting original

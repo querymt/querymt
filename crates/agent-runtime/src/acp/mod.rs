@@ -10,13 +10,20 @@ pub mod cwd;
 pub mod delivery;
 pub use querymt_agent_core::protocol;
 pub mod shared;
+mod snapshot_view;
 #[doc(hidden)]
 pub mod stdio;
 #[doc(hidden)]
 pub mod trace_context;
 
 #[cfg(test)]
+mod cursor_updates_tests;
+#[cfg(test)]
+mod session_core_conformance;
+#[cfg(test)]
 mod session_load_snapshot_tests;
+#[cfg(test)]
+mod subagent_updates_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;

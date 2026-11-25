@@ -654,6 +654,107 @@ pub struct RpcResponse {
 }
 ```
 
+### Turn usage on `session/prompt`
+
+The `session/prompt` response carries `usage` with the token counts of the execution cycle that answered the prompt:
+
+| Field | Meaning |
+|---|---|
+| `inputTokens` | input tokens of every provider request in the cycle |
+| `outputTokens` | output tokens |
+| `thoughtTokens` | reasoning tokens |
+| `cachedReadTokens` | cache-read tokens |
+| `cachedWriteTokens` | cache-write tokens |
+| `totalTokens` | sum of the five categories above |
+
+- **Per cycle, not per session.** Although the ACP schema describes these counts as "across session", QueryMT reports the usage of the prompt that was just answered. A second prompt in the same session starts from zero. For session totals use the `usage_update` accounting described above.
+- **Omitted when unknown.** When no provider attempt in the cycle reported token usage, `usage` is left out of the response rather than reported as zero. A cycle whose providers genuinely reported zero tokens is indistinguishable from this case and is also omitted.
+- **Every stop reason.** The field is set for end of turn, cancelled, refusal, budget or price limit, and compaction-only (`/compact`) responses, and counts what was incurred up to that point (a cancelled turn reports the requests that had already settled).
+- The counts come from the cycle's settled accounting attempts (the same ledger as the cost accounting above), so they agree with the cycle's recorded spend.
+
+```json
+{
+  "stopReason": "end_turn",
+  "usage": {
+    "totalTokens": 1800,
+    "inputTokens": 1500,
+    "outputTokens": 300,
+    "thoughtTokens": 0,
+    "cachedReadTokens": 0,
+    "cachedWriteTokens": 0
+  }
+}
+```
+
+### Session cursors and fork at a cursor
+
+A client that advertises `clientCapabilities.session.cursors` receives a `cursor_update` for each position it can address in a session's timeline. Clients that omit the capability (or send `null`) receive none, live or replayed.
+
+A `cursor_update` is sent **after** the entity it is anchored to, with `position: "after"`, once the entity's own update has been sent:
+
+| Anchor | Announced when | Forkable |
+|---|---|---|
+| `user_message` | the prompt is stored | yes |
+| `agent_message` | the assistant message is stored | yes |
+| `agent_thought` | the assistant message that holds the thought is stored | no |
+| `tool_call` | the tool call has finished | no |
+| `compaction` | a compaction completes (only to clients that also advertise `compaction`, since it follows that update) | no |
+
+- **Opaque ids.** A cursor id is an opaque string. Clients must only echo ids the agent announced and must not parse or build them. The agent derives each id from the anchored entity, so the same anchor has the same id live, on `session/load` replay, after a reconnect and after an agent restart. Nothing is stored for it.
+- **Forkable cursors** carry `capabilities.fork`. This is fixed for the cursor's lifetime.
+- **Replay.** `session/load` replay announces a cursor for every anchor in the replayed history. A windowed load announces cursors for the returned window only.
+
+`session/fork` accepts `cursorId`. The fork's history is the source history through the anchored message, that message included. This is the same boundary as `_meta.querymt.message_id`:
+
+| Request | Fork boundary |
+|---|---|
+| `cursorId` | through the cursor's message |
+| `cursorId` and `_meta.querymt.message_id` | `cursorId` wins |
+| only `_meta.querymt.message_id` | through that message |
+| neither | the whole session |
+
+A `cursorId` that is unknown, was announced on another session, or is not forkable (thought, tool call, compaction) fails with `-32602`, creates no session and does not fall back to forking the whole session. A `_meta.querymt.message_id` that is not a message of the source session is rejected the same way.
+
+**Remote-hosted sessions.** When the source session is hosted on another mesh node, that node creates the fork (so the fork is hosted there) and the forking node records it as a remote session, so `session/load` works on the returned id. The target rules are the same, and a rejected request creates no session on either node. The owner's refusals keep their error code and data: `-32602` for an invalid target, `-32600` with `code` `owner_transferred` or `workspace_archived` for a read-only source.
+
+Of the request's `_meta`, only `querymt.message_id` is forwarded. Workspace options (`querymt.sessionWorkspace`) are not: such a request fails with `-32602` (`data.code` `remote_fork_workspace_options`) and creates nothing, instead of forking without the requested isolation. The owner applies its own workspace policy, so a source that is managed there stays isolated.
+
+Once the owner has created the fork it is a session there, as a local fork is. If the forking node cannot attach it right away, the request still succeeds and `session/load` connects it from the recorded bookmark.
+
+```json
+{"sessionUpdate": "cursor_update", "cursorId": "<opaque>",
+ "anchor": {"type": "agent_message", "messageId": "…", "position": "after"},
+ "capabilities": {"fork": {}}}
+```
+
+**Snapshots and history pages.** The `querymt/sessionLoadSnapshot.v1` object in a `session/load` response and each `querymt/session/history` response carry `cursorUpdates`: the same cursors, with the same ids, that replaying the events they hold announces, each once, in event order. Each element is a `cursor_update` without the `sessionUpdate` tag. A load replaces a client's cursors with its list; a page adds its own. A client that did not advertise `session.cursors` receives no `cursorUpdates`, and one that did not advertise `compaction` receives no compaction cursors (it was never sent the compactions they follow).
+
+```json
+{"method": "session/fork", "params": {"sessionId": "…", "cwd": "/work", "cursorId": "<opaque>"}}
+```
+
+### Subagent updates for delegations
+
+A client that advertises the top-level `clientCapabilities.subagents` capability (omitted or `null` means unsupported) receives each delegated child session as a `subagent_update` sent on the **parent** session. See [Delegation](delegation.md#subagents-over-acp) for the lifecycle and the full mapping.
+
+```json
+{"sessionUpdate": "subagent_update", "sessionId": "<child session id>",
+ "title": "coder", "description": "fix the build",
+ "state": {"state": "running"},
+ "capabilities": {"cancel": {}},
+ "_meta": {"querymt": {"delegationId": "…", "stage": "verifying", "modelId": "gpt-5",
+                       "providerNodeId": "gpu-node", "requestedAt": 0, "forkedAt": 0, "updatedAt": 0}}}
+```
+
+- **Ordering.** The announcement arrives before any live event of the child and before any update that references the child. A child event that reaches the connection first is preceded by the announcement.
+- **State.** `running` while the delegation executes, verifies or finalizes, `idle` once it completed, failed or was cancelled. The verifying, finalizing and cancel-requested stages are `running` with `_meta.querymt.stage`; the stage is dropped when the delegation ends.
+- **Metadata.** `_meta.querymt` carries `delegationId`, the confirmed child `modelId` and `providerNodeId` when known, and the `requestedAt`, `forkedAt`, `finishedAt` and `updatedAt` timestamps (unix seconds).
+- **Cancel.** `capabilities.cancel` is advertised while the delegation runs and withdrawn (`capabilities: null`) with the final update. `session/cancel` on a running child cancels that delegation, exactly as a delegation cancel requested by the agent would. A cancel for a child that is no longer running behaves like any other `session/cancel`.
+- **Delegate tool call.** The `delegate` tool call ends `completed` as soon as the delegation is accepted. Once the child is announced, a `tool_call_update` with `content: [{"type": "session", "sessionId": "<child>"}]` follows the announcement. A delegation that later **fails or is cancelled** sends a final `tool_call_update` with status `failed` after the child's final `subagent_update`. A completed delegation leaves the call `completed`.
+- **Load and replay.** `session/load` replays one materialized `subagent_update` per child, before the history that references it, and the failed status at the point where the journal recorded the failure. Load snapshots carry the latest update of every child in `subagentUpdates`, including the live state of delegations that are still running. The snapshot still carries `delegationUpdates` and the `querymt/session/delegationUpdate` notification is still sent alongside, until both are removed in the release that switches the desktop client.
+
+Clients without the capability receive no `subagent_update`, no session reference and no failed status update. They still receive the delegate tool call and the child session's events.
+
 ## Remote/Mesh API
 
 ### Mesh Configuration

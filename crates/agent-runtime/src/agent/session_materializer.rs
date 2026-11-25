@@ -1113,10 +1113,13 @@ impl SessionMaterializer {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        let target_message_id = fork_message_id_from_meta(req.meta.as_ref())
-            .map(ToOwned::to_owned)
-            .or_else(|| history.last().map(|msg| msg.id.clone()))
-            .ok_or(crate::error::AgentError::EmptySessionFork)?;
+        // An invalid target is rejected here, before the isolation plan, so
+        // no row or worktree exists.
+        let target_message_id = resolve_fork_target(
+            req.cursor_id.as_ref().map(|cursor| cursor.0.as_ref()),
+            req.meta.as_ref(),
+            &history,
+        )?;
 
         // Resolve and validate the fork's isolation policy BEFORE any
         // conversation copy: invalid or unhonorable requests fail closed
@@ -1712,7 +1715,7 @@ impl SessionMaterializer {
             .iter()
             .map(|server| {
                 crate::config::McpServerConfig::from_acp(server)
-                    .map(querymt_agent_core::events::McpServerInfo::from)
+                    .map(querymt_agent_core::config::mcp::McpServerConfig::server_info)
             })
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| Error::invalid_params().data(e.to_string()))?;
@@ -1960,6 +1963,80 @@ impl SessionMaterializer {
 
         Ok(SessionMaterialization { actor_ref, runtime })
     }
+}
+
+/// The message a `session/fork` forks after, the one rule for every fork
+/// (local, and remote on the owning node).
+///
+/// Precedence: the cursor, then the `_meta.querymt.message_id` hint, then the
+/// last message. An explicit target (cursor or hint) must be a message of the
+/// source session; otherwise the request fails with `-32602` and nothing is
+/// created, so a fork can never be cut at another session's message and an
+/// invalid cursor never falls back to forking the whole session.
+pub(crate) fn resolve_fork_target(
+    cursor_id: Option<&str>,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    history: &[querymt_agent_core::model::AgentMessage],
+) -> Result<String, Error> {
+    if let Some(cursor_id) = cursor_id {
+        return fork_message_id_from_cursor(cursor_id, history);
+    }
+    if let Some(hint) = fork_message_id_from_meta(meta) {
+        return history
+            .iter()
+            .any(|message| message.id == hint)
+            .then(|| hint.to_owned())
+            .ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "message does not belong to the source session",
+                    "messageId": hint,
+                }))
+            });
+    }
+    history
+        .last()
+        .map(|message| message.id.clone())
+        .ok_or_else(|| crate::error::AgentError::EmptySessionFork.into())
+}
+
+/// The message a `session/fork` cursor forks after.
+///
+/// Rejects with `-32602` a cursor that does not decode, is not forkable
+/// (thought, tool call or compaction anchors), or names a message that is not
+/// in the source session's history (never announced there, or announced on
+/// another session). The fork keeps the source history through that message.
+fn fork_message_id_from_cursor(
+    cursor_id: &str,
+    history: &[querymt_agent_core::model::AgentMessage],
+) -> Result<String, Error> {
+    let message_id = forkable_cursor_message_id(cursor_id)?;
+    history
+        .iter()
+        .any(|message| message.id == message_id)
+        .then_some(message_id)
+        .ok_or_else(|| invalid_cursor(cursor_id, "cursor does not belong to the source session"))
+}
+
+fn invalid_cursor(cursor_id: &str, reason: &str) -> Error {
+    Error::invalid_params().data(serde_json::json!({
+        "message": reason,
+        "cursorId": cursor_id,
+    }))
+}
+
+/// The message id of a cursor `session/fork` may use, from the id alone:
+/// rejects with `-32602` a cursor that does not decode or is not forkable.
+/// Needs no session, so a node that does not own the source can reject early;
+/// whether the message belongs to the source is checked against its history.
+pub(crate) fn forkable_cursor_message_id(cursor_id: &str) -> Result<String, Error> {
+    use querymt_agent_core::replay::CursorTarget;
+
+    let target = CursorTarget::decode(cursor_id)
+        .ok_or_else(|| invalid_cursor(cursor_id, "unknown cursor"))?;
+    target
+        .forkable_message_id()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| invalid_cursor(cursor_id, "cursor is not forkable"))
 }
 
 pub(crate) fn fork_message_id_from_meta(
@@ -5014,5 +5091,216 @@ mod worktree_binding_tests {
         assert_eq!(index_a.root, root_a);
         assert_eq!(index_b.root, root_b);
         assert_ne!(index_a.root, index_b.root);
+    }
+
+    // ---- fork at a session cursor ----
+
+    /// A local source session holding `ids` as its history.
+    async fn cursor_source(fx: &WorktreeFixture, ids: &[&str]) -> String {
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .expect("local source prepares");
+        let source_id = source.session_id.clone();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, ids).await;
+        source_id
+    }
+
+    fn fork_request(
+        source_id: &str,
+        cursor: Option<&str>,
+        hint: Option<&str>,
+    ) -> ForkSessionRequest {
+        let mut req = ForkSessionRequest::new(
+            SessionId::from(source_id.to_owned()),
+            std::path::PathBuf::from("/tmp"),
+        );
+        if let Some(cursor) = cursor {
+            req.cursor_id = Some(cursor.to_owned().into());
+        }
+        if let Some(hint) = hint {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "querymt".to_string(),
+                serde_json::json!({ "message_id": hint }),
+            );
+            req = req.meta(meta);
+        }
+        req
+    }
+
+    /// How many messages the fork `response` holds.
+    async fn forked_messages(
+        fx: &WorktreeFixture,
+        response: &crate::acp::protocol::ForkSessionResponse,
+    ) -> usize {
+        fx.storage
+            .get_history(&response.session_id.to_string())
+            .await
+            .expect("fork history")
+            .len()
+    }
+
+    async fn assert_rejected_without_a_fork(
+        fx: &WorktreeFixture,
+        source_id: &str,
+        cursor: &str,
+        hint: Option<&str>,
+    ) {
+        let sessions_before = fx.storage.list_sessions().await.unwrap().len();
+        let error = match fx
+            .materializer
+            .prepare_fork_session(fork_request(source_id, Some(cursor), hint))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("cursor `{cursor}` must be rejected"),
+        };
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::new(-32602),
+            "{error:?}"
+        );
+        assert_eq!(
+            fx.storage.list_sessions().await.unwrap().len(),
+            sessions_before,
+            "no fork session exists afterwards"
+        );
+    }
+
+    /// Scenario "Fork at an agent message cursor": the fork keeps the source
+    /// history through the anchored message, that message included.
+    #[tokio::test]
+    async fn fork_at_an_agent_message_cursor() {
+        let fx = worktree_fixture(false).await;
+        let source_id = cursor_source(&fx, &["msg-1", "msg-2", "msg-3", "msg-4"]).await;
+
+        let response = fx
+            .materializer
+            .prepare_fork_session(fork_request(&source_id, Some("m:msg-2"), None))
+            .await
+            .expect("fork at the cursor");
+
+        let history = fx
+            .storage
+            .get_history(&response.session_id.to_string())
+            .await
+            .expect("fork history");
+        assert_eq!(history.len(), 2, "through msg-2 and nothing after it");
+        assert!(
+            history.iter().all(|message| message.id != "msg-2"),
+            "the fork's messages have their own ids"
+        );
+        // Forking at the message through the hint gives the same boundary.
+        let hinted = fx
+            .materializer
+            .prepare_fork_session(fork_request(&source_id, None, Some("msg-2")))
+            .await
+            .expect("fork at the hint");
+        assert_eq!(forked_messages(&fx, &hinted).await, 2);
+    }
+
+    /// Scenario "Message id hint still works".
+    #[tokio::test]
+    async fn message_id_hint_still_works() {
+        let fx = worktree_fixture(false).await;
+        let source_id = cursor_source(&fx, &["msg-1", "msg-2", "msg-3"]).await;
+
+        let response = fx
+            .materializer
+            .prepare_fork_session(fork_request(&source_id, None, Some("msg-1")))
+            .await
+            .expect("fork at the hint");
+
+        assert_eq!(forked_messages(&fx, &response).await, 1);
+    }
+
+    /// Scenario "Cursor takes precedence over the message id hint".
+    #[tokio::test]
+    async fn cursor_takes_precedence_over_the_message_id_hint() {
+        let fx = worktree_fixture(false).await;
+        let source_id = cursor_source(&fx, &["msg-1", "msg-2", "msg-3"]).await;
+
+        let response = fx
+            .materializer
+            .prepare_fork_session(fork_request(&source_id, Some("m:msg-3"), Some("msg-1")))
+            .await
+            .expect("fork at the cursor");
+
+        assert_eq!(forked_messages(&fx, &response).await, 3, "the cursor wins");
+    }
+
+    /// The `message_id` hint follows the same rule as a cursor: it must be a
+    /// message of the source session, so a fork is never cut at another
+    /// session's message.
+    #[tokio::test]
+    async fn message_id_hint_from_another_session_is_rejected() {
+        let fx = worktree_fixture(false).await;
+        let a = cursor_source(&fx, &["a-1", "a-2"]).await;
+        let _b = cursor_source(&fx, &["b-1", "b-2"]).await;
+        let sessions_before = fx.storage.list_sessions().await.unwrap().len();
+
+        for hint in ["b-2", "never-existed"] {
+            let error = match fx
+                .materializer
+                .prepare_fork_session(fork_request(&a, None, Some(hint)))
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("hint `{hint}` must be rejected"),
+            };
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::new(-32602));
+        }
+        assert_eq!(
+            fx.storage.list_sessions().await.unwrap().len(),
+            sessions_before,
+            "no fork session exists afterwards"
+        );
+    }
+
+    /// Scenario "Unknown cursor is rejected": it does not decode, or it names
+    /// a message the source never had. Neither falls back to a whole fork.
+    #[tokio::test]
+    async fn unknown_cursor_is_rejected() {
+        let fx = worktree_fixture(false).await;
+        let source_id = cursor_source(&fx, &["msg-1", "msg-2"]).await;
+
+        for cursor in ["m:never-announced", "x:msg-1", "msg-1", "m:", ""] {
+            assert_rejected_without_a_fork(&fx, &source_id, cursor, None).await;
+        }
+        // A valid hint does not rescue an invalid cursor.
+        assert_rejected_without_a_fork(&fx, &source_id, "m:never-announced", Some("msg-1")).await;
+    }
+
+    /// Scenario "Non-forkable cursor is rejected": tool-call, thought and
+    /// compaction anchors.
+    #[tokio::test]
+    async fn non_forkable_cursor_is_rejected() {
+        let fx = worktree_fixture(false).await;
+        let source_id = cursor_source(&fx, &["msg-1", "msg-2"]).await;
+
+        for cursor in ["c:call-1", "t:msg-1", "k:cmp-1"] {
+            assert_rejected_without_a_fork(&fx, &source_id, cursor, None).await;
+        }
+    }
+
+    /// Scenario "Cursor from another session is rejected": a forkable cursor
+    /// of session `b` means nothing on session `a`.
+    #[tokio::test]
+    async fn cursor_from_another_session_is_rejected() {
+        let fx = worktree_fixture(false).await;
+        let a = cursor_source(&fx, &["a-1", "a-2"]).await;
+        let b = cursor_source(&fx, &["b-1", "b-2"]).await;
+
+        assert_rejected_without_a_fork(&fx, &a, "m:b-2", None).await;
+        // The same cursor works on the session that has the message.
+        let response = fx
+            .materializer
+            .prepare_fork_session(fork_request(&b, Some("m:b-2"), None))
+            .await
+            .expect("fork on the owning session");
+        assert_eq!(forked_messages(&fx, &response).await, 2);
     }
 }

@@ -6,7 +6,7 @@
 //! materialised. Positions are *history positions*: `stream_seq` for local
 //! sessions and the owner's `source_seq` for remote ones.
 
-use crate::accounting::{AccountingReducer, ScopeTotals};
+use crate::accounting::AccountingReducer;
 use crate::control::delegation_notifications::{
     DelegationUpdateNotification, DelegationUpdateProjector,
 };
@@ -15,55 +15,17 @@ use crate::session::error::SessionResult;
 use crate::session::projection::{EventJournal, HistoryPageDirection};
 use crate::session::turns::turn_start_indices;
 use querymt_agent_core::events::{AgentEvent, AgentEventKind};
-use querymt_agent_core::protocol::ContentBlock;
+pub use querymt_agent_core::session::history::{
+    ChildSessionLink, DEFAULT_TRUNCATE_BYTES, DEFAULT_WINDOW_BYTES, DEFAULT_WINDOW_TURNS,
+    HistoryInfo, InputDelivery, LoadWindow, MAX_TRUNCATE_BYTES, MAX_WINDOW_BYTES, MAX_WINDOW_TURNS,
+    PendingInputState, PendingInputSummary, PriorUsage, SessionHistorySummary, SummaryProvider,
+    SummaryUsage, ToolContentPart, TruncatedEntry, UsageBreakdown,
+};
 use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use typeshare::typeshare;
-
-pub const DEFAULT_WINDOW_TURNS: usize = 20;
-pub const DEFAULT_WINDOW_BYTES: usize = 1024 * 1024;
-pub const DEFAULT_TRUNCATE_BYTES: usize = 32 * 1024;
-pub const MAX_WINDOW_TURNS: usize = 100;
-pub const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_TRUNCATE_BYTES: usize = 256 * 1024;
 
 const BACKWARD_PAGE: usize = 256;
 const SCAN_PAGE: usize = 1000;
-
-/// A client's request for a recent-history window.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct LoadWindow {
-    #[typeshare(serialized_as = "number")]
-    pub max_turns: usize,
-    #[typeshare(serialized_as = "number")]
-    pub max_bytes: usize,
-    #[typeshare(serialized_as = "number")]
-    pub truncate_bytes: usize,
-}
-
-impl Default for LoadWindow {
-    fn default() -> Self {
-        Self {
-            max_turns: DEFAULT_WINDOW_TURNS,
-            max_bytes: DEFAULT_WINDOW_BYTES,
-            truncate_bytes: DEFAULT_TRUNCATE_BYTES,
-        }
-    }
-}
-
-impl LoadWindow {
-    /// Clamp every value into `1..=` its own agent-side maximum.
-    pub fn clamped(self) -> Self {
-        Self {
-            max_turns: self.max_turns.clamp(1, MAX_WINDOW_TURNS),
-            max_bytes: self.max_bytes.clamp(1, MAX_WINDOW_BYTES),
-            truncate_bytes: self.truncate_bytes.clamp(1, MAX_TRUNCATE_BYTES),
-        }
-    }
-}
 
 /// Read `_meta.querymt.loadWindow` from a request's `_meta` map.
 ///
@@ -106,215 +68,11 @@ pub fn load_window_from_meta(
     )
 }
 
-/// Where the returned events sit in the session's history.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryInfo {
-    /// No older history exists before the returned events.
-    pub complete: bool,
-    /// Opaque token for the `session/history` request that returns the turns
-    /// preceding the returned events. Absent when `complete`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before: Option<String>,
-    /// The owner was unreachable; the history was served from the local copy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale: Option<bool>,
-}
-
-/// Which part of a tool call a truncation marker or content request refers to.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolContentPart {
-    Result,
-    Arguments,
-}
-
-/// A tool result or argument string that was shortened in a response.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TruncatedEntry {
-    pub tool_call_id: String,
-    pub part: ToolContentPart,
-    /// JSON pointer to the shortened string inside the arguments; absent for
-    /// results and for arguments that are not JSON.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[typeshare(serialized_as = "number")]
-    pub full_bytes: u64,
-}
-
-/// Exclusive token categories, as in the live usage meta.
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageBreakdown {
-    #[typeshare(serialized_as = "number")]
-    pub input_tokens: u64,
-    #[typeshare(serialized_as = "number")]
-    pub output_tokens: u64,
-    #[typeshare(serialized_as = "number")]
-    pub reasoning_tokens: u64,
-    #[typeshare(serialized_as = "number")]
-    pub cache_read_tokens: u64,
-    #[typeshare(serialized_as = "number")]
-    pub cache_write_tokens: u64,
-}
-
-impl UsageBreakdown {
-    fn from_usage(usage: &querymt::Usage) -> Self {
-        Self {
-            input_tokens: u64::from(usage.input_tokens),
-            output_tokens: u64::from(usage.output_tokens),
-            reasoning_tokens: u64::from(usage.reasoning_tokens),
-            cache_read_tokens: u64::from(usage.cache_read),
-            cache_write_tokens: u64::from(usage.cache_write),
-        }
-    }
-
-    fn add(&mut self, other: &Self) {
-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(other.cache_read_tokens);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(other.cache_write_tokens);
-    }
-}
-
-/// Whole-session token usage (the live `_meta.querymt.usage` v1 fields) plus
-/// the state a client needs to keep live usage correct after a window.
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SummaryUsage {
-    pub latest_request: Option<UsageBreakdown>,
-    pub session_totals: Option<UsageBreakdown>,
-    pub partial: bool,
-    /// Number of main-request completions in the session.
-    #[typeshare(serialized_as = "number")]
-    pub request_count: u64,
-    /// Context occupancy reported by the last request, and its position.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "Option<number>")]
-    pub context_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "Option<number>")]
-    pub context_position: Option<i64>,
-    /// Session-lifetime accounting totals from the shared reducer.
-    #[typeshare(serialized_as = "any")]
-    pub accounting: ScopeTotals,
-    /// Usage of the events *before* the returned window. A consumer that
-    /// replays the window's own events seeds from this to reach whole-session
-    /// totals without counting any event twice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_window: Option<PriorUsage>,
-}
-
-/// Usage accumulated over the part of history preceding a window.
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PriorUsage {
-    /// Journal position of the window's first event; the prior totals cover
-    /// exactly the events with a smaller position.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "Option<number>")]
-    pub window_start: Option<i64>,
-    pub session_totals: Option<UsageBreakdown>,
-    pub partial: bool,
-    #[typeshare(serialized_as = "number")]
-    pub request_count: u64,
-    #[typeshare(serialized_as = "any")]
-    pub accounting: ScopeTotals,
-}
-
 struct PriorAcc {
     reducer: AccountingReducer,
     totals: Option<UsageBreakdown>,
     partial: bool,
     requests: u64,
-}
-
-/// The session's current model, from its last `ProviderChanged`.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SummaryProvider {
-    pub provider: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "Option<number>")]
-    pub context_limit: Option<u64>,
-    #[typeshare(serialized_as = "number")]
-    pub position: i64,
-}
-
-/// How a pending input will reach the run.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum InputDelivery {
-    Steer,
-    Queue,
-}
-
-/// Where a pending input is in its lifecycle.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PendingInputState {
-    Accepted,
-    Queued,
-}
-
-/// A queued or steering input that has not started or been applied yet.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingInputSummary {
-    pub input_id: String,
-    pub delivery: InputDelivery,
-    pub state: PendingInputState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "Option<number>")]
-    pub position: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[typeshare(serialized_as = "any")]
-    pub blocks: Vec<ContentBlock>,
-    /// Acceptance time in milliseconds since the epoch.
-    #[typeshare(serialized_as = "number")]
-    pub created_at: i64,
-}
-
-/// A child session spawned by this session.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChildSessionLink {
-    pub child_session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
-
-/// State computed over the entire session, independent of the window.
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionHistorySummary {
-    pub usage: SummaryUsage,
-    pub provider: Option<SummaryProvider>,
-    pub pending_inputs: Vec<PendingInputSummary>,
-    pub child_sessions: Vec<ChildSessionLink>,
 }
 
 /// Result of the whole-session streaming pass.
@@ -602,6 +360,10 @@ struct SummaryAcc {
     pending: Vec<PendingInputSummary>,
     children: Vec<ChildSessionLink>,
     delegation_tools: HashMap<String, String>,
+    /// Start time (ms) of each run that has started and not ended.
+    run_starts: HashMap<String, i64>,
+    /// Total time of the ended runs, in ms.
+    active_ms: u64,
 }
 
 impl SummaryAcc {
@@ -639,6 +401,32 @@ impl SummaryAcc {
                 }
                 self.latest = request;
             }
+            // A finished compaction reports the context the session holds
+            // afterwards; live delivery and replay use it as the measurement,
+            // so the summary must too.
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(tokens),
+                ..
+            } => {
+                self.context = Some((*tokens, position));
+            }
+            // Active time is run time: the sum over ended runs of the time
+            // from `RunStarted` to `RunCompleted`, paired by run id. A start
+            // without an end is the active run (the runtime status reports
+            // it); an end without a start is ignored. Event timestamps are
+            // whole seconds, so the total is exact to one second per run.
+            AgentEventKind::RunStarted { run_id, .. } => {
+                self.run_starts
+                    .insert(run_id.clone(), event.timestamp.saturating_mul(1000));
+            }
+            AgentEventKind::RunCompleted { run_id, .. } => {
+                if let Some(start) = self.run_starts.remove(run_id) {
+                    let ended = event.timestamp.saturating_mul(1000);
+                    self.active_ms = self
+                        .active_ms
+                        .saturating_add(u64::try_from(ended.saturating_sub(start)).unwrap_or(0));
+                }
+            }
             AgentEventKind::ProviderChanged {
                 provider,
                 model,
@@ -646,6 +434,19 @@ impl SummaryAcc {
                 provider_node_id,
                 ..
             } => {
+                // Selecting the model the session already uses (another
+                // configuration or node) keeps the position: the last
+                // measurement still describes that model.
+                let position = match &self.provider {
+                    Some(current)
+                        if current.provider == *provider
+                            && current.model == *model
+                            && current.context_limit == *context_limit =>
+                    {
+                        current.position
+                    }
+                    _ => position,
+                };
                 self.provider = Some(SummaryProvider {
                     provider: provider.clone(),
                     model: model.clone(),
@@ -745,16 +546,7 @@ pub async fn summarize_history(
     source_node: Option<&str>,
     window_start: Option<i64>,
 ) -> SessionResult<SummaryPass> {
-    let mut prior = window_start.map(|_| PriorAcc {
-        reducer: AccountingReducer::new(session_id),
-        totals: None,
-        partial: false,
-        requests: 0,
-    });
-    let mut reducer = AccountingReducer::new(session_id);
-    let mut projector = DelegationUpdateProjector::default();
-    let mut cursor = StreamCursor::default();
-    let mut acc = SummaryAcc::default();
+    let mut fold = SummaryFold::new(session_id, window_start);
     let mut after = 0i64;
     loop {
         let page = journal
@@ -769,75 +561,135 @@ pub async fn summarize_history(
         let page_len = page.len();
         after = last;
         for (position, durable) in page {
-            let event = AgentEvent::from(durable);
-            observe_cursor(&mut cursor, &event);
-            if let Err(conflict) = reducer.apply(&event.kind) {
-                tracing::warn!(
-                    session.id = %session_id,
-                    attempt.id = %conflict.attempt_id,
-                    detail = conflict.detail,
-                    "skipping conflicting accounting record in snapshot"
-                );
-            }
-            if is_delegation_event(&event.kind) {
-                projector.project_event(&event);
-            }
-            acc.observe(session_id, position, &event);
-            if let (Some(prior), Some(start)) = (prior.as_mut(), window_start)
-                && position < start
-            {
-                let _ = prior.reducer.apply(&event.kind);
-                if let AgentEventKind::LlmRequestEnd { usage, .. } = &event.kind {
-                    prior.requests += 1;
-                    match usage.as_ref().map(UsageBreakdown::from_usage) {
-                        Some(request) => prior
-                            .totals
-                            .get_or_insert_with(UsageBreakdown::default)
-                            .add(&request),
-                        None => prior.partial = true,
-                    }
-                }
-            }
+            fold.observe(position, &AgentEvent::from(durable));
         }
         if page_len < SCAN_PAGE {
             break;
         }
     }
+    Ok(fold.finish())
+}
 
-    for child in &mut acc.children {
-        child.tool_call_id = child
-            .delegation_id
-            .as_ref()
-            .and_then(|id| acc.delegation_tools.get(id))
-            .cloned();
+/// The same pass over events the caller already holds, each with its history
+/// position, in ascending order. A snapshot that read its history once builds
+/// its summary from those events, so both describe one and the same cut.
+pub fn summarize_events<'a>(
+    session_id: &str,
+    events: impl IntoIterator<Item = (i64, &'a AgentEvent)>,
+) -> SummaryPass {
+    let mut fold = SummaryFold::new(session_id, None);
+    for (position, event) in events {
+        fold.observe(position, event);
     }
-    let usage = SummaryUsage {
-        latest_request: acc.latest,
-        session_totals: acc.totals,
-        partial: acc.partial,
-        request_count: acc.requests,
-        context_tokens: acc.context.map(|(tokens, _)| tokens),
-        context_position: acc.context.map(|(_, position)| position),
-        accounting: reducer.session().clone(),
-        before_window: prior.map(|prior| PriorUsage {
+    fold.finish()
+}
+
+/// State of the whole-session pass: fed event by event, in order.
+struct SummaryFold {
+    session_id: String,
+    window_start: Option<i64>,
+    prior: Option<PriorAcc>,
+    reducer: AccountingReducer,
+    projector: DelegationUpdateProjector,
+    cursor: StreamCursor,
+    acc: SummaryAcc,
+}
+
+impl SummaryFold {
+    fn new(session_id: &str, window_start: Option<i64>) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
             window_start,
-            session_totals: prior.totals,
-            partial: prior.partial,
-            request_count: prior.requests,
-            accounting: prior.reducer.session().clone(),
-        }),
-    };
-    Ok(SummaryPass {
-        accounting: crate::accounting::AccountingSnapshot::from_reducer(&reducer),
-        delegation_updates: projector.snapshots(),
-        cursor,
-        summary: SessionHistorySummary {
-            usage,
-            provider: acc.provider,
-            pending_inputs: acc.pending,
-            child_sessions: acc.children,
-        },
-    })
+            prior: window_start.map(|_| PriorAcc {
+                reducer: AccountingReducer::new(session_id),
+                totals: None,
+                partial: false,
+                requests: 0,
+            }),
+            reducer: AccountingReducer::new(session_id),
+            projector: DelegationUpdateProjector::default(),
+            cursor: StreamCursor::default(),
+            acc: SummaryAcc::default(),
+        }
+    }
+
+    fn observe(&mut self, position: i64, event: &AgentEvent) {
+        observe_cursor(&mut self.cursor, event);
+        if let Err(conflict) = self.reducer.apply(&event.kind) {
+            tracing::warn!(
+                session.id = %self.session_id,
+                attempt.id = %conflict.attempt_id,
+                detail = conflict.detail,
+                "skipping conflicting accounting record in snapshot"
+            );
+        }
+        if is_delegation_event(&event.kind) {
+            self.projector.project_event(event);
+        }
+        self.acc.observe(&self.session_id, position, event);
+        if let (Some(prior), Some(start)) = (self.prior.as_mut(), self.window_start)
+            && position < start
+        {
+            let _ = prior.reducer.apply(&event.kind);
+            if let AgentEventKind::LlmRequestEnd { usage, .. } = &event.kind {
+                prior.requests += 1;
+                match usage.as_ref().map(UsageBreakdown::from_usage) {
+                    Some(request) => prior
+                        .totals
+                        .get_or_insert_with(UsageBreakdown::default)
+                        .add(&request),
+                    None => prior.partial = true,
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> SummaryPass {
+        let Self {
+            window_start,
+            prior,
+            reducer,
+            projector,
+            cursor,
+            mut acc,
+            ..
+        } = self;
+        for child in &mut acc.children {
+            child.tool_call_id = child
+                .delegation_id
+                .as_ref()
+                .and_then(|id| acc.delegation_tools.get(id))
+                .cloned();
+        }
+        let usage = SummaryUsage {
+            latest_request: acc.latest,
+            session_totals: acc.totals,
+            partial: acc.partial,
+            request_count: acc.requests,
+            context_tokens: acc.context.map(|(tokens, _)| tokens),
+            context_position: acc.context.map(|(_, position)| position),
+            accounting: reducer.session().clone(),
+            before_window: prior.map(|prior| PriorUsage {
+                window_start,
+                session_totals: prior.totals,
+                partial: prior.partial,
+                request_count: prior.requests,
+                accounting: prior.reducer.session().clone(),
+            }),
+        };
+        SummaryPass {
+            accounting: crate::accounting::snapshot_from_reducer(&reducer),
+            delegation_updates: projector.snapshots(),
+            cursor,
+            summary: SessionHistorySummary {
+                usage,
+                provider: acc.provider,
+                pending_inputs: acc.pending,
+                child_sessions: acc.children,
+                active_ms: acc.active_ms,
+            },
+        }
+    }
 }
 
 // ── full tool content ──────────────────────────────────────────────────────
@@ -1237,6 +1089,131 @@ mod tests {
         assert_eq!(prior.session_totals.unwrap().input_tokens, 350);
         assert_eq!(windowed.accounting, full.accounting);
         assert_eq!(windowed.cursor.local_seq, full.cursor.local_seq);
+    }
+
+    #[tokio::test]
+    async fn summary_over_held_events_equals_the_journal_pass() {
+        let s = storage().await;
+        append(
+            &s,
+            AgentEventKind::ProviderChanged {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                config_id: 1,
+                context_limit: Some(1000),
+                provider_node_id: None,
+            },
+        )
+        .await;
+        seed_turns(&s, 6).await;
+        let events: Vec<AgentEvent> = s
+            .load_session_stream(SID, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(AgentEvent::from)
+            .collect();
+        let held = summarize_events(SID, events.iter().map(|event| (event.seq, event)));
+        let journal = summarize_history(&s, SID, None, None).await.unwrap();
+        assert_eq!(held.summary, journal.summary);
+        assert_eq!(held.accounting, journal.accounting);
+        assert_eq!(held.cursor.local_seq, journal.cursor.local_seq);
+        assert_eq!(held.summary.usage.request_count, 6);
+    }
+
+    /// A run boundary at `timestamp` seconds, for the active-time tests.
+    fn run_event(seq: i64, timestamp: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            seq,
+            session_seq: seq,
+            timestamp,
+            session_id: SID.into(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    fn run_end(run_id: &str) -> AgentEventKind {
+        AgentEventKind::RunCompleted {
+            run_id: run_id.into(),
+            outcome: "completed".into(),
+            stop_type: None,
+            reason: None,
+        }
+    }
+
+    fn active_ms(events: &[AgentEvent], window_start: Option<i64>) -> u64 {
+        let mut fold = SummaryFold::new(SID, window_start);
+        for event in events {
+            fold.observe(event.seq, event);
+        }
+        fold.finish().summary.active_ms
+    }
+
+    #[test]
+    fn ended_runs_are_summed() {
+        let events = vec![
+            run_event(1, 100, run(0)),
+            run_event(2, 130, run_end("r0")),
+            run_event(3, 200, run(1)),
+            run_event(4, 290, run_end("r1")),
+        ];
+        assert_eq!(active_ms(&events, None), 120_000);
+        // The total covers the whole session, not the window.
+        assert_eq!(active_ms(&events, Some(3)), 120_000);
+        let held = summarize_events(SID, events.iter().map(|event| (event.seq, event)));
+        assert_eq!(held.summary.active_ms, 120_000);
+    }
+
+    #[test]
+    fn running_run_is_not_counted() {
+        let events = vec![
+            run_event(1, 100, run(0)),
+            run_event(2, 130, run_end("r0")),
+            run_event(3, 200, run(1)),
+            run_event(4, 290, run_end("r1")),
+            run_event(5, 400, run(2)),
+        ];
+        assert_eq!(active_ms(&events, None), 120_000);
+    }
+
+    #[test]
+    fn an_end_without_a_start_is_ignored_and_pairs_are_per_run_id() {
+        let events = vec![
+            run_event(1, 100, run_end("orphan")),
+            run_event(2, 200, run(1)),
+            run_event(3, 205, run(2)),
+            run_event(4, 210, run_end("r2")),
+            run_event(5, 230, run_end("r1")),
+        ];
+        // r2: 5 s, r1: 30 s.
+        assert_eq!(active_ms(&events, None), 35_000);
+    }
+
+    #[tokio::test]
+    async fn reselecting_the_model_keeps_its_position() {
+        let s = storage().await;
+        let select = |config_id: i64, limit: u64| AgentEventKind::ProviderChanged {
+            provider: "p".into(),
+            model: "m".into(),
+            config_id,
+            context_limit: Some(limit),
+            provider_node_id: None,
+        };
+        let position = |pass: SummaryPass| pass.summary.provider.expect("a model").position;
+        append(&s, select(1, 1000)).await;
+        let first = position(summarize_history(&s, SID, None, None).await.unwrap());
+        // Another configuration of the same model: the measurement taken
+        // since the first selection still describes it.
+        seed_turns(&s, 1).await;
+        append(&s, select(2, 1000)).await;
+        let again = position(summarize_history(&s, SID, None, None).await.unwrap());
+        assert_eq!(again, first);
+        // Another context limit is another model.
+        append(&s, select(3, 2000)).await;
+        let other = position(summarize_history(&s, SID, None, None).await.unwrap());
+        assert!(other > again);
     }
 
     /// 50k-event journal: the window build and the tool-content lookup stay

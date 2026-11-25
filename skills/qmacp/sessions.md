@@ -56,14 +56,35 @@ qmacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
 ```
 
 `status` is mode/model/profile/effort; `runtime` is phase/queue/steerability.
-Compact `inspect` includes `delegations` from snapshot `delegationUpdates`, separate
-from dispatch `tools`, using the same records as live `delegation` events.
+Compact `inspect` includes `delegations` from the snapshot's `subagentUpdates` (the
+latest `subagent_update` of each child), separate from dispatch `tools`, using the
+same records as live `delegation` events (`childSessionId`, `title`, `state`
+`running`/`idle`, `stage`, ...). It also lists `cursors`, the cursors the load
+replayed (see [fork at a cursor](#fork-at-a-cursor)).
 `inspect --tools` defaults true; `--tools false` hides only tools, not delegations.
-Snapshot records are point observations; a later live record with the same
-`sourceEpoch` and higher `sessionSeq` is newer. Historical nonterminal rows do not
-prove live activity, and a terminal workflow record does not prove OS process exit.
+Snapshot records are point observations: a `running` child in a snapshot may have
+ended since, and an `idle` child does not prove its OS processes exited.
 `--full` dumps the raw snapshot (large). Do not treat earlier output as current
 state; query again before acting. Require exit 0 and JSON `ok: true` for changes.
+
+## Fork at a cursor
+
+```sh
+qmacp --quiet inspect --cwd "$PWD" "$SESSION_ID"      # "cursors": [...]
+qmacp --quiet fork "$SESSION_ID" --cursor "$CURSOR_ID" --cwd "$PWD"
+qmacp --quiet fork "$SESSION_ID" --cwd "$PWD"          # whole session
+```
+
+The agent announces a cursor after each user message, agent message, thought, tool
+call and compaction. qmacp reports them as `cursor` events (`follow`, `prompt`) and
+lists those received during `inspect`'s load in its `cursors`. Ids are opaque: use
+only ids the agent announced for this session. Only cursors with `forkable: true`
+(after a user or agent message) can be forked; the fork keeps the history through
+that message and returns `{"ok": true, "sessionId": <new>, "forkedFrom", "cursorId"}`.
+The agent rejects an unknown, foreign or non-forkable cursor; the command exits 3
+and its error carries the agent's code (`-32602`). Nothing is created then. A
+windowed or older agent may announce no cursors; `fork` without `--cursor` forks
+the whole session.
 
 ## Lifecycle and pins
 

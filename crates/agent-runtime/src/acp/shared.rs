@@ -10,17 +10,25 @@ use crate::acp::protocol::{
     ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined,
-    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
-    PlanRemoved, PlanUpdate, PlanUpdateContent, RequestPermissionOutcome, SessionId,
-    SessionInfoUpdate, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanId, PlanRemoved,
+    RequestPermissionOutcome, SessionId, SessionInfoUpdate, SessionModeId, SessionUpdate,
+    TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    UsageUpdate,
 };
+use crate::acp::snapshot_view::LoadSnapshotView;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::delegation_notifications::DelegationUpdateNotification;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
-use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
+use querymt_agent_core::replay::{
+    CompactionIds, is_todo_write_tool, stored_summary_updates, todo_entries_from_arguments,
+};
+use querymt_agent_protocol_types::session::state_update::stop_reason_for_outcome;
+pub use querymt_agent_protocol_types::session::state_update::{
+    SESSION_STATE_UPDATE_METHOD, SessionStateUpdate,
+};
 use querymt_agent_services::event_fanout::EventFanout;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -264,6 +272,13 @@ pub struct RpcDispatchOutput {
     /// history, and the client needs that content before its load promise
     /// resolves so replay is never misapplied as live traffic.
     pub notify_before_response: bool,
+    /// Set when a `session/load` answered: the live events it held back are
+    /// released once the transport has sent the response.
+    #[doc(hidden)]
+    pub load_release: Option<(
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    )>,
 }
 
 impl RpcDispatchOutput {
@@ -339,6 +354,7 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let RpcDispatchOutput {
         notifications,
         mut response,
+        load_release,
         ..
     } = output;
 
@@ -379,6 +395,14 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
             Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
         }
     }
+
+    // The response is queued: the held live events follow it.
+    if let Some((hold, cut)) = load_release {
+        match agent.as_any().downcast_ref::<AgentHandle>() {
+            Some(local) => hold.release_with(cut, local.config.event_sink.fanout()),
+            None => hold.release(cut.unwrap_or_default(), None),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -412,6 +436,20 @@ impl RpcDispatchContext {
             .as_ref()
             .and_then(|preferences| preferences.lock().ok().map(|guard| guard.snapshot_history))
             .unwrap_or(false)
+    }
+
+    /// The Preview session-update capabilities this connection negotiated;
+    /// none when the context has no translator.
+    pub(crate) fn session_update_capabilities(&self) -> AcpSessionUpdateCapabilities {
+        self.translator
+            .as_ref()
+            .map(|translator| {
+                translator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .capabilities()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -577,6 +615,73 @@ pub(crate) async fn session_events(
     session_ref.get_event_stream().await
 }
 
+/// Tell a connection's translator which run a just-loaded session is in, so
+/// the state sent after the load and the run id on later updates are right.
+///
+/// The snapshot's runtime status names the run when the load carries one;
+/// otherwise the session's actor is asked. A session without a run (or one
+/// whose actor is not reachable here) is seeded as idle.
+pub(crate) async fn seed_loaded_run_state(
+    agent: &AgentHandle,
+    session_id: &str,
+    snapshot: Option<&LoadSnapshotView>,
+    translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+) {
+    let from_snapshot = snapshot.map(|snapshot| snapshot.active_run_id.clone());
+    let session_ref = agent.owned_session_ref(session_id).await;
+    let run_id = match from_snapshot {
+        Some(run_id) => run_id,
+        None => match &session_ref {
+            Some(session_ref) => session_ref
+                .get_runtime_status()
+                .await
+                .ok()
+                .and_then(|status| status.active_run_id),
+            None => None,
+        },
+    };
+    let waiting = match (&run_id, &session_ref) {
+        (Some(_), Some(session_ref)) => session_ref
+            .list_pending_interactions(None)
+            .await
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false),
+        _ => false,
+    };
+    translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .seed_run_state(session_id, run_id, waiting);
+}
+
+/// Seeds a connection's translator from a `session/load` response: the run
+/// state (when the agent is local), the configuration options and the usage,
+/// delegation and compaction state of the history the snapshot carries.
+///
+/// `snapshot` is the view of `response`'s snapshot, read once by the caller
+/// (it also takes the load's cut from it).
+///
+/// Returns the delegation updates that history recovered, or `None` when the
+/// response carries no snapshot history, so the caller reads it itself.
+pub(crate) async fn seed_translator_from_load(
+    local_agent: Option<&AgentHandle>,
+    session_id: &str,
+    response: &crate::acp::protocol::LoadSessionResponse,
+    snapshot: Option<&LoadSnapshotView>,
+    translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+) -> Option<Vec<DelegationUpdateNotification>> {
+    if let Some(local_agent) = local_agent {
+        seed_loaded_run_state(local_agent, session_id, snapshot, translator).await;
+    }
+    let mut translator = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(options) = response.config_options.as_ref() {
+        translator.seed_config_options(session_id, options);
+    }
+    translator.seed_history_from_snapshot(session_id, snapshot?)
+}
+
 pub(crate) async fn restore_session_history(
     agent: &AgentHandle,
     session_id: &str,
@@ -688,6 +793,14 @@ fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Valu
         "method": method,
         "params": params,
     })
+}
+
+/// JSON-RPC notification for a run state update.
+pub fn state_update_notification(update: &SessionStateUpdate) -> serde_json::Value {
+    ext_notification(
+        SESSION_STATE_UPDATE_METHOD,
+        serde_json::to_value(update).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 pub fn mesh_nodes_changed_notification(peer_id: &str, change: &str) -> serde_json::Value {
@@ -898,8 +1011,26 @@ pub fn input_state_notification(event: &EventEnvelope) -> Option<serde_json::Val
     ))
 }
 
-fn normalize_querymt_ext_method(method: &str) -> &str {
+/// The QueryMT extension method name as the agent's `ext_method` handler
+/// matches it: without the leading `_` that ACP puts on extension methods.
+///
+/// ACP clients send `_querymt/...` and the SDK hands the extension request to
+/// the agent with that underscore intact, so every transport has to normalize
+/// before it calls `ext_method`.
+pub(crate) fn normalize_querymt_ext_method(method: &str) -> &str {
     method.strip_prefix('_').unwrap_or(method)
+}
+
+/// `req` with a `_querymt/...` method renamed to the name the agent's
+/// `ext_method` handler matches. Other extension namespaces pass through.
+pub(crate) fn normalize_querymt_ext_request(
+    mut req: crate::acp::protocol::ExtRequest,
+) -> crate::acp::protocol::ExtRequest {
+    let normalized = normalize_querymt_ext_method(&req.method);
+    if normalized.starts_with("querymt/") && normalized.len() != req.method.len() {
+        req.method = std::sync::Arc::from(normalized);
+    }
+    req
 }
 
 fn attach_before_querymt_ext_method(method: &str) -> bool {
@@ -983,45 +1114,6 @@ where
     I: IntoIterator<Item = AgentEvent>,
 {
     replay_agent_events_with_user_prompts(session_id, events, &HashMap::new())
-}
-
-fn thought_chunk(content: &str, message_id: &str, part_id: Option<&str>) -> ContentChunk {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
-        .message_id(MessageId::from(message_id.to_string()));
-    match part_id.filter(|part_id| !part_id.is_empty()) {
-        Some(part_id) => chunk.meta(serde_json::Map::from_iter([(
-            "querymt".to_string(),
-            serde_json::json!({ "reasoning_part_id": part_id }),
-        )])),
-        None => chunk,
-    }
-}
-
-fn stored_summary_updates(
-    content: &str,
-    message_id: Option<&str>,
-    reasoning_parts: &[ReasoningPartStored],
-) -> Vec<SessionUpdate> {
-    let mut updates = Vec::new();
-    if let Some(message_id) = message_id {
-        for part in reasoning_parts {
-            if part.text.is_empty() {
-                continue;
-            }
-            updates.push(SessionUpdate::AgentThoughtChunk(thought_chunk(
-                &part.text,
-                message_id,
-                Some(&part.id),
-            )));
-        }
-    }
-    if !content.is_empty() {
-        updates.push(SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
-                .message_id(message_id.map(|id| MessageId::from(id.to_string()))),
-        ));
-    }
-    updates
 }
 
 fn user_prompt_chunk(
@@ -1170,10 +1262,7 @@ where
     {
         if capabilities.plan_operations {
             push(
-                SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
-                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
-                    entries,
-                ))),
+                querymt_agent_core::replay::todo_plan_update(entries),
                 &mut notifications,
             );
         } else {
@@ -1181,28 +1270,51 @@ where
         }
     }
 
-    // 5. Terminal compactions with their original identities and final
-    // summaries; chunks and in-progress states are omitted.
-    if capabilities.compaction {
-        for terminal in &materialized.compactions {
-            let mut update = CompactionUpdate::new(
-                CompactionId::from(terminal.id.clone()),
-                terminal.status.clone(),
-            );
-            if let Some(summary) = &terminal.summary {
-                update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
-                    summary.clone(),
-                ))]));
-            }
-            if let Some(error) = &terminal.error {
-                update = update.error(error.clone());
-            }
-            push(SessionUpdate::CompactionUpdate(update), &mut notifications);
-        }
+    // 4b. The latest subagent state of every child the history delegated
+    // to, one update per child, ahead of the history that references it.
+    let subagents = if capabilities.subagents {
+        crate::control::delegation_notifications::delegation_updates_from_events(&events)
+            .into_iter()
+            .filter(|snapshot| snapshot.child_session_id.is_some())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for update in subagents.iter().filter_map(subagent_update_from_snapshot) {
+        push(SessionUpdate::SubagentUpdate(update), &mut notifications);
     }
 
-    // 6. Historical conversation/tool content in order.
+    // 5. Historical conversation/tool content in order. A compaction's
+    // terminal state (original identity, final summary; chunks and in-progress
+    // states are omitted) is sent where its terminal event happened, so a
+    // client places it in the timeline where it occurred.
+    // The run an event belongs to is the enclosing `RunStarted`; updates carry
+    // its id as live updates do.
+    let mut current_run: Option<String> = None;
+    // Cursors of the replayed window only (`events` is the window), each
+    // announced once, derived by the rules every cursor producer shares. A
+    // compaction cursor follows a compaction update, which only a client that
+    // advertised `compaction` was sent.
+    let mut cursors = querymt_agent_core::replay::CursorTracker::new(capabilities.compaction);
     for event in events {
+        let cursor_entities = if capabilities.cursors {
+            cursors.observe(event.seq, &event.kind)
+        } else {
+            Vec::new()
+        };
+        if let AgentEventKind::RunStarted { run_id, .. } = &event.kind {
+            current_run = Some(run_id.clone());
+        }
+        let started_tool_call = match &event.kind {
+            AgentEventKind::ToolCallStart { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        };
+        let unsuccessful_delegation = match &event.kind {
+            AgentEventKind::DelegationFailed { delegation_id, .. }
+            | AgentEventKind::DelegationCancelled { delegation_id } => Some(delegation_id.clone()),
+            _ => None,
+        };
+        let ends_run = matches!(&event.kind, AgentEventKind::RunCompleted { .. });
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
@@ -1218,12 +1330,89 @@ where
             }),
             _ => None,
         };
-        let updates = structured_updates.unwrap_or_else(|| {
-            let envelope = EventEnvelope::from(event);
-            translate_replay_event_to_updates(&envelope)
-        });
-        for update in updates {
+        let seq = event.seq;
+        // A plan-operations client already received the materialized
+        // `plan_update` (step 4); the history pass must not follow it with a
+        // legacy `plan` from the same todowrite.
+        let repeats_materialized_plan = capabilities.plan_operations
+            && matches!(
+                &event.kind,
+                AgentEventKind::ToolCallStart { tool_name, .. } if is_todo_write_tool(tool_name)
+            );
+        let updates = if repeats_materialized_plan {
+            Vec::new()
+        } else {
+            structured_updates.unwrap_or_else(|| {
+                let envelope = EventEnvelope::from(event);
+                translate_replay_event_to_updates(&envelope)
+            })
+        };
+        for mut update in updates {
+            if let Some(run_id) = &current_run {
+                querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
+            }
             push(update, &mut notifications);
+        }
+        // A failed or cancelled delegation fails its delegate tool call where
+        // the journal recorded the outcome, after the call's own end.
+        if let Some(delegation_id) = unsuccessful_delegation {
+            for snapshot in subagents
+                .iter()
+                .filter(|snapshot| snapshot.delegation_id == delegation_id)
+            {
+                if let Some(outcome) = delegation_outcome_update(snapshot) {
+                    push(outcome, &mut notifications);
+                }
+            }
+        }
+        // A delegate tool call points at its child right after it starts,
+        // where the live stream sends the reference once the child exists.
+        if let Some(tool_call_id) = started_tool_call {
+            for snapshot in subagents
+                .iter()
+                .filter(|snapshot| snapshot.tool_call_id.as_deref() == Some(&tool_call_id))
+            {
+                if let Some(child) = snapshot.child_session_id.as_deref() {
+                    push(
+                        session_reference_update(&tool_call_id, child),
+                        &mut notifications,
+                    );
+                }
+            }
+        }
+        if capabilities.compaction {
+            for terminal in materialized.compactions.iter().filter(|t| t.seq == seq) {
+                let mut update =
+                    CompactionUpdate::new(terminal.id.clone(), terminal.status.clone());
+                if let Some(summary) = &terminal.summary {
+                    update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                        summary.clone(),
+                    ))]));
+                }
+                if let Some(error) = &terminal.error {
+                    update = update.error(error.clone());
+                }
+                let mut update = SessionUpdate::CompactionUpdate(update);
+                querymt_agent_core::replay::stamp_compaction_tokens(
+                    &mut update,
+                    terminal.tokens_before,
+                    terminal.tokens_after,
+                );
+                if let Some(run_id) = &current_run {
+                    querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
+                }
+                push(update, &mut notifications);
+            }
+        }
+        // Cursors follow the updates of the entity that introduced them.
+        for entity in cursor_entities {
+            push(
+                querymt_agent_core::replay::cursor_update(&entity),
+                &mut notifications,
+            );
+        }
+        if ends_run {
+            current_run = None;
         }
     }
 
@@ -1232,10 +1421,15 @@ where
 
 /// Final folded state of one compaction entity.
 struct ReplayCompactionTerminal {
-    id: String,
+    id: CompactionId,
+    /// The event that settled it; the update is sent at that position.
+    seq: i64,
     status: CompactionStatus,
     summary: Option<String>,
     error: Option<String>,
+    /// `_meta.querymt.compaction` counts, as the live updates carry them.
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
 }
 
 /// Folds durable events into the current session-update state for replay.
@@ -1245,11 +1439,10 @@ fn materialize_replay_state(
 ) -> MaterializedReplayState {
     let _ = capabilities;
     let mut state = MaterializedReplayState::default();
-    // Most recent legacy (ID-less) compaction start, for pairing terminals.
-    let mut open_legacy_start: Option<String> = None;
-    let mut legacy_counter: usize = 0;
+    let mut compaction_ids = CompactionIds::default();
 
     for event in events {
+        let switches_model = state.usage.selects_other_model(&event.kind);
         state
             .usage
             .observe(&event.session_id, event.seq, &event.kind);
@@ -1274,8 +1467,10 @@ fn materialize_replay_state(
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 state.usage.context_limit = context_limit;
                 // A measurement taken for the previous model is not validated
-                // for this one; live delivery invalidates it the same way.
-                state.usage_used = None;
+                // for another one; live delivery invalidates it the same way.
+                if switches_model {
+                    state.usage_used = None;
+                }
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 // Money comes from the shared reducer (observed above), never
@@ -1286,54 +1481,49 @@ fn materialize_replay_state(
                     state.usage_used = None;
                 }
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => match compaction_id {
-                Some(_) => open_legacy_start = None,
-                None => {
-                    legacy_counter += 1;
-                    open_legacy_start = Some(format!(
-                        "querymt-compaction-legacy-{}",
-                        envelope.seq().max(legacy_counter as i64)
-                    ));
-                }
-            },
+            AgentEventKind::CompactionStart {
+                compaction_id,
+                token_estimate,
+            } => {
+                let id = compaction_ids.start(compaction_id.as_deref(), envelope.seq());
+                compaction_ids.start_tokens(&id, token_estimate);
+            }
             AgentEventKind::CompactionEnd {
                 compaction_id,
                 summary,
                 context_tokens,
                 ..
             } => {
-                let id = match compaction_id {
-                    Some(id) => id,
-                    None => open_legacy_start.take().unwrap_or_else(|| {
-                        legacy_counter += 1;
-                        format!(
-                            "querymt-compaction-legacy-{}",
-                            envelope.seq().max(legacy_counter as i64)
-                        )
-                    }),
-                };
+                let id = compaction_ids.end(compaction_id.as_deref(), envelope.seq());
+                let tokens_before = compaction_ids.take_tokens_before(&id);
                 state
                     .compactions
                     .retain(|c: &ReplayCompactionTerminal| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
-                    id: id.clone(),
+                    id,
+                    seq: envelope.seq(),
                     status: CompactionStatus::Completed,
                     summary: (!summary.trim().is_empty()).then_some(summary),
                     error: None,
+                    tokens_before,
+                    tokens_after: context_tokens,
                 });
                 if let Some(tokens) = context_tokens {
                     state.usage_used = Some(tokens);
                 }
-                open_legacy_start = None;
             }
             AgentEventKind::CompactionFailed {
                 compaction_id,
                 reason,
                 cancelled,
             } => {
-                state.compactions.retain(|c| c.id != compaction_id);
+                compaction_ids.failed();
+                let id = CompactionId::from(compaction_id);
+                let tokens_before = compaction_ids.take_tokens_before(&id);
+                state.compactions.retain(|c| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
-                    id: compaction_id.clone(),
+                    id,
+                    seq: envelope.seq(),
                     status: if cancelled {
                         CompactionStatus::Cancelled
                     } else {
@@ -1341,8 +1531,9 @@ fn materialize_replay_state(
                     },
                     summary: None,
                     error: (!cancelled).then_some(reason),
+                    tokens_before,
+                    tokens_after: None,
                 });
-                open_legacy_start = None;
             }
             AgentEventKind::CompactionSummaryChunk { .. }
             | AgentEventKind::HookNotice { .. }
@@ -1363,6 +1554,8 @@ fn materialize_replay_state(
             }
             _ => {}
         }
+        // The measurement this event took counts for the compactions after it.
+        compaction_ids.observe(&event.kind);
     }
 
     state
@@ -1383,7 +1576,7 @@ struct MaterializedReplayState {
 }
 
 /// Deterministic plan identity for QueryMT's todo list within a session.
-pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+pub use querymt_agent_core::replay::QUERYMT_TODO_PLAN_ID;
 
 pub use querymt_agent_core::meta::QUERYMT_META_NAMESPACE;
 
@@ -1457,6 +1650,11 @@ pub struct AcpSessionUpdateCapabilities {
     pub notices: bool,
     /// Client advertised ID-addressed compaction updates.
     pub compaction: bool,
+    /// Client advertised `session.cursors` (`cursor_update` support).
+    pub cursors: bool,
+    /// Client advertised the top-level `subagents` capability
+    /// (`subagent_update` and tool-call `session` references).
+    pub subagents: bool,
 }
 
 impl AcpSessionUpdateCapabilities {
@@ -1467,23 +1665,130 @@ impl AcpSessionUpdateCapabilities {
             plan_operations: capabilities.plan.is_some(),
             notices: session.is_some_and(|session| session.notices.is_some()),
             compaction: session.is_some_and(|session| session.compaction.is_some()),
+            cursors: session.is_some_and(|session| session.cursors.is_some()),
+            subagents: capabilities.subagents.is_some(),
         }
     }
 }
 
-/// `_meta.querymt.accounting` key carrying the replacement accounting DTO.
-pub const QUERYMT_ACCOUNTING_META_KEY: &str = "accounting";
+/// Response key of the load snapshot inside `session/load`'s `_meta`.
+pub(crate) const SESSION_LOAD_SNAPSHOT_RESPONSE_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 
-/// The whole-session summary of a windowed load snapshot, when the snapshot
-/// does not contain the complete history.
-fn windowed_summary(
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<crate::session::history_window::SessionHistorySummary> {
-    let snapshot = meta?.get("querymt/sessionLoadSnapshot.v1")?;
-    if snapshot["history"]["complete"].as_bool() != Some(false) {
-        return None;
+/// Extension method serving an older page of a session's history.
+const QUERYMT_SESSION_HISTORY_METHOD: &str = "querymt/session/history";
+
+/// Key of the cursor list in a load snapshot and in a history page.
+const CURSOR_UPDATES_KEY: &str = "cursorUpdates";
+
+/// Narrows the `cursorUpdates` of a load snapshot or a history page (`holder`)
+/// to what this connection negotiated.
+///
+/// The agent computes the full list once; the transport owns the capability
+/// decision, as it does for live and replayed updates. A client without
+/// `session.cursors` gets no key, one without `compaction` gets no compaction
+/// cursors (it was never sent the compactions they follow).
+pub(crate) fn scope_cursor_updates(
+    holder: &mut serde_json::Map<String, serde_json::Value>,
+    capabilities: &AcpSessionUpdateCapabilities,
+) {
+    use querymt_agent_core::replay::CursorTarget;
+    if !capabilities.cursors {
+        holder.remove(CURSOR_UPDATES_KEY);
+        return;
     }
-    serde_json::from_value(snapshot.get("summary")?.clone()).ok()
+    if capabilities.compaction {
+        return;
+    }
+    let Some(serde_json::Value::Array(updates)) = holder.get_mut(CURSOR_UPDATES_KEY) else {
+        return;
+    };
+    updates.retain(|update| {
+        let target = update
+            .get("cursorId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(CursorTarget::decode);
+        !matches!(target, Some(CursorTarget::Compaction(_)))
+    });
+    if updates.is_empty() {
+        holder.remove(CURSOR_UPDATES_KEY);
+    }
+}
+
+/// [`scope_cursor_updates`] for the snapshot inside a `session/load`
+/// response's `_meta`.
+pub(crate) fn scope_load_cursor_updates(
+    meta: Option<&mut serde_json::Map<String, serde_json::Value>>,
+    capabilities: &AcpSessionUpdateCapabilities,
+) {
+    if let Some(snapshot) = meta
+        .and_then(|meta| meta.get_mut(SESSION_LOAD_SNAPSHOT_RESPONSE_KEY))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        scope_cursor_updates(snapshot, capabilities);
+    }
+}
+
+/// [`scope_cursor_updates`] for the response of the QueryMT extension
+/// `method`, when it is a history page.
+pub(crate) fn scope_ext_response_cursor_updates(
+    method: &str,
+    response: &mut serde_json::Value,
+    capabilities: &AcpSessionUpdateCapabilities,
+) {
+    if normalize_querymt_ext_method(method) != QUERYMT_SESSION_HISTORY_METHOD {
+        return;
+    }
+    if let Some(page) = response.as_object_mut() {
+        scope_cursor_updates(page, capabilities);
+    }
+}
+
+// The `_meta.querymt` keys are defined with the shared replay projection, so
+// the agent and every client name one value: the accounting DTO, the signal
+// that the last context measurement no longer applies, and the model the
+// session switched to.
+pub use querymt_agent_core::replay::{
+    ACCOUNTING_META_KEY as QUERYMT_ACCOUNTING_META_KEY,
+    CONTEXT_INVALIDATED_META_KEY as QUERYMT_CONTEXT_INVALIDATED_META_KEY,
+    MODEL_META_KEY as QUERYMT_MODEL_META_KEY,
+};
+
+/// The model-change signal: a `session_info_update` that changes neither the
+/// title nor the timestamp and carries `_meta.querymt.contextInvalidated: true`
+/// with the model the session switched to (`_meta.querymt.model`).
+fn model_changed_update(
+    provider: &str,
+    model: &str,
+    node: Option<&str>,
+    context_limit: Option<u64>,
+) -> SessionUpdate {
+    let mut selected = serde_json::Map::new();
+    selected.insert("provider".to_owned(), provider.into());
+    selected.insert("model".to_owned(), model.into());
+    if let Some(node) = node {
+        selected.insert("node".to_owned(), node.into());
+    }
+    if let Some(limit) = context_limit {
+        selected.insert("contextLimit".to_owned(), limit.into());
+    }
+    let meta = serde_json::Map::from_iter([(
+        QUERYMT_META_NAMESPACE.to_string(),
+        serde_json::json!({
+            QUERYMT_CONTEXT_INVALIDATED_META_KEY: true,
+            QUERYMT_MODEL_META_KEY: selected,
+        }),
+    )]);
+    SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta))
+}
+
+/// The model a session uses, as far as its context measurement is concerned.
+/// Selecting the same provider, model and limit again (another configuration
+/// or node) does not make a measurement stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelIdentity {
+    provider: String,
+    model: String,
+    context_limit: Option<u64>,
 }
 
 /// Per-session usage projection state for the live context meter.
@@ -1497,6 +1802,9 @@ struct SessionUsageProjection {
     /// Shared reducer over attempt records; created on first accounting
     /// evidence so a session with none publishes no accounting payload.
     accounting: Option<querymt_agent_services::accounting::AccountingReducer>,
+    /// `tokensBefore` of the compactions that started and did not settle,
+    /// by compaction id.
+    open_compactions: HashMap<String, u64>,
     /// Last main-context occupancy and the journal sequence that reported it.
     context_used: Option<u64>,
     used_seq: Option<i64>,
@@ -1508,6 +1816,8 @@ struct SessionUsageProjection {
     request_seqs: HashMap<i64, Option<TokenUsageBreakdown>>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
+    /// The model `provider_seq` selected; see [`ModelIdentity`].
+    model: Option<ModelIdentity>,
     history_loaded: bool,
     /// Main requests that happened before a windowed load's first event.
     prior_requests: u64,
@@ -1595,12 +1905,30 @@ impl SessionUsageProjection {
             .flatten()
     }
 
+    /// Whether `kind` is a model selection that switches this session to a
+    /// different model (or the first one this projection sees).
+    fn selects_other_model(&self, kind: &AgentEventKind) -> bool {
+        let AgentEventKind::ProviderChanged {
+            provider,
+            model,
+            context_limit,
+            ..
+        } = kind
+        else {
+            return false;
+        };
+        self.model.as_ref().is_none_or(|current| {
+            current.provider != *provider
+                || current.model != *model
+                || current.context_limit != *context_limit
+        })
+    }
+
     fn accounting_snapshot(
         &self,
     ) -> Option<querymt_agent_services::accounting::AccountingSnapshot> {
         self.accounting.as_ref().map(|reducer| {
-            let mut snapshot =
-                querymt_agent_services::accounting::AccountingSnapshot::from_reducer(reducer);
+            let mut snapshot = querymt_agent_services::accounting::snapshot_from_reducer(reducer);
             if self.untransferred_history {
                 snapshot.mark_untransferred_history();
             }
@@ -1621,11 +1949,34 @@ impl SessionUsageProjection {
             AgentEventKind::LlmAttemptSettled { .. } => {
                 self.apply_accounting(session_id, seq, kind)
             }
-            AgentEventKind::ProviderChanged { context_limit, .. } => {
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                context_limit,
+                ..
+            } => {
                 if self.provider_seq.is_none_or(|previous| seq > previous) {
                     self.context_limit = *context_limit;
-                    self.provider_seq = Some(seq);
+                    // Only another model makes the last measurement stale.
+                    if self.selects_other_model(kind) {
+                        self.model = Some(ModelIdentity {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            context_limit: *context_limit,
+                        });
+                        self.provider_seq = Some(seq);
+                    }
                 }
+                false
+            }
+            // A finished compaction reports the context the session holds
+            // afterwards: a measurement like a request end, on every path
+            // (live, seeding from a load, replay).
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(tokens),
+                ..
+            } => {
+                self.observe_context_used(seq, *tokens);
                 false
             }
             AgentEventKind::LlmRequestEnd {
@@ -1719,7 +2070,9 @@ impl SessionUsageProjection {
     /// measurement/limit pair exists. It never changes the title or the
     /// activity timestamp and fabricates no context numbers.
     fn accounting_only_update(&self) -> Option<SessionUpdate> {
-        let meta = self.querymt_meta(false)?;
+        // The token breakdown is session-wide and stays valid after a model
+        // change, so it travels with the accounting.
+        let meta = self.querymt_meta(true)?;
         meta.get(QUERYMT_META_NAMESPACE)?
             .get(QUERYMT_ACCOUNTING_META_KEY)?;
         let update = SessionInfoUpdate::new();
@@ -1813,6 +2166,148 @@ pub struct AcpLiveEventTranslator {
     /// Sessions whose deterministic todo plan is currently announced to a
     /// plan-operations client, so an empty snapshot removes it exactly once.
     announced_todo_plans: HashSet<String>,
+    /// Current run and blocking waits per session, for run state updates and
+    /// the run id stamped on session updates.
+    runs: HashMap<String, RunTracking>,
+    /// Delegated child sessions announced to this connection with a
+    /// `subagent_update`, so each child is announced once, before its traffic.
+    announced_children: HashSet<String>,
+    /// `(session id, cursor id)` pairs already sent to this connection, so a
+    /// cursor is announced once even when live and recovered paths both see
+    /// its entity.
+    announced_cursors: HashSet<(String, String)>,
+}
+
+/// One internal event as translated for a connection: the delegation
+/// extension notification (still sent until it is removed) and the session
+/// updates, each addressed to the session it belongs to. Updates are
+/// addressed because a child's announcement belongs to the parent session
+/// even when a child event triggers it.
+#[derive(Debug, Default)]
+pub struct TranslatedEvent {
+    /// Delegation state for the legacy extension notification.
+    pub delegation: Option<DelegationUpdateNotification>,
+    /// `(session id, update)` in delivery order.
+    pub updates: Vec<(String, SessionUpdate)>,
+}
+
+/// The `_meta.querymt` key on `subagent_update` holding the delegation stage
+/// (`verifying`, `finalizing`, `cancel_requested`) while one is in progress.
+pub const SUBAGENT_STAGE_META_KEY: &str = "stage";
+
+/// The ACP `subagent_update` for a delegation snapshot, `None` while the
+/// delegation has no child session yet.
+///
+/// Running states (forked, executing, verifying, finalizing, cancel
+/// requested) report `running` with the cancel capability; the stage of the
+/// last three goes in `_meta.querymt.stage`. A completed, failed or cancelled
+/// delegation reports `idle`, withdraws cancel and carries no stage. The
+/// confirmed model, provider node, delegation id and timestamps are always in
+/// `_meta.querymt`.
+pub(crate) fn subagent_update_from_snapshot(
+    snapshot: &querymt_agent_services::control::delegation_notifications::SubagentSnapshot,
+) -> Option<crate::acp::protocol::SubagentUpdate> {
+    use crate::acp::protocol::{
+        IdleStateUpdate, RunningStateUpdate, SessionCancelCapabilities, StateUpdate,
+        SubagentSessionCapabilities, SubagentUpdate,
+    };
+    use querymt_agent_core::delegation_update::DelegationStage;
+
+    let child = snapshot.child_session_id.as_deref()?;
+    let running = !snapshot.state.is_terminal();
+
+    let mut namespace = serde_json::Map::new();
+    namespace.insert("delegationId".into(), snapshot.delegation_id.clone().into());
+    if let Some(model) = &snapshot.selected_model_id {
+        namespace.insert("modelId".into(), model.clone().into());
+    }
+    if let Some(node) = &snapshot.selected_provider_node_id {
+        namespace.insert("providerNodeId".into(), node.clone().into());
+    }
+    namespace.insert("requestedAt".into(), snapshot.requested_at.into());
+    if let Some(forked_at) = snapshot.forked_at {
+        namespace.insert("forkedAt".into(), forked_at.into());
+    }
+    if let Some(finished_at) = snapshot.finished_at {
+        namespace.insert("finishedAt".into(), finished_at.into());
+    }
+    namespace.insert("updatedAt".into(), snapshot.updated_at.into());
+    if running
+        && let Some(
+            stage @ (DelegationStage::Verifying
+            | DelegationStage::Finalizing
+            | DelegationStage::CancelRequested),
+        ) = snapshot.stage
+        && let Ok(stage) = serde_json::to_value(stage)
+    {
+        namespace.insert(SUBAGENT_STAGE_META_KEY.into(), stage);
+    }
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert(
+        QUERYMT_META_NAMESPACE.to_owned(),
+        serde_json::Value::Object(namespace),
+    );
+
+    let mut update = SubagentUpdate::new(SessionId::from(child.to_owned()));
+    update.title = MaybeUndefined::Value(snapshot.target_agent_id.clone());
+    update.description = MaybeUndefined::Value(snapshot.objective.clone());
+    update.meta = MaybeUndefined::Value(meta);
+    if running {
+        update.state = MaybeUndefined::Value(StateUpdate::Running(RunningStateUpdate::new()));
+        update.capabilities = MaybeUndefined::Value(
+            SubagentSessionCapabilities::new().cancel(SessionCancelCapabilities::new()),
+        );
+    } else {
+        update.state = MaybeUndefined::Value(StateUpdate::Idle(IdleStateUpdate::new()));
+        update.capabilities = MaybeUndefined::Null;
+    }
+    Some(update)
+}
+
+/// The delegate tool call update that points at its child session.
+fn session_reference_update(tool_call_id: &str, child_session_id: &str) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(tool_call_id.to_owned()),
+        ToolCallUpdateFields::new().content(vec![ToolCallContent::Session(
+            crate::acp::protocol::SessionReference::new(SessionId::from(
+                child_session_id.to_owned(),
+            )),
+        )]),
+    ))
+}
+
+/// The final status of a delegate tool call whose delegation did not
+/// succeed. The tool call itself ends `completed` as soon as the delegation is
+/// accepted, so a failed or cancelled delegation is reported by a later update
+/// of the same call. `None` for a delegation that completed or is still running.
+fn delegation_outcome_update(
+    snapshot: &querymt_agent_services::control::delegation_notifications::SubagentSnapshot,
+) -> Option<SessionUpdate> {
+    use querymt_agent_core::delegation_update::DelegationUpdateState;
+    if !matches!(
+        snapshot.state,
+        DelegationUpdateState::Failed | DelegationUpdateState::Cancelled
+    ) {
+        return None;
+    }
+    snapshot.child_session_id.as_ref()?;
+    let tool_call_id = snapshot.tool_call_id.as_deref()?;
+    Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(tool_call_id.to_owned()),
+        ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+    )))
+}
+
+/// Stand-in wait id for a wait a load found pending: its real id is unknown
+/// until its resolution event arrives.
+const LOAD_PENDING_WAIT: &str = "\u{0}load-pending";
+
+/// The run a session is executing and the interactions it waits on.
+#[derive(Debug, Default, Clone)]
+struct RunTracking {
+    run_id: Option<String>,
+    /// Pending permission and elicitation ids of the current run.
+    waiting: HashSet<String>,
 }
 
 impl Default for AcpLiveEventTranslator {
@@ -1820,6 +2315,9 @@ impl Default for AcpLiveEventTranslator {
         Self::new()
     }
 }
+
+/// Most cursor ids a live translator remembers before it starts over.
+const MAX_ANNOUNCED_CURSORS: usize = 4096;
 
 impl AcpLiveEventTranslator {
     pub fn new() -> Self {
@@ -1833,7 +2331,208 @@ impl AcpLiveEventTranslator {
             usage: HashMap::new(),
             config: HashMap::new(),
             announced_todo_plans: HashSet::new(),
+            runs: HashMap::new(),
+            announced_children: HashSet::new(),
+            announced_cursors: HashSet::new(),
         }
+    }
+
+    /// The `cursor_update`s an event causes for a client that advertised
+    /// `session.cursors`: one per anchor the event completes, not yet sent.
+    /// They follow the entity's own update in the caller's vector.
+    fn cursor_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        if !self.capabilities.cursors {
+            return Vec::new();
+        }
+        // A compaction cursor follows a compaction update, which only a
+        // client that advertised `compaction` is sent.
+        let completed = match event.kind() {
+            AgentEventKind::CompactionEnd { compaction_id, .. } if self.capabilities.compaction => {
+                Some(compaction_identity(compaction_id.as_deref(), event))
+            }
+            _ => None,
+        };
+        let entities =
+            querymt_agent_core::replay::event_cursor_entities(event.kind(), completed.as_ref());
+        if entities.is_empty() {
+            return Vec::new();
+        }
+        // The set only suppresses a repeat announcement, which is harmless
+        // (a cursor update is idempotent), so it is bounded by dropping it
+        // rather than growing with the session.
+        if self.announced_cursors.len() >= MAX_ANNOUNCED_CURSORS {
+            self.announced_cursors.clear();
+        }
+        let session_id = event.session_id();
+        entities
+            .into_iter()
+            .filter(|entity| {
+                self.announced_cursors
+                    .insert((session_id.to_owned(), entity.cursor_id()))
+            })
+            .map(|entity| querymt_agent_core::replay::cursor_update(&entity))
+            .collect()
+    }
+
+    /// Observe one live event and return the run state transition it causes.
+    ///
+    /// Call it for every event before [`Self::translate_updates`], so the run
+    /// id stamped on the event's updates is the one the event belongs to.
+    /// `RunStarted` is `running`, `RunCompleted` is `idle` with the mapped stop
+    /// reason, and a blocking permission or elicitation wait is
+    /// `requires_action` until the last one resolves.
+    pub fn translate_state_update(&mut self, event: &EventEnvelope) -> Option<SessionStateUpdate> {
+        // The host's time of the transition, in ms (event timestamps are
+        // whole seconds): both ends of a run are measured on this clock.
+        let at_ms = event.timestamp().saturating_mul(1000);
+        self.translate_state_transition(event)
+            .map(|update| update.at(at_ms))
+    }
+
+    fn translate_state_transition(&mut self, event: &EventEnvelope) -> Option<SessionStateUpdate> {
+        let session_id = event.session_id();
+        match event.kind() {
+            AgentEventKind::RunStarted { run_id, .. } => {
+                let tracking = self.runs.entry(session_id.to_owned()).or_default();
+                tracking.run_id = Some(run_id.clone());
+                tracking.waiting.clear();
+                Some(SessionStateUpdate::running(session_id, run_id))
+            }
+            AgentEventKind::RunCompleted {
+                run_id,
+                outcome,
+                stop_type,
+                ..
+            } => {
+                let tracking = self.runs.get_mut(session_id)?;
+                // A completion of an older run does not end the current one.
+                if tracking.run_id.as_deref().is_some_and(|id| id != run_id) {
+                    return None;
+                }
+                self.runs.remove(session_id);
+                Some(SessionStateUpdate::idle(
+                    session_id,
+                    run_id,
+                    stop_reason_for_outcome(outcome, *stop_type),
+                ))
+            }
+            AgentEventKind::PermissionRequested { permission_id, .. } => {
+                self.begin_wait(session_id, permission_id)
+            }
+            AgentEventKind::ElicitationRequested { elicitation_id, .. } => {
+                self.begin_wait(session_id, elicitation_id)
+            }
+            AgentEventKind::PermissionGranted { permission_id, .. } => {
+                self.end_wait(session_id, permission_id)
+            }
+            AgentEventKind::ElicitationResolved { elicitation_id, .. } => {
+                self.end_wait(session_id, elicitation_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn begin_wait(&mut self, session_id: &str, interaction_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get_mut(session_id)?;
+        let run_id = tracking.run_id.clone()?;
+        let was_empty = tracking.waiting.is_empty();
+        let inserted = tracking.waiting.insert(interaction_id.to_owned());
+        (inserted && was_empty).then(|| SessionStateUpdate::requires_action(session_id, &run_id))
+    }
+
+    fn end_wait(&mut self, session_id: &str, interaction_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get_mut(session_id)?;
+        let run_id = tracking.run_id.clone()?;
+        // A wait the load found pending resolves under its real id.
+        let removed =
+            tracking.waiting.remove(interaction_id) || tracking.waiting.remove(LOAD_PENDING_WAIT);
+        (removed && tracking.waiting.is_empty())
+            .then(|| SessionStateUpdate::running(session_id, &run_id))
+    }
+
+    /// Replace what this connection knows of the session's run with the state
+    /// a load found: the run in progress (if any) and whether it waits for
+    /// the user. Later events refine it.
+    pub fn seed_run_state(&mut self, session_id: &str, run_id: Option<String>, waiting: bool) {
+        let Some(run_id) = run_id else {
+            self.runs.remove(session_id);
+            return;
+        };
+        let tracking = self.runs.entry(session_id.to_owned()).or_default();
+        tracking.run_id = Some(run_id);
+        tracking.waiting.clear();
+        if waiting {
+            // The ids of the waits are unknown; any resolution of a wait the
+            // connection did not see leaves this marker until the run moves on.
+            tracking.waiting.insert(LOAD_PENDING_WAIT.to_owned());
+        }
+    }
+
+    /// The text of messages that were streaming when a load answered, as the
+    /// chunks a client holding the stored history is missing. Each message's
+    /// text is marked streamed, so its stored form is not delivered again and
+    /// later deltas append to it.
+    pub fn inflight_updates(
+        &mut self,
+        session_id: &str,
+        inflight: &querymt_agent_services::event_fanout::InflightText,
+    ) -> Vec<SessionUpdate> {
+        let mut updates = Vec::new();
+        for message in &inflight.messages {
+            for part in message.reasoning.iter().filter(|p| !p.text.is_empty()) {
+                updates.push(SessionUpdate::AgentThoughtChunk(
+                    querymt_agent_core::replay::thought_chunk(
+                        &part.text,
+                        &message.message_id,
+                        part.part_id.as_deref(),
+                    ),
+                ));
+            }
+            if !message.text.is_empty() {
+                self.streamed_assistant_messages
+                    .insert((session_id.to_owned(), message.message_id.clone()));
+                updates.push(SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(message.text.clone())))
+                        .message_id(MessageId::from(message.message_id.clone())),
+                ));
+            }
+        }
+        if let Some(run_id) = self.current_run_id(session_id) {
+            for update in &mut updates {
+                querymt_agent_core::replay::stamp_run_id(update, run_id);
+            }
+        }
+        updates
+    }
+
+    /// What a connection is owed first when a load released its held events:
+    /// the session's current run state (none while idle) and the in-flight
+    /// text, ahead of every other live update.
+    pub fn released_load_prelude(
+        &mut self,
+        session_id: &str,
+        inflight: Option<&querymt_agent_services::event_fanout::InflightText>,
+    ) -> (Option<SessionStateUpdate>, Vec<SessionUpdate>) {
+        let updates = inflight
+            .map(|inflight| self.inflight_updates(session_id, inflight))
+            .unwrap_or_default();
+        (self.current_state_update(session_id), updates)
+    }
+
+    /// The run the session is executing, as observed on this connection.
+    pub fn current_run_id(&self, session_id: &str) -> Option<&str> {
+        self.runs.get(session_id)?.run_id.as_deref()
+    }
+
+    /// Current state of the session's foreground work; `None` when idle.
+    pub fn current_state_update(&self, session_id: &str) -> Option<SessionStateUpdate> {
+        let tracking = self.runs.get(session_id)?;
+        let run_id = tracking.run_id.as_deref()?;
+        Some(if tracking.waiting.is_empty() {
+            SessionStateUpdate::running(session_id, run_id)
+        } else {
+            SessionStateUpdate::requires_action(session_id, run_id)
+        })
     }
 
     /// Applies the connection's negotiated Preview capability snapshot.
@@ -1880,61 +2579,35 @@ impl AcpLiveEventTranslator {
     }
 
     /// Reuse load snapshots rather than issuing a second full history read.
+    /// `None` when the snapshot carries no event list.
+    pub(crate) fn seed_history_from_snapshot(
+        &mut self,
+        session_id: &str,
+        snapshot: &LoadSnapshotView,
+    ) -> Option<Vec<DelegationUpdateNotification>> {
+        let history = snapshot.history.as_ref()?;
+        if let Some(summary) = &snapshot.summary {
+            self.seed_prior_usage(session_id, summary);
+        }
+        let recovered = self.seed_history(session_id, &history.events);
+        if let Some(summary) = &snapshot.summary {
+            self.seed_whole_session_state(session_id, summary);
+        }
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        usage.partial |= history.partial;
+        // A later load after the fill reports exact values and lifts the limit.
+        usage.untransferred_history = snapshot.untransferred_history;
+        Some(recovered)
+    }
+
+    /// [`Self::seed_history_from_snapshot`] for a response's `_meta`.
+    #[cfg(test)]
     pub(crate) fn seed_history_from_meta(
         &mut self,
         session_id: &str,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Option<Vec<DelegationUpdateNotification>> {
-        let events = meta
-            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
-            .and_then(|snapshot| snapshot.get("audit"))
-            .and_then(|audit| audit.get("events"))
-            .and_then(serde_json::Value::as_array)?;
-        let mut partial = false;
-        let mut history = Vec::new();
-        for event in events {
-            if !matches!(
-                event["kind"]["type"].as_str(),
-                Some(
-                    "llm_request_end"
-                        | "provider_changed"
-                        | "llm_attempt_started"
-                        | "llm_attempt_settled"
-                        | "delegation_requested"
-                        | "session_forked"
-                        | "delegation_completed"
-                        | "delegation_failed"
-                        | "delegation_cancelled"
-                )
-            ) {
-                continue;
-            }
-            match serde_json::from_value::<AgentEvent>(event.clone()) {
-                Ok(event) => history.push(event),
-                Err(_) => partial = true,
-            }
-        }
-        let summary = windowed_summary(meta);
-        if let Some(summary) = &summary {
-            self.seed_prior_usage(session_id, summary);
-        }
-        let recovered = self.seed_history(session_id, &history);
-        if let Some(summary) = &summary {
-            self.seed_whole_session_state(session_id, summary);
-        }
-        let untransferred = meta
-            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
-            .and_then(|snapshot| snapshot["accounting"]["session"]["reasons"].as_array())
-            .is_some_and(|reasons| {
-                reasons
-                    .iter()
-                    .any(|reason| reason["kind"] == "untransferred_history")
-            });
-        let usage = self.usage.entry(session_id.to_owned()).or_default();
-        usage.partial |= partial;
-        // A later load after the fill reports exact values and lifts the limit.
-        usage.untransferred_history = untransferred;
-        Some(recovered)
+        self.seed_history_from_snapshot(session_id, &LoadSnapshotView::from_meta(meta)?)
     }
 
     /// Before the window's own events are observed: start token totals from
@@ -2011,6 +2684,11 @@ impl AcpLiveEventTranslator {
         {
             usage.context_limit = provider.context_limit;
             usage.provider_seq = Some(provider.position);
+            usage.model = Some(ModelIdentity {
+                provider: provider.provider.clone(),
+                model: provider.model.clone(),
+                context_limit: provider.context_limit,
+            });
         }
         if let (Some(tokens), Some(position)) =
             (summary.usage.context_tokens, summary.usage.context_position)
@@ -2049,17 +2727,96 @@ impl AcpLiveEventTranslator {
         self.usage.remove(session_id);
         self.config.remove(session_id);
         self.announced_todo_plans.remove(session_id);
+        self.runs.remove(session_id);
+        self.announced_children.remove(session_id);
+        self.announced_cursors
+            .retain(|(session, _)| session != session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
         self.structured_user_messages
             .retain(|(session, _)| session != session_id);
     }
 
-    pub fn translate_delegation_update(
+    /// The `subagent_update` for `snapshot` and, the first time its child is
+    /// announced, the delegate tool call's session reference. Empty for
+    /// clients without `subagents` and for delegations without a child yet.
+    fn subagent_updates(
         &mut self,
-        event: &EventEnvelope,
-    ) -> Option<crate::control::delegation_notifications::DelegationUpdateNotification> {
-        self.delegation_updates.project_envelope(event)
+        snapshot: &DelegationUpdateNotification,
+    ) -> Vec<(String, SessionUpdate)> {
+        if !self.capabilities.subagents {
+            return Vec::new();
+        }
+        let Some(update) = subagent_update_from_snapshot(snapshot) else {
+            return Vec::new();
+        };
+        let Some(child) = snapshot.child_session_id.as_deref() else {
+            return Vec::new();
+        };
+        let parent = snapshot.session_id.clone();
+        let mut updates = vec![(parent.clone(), SessionUpdate::SubagentUpdate(update))];
+        if self.announced_children.insert(child.to_owned())
+            && let Some(tool_call_id) = snapshot.tool_call_id.as_deref()
+        {
+            updates.push((
+                parent.clone(),
+                session_reference_update(tool_call_id, child),
+            ));
+        }
+        // A failed or cancelled delegation fails its tool call, after the
+        // child's final state.
+        if let Some(outcome) = delegation_outcome_update(snapshot) {
+            updates.push((parent, outcome));
+        }
+        updates
+    }
+
+    /// Translates one internal event for this connection: the delegation
+    /// state it changes and the session updates it causes, in order.
+    ///
+    /// A delegation event yields its `subagent_update` (then the session
+    /// reference of the delegate tool call). Any other event of a delegated
+    /// child that this connection has not been told about yet is preceded by
+    /// that announcement, so a child never speaks before it is announced.
+    pub fn translate_event(&mut self, event: &EventEnvelope) -> TranslatedEvent {
+        let delegation = self.delegation_updates.project_envelope(event);
+        let mut updates = match &delegation {
+            Some(snapshot) => self.subagent_updates(snapshot),
+            None => {
+                let mut updates = Vec::new();
+                if self.capabilities.subagents
+                    && !self.announced_children.contains(event.session_id())
+                    && let Some(snapshot) = self
+                        .delegation_updates
+                        .snapshot_for_child(event.session_id())
+                {
+                    updates.extend(self.subagent_updates(&snapshot));
+                }
+                let session_id = event.session_id().to_owned();
+                updates.extend(
+                    self.translate_unstamped_updates(event)
+                        .into_iter()
+                        .map(|update| (session_id.clone(), update)),
+                );
+                // Cursors follow the entity update that introduced them.
+                let cursors = self.cursor_updates(event);
+                updates.extend(
+                    cursors
+                        .into_iter()
+                        .map(|update| (session_id.clone(), update)),
+                );
+                updates
+            }
+        };
+        for (session_id, update) in &mut updates {
+            if let Some(run_id) = self.current_run_id(session_id) {
+                querymt_agent_core::replay::stamp_run_id(update, run_id);
+            }
+        }
+        TranslatedEvent {
+            delegation,
+            updates,
+        }
     }
 
     #[doc(hidden)]
@@ -2097,9 +2854,6 @@ impl AcpLiveEventTranslator {
                 error.as_deref(),
             )];
         }
-        if let Some(update) = self.translate_delegation_update(event) {
-            return vec![delegation_update_notification(update)];
-        }
         if let Some(notification) = input_state_notification(event) {
             return vec![notification];
         }
@@ -2126,20 +2880,22 @@ impl AcpLiveEventTranslator {
             })];
         }
 
-        let session_id = event.session_id().to_owned();
-        self.translate_updates(event)
-            .into_iter()
-            .map(|update| {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "update": update
-                    }
-                })
+        let translated = self.translate_event(event);
+        let mut notifications = Vec::new();
+        if let Some(update) = translated.delegation {
+            notifications.push(delegation_update_notification(update));
+        }
+        notifications.extend(translated.updates.into_iter().map(|(session_id, update)| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": update
+                }
             })
-            .collect()
+        }));
+        notifications
     }
 
     /// Single-notification adapter over [`Self::translate_notifications`].
@@ -2151,7 +2907,18 @@ impl AcpLiveEventTranslator {
     }
 
     /// Translates one internal event into zero or more ordered session updates.
+    ///
+    /// Updates that belong to a run carry its id in `_meta.querymt.runId`: the
+    /// run [`Self::translate_state_update`] last observed for the session.
     pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        self.translate_event(event)
+            .updates
+            .into_iter()
+            .map(|(_, update)| update)
+            .collect()
+    }
+
+    fn translate_unstamped_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
         match event.kind() {
             AgentEventKind::UserPromptBlock {
                 message_id,
@@ -2260,22 +3027,40 @@ impl AcpLiveEventTranslator {
                 }
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
-            AgentEventKind::ProviderChanged { .. } => {
-                self.usage.entry(session_id.clone()).or_default().observe(
-                    &session_id,
-                    event.seq(),
-                    event.kind(),
-                );
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                context_limit,
+                provider_node_id,
+                ..
+            } => {
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                let switched = usage.selects_other_model(event.kind());
+                usage.observe(&session_id, event.seq(), event.kind());
                 let config = self.config.entry(session_id).or_default();
                 config.observe(event.kind());
-                config
-                    .snapshot()
-                    .map(|options| {
-                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                            options,
-                        ))]
-                    })
-                    .unwrap_or_default()
+                // The last context measurement does not describe a different
+                // model. A metadata-only `session_info_update` (no title, no
+                // timestamp) tells every client, with or without notice
+                // support; replay does not repeat it. Selecting the model the
+                // session already uses (another configuration or node) keeps
+                // the measurement and sends no signal. A translator that has
+                // not seen a model yet cannot tell, and sends it.
+                let mut updates = Vec::new();
+                if switched {
+                    updates.push(model_changed_update(
+                        provider,
+                        model,
+                        provider_node_id.as_deref(),
+                        *context_limit,
+                    ));
+                }
+                if let Some(options) = config.snapshot() {
+                    updates.push(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                        options,
+                    )));
+                }
+                updates
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 let usage = self.usage.entry(session_id.clone()).or_default();
@@ -2365,14 +3150,32 @@ impl AcpLiveEventTranslator {
             } if is_todo_write_tool(tool_name) => {
                 self.translate_todo_updates(&session_id, arguments)
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => {
+            AgentEventKind::CompactionStart {
+                compaction_id,
+                token_estimate,
+            } => {
                 if !self.capabilities.compaction {
                     return Vec::new();
                 }
-                vec![SessionUpdate::CompactionUpdate(CompactionUpdate::new(
-                    compaction_identity(compaction_id.as_deref(), event),
+                let id = compaction_identity(compaction_id.as_deref(), event);
+                // The last context measurement this session's usage
+                // projection holds, or the compaction's own estimate.
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                let before = querymt_agent_core::replay::compaction_tokens_before(
+                    usage.context_used,
+                    *token_estimate,
+                );
+                usage.open_compactions.insert(id.0.to_string(), before);
+                let mut update = SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                    id,
                     CompactionStatus::InProgress,
-                ))]
+                ));
+                querymt_agent_core::replay::stamp_compaction_tokens(
+                    &mut update,
+                    Some(before),
+                    None,
+                );
+                vec![update]
             }
             AgentEventKind::CompactionSummaryChunk {
                 compaction_id,
@@ -2390,21 +3193,41 @@ impl AcpLiveEventTranslator {
             }
             AgentEventKind::CompactionEnd {
                 compaction_id,
+                summary,
                 context_tokens,
                 ..
             } => {
                 let mut updates = Vec::new();
                 if self.capabilities.compaction {
-                    updates.push(SessionUpdate::CompactionUpdate(CompactionUpdate::new(
-                        compaction_identity(compaction_id.as_deref(), event),
-                        CompactionStatus::Completed,
-                    )));
+                    let id = compaction_identity(compaction_id.as_deref(), event);
+                    let before = self
+                        .usage
+                        .entry(session_id.clone())
+                        .or_default()
+                        .open_compactions
+                        .remove(&*id.0);
+                    let mut update = CompactionUpdate::new(id, CompactionStatus::Completed);
+                    // The whole final summary, as one block, so a client that
+                    // received chunks holds what a loaded session holds.
+                    if !summary.trim().is_empty() {
+                        update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                            summary.clone(),
+                        ))]));
+                    }
+                    let mut update = SessionUpdate::CompactionUpdate(update);
+                    querymt_agent_core::replay::stamp_compaction_tokens(
+                        &mut update,
+                        before,
+                        *context_tokens,
+                    );
+                    updates.push(update);
                 }
                 // Post-compaction usage snapshots are stable, ungated updates.
-                if let Some(tokens) = context_tokens
-                    && let Some(usage) = self.usage.get_mut(&session_id)
-                {
-                    usage.observe_context_used(event.seq(), *tokens);
+                if let Some(tokens) = context_tokens {
+                    // The same rule as seeding and replay, whether or not
+                    // this translator has seen the session's model yet.
+                    let usage = self.usage.entry(session_id.clone()).or_default();
+                    usage.observe(&session_id, event.seq(), event.kind());
                     if let Some(update) = usage.usage_update(*tokens) {
                         updates.push(SessionUpdate::UsageUpdate(update));
                     }
@@ -2419,6 +3242,12 @@ impl AcpLiveEventTranslator {
                 if !self.capabilities.compaction {
                     return Vec::new();
                 }
+                let before = self
+                    .usage
+                    .entry(session_id.clone())
+                    .or_default()
+                    .open_compactions
+                    .remove(compaction_id.as_str());
                 let mut update = CompactionUpdate::new(
                     CompactionId::from(compaction_id.clone()),
                     if *cancelled {
@@ -2430,7 +3259,9 @@ impl AcpLiveEventTranslator {
                 if !*cancelled {
                     update = update.error(reason.clone());
                 }
-                vec![SessionUpdate::CompactionUpdate(update)]
+                let mut update = SessionUpdate::CompactionUpdate(update);
+                querymt_agent_core::replay::stamp_compaction_tokens(&mut update, before, None);
+                vec![update]
             }
             AgentEventKind::ToolCallProgress {
                 tool_call_id,
@@ -2472,9 +3303,7 @@ impl AcpLiveEventTranslator {
                 return Vec::new();
             }
             self.announced_todo_plans.insert(session_id.to_owned());
-            return vec![SessionUpdate::PlanUpdate(PlanUpdate::new(
-                PlanUpdateContent::items(PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()), entries),
-            ))];
+            return vec![querymt_agent_core::replay::todo_plan_update(entries)];
         }
         vec![SessionUpdate::Plan(Plan::new(entries))]
     }
@@ -2589,198 +3418,7 @@ pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUp
 /// (mode/config, metadata, usage, notices, capability-gated plans, and
 /// compaction) are projected by their owners instead.
 fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
-    match event.kind() {
-        AgentEventKind::PromptReceived {
-            content,
-            message_id,
-        } => vec![SessionUpdate::UserMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                .message_id(message_id.clone().map(MessageId::from)),
-        )],
-        AgentEventKind::UserPromptBlock { .. } => Vec::new(),
-        // Live-only: progress is transient and never part of replayed history.
-        AgentEventKind::ToolCallProgress { .. } => Vec::new(),
-        // Live-only: delivered as an ext notification, never replayed.
-        AgentEventKind::McpServerAuthRequired { .. } => Vec::new(),
-        AgentEventKind::AssistantMessageStored {
-            content,
-            message_id,
-            ..
-        } => {
-            if content.is_empty() {
-                return Vec::new();
-            }
-            vec![SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(message_id.clone().map(MessageId::from)),
-            )]
-        }
-        // Streaming text deltas are live-only; replay uses persisted messages.
-        AgentEventKind::AssistantContentDelta { .. } => Vec::new(),
-        AgentEventKind::AssistantThinkingDelta {
-            content,
-            message_id,
-            part_id,
-        } => {
-            if content.is_empty() {
-                return Vec::new();
-            }
-            vec![SessionUpdate::AgentThoughtChunk(thought_chunk(
-                content,
-                message_id,
-                part_id.as_deref(),
-            ))]
-        }
-        AgentEventKind::ToolCallStart {
-            tool_call_id,
-            tool_name,
-            arguments,
-        } => {
-            if is_todo_write_tool(tool_name) {
-                // Ungated contexts receive the legacy full-replacement plan;
-                // plan-operations connections intercept todowrite earlier.
-                return todo_entries_from_arguments(arguments)
-                    .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
-                    .unwrap_or_default();
-            }
-
-            let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-            vec![SessionUpdate::ToolCall(
-                ToolCall::new(
-                    ToolCallId::from(tool_call_id.clone()),
-                    format!("Run {}", tool_name),
-                )
-                .kind(tool_kind_for_tool(tool_name))
-                .status(ToolCallStatus::InProgress)
-                .raw_input(args),
-            )]
-        }
-        AgentEventKind::ToolCallEnd {
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-        } => {
-            if is_todo_write_tool(tool_name) {
-                return Vec::new();
-            }
-
-            let status = if *is_error {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            };
-            let raw_output = serde_json::from_str(result).ok();
-            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                ToolCallId::from(tool_call_id.clone()),
-                ToolCallUpdateFields::new()
-                    .kind(tool_kind_for_tool(tool_name))
-                    .status(status)
-                    .title(format!("Run {}", tool_name))
-                    .content(vec![ToolCallContent::Content(Content::new(
-                        ContentBlock::Text(TextContent::new(result.clone())),
-                    ))])
-                    .raw_output(raw_output),
-            ))]
-        }
-        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))),
-        )],
-        AgentEventKind::WorktreeOwnershipTransferred {
-            workspace_id,
-            successor_session_id,
-            summary_seeded,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
-            workspace_id,
-            successor_session_id,
-            *summary_seeded,
-        ))],
-        AgentEventKind::WorktreeArchived {
-            workspace_id,
-            by_session_id,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
-            workspace_id,
-            by_session_id.as_deref(),
-        ))],
-        _ => Vec::new(),
-    }
-}
-
-/// Announcement of an archived workspace. The `message_id` is derived from the
-/// workspace so live delivery and replay agree on identity.
-fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
-    let text = format!(
-        "This session's workspace {workspace_id} was archived. This session is now \
-         read-only; run `/worktree remove` to delete the checkout."
-    );
-    let mut details = serde_json::json!({ "workspaceId": workspace_id });
-    if let Some(by) = by_session_id {
-        details["bySessionId"] = by.into();
-    }
-    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
-        .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
-        .meta(serde_json::Map::from_iter([(
-            QUERYMT_META_NAMESPACE.to_string(),
-            serde_json::json!({ "worktreeArchived": details }),
-        )]))
-}
-
-/// Announcement of an ownership handoff. The `message_id` is derived from the
-/// workspace and successor so live delivery and replay agree on identity.
-fn worktree_handoff_chunk(
-    workspace_id: &str,
-    successor_session_id: &str,
-    summary_seeded: bool,
-) -> ContentChunk {
-    let text = format!(
-        "This session's workspace {workspace_id} was handed off to session \
-         {successor_session_id}. This session is now read-only."
-    );
-    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
-        .message_id(MessageId::from(format!(
-            "worktree-handoff-{workspace_id}-{successor_session_id}"
-        )))
-        .meta(serde_json::Map::from_iter([(
-            QUERYMT_META_NAMESPACE.to_string(),
-            serde_json::json!({
-                "worktreeHandoff": {
-                    "workspaceId": workspace_id,
-                    "successorSessionId": successor_session_id,
-                    "summarySeeded": summary_seeded,
-                }
-            }),
-        )]))
-}
-
-fn is_todo_write_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "todowrite" | "mcp_todowrite")
-}
-
-fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let todos = parsed.get("todos")?.as_array()?;
-    let mut entries = Vec::with_capacity(todos.len());
-
-    for todo in todos {
-        let content = todo.get("content")?.as_str()?.to_string();
-        let Some(status) = todo
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .and_then(todo_status_to_plan_status)
-        else {
-            continue;
-        };
-
-        let priority = todo
-            .get("priority")
-            .and_then(serde_json::Value::as_str)
-            .and_then(todo_priority_to_plan_priority)
-            .unwrap_or(PlanEntryPriority::Medium);
-
-        entries.push(PlanEntry::new(content, priority, status));
-    }
-
-    Some(entries)
+    querymt_agent_core::replay::replayable_updates(event.kind())
 }
 
 /// Resolves the protocol compaction identity for a compaction event. Live
@@ -2789,7 +3427,7 @@ fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
 fn compaction_identity(explicit: Option<&str>, event: &EventEnvelope) -> CompactionId {
     match explicit {
         Some(id) if !id.is_empty() => CompactionId::from(id.to_string()),
-        _ => CompactionId::from(format!("querymt-compaction-legacy-{}", event.seq())),
+        _ => querymt_agent_core::replay::legacy_compaction_id(event.seq()),
     }
 }
 
@@ -2799,26 +3437,6 @@ fn parse_reasoning_effort(value: &str) -> Option<querymt::chat::ReasoningEffort>
         return None;
     }
     serde_json::from_value(serde_json::json!(value)).ok()
-}
-
-fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
-    match priority {
-        "high" => Some(PlanEntryPriority::High),
-        "medium" => Some(PlanEntryPriority::Medium),
-        "low" => Some(PlanEntryPriority::Low),
-        _ => None,
-    }
-}
-
-fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
-    match status {
-        "pending" => Some(PlanEntryStatus::Pending),
-        "in_progress" => Some(PlanEntryStatus::InProgress),
-        "completed" => Some(PlanEntryStatus::Completed),
-        // ACP plans do not support a cancelled state; omit these entries.
-        "cancelled" => None,
-        _ => None,
-    }
 }
 
 /// Map tool names to ToolKind enum.
@@ -2890,6 +3508,12 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
     let mut notifications = Vec::new();
+    // A `session/load` that answered: its held live events are released once
+    // the transport has sent the response.
+    let mut load_release: Option<(
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    )> = None;
     let result: Result<serde_json::Value, Error> =
         run_with_acp_span(&rpc_method, &rpc_params, async {
             let method = req.method.clone();
@@ -3059,18 +3683,36 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     ) {
                         Ok(params) => {
                             let session_id = params.session_id.to_string();
+                            // Live events of the session wait from here until the
+                            // response is out (see `ConnectionDelivery::begin_load`).
+                            let hold = context
+                                .delivery
+                                .as_ref()
+                                .map(|delivery| delivery.begin_load(&session_id));
                             // MCP attachments are now resolved internally by the
                             // materializer via the runtime attachment source.
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
+                                    // The cut and the translator seed read the
+                                    // snapshot together, once.
+                                    let snapshot = LoadSnapshotView::from_meta(r.meta.as_ref());
+                                    let mut cut = snapshot.as_ref().map(|snapshot| snapshot.cut);
                                     if let Some(translator) = context.translator.as_ref() {
-                                        let mut translator = translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        if let Some(options) = r.config_options.as_ref() {
-                                            translator.seed_config_options(&session_id, options);
-                                        }
-                                        notifications.extend(translator.seed_history_from_meta(&session_id, r.meta.as_ref())
-                                            .unwrap_or_default().into_iter().map(delegation_update_notification));
+                                        let recovered = seed_translator_from_load(
+                                            agent.as_any().downcast_ref::<AgentHandle>(),
+                                            &session_id,
+                                            &r,
+                                            snapshot.as_ref(),
+                                            translator,
+                                        )
+                                        .await;
+                                        notifications.extend(
+                                            recovered
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(delegation_update_notification),
+                                        );
                                     }
                                     let request_lock =
                                         session_owners.request_lock(&session_id, conn_id).await;
@@ -3085,6 +3727,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     )
                                     .await?;
                                     let mut value = serde_json::to_value(r).unwrap();
+                                    let capabilities = context.session_update_capabilities();
+                                    scope_load_cursor_updates(
+                                        value.get_mut("_meta").and_then(serde_json::Value::as_object_mut),
+                                        &capabilities,
+                                    );
                                     let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
                                     if let (Some(hooks), Some(local_agent)) =
                                         (context.session_hooks.as_ref(), local_agent)
@@ -3113,24 +3760,14 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                             "skipping ACP history replay for snapshot-capable client"
                                         );
                                     } else if let Some(local_agent) = local_agent {
-                                        let capabilities = context
-                                            .translator
-                                            .as_ref()
-                                            .map(|translator| {
-                                                translator
-                                                    .lock()
-                                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                    .capabilities()
-                                            })
-                                            .unwrap_or_default();
                                         let replay =
-                                            crate::acp::stdio::replay_loaded_session(
+                                            crate::acp::stdio::replay_loaded_session_with_cut(
                                                 local_agent,
                                                 &session_id,
                                                 &capabilities,
                                             )
                                             .await;
-                                        let (replay, _) = match replay {
+                                        let (replay, _, replay_cut) = match replay {
                                             Ok(replay) => replay,
                                             Err(error) => {
                                                 if ownership_inserted {
@@ -3144,6 +3781,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                                 return Err(error);
                                             }
                                         };
+                                        cut = Some(replay_cut);
                                         for notification in replay {
                                             let mut params = serde_json::to_value(notification)
                                                 .map_err(Error::into_internal_error)?;
@@ -3159,6 +3797,28 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         available_commands_session_update(agent, &session_id).await
                                     {
                                         notifications.push(notification);
+                                    }
+                                    if let Some(hold) = hold {
+                                        // More live events than the connection can
+                                        // buffer arrived: answering would leave a
+                                        // gap, so the load fails and can be retried.
+                                        if hold.check().is_err() {
+                                            if ownership_inserted {
+                                                unsubscribe_connection(
+                                                    session_owners,
+                                                    &session_id,
+                                                    conn_id,
+                                                )
+                                                .await;
+                                            }
+                                            return Err(Error::internal_error().data(
+                                                serde_json::json!({
+                                                    "message": "Too many live events arrived while loading the session; retry the load",
+                                                    "sessionId": session_id,
+                                                }),
+                                            ));
+                                        }
+                                        load_release = Some((hold, cut));
                                     }
                                     Ok(value)
                                 }
@@ -3402,8 +4062,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 }
 
                 // Forward QueryMT extension methods to the agent's ext_method handler.
-                // SDK ACP strips the leading underscore for extension requests;
-                // WebSocket clients may send either shape, so normalize here.
+                // ACP extension methods carry a leading underscore on the wire and
+                // the SDK keeps it; WebSocket clients may send either shape, so
+                // normalize here (stdio does the same via
+                // `normalize_querymt_ext_request`).
                 m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
                     let ext_method = normalize_querymt_ext_method(m);
                     let session_id_for_owner =
@@ -3456,6 +4118,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     });
                     match response {
                         Ok(mut value) => {
+                            scope_ext_response_cursor_updates(
+                                ext_method,
+                                &mut value,
+                                &context.session_update_capabilities(),
+                            );
                             let session_id = session_id_for_owner.clone().or_else(|| {
                                 querymt_session_id_from_response(ext_method, &value)
                             });
@@ -3587,6 +4254,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
         // Only `session/load` replays history through the notification queue;
         // every other method keeps the respond-first ordering.
         notify_before_response: rpc_method == AGENT_METHOD_NAMES.session_load,
+        load_release,
     }
 }
 
@@ -3723,9 +4391,111 @@ fn acp_method_span(method: &str) -> tracing::Span {
 }
 
 #[cfg(test)]
+mod cursor_scope_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn page() -> Value {
+        json!({
+            "events": [],
+            "cursorUpdates": [
+                { "cursorId": "m:a1" },
+                { "cursorId": "c:call-1" },
+                { "cursorId": "k:cmp-1" },
+            ],
+        })
+    }
+
+    fn ids(page: &Value) -> Vec<&str> {
+        page["cursorUpdates"]
+            .as_array()
+            .map(|updates| {
+                updates
+                    .iter()
+                    .filter_map(|u| u["cursorId"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn scoped(method: &str, capabilities: AcpSessionUpdateCapabilities) -> Value {
+        let mut response = page();
+        scope_ext_response_cursor_updates(method, &mut response, &capabilities);
+        response
+    }
+
+    #[test]
+    fn client_without_cursor_support_gets_no_cursor_key() {
+        let response = scoped(
+            "querymt/session/history",
+            AcpSessionUpdateCapabilities::default(),
+        );
+        assert!(response.get("cursorUpdates").is_none(), "{response}");
+        assert!(response.get("events").is_some());
+    }
+
+    #[test]
+    fn client_with_cursors_and_compaction_keeps_every_cursor() {
+        let capabilities = AcpSessionUpdateCapabilities {
+            cursors: true,
+            compaction: true,
+            ..Default::default()
+        };
+        let response = scoped("querymt/session/history", capabilities);
+        assert_eq!(ids(&response), ["m:a1", "c:call-1", "k:cmp-1"]);
+    }
+
+    #[test]
+    fn client_without_compaction_gets_no_compaction_cursor() {
+        let capabilities = AcpSessionUpdateCapabilities {
+            cursors: true,
+            ..Default::default()
+        };
+        let response = scoped("querymt/session/history", capabilities);
+        assert_eq!(ids(&response), ["m:a1", "c:call-1"]);
+    }
+
+    #[test]
+    fn only_compaction_cursors_leave_no_empty_key() {
+        let mut response = json!({ "cursorUpdates": [{ "cursorId": "k:cmp-1" }] });
+        let capabilities = AcpSessionUpdateCapabilities {
+            cursors: true,
+            ..Default::default()
+        };
+        scope_ext_response_cursor_updates("_querymt/session/history", &mut response, &capabilities);
+        assert!(response.get("cursorUpdates").is_none(), "{response}");
+    }
+
+    #[test]
+    fn other_extension_responses_are_untouched() {
+        let response = scoped(
+            "querymt/session/toolContent",
+            AcpSessionUpdateCapabilities::default(),
+        );
+        assert_eq!(ids(&response).len(), 3);
+    }
+
+    #[test]
+    fn load_snapshot_is_scoped_inside_the_response_meta() {
+        let mut meta = serde_json::Map::new();
+        meta.insert(SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.into(), page());
+        scope_load_cursor_updates(Some(&mut meta), &AcpSessionUpdateCapabilities::default());
+        assert!(
+            meta[SESSION_LOAD_SNAPSHOT_RESPONSE_KEY]
+                .get("cursorUpdates")
+                .is_none()
+        );
+        // A load without a snapshot has nothing to scope.
+        scope_load_cursor_updates(None, &AcpSessionUpdateCapabilities::default());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::protocol::{PlanEntryPriority, PlanEntryStatus};
     use crate::agent::core::AgentMode;
+    use querymt_agent_core::events::ReasoningPartStored;
 
     #[test]
     fn unknown_session_errors_are_recognized() {
@@ -5749,7 +6519,7 @@ mod tests {
         );
         assert_eq!(
             notification["params"]["update"]["availableCommands"][0]["name"],
-            "/docs"
+            "docs"
         );
     }
 
@@ -5893,6 +6663,7 @@ mod tests {
                 plan_operations: true,
                 notices: true,
                 compaction: true,
+                ..Default::default()
             },
         )
         .await;
@@ -6363,7 +7134,7 @@ mod tests {
                     session_id.to_owned(),
                     crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(
                         crate::acp::protocol::AvailableCommandsUpdate::new(vec![
-                            crate::acp::protocol::AvailableCommand::new("/compact", "Compact"),
+                            crate::acp::protocol::AvailableCommand::new("compact", "Compact"),
                         ]),
                     ),
                 ))
@@ -6405,6 +7176,44 @@ mod tests {
             })
             .expect("remote attach advertises the command catalog");
         assert_eq!(advertised["params"]["sessionId"], "s-remote");
+    }
+
+    #[test]
+    fn querymt_ext_request_drops_the_wire_underscore_only_for_querymt() {
+        let request = |method: &str| {
+            crate::acp::protocol::ExtRequest::new(
+                method,
+                Arc::from(serde_json::value::RawValue::from_string("{}".to_string()).unwrap()),
+            )
+        };
+        let method = |method: &str| {
+            normalize_querymt_ext_request(request(method))
+                .method
+                .to_string()
+        };
+
+        assert_eq!(method("_querymt/models"), "querymt/models");
+        assert_eq!(method("querymt/models"), "querymt/models");
+        assert_eq!(
+            method("_querymt/session/history"),
+            "querymt/session/history"
+        );
+        // Other extension namespaces keep their wire name.
+        assert_eq!(method("_workspace/query"), "_workspace/query");
+    }
+
+    #[test]
+    fn querymt_ext_request_keeps_params() {
+        let params = Arc::from(
+            serde_json::value::RawValue::from_string(r#"{"session_id":"s-1"}"#.to_string())
+                .unwrap(),
+        );
+        let normalized = normalize_querymt_ext_request(crate::acp::protocol::ExtRequest::new(
+            "_querymt/session/history",
+            params,
+        ));
+
+        assert_eq!(normalized.params.get(), r#"{"session_id":"s-1"}"#);
     }
 
     #[test]
@@ -7472,6 +8281,7 @@ mod tests {
 #[cfg(test)]
 mod session_update_tests {
     use super::*;
+    use crate::acp::protocol::PlanUpdateContent;
     use crate::agent::core::AgentMode;
     use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use std::collections::HashMap;
@@ -7508,6 +8318,7 @@ mod session_update_tests {
             plan_operations: true,
             notices: true,
             compaction: true,
+            ..Default::default()
         }
     }
 
@@ -7671,6 +8482,149 @@ mod session_update_tests {
         assert!(!null_session.notices && !null_session.compaction);
     }
 
+    fn capabilities_from_json(value: serde_json::Value) -> AcpSessionUpdateCapabilities {
+        let capabilities: crate::acp::protocol::ClientCapabilities =
+            serde_json::from_value(value).expect("client capabilities deserialize");
+        AcpSessionUpdateCapabilities::from_client_capabilities(&capabilities)
+    }
+
+    #[test]
+    fn clients_advertise_different_preview_capabilities() {
+        let cursors_only = capabilities_from_json(serde_json::json!({
+            "session": {"cursors": {}}
+        }));
+        let subagents_only = capabilities_from_json(serde_json::json!({
+            "subagents": {}
+        }));
+        let everything = capabilities_from_json(serde_json::json!({
+            "plan": {},
+            "subagents": {},
+            "session": {"notices": {}, "compaction": {}, "cursors": {}}
+        }));
+
+        // Each capability is parsed independently of the others.
+        assert_eq!(
+            cursors_only,
+            AcpSessionUpdateCapabilities {
+                cursors: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            subagents_only,
+            AcpSessionUpdateCapabilities {
+                subagents: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            everything,
+            AcpSessionUpdateCapabilities {
+                plan_operations: true,
+                notices: true,
+                compaction: true,
+                cursors: true,
+                subagents: true,
+            }
+        );
+
+        // Two translators with different capabilities over the same events:
+        // each receives only the variants it advertised.
+        let mut full = AcpLiveEventTranslator::new();
+        full.set_capabilities(everything);
+        let mut narrow = AcpLiveEventTranslator::new();
+        narrow.set_capabilities(cursors_only);
+        assert_eq!(full.capabilities(), everything);
+        assert_eq!(narrow.capabilities(), cursors_only);
+
+        let notice = envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&notice).as_slice(),
+            [SessionUpdate::Notice(_)]
+        ));
+        assert!(narrow.translate_updates(&notice).is_empty());
+
+        let plan = todo_start(&todo_args(&[("a", "pending")]));
+        assert!(matches!(
+            full.translate_updates(&plan).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        assert!(matches!(
+            narrow.translate_updates(&plan).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+    }
+
+    fn cursor_json(entity: &querymt_agent_core::replay::CursorEntity) -> serde_json::Value {
+        let update = querymt_agent_core::replay::cursor_update(entity);
+        serde_json::to_value(update).expect("cursor update serializes")
+    }
+
+    #[test]
+    fn message_cursors_are_forkable() {
+        use querymt_agent_core::replay::CursorEntity;
+        for (entity, kind) in [
+            (CursorEntity::UserMessage("u1".into()), "user_message"),
+            (CursorEntity::AgentMessage("a1".into()), "agent_message"),
+        ] {
+            let json = cursor_json(&entity);
+            assert_eq!(json["sessionUpdate"], "cursor_update");
+            assert_eq!(json["cursorId"], entity.cursor_id());
+            assert_eq!(json["anchor"]["type"], kind);
+            assert_eq!(json["anchor"]["position"], "after");
+            assert!(
+                json["capabilities"]["fork"].is_object(),
+                "message cursor must advertise fork: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_cursors_are_not_forkable() {
+        use querymt_agent_core::replay::CursorEntity;
+        for (entity, kind) in [
+            (CursorEntity::ToolCall("call-1".into()), "tool_call"),
+            (CursorEntity::AgentThought("m1".into()), "agent_thought"),
+            (CursorEntity::Compaction("k1".into()), "compaction"),
+        ] {
+            let json = cursor_json(&entity);
+            assert_eq!(json["anchor"]["type"], kind);
+            assert!(
+                json.get("capabilities").is_none(),
+                "{kind} cursor must carry no fork capability: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_is_omitted_or_null() {
+        let omitted = capabilities_from_json(serde_json::json!({}));
+        assert!(!omitted.cursors && !omitted.subagents);
+
+        let null = capabilities_from_json(serde_json::json!({
+            "subagents": null,
+            "session": {"cursors": null}
+        }));
+        assert!(!null.cursors && !null.subagents);
+
+        let null_session = capabilities_from_json(serde_json::json!({"session": null}));
+        assert!(!null_session.cursors && !null_session.subagents);
+
+        // An empty object advertises support.
+        let supplied = capabilities_from_json(serde_json::json!({
+            "subagents": {},
+            "session": {"cursors": {}}
+        }));
+        assert!(supplied.cursors && supplied.subagents);
+    }
+
     #[test]
     fn capability_snapshot_matches_documented_client_capabilities_json() {
         // Mirrors the JSON advertised in the ACP documentation.
@@ -7712,6 +8666,7 @@ mod session_update_tests {
             plan_operations: false,
             notices: false,
             compaction: true,
+            ..Default::default()
         });
         let mut legacy = AcpLiveEventTranslator::new();
 
@@ -7777,6 +8732,165 @@ mod session_update_tests {
     }
 
     #[test]
+    fn model_change_after_a_request() {
+        // Every client, with or without notice support.
+        for capabilities in [plan_ops(), AcpSessionUpdateCapabilities::default()] {
+            let mut translator = AcpLiveEventTranslator::new();
+            translator.set_capabilities(capabilities);
+            translator.translate_updates(&provider_changed(1, Some(200_000)));
+            translator.translate_updates(&accounted_end(2, 12_000));
+            let updates = translator.translate_updates(&provider_changed(3, Some(100_000)));
+            let Some(SessionUpdate::SessionInfoUpdate(info)) = updates.first() else {
+                panic!("expected a session_info_update first: {updates:?}");
+            };
+            assert!(matches!(info.title, MaybeUndefined::Undefined));
+            assert!(matches!(info.updated_at, MaybeUndefined::Undefined));
+            let meta = info.meta.as_ref().expect("meta");
+            assert_eq!(
+                meta[QUERYMT_META_NAMESPACE][QUERYMT_CONTEXT_INVALIDATED_META_KEY],
+                true
+            );
+            assert_eq!(meta.len(), 1);
+            // The signal and the model the session switched to, nothing else.
+            assert_eq!(meta[QUERYMT_META_NAMESPACE].as_object().unwrap().len(), 2);
+            let model = &meta[QUERYMT_META_NAMESPACE][QUERYMT_MODEL_META_KEY];
+            assert_eq!(model["provider"], "local");
+            assert_eq!(model["model"], "m");
+            assert_eq!(model["contextLimit"], 100_000);
+        }
+    }
+
+    #[test]
+    fn selecting_the_same_model_again_keeps_the_measurement() {
+        // Another configuration of the model the session already uses: the
+        // last measurement still describes it, so no signal is sent.
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(200_000)));
+        translator.translate_updates(&accounted_end(2, 12_000));
+        let updates = translator.translate_updates(&provider_changed(3, Some(200_000)));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::SessionInfoUpdate(_))),
+            "no signal for the same model: {updates:?}"
+        );
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(12_000));
+
+        // Another model, or the same one with another limit, is a switch.
+        let other = translator.translate_updates(&provider_changed(5, Some(100_000)));
+        assert!(matches!(
+            other.first(),
+            Some(SessionUpdate::SessionInfoUpdate(_))
+        ));
+        assert_eq!(translator.usage["s-1"].reliable_used(), None);
+    }
+
+    #[test]
+    fn replay_keeps_the_measurement_across_the_same_model() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 12_000).kind().clone()),
+            agent_event(3, provider_changed(3, Some(200_000)).kind().clone()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let used: Vec<u64> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UsageUpdate(usage) => Some(usage.used),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(used, [12_000]);
+    }
+
+    fn compaction_end(seq: i64, context_tokens: Option<u64>) -> AgentEvent {
+        agent_event(
+            seq,
+            AgentEventKind::CompactionEnd {
+                summary: "summary".to_string(),
+                summary_len: 7,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens,
+            },
+        )
+    }
+
+    #[test]
+    fn seeded_history_keeps_the_context_a_compaction_reported() {
+        let history = [
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 150_000).kind().clone()),
+            compaction_end(3, Some(20_000)),
+        ];
+        // The events of a whole-history load or an attach.
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.seed_history("s-1", &history);
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(20_000));
+
+        // The same events inside a load snapshot's audit, windowed or not.
+        let meta = serde_json::json!({
+            "querymt/sessionLoadSnapshot.v1": {
+                "audit": { "events": history },
+            }
+        });
+        let meta = meta.as_object().cloned().unwrap();
+        let mut from_load = AcpLiveEventTranslator::new();
+        from_load.seed_history_from_meta("s-1", Some(&meta));
+        assert_eq!(from_load.usage["s-1"].reliable_used(), Some(20_000));
+
+        // A later accounting change reports the post-compaction context, not
+        // the measurement from before it.
+        let carrier = from_load.usage["s-1"]
+            .accounting_update()
+            .expect("a usage carrier");
+        let SessionUpdate::UsageUpdate(update) = carrier else {
+            panic!("expected a usage_update: {carrier:?}");
+        };
+        assert_eq!(update.used, 20_000);
+    }
+
+    #[test]
+    fn live_compaction_end_is_a_measurement_without_a_prior_usage_entry() {
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(!translator.usage.contains_key("s-1"));
+        translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "s".to_string(),
+                summary_len: 1,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(20_000),
+            },
+        ));
+        assert_eq!(translator.usage["s-1"].reliable_used(), Some(20_000));
+    }
+
+    #[test]
+    fn replay_does_not_repeat_the_signal() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(200_000)).kind().clone()),
+            agent_event(2, accounted_end(2, 12_000).kind().clone()),
+            agent_event(3, provider_changed(3, Some(100_000)).kind().clone()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        assert!(updates.iter().all(|update| match update {
+            SessionUpdate::SessionInfoUpdate(info) => info.meta.as_ref().is_none_or(|meta| {
+                meta.get(QUERYMT_META_NAMESPACE)
+                    .and_then(|q| q.get(QUERYMT_CONTEXT_INVALIDATED_META_KEY))
+                    .is_none()
+            }),
+            _ => true,
+        }));
+        // No context measurement taken before the change is reported.
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::UsageUpdate(_)))
+        );
+    }
+
+    #[test]
     fn provider_change_projects_model_identity_to_all_clients() {
         let event = envelope(
             1,
@@ -7798,7 +8912,9 @@ mod session_update_tests {
         );
         translator.translate_updates(&config);
         let updates = translator.translate_updates(&event);
-        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+        // The model change first invalidates the last context measurement.
+        assert!(matches!(updates[0], SessionUpdate::SessionInfoUpdate(_)));
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[1] else {
             panic!("model update");
         };
         let json = serde_json::to_value(update).unwrap();
@@ -7867,7 +8983,7 @@ mod session_update_tests {
         ));
         seeded.seed_config_options("s-1", &options);
         let updates = seeded.translate_updates(&event);
-        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[1] else {
             panic!("seeded snapshot");
         };
         assert_eq!(
@@ -7897,6 +9013,66 @@ mod session_update_tests {
         ));
         assert!(matches!(updates[0], SessionUpdate::CompactionUpdate(_)));
         assert!(matches!(updates[1], SessionUpdate::UsageUpdate(_)));
+    }
+
+    #[test]
+    fn live_terminal_compaction_carries_its_summary() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 10,
+                compaction_id: Some("c-1".to_string()),
+            },
+        ));
+        let chunk = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id: "c-1".to_string(),
+                content: "part".to_string(),
+            },
+        ));
+        assert!(matches!(
+            chunk.as_slice(),
+            [SessionUpdate::CompactionSummaryChunk(_)]
+        ));
+        let end = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::CompactionEnd {
+                summary: "the whole final summary".to_string(),
+                summary_len: 23,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let [SessionUpdate::CompactionUpdate(update)] = end.as_slice() else {
+            panic!("expected one terminal compaction update: {end:?}");
+        };
+        assert_eq!(update.status, CompactionStatus::Completed);
+        let MaybeUndefined::Value(blocks) = &update.summary else {
+            panic!("terminal update carries no summary: {update:?}");
+        };
+        assert_eq!(blocks.len(), 1, "the summary is one block");
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(text.text, "the whole final summary");
+
+        // An empty summary sends none (omitted leaves the stored value).
+        let empty = translator.translate_updates(&envelope(
+            4,
+            AgentEventKind::CompactionEnd {
+                summary: "  ".to_string(),
+                summary_len: 2,
+                compaction_id: Some("c-2".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let [SessionUpdate::CompactionUpdate(update)] = empty.as_slice() else {
+            panic!("expected one terminal compaction update");
+        };
+        assert!(matches!(update.summary, MaybeUndefined::Undefined));
     }
 
     #[test]
@@ -9273,7 +10449,8 @@ mod session_update_tests {
             panic!("expected compaction update");
         };
         assert_eq!(update.status, CompactionStatus::Completed);
-        assert!(!matches!(update.summary, MaybeUndefined::Value(_)));
+        // The terminal update carries the final summary as one block.
+        assert!(matches!(&update.summary, MaybeUndefined::Value(blocks) if blocks.len() == 1));
     }
 
     #[test]
@@ -9570,6 +10747,41 @@ mod session_update_tests {
     }
 
     #[test]
+    fn replay_sends_the_todo_plan_once() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t2".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "completed"), ("b", "pending")]),
+                },
+            ),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let plan_updates: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::PlanUpdate(_) | SessionUpdate::Plan(_)))
+            .collect();
+        let [SessionUpdate::PlanUpdate(update)] = plan_updates.as_slice() else {
+            panic!("expected exactly one plan_update and no legacy plan: {plan_updates:?}");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected an item-based plan");
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+        assert_eq!(items.entries.len(), 2, "the current, complete content");
+    }
+
+    #[test]
     fn replay_excludes_unsupported_preview_variants() {
         let events = vec![
             agent_event(0, provider_changed(0, None).kind().clone()),
@@ -9625,6 +10837,64 @@ mod session_update_tests {
     }
 
     #[test]
+    fn compaction_without_an_id() {
+        // A session recorded before compactions carried ids: each start and
+        // its end are one compaction, replayed once.
+        let compaction = |seq, kind| agent_event(seq, kind);
+        let events = vec![
+            compaction(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: None,
+                },
+            ),
+            compaction(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "one".to_string(),
+                    summary_len: 3,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+            compaction(
+                3,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 20,
+                    compaction_id: None,
+                },
+            ),
+            compaction(
+                4,
+                AgentEventKind::CompactionEnd {
+                    summary: "two".to_string(),
+                    summary_len: 3,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let ids: Vec<String> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::CompactionUpdate(compaction) => {
+                    Some(compaction.compaction_id.0.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "each compaction is replayed once: {ids:?}");
+        assert_ne!(ids[0], ids[1]);
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("querymt-compaction-legacy-"))
+        );
+    }
+
+    #[test]
     fn replay_pairs_legacy_compaction_terminal_with_stable_id() {
         let events = vec![
             agent_event(
@@ -9659,6 +10929,164 @@ mod session_update_tests {
     }
 
     #[test]
+    fn compaction_between_two_prompts() {
+        let prompt = |seq, id: &str| {
+            agent_event(
+                seq,
+                AgentEventKind::PromptReceived {
+                    content: id.to_string(),
+                    message_id: Some(id.to_string()),
+                },
+            )
+        };
+        let events = vec![
+            prompt(1, "u1"),
+            agent_event(
+                2,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+            prompt(4, "u2"),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let order: Vec<&str> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(_) => Some("user"),
+                SessionUpdate::CompactionUpdate(_) => Some("compaction"),
+                _ => None,
+            })
+            .collect();
+        // The compaction sits between the prompts around it, not before both.
+        assert_eq!(order, ["user", "compaction", "user"]);
+    }
+
+    /// `_meta.querymt.compaction` of a compaction update, by status.
+    fn compaction_counts(updates: &[SessionUpdate], status: CompactionStatus) -> serde_json::Value {
+        updates
+            .iter()
+            .find_map(|update| match update {
+                SessionUpdate::CompactionUpdate(c) if c.status == status => Some(c),
+                _ => None,
+            })
+            .and_then(|c| match &c.meta {
+                MaybeUndefined::Value(meta) => meta
+                    .get(QUERYMT_META_NAMESPACE)
+                    .and_then(|querymt| querymt.get("compaction"))
+                    .cloned(),
+                _ => None,
+            })
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A request reporting 150000 context tokens, then a compaction that
+    /// ends at 20000.
+    fn counted_compaction_events() -> Vec<AgentEvent> {
+        vec![
+            agent_event(1, accounted_end_kind(150_000)),
+            agent_event(
+                2,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 90_000,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: Some(20_000),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn live_compaction_reports_its_counts() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let mut updates = Vec::new();
+        for event in counted_compaction_events() {
+            updates.extend(translator.translate_updates(&EventEnvelope::from(event)));
+        }
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::InProgress),
+            serde_json::json!({ "tokensBefore": 150_000 })
+        );
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::Completed),
+            serde_json::json!({ "tokensBefore": 150_000, "tokensAfter": 20_000 })
+        );
+    }
+
+    #[test]
+    fn replay_reports_the_same_counts() {
+        let updates = replay_updates(counted_compaction_events(), plan_ops());
+        assert_eq!(
+            compaction_counts(&updates, CompactionStatus::Completed),
+            serde_json::json!({ "tokensBefore": 150_000, "tokensAfter": 20_000 })
+        );
+    }
+
+    #[test]
+    fn no_measurement_before_the_compaction() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 90_000,
+                    compaction_id: Some("c1".to_string()),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "done".to_string(),
+                    summary_len: 4,
+                    compaction_id: Some("c1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+        ];
+        // The estimate stands in; `tokensAfter` is unknown and omitted.
+        let expected = serde_json::json!({ "tokensBefore": 90_000 });
+
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        let mut live = Vec::new();
+        for event in events.clone() {
+            live.extend(translator.translate_updates(&EventEnvelope::from(event)));
+        }
+        assert_eq!(
+            compaction_counts(&live, CompactionStatus::InProgress),
+            expected
+        );
+        assert_eq!(
+            compaction_counts(&live, CompactionStatus::Completed),
+            expected
+        );
+        let replayed = replay_updates(events, plan_ops());
+        assert_eq!(
+            compaction_counts(&replayed, CompactionStatus::Completed),
+            expected
+        );
+    }
+
+    #[test]
     fn replay_drops_obsolete_in_progress_compaction() {
         let events = vec![agent_event(
             1,
@@ -9673,5 +11101,498 @@ mod session_update_tests {
                 .iter()
                 .all(|u| !matches!(u, SessionUpdate::CompactionUpdate(_)))
         );
+    }
+
+    // ── Run state updates ──────────────────────────────────────────────────
+
+    fn run_started(seq: i64, run_id: &str, origin: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::RunStarted {
+                run_id: run_id.to_string(),
+                origin: origin.to_string(),
+            },
+        )
+    }
+
+    fn run_completed(seq: i64, run_id: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::RunCompleted {
+                run_id: run_id.to_string(),
+                outcome: "completed".to_string(),
+                stop_type: None,
+                reason: None,
+            },
+        )
+    }
+
+    fn permission_requested(seq: i64, id: &str) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::PermissionRequested {
+                permission_id: id.to_string(),
+                task_id: None,
+                tool_name: "shell".to_string(),
+                reason: "needs approval".to_string(),
+                tool_call_id: "call-1".to_string(),
+                request: None,
+            },
+        )
+    }
+
+    fn permission_granted(seq: i64, id: &str, granted: bool) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::PermissionGranted {
+                permission_id: id.to_string(),
+                granted,
+            },
+        )
+    }
+
+    fn states(
+        translator: &mut AcpLiveEventTranslator,
+        events: Vec<EventEnvelope>,
+    ) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|event| translator.translate_state_update(event))
+            .map(|update| serde_json::to_value(update).unwrap())
+            .collect()
+    }
+
+    /// A durable event stamped `timestamp` (whole seconds).
+    fn envelope_at(seq: i64, timestamp: i64, kind: AgentEventKind) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
+            event_id: format!("evt-{seq}"),
+            stream_seq: seq,
+            timestamp,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        })
+    }
+
+    #[test]
+    fn state_updates_carry_the_host_time_of_the_event() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let started = envelope_at(
+            1,
+            100,
+            AgentEventKind::RunStarted {
+                run_id: "r1".into(),
+                origin: "interactive".into(),
+            },
+        );
+        let waiting = envelope_at(
+            2,
+            101,
+            AgentEventKind::PermissionRequested {
+                permission_id: "p1".into(),
+                task_id: None,
+                tool_name: "shell".into(),
+                reason: "needs approval".into(),
+                tool_call_id: "call-1".into(),
+                request: None,
+            },
+        );
+        let granted = envelope_at(
+            3,
+            103,
+            AgentEventKind::PermissionGranted {
+                permission_id: "p1".into(),
+                granted: true,
+            },
+        );
+        let done = envelope_at(
+            4,
+            110,
+            AgentEventKind::RunCompleted {
+                run_id: "r1".into(),
+                outcome: "completed".into(),
+                stop_type: None,
+                reason: None,
+            },
+        );
+        let at: Vec<Option<i64>> = [started, waiting, granted, done]
+            .iter()
+            .map(|event| {
+                translator
+                    .translate_state_update(event)
+                    .and_then(|u| u.at_ms)
+            })
+            .collect();
+        assert_eq!(
+            at,
+            [Some(100_000), Some(101_000), Some(103_000), Some(110_000)]
+        );
+        // The sync after a load has no host time of its own.
+        translator.seed_run_state("s-1", Some("r2".into()), false);
+        let current = translator.current_state_update("s-1").expect("running");
+        assert_eq!(current.at_ms, None);
+    }
+
+    #[test]
+    fn prompted_run_reports_running_and_idle() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                envelope(
+                    2,
+                    AgentEventKind::PromptReceived {
+                        content: "hi".to_string(),
+                        message_id: Some("m1".to_string()),
+                    },
+                ),
+                run_completed(3, "r1"),
+            ],
+        );
+        assert_eq!(
+            updates,
+            [
+                serde_json::json!({
+                    "sessionId": "s-1", "state": "running", "runId": "r1", "atMs": 0
+                }),
+                serde_json::json!({
+                    "sessionId": "s-1", "state": "idle", "runId": "r1",
+                    "stopReason": "end_turn", "atMs": 0
+                }),
+            ]
+        );
+        assert_eq!(translator.current_state_update("s-1"), None);
+    }
+
+    #[test]
+    fn scheduled_run_is_reported() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r-sched", "scheduled"),
+                run_completed(2, "r-sched"),
+            ],
+        );
+        let states: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["running", "idle"]);
+        assert!(updates.iter().all(|u| u["runId"] == "r-sched"));
+    }
+
+    #[test]
+    fn waiting_for_permission() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+                permission_granted(3, "p1", true),
+            ],
+        );
+        let kinds: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["running", "requires_action", "running"]);
+        assert!(updates.iter().all(|u| u["runId"] == "r1"));
+    }
+
+    #[test]
+    fn overlapping_waits_resolve_to_running_once() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+                permission_requested(3, "p2"),
+                permission_granted(4, "p1", false),
+                permission_granted(5, "p2", true),
+            ],
+        );
+        let kinds: Vec<_> = updates
+            .iter()
+            .map(|u| u["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["running", "requires_action", "running"]);
+    }
+
+    #[test]
+    fn short_run_is_not_coalesced() {
+        // Both transitions arrive before anything reads them: the translator
+        // still yields one update per transition, in order.
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = states(
+            &mut translator,
+            vec![run_started(1, "r1", "interactive"), run_completed(2, "r1")],
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["state"], "running");
+        assert_eq!(updates[1]["state"], "idle");
+    }
+
+    #[test]
+    fn cancelled_and_stopped_runs_map_their_stop_reason() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let cancelled = |run_id: &str, seq| {
+            envelope(
+                seq,
+                AgentEventKind::RunCompleted {
+                    run_id: run_id.to_string(),
+                    outcome: "cancelled".to_string(),
+                    stop_type: None,
+                    reason: None,
+                },
+            )
+        };
+        let updates = states(
+            &mut translator,
+            vec![run_started(1, "r1", "interactive"), cancelled("r1", 2)],
+        );
+        assert_eq!(updates[1]["stopReason"], "cancelled");
+    }
+
+    // ── Run identity on updates ────────────────────────────────────────────
+
+    fn run_id_of(update: &SessionUpdate) -> Option<String> {
+        let meta = match update {
+            SessionUpdate::UserMessageChunk(chunk)
+            | SessionUpdate::AgentMessageChunk(chunk)
+            | SessionUpdate::AgentThoughtChunk(chunk) => chunk.meta.clone(),
+            SessionUpdate::ToolCall(call) => call.meta.clone(),
+            SessionUpdate::ToolCallUpdate(call) => call.meta.clone(),
+            SessionUpdate::CompactionUpdate(update) => match &update.meta {
+                MaybeUndefined::Value(meta) => Some(meta.clone()),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        meta.get("querymt")?
+            .get("runId")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    fn run_events() -> Vec<EventEnvelope> {
+        vec![
+            run_started(1, "r1", "interactive"),
+            envelope(
+                2,
+                AgentEventKind::PromptReceived {
+                    content: "go".to_string(),
+                    message_id: Some("u1".to_string()),
+                },
+            ),
+            envelope(
+                3,
+                AgentEventKind::AssistantContentDelta {
+                    content: "working".to_string(),
+                    message_id: "a1".to_string(),
+                },
+            ),
+            envelope(
+                4,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ),
+            envelope(
+                5,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+            run_completed(6, "r1"),
+        ]
+    }
+
+    #[test]
+    fn live_updates_carry_the_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let mut updates = Vec::new();
+        for event in run_events() {
+            translator.translate_state_update(&event);
+            updates.extend(translator.translate_updates(&event));
+        }
+        // user message, assistant chunk, tool call, tool call update
+        assert_eq!(updates.len(), 4);
+        for update in &updates {
+            assert_eq!(run_id_of(update).as_deref(), Some("r1"), "{update:?}");
+        }
+    }
+
+    #[test]
+    fn live_updates_outside_a_run_carry_no_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let events = run_events();
+        for event in &events {
+            translator.translate_state_update(event);
+            translator.translate_updates(event);
+        }
+        let after = envelope(
+            7,
+            AgentEventKind::PromptReceived {
+                content: "later".to_string(),
+                message_id: Some("u2".to_string()),
+            },
+        );
+        translator.translate_state_update(&after);
+        let updates = translator.translate_updates(&after);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(run_id_of(&updates[0]), None);
+    }
+
+    #[test]
+    fn existing_querymt_meta_keys_survive_the_run_id() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_state_update(&run_started(1, "r1", "interactive"));
+        let thought = envelope(
+            2,
+            AgentEventKind::AssistantThinkingDelta {
+                content: "hm".to_string(),
+                message_id: "a1".to_string(),
+                part_id: Some("p1".to_string()),
+            },
+        );
+        let updates = translator.translate_updates(&thought);
+        let SessionUpdate::AgentThoughtChunk(chunk) = &updates[0] else {
+            panic!("expected thought chunk");
+        };
+        let namespace = chunk.meta.as_ref().unwrap().get("querymt").unwrap();
+        assert_eq!(namespace["reasoning_part_id"], "p1");
+        assert_eq!(namespace["runId"], "r1");
+    }
+
+    #[test]
+    fn replay_carries_the_same_run_id() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::RunStarted {
+                    run_id: "r1".to_string(),
+                    origin: "interactive".to_string(),
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::PromptReceived {
+                    content: "go".to_string(),
+                    message_id: Some("u1".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: "t1".to_string(),
+                    tool_name: "shell".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+            agent_event(
+                5,
+                AgentEventKind::RunCompleted {
+                    run_id: "r1".to_string(),
+                    outcome: "completed".to_string(),
+                    stop_type: None,
+                    reason: None,
+                },
+            ),
+            agent_event(
+                6,
+                AgentEventKind::RunStarted {
+                    run_id: "r2".to_string(),
+                    origin: "interactive".to_string(),
+                },
+            ),
+            agent_event(
+                7,
+                AgentEventKind::PromptReceived {
+                    content: "again".to_string(),
+                    message_id: Some("u2".to_string()),
+                },
+            ),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        let ids: Vec<Option<String>> = updates
+            .iter()
+            .filter(|update| {
+                matches!(
+                    update,
+                    SessionUpdate::UserMessageChunk(_)
+                        | SessionUpdate::ToolCall(_)
+                        | SessionUpdate::ToolCallUpdate(_)
+                )
+            })
+            .map(run_id_of)
+            .collect();
+        let expected = |id: &str| Some(id.to_string());
+        assert_eq!(
+            ids,
+            [
+                expected("r1"),
+                expected("r1"),
+                expected("r1"),
+                expected("r2")
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_prompt_joins_the_running_run() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_state_update(&run_started(1, "r1", "interactive"));
+        let steering = envelope(
+            2,
+            AgentEventKind::UserPromptBlock {
+                message_id: "steer-1".to_string(),
+                client_prompt_id: None,
+                block: ContentBlock::Text(TextContent::new("also do x")),
+            },
+        );
+        translator.translate_state_update(&steering);
+        let updates = translator.translate_updates(&steering);
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(updates[0], SessionUpdate::UserMessageChunk(_)));
+        assert_eq!(run_id_of(&updates[0]).as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn current_state_reflects_a_run_in_progress() {
+        let mut translator = AcpLiveEventTranslator::new();
+        states(
+            &mut translator,
+            vec![
+                run_started(1, "r1", "interactive"),
+                permission_requested(2, "p1"),
+            ],
+        );
+        let current = translator.current_state_update("s-1").unwrap();
+        assert_eq!(current.run_id, "r1");
+        assert_eq!(
+            current.state,
+            querymt_agent_protocol_types::session::state_update::SessionRunState::RequiresAction
+        );
+        assert_eq!(translator.current_run_id("s-1"), Some("r1"));
     }
 }

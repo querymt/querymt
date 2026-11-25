@@ -269,6 +269,7 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
             plan_operations: false,
             notices: false,
             compaction: true,
+            ..Default::default()
         });
     translator.lock().unwrap().seed_config_options(
         session_id,
@@ -322,6 +323,22 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
         },
     ));
 
+    // A model change first tells the client its context measurement is stale.
+    let invalidated: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        invalidated["params"]["update"]["sessionUpdate"],
+        "session_info_update"
+    );
+    assert_eq!(
+        invalidated["params"]["update"]["_meta"]["querymt"]["contextInvalidated"],
+        true
+    );
     let model: serde_json::Value = serde_json::from_str(
         &timeout(Duration::from_secs(2), wire_rx.recv())
             .await
@@ -3316,8 +3333,14 @@ async fn prompt_response_waits_for_updates_and_is_released_on_connection_close()
     assert_eq!(message["id"], serde_json::json!(7));
     assert!(message.get("error").is_none() || message["error"].is_null());
     assert!(
-        message["result"].get("_meta").is_none(),
+        message["result"]["_meta"]["querymt"]
+            .get("eventTip")
+            .is_none(),
         "the internal event tip never reaches the client: {message}"
+    );
+    assert!(
+        message["result"]["_meta"]["querymt"]["messageId"].is_string(),
+        "the response names the inserted message: {message}"
     );
     task.await.unwrap();
 }

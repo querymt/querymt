@@ -5,6 +5,15 @@ pub use querymt_agent_core::delegation_update::{
 use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use std::collections::HashMap;
 
+/// The projector's folded view of one delegation: lifecycle state, stage,
+/// child session, confirmed model and node, and timestamps.
+///
+/// This is the internal source of the ACP `subagent_update` (the mapping lives
+/// next to the ACP translator). Until the extension notification is removed
+/// it is also the payload of that notification, so both are built from the
+/// same folded state.
+pub type SubagentSnapshot = DelegationUpdateNotification;
+
 const TERMINAL_SUMMARY_MAX_CHARS: usize = 512;
 const LIVE_MAX_TRACKED_DELEGATIONS: usize = 1024;
 
@@ -240,6 +249,15 @@ impl DelegationUpdateProjector {
         }
         self.snapshots.insert(update.delegation_id.clone(), update);
         self.prune_snapshots();
+    }
+
+    /// The delegation whose child session is `child_session_id`, once the
+    /// fork that created it was observed.
+    pub fn snapshot_for_child(&self, child_session_id: &str) -> Option<SubagentSnapshot> {
+        self.snapshots
+            .values()
+            .find(|snapshot| snapshot.child_session_id.as_deref() == Some(child_session_id))
+            .cloned()
     }
 
     pub fn snapshots(&self) -> Vec<DelegationUpdateNotification> {
