@@ -2469,7 +2469,7 @@ mod genai_trace_tests {
                 registry.add(Arc::new(UnrelatedSkill));
             } else {
                 catalog = Some(Arc::new(SkillCatalog::from_parts(
-                    Arc::new(std::sync::Mutex::new(SkillRegistry::new())),
+                    SkillRegistry::new(),
                     Arc::new(permissions),
                     vec![SkillSource::Configured(dir.path().to_owned())],
                     false,
@@ -5126,7 +5126,7 @@ mod mcp_tool_tests {
                 .await;
         let mut config = agent.config.as_ref().clone();
         config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
-            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            crate::skills::SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             false,
@@ -5487,7 +5487,7 @@ mod mcp_tool_tests {
                 .await;
         let mut config = agent.config.as_ref().clone();
         config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
-            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            crate::skills::SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             false,
@@ -5703,7 +5703,7 @@ mod mcp_tool_tests {
                 .await;
         let mut config = agent.config.as_ref().clone();
         config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
-            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            crate::skills::SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             false,

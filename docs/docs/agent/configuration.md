@@ -272,12 +272,22 @@ include_external = true   # Check Claude Code, agents conventions paths
 paths = ["./skills"]      # Custom skill search paths
 urls = []                 # Remote skill URLs (future)
 mcp = true                # Offer skills published by connected MCP servers
+nested_depth = 4          # Levels below a project .agents/skills that may hold a skill (1-16)
 
 [agent.skills.permissions]
 "internal-*" = "deny"     # local skills: exact name or prefix wildcard
 "docs.*" = "allow"        # skills of the MCP server "docs"
 "ops.runbook" = "ask"
 ```
+
+#### Local skill discovery
+
+Local skills are read from the global folders, the project folders and the configured `paths`. The same rules apply to every one of them:
+
+- **Links are followed.** A skill folder, or a category folder holding skills, that is a symbolic link is offered wherever the link points, including outside the workspace. Supporting files of a linked skill are read from the link target and must stay inside it. A broken link (including a source folder whose link target was removed) or a link loop is reported as a skill problem and does not hide the other skills of the folder. A definition file must be a regular file of at most 1 MiB; anything else is reported as a problem. A `SKILL.md` placed directly in a source folder is not a skill; skills are directories below the source folder.
+- **Ignore files do not apply.** `.gitignore`, `.ignore` and global excludes are not consulted, so a skill folder that version control ignores is still offered. To keep a skill out of the listing, set `enabled: false` in its frontmatter (honored in `.agents/skills` folders only) or remove it from the folder. A `deny` permission rule only blocks loading; the skill stays listed.
+- **`nested_depth`.** Path `agent.skills.nested_depth` (also the `skills` table of a `[[delegates]]` entry and the deprecated `[planner.skills]`). Integer, default `4`, range `1` to `16`; `1` means direct children only. It sets how many directory levels below a project `.agents/skills` folder may hold a skill directory, so with the default `.agents/skills/a/b/c/review/SKILL.md` is offered and `.agents/skills/a/b/c/d/review/SKILL.md` is not. Every other source accepts direct children only. A value outside the range, or one that is not an integer, fails configuration loading with an error that names `nested_depth`.
+- **Problems.** A refresh fails only when a source folder itself cannot be read; the previous skill set stays in place then. An entry that cannot be read, a malformed definition and a duplicate ID are recorded as problems and excluded.
 
 #### Skills from MCP servers
 

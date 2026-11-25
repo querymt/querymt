@@ -16,12 +16,17 @@ pub mod tool;
 pub mod types;
 
 pub use catalog::SkillCatalog;
-pub use discovery::{default_search_paths, discover_all, discover_from_source};
+pub use discovery::{
+    SkillScanOptions, SkillScanReport, default_search_paths, discover, discover_from_source,
+};
 pub use parser::{PROTOCOL_SKILL_FILENAME, SKILL_FILENAME, parse_skill_file, parse_skill_file_ex};
 pub use permissions::{PermissionLevel, SkillPermissions};
 pub use registry::SkillRegistry;
 pub use tool::SkillTool;
-pub use types::{Skill, SkillMetadata, SkillSource, ToolAccessPolicy};
+pub use types::{
+    Skill, SkillInventoryEntry, SkillMetadata, SkillProblem, SkillProblemKind, SkillSource,
+    SkillSourceKind, ToolAccessPolicy,
+};
 
 #[cfg(test)]
 mod tests {

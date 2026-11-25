@@ -426,11 +426,13 @@ impl SkillTool {
 
         if let Ok(entries) = std::fs::read_dir(&skill.path) {
             for entry in entries.flatten().take(10) {
-                if let Ok(file_type) = entry.file_type()
-                    && (file_type.is_file() || file_type.is_dir())
+                // Resolved metadata, so a link to a file or directory is
+                // listed as what it points to. A dangling link is skipped.
+                if let Ok(meta) = std::fs::metadata(entry.path())
+                    && (meta.is_file() || meta.is_dir())
                 {
                     let name = entry.file_name();
-                    let kind = if file_type.is_dir() { "dir" } else { "file" };
+                    let kind = if meta.is_dir() { "dir" } else { "file" };
                     samples.push(format!("  - {} ({})", name.to_string_lossy(), kind));
                 }
             }
@@ -673,6 +675,7 @@ impl Tool for SkillTool {
 mod tests {
     use super::*;
     use crate::skills::catalog::SkillCatalog;
+    use crate::skills::discovery::{SkillScanOptions, SkillScanReport};
     use crate::skills::permissions::SkillPermissions;
     use crate::skills::registry::SkillRegistry;
     use crate::skills::types::{Skill, SkillMetadata, SkillSource};
@@ -806,7 +809,7 @@ mod tests {
     }
 
     fn new_tool_with_fallback(
-        registry: Arc<Mutex<SkillRegistry>>,
+        registry: SkillRegistry,
         permissions: Arc<SkillPermissions>,
         sources: Vec<SkillSource>,
         include_external: bool,
@@ -825,7 +828,7 @@ mod tests {
     }
 
     fn new_tool(
-        registry: Arc<Mutex<SkillRegistry>>,
+        registry: SkillRegistry,
         permissions: Arc<SkillPermissions>,
         sources: Vec<SkillSource>,
         include_external: bool,
@@ -850,7 +853,7 @@ mod tests {
     }
 
     fn tool_with_sources(
-        registry: Arc<Mutex<SkillRegistry>>,
+        registry: SkillRegistry,
         sources: Vec<SkillSource>,
         permissions: Arc<SkillPermissions>,
     ) -> SkillTool {
@@ -900,7 +903,7 @@ mod tests {
         );
 
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
             true,
@@ -947,7 +950,7 @@ mod tests {
         );
 
         let tool = Arc::new(new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
             true,
@@ -1003,7 +1006,7 @@ mod tests {
         );
 
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
             true,
@@ -1046,7 +1049,7 @@ mod tests {
             SkillSource::Configured(configured.path().to_path_buf()),
         ];
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             sources,
             true,
@@ -1083,7 +1086,7 @@ mod tests {
             SkillSource::Configured(configured.path().to_path_buf()),
         ];
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             sources,
             false,
@@ -1113,7 +1116,7 @@ mod tests {
         );
 
         let base = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
             true,
@@ -1158,7 +1161,7 @@ mod tests {
         );
 
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(bound.path().join(".qmt/skills"))],
             true,
@@ -1188,7 +1191,7 @@ mod tests {
         write_skill(&workspace_b.path().join(".qmt/skills"), "b-only", "B only");
 
         let tool = new_tool_with_fallback(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
             true,
@@ -1207,13 +1210,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_tool_call() {
-        let registry = Arc::new(Mutex::new(SkillRegistry::new()));
+        let mut registry = SkillRegistry::new();
         let permissions = Arc::new(SkillPermissions::default());
-
-        {
-            let mut reg = registry.lock().unwrap();
-            reg.register(create_test_skill("test-skill", "A test skill"));
-        }
+        registry.register(create_test_skill("test-skill", "A test skill"));
 
         // Empty sources: the registered skill is hit without any refresh.
         let tool = tool_with_sources(registry, vec![], permissions);
@@ -1225,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_not_found_lists_availability() {
-        let registry = Arc::new(Mutex::new(SkillRegistry::new()));
+        let registry = SkillRegistry::new();
         let permissions = Arc::new(SkillPermissions::default());
 
         // Empty sources and empty registry: the error states no skills are
@@ -1247,17 +1246,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_denied_by_permission() {
-        let registry = Arc::new(Mutex::new(SkillRegistry::new()));
+        let mut registry = SkillRegistry::new();
         let mut perms = SkillPermissions::default();
         perms
             .patterns
             .insert("denied-skill".to_string(), PermissionLevel::Deny);
         let permissions = Arc::new(perms);
 
-        {
-            let mut reg = registry.lock().unwrap();
-            reg.register(create_test_skill("denied-skill", "Denied skill"));
-        }
+        registry.register(create_test_skill("denied-skill", "Denied skill"));
 
         let tool = tool_with_sources(registry, vec![], permissions);
 
@@ -1286,7 +1282,7 @@ mod tests {
         let permissions = Arc::new(perms);
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(skills_root)],
             permissions,
         );
@@ -1315,7 +1311,7 @@ mod tests {
         write_skill(dir.path(), "skill-b", "Second skill");
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1354,7 +1350,7 @@ Body
         .unwrap();
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1372,7 +1368,7 @@ Body
         write_skill(dir.path(), "skill-a", "First version");
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1411,7 +1407,7 @@ Body
         write_skill(dir.path(), "gamma", "Gamma skill");
 
         let tool = Arc::new(tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         ));
@@ -1460,7 +1456,7 @@ Body
         write_skill(dir.path(), "skill-a", "First skill");
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1485,7 +1481,7 @@ Body
         write_skill(dir.path(), "skill-b", "Stays");
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1513,7 +1509,7 @@ Body
 
     /// Task 4.1: a refresh failure preserves and reports the old snapshot.
     #[tokio::test]
-    async fn test_call_with_failed_refresh_preserves_old_snapshot() {
+    async fn unreadable_source_does_not_publish_a_partial_snapshot() {
         let dir = TempDir::new().unwrap();
         write_skill(dir.path(), "healthy", "Healthy skill");
 
@@ -1521,34 +1517,44 @@ Body
         let healthy_path = dir.path().join("healthy");
         let discovery_fn = {
             let fail_after_first = Arc::clone(&fail_after_first);
-            Arc::new(move |_sources: &[SkillSource], _include_external: bool| {
-                if fail_after_first.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    Ok(vec![Skill {
-                        path: healthy_path.clone(),
-                        metadata: SkillMetadata {
-                            name: "healthy".to_string(),
-                            description: "Healthy skill".to_string(),
-                            id: None,
-                            enabled: None,
-                            version: None,
-                            license: None,
-                            compatibility: None,
-                            allowed_tools: None,
-                            tags: None,
-                            author: None,
-                            extra: HashMap::new(),
-                        },
-                        content: "Healthy content".to_string(),
-                        source: SkillSource::Global(PathBuf::from("/ignored")),
-                    }])
-                } else {
-                    Err(anyhow::anyhow!("injected refresh failure"))
-                }
-            })
+            Arc::new(
+                move |_sources: &[SkillSource], _options: &SkillScanOptions| {
+                    if fail_after_first.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        SkillScanReport {
+                            skills: vec![Skill {
+                                path: healthy_path.clone(),
+                                metadata: SkillMetadata {
+                                    name: "healthy".to_string(),
+                                    description: "Healthy skill".to_string(),
+                                    id: None,
+                                    enabled: None,
+                                    version: None,
+                                    license: None,
+                                    compatibility: None,
+                                    allowed_tools: None,
+                                    tags: None,
+                                    author: None,
+                                    extra: HashMap::new(),
+                                },
+                                content: "Healthy content".to_string(),
+                                source: SkillSource::Global(PathBuf::from("/ignored")),
+                            }],
+                            ..Default::default()
+                        }
+                    } else {
+                        // An unreadable source: a partial snapshot must not be
+                        // published.
+                        SkillScanReport {
+                            unreadable_sources: true,
+                            ..Default::default()
+                        }
+                    }
+                },
+            )
         };
 
         let catalog = SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             true,
@@ -1587,7 +1593,7 @@ Body
         write_skill(dir.path(), "edited-skill", "Before edit");
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![SkillSource::Project(dir.path().to_path_buf())],
             Arc::new(SkillPermissions::default()),
         );
@@ -1635,7 +1641,7 @@ Body
         .unwrap();
 
         let tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             vec![
                 SkillSource::Global(global_skills),
                 SkillSource::Project(project_skills.clone()),
@@ -1688,11 +1694,8 @@ Body
         deny_perms
             .patterns
             .insert("review".to_string(), PermissionLevel::Deny);
-        let deny_tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
-            sources.clone(),
-            Arc::new(deny_perms),
-        );
+        let deny_tool =
+            tool_with_sources(SkillRegistry::new(), sources.clone(), Arc::new(deny_perms));
         for _ in 0..2 {
             assert_eq!(enum_of(&deny_tool), vec!["review".to_string()]);
             let error = call_named(&deny_tool, "review").await.unwrap_err();
@@ -1704,11 +1707,8 @@ Body
         ask_perms
             .patterns
             .insert("review".to_string(), PermissionLevel::Ask);
-        let ask_tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
-            sources.clone(),
-            Arc::new(ask_perms),
-        );
+        let ask_tool =
+            tool_with_sources(SkillRegistry::new(), sources.clone(), Arc::new(ask_perms));
 
         let ctx = MockContext::with_answers(&["Allow"]);
         let result = ask_tool.call(json!({"name": "review"}), &ctx).await;
@@ -1727,11 +1727,8 @@ Body
         deny_alias_perms
             .patterns
             .insert("review".to_string(), PermissionLevel::Deny);
-        let deny_alias_tool = tool_with_sources(
-            Arc::new(Mutex::new(SkillRegistry::new())),
-            sources,
-            Arc::new(deny_alias_perms),
-        );
+        let deny_alias_tool =
+            tool_with_sources(SkillRegistry::new(), sources, Arc::new(deny_alias_perms));
         let ctx = MockContext::with_answers(&["Allow"]);
         let error = deny_alias_tool
             .call(json!({"name": "Code Review"}), &ctx)
@@ -1780,7 +1777,7 @@ Body
 
     fn plain_catalog() -> SkillCatalog {
         SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             false,
@@ -1798,7 +1795,7 @@ Body
         let local = TempDir::new().unwrap();
         write_skill(local.path(), "local-one", "Local skill");
         let catalog = SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(local.path().to_path_buf())],
             true,
@@ -1899,7 +1896,7 @@ Body
         )
         .unwrap();
         let catalog = Arc::new(SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![SkillSource::Project(skills_root.clone())],
             true,
@@ -1938,7 +1935,7 @@ Body
         // External (project) sources must be on, or the workspace's skills
         // are never discovered.
         let catalog = Arc::new(SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             true,
@@ -2002,7 +1999,7 @@ Body
             perms.patterns.insert((*pattern).to_string(), *level);
         }
         SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(perms),
             vec![],
             false,
@@ -2192,7 +2189,7 @@ Body
         .unwrap();
         let tool = bind_tool(
             SkillCatalog::from_parts(
-                Arc::new(Mutex::new(SkillRegistry::new())),
+                SkillRegistry::new(),
                 Arc::new(SkillPermissions::default()),
                 vec![SkillSource::Project(dir.path().to_path_buf())],
                 true,
@@ -2540,7 +2537,7 @@ Body
         }
         bind_tool(
             SkillCatalog::from_parts(
-                Arc::new(Mutex::new(SkillRegistry::new())),
+                SkillRegistry::new(),
                 Arc::new(perms),
                 vec![SkillSource::Project(dir.path().to_path_buf())],
                 true,
@@ -2696,7 +2693,7 @@ Body
     fn local_file_tool(dir: &TempDir) -> SkillTool {
         bind_tool(
             SkillCatalog::from_parts(
-                Arc::new(Mutex::new(SkillRegistry::new())),
+                SkillRegistry::new(),
                 Arc::new(SkillPermissions::default()),
                 vec![SkillSource::Project(dir.path().to_path_buf())],
                 true,
@@ -2704,6 +2701,125 @@ Body
             ),
             PathBuf::from("."),
         )
+    }
+
+    /// A skill source holding `linked -> <target>` where the target lives in
+    /// another temp directory.
+    #[cfg(unix)]
+    fn linked_skill_fixture() -> (TempDir, TempDir, PathBuf) {
+        let source = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("linked-target");
+        write_skill(outside.path(), "linked-target", "Linked skill");
+        // The skill ID is the name in the definition file.
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: linked\ndescription: Linked skill\n---\nLinked body\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, source.path().join("linked")).unwrap();
+        (source, outside, target)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supporting_file_of_a_linked_skill_is_read_from_the_link_target() {
+        let (source, _outside, target) = linked_skill_fixture();
+        fs::create_dir_all(target.join("templates")).unwrap();
+        fs::write(target.join("templates/checklist.md"), "LINKED CHECKLIST").unwrap();
+        let tool = local_file_tool(&source);
+
+        let out = call_file(&tool, "linked", "templates/checklist.md")
+            .await
+            .unwrap();
+        assert!(out.contains("LINKED CHECKLIST"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supporting_files_of_a_skill_in_a_linked_category_stay_confined() {
+        let workspace = TempDir::new().unwrap();
+        let skills_root = workspace.path().join(".agents").join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let outside = TempDir::new().unwrap();
+        let category = outside.path().join("category");
+        let skill_dir = category.join("inner");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: inner\ndescription: Inner skill\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("notes.md"), "ORDINARY NOTES").unwrap();
+        // A file beside the skill directory, inside the linked category.
+        fs::write(category.join("secret.txt"), "BESIDE THE SKILL").unwrap();
+        std::os::unix::fs::symlink(category.join("secret.txt"), skill_dir.join("leak.md")).unwrap();
+        std::os::unix::fs::symlink(&category, skills_root.join("group")).unwrap();
+
+        let tool = bind_tool(
+            SkillCatalog::from_parts(
+                SkillRegistry::new(),
+                Arc::new(SkillPermissions::default()),
+                vec![SkillSource::Project(skills_root)],
+                true,
+                PathBuf::from("."),
+            ),
+            PathBuf::from("."),
+        );
+
+        let out = call_file(&tool, "inner", "notes.md").await.unwrap();
+        assert!(out.contains("ORDINARY NOTES"), "{out}");
+        for bad in ["leak.md", "../secret.txt"] {
+            let error = call_file(&tool, "inner", bad).await.unwrap_err();
+            assert!(
+                matches!(&error, ToolError::InvalidRequest(_)),
+                "{bad}: {error:?}"
+            );
+            assert!(!format!("{error:?}").contains("BESIDE THE SKILL"), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supporting_file_path_cannot_leave_a_linked_skills_target() {
+        let (source, outside, target) = linked_skill_fixture();
+        fs::write(outside.path().join("secret.env"), "TOP SECRET").unwrap();
+        // A link inside the target that resolves outside the target.
+        std::os::unix::fs::symlink(outside.path().join("secret.env"), target.join("leak.md"))
+            .unwrap();
+        let tool = local_file_tool(&source);
+
+        for bad in ["leak.md", "../secret.env"] {
+            let error = call_file(&tool, "linked", bad).await.unwrap_err();
+            assert!(
+                matches!(&error, ToolError::InvalidRequest(_)),
+                "{bad}: {error:?}"
+            );
+            assert!(!format!("{error:?}").contains("TOP SECRET"), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_file_inside_a_skill_is_listed_with_the_skills_files() {
+        let source = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_skill(source.path(), "review", "Review");
+        let skill_dir = source.path().join("review");
+        fs::write(outside.path().join("notes.md"), "notes").unwrap();
+        fs::create_dir(outside.path().join("assets")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("notes.md"), skill_dir.join("notes.md"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("assets"), skill_dir.join("assets"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("missing"), skill_dir.join("dangling"))
+            .unwrap();
+        let tool = local_file_tool(&source);
+
+        let out = call_named(&tool, "review").await.unwrap();
+        assert!(out.contains("- notes.md (file)"), "{out}");
+        assert!(out.contains("- assets (dir)"), "{out}");
+        assert!(!out.contains("dangling"), "{out}");
     }
 
     #[tokio::test]

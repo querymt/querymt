@@ -10,6 +10,39 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// keeps requiring the uppercase `SKILL.md` name.
 pub const PROTOCOL_SKILL_FILENAME: &str = "skill.md";
 
+/// Largest accepted skill definition file.
+pub const SKILL_DEFINITION_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read a skill definition file.
+///
+/// Discovery follows symbolic links, so the target can be anything. Reading
+/// a pipe would block the scan and reading a device such as `/dev/zero`
+/// would never end; only regular files within the size limit are read.
+fn read_definition(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let read_error = || format!("Failed to read {}", path.display());
+    let checked = std::fs::metadata(path).with_context(read_error)?;
+    if !checked.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let file = std::fs::File::open(path).with_context(read_error)?;
+    // The path may have been swapped between the check and the open.
+    if !file.metadata().with_context(read_error)?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    file.take(SKILL_DEFINITION_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(read_error)?;
+    if bytes.len() as u64 > SKILL_DEFINITION_MAX_BYTES {
+        bail!(
+            "{} is over the {SKILL_DEFINITION_MAX_BYTES} byte limit",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
+}
+
 /// Parse a SKILL.md file into a Skill struct.
 ///
 /// This is the legacy, non-protocol entry point: `name` and `description`
@@ -29,8 +62,7 @@ pub fn parse_skill_file(path: &Path, source: SkillSource) -> Result<Skill> {
 ///
 /// `description` remains required in both modes.
 pub fn parse_skill_file_ex(path: &Path, source: SkillSource, protocol: bool) -> Result<Skill> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = read_definition(path)?;
 
     let origin = path.display().to_string();
     let (mut metadata, body) = parse_document(&content, &origin)?;

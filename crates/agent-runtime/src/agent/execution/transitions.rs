@@ -4439,7 +4439,7 @@ mod tests {
             // Catalog: session tool is offered, agent registry still lacks it.
             let mut config = (*fixture.config).clone();
             config.skill_catalog = Some(Arc::new(crate::skills::SkillCatalog::from_parts(
-                Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+                crate::skills::SkillRegistry::new(),
                 Arc::new(crate::skills::SkillPermissions::default()),
                 vec![],
                 false,
