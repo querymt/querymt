@@ -1,0 +1,51 @@
+# Proposal: Provider account snapshots (plan, usage windows, credits)
+
+## Why
+
+A user running Codex, xAI or Anthropic through an OAuth subscription cannot see how much of their allowance is left. Each of those services exposes it (a weekly window for Codex, a weekly credit pool for Grok, a five-hour and a seven-day window for Claude) but through unrelated endpoints, headers and shapes, and QueryMT has no place to ask. API-key providers vary: most expose nothing to an inference key (OpenAI, Anthropic, xAI, Mistral, Groq and Google keep usage behind admin or management keys), while some expose a balance (DeepSeek `GET /user/balance`, Moonshot `GET /v1/users/me/balance`) or even spend budgets with reset windows (OpenRouter `GET /api/v1/key`). The contract therefore has to let a provider decline per credential, not per provider kind.
+
+QueryMT needs one small contract that lets a provider plugin answer "what does this provider know about the credential it is running under", lets the host answer "nothing" for providers and credentials that have no such concept, and exposes the result to ACP clients without making them aware of each provider's API.
+
+## What Changes
+
+- **New concept: provider account snapshot.** A snapshot is what a provider reports for the credential in the resolved configuration: an optional plan name, zero or more usage limits (each a percentage used, with optional window length, reset time and scope), and an optional credit balance. Usage is one part of the snapshot, not the whole concept, so the contract is named *account*, not *usage*, and the same shape serves subscription windows (Codex, Claude, Grok), prepaid balances and "nothing to report".
+- **Plugin contract (additive, optional).** HTTP provider factories gain a request/parse pair mirroring model listing: build one HTTP request for the account snapshot from the resolved config, or decline (`None`) when the provider or that credential type has no account data; then parse the response into the snapshot. The generic factory trait gains an async `account` operation returning an `AccountReport` enum (`Unsupported` or `Account(snapshot)`) with a default of `Unsupported`. The Extism plugin macro exports the pair as optional functions; the host treats a plugin without the exports as `Unsupported`. Plugins that do not implement the contract need no change and keep working.
+- **Three plugins implement it:** `codex` (ChatGPT usage endpoint, always, since Codex is OAuth-only), `xai` (Grok credits endpoint when `auth_type = "oauth"`; declines for API keys) and `anthropic` (Claude OAuth usage endpoint when the credential is an OAuth token; declines for API keys).
+- **Live updates from chat responses.** Codex and Claude (OAuth) return the same usage windows as response headers on every chat call (`x-codex-*`, `anthropic-ratelimit-unified-*`); xAI returns none. HTTP providers gain one stateless, I/O-free hook that maps a response's headers to a partial snapshot; the host calls it once per chat response (streamed or not), merges the result into the cached snapshot by limit id, and pushes `querymt/auth/accountChanged` to connected clients. For providers without headers, a completed turn marks the cached entry stale so the next `querymt/auth/account` call re-fetches. The pull method stays the source of truth; headers only keep it current between pulls.
+- **qmacp and qmcp.** One flat qmacp command `qmacp account [--provider] [--refresh]` (shaped like `models`, gated on the `auth_account` capability), one read-only qmcp MCP tool `account` with the same arguments returning the payload under `result`, and one compact NDJSON event `account_changed` for the notification during `prompt`/`follow`/`watch` (qmcp inherits it through qmacp). No new subcommand group.
+- **New ACP method `querymt/auth/account`.** Params `{ provider?: string, refresh?: bool }`. Returns one entry per configured provider (or the one requested) with a status of `ok` (with the snapshot and its fetch time), `unsupported` (no snapshot for this provider/credential), `unauthenticated` (no usable credential), or `error` (with a message). Credentials are resolved exactly as for model listing (OAuth refresh, stored key, environment). Successful and unsupported answers are cached for 60 seconds per provider; `refresh: true` bypasses the cache; auth mutations invalidate it. The method is advertised in `querymt/capabilities` under `methods` and as feature `auth_account`.
+
+## Non-goals
+
+- Anthropic API-key rate-limit headers (`anthropic-ratelimit-requests-*`, `-input-tokens-*`, `-output-tokens-*`): per-minute request/token rate limits, not subscription usage; keeping them out keeps "API key = unsupported" uniform. Stream-body usage events (Codex WebSocket `rate_limits` events) are also out; QueryMT uses the HTTP transport.
+- Multi-request snapshots (for example fetching a plan name from a second profile endpoint). Each plugin issues one request; a plan name that needs another call stays `None`.
+- A `qmt` CLI command (qmacp is covered; the main CLI is not), a `/usage` slash command, dashboard or desktop rendering, background polling, "approaching limit" notifications, and persisting snapshots.
+- Account snapshots for mesh peers' providers, for `kimi-code` and for local providers. The contract allows them; no plugin implements them here.
+- OpenRouter, DeepSeek and Moonshot API-key snapshots. Explored and confirmed to fit the snapshot shape without change (OpenRouter budgets and free-model daily quota as `limits`, key `limit_remaining` as `credits`; DeepSeek and Moonshot as `credits` only). Each is a request/parse pair in its own provider crate with no host, runtime or ACP work, so they are a short follow-up change once this one lands.
+- Any change to cost accounting (`llm-cost-accounting`); a snapshot is provider-reported, not derived from QueryMT's own token accounting.
+
+## Capabilities
+
+### New Capabilities
+
+- `provider-account-snapshot`: the snapshot data model, the factory request/parse contract, the Extism exports, and the three plugin implementations.
+- `provider-account-acp`: the `querymt/auth/account` method, credential resolution, status mapping, caching and capability advertisement.
+- `qmacp-account`: the `qmacp account` command, the qmcp `account` tool and the `account_changed` stream event.
+- `provider-account-live`: the header-to-snapshot hook, host-side capture on streamed and buffered chat responses, the merge rule, the `querymt/auth/accountChanged` notification, and turn-completion staleness for header-less providers. Implemented after the two capabilities above and deferrable without changing them.
+
+### Modified Capabilities
+
+None. No existing spec's requirements change; `provider-resolution`, `agent-configuration` and `llm-cost-accounting` are untouched.
+
+## Impact
+
+- `querymt` (no feature gate for the types; `http-client` for the adapter, `extism_host` for the host side, `extism_plugin` via the macro crate): new public types `AccountReport`, `ProviderAccount`, `UsageLimit`, `CreditBalance`; new default methods `LLMProviderFactory::account`, `HTTPLLMProviderFactory::account_request` and `parse_account`, `HTTPLLMProvider::account_from_headers` and `LLMProvider::set_account_observer`; new Extism wire structs. All trait additions have defaults, so existing implementors compile unchanged.
+- **BREAKING (Rust API, `querymt::outbound`, live capability only):** `OutboundStreamResult::Success` gains a `headers: http::HeaderMap` field. The enum is `pub` in a `pub mod`, so any external code matching `Success { stream }` exhaustively stops compiling; inside this workspace the only matchers are in `querymt` itself (`adapters.rs`, `outbound/tests.rs`) and are updated in the same edit. Alternatives considered and rejected as not worth it: `#[non_exhaustive]` (does not prevent this first break) or a parallel `call_outbound_stream_with_headers` function (duplicates the API). This is the only non-additive Rust change in the proposal and it lands with task group 5; groups 1–4 are purely additive. The Extism contract gains two optional exports detected by name, like `list_models_static`; no contract version bump is needed because hosts and plugins without the exports interoperate. Flagging for review: if the reviewer prefers an explicit version signal, `ITEM_AWARE_CHAT_CONTRACT_VERSION` is the wrong knob and a dedicated `ACCOUNT_CONTRACT_VERSION` export would be the alternative.
+- `querymt-extism-macros`: `impl_extism_http_plugin!` exports `account_request`, `parse_account_response` and `account_from_headers`.
+- `qmt-codex`, `qmt-xai`, `qmt-anthropic` (`extism` and `native` features; wasm32-wasip1 builds): factory implementations and parsers.
+- `querymt-agent-runtime` (`oauth` for OAuth credentials, no new feature): new ACP method, cache, capability entry. **Wire shape added**: `querymt/auth/account` response, the `querymt/auth/accountChanged` notification and the `auth_account` capability flag. No config keys, no DB schema change, no hook or middleware change.
+- `qmacp`: one `Command` variant, one `pub` gate+call helper, one notification arm in `client.rs`. `qmcp`: one `Command` variant (tool schema derived), one `read_only` entry. READMEs and skill docs. No change to existing commands, tools or event shapes.
+- `querymt-agent`: facade re-exports only. `querymt-agent-py`, `querymt-mobile-ffi`: no change (ACP-level feature).
+- Native plugin ABI: HTTP providers are loaded as Wasm or linked statically; once `stabilize-native-plugin-abi` lands there is no native vtable for `HTTPLLMProviderFactory`. If this change ships first, the added trait methods change the `dyn HTTPLLMProviderFactory` vtable and `NATIVE_PLUGIN_API` must be bumped to 3.
+- Typeshare: `ProviderAccount`, `UsageLimit` and `CreditBalance` are typeshared behind `querymt`'s `type-generation` feature; the runtime's `ProviderAccountStatus` is typeshared. `querymt-desktop` follow-up: render per-provider plan, limit bars with reset times and credits on the provider/auth settings view, using `querymt/auth/account`.
+- `CHANGELOG.md` Unreleased: "Added" entries for the plugin contract and the ACP method (no breaking entry unless the native ABI bump above applies).
