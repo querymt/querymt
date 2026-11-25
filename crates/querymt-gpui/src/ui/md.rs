@@ -318,14 +318,6 @@ struct CodeHeader {
     row: AnyElement,
 }
 
-impl IntoElement for CodeHeader {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for CodeHeader {
     type RequestLayoutState = ();
     type PrepaintState = ();

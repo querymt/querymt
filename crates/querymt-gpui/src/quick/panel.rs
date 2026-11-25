@@ -22,15 +22,15 @@ use super::{Picks, Resume};
 use crate::session::PlanDigest;
 use crate::session::open::{OpenSession, SessionKey, SessionRef};
 use crate::store::launch::{LaunchError, LaunchRequest, Placement};
-use crate::store::{AgentsStore, LAUNCH_REASONING, PickerLayout, SessionSummary};
+use crate::store::{AgentsStore, LAUNCH_REASONING, PickerLayout, QuickPosition, SessionSummary};
 use crate::theme::{Palette, palette};
 use crate::ui::keys::{ChooseFolder, CycleReasoning, OpenModelPicker, OpenSidebarSession};
-use crate::ui::model_picker::{ModelPicker, ModelPickerEvent, Target};
+use crate::ui::model_picker::{ModelPicker, ModelPickerEvent, PickerFrame, Target};
 use crate::ui::workspace_select::{WorkspaceEvent, WorkspaceField, home_dir};
 use crate::ui::{Density, SessionPane, SessionPaneEvent, SmoothScroll, kit};
 
 /// Width of the panel window.
-const WIDTH: f32 = 680.;
+pub(crate) const WIDTH: f32 = 680.;
 /// Height of a new quick chat: its bar, one line of text (design D15).
 pub(super) const BAR_HEIGHT: f32 = 64.;
 /// Size of the text typed into the bar.
@@ -49,18 +49,21 @@ const STEP: f32 = 8.;
 const MODEL_PICKER_FLOOR: f32 = 520.;
 /// Room for the folder chooser and its list of suggestions.
 const FOLDER_FLOOR: f32 = 440.;
-/// What the session picker needs besides its rows: header, search, padding.
-const PICKER_CHROME: f32 = PICKER_TOP + 52. + 24.;
-/// Where the session picker starts under the header of a conversation.
-const PICKER_TOP: f32 = 46.;
+/// Height of the header of a conversation.
+const HEADER_HEIGHT: f32 = 44.;
+/// How long the panel must stay put before where it was left is written.
+const POSITION_SAVE_MS: u64 = 500;
+/// Share of its display an overlay may make the window.
+const OVERLAY_SHARE: f32 = 0.9;
+/// What the session list needs besides its rows before it is laid out:
+/// header, search, padding. Only an estimate, for the first frame.
+const PICKER_CHROME: f32 = HEADER_HEIGHT + 52. + 24.;
 const PICKER_ROW: f32 = 46.;
 /// A card of the picker's grid with every line it can have: title, meta,
 /// bar, three todos and "+N more".
 const GRID_CARD: f32 = 148.;
 const GRID_GAP: f32 = 8.;
 const GRID_COLUMNS: usize = 2;
-/// The search row of the picker, with its padding.
-const PICKER_SEARCH: f32 = 52.;
 /// Opening animation (design D14): the whole of it.
 const OPEN_MS: u64 = 280;
 /// The panel starts this much smaller than its final size.
@@ -111,6 +114,13 @@ pub(crate) struct QuickPanel {
     /// Height the bar of a new quick chat needs, as last laid out: it grows
     /// with the lines typed and with an error shown above it.
     bar_h: Rc<Cell<f32>>,
+    /// What the open overlays need, as last laid out (design D13): the session
+    /// list's search row and its rows, the model picker's card and the folder
+    /// chooser's card. 0 while not laid out; the fixed estimates then stand in.
+    list_search_h: Rc<Cell<f32>>,
+    list_rows_h: Rc<Cell<f32>>,
+    model_h: Rc<Cell<f32>>,
+    folder_h: Rc<Cell<f32>>,
     /// What the shown session is doing, for the light along the edge.
     tracker: Tracker,
     /// What the light shows (design D14).
@@ -154,6 +164,13 @@ pub(crate) struct QuickPanel {
     /// The window has been active once: only then does losing focus close it.
     active_seen: bool,
     closed: bool,
+    /// The window can be dragged (not a layer-shell surface, design D18).
+    movable: bool,
+    /// Writes where the panel was left once it stops moving.
+    position_save: Option<Task<()>>,
+    /// Drags started, for tests.
+    #[cfg(test)]
+    drags: usize,
     _subs: Vec<Subscription>,
 }
 
@@ -197,10 +214,75 @@ fn initial_height(session: bool) -> f32 {
     if session { MIN_HEIGHT } else { BAR_HEIGHT }
 }
 
+/// Whether a window of `kind` can be dragged: a layer-shell surface is placed
+/// by the compositor (design D18).
+fn movable(kind: &WindowKind) -> bool {
+    #[cfg(target_os = "linux")]
+    if matches!(kind, WindowKind::LayerShell(_)) {
+        return false;
+    }
+    let _ = kind;
+    true
+}
+
+/// The edge the platform keeps while the panel grows, and so the one kept
+/// where the user left it: the bottom on macOS (design D13), else the top.
+pub(crate) const BOTTOM_ANCHORED: bool = cfg!(target_os = "macos");
+
+/// What a display is known by in the stored positions: its uuid, which
+/// outlives a restart, else its id.
+pub(crate) fn display_key(display: &dyn PlatformDisplay) -> String {
+    display
+        .uuid()
+        .map(|uuid| uuid.to_string())
+        .unwrap_or_else(|_| format!("id:{:?}", display.id()))
+}
+
+/// Where the panel was left on a display whose bounds are `display`.
+pub(crate) fn position_of(bounds: Bounds<Pixels>, display: Bounds<Pixels>) -> QuickPosition {
+    let rel = |v: Pixels, origin: Pixels| f32::from(v - origin).round() as i32;
+    QuickPosition {
+        left: rel(bounds.left(), display.left()),
+        top: rel(bounds.top(), display.top()),
+        bottom: rel(bounds.bottom(), display.top()),
+    }
+}
+
+/// The bounds of a panel `height` tall left at `position` on a display:
+/// the kept edge (`bottom_anchored`) where it was, the whole panel inside the
+/// display's `visible` area (a display may have shrunk since).
+pub(crate) fn placed(
+    display: Bounds<Pixels>,
+    visible: Bounds<Pixels>,
+    position: QuickPosition,
+    height: f32,
+    bottom_anchored: bool,
+) -> Bounds<Pixels> {
+    let (dx, dy) = (f32::from(display.left()), f32::from(display.top()));
+    let top = if bottom_anchored {
+        dy + position.bottom as f32 - height
+    } else {
+        dy + position.top as f32
+    };
+    let within = |v: f32, low: Pixels, high: Pixels, size: f32| {
+        let (low, high) = (f32::from(low), f32::from(high) - size);
+        v.min(high).max(low)
+    };
+    let left = within(
+        dx + position.left as f32,
+        visible.left(),
+        visible.right(),
+        WIDTH,
+    );
+    let top = within(top, visible.top(), visible.bottom(), height);
+    Bounds::new(point(px(left), px(top)), size(px(WIDTH), px(height)))
+}
+
 fn window_options(
     kind: WindowKind,
     display: Option<DisplayId>,
     height: f32,
+    positions: &std::collections::BTreeMap<String, QuickPosition>,
     cx: &App,
 ) -> WindowOptions {
     // Placed where a centred conversation has its bottom edge: the panel
@@ -208,13 +290,31 @@ fn window_options(
     let mut bounds = Bounds::centered(display, size(px(WIDTH), px(MIN_HEIGHT)), cx);
     bounds.origin.y += px(MIN_HEIGHT - height);
     bounds.size.height = px(height);
+    // Where the user left it on this display, if they moved it (design D18).
+    let movable = movable(&kind);
+    let screen = display
+        .and_then(|id| cx.find_display(id))
+        .or_else(|| cx.primary_display());
+    if movable
+        && let Some(screen) = screen
+        && let Some(position) = positions.get(&display_key(&*screen))
+    {
+        bounds = placed(
+            screen.bounds(),
+            screen.visible_bounds(),
+            *position,
+            height,
+            BOTTOM_ANCHORED,
+        );
+    }
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
         focus: true,
         show: true,
         kind,
-        is_movable: false,
+        // AppKit and Windows move only a movable window.
+        is_movable: movable,
         is_resizable: false,
         is_minimizable: false,
         display_id: display,
@@ -235,7 +335,9 @@ pub(super) fn open_window(
     let mut last = None;
     let height = initial_height(resume.session.is_some());
     for kind in window_kinds() {
-        let options = window_options(kind, display, height, cx);
+        let movable = movable(&kind);
+        let positions = store.read(cx).prefs.quick.positions.clone();
+        let options = window_options(kind, display, height, &positions, cx);
         let (store, resume) = (store.clone(), resume.clone());
         let mut built = None;
         // Not `gpui_kit::open_window`: its `Root` is painted with the app
@@ -243,7 +345,7 @@ pub(super) fn open_window(
         // would cover the material and every layer under GPUI's view. The
         // root's own style is applied after the plugin's, so it can clear it.
         match cx.open_window(options, |window, cx| {
-            let panel = cx.new(|cx| QuickPanel::new(store, resume, window, cx));
+            let panel = cx.new(|cx| QuickPanel::new(store, resume, movable, window, cx));
             built = Some(panel.clone());
             cx.new(|cx| gpui_kit::base::Root::new(panel, window, cx).bg(transparent_black()))
         }) {
@@ -263,6 +365,7 @@ impl QuickPanel {
     fn new(
         store: Entity<AgentsStore>,
         resume: Resume,
+        movable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -310,6 +413,8 @@ impl QuickPanel {
                 let mut field =
                     WorkspaceField::new(store, input, true, SmoothScroll::default(), cx);
                 field.set_palette(Some(hud), cx);
+                // In the panel's layout, so the window makes room for them.
+                field.set_inline(true);
                 field
             })
         };
@@ -379,6 +484,7 @@ impl QuickPanel {
             cx.observe_window_activation(window, |this, window, cx| {
                 this.on_activation(window.is_window_active(), window, cx)
             }),
+            cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)),
         ];
         let edge = Edge::new(cx.background_executor().now());
         // Over the panel's own material the light is Core Animation's; when
@@ -393,6 +499,10 @@ impl QuickPanel {
             opening: Rc::new(Cell::new(0.)),
             stepped: Rc::new(Cell::new(None)),
             bar_h: Rc::new(Cell::new(0.)),
+            list_search_h: Rc::new(Cell::new(0.)),
+            list_rows_h: Rc::new(Cell::new(0.)),
+            model_h: Rc::new(Cell::new(0.)),
+            folder_h: Rc::new(Cell::new(0.)),
             tracker: Tracker::new(cx.background_executor().now()),
             edge,
             last_activity: Activity::default(),
@@ -417,6 +527,10 @@ impl QuickPanel {
             error: None,
             active_seen: window.is_window_active(),
             closed: false,
+            movable,
+            position_save: None,
+            #[cfg(test)]
+            drags: 0,
             _subs: subs,
         }
     }
@@ -431,11 +545,55 @@ impl QuickPanel {
         }
     }
 
+    /// The window moved or grew: remember where it is on its display, and
+    /// write it down once it stays put (design D18).
+    fn bounds_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.movable || self.closed {
+            return;
+        }
+        let Some(display) = window.display(cx) else {
+            return;
+        };
+        let position = position_of(window.bounds(), display.bounds());
+        let key = display_key(&*display);
+        let store = self.store.clone();
+        store.update(cx, |s, _| s.remember_quick_position(key, position));
+        // Replacing the task cancels a write still waiting.
+        self.position_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(POSITION_SAVE_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| this.flush_position(cx));
+        }));
+    }
+
+    /// Write a remembered position that is still waiting.
+    fn flush_position(&mut self, cx: &mut Context<Self>) {
+        if self.position_save.take().is_some() {
+            self.store.read(cx).save();
+        }
+    }
+
+    /// A press on a drag area: move the window with the pointer (design D18).
+    fn start_drag(&mut self, window: &mut Window) {
+        // GPUI's test window does not implement moving: tests count instead.
+        #[cfg(test)]
+        {
+            let _ = window;
+            self.drags += 1;
+        }
+        #[cfg(not(test))]
+        if self.movable {
+            window.start_window_move();
+        }
+    }
+
     /// Close the window; the host keeps the session and the draft.
     pub(crate) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
+        self.flush_position(cx);
         let (session, draft) = {
             let pane = self.pane.read(cx);
             (pane.session().cloned(), pane.draft(cx))
@@ -454,6 +612,7 @@ impl QuickPanel {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
+        self.flush_position(cx);
         self.pane.update(cx, |pane, cx| pane.clear(cx));
         self.pane
             .update(cx, |pane, cx| pane.set_draft("", window, cx));
@@ -541,23 +700,48 @@ impl QuickPanel {
             .unwrap_or(900.)
     }
 
-    /// The least height that shows what is open over the conversation.
+    /// The least height that shows what is open in place of the conversation.
+    ///
+    /// What is open is measured (design D13): what it laid out last frame is
+    /// the floor. The fixed estimates stand in only until the first layout.
     fn height_floor(&self, cx: &App) -> f32 {
-        let sessions = if self.picker_open {
-            picker_height(self.picker_layout(cx), self.picker_rows(cx).len())
+        let shown = self.pane.read(cx).session().is_some();
+        // The root's border, top and bottom.
+        const BORDER: f32 = 2.;
+        // A new quick chat is as tall as its bar needs.
+        let bar = if shown {
+            0.
         } else {
+            self.bar_h.get().ceil() + BORDER
+        };
+        // What is open takes the conversation's place, under the header; in a
+        // new quick chat it lies above the bar, which holds the border.
+        let around = if shown { HEADER_HEIGHT + BORDER } else { bar };
+        let placed = |measured: Option<f32>, estimate: f32| match measured {
+            Some(h) => h.ceil() + around,
+            None => estimate + if shown { 0. } else { BAR_HEIGHT },
+        };
+        let sessions = if self.picker_open {
+            let (search, rows) = (self.list_search_h.get(), self.list_rows_h.get());
+            let estimate = picker_height(self.picker_layout(cx), self.picker_rows(cx).len());
+            placed((rows > 0.).then_some(search + rows), estimate)
+        } else {
+            self.list_search_h.set(0.);
+            self.list_rows_h.set(0.);
             0.
         };
         let models = if self.models.read(cx).is_open() {
-            MODEL_PICKER_FLOOR
+            let h = self.model_h.get();
+            placed((h > 0.).then_some(h), MODEL_PICKER_FLOOR)
         } else {
+            self.model_h.set(0.);
             0.
         };
-        let folders = if self.folder_open { FOLDER_FLOOR } else { 0. };
-        // A new quick chat is as tall as its bar needs, plus the root's border.
-        let bar = if self.pane.read(cx).session().is_none() {
-            self.bar_h.get().ceil() + 2.
+        let folders = if self.folder_open {
+            let h = self.folder_h.get();
+            placed((h > 0.).then_some(h), FOLDER_FLOOR)
         } else {
+            self.folder_h.set(0.);
             0.
         };
         sessions.max(models).max(folders).max(bar)
@@ -940,6 +1124,30 @@ impl QuickPanel {
         &self.models
     }
 
+    /// Drags started so far.
+    #[cfg(test)]
+    pub(crate) fn drags_for_test(&self) -> usize {
+        self.drags
+    }
+
+    /// The colours the panel paints with.
+    #[cfg(test)]
+    pub(crate) fn hud_for_test(&self, cx: &App) -> Palette {
+        self.hud(cx)
+    }
+
+    /// The session list's search field.
+    #[cfg(test)]
+    pub(crate) fn picker_query_for_test(&self) -> &Entity<InputState> {
+        &self.query
+    }
+
+    /// The folder chooser's field.
+    #[cfg(test)]
+    pub(crate) fn folder_input_for_test(&self, cx: &App) -> Entity<InputState> {
+        self.folders.read(cx).input_for_test().clone()
+    }
+
     /// The model picked for the next quick chat.
     #[cfg(test)]
     pub(crate) fn model_for_test(&self) -> Option<&str> {
@@ -1028,6 +1236,8 @@ impl QuickPanel {
         let hover = p.card_hover;
         h_flex()
             .id(id)
+            // Over a drag area: a press here is the button's (design D18).
+            .occlude()
             .flex_none()
             .size(px(30.))
             .justify_center()
@@ -1049,14 +1259,20 @@ impl QuickPanel {
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| "Quick chat".into());
         // No rule under it: the header is a small dim title row (design D15).
+        // The header is a drag area (design D18); its controls occlude it.
         h_flex()
             .id("quick-header")
             .debug_selector(|| "quick-header".into())
             .flex_none()
-            .h(px(44.))
+            .h(px(HEADER_HEIGHT))
             .px_3()
             .gap_1()
             .items_center()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| this.start_drag(window)),
+            )
             .child(
                 Self::icon_button(
                     "quick-new",
@@ -1077,9 +1293,12 @@ impl QuickPanel {
                 })),
             )
             .child(
+                // As wide as the title, so the rest of the header is free to
+                // drag by.
                 h_flex()
                     .id("quick-picker-toggle")
-                    .flex_1()
+                    .debug_selector(|| "quick-title".into())
+                    .occlude()
                     .min_w_0()
                     .h(px(30.))
                     .px_2()
@@ -1089,15 +1308,20 @@ impl QuickPanel {
                     .hover(move |s| s.bg(p.card_hover))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(p.dim)
+                            .text_color(p.muted)
                             .child(title),
                     )
-                    .child(kit::icon(IconName::ChevronDown, 14., p.dim))
+                    .child(kit::icon(IconName::ChevronDown, 14., p.muted))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "quick-drag".into())
+                    .flex_1()
+                    .h_full(),
             )
             .when(session, |el| {
                 el.child(
@@ -1113,12 +1337,9 @@ impl QuickPanel {
             .into_any_element()
     }
 
-    /// The model picker over the panel, while it is open.
-    fn render_model_overlay(
-        &mut self,
-        session: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    /// The model picker in place of the conversation, while it is open
+    /// (design D17): no dimming, card or shadow, on the panel's surface.
+    fn render_model_sheet(&mut self, session: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.models.read(cx).is_open() {
             return None;
         }
@@ -1129,71 +1350,56 @@ impl QuickPanel {
         } else {
             self.picks.model.clone().map(Some)
         };
-        let max_h = px(self.height - 24.);
         let p = self.hud(cx);
-        let card = self.models.update(cx, |models, cx| {
+        // What the sheet needs to show every row, read once it is laid out.
+        let rows = self.models.read(cx).rows_scroll();
+        let probe = Self::measure_with(&self.model_h, cx, move |whole| {
+            ModelPicker::sheet_height(&rows, whole)
+        })
+        .into_any_element();
+        let sheet = self.models.update(cx, |models, cx| {
             models.set_palette(Some(p));
             models.set_overrides(None, selected);
-            models.card(px(WIDTH - 32.), max_h, cx)
+            models.card(PickerFrame::Sheet { probe }, cx)
         })?;
         Some(
-            div()
+            v_flex()
                 .id("quick-models")
-                .absolute()
-                .inset_0()
-                .rounded(self.chrome.radius)
-                .bg(black().opacity(0.3))
-                .occlude()
-                .flex()
-                .justify_center()
-                .items_start()
-                .pt_3()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.models.update(cx, |models, cx| {
-                        models.close(cx);
-                    });
-                }))
-                .child(card)
+                .debug_selector(|| "quick-models".into())
+                .flex_1()
+                .min_h_0()
+                .child(sheet)
                 .into_any_element(),
         )
     }
 
-    /// The folder chooser over the panel, while it is open.
-    fn render_folder_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The folder chooser in place of the conversation, while it is open
+    /// (design D17), its suggestions laid out under the field.
+    fn render_folder_sheet(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.folder_open {
             return None;
         }
         let p = self.hud(cx);
         self.folders
             .update(cx, |folders, cx| folders.set_palette(Some(p), cx));
+        // `flex_none` inside the scrolling box: the content keeps its natural
+        // height, which is what the window's floor is measured from.
         Some(
-            div()
+            v_flex()
                 .id("quick-folders")
                 .debug_selector(|| "quick-folders".into())
-                .absolute()
-                .inset_0()
-                .rounded(self.chrome.radius)
-                .bg(black().opacity(0.3))
-                .occlude()
-                .flex()
-                .justify_center()
-                .items_start()
-                .pt_3()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.close_folder_chooser(window, cx);
-                }))
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
                 .child(
                     v_flex()
-                        .id("quick-folders-card")
-                        .w(px(WIDTH - 32.))
-                        .p_3()
+                        .relative()
+                        .flex_none()
+                        .px_3()
+                        .pt_3()
+                        .pb_1()
                         .gap_2()
-                        .rounded(px(16.))
-                        .bg(p.surface)
-                        .border_1()
-                        .border_color(p.border)
-                        .shadow_lg()
-                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(Self::measure(&self.folder_h, cx))
                         .child(
                             div()
                                 .text_sm()
@@ -1204,7 +1410,7 @@ impl QuickPanel {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(p.dim)
+                                .text_color(p.muted)
                                 .child("Pick or type the folder this chat runs in. Esc cancels."),
                         )
                         .child(self.folders.clone()),
@@ -1213,34 +1419,74 @@ impl QuickPanel {
         )
     }
 
+    /// A canvas that stores the height of the element it is placed in (which
+    /// must be `relative`) and renders the panel again when it changed, so
+    /// the window follows what is laid out (design D13).
+    fn measure(cell: &Rc<Cell<f32>>, cx: &mut Context<Self>) -> impl Styled + IntoElement + use<> {
+        Self::measure_with(cell, cx, |h| h)
+    }
+
+    /// [`Self::measure`], storing `f` of the height. `f` runs while painting,
+    /// after the whole frame is laid out, so it may read other elements'
+    /// bounds of this frame.
+    fn measure_with<F: Fn(f32) -> f32 + 'static>(
+        cell: &Rc<Cell<f32>>,
+        cx: &mut Context<Self>,
+        f: F,
+    ) -> impl Styled + IntoElement + use<F> {
+        let (cell, weak) = (cell.clone(), cx.entity().downgrade());
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let h = f(f32::from(bounds.size.height));
+                if (cell.get() - h).abs() > 0.5 {
+                    cell.set(h);
+                    let weak = weak.clone();
+                    window.on_next_frame(move |_, cx| {
+                        let _ = weak.update(cx, |_, cx| cx.notify());
+                    });
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    /// The session list, which takes the conversation's place (design D17):
+    /// no card, border or shadow, rows straight on the panel's surface. In a
+    /// new quick chat it lies above the bar. The search row stays in view and
+    /// the rows scroll under it once the window cannot be taller.
     fn render_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.hud(cx);
         let layout = self.picker_layout(cx);
         let rows = self.picker_rows(cx);
         let empty = rows.is_empty();
         let cursor = self.picker_cursor.min(rows.len().saturating_sub(1));
-        // Under the header of a conversation; a new quick chat has none.
-        let top = if self.pane.read(cx).session().is_some() {
-            PICKER_TOP
-        } else {
-            8.
-        };
-        // The grid scrolls under the search row once it is taller than the
-        // panel allows.
-        let cards_max = (self.height - top - PICKER_SEARCH - 8.).max(GRID_CARD);
         let (toggle_icon, toggle_tip) = match layout {
             PickerLayout::List => (IconName::LayoutGrid, "Show sessions as cards"),
             PickerLayout::Grid => (IconName::List, "Show sessions as a list"),
         };
+        // Both parts carry their own padding, so what they measure is what
+        // the list needs.
         let search = h_flex()
             .debug_selector(|| "quick-picker-search".into())
+            .relative()
+            .flex_none()
             .items_center()
             .gap_1()
+            .px_2()
+            .pb_1()
+            .child(Self::measure(&self.list_search_h, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(gpui_kit::component::input::Input::new(&self.query).appearance(false)),
+                    .child(kit::input_colours(&self.query, &p))
+                    .child(
+                        gpui_kit::component::input::Input::new(&self.query)
+                            .appearance(false)
+                            .text_color(p.text),
+                    ),
             )
             .child(
                 Self::icon_button("quick-picker-layout", toggle_icon, toggle_tip, &p)
@@ -1249,15 +1495,18 @@ impl QuickPanel {
                         this.set_picker_layout(layout.other(), window, cx)
                     })),
             );
-        let body = match layout {
-            PickerLayout::List => v_flex()
-                .gap_1()
-                .children(
-                    rows.into_iter()
-                        .enumerate()
-                        .map(|(ix, row)| self.picker_list_row(ix, row, ix == cursor, &p, cx)),
-                )
-                .into_any_element(),
+        let (list, scroll_id) = match layout {
+            PickerLayout::List => (
+                v_flex()
+                    .gap_1()
+                    .children(
+                        rows.into_iter()
+                            .enumerate()
+                            .map(|(ix, row)| self.picker_list_row(ix, row, ix == cursor, &p, cx)),
+                    )
+                    .into_any_element(),
+                "quick-picker-list",
+            ),
             PickerLayout::Grid => {
                 // Rows of two cards that share the width, so the columns hold
                 // while the panel grows into its size.
@@ -1274,19 +1523,46 @@ impl QuickPanel {
                         .unwrap_or_else(|| div().flex_1().min_w_0().into_any_element());
                     grid_rows.push(h_flex().gap(px(GRID_GAP)).child(first).child(second));
                 }
-                v_flex()
-                    .id("quick-picker-cards")
-                    .debug_selector(|| "quick-picker-cards".into())
-                    .gap(px(GRID_GAP))
-                    .max_h(px(cards_max))
-                    .overflow_y_scroll()
-                    .children(grid_rows)
-                    .into_any_element()
+                (
+                    v_flex()
+                        .gap(px(GRID_GAP))
+                        .children(grid_rows)
+                        .into_any_element(),
+                    "quick-picker-cards",
+                )
             }
         };
+        // `flex_none` inside the scrolling box: the content keeps its natural
+        // height, which is what the window's floor is measured from.
+        let body = v_flex()
+            .id(scroll_id)
+            .debug_selector(move || scroll_id.into())
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_none()
+                    .px_2()
+                    .pb_2()
+                    .child(Self::measure(&self.list_rows_h, cx))
+                    .child(list)
+                    .when(empty, |el| {
+                        el.child(
+                            div()
+                                .px_2()
+                                .py_2()
+                                .text_sm()
+                                .text_color(p.muted)
+                                .child("No sessions match."),
+                        )
+                    }),
+            );
         v_flex()
             .id("quick-picker")
-            .occlude()
+            .debug_selector(|| "quick-picker".into())
+            .flex_1()
+            .min_h_0()
             // Before the search field, which would take the arrows for its caret.
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
                 if this.move_picker_cursor(false, cx) {
@@ -1298,29 +1574,8 @@ impl QuickPanel {
                     cx.stop_propagation();
                 }
             }))
-            .absolute()
-            .top(px(top))
-            .left(px(8.))
-            .right(px(8.))
-            .p_1()
-            .gap_1()
-            .rounded(px(10.))
-            .border_1()
-            .border_color(p.border)
-            .bg(p.surface)
-            .shadow_lg()
             .child(search)
             .child(body)
-            .when(empty, |el| {
-                el.child(
-                    div()
-                        .px_2()
-                        .py_2()
-                        .text_sm()
-                        .text_color(p.dim)
-                        .child("No sessions match."),
-                )
-            })
             .into_any_element()
     }
 
@@ -1404,7 +1659,7 @@ impl QuickPanel {
                         div()
                             .truncate()
                             .text_xs()
-                            .text_color(p.dim)
+                            .text_color(p.muted)
                             .child(format!("{} · {}", row.agent_name, row.workspace)),
                     ),
             )
@@ -1567,7 +1822,7 @@ impl QuickPanel {
                     .h(px(16.))
                     .truncate()
                     .text_xs()
-                    .text_color(p.dim)
+                    .text_color(p.muted)
                     .child(meta),
             )
             .children(progress)
@@ -1576,14 +1831,15 @@ impl QuickPanel {
     }
 
     /// What the panel shows before the first prompt of a quick chat.
-    fn render_empty(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// A new quick chat: its bar, with the session `list` above it when open.
+    fn render_empty(&mut self, list: Option<AnyElement>, cx: &mut Context<Self>) -> AnyElement {
         let p = self.hud(cx);
         // The agent and folder, then the model as a button.
         let summary = match self.launch_parts(cx) {
             None => div()
                 .flex_none()
                 .text_xs()
-                .text_color(p.dim)
+                .text_color(p.muted)
                 .child("No agent connected")
                 .into_any_element(),
             Some((agent, cwd)) => {
@@ -1607,6 +1863,7 @@ impl QuickPanel {
                     h_flex()
                         .id(id)
                         .debug_selector(move || id.into())
+                        .occlude()
                         .h(px(26.))
                         .gap_1()
                         .px_2()
@@ -1620,20 +1877,29 @@ impl QuickPanel {
                     .gap_1p5()
                     .items_center()
                     .text_xs()
-                    .text_color(p.dim)
+                    .text_color(p.muted)
+                    // The values read in `text`, their icons in `muted`: what
+                    // the chat runs with must read first (design D11).
                     .when(several, |el| {
-                        el.child(div().max_w(px(70.)).truncate().child(agent.clone()))
+                        el.child(
+                            div()
+                                .max_w(px(70.))
+                                .truncate()
+                                .text_color(p.text)
+                                .child(agent.clone()),
+                        )
                     })
                     .child(
                         chip("quick-folder")
                             .tooltip(move |window, cx| {
                                 kit::wrap_tip(folder_tip.clone()).build(window, cx)
                             })
-                            .child(kit::icon(IconName::Folder, 12., p.dim))
+                            .child(kit::icon(IconName::Folder, 12., p.muted))
                             .child(
                                 div()
                                     .max_w(px(100.))
                                     .truncate()
+                                    .text_color(p.text)
                                     .child(cwd.unwrap_or_else(|| "Choose folder".into())),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1645,8 +1911,14 @@ impl QuickPanel {
                             .tooltip(|window, cx| {
                                 kit::wrap_tip("Model for this chat (Cmd/Ctrl+M)").build(window, cx)
                             })
-                            .child(div().max_w(px(130.)).truncate().child(model))
-                            .child(kit::icon(IconName::ChevronDown, 12., p.dim))
+                            .child(
+                                div()
+                                    .max_w(px(130.))
+                                    .truncate()
+                                    .text_color(p.text)
+                                    .child(model),
+                            )
+                            .child(kit::icon(IconName::ChevronDown, 12., p.muted))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_model_picker(window, cx)
                             })),
@@ -1659,10 +1931,12 @@ impl QuickPanel {
                             .child(kit::icon(
                                 IconName::Brain,
                                 13.,
-                                if auto { p.dim } else { p.text },
+                                if auto { p.muted } else { p.text },
                             ))
                             // The level shows once it is not the default.
-                            .when(!auto, |el| el.child(reasoning_label.clone()))
+                            .when(!auto, |el| {
+                                el.child(div().text_color(p.text).child(reasoning_label.clone()))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_reasoning(cx))),
                     )
                     .into_any_element()
@@ -1672,6 +1946,8 @@ impl QuickPanel {
         let error = self.error.clone();
         let input = div()
             .debug_selector(|| "quick-composer".into())
+            // Pressing in the text selects it; it does not drag (design D18).
+            .occlude()
             .flex_1()
             .min_w_0()
             .capture_action(cx.listener(|this, a: &Enter, window, cx| {
@@ -1685,17 +1961,28 @@ impl QuickPanel {
                     this.submit(window, cx);
                 }
             }))
+            // Placeholder, selection and caret in the panel's colours.
+            .child(kit::input_colours(self.pane.read(cx).prompt_input(), &p))
             .child(
                 Textarea::new(self.pane.read(cx).prompt_input())
                     .appearance(false)
+                    // The kit's input paints in the app theme's foreground
+                    // (gpui-kit 0.11), which is dark in a light app theme.
+                    .text_color(p.text)
                     .text_size(px(BAR_TEXT))
                     .line_height(px(BAR_LINE)),
             );
         // The bar is the whole panel: nothing is drawn around the input, which
         // sits straight on the panel's surface (design D15).
+        // Around its controls the bar is a drag area (design D18).
         let bar = h_flex()
             .id("quick-bar")
             .debug_selector(|| "quick-bar".into())
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| this.start_drag(window)),
+            )
             .w_full()
             .min_h(px(BAR_HEIGHT - 2.))
             .items_center()
@@ -1718,29 +2005,14 @@ impl QuickPanel {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx))),
             );
         // What the bar and the error above it need: the window follows it.
-        let measure = {
-            let (cell, weak) = (self.bar_h.clone(), cx.entity().downgrade());
-            canvas(
-                move |bounds, window, _| {
-                    let h = f32::from(bounds.size.height);
-                    if (cell.get() - h).abs() > 0.5 {
-                        cell.set(h);
-                        window.on_next_frame(move |_, cx| {
-                            let _ = weak.update(cx, |_, cx| cx.notify());
-                        });
-                    }
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .inset_0()
-        };
+        let measure = Self::measure(&self.bar_h, cx);
         // The bar stays at the bottom edge, which is the one that does not
         // move when the window grows (design D13).
         v_flex()
             .flex_1()
             .min_h_0()
             .justify_end()
+            .children(list)
             .child(
                 v_flex()
                     .relative()
@@ -2007,8 +2279,6 @@ impl Render for QuickPanel {
             .absolute()
             .size_0()
         });
-        let model_overlay = self.render_model_overlay(session, cx);
-        let folder_overlay = self.render_folder_overlay(cx);
         // The light along the edge, drawn here when no renderer outside GPUI
         // draws it.
         let ring_frame = self.ring_frame.clone();
@@ -2034,22 +2304,30 @@ impl Render for QuickPanel {
         if ring.is_none() {
             self.ring_frame.set(None);
         }
-        let picker = if self.picker_open {
-            Some(self.render_picker(cx))
-        } else {
-            None
+        // The session list, the model picker and the folder chooser take the
+        // conversation's place (design D17); the pane is kept, so the
+        // conversation returns where it was scrolled to. In a new quick chat
+        // they lie above the bar. At most one is open.
+        let list = match self.render_folder_sheet(cx) {
+            Some(sheet) => Some(sheet),
+            None => match self.render_model_sheet(session, cx) {
+                Some(sheet) => Some(sheet),
+                None => self.picker_open.then(|| self.render_picker(cx)),
+            },
         };
         // A new quick chat is only its bar.
         let header = session.then(|| self.render_header(cx));
-        let body = if session {
+        let body = if !session {
+            self.render_empty(list, cx)
+        } else if let Some(list) = list {
+            list
+        } else {
             div()
                 .relative()
                 .flex_1()
                 .min_h_0()
                 .child(self.pane.clone())
                 .into_any_element()
-        } else {
-            self.render_empty(cx)
         };
         v_flex()
             .id("quick-panel")
@@ -2100,9 +2378,6 @@ impl Render for QuickPanel {
             }))
             .children(header)
             .child(body)
-            .children(picker)
-            .children(model_overlay)
-            .children(folder_overlay)
             .children(ring)
             .children(step)
             .with_animation(
@@ -2166,7 +2441,7 @@ pub(super) fn fitted_height(
 ) -> f32 {
     let cap = (display * DISPLAY_SHARE).clamp(MIN_HEIGHT, MAX_HEIGHT);
     // An overlay is never clipped, even on a small display.
-    let floor = floor.min(display * 0.9);
+    let floor = floor.min(display * OVERLAY_SHARE);
     let limit = cap.max(floor);
     // What this state is at least tall, and what steps count from.
     let least = if shown { MIN_HEIGHT } else { BAR_HEIGHT };

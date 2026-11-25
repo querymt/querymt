@@ -10,6 +10,10 @@ pub struct Palette {
     pub dark: bool,
     pub bg: Hsla,
     pub surface: Hsla,
+    /// What menus and pickers over the page are painted with. The same as
+    /// `surface` in the app; the quick panel's own is neutral and, over its
+    /// material, see-through (quick-panel / Overlays sit on the panel).
+    pub popover: Hsla,
     pub card: Hsla,
     pub card_hover: Hsla,
     pub border: Hsla,
@@ -39,11 +43,19 @@ fn hexa(v: u32) -> Hsla {
 }
 
 impl Palette {
+    /// Overlays (menus, pickers) cast a shadow. Not over the quick panel's
+    /// material: the overlay is part of the panel's surface there, and a
+    /// shadow on a see-through card would show as a dark smear (design D17).
+    pub fn overlay_shadow(&self) -> bool {
+        self.popover.a >= 1.
+    }
+
     pub fn light() -> Self {
         Self {
             dark: false,
             bg: hex(0xf6f5f4),
             surface: hex(0xffffff),
+            popover: hex(0xffffff),
             card: hex(0xf1efed),
             card_hover: hex(0xebe9e6),
             border: hex(0xdeddda),
@@ -69,6 +81,7 @@ impl Palette {
             dark: true,
             bg: hex(0x1b1b1b),
             surface: hex(0x202020),
+            popover: hex(0x202020),
             card: hex(0x292929),
             card_hover: hex(0x303030),
             border: hex(0x383838),

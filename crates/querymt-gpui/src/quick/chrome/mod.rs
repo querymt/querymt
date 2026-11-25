@@ -16,7 +16,9 @@ mod windows;
 
 use gpui_kit::*;
 
-use super::hud::{DARK_MATERIAL_TINT, TINT};
+use super::hud::{
+    LIQUID_GLASS_TINT, LIQUID_GLASS_WHITE_THROUGH, TINT, VFX_TINT, VFX_WHITE_THROUGH,
+};
 use crate::theme::Palette;
 
 /// Corner radius of the panel's rounded root.
@@ -40,6 +42,10 @@ pub(crate) struct Chrome {
     /// scales together with the window (design D14), so the panel's root does
     /// not fade on its own.
     pub(crate) native_motion: bool,
+    /// The most of a white backdrop the material lets through, 0 to 1 (an
+    /// opaque surface 0). The legibility contract is held against it
+    /// (design D11).
+    pub(crate) white_through: f32,
 }
 
 /// The colours of the panel's root, picked by [`Chrome`]. Everything inside
@@ -61,6 +67,7 @@ impl Chrome {
             tint: 1.,
             rimmed: false,
             native_motion: false,
+            white_through: 0.,
         }
     }
 
@@ -74,19 +81,29 @@ impl Chrome {
             tint: TINT,
             rimmed: false,
             native_motion: false,
+            // Mica and compositor blur are the system's to choose, and a white
+            // window behind them comes through whole.
+            white_through: 1.,
         }
     }
 
-    /// A material the panel itself keeps dark (macOS) is drawn behind the
-    /// window by a view of ours. `rimmed`: it draws its own edge.
+    /// A material set to dark aqua (macOS) is drawn behind the window by a
+    /// view of ours. `rimmed`: it is Liquid Glass, which draws its own edge;
+    /// else the visual-effect material.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn dark_material(rimmed: bool) -> Self {
+        let (tint, white_through) = if rimmed {
+            (LIQUID_GLASS_TINT, LIQUID_GLASS_WHITE_THROUGH)
+        } else {
+            (VFX_TINT, VFX_WHITE_THROUGH)
+        };
         Self {
             glass: true,
             radius: px(RADIUS),
-            tint: DARK_MATERIAL_TINT,
+            tint,
             rimmed,
             native_motion: true,
+            white_through,
         }
     }
 
@@ -113,26 +130,59 @@ impl Chrome {
 /// macOS the material is set dark once, whatever the app theme or the desktop
 /// is set to (the panel is a HUD, D15). `animate`: the opening animation will
 /// run, so the material starts invisible and [`open_step`] brings it in.
+///
+/// When the system asks to reduce transparency, no material is installed at
+/// all and the panel is the opaque one, as on a desktop without a material
+/// (design D11).
+///
+/// On macOS the window has no system shadow either way: it would follow the
+/// window's outline, not the panel's (see `macos::drop_window_shadow`).
 pub(crate) fn install(window: &mut Window, animate: bool) -> Chrome {
     #[cfg(target_os = "macos")]
-    {
-        macos::install(window, animate)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = animate;
-        windows::install(window)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = animate;
-        linux::install(window)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        let _ = (window, animate);
+    macos::drop_window_shadow(window);
+    chrome_for(reduce_transparency(), || {
+        #[cfg(target_os = "macos")]
+        {
+            macos::install(window, animate)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = animate;
+            windows::install(window)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = animate;
+            linux::install(window)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (window, animate);
+            Chrome::solid()
+        }
+    })
+}
+
+/// The chrome for a system that does, or does not, ask to reduce
+/// transparency; `material` installs the desktop's and runs only when it is
+/// not asked.
+fn chrome_for(reduce_transparency: bool, material: impl FnOnce() -> Chrome) -> Chrome {
+    if reduce_transparency {
         Chrome::solid()
+    } else {
+        material()
     }
+}
+
+/// The system asks apps for less transparency (macOS Reduce transparency,
+/// Windows Transparency effects off). Not read on other systems.
+fn reduce_transparency() -> bool {
+    #[cfg(target_os = "macos")]
+    return macos::reduce_transparency();
+    #[cfg(target_os = "windows")]
+    return windows::reduce_transparency();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    false
 }
 
 /// A renderer of the light along the edge outside GPUI, where there is one
@@ -229,18 +279,38 @@ mod tests {
         assert!(s.bg.l < 0.1);
     }
 
-    // quick-panel / Uses its desktop's material: where the panel keeps the
-    // material dark itself, nothing of ours covers it.
+    // quick-panel / Bright window behind the panel: a dark aqua material still
+    // comes out light grey over a white window (task 7.19), so the panel darkens
+    // it; `hud::text_passes_over_a_white_backdrop` sets how much.
     #[test]
-    fn a_dark_material_gets_no_fill_and_a_rimmed_one_no_hairline() {
+    fn a_macos_material_is_darkened_and_a_rimmed_one_has_no_hairline() {
         let p = hud_palette(&Palette::light(), true);
         let glass = Chrome::dark_material(true).surfaces(&p);
-        assert!(glass.bg.a < Chrome::glass().surfaces(&p).bg.a);
-        assert_eq!(glass.border.a, 0., "Liquid Glass draws its own edge");
         let effect = Chrome::dark_material(false).surfaces(&p);
+        for bg in [glass.bg, effect.bg] {
+            assert!(bg.a >= 0.6, "a black tint of its own: {bg:?}");
+            assert!(bg.l < 0.01);
+        }
+        assert_eq!(glass.border.a, 0., "Liquid Glass draws its own edge");
         assert!(effect.border.a > 0., "a visual-effect view has none");
         assert!(Chrome::dark_material(true).native_motion);
         assert!(!Chrome::glass().native_motion && !Chrome::solid().native_motion);
+    }
+
+    // quick-panel / Reduce transparency
+    #[test]
+    fn reduce_transparency_gives_the_opaque_chrome_and_installs_no_material() {
+        let mut installed = false;
+        let chrome = super::chrome_for(true, || {
+            installed = true;
+            Chrome::dark_material(true)
+        });
+        assert_eq!(chrome, Chrome::solid());
+        assert!(!chrome.glass && !chrome.native_motion);
+        assert!(!installed, "no material view is added");
+        // Without the setting the desktop's material is used.
+        let chrome = super::chrome_for(false, Chrome::glass);
+        assert!(chrome.glass);
     }
 
     #[test]

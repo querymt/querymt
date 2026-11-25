@@ -212,13 +212,6 @@ struct ScrollRegion {
     element: AnyElement,
 }
 
-impl IntoElement for ScrollRegion {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for ScrollRegion {
     type RequestLayoutState = ();
     type PrepaintState = ();

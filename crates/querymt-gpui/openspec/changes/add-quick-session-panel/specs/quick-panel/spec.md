@@ -6,7 +6,7 @@ A floating conversation panel summoned by a global shortcut on desktop, for quic
 ## ADDED Requirements
 
 ### Requirement: Summon and dismiss
-On desktop builds the app SHALL toggle the quick panel when its global shortcut is pressed, from any application. The panel SHALL appear above other windows with keyboard focus in its composer, centered on the display of the main window when it is open and on the primary display otherwise; where the desktop places such panels itself (Wayland), it SHALL appear where the desktop puts it. It SHALL close when the user presses Esc, presses the shortcut again, or focus moves to another window.
+On desktop builds the app SHALL toggle the quick panel when its global shortcut is pressed, from any application. The panel SHALL appear above other windows with keyboard focus in its composer, where the user left it on that display, else centered on the main window's display or the primary one; where the desktop places such panels itself (Wayland), it SHALL appear where the desktop puts it. It SHALL close when the user presses Esc, presses the shortcut again, or focus moves to another window.
 
 #### Scenario: Summon over another application
 - **GIVEN** another application is focused
@@ -33,6 +33,15 @@ The panel SHALL be dark whatever the app's theme or the desktop's, with a look o
 - **GIVEN** the panel shows a session with markdown, a code block and a diff
 - **THEN** all of them use the panel's colours, not the main window's
 
+#### Scenario: Overlays sit on the panel
+- **WHEN** the session list, the model picker, the folder chooser or the composer's command list is open
+- **THEN** it is drawn on the panel's own surface, with no separately tinted box, no dimming of the panel and no shadow over the material
+
+#### Scenario: Typed text in a light app theme
+- **GIVEN** the app theme is light
+- **WHEN** the user types in the panel's composer or in a search field of the panel
+- **THEN** the text, its placeholder, its selection and its caret use the panel's colours and are light on the dark panel
+
 ### Requirement: A new quick chat is one bar
 Before a conversation is shown, the panel SHALL be a single bar holding the input, what the chat will run on and a way to pick a session, with no header. The header, with its new-chat, session-picker and open-in-main-window actions, SHALL appear with a conversation.
 
@@ -56,6 +65,16 @@ The panel SHALL use the translucent material its desktop offers, drawn dark wher
 - **GIVEN** a desktop that offers no blur for application windows
 - **WHEN** the panel is summoned
 - **THEN** it shows the same layout on an opaque surface, with no transparent or unreadable areas
+
+#### Scenario: Bright window behind the panel
+- **GIVEN** a white window lies behind the panel
+- **WHEN** the panel is summoned
+- **THEN** the conversation text, the composer text, and the model, folder, mode and title labels keep a contrast of at least 4.5:1 against what is drawn behind them
+
+#### Scenario: Reduce transparency
+- **GIVEN** the system asks to reduce transparency
+- **WHEN** the panel is summoned
+- **THEN** it is drawn on an opaque dark surface, as on a desktop without a material
 
 #### Scenario: Panel never becomes the active window
 - **WHEN** the panel is open above another application that stays active
@@ -114,6 +133,35 @@ The panel SHALL let the user switch to any existing session by searching session
 - **WHEN** the user picks session A in the panel
 - **THEN** the panel shows session A's conversation with its live reply, and the main window is unchanged
 
+### Requirement: Session list in place of the conversation
+The session list, the model picker and the folder chooser SHALL each open in place of the conversation, inside the panel's own surface rather than as a separate card over it, and the conversation SHALL return when they close. The folder chooser's suggestions SHALL be part of it, not a dropdown over the panel.
+
+#### Scenario: List in place of the conversation
+- **GIVEN** the panel shows a conversation
+- **WHEN** the user opens the session list, the model picker or the folder chooser
+- **THEN** it takes the conversation's place under the header, and closing it shows the conversation again at the same scroll position
+
+#### Scenario: Every folder suggestion is visible
+- **GIVEN** the folder chooser offers suggestions
+- **WHEN** it is open
+- **THEN** every suggestion is inside the panel, or, once they need more room than the panel's limit, they scroll
+
+### Requirement: Move the panel
+The user SHALL be able to move the panel by dragging its header, or the empty parts of a new quick chat's bar, with the pointer; dragging SHALL NOT start from the text field or a button. The panel SHALL reopen where it was last left on that display, also after the app restarts, kept inside the display's visible area. Where the desktop places the panel itself (Wayland layer-shell), it cannot be moved.
+
+#### Scenario: Drag the panel
+- **WHEN** the user drags the panel's header
+- **THEN** the panel follows the pointer, and keeps growing from where it was left
+
+#### Scenario: Reopen where it was left
+- **GIVEN** the user moved the panel and closed it, or quit the app
+- **WHEN** the panel is summoned on the same display
+- **THEN** it appears where it was left, moved inside the visible area if the display changed size
+
+#### Scenario: Typing is not dragging
+- **WHEN** the user presses in the composer and moves the pointer
+- **THEN** text is selected and the panel stays put
+
 ### Requirement: Compact conversation
 The panel SHALL show the picked session's conversation in a compact form of the main transcript: the same messages, tool calls, reasoning, compactions and run state, with tool calls and reasoning collapsed to one line each until expanded. Its composer SHALL be one line at rest, so that its placeholder and its buttons share a centre line, and SHALL grow with the text, and SHALL grow with the text up to a limit. The panel SHALL send a prompt, steer or queue a message while a run is active, and stop the run, under the same rules as the main window.
 
@@ -143,6 +191,11 @@ The panel SHALL open at a compact height and SHALL grow as its conversation grow
 - **GIVEN** the panel is at its compact height
 - **WHEN** the user opens the session picker or the model picker
 - **THEN** the whole picker is visible inside the panel
+
+#### Scenario: Every listed session is visible
+- **GIVEN** the session list holds as many sessions as it shows, at any text size the app offers
+- **WHEN** the list is open
+- **THEN** every row is fully inside the panel, or, once the list needs more room than the panel's limit, the rows scroll under the search row
 
 #### Scenario: Back to a new quick chat
 - **GIVEN** the panel has grown around a long conversation

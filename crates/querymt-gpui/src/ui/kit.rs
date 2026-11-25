@@ -1107,8 +1107,10 @@ pub fn identicon(seed: &str, size: f32) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            for (path, color) in paths.iter() {
-                window.paint_path(translated(path, bounds.origin), *color);
+            for (corners, color) in paths.iter() {
+                if let Some(path) = hexagon_at(corners, bounds.origin) {
+                    window.paint_path(path, *color);
+                }
             }
         },
     )
@@ -1116,15 +1118,20 @@ pub fn identicon(seed: &str, size: f32) -> impl IntoElement {
     .size(px(size))
 }
 
-/// Tessellated hexagons of one identicon at the origin, with their colors.
-type IdenticonPaths = std::rc::Rc<Vec<(Path<Pixels>, Hsla)>>;
+/// The six corners of one hexagon, relative to the identicon's origin.
+type Hexagon = [Point<Pixels>; 6];
+
+/// The hexagons of one identicon at the origin, with their colors.
+type IdenticonPaths = std::rc::Rc<Vec<(Hexagon, Hsla)>>;
 
 /// Identicons kept before the cache starts over (a few per session).
 const IDENTICON_CACHE_MAX: usize = 4096;
 
 thread_local! {
-    /// (seed, size in 1/100 px) → paths. Tessellating every hexagon on every
-    /// paint was a measurable part of a long session list's frame.
+    /// (seed, size in 1/100 px) → hexagons. Hashing the seed and placing the
+    /// cells on every paint was a measurable part of a long session list's
+    /// frame. A built `Path` can no longer be moved (gpui-pre 0.3.14), so
+    /// the corners are kept and the path is built where it is painted.
     static IDENTICONS: std::cell::RefCell<std::collections::HashMap<(String, u32), IdenticonPaths>> =
         std::cell::RefCell::default();
 }
@@ -1145,37 +1152,31 @@ fn identicon_paths(seed: &str, size: f32) -> IdenticonPaths {
     })
 }
 
-fn build_identicon(seed: &str, size: f32) -> Vec<(Path<Pixels>, Hsla)> {
+fn build_identicon(seed: &str, size: f32) -> Vec<(Hexagon, Hsla)> {
     let scale = size / IDENTICON_SIZE;
     let hex_r = IDENTICON_SIZE * 0.082 * scale;
     identicon_cells(seed)
         .into_iter()
-        .filter_map(|(x, y, color)| {
+        .map(|(x, y, color)| {
             let (cx, cy) = (x * scale, y * scale);
-            let mut path = PathBuilder::fill();
-            for i in 0..6 {
+            let corners = std::array::from_fn(|i| {
                 let ang = std::f32::consts::FRAC_PI_3 * i as f32 - std::f32::consts::FRAC_PI_6;
-                let pt = point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()));
-                if i == 0 {
-                    path.move_to(pt)
-                } else {
-                    path.line_to(pt)
-                }
-            }
-            path.close();
-            path.build().ok().map(|path| (path, color))
+                point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()))
+            });
+            (corners, color)
         })
         .collect()
 }
 
-/// `path` moved by `by`.
-fn translated(path: &Path<Pixels>, by: Point<Pixels>) -> Path<Pixels> {
-    let mut path = path.clone();
-    path.bounds.origin += by;
-    for vertex in &mut path.vertices {
-        vertex.xy_position += by;
+/// The hexagon with `corners`, moved by `by`, as a filled path.
+fn hexagon_at(corners: &Hexagon, by: Point<Pixels>) -> Option<Path> {
+    let mut path = PathBuilder::fill();
+    path.move_to(corners[0] + by);
+    for &corner in &corners[1..] {
+        path.line_to(corner + by);
     }
-    path
+    path.close();
+    path.build().ok()
 }
 
 /// Thin progress ring (context usage), like the desktop header dial.
@@ -1590,4 +1591,46 @@ mod tests {
         );
         assert_eq!(degrees.iter().sum::<usize>() / 2, 36);
     }
+}
+
+/// The colours a text field's editor paints with in `p`: typed text, the
+/// placeholder in `muted`, the selection and the caret in the accent. The
+/// kit's own come from the app theme, which is wrong on a palette of its own
+/// (the quick panel's is dark whatever the app theme).
+pub(crate) fn editor_style(p: &Palette, cx: &App) -> base::input::InputEditorStyle {
+    let theme = gpui_kit::component::ActiveTheme::theme(cx);
+    base::input::InputEditorStyle {
+        foreground: p.text,
+        muted_foreground: p.muted,
+        background: transparent_black(),
+        border: p.border,
+        selection: p.accent.opacity(0.32),
+        caret: p.accent,
+        highlight_styles: theme.highlight_theme.clone(),
+        ..Default::default()
+    }
+}
+
+/// Place before the input of `state`, in the same parent: paints that input
+/// with [`editor_style`] of `p`.
+///
+/// gpui-kit 0.11 has no setting for these colours: `Input::render` writes the
+/// app theme's into the state on every frame. Both renders run before any
+/// element is prepainted, and the input reads the style while prepainting and
+/// painting, so a canvas before it that writes ours while prepainting is the
+/// last word. Remove once the kit takes the colours (task 7.29).
+pub(crate) fn input_colours<M: base::input::InputModeKind>(
+    state: &Entity<base::input::InputBaseState<M>>,
+    p: &Palette,
+) -> impl IntoElement + use<M> {
+    let (state, p) = (state.clone(), *p);
+    canvas(
+        move |_, _, cx| {
+            let style = editor_style(&p, cx);
+            state.update(cx, |s, _| s.set_editor_style(style));
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_0()
 }
