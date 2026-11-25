@@ -23,10 +23,15 @@ use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
 use crate::worktree::identity::resolve_repository;
 use crate::worktree::lifecycle::WorkspaceManager;
-use crate::worktree::repo_ops::RepositoryOps;
+use crate::worktree::repo_ops::{BASELINE_COMMIT_MESSAGE, RepositoryOps};
 use crate::worktree::session_options::SessionCreationOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Commit message of a published result's private commit.
+fn result_commit_message(id: &impl std::fmt::Display) -> String {
+    format!("QueryMT result {id}")
+}
 
 /// A resolved, durable binding between a session and its workspace.
 #[derive(Debug, Clone)]
@@ -620,6 +625,7 @@ impl WorkspaceService {
             self.git.as_ref(),
             parent_cwd,
             CaptureRetryPolicy::default(),
+            BASELINE_COMMIT_MESSAGE,
         );
         let captured = match mutation_gate {
             Some(gate) => match gate.run(capture).await {
@@ -796,10 +802,12 @@ impl WorkspaceService {
     ) -> WorktreeResult<ResultProvenance> {
         crate::worktree::placement::ensure_local_filesystem_execution(checkout)?;
 
+        let message = result_commit_message(&record.id);
         let capture = capture_working_state_validated(
             self.git.as_ref(),
             checkout,
             CaptureRetryPolicy::default(),
+            &message,
         );
         let captured = match gate {
             Some(gate) => gate.run(capture).await??,
@@ -1214,12 +1222,14 @@ mod tests {
             )
             .await
             .unwrap();
+        // An edit after publishing is not preserved by the result.
+        fs::write(bound.effective_cwd.join("file.txt"), "unpublished edit").unwrap();
         assert!(svc.manager().remove(&bound.record).await.is_err());
         svc.registry().detach_owner(&bound.record.id).await.unwrap();
         assert!(svc.manager().remove(&bound.record).await.is_err());
         assert_eq!(
             fs::read_to_string(bound.effective_cwd.join("file.txt")).unwrap(),
-            "recoverable child"
+            "unpublished edit"
         );
         fs::write(bound.effective_cwd.join("file.txt"), "parent dirty").unwrap();
         let removed = svc.manager().remove(&bound.record).await.unwrap();
@@ -1452,8 +1462,10 @@ mod tests {
             crate::worktree::ChangeKind::Modified
         );
 
-        // Conservative removal: unpreserved edits are refused, then a clean
-        // checkout is removed with retained refs after archiving.
+        // Conservative removal: edits made after publishing are not
+        // preserved by the result and are refused, then a clean checkout is
+        // removed with retained refs after archiving.
+        fs::write(bound.effective_cwd.join("file.txt"), "unpublished edit").unwrap();
         svc.registry().detach_owner(&bound.record.id).await.unwrap();
         let current = svc
             .registry()
@@ -1464,7 +1476,7 @@ mod tests {
         assert!(svc.manager().remove(&current).await.is_err());
         assert_eq!(
             fs::read_to_string(bound.effective_cwd.join("file.txt")).unwrap(),
-            "child edit"
+            "unpublished edit"
         );
         fs::write(bound.effective_cwd.join("file.txt"), "parent dirty").unwrap();
         svc.manager().archive(&current).await.unwrap();
@@ -3061,6 +3073,29 @@ mod tests {
             1,
             "review never publishes live state"
         );
+    }
+
+    #[tokio::test]
+    async fn published_result_commit_has_its_own_message() {
+        let (repo, _storage, svc) = service().await;
+        let record = provision_owned(&svc, repo.path(), "sess-owner").await;
+        fs::write(record.checkout_path.join("out.txt"), "work").unwrap();
+
+        let provenance = svc
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+
+        let commit = provenance.result_commit.unwrap();
+        let git = gix::open(&record.repository.common_dir).unwrap();
+        let id = gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap();
+        let message = git
+            .find_commit(id)
+            .unwrap()
+            .message_raw_sloppy()
+            .to_string();
+        assert_eq!(message, format!("QueryMT result {}", record.id));
+        assert_ne!(message, crate::worktree::BASELINE_COMMIT_MESSAGE);
     }
 
     /// Section 17.1: a failed publication reports an explicit error, records

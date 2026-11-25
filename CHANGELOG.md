@@ -726,6 +726,40 @@
 
 ### Breaking
 
+- **Worktree removal accepts published work; native `/worktree` replies are
+  durable (BREAKING, ACP session updates).** `/worktree remove` now removes a
+  checkout with uncommitted or untracked files when its full working state is
+  exactly the tree of one of the workspace's retained published results
+  (`/worktree publish`); the response reports the preserving result ref as
+  `preserved_by`. Ignored files, working state that differs from every
+  published result, results whose ref no longer exists or points elsewhere, and
+  staged content that was changed or deleted on disk afterwards, still refuse
+  removal. An archived owner session may run `/worktree publish` so a refused
+  `remove --archive` can be recovered from the same conversation. The
+  `unpreserved_content` message now
+  names publishing as a way forward and, when a published result exists but the
+  files changed since, names it as stale. Published result commits carry the
+  message `QueryMT result <workspace-id>` instead of `QueryMT private
+  baseline`. The replies to the mutating native commands `publish`, `archive`,
+  `remove`, `recover` and `handoff` are recorded as a durable
+  `worktree_command_completed` event (new `AgentEventKind` variant) and
+  replayed on load with `messageId = worktree-cmd-<id>` and
+  `_meta.querymt.worktreeCommand = {command, code?, archived?}`; `list`,
+  `status`, `result`, `create` and usage errors stay transient. `remove
+  --archive` now records the owner's `worktree_archived` update after the
+  removal attempt, with a new optional `removal` field (`removed`, or
+  `refused` with `code` and `message`), and its text no longer asks the user to
+  run `/worktree remove` when removal was just attempted. `session/cancel` on an
+  archived owner or a previous owner succeeds without effect instead of
+  returning an internal error. Rust API: `RemovalReport` and
+  `WorktreeRemoveResponse` gain `preserved_by`;
+  `WorktreeError::UnpreservedContent` gains `stale_result`;
+  `OwnerHost::announce_archived` takes the removal outcome;
+  `WorktreeOps::remove_announced` returns a `RemoveOutcome`;
+  `worktree_archived_chunk` takes the removal outcome. Journals containing the
+  new event kind are not readable by older binaries. Clients (querymt-desktop)
+  should render `worktreeCommand` replies and switch to read-only live on
+  `worktreeArchived` / `worktreeHandoff` metadata.
 - **BREAKING (`querymt_agent::skills`): skill discovery returns a scan report.**
   `discover_all` and `discover_all_strict` are replaced by
   `discover(sources, &SkillScanOptions) -> SkillScanReport` (skills, problems,

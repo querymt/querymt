@@ -23,7 +23,7 @@
 //! baseline lives with the caller (section 3.3).
 
 use crate::worktree::error::{WorktreeError, WorktreeResult};
-use crate::worktree::repo_ops::{CapturedWorkingState, RepositoryOps};
+use crate::worktree::repo_ops::{BASELINE_COMMIT_MESSAGE, CapturedWorkingState, RepositoryOps};
 use std::path::Path;
 
 /// Result of capturing a checkout's working state.
@@ -66,12 +66,13 @@ pub async fn capture_working_state_validated(
     ops: &dyn RepositoryOps,
     checkout_root: &Path,
     policy: CaptureRetryPolicy,
+    commit_message: &str,
 ) -> WorktreeResult<CapturedWorkingState> {
     let attempts = policy.max_attempts.max(1);
     let mut last_diagnostic = String::new();
     for attempt in 0..attempts {
         let before = source_manifest(ops, checkout_root).await?;
-        let captured = capture_working_state(ops, checkout_root).await?;
+        let captured = capture_working_state(ops, checkout_root, commit_message).await?;
         let after = source_manifest(ops, checkout_root).await?;
         if before == after && captured.source_head == before.0 && captured.tree == before.1 {
             return Ok(captured);
@@ -92,7 +93,7 @@ async fn source_manifest(
 ) -> WorktreeResult<(String, String, Vec<u8>)> {
     // A private tree records contents, modes, symlink targets and untracked
     // files. Status labels cannot detect edits to an already-dirty path.
-    let state = capture_working_state(ops, checkout_root).await?;
+    let state = capture_working_state(ops, checkout_root, BASELINE_COMMIT_MESSAGE).await?;
     let index = ops.index_manifest(checkout_root).await?;
     Ok((state.source_head, state.tree, index))
 }
@@ -108,9 +109,11 @@ async fn source_manifest(
 pub async fn capture_working_state(
     ops: &dyn RepositoryOps,
     checkout_root: &Path,
+    commit_message: &str,
 ) -> WorktreeResult<CapturedWorkingState> {
     validate_supported_layout(ops, checkout_root).await?;
-    ops.capture_working_state(checkout_root).await
+    ops.capture_working_state(checkout_root, commit_message)
+        .await
 }
 
 /// Reject source layouts this first version cannot materialize faithfully.
@@ -254,7 +257,7 @@ mod tests {
     }
 
     async fn capture(root: &Path) -> WorktreeResult<CapturedState> {
-        capture_working_state(&GixRepoOps::new(), root).await
+        capture_working_state(&GixRepoOps::new(), root, BASELINE_COMMIT_MESSAGE).await
     }
 
     // -- Clean and dirty captures ---------------------------------------------
@@ -873,10 +876,14 @@ mod tests {
         commit_all(repo.path(), "init");
 
         let ops = FlakyWriterOps::stage_flaky_once();
-        let captured =
-            capture_working_state_validated(&ops, repo.path(), CaptureRetryPolicy::default())
-                .await
-                .unwrap();
+        let captured = capture_working_state_validated(
+            &ops,
+            repo.path(),
+            CaptureRetryPolicy::default(),
+            BASELINE_COMMIT_MESSAGE,
+        )
+        .await
+        .unwrap();
         assert!(captured.created_commit, "the staged file changed the tree");
         let late_paths = tree_paths(repo.path(), &captured.tree);
         let paths: Vec<&str> = late_paths.iter().map(|(p, _)| p.as_str()).collect();
@@ -997,8 +1004,12 @@ mod tests {
         async fn capture_working_state(
             &self,
             checkout: &Path,
+            commit_message: &str,
         ) -> WorktreeResult<CapturedWorkingState> {
-            let out = self.inner.capture_working_state(checkout).await?;
+            let out = self
+                .inner
+                .capture_working_state(checkout, commit_message)
+                .await?;
             if self
                 .remaining_mutations
                 .try_update(
@@ -1048,6 +1059,14 @@ mod tests {
 
         async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool> {
             self.inner.has_unmerged_entries(checkout).await
+        }
+
+        async fn unpreserved_staged_paths(
+            &self,
+            checkout: &Path,
+            tree: &str,
+        ) -> WorktreeResult<Vec<String>> {
+            self.inner.unpreserved_staged_paths(checkout, tree).await
         }
 
         async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {
@@ -1161,8 +1180,17 @@ mod tests {
             self.inner.add_worktree(common_dir, path, branch).await
         }
 
-        async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
-            self.inner.remove_worktree(common_dir, path).await
+        async fn remove_worktree(
+            &self,
+            common_dir: &Path,
+            path: &Path,
+            mode: crate::worktree::repo_ops::RemoveCheckout,
+        ) -> WorktreeResult<()> {
+            self.inner.remove_worktree(common_dir, path, mode).await
+        }
+
+        async fn commit_tree(&self, common_dir: &Path, commit: &str) -> Option<String> {
+            self.inner.commit_tree(common_dir, commit).await
         }
 
         async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
@@ -1230,10 +1258,14 @@ mod tests {
         commit_all(repo.path(), "init");
 
         let git = FlakyWriterOps::flaky_once();
-        let captured =
-            capture_working_state_validated(&git, repo.path(), CaptureRetryPolicy::default())
-                .await
-                .unwrap();
+        let captured = capture_working_state_validated(
+            &git,
+            repo.path(),
+            CaptureRetryPolicy::default(),
+            BASELINE_COMMIT_MESSAGE,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(git.mutation_count(), 1, "the injected race fired once");
         // The retry captured the post-race state: race.txt is included and
@@ -1254,9 +1286,10 @@ mod tests {
 
         let git = FlakyWriterOps::always_flaky();
         let policy = CaptureRetryPolicy { max_attempts: 2 };
-        let err = capture_working_state_validated(&git, repo.path(), policy)
-            .await
-            .unwrap_err();
+        let err =
+            capture_working_state_validated(&git, repo.path(), policy, BASELINE_COMMIT_MESSAGE)
+                .await
+                .unwrap_err();
 
         let message = err.to_string();
         assert!(
@@ -1277,10 +1310,14 @@ mod tests {
         fs::write(repo.path().join("file.txt"), "one").unwrap();
         commit_all(repo.path(), "init");
 
-        let captured =
-            capture_working_state_validated(&GixRepoOps::new(), repo.path(), Default::default())
-                .await
-                .unwrap();
+        let captured = capture_working_state_validated(
+            &GixRepoOps::new(),
+            repo.path(),
+            Default::default(),
+            BASELINE_COMMIT_MESSAGE,
+        )
+        .await
+        .unwrap();
         assert_eq!(captured.commit, captured.source_head);
     }
 

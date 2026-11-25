@@ -37,6 +37,16 @@ pub struct RegisteredWorktree {
     pub is_main: bool,
 }
 
+/// How `remove_worktree` treats uncommitted files in the checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveCheckout {
+    /// Refuse a dirty checkout.
+    RefuseDirty,
+    /// Delete uncommitted files too. Only valid after the caller proved a
+    /// retained ref preserves exactly the checkout's working state.
+    DiscardPreserved,
+}
+
 /// Live working-tree state of one checkout.
 ///
 /// Typed replacement for `status --porcelain` parsing: the lists hold
@@ -141,9 +151,21 @@ pub trait RepositoryOps: Send + Sync {
     ) -> WorktreeResult<()>;
 
     /// Remove a linked worktree (checkout directory plus registration
-    /// metadata). Refuses dirty checkouts; the lifecycle layer has already
-    /// verified content safety.
-    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()>;
+    /// metadata). `RemoveCheckout::RefuseDirty` refuses dirty checkouts;
+    /// `RemoveCheckout::DiscardPreserved` deletes uncommitted files too and
+    /// is only selected after the lifecycle layer proved a retained result
+    /// ref preserves exactly that working state. Locked worktrees are kept
+    /// in both modes.
+    async fn remove_worktree(
+        &self,
+        common_dir: &Path,
+        path: &Path,
+        mode: RemoveCheckout,
+    ) -> WorktreeResult<()>;
+
+    /// Tree id of a commit (peeled), or `None` when the commit is missing
+    /// or unreadable.
+    async fn commit_tree(&self, common_dir: &Path, commit: &str) -> Option<String>;
 
     /// Prune registration metadata of linked worktrees whose checkout
     /// directory no longer exists.
@@ -198,7 +220,11 @@ pub trait RepositoryOps: Send + Sync {
     /// Captured source HEAD and tree; reuses HEAD when the working state is
     /// identical to it. `ignored_files` lists ignored untracked paths for
     /// disclosure.
-    async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState>;
+    async fn capture_working_state(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<CapturedWorkingState>;
 
     /// Deterministic manifest of the real index entries (path, stage, mode,
     /// object id) for before/after equality checks.
@@ -206,6 +232,18 @@ pub trait RepositoryOps: Send + Sync {
 
     /// Whether the real index contains unmerged (stage > 0) entries.
     async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool>;
+
+    /// Paths whose staged (real index) content is retained by neither the
+    /// checkout's HEAD tree nor `tree`. Capture builds its tree from HEAD plus
+    /// the files on disk and ignores the index, so staged content that was
+    /// later changed or deleted on disk is absent from it; discarding the
+    /// checkout would lose that content. Empty means every index entry is
+    /// recoverable from HEAD or `tree`.
+    async fn unpreserved_staged_paths(
+        &self,
+        checkout: &Path,
+        tree: &str,
+    ) -> WorktreeResult<Vec<String>>;
 
     /// Whether `core.sparseCheckout` is enabled for the checkout.
     async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool>;
@@ -855,21 +893,38 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
+    async fn remove_worktree(
+        &self,
+        common_dir: &Path,
+        path: &Path,
+        mode: RemoveCheckout,
+    ) -> WorktreeResult<()> {
         let common_dir = common_dir.to_path_buf();
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let repo = open_repo(&common_dir)?;
-            repo.remove_worktree(
-                &path,
-                gix::worktree::remove::Force::Never,
-                gix::progress::Discard,
-            )
-            .map_err(native_err)?;
+            let force = match mode {
+                RemoveCheckout::RefuseDirty => gix::worktree::remove::Force::Never,
+                RemoveCheckout::DiscardPreserved => gix::worktree::remove::Force::DiscardChanges,
+            };
+            repo.remove_worktree(&path, force, gix::progress::Discard)
+                .map_err(native_err)?;
             Ok(())
         })
         .await
         .map_err(native_err)?
+    }
+
+    async fn commit_tree(&self, common_dir: &Path, commit: &str) -> Option<String> {
+        let common_dir = common_dir.to_path_buf();
+        let commit = commit.to_string();
+        tokio::task::spawn_blocking(move || {
+            let repo = open_repo(&common_dir).ok()?;
+            let id = parse_oid(&commit).ok()?;
+            peel_to_tree(&repo, id).ok().map(|tree| tree.to_string())
+        })
+        .await
+        .ok()?
     }
 
     async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
@@ -1061,8 +1116,13 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState> {
+    async fn capture_working_state(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<CapturedWorkingState> {
         let checkout = checkout.to_path_buf();
+        let commit_message = commit_message.to_string();
         tokio::task::spawn_blocking(move || {
             // The status pass below must see untracked files even when the
             // repository config disables them (`status.showUntrackedFiles`),
@@ -1114,7 +1174,7 @@ impl RepositoryOps for GixRepoOps {
                     author: signature.clone(),
                     committer: signature,
                     encoding: None,
-                    message: INTERNAL_COMMIT_MESSAGE.as_bytes().into(),
+                    message: commit_message.as_bytes().into(),
                     extra_headers: Default::default(),
                 };
                 let written = repo.write_object(&commit).map_err(native_err)?;
@@ -1153,6 +1213,45 @@ impl RepositoryOps for GixRepoOps {
                 manifest.push(b'\n');
             }
             Ok(manifest)
+        })
+        .await
+        .map_err(native_err)?
+    }
+
+    async fn unpreserved_staged_paths(
+        &self,
+        checkout: &Path,
+        tree: &str,
+    ) -> WorktreeResult<Vec<String>> {
+        let checkout = checkout.to_path_buf();
+        let tree = parse_oid(tree)?;
+        tokio::task::spawn_blocking(move || {
+            let repo = open_checkout(&checkout)?;
+            if !repo.index_path().exists() {
+                return Ok(Vec::new());
+            }
+            let mut head_entries = std::collections::HashMap::new();
+            if let Some(head_tree) = head_tree_id(&repo)? {
+                flatten_tree(&repo, head_tree, &mut head_entries, String::new())?;
+            }
+            let mut captured_entries = std::collections::HashMap::new();
+            flatten_tree(&repo, tree, &mut captured_entries, String::new())?;
+
+            let index = repo.open_index().map_err(native_err)?;
+            let mut unpreserved = Vec::new();
+            for entry in index.entries() {
+                let path: gix::bstr::BString = entry.path(&index).to_vec().into();
+                let retained = entry.stage() == gix::index::entry::Stage::Unconflicted
+                    && [&head_entries, &captured_entries].iter().any(|entries| {
+                        entries
+                            .get(&path)
+                            .is_some_and(|(mode, oid)| *mode == entry.mode && *oid == entry.id)
+                    });
+                if !retained {
+                    unpreserved.push(path.to_string());
+                }
+            }
+            Ok(unpreserved)
         })
         .await
         .map_err(native_err)?
@@ -1909,7 +2008,8 @@ pub(crate) fn write_tree_from_index(
     write_dir(repo, &root)
 }
 
-const INTERNAL_COMMIT_MESSAGE: &str = "QueryMT private baseline";
+/// Commit message of baseline captures.
+pub const BASELINE_COMMIT_MESSAGE: &str = "QueryMT private baseline";
 const INTERNAL_COMMIT_NAME: &str = "QueryMT";
 const INTERNAL_COMMIT_EMAIL: &str = "querymt@localhost";
 
@@ -1973,6 +2073,7 @@ pub fn validate_ref_name(name: &str) -> WorktreeResult<()> {
 pub struct FaultInjectingRepoOps {
     inner: Arc<dyn RepositoryOps>,
     failures: std::sync::Mutex<std::collections::HashMap<FailurePoint, (usize, String)>>,
+    removal_modes: std::sync::Mutex<Vec<RemoveCheckout>>,
 }
 
 /// Named operation boundaries at which failures can be injected.
@@ -2019,7 +2120,16 @@ impl FaultInjectingRepoOps {
         Self {
             inner,
             failures: std::sync::Mutex::new(Default::default()),
+            removal_modes: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Modes of every `remove_worktree` call seen so far, in call order.
+    pub fn removal_modes(&self) -> Vec<RemoveCheckout> {
+        self.removal_modes
+            .lock()
+            .expect("removal-mode mutex")
+            .clone()
     }
 
     /// Make the next `times` invocations of `point` fail with `message`.
@@ -2145,11 +2255,24 @@ impl RepositoryOps for FaultInjectingRepoOps {
         self.inner().add_worktree(common_dir, path, branch).await
     }
 
-    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
+    async fn remove_worktree(
+        &self,
+        common_dir: &Path,
+        path: &Path,
+        mode: RemoveCheckout,
+    ) -> WorktreeResult<()> {
+        self.removal_modes
+            .lock()
+            .expect("removal-mode mutex")
+            .push(mode);
         if let Some(err) = self.take_failure(FailurePoint::RemoveWorktree) {
             return Err(err);
         }
-        self.inner().remove_worktree(common_dir, path).await
+        self.inner().remove_worktree(common_dir, path, mode).await
+    }
+
+    async fn commit_tree(&self, common_dir: &Path, commit: &str) -> Option<String> {
+        self.inner().commit_tree(common_dir, commit).await
     }
 
     async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
@@ -2234,11 +2357,17 @@ impl RepositoryOps for FaultInjectingRepoOps {
             .await
     }
 
-    async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState> {
+    async fn capture_working_state(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<CapturedWorkingState> {
         if let Some(err) = self.take_failure(FailurePoint::CaptureWorkingState) {
             return Err(err);
         }
-        self.inner().capture_working_state(checkout).await
+        self.inner()
+            .capture_working_state(checkout, commit_message)
+            .await
     }
 
     async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
@@ -2253,6 +2382,14 @@ impl RepositoryOps for FaultInjectingRepoOps {
             return Err(err);
         }
         self.inner().has_unmerged_entries(checkout).await
+    }
+
+    async fn unpreserved_staged_paths(
+        &self,
+        checkout: &Path,
+        tree: &str,
+    ) -> WorktreeResult<Vec<String>> {
+        self.inner().unpreserved_staged_paths(checkout, tree).await
     }
 
     async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {
@@ -2773,6 +2910,84 @@ mod tests {
             .await
             .unwrap();
         (repo, common, branch)
+    }
+
+    #[tokio::test]
+    async fn commit_tree_resolves_the_commit_tree() {
+        let repo = init_repo();
+        let head = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let common = repo.path().join(".git");
+        let expected = open_repo(&common)
+            .unwrap()
+            .find_commit(head)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .to_string();
+        let ops = GixRepoOps::new();
+
+        assert_eq!(
+            ops.commit_tree(&common, &head.to_string()).await,
+            Some(expected)
+        );
+        assert_eq!(
+            ops.commit_tree(&common, &"0".repeat(40)).await,
+            None,
+            "a missing commit has no tree"
+        );
+        assert_eq!(ops.commit_tree(&common, "not-an-id").await, None);
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_refuses_dirty_unless_discarding() {
+        let ops = GixRepoOps::new();
+
+        // Dirty checkout: refused with `RefuseDirty`, removed with
+        // `DiscardPreserved`.
+        let (_repo, common, branch) = repo_with_branch("rm-dirty").await;
+        let parent = tempfile::TempDir::new().unwrap();
+        let checkout = parent.path().join("wt");
+        ops.add_worktree(&common, &checkout, &branch).await.unwrap();
+        std::fs::write(checkout.join("a.txt"), "edited").unwrap();
+        std::fs::write(checkout.join("new.txt"), "untracked").unwrap();
+
+        ops.remove_worktree(&common, &checkout, RemoveCheckout::RefuseDirty)
+            .await
+            .expect_err("a dirty checkout is refused");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "edited"
+        );
+        assert!(checkout.join("new.txt").exists());
+
+        ops.remove_worktree(&common, &checkout, RemoveCheckout::DiscardPreserved)
+            .await
+            .unwrap();
+        assert!(!checkout.exists());
+
+        // Locked worktrees are kept in both modes.
+        let (_repo2, common2, branch2) = repo_with_branch("rm-locked").await;
+        let parent2 = tempfile::TempDir::new().unwrap();
+        let locked = parent2.path().join("locked-wt");
+        ops.add_worktree(&common2, &locked, &branch2).await.unwrap();
+        std::fs::write(locked.join("a.txt"), "edited").unwrap();
+        let admin = std::fs::read_dir(common2.join("worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(admin.join("locked"), "test lock").unwrap();
+
+        for mode in [
+            RemoveCheckout::RefuseDirty,
+            RemoveCheckout::DiscardPreserved,
+        ] {
+            ops.remove_worktree(&common2, &locked, mode)
+                .await
+                .expect_err("a locked worktree is never removed");
+            assert!(locked.join("a.txt").exists(), "{mode:?} kept the checkout");
+        }
     }
 
     /// gix 0.90 copies sparse-checkout state into new worktrees; a sparse

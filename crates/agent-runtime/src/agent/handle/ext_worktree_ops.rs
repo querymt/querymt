@@ -20,7 +20,7 @@ use crate::worktree::{
     HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost, WorkspaceTarget,
     WorktreeCreateRequest, WorktreeError, WorktreeOpError, WorktreeOps, WorktreeRecoverResponse,
 };
-use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::events::{AgentEventKind, ArchiveRemoval};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -147,12 +147,28 @@ enum NativeCommand {
 impl NativeCommand {
     /// Whether the command changes the session's own workspace or starts new
     /// work, so an archived (read-only) session must refuse it. Inspection and
-    /// cleanup stay available.
+    /// cleanup stay available. `publish` is cleanup: it only pins the working
+    /// state under a retained result ref and never touches the checkout, and an
+    /// archived owner needs it to preserve work before `remove`.
     fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::Create { .. } | Self::Handoff(_) | Self::Publish(_) | Self::Archive(_)
+            Self::Create { .. } | Self::Handoff(_) | Self::Archive(_)
         )
+    }
+
+    /// Subcommand name when the command's reply is durable: the mutating
+    /// commands whose outcome (successful or refused) must survive a reload.
+    /// `create`, `list`, `status` and `result` replies stay transient.
+    fn durable_reply(&self) -> Option<&'static str> {
+        match self {
+            Self::Publish(_) => Some("publish"),
+            Self::Archive(_) => Some("archive"),
+            Self::Remove { .. } => Some("remove"),
+            Self::Recover(_) => Some("recover"),
+            Self::Handoff(_) => Some("handoff"),
+            Self::Create { .. } | Self::List | Self::Status(_) | Self::Result(_) => None,
+        }
     }
 
     fn parse(words: &[String]) -> Result<Self, WorktreeOpError> {
@@ -391,6 +407,7 @@ impl OwnerHost for LocalAgentHandle {
         owner: &str,
         workspace_id: &str,
         by_session_id: Option<&str>,
+        removal: Option<ArchiveRemoval>,
     ) -> Option<i64> {
         let config = self.hosting_config(owner).await?;
         let event = config
@@ -399,6 +416,7 @@ impl OwnerHost for LocalAgentHandle {
                 AgentEventKind::WorktreeArchived {
                     workspace_id: workspace_id.to_string(),
                     by_session_id: by_session_id.map(str::to_owned),
+                    removal,
                 },
             )
             .await;
@@ -979,45 +997,76 @@ impl LocalAgentHandle {
 
         // Every failure below, usage errors included, is a visible reply: a
         // successful turn carrying the error code, never a bare JSON-RPC error.
-        let outcome = async {
-            let command = NativeCommand::parse(&words)?;
-            if let Some(ReadOnlyReason::WorkspaceArchived { workspace_id }) = read_only
-                && command.is_mutating()
-            {
-                return Err(WorktreeOpError::Worktree(
-                    WorktreeError::WorkspaceArchived { workspace_id },
-                ));
-            }
-            self.run_native_command(&session_id, command).await
-        }
-        .await;
+        let parsed = NativeCommand::parse(&words);
+        let durable_command = parsed.as_ref().ok().and_then(NativeCommand::durable_reply);
+        let (result, announced_tip) = match parsed {
+            Err(err) => (Err(err), None),
+            Ok(command) => match read_only {
+                Some(ReadOnlyReason::WorkspaceArchived { workspace_id })
+                    if command.is_mutating() =>
+                {
+                    (
+                        Err(WorktreeOpError::Worktree(
+                            WorktreeError::WorkspaceArchived { workspace_id },
+                        )),
+                        None,
+                    )
+                }
+                _ => self.run_native_command(&session_id, command).await,
+            },
+        };
 
-        let (payload, text, announced_tip) = match outcome {
-            Ok((value, tip)) => {
-                let text = value.to_string();
-                (value, text, tip)
+        let (payload, text, code, archived) = match &result {
+            Ok(value) => (value.clone(), value.to_string(), None, None),
+            Err(err) => {
+                let data = err.error_data();
+                let archived = data.get("archived").and_then(serde_json::Value::as_bool);
+                (
+                    serde_json::json!({ "error": data }),
+                    err.to_string(),
+                    Some(err.code().to_owned()),
+                    archived,
+                )
             }
-            Err(err) => (
-                serde_json::json!({ "error": err.error_data() }),
-                err.to_string(),
-                None,
-            ),
         };
 
         // Output is a session update on the issuing session's ordered stream,
         // so the transport's event-tip hold delivers it before the response on
         // every connection attached to the session. An announcement already
-        // emitted on this stream (handoff, self-archive) is the output.
+        // recorded on this stream (handoff, self-archive, self `remove
+        // --archive`) is the output. Otherwise a mutating command records a
+        // durable reply that is replayed on load; everything else is a
+        // transient message.
         let tip = match announced_tip {
             Some(tip) => tip,
             None => match self.hosting_config(&session_id).await {
                 Some(config) => {
-                    let tip = config
-                        .emit_ephemeral_event(
-                            &session_id,
-                            AgentEventKind::WorktreeCommandOutput { text },
-                        )
-                        .await;
+                    let transient = AgentEventKind::WorktreeCommandOutput { text: text.clone() };
+                    let tip = match durable_command {
+                        Some(command) => {
+                            let reply = AgentEventKind::WorktreeCommandCompleted {
+                                id: uuid::Uuid::now_v7().to_string(),
+                                command: command.to_owned(),
+                                code,
+                                archived,
+                                text,
+                            };
+                            match config.emit_event_persisted(&session_id, reply).await {
+                                Ok(event) => event.session_seq,
+                                Err(err) => {
+                                    // Delivery never fails a completed operation.
+                                    tracing::warn!(
+                                        session_id,
+                                        command,
+                                        error = %err,
+                                        "failed to record the worktree command reply; sending it transiently"
+                                    );
+                                    config.emit_ephemeral_event(&session_id, transient).await
+                                }
+                            }
+                        }
+                        None => config.emit_ephemeral_event(&session_id, transient).await,
+                    };
                     // A session without an actor has nothing else to retire
                     // its stream.
                     if self
@@ -1039,11 +1088,28 @@ impl LocalAgentHandle {
     }
 
     /// Execute a parsed native command against the typed operations core.
+    ///
+    /// Returns the outcome plus the `session_seq` of a durable announcement
+    /// on the issuing session's own stream, which then is the reply (also on
+    /// a refusal that followed an archive).
     async fn run_native_command(
         &self,
         session_id: &str,
         command: NativeCommand,
-    ) -> Result<(serde_json::Value, Option<i64>), WorktreeOpError> {
+    ) -> (Result<serde_json::Value, WorktreeOpError>, Option<i64>) {
+        let mut tip = None;
+        let result = self
+            .run_native_command_inner(session_id, command, &mut tip)
+            .await;
+        (result, tip)
+    }
+
+    async fn run_native_command_inner(
+        &self,
+        session_id: &str,
+        command: NativeCommand,
+        tip: &mut Option<i64>,
+    ) -> Result<serde_json::Value, WorktreeOpError> {
         fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, WorktreeOpError> {
             serde_json::to_value(value).map_err(|e| WorktreeOpError::Internal(e.to_string()))
         }
@@ -1064,7 +1130,7 @@ impl LocalAgentHandle {
                         source_session_id: Some(session_id.to_string()),
                     })
                     .await?;
-                return Ok((to_value(&response)?, None));
+                return to_value(&response);
             }
             other => other,
         };
@@ -1088,8 +1154,9 @@ impl LocalAgentHandle {
             // The owner actor is unloaded by the handoff, so the reply is the
             // durable announcement on the previous owner's stream.
             NativeCommand::Handoff(options) => {
-                let (response, tip) = ops.handoff_announced(self, &own, options).await?;
-                return Ok((to_value(&response)?, tip));
+                let (response, announced) = ops.handoff_announced(self, &own, options).await?;
+                *tip = announced;
+                return to_value(&response);
             }
             NativeCommand::List => to_value(&ops.list().await?),
             NativeCommand::Status(id) => to_value(&ops.status(&own_or(id).await?).await?),
@@ -1100,11 +1167,17 @@ impl LocalAgentHandle {
             }
             NativeCommand::Remove { id, archive } => {
                 let target = native_target(id, session_id);
-                let (response, _) = ops_for(&target)
+                let outcome = ops_for(&target)
                     .await?
                     .remove_announced(self, &target, archive, Some(session_id))
-                    .await?;
-                to_value(&response)
+                    .await;
+                // The archived update states the removal outcome, refused or
+                // not, so on the issuer's own stream it is the reply.
+                *tip = outcome
+                    .announcement
+                    .filter(|announcement| announcement.session_id == session_id)
+                    .map(|announcement| announcement.seq);
+                to_value(&outcome.result?)
             }
             NativeCommand::Recover(id) => {
                 let target = WorkspaceTarget::Workspace(id);
@@ -1118,14 +1191,14 @@ impl LocalAgentHandle {
                     .await?
                     .archive_announced(self, &target, Some(session_id))
                     .await?;
-                let tip = outcome
+                *tip = outcome
                     .announcement
                     .filter(|announcement| announcement.session_id == session_id)
                     .map(|announcement| announcement.seq);
-                return Ok((to_value(&outcome.summary)?, tip));
+                return to_value(&outcome.summary);
             }
         }?;
-        Ok((value, None))
+        Ok(value)
     }
 
     /// `querymt/worktree/create`: create a new isolated session with its own
@@ -1400,10 +1473,19 @@ mod native_command_tests {
             parse("archive ws-1").unwrap(),
             NativeCommand::Archive(Some("ws-1".into()))
         );
-        for mutating in ["create", "handoff", "publish", "archive"] {
+        for mutating in ["create", "handoff", "archive"] {
             assert!(parse(mutating).unwrap().is_mutating(), "{mutating}");
         }
-        for allowed in ["list", "status", "result", "remove", "recover ws-1"] {
+        // `publish` stays available to an archived owner: it only pins a
+        // result ref, which a refused `remove --archive` needs.
+        for allowed in [
+            "list",
+            "status",
+            "result",
+            "publish",
+            "remove",
+            "recover ws-1",
+        ] {
             assert!(!parse(allowed).unwrap().is_mutating(), "{allowed}");
         }
     }

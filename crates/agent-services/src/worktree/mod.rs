@@ -79,16 +79,17 @@ pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
     Announcement, ArchiveOutcome, HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost,
-    WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeHandoffResponse,
-    WorktreeListResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
-    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry, WorktreeResultResponse,
-    WorktreeStatusResponse, WorktreeSummary,
+    RemoveOutcome, WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse,
+    WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError, WorktreeOps,
+    WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry,
+    WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
 pub use querymt_agent_core::worktree::repository::WorkspaceRepository;
 pub use repo_ops::{
-    CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
-    RegisteredWorktree, RepositoryOps, validate_ref_name,
+    BASELINE_COMMIT_MESSAGE, CapturedWorkingState, CheckoutStatus, FailurePoint,
+    FaultInjectingRepoOps, GixRepoOps, RegisteredWorktree, RemoveCheckout, RepositoryOps,
+    validate_ref_name,
 };
 pub use service::{WorkspaceBinding, WorkspaceService};
 pub use session_options::{

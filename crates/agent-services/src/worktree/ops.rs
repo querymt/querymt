@@ -12,6 +12,7 @@ use crate::worktree::{
     BaselineMode, BaselineSource, ResultProvenance, ResultVerificationStatus, WorkspaceId,
     WorkspaceLifecycle, WorkspaceRecord, WorkspaceService, WorktreeError,
 };
+use querymt_agent_core::events::ArchiveRemoval;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -325,6 +326,10 @@ pub struct WorktreeRemoveResponse {
     /// and deletion: the branch was retained, never deleted unconditionally.
     pub branch_moved_during_removal: Option<String>,
     pub retained_refs: Vec<String>,
+    /// The published result ref that preserves the discarded uncommitted
+    /// working state; absent when the checkout was clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preserved_by: Option<String>,
 }
 
 /// Outcome of recovering an interrupted workspace.
@@ -364,6 +369,15 @@ pub struct Announcement {
     pub seq: i64,
 }
 
+/// Result of [`WorktreeOps::remove_announced`].
+#[derive(Debug)]
+pub struct RemoveOutcome {
+    pub result: Result<WorktreeRemoveResponse, WorktreeOpError>,
+    /// The owner-stream archived update recorded by `remove --archive`, on
+    /// success and on a refusal after the archive alike.
+    pub announcement: Option<Announcement>,
+}
+
 /// Result of [`WorktreeOps::archive_announced`].
 #[derive(Debug, Clone)]
 pub struct ArchiveOutcome {
@@ -382,6 +396,7 @@ fn removal_response(report: crate::worktree::RemovalReport) -> WorktreeRemoveRes
             .branch_moved_during_removal
             .map(|b| b.as_str().to_string()),
         retained_refs: report.retained_refs,
+        preserved_by: report.preserved_by,
     }
 }
 
@@ -413,11 +428,15 @@ pub trait OwnerHost: Send + Sync {
     ///
     /// Best effort: a failure is logged by the host and never fails the
     /// archive, which is already committed. Returns the event's `session_seq`.
+    ///
+    /// `removal` is the outcome of the removal attempted with the archive
+    /// (`remove --archive`); `None` for a plain archive.
     async fn announce_archived(
         &self,
         owner: &str,
         workspace_id: &str,
         by_session_id: Option<&str>,
+        removal: Option<ArchiveRemoval>,
     ) -> Option<i64>;
 }
 
@@ -1070,7 +1089,9 @@ impl WorktreeOps {
         }
         let archived = self.service.manager().archive_held(&record, &lease).await?;
         drop(lease);
-        let announcement = self.announce_archive(host, &archived, by_session).await;
+        let announcement = self
+            .announce_archive(host, &archived, by_session, None)
+            .await;
         Ok(ArchiveOutcome {
             summary: WorktreeSummary::from(&archived),
             announcement,
@@ -1082,10 +1103,11 @@ impl WorktreeOps {
         host: &dyn OwnerHost,
         archived: &WorkspaceRecord,
         by_session: Option<&str>,
+        removal: Option<ArchiveRemoval>,
     ) -> Option<Announcement> {
         let owner = archived.ownership.owner_session_id.as_deref()?;
         let seq = host
-            .announce_archived(owner, archived.id.as_str(), by_session)
+            .announce_archived(owner, archived.id.as_str(), by_session, removal)
             .await?;
         Some(Announcement {
             session_id: owner.to_owned(),
@@ -1111,21 +1133,38 @@ impl WorktreeOps {
     ) -> Result<WorktreeRemoveResponse, WorktreeOpError> {
         self.remove_announced(host, target, archive, None)
             .await
-            .map(|(response, _)| response)
+            .result
     }
 
     /// [`Self::remove`], additionally returning the archive announcement made
-    /// by `archive`, if any.
-    ///
-    /// # Errors
-    /// Same as [`Self::remove`].
+    /// by `archive`, if any. The announcement is recorded after the removal
+    /// attempt and states its outcome, so it is returned on success and on a
+    /// refusal that followed the archive alike.
     pub async fn remove_announced(
         &self,
         host: &dyn OwnerHost,
         target: &WorkspaceTarget,
         archive: bool,
         by_session: Option<&str>,
-    ) -> Result<(WorktreeRemoveResponse, Option<Announcement>), WorktreeOpError> {
+    ) -> RemoveOutcome {
+        let mut announcement = None;
+        let result = self
+            .remove_inner(host, target, archive, by_session, &mut announcement)
+            .await;
+        RemoveOutcome {
+            result,
+            announcement,
+        }
+    }
+
+    async fn remove_inner(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        archive: bool,
+        by_session: Option<&str>,
+        announcement_out: &mut Option<Announcement>,
+    ) -> Result<WorktreeRemoveResponse, WorktreeOpError> {
         let record = self.resolve(target).await?;
         let refused = |archived: bool, source: WorktreeError| WorktreeOpError::RemovalRefused {
             workspace_id: record.id.to_string(),
@@ -1157,7 +1196,6 @@ impl WorktreeOps {
             let lease = self.acquire_exclusive_activity(&record).await?;
             (self.lookup(record.id.as_str()).await?, lease)
         };
-        let mut announcement = None;
         let mut archived = false;
         if needs_archive && current.lifecycle != WorkspaceLifecycle::Archived {
             current = self
@@ -1166,15 +1204,30 @@ impl WorktreeOps {
                 .archive_held(&current, &lease)
                 .await?;
             archived = true;
-            announcement = self.announce_archive(host, &current, by_session).await;
         }
-        let report = self
-            .service
-            .manager()
-            .remove_held(&current, &lease)
-            .await
-            .map_err(|source| refused(archived, source))?;
-        Ok((removal_response(report), announcement))
+        let removed = self.service.manager().remove_held(&current, &lease).await;
+        drop(lease);
+        let result = removed
+            .map(removal_response)
+            .map_err(|source| refused(archived, source));
+        // The owner's archived update is recorded after the removal attempt
+        // and states its outcome.
+        if archived {
+            let removal = match &result {
+                Ok(_) => ArchiveRemoval::Removed,
+                Err(err) => ArchiveRemoval::Refused {
+                    code: err.code().to_owned(),
+                    message: match err {
+                        WorktreeOpError::RemovalRefused { source, .. } => source.to_string(),
+                        other => other.to_string(),
+                    },
+                },
+            };
+            *announcement_out = self
+                .announce_archive(host, &current, by_session, Some(removal))
+                .await;
+        }
+        result
     }
 
     async fn remove_record(

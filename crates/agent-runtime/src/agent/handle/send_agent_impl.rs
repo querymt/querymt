@@ -68,6 +68,17 @@ impl SendAgent for LocalAgentHandle {
             );
             return Ok(());
         }
+        // An archived workspace's owner or a previous owner is read-only and
+        // never has an actor, so there is nothing to cancel. Cancel is a
+        // notification: answer it without effect rather than an internal error.
+        if matches!(
+            self.session_materializer
+                .read_only_reason(&session_id)
+                .await,
+            Ok(Some(_))
+        ) {
+            return Ok(());
+        }
         #[cfg(feature = "remote")]
         {
             match self

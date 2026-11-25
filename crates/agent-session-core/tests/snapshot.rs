@@ -503,6 +503,17 @@ fn workspace_announcements_are_conversation_entries() {
             "worktree_archived",
             serde_json::json!({ "workspace_id": "w1" }),
         ),
+        event(
+            3,
+            "worktree_command_completed",
+            serde_json::json!({
+                "id": "c1",
+                "command": "remove",
+                "code": "unpreserved_content",
+                "archived": true,
+                "text": "removal refused"
+            }),
+        ),
     ]);
     let messages = core
         .turn_ids()
@@ -510,7 +521,7 @@ fn workspace_announcements_are_conversation_entries() {
         .flat_map(|id| core.turn(id).expect("turn").entries)
         .filter(|e| matches!(e.kind, EntryKind::AssistantMessage(_)))
         .count();
-    assert_eq!(messages, 1);
+    assert_eq!(messages, 2);
 }
 
 #[test]
