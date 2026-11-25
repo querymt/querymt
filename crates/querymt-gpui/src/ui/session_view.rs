@@ -24,16 +24,20 @@ use gpui_kit::component::{Selectable as _, Sizable as _, StyledExt as _, h_flex,
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::connectors::oauth_flow_box;
+use super::kit;
 use super::kit::ButtonExt as _;
+use super::kit::{accent_btn, flat_btn};
+use super::session_pane::{SessionPane, SessionPaneEvent};
 use super::start::{badged_tone, mode_tone, toolbar_button};
-use super::{Page, QmtApp, kit};
+use crate::session::open::{Delivery, SessionKey};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
     SessionView, Thought, ToolCall, UserAttachment, WorkEntry, is_compact_command,
 };
-use crate::store::SessionSummary;
+use crate::store::Model;
 use crate::store::worktree::WorktreeAction;
-use crate::theme::{Palette, palette};
+use crate::theme::Palette;
 use crate::usage::{self, TokenKey};
 use crate::util::{human_size, workspace_name};
 
@@ -115,6 +119,123 @@ fn copy_tooltip(value: Option<String>, hint: &'static str, dim: Hsla, mono: bool
 
 /// Desktop `--session-chat-max` (52rem).
 pub(super) const CHAT_MAX: f32 = 832.;
+/// Transcript column of a compact pane (the quick panel is 680 px wide).
+const COMPACT_CHAT_MAX: f32 = 640.;
+/// Size of the conversation's text in the HUD.
+const COMPACT_PROSE_PX: f32 = 14.5;
+
+/// How much a session pane shows. The row renderers are the same in both;
+/// compact changes defaults and limits only (design D6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Density {
+    /// The main window.
+    #[default]
+    Comfortable,
+    /// The quick panel: collapsed rows, small caps, hover actions, a one-line
+    /// composer, no usage ring, details or options panel.
+    // Built by the quick panel (tasks 6.x) and by tests until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Compact,
+}
+
+impl Density {
+    pub(crate) fn is_compact(self) -> bool {
+        self == Self::Compact
+    }
+
+    /// Lines of tool output and parameters shown before "N more lines".
+    fn output_lines(self) -> usize {
+        match self {
+            Self::Comfortable => OUTPUT_LINES,
+            Self::Compact => 20,
+        }
+    }
+
+    /// Code lines of a read result shown before "N more lines".
+    fn read_lines(self) -> usize {
+        match self {
+            Self::Comfortable => READ_LINES,
+            Self::Compact => 40,
+        }
+    }
+
+    /// Lines of each diff hunk shown before "N more lines".
+    fn diff_lines(self) -> usize {
+        match self {
+            Self::Comfortable => DIFF_LINES,
+            Self::Compact => 40,
+        }
+    }
+
+    /// Height of the scrolling block of read results.
+    fn read_block_h(self) -> f32 {
+        match self {
+            Self::Comfortable => READ_BLOCK_MAX_H,
+            Self::Compact => TOOL_LINE_H * 10.,
+        }
+    }
+
+    /// Height of the scrolling block of terminal output.
+    fn terminal_block_h(self) -> f32 {
+        match self {
+            Self::Comfortable => TERMINAL_BLOCK_MAX_H,
+            Self::Compact => TOOL_LINE_H * 10.,
+        }
+    }
+
+    /// Height of the scrolling block of a diff.
+    fn diff_block_h(self) -> f32 {
+        match self {
+            Self::Comfortable => DIFF_BLOCK_MAX_H,
+            Self::Compact => TOOL_LINE_H * 16.,
+        }
+    }
+
+    /// Widest the transcript column and the composer grow.
+    pub(super) fn column_max(self) -> f32 {
+        match self {
+            Self::Comfortable => CHAT_MAX,
+            Self::Compact => COMPACT_CHAT_MAX,
+        }
+    }
+
+    /// Horizontal padding of a transcript row, in px.
+    fn row_pad(self) -> f32 {
+        match self {
+            Self::Comfortable => 24.,
+            Self::Compact => 12.,
+        }
+    }
+
+    /// A running work group with more than `.0` blocks shows only its last
+    /// `.1` blocks behind a "+N previous" toggle.
+    fn live_tail(self) -> (usize, usize) {
+        match self {
+            Self::Comfortable => (3, 2),
+            Self::Compact => (2, 1),
+        }
+    }
+
+    /// Copy, undo, redo and fork show while the pointer is over the turn.
+    fn hover_actions(self) -> bool {
+        self.is_compact()
+    }
+
+    /// The context ring, the details panel and the options panel exist.
+    pub(super) fn has_panels(self) -> bool {
+        !self.is_compact()
+    }
+
+    /// Lines the composer grows between.
+    pub(super) fn composer_lines(self) -> (usize, usize) {
+        match self {
+            Self::Comfortable => (2, 12),
+            // One line at rest: the placeholder, the attach button, the model
+            // chip and the send button then share one centre line.
+            Self::Compact => (1, 6),
+        }
+    }
+}
 /// Hover group of a tool row (status ↔ chevron swap).
 const TOOL_ROW_GROUP: &str = "tool-row";
 
@@ -304,7 +425,8 @@ struct RenderCtx {
     p: Palette,
     /// Syntax colors of the active component theme (dark/light).
     syntax: std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme>,
-    weak: WeakEntity<QmtApp>,
+    weak: WeakEntity<SessionPane>,
+    density: Density,
     smooth_scroll: super::smooth_scroll::SmoothScroll,
     expanded: HashSet<String>,
     running: bool,
@@ -422,6 +544,12 @@ impl RenderCtx {
 
     /// What every row depends on: theme and agent abilities.
     fn hash_globals(&self, h: &mut DefaultHasher) {
+        self.density.hash(h);
+        // A pane with a palette of its own (the quick panel) can change it
+        // while the rows stay: the accent follows the user's setting.
+        for c in [self.p.text, self.p.accent, self.p.bg, self.p.card] {
+            [c.h, c.s, c.l, c.a].map(f32::to_bits).hash(h);
+        }
         (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(h);
         self.tool_content.hash(h);
         self.developer.hash(h);
@@ -1300,8 +1428,9 @@ fn detail_section(
     title: &'static str,
     text: String,
     danger: bool,
-    p: &Palette,
+    rc: &RenderCtx,
 ) -> Div {
+    let p = &rc.p;
     let copy = text.clone();
     v_flex()
         .gap_1()
@@ -1321,7 +1450,8 @@ fn detail_section(
                 ),
         )
         .child(
-            code_block(clipped(&text, OUTPUT_LINES), p).when(danger, |el| el.text_color(p.danger)),
+            code_block(clipped(&text, rc.density.output_lines()), p)
+                .when(danger, |el| el.text_color(p.danger)),
         )
 }
 
@@ -1488,12 +1618,12 @@ fn render_diff_file(
     let (mut adds, mut dels) = (0usize, 0usize);
     let mut body: Vec<AnyElement> = Vec::new();
     let multi = hunks.len() > 1;
-    // Each hunk is cut at `DIFF_LINES`; one toggle shows the rest of all.
-    let cap = line_cap(&key, DIFF_LINES, rc);
+    // Each hunk is cut at the density's diff line cap; one toggle shows the rest of all.
+    let cap = line_cap(&key, rc.density.diff_lines(), rc);
     let mut hidden = 0;
     for (ix, d) in hunks.iter().enumerate() {
         let (rows, a, r, lines) = diff_rows(d, cap, p);
-        hidden += lines.saturating_sub(DIFF_LINES);
+        hidden += lines.saturating_sub(rc.density.diff_lines());
         adds += a;
         dels += r;
         if multi || d.old_start.is_some() {
@@ -1501,7 +1631,12 @@ fn render_diff_file(
         }
         body.extend(rows);
     }
-    let more = more_lines(&key, DIFF_LINES + hidden, DIFF_LINES, rc);
+    let more = more_lines(
+        &key,
+        rc.density.diff_lines() + hidden,
+        rc.density.diff_lines(),
+        rc,
+    );
     // The tool card attached to the header draws the frame.
     v_flex()
         .w_full()
@@ -1545,7 +1680,7 @@ fn render_diff_file(
         // A fixed-height block that scrolls vertically only, flush to the card's bottom edge.
         .child(scroll_area(
             key,
-            DIFF_BLOCK_MAX_H,
+            rc.density.diff_block_h(),
             ScrollbarAxis::Vertical,
             v_flex()
                 .w_full()
@@ -1921,7 +2056,7 @@ fn delegate_pill(call: &ToolCall, target: String, rc: &RenderCtx) -> AnyElement 
         // The rest of the row toggles the card; the pill only navigates.
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
-            let _ = weak.update(cx, |this, cx| this.open_child_session(&agent, &child, cx));
+            let _ = weak.update(cx, |this, cx| this.open_child(&agent, &child, cx));
         })
         .into_any_element()
 }
@@ -1965,7 +2100,8 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 .when(ix > 0, |el| el.border_t_1().border_color(p.border))
             }))
             .when(call.failed() && !output.trim().is_empty(), |el| {
-                let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
+                let (text, more) =
+                    clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
                 el.child(
                     flat_block(text, p)
                         .border_t_1()
@@ -1991,13 +2127,14 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 )
                 .into_any_element()
             } else {
-                let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
+                let (text, more) =
+                    clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
                 let block = flat_block(text, p).when(call.failed(), |el| el.text_color(p.danger));
                 v_flex()
                     .w_full()
                     .child(scroll_area(
                         format!("term-{}", call.id),
-                        TERMINAL_BLOCK_MAX_H,
+                        rc.density.terminal_block_h(),
                         ScrollbarAxis::Vertical,
                         block,
                         rc,
@@ -2021,7 +2158,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             )
             .into_any_element()
         } else {
-            let (text, more) = clipped_with_more(id, output, READ_LINES, rc);
+            let (text, more) = clipped_with_more(id, output, rc.density.read_lines(), rc);
             let block = flat_frame(p)
                 .when(call.failed(), |el| el.text_color(p.danger))
                 .child(linked_text(
@@ -2033,7 +2170,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 .w_full()
                 .child(scroll_area(
                     format!("fetch-scroll-{id}"),
-                    READ_BLOCK_MAX_H,
+                    rc.density.read_block_h(),
                     ScrollbarAxis::Vertical,
                     block,
                     rc,
@@ -2053,7 +2190,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         ));
     }
     if call.failed() {
-        let (text, more) = clipped_with_more(&call.id, output, OUTPUT_LINES, rc);
+        let (text, more) = clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
         return body
             .child(flat_block(text, p).text_color(p.danger))
             .children(more);
@@ -2063,14 +2200,14 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         &format!("read-{}", call.id),
         output,
         Some(path.as_str()).filter(|s| !s.is_empty()),
-        line_cap(&call.id, READ_LINES, rc),
+        line_cap(&call.id, rc.density.read_lines(), rc),
         true,
         &rc.syntax,
         p,
     );
     body.child(scroll_area(
         format!("read-scroll-{}", call.id),
-        READ_BLOCK_MAX_H,
+        rc.density.read_block_h(),
         ScrollbarAxis::Vertical,
         code,
         rc,
@@ -2078,7 +2215,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     .children(more_lines(
         &call.id,
         super::code::read_line_count(output),
-        READ_LINES,
+        rc.density.read_lines(),
         rc,
     ))
 }
@@ -2101,7 +2238,7 @@ fn tool_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             "Parameters",
             input,
             false,
-            p,
+            rc,
         ))
     })
     .when(!output_empty, |el| {
@@ -2110,7 +2247,7 @@ fn tool_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             if call.failed() { "Error" } else { "Result" },
             output.to_string(),
             call.failed(),
-            p,
+            rc,
         ))
     })
     .when(!has_input && output_empty, |el| {
@@ -2161,12 +2298,12 @@ fn fenced(lang: &str, code: &str) -> String {
     format!("{fence}{lang}\n{code}\n{fence}")
 }
 
-fn toggle_expanded(weak: &WeakEntity<QmtApp>, key: String, cx: &mut App) {
+fn toggle_expanded(weak: &WeakEntity<SessionPane>, key: String, cx: &mut App) {
     let _ = weak.update(cx, |this, cx| {
         // Inspecting a block is a reading action, not new content to follow.
         this.transcript.list.pause_following_tail();
-        if !this.expanded_items.remove(&key) {
-            this.expanded_items.insert(key);
+        if !this.expanded.remove(&key) {
+            this.expanded.insert(key);
         }
         cx.notify();
     });
@@ -2223,12 +2360,20 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
     let strip = (open && expandable)
         .then(|| truncation_strip(call, rc))
         .flatten();
+    let row_selector = format!("tool-row-{}", call.id);
+    // The HUD shows a tool call as a one-line chip: a faint white fill that
+    // is as wide as its text, with no border (design D15).
+    let chip = rc.density.is_compact() && !attached;
     let row = h_flex()
         .id(SharedString::from(format!("tool-{}", call.id)))
+        .debug_selector(move || row_selector)
         .gap_2()
         .px_1p5()
-        .min_h(px(29.))
-        .when(!attached, |el| el.rounded(px(8.)))
+        .min_h(px(if rc.density.is_compact() { 26. } else { 29. }))
+        .when(!attached, |el| {
+            el.rounded(px(if rc.density.is_compact() { 10. } else { 8. }))
+        })
+        .when(chip, |el| el.bg(p.chip).max_w_full())
         // Open + attached: the row becomes the card's header strip.
         .when(attached, |el| {
             el.bg(p.card.opacity(0.88))
@@ -2358,15 +2503,19 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
                         if fetch_args {
                             let id = id.clone();
                             let _ = weak.update(cx, |this, cx| {
-                                this.store
-                                    .update(cx, |s, cx| s.load_tool_content(&id, "arguments", cx))
+                                this.load_tool_content(&id, "arguments", cx)
                             });
                         }
                     })
             }
         });
+    let (card_selector, detail_selector) = (
+        format!("tool-card-{}", call.id),
+        format!("tool-detail-{}", call.id),
+    );
     if attached {
         return v_flex()
+            .debug_selector(move || card_selector)
             .mt_1()
             .mb_2()
             .rounded(px(8.))
@@ -2385,9 +2534,16 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
             .into_any_element();
     }
     v_flex()
+        .when(rc.density.is_compact(), |el| el.items_start())
         .child(row)
         .when(open && expandable, |el| {
-            el.child(detail_well(p).children(strip).child(tool_content(call, rc)))
+            el.child(
+                detail_well(p)
+                    .w_full()
+                    .debug_selector(move || detail_selector)
+                    .children(strip)
+                    .child(tool_content(call, rc)),
+            )
         })
         .into_any_element()
 }
@@ -2409,10 +2565,7 @@ fn truncation_strip(call: &ToolCall, rc: &RenderCtx) -> Option<AnyElement> {
     let load = move |id: String| {
         move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             let id = id.clone();
-            let _ = weak.update(cx, |this, cx| {
-                this.store
-                    .update(cx, |s, cx| s.load_tool_content(&id, part, cx))
-            });
+            let _ = weak.update(cx, |this, cx| this.load_tool_content(&id, part, cx));
         }
     };
     let action: AnyElement = match &call.fetch {
@@ -2531,6 +2684,8 @@ struct WorkPlan {
     /// A settled turn's group: a summary row, open or closed.
     settled: bool,
     open: bool,
+    /// Blocks a running group shows whole; more are folded to its tail.
+    collapse_above: usize,
     blocks: Vec<Range<usize>>,
     /// Blocks shown: `blocks[visible_from..]` (none for a closed summary).
     visible_from: usize,
@@ -2543,17 +2698,19 @@ impl WorkPlan {
         let settled = !(rc.running && ix >= rc.last_turn_start);
         let open = rc.expanded.contains(&item.key);
         let blocks = work_blocks(entries);
+        let (collapse_above, tail) = rc.density.live_tail();
         // Summary runs show as one block, so collapsing counts blocks, not entries.
         let visible_from = if settled && !open {
             blocks.len()
-        } else if settled || open || blocks.len() <= 3 {
+        } else if settled || open || blocks.len() <= collapse_above {
             0
         } else {
-            blocks.len() - 2
+            blocks.len() - tail
         };
         Self {
             settled,
             open,
+            collapse_above,
             visible_from,
             live_tail: rc.running && ix == rc.last_ix,
             blocks,
@@ -2570,7 +2727,7 @@ impl WorkPlan {
 
     /// A header row: the settled summary, or the running group's toggle.
     fn has_header(&self) -> bool {
-        self.settled || self.hidden() > 0 || self.open && self.blocks.len() > 3
+        self.settled || self.hidden() > 0 || self.open && self.blocks.len() > self.collapse_above
     }
 
     fn split(&self) -> bool {
@@ -2837,6 +2994,11 @@ fn work_header(
     )
 }
 
+/// Hover group of the turn a compact pane shows its response actions for.
+fn turn_group(ix: usize) -> SharedString {
+    SharedString::from(format!("turn-{ix}"))
+}
+
 /// Copy / change-stats row under the last block of a turn (desktop "response actions").
 fn turn_actions(
     ix: usize,
@@ -2855,11 +3017,11 @@ fn turn_actions(
     let fork = rc.fork_points.contains(&ix);
     let diff_open = rc.diff_open == Some(ix);
     let live = rc.live_turn(ix);
-    h_flex()
+    // Compact: the buttons wait for the pointer over the turn (the change
+    // pill stays, it is information).
+    let hover_only = rc.density.hover_actions() && !copied;
+    let buttons = h_flex()
         .gap_1()
-        .pl_1()
-        .pt_0p5()
-        .text_color(p.muted)
         .when(!live, |el| {
             el.child(
                 kit::icon_button(
@@ -2903,9 +3065,7 @@ fn turn_actions(
                 )
                 .xsmall()
                 .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.store.update(cx, |s, cx| s.redo_workspace(cx))
-                    });
+                    let _ = weak.update(cx, |this, cx| this.redo(cx));
                 }),
             )
         })
@@ -2919,10 +3079,19 @@ fn turn_actions(
                 )
                 .xsmall()
                 .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |this, cx| this.request_fork(ix, cx));
+                    let _ = weak.update(cx, |_, cx| cx.emit(SessionPaneEvent::Fork { end: ix }));
                 }),
             )
         })
+        .when(hover_only, |el| {
+            el.invisible().group_hover(turn_group(ix), |s| s.visible())
+        });
+    h_flex()
+        .gap_1()
+        .pl_1()
+        .pt_0p5()
+        .text_color(p.muted)
+        .child(buttons)
         .child(div().flex_1())
         .when(adds > 0 || dels > 0, |el| {
             // Desktop `.session-turn-diff-pill`: 0.28rem/0.5rem padding,
@@ -3011,8 +3180,8 @@ fn render_user_attachment(key: &str, ix: usize, a: &UserAttachment, rc: &RenderC
                 .size(px(48.))
                 .cursor_pointer()
                 .hover(move |s| s.border_color(hover))
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.open_chat_image(&key, ix, window, cx));
+                .on_click(move |_, _window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.open_chat_image(&key, ix, cx));
                 })
                 .child(
                     img(image)
@@ -3114,25 +3283,40 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                                 })
                                 .when(!text.is_empty() || attachments.is_empty(), |el| {
                                     el.child(
-                                        div()
-                                            .min_w_0()
-                                            .px_3p5()
-                                            .py_2()
-                                            .rounded(px(14.))
-                                            .bg(p.accent_dim)
-                                            .text_sm()
-                                            .when(*local, |el| el.opacity(0.7))
-                                            .when(text.is_empty(), |el| {
-                                                el.text_color(p.dim).child("No message body")
-                                            })
-                                            // Markdown like the desktop app's user messages.
-                                            .when(!text.is_empty(), |el| {
+                                        // Right-aligned and tinted with the
+                                        // accent; the HUD's is a full pill.
+                                        prose(
+                                            div()
+                                                .min_w_0()
+                                                .px_3p5()
+                                                .py(px(if rc.density.is_compact() {
+                                                    6.
+                                                } else {
+                                                    8.
+                                                }))
+                                                .rounded(px(if rc.density.is_compact() {
+                                                    18.
+                                                } else {
+                                                    14.
+                                                }))
+                                                .bg(p.accent_dim),
+                                            rc.density,
+                                        )
+                                        .when(*local, |el| el.opacity(0.7))
+                                        .when(text.is_empty(), |el| {
+                                            el.text_color(p.dim).child("No message body")
+                                        })
+                                        // Markdown like the desktop app's user messages.
+                                        .when(
+                                            !text.is_empty(),
+                                            |el| {
                                                 el.min_w_0().child(rc.md.markdown(
                                                     format!("umd-{}", item.key),
                                                     text.clone(),
                                                     p,
                                                 ))
-                                            }),
+                                            },
+                                        ),
                                     )
                                 }),
                         )
@@ -3186,21 +3370,10 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                 )
                 .into_any_element()
         }
-        ItemKind::Agent { text } => v_flex()
-            .w_full()
-            .px_1()
-            .text_sm()
-            .child(
-                rc.md
-                    .markdown(format!("md-{}", item.key), text.clone(), p)
-                    .motion(md::stream_motion(rc.stream_fade)),
-            )
-            .when_some(actions, |el, stats| {
-                el.child(turn_actions(ix, item, stats, rc))
-            })
-            .into_any_element(),
+        ItemKind::Agent { text } => agent_message(ix, item, text, actions, rc).into_any_element(),
         ItemKind::Work(entries) => v_flex()
             .w_full()
+            .when(rc.density.hover_actions(), |el| el.group(turn_group(ix)))
             .child(render_work(ix, item, entries, rc))
             .when_some(actions, |el, stats| {
                 el.child(turn_actions(ix, item, stats, rc))
@@ -3223,6 +3396,39 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
     row_frame(ix, body, (true, true), rc)
 }
 
+/// Type of the conversation: the HUD reads in the system UI font at 14.5 px
+/// (design D15); the main window keeps the theme's font at its small size.
+fn prose<E: Styled>(el: E, density: Density) -> E {
+    if density.is_compact() {
+        el.text_size(px(COMPACT_PROSE_PX))
+            .font_family(kit::SYSTEM_UI)
+    } else {
+        el.text_sm()
+    }
+}
+
+/// An assistant reply: text straight on the surface behind the transcript, in
+/// both densities, with no card, border or fill of its own. The turn's actions
+/// (copy, undo, fork) follow it.
+fn agent_message(
+    ix: usize,
+    item: &Item,
+    text: &str,
+    actions: Option<(usize, usize, usize)>,
+    rc: &RenderCtx,
+) -> Div {
+    prose(v_flex().w_full().px_1(), rc.density)
+        .when(rc.density.hover_actions(), |el| el.group(turn_group(ix)))
+        .child(
+            rc.md
+                .markdown(format!("md-{}", item.key), text.to_owned(), &rc.p)
+                .motion(md::stream_motion(rc.stream_fade)),
+        )
+        .when_some(actions, |el, stats| {
+            el.child(turn_actions(ix, item, stats, rc))
+        })
+}
+
 /// The document column around a row. `(top, bottom)`: the row starts or
 /// ends its item, so it takes the gap between items on that side (rows of a
 /// split work group sit flush against each other).
@@ -3239,11 +3445,16 @@ fn row_frame(
         .w_full()
         .flex()
         .justify_center()
-        .px_6()
+        .px(px(rc.density.row_pad()))
         .when(top, |el| el.pt_1())
         .when(bottom, |el| el.pb_1())
         .when(reverted, |el| el.opacity(0.5))
-        .child(div().w_full().max_w(px(CHAT_MAX)).child(body))
+        .child(
+            div()
+                .w_full()
+                .max_w(px(rc.density.column_max()))
+                .child(body),
+        )
         .into_any_element()
 }
 
@@ -3344,6 +3555,7 @@ fn render_row(row: &Row, rc: &RenderCtx) -> AnyElement {
             let actions = last.then(|| turn_actions_of(ix, rc)).flatten();
             let body = v_flex()
                 .w_full()
+                .when(rc.density.hover_actions(), |el| el.group(turn_group(ix)))
                 .child(render_block(&entries[range.clone()], *live, rc))
                 .when_some(actions, |el, stats| {
                     el.child(turn_actions(ix, item, stats, rc))
@@ -3517,7 +3729,7 @@ fn segmented(
     option: &SelectOption,
     pending: bool,
     p: &Palette,
-    cx: &mut Context<QmtApp>,
+    cx: &mut Context<SessionPane>,
 ) -> Div {
     let config_id = option.id.clone();
     kit::segment_bar(p).children(
@@ -3532,8 +3744,7 @@ fn segmented(
                     .label(label.clone())
                     .inactive(pending)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.store
-                            .update(cx, |s, cx| s.set_session_option(&config_id, &value, cx));
+                        this.set_option(&config_id, &value, cx);
                         this.restore_focus(window, cx);
                     }))
             }),
@@ -3547,7 +3758,7 @@ fn usage_ring(
     selected: Option<TokenKey>,
     pinned: Option<TokenKey>,
     p: &Palette,
-    cx: &mut Context<QmtApp>,
+    cx: &mut Context<SessionPane>,
 ) -> Div {
     const SIZE: f32 = 76.;
     let active = selected.and_then(|k| chart.segment(k));
@@ -3666,57 +3877,10 @@ fn usage_ring(
         .child(key)
 }
 
-impl QmtApp {
-    /// Open a delegated child session; Back returns to the current one.
-    fn open_child_session(&mut self, agent: &str, child: &str, cx: &mut Context<Self>) {
-        self.store
-            .update(cx, |s, cx| s.open_child_session(agent, child, cx));
-        self.page = Page::Session;
-        self.session_options_open = false;
-        self.session_details_open = false;
-        self.session_menu_open = false;
-        cx.notify();
-    }
-
-    /// Back: to the parent of a delegated session, else to the session list.
-    fn go_back_from_session(&mut self, cx: &mut Context<Self>) {
-        if self.store.update(cx, |s, cx| s.open_parent_session(cx)) {
-            self.session_options_open = false;
-            self.session_details_open = false;
-            self.session_menu_open = false;
-            cx.notify();
-        } else {
-            self.go(Page::Sessions, cx);
-        }
-    }
-
-    pub(super) fn open_session(
-        &mut self,
-        agent: &str,
-        session_id: &str,
-        cwd: &str,
-        title: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.store.update(cx, |s, cx| {
-            s.open_session(agent, session_id, cwd, title, cx)
-        });
-        self.page = Page::Session;
-        self.session_options_open = false;
-        self.session_details_open = false;
-        self.session_menu_open = false;
-        cx.notify();
-    }
-
-    pub(super) fn open_summary(&mut self, s: &SessionSummary, cx: &mut Context<Self>) {
-        let title = s.display_title();
-        self.open_session(&s.agent_id, &s.id, &s.cwd, &title, cx);
-    }
-
+impl SessionPane {
     /// Tab / Shift+Tab in the session composer: next / previous agent mode.
     pub(super) fn cycle_session_mode(&mut self, back: bool, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let Some(option) = store.session.as_ref().and_then(|v| {
+        let Some(option) = self.view(cx).and_then(|v| {
             let key = |o: &SelectOption| {
                 if o.id.is_empty() {
                     "mode".to_string()
@@ -3737,21 +3901,23 @@ impl QmtApp {
             .unwrap_or(0);
         let next = if back { (at + n - 1) % n } else { (at + 1) % n };
         let value = option.choices[next].0.clone();
-        self.store
-            .update(cx, |s, cx| s.set_session_option(&option.id, &value, cx));
+        self.set_option(&option.id, &value, cx);
     }
 
-    /// The open session can take a prompt now: its agent is connected, it
+    /// The shown session can take a prompt now: its agent is connected, it
     /// has loaded without error, and a running turn can be steered or queued.
     /// Typed prompts and palette commands share this check.
-    pub(super) fn session_ready(&self, cx: &App) -> bool {
-        let store = self.store.read(cx);
-        let Some(view) = store.session.as_ref() else {
+    pub(crate) fn session_ready(&self, cx: &App) -> bool {
+        let Some(session) = self.session.as_ref() else {
             return false;
         };
+        let open = session.read(cx);
+        let view = &open.view;
         // Without a connection the prompt would be dropped: keep it in the
         // composer until the agent is back.
-        let connected = store
+        let connected = self
+            .store
+            .read(cx)
             .runtime(&view.agent_id)
             .is_some_and(|rt| rt.is_connected());
         // A read-only session (archived, handed off) takes no prompts.
@@ -3759,20 +3925,24 @@ impl QmtApp {
             && view.access.is_none()
             && !view.loading
             && view.error.is_none()
-            && (!view.running() || store.session_can_control_run())
+            && (!view.running() || open.can_control_run())
     }
 
-    pub(super) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.session_prompt.read(cx).value().trim().to_string();
-        if (text.is_empty() && self.session_attachments.is_empty()) || !self.session_ready(cx) {
+    pub(crate) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.prompt.read(cx).value().trim().to_string();
+        if (text.is_empty() && self.attachments.is_empty()) || !self.session_ready(cx) {
             return;
         }
-        let attachments = std::mem::take(&mut self.session_attachments);
-        self.session_attach_error = None;
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let attachments = std::mem::take(&mut self.attachments);
+        self.attach_error = None;
         let delivery = self.delivery;
-        self.store
-            .update(cx, |s, cx| s.send_prompt(text, attachments, delivery, cx));
-        self.session_prompt
+        self.store.update(cx, |s, cx| {
+            s.send_prompt(&session, text, attachments, delivery, cx)
+        });
+        self.prompt
             .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
         self.transcript.list.set_follow_mode(FollowMode::Tail);
         self.transcript.list.scroll_to_end();
@@ -3798,25 +3968,21 @@ impl QmtApp {
     /// Ask before rolling the workspace back to `message_id` (desktop
     /// "Undo workspace changes?" dialog).
     pub(super) fn request_undo(&mut self, message_id: String, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let ok = store.session_supports_undo()
-            && store.session.as_ref().is_some_and(|v| {
-                !v.running() && !v.undo_pending && v.undo_affected_turns(&message_id).is_some()
-            });
+        let ok = self.session.as_ref().is_some_and(|session| {
+            let open = session.read(cx);
+            let v = &open.view;
+            open.supports_undo()
+                && !v.running()
+                && !v.undo_pending
+                && v.undo_affected_turns(&message_id).is_some()
+        });
         if ok {
-            self.confirm_undo = Some(message_id);
-            cx.notify();
+            cx.emit(SessionPaneEvent::ConfirmUndo(message_id));
         }
     }
 
     fn copy_turn(&mut self, ix: usize, key: String, cx: &mut Context<Self>) {
-        let text = self
-            .store
-            .read(cx)
-            .session
-            .as_ref()
-            .map(|v| v.turn_text(ix))
-            .unwrap_or_default();
+        let text = self.view(cx).map(|v| v.turn_text(ix)).unwrap_or_default();
         if text.is_empty() {
             return;
         }
@@ -3828,6 +3994,283 @@ impl QmtApp {
         self.transcript.list.set_follow_mode(FollowMode::Tail);
         self.transcript.list.scroll_to_end();
         cx.notify();
+    }
+
+    /// Above the composer: MCP servers this session left out, with sign-in
+    /// (desktop `session-mcp-auth-notice`). Hidden for read-only sessions.
+    pub(super) fn mcp_notice(&self, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (agent, cwd, oauth, skipped, skey) = {
+            let store = self.store.read(cx);
+            let view = self.view(cx).filter(|v| v.access.is_none())?;
+            let (agent, cwd) = (view.agent_id.clone(), view.cwd.clone());
+            let skey = SessionKey::new(&view.agent_id, &view.session_id);
+            let skipped: Vec<_> = store
+                .skipped_mcp(&skey)
+                .into_iter()
+                .map(|s| {
+                    let signed_in = store.mcp_signed_in(&agent, &s.provider);
+                    let busy = store.is_pending(&agent, &format!("oauth:{}", s.provider));
+                    (s, signed_in, busy)
+                })
+                .collect();
+            let oauth = store.runtime(&agent).and_then(|rt| rt.oauth.clone());
+            (agent, cwd, oauth, skipped, skey)
+        };
+        if skipped.is_empty() {
+            return None;
+        }
+        let rows: Vec<AnyElement> = skipped
+            .iter()
+            .map(|(server, signed_in, busy)| {
+                let (signed_in, busy) = (*signed_in, *busy);
+                let key: SharedString = server.server.clone().into();
+                let signing = oauth.as_ref().filter(|f| f.provider == server.provider);
+                let text = if signed_in {
+                    format!(
+                        "Signed in to \"{}\". Start a new session to use its tools.",
+                        server.server
+                    )
+                } else {
+                    server.describe()
+                };
+                let tone = if server.error.is_some() {
+                    p.warn
+                } else {
+                    p.accent
+                };
+                let actions = h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .when(signed_in, |el| {
+                        let (agent, cwd) = (agent.clone(), cwd.clone());
+                        el.child(
+                            accent_btn(kit::keyed("mcp-notice-new", key.clone()), true, true, p)
+                                .child("New session")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SessionPaneEvent::NewSessionIn {
+                                        cwd: cwd.clone(),
+                                        agent: agent.clone(),
+                                    })
+                                })),
+                        )
+                    })
+                    .when(!signed_in, |el| {
+                        let enabled = signing.is_none() && oauth.is_none() && !busy;
+                        let (agent, provider) = (agent.clone(), server.provider.clone());
+                        let selector = format!("mcp-notice-signin-{}", server.server);
+                        el.child(
+                            flat_btn(
+                                kit::keyed("mcp-notice-signin", key.clone()),
+                                enabled,
+                                true,
+                                p,
+                            )
+                            .debug_selector(move || selector)
+                            .child(kit::icon(IconName::LogIn, 14., p.text))
+                            .child(if server.error.is_some() {
+                                "Retry sign-in"
+                            } else {
+                                "Sign in"
+                            })
+                            .when(enabled, |el| {
+                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.store
+                                        .update(cx, |s, cx| s.start_oauth(&agent, &provider, cx))
+                                }))
+                            }),
+                        )
+                        .when(server.error.is_some(), |el| {
+                            el.child(
+                                flat_btn(
+                                    kit::keyed("mcp-notice-settings", key.clone()),
+                                    true,
+                                    true,
+                                    p,
+                                )
+                                .child("Settings")
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| cx.emit(SessionPaneEvent::ConnectorSettings),
+                                )),
+                            )
+                        })
+                    })
+                    .child({
+                        let name = server.server.clone();
+                        let skey = skey.clone();
+                        kit::icon_button(
+                            kit::keyed("mcp-notice-dismiss", key.clone()),
+                            IconName::X,
+                            "Dismiss",
+                        )
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.store
+                                .update(cx, |s, cx| s.dismiss_skipped_mcp(&skey, &name, cx))
+                        }))
+                    });
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2p5()
+                            .child(kit::icon(
+                                if signed_in {
+                                    IconName::CircleCheck
+                                } else {
+                                    IconName::Plug
+                                },
+                                15.,
+                                if signed_in { p.success } else { tone },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(p.text)
+                                    .child(text),
+                            )
+                            .child(actions),
+                    )
+                    .children(signing.map(|flow| {
+                        oauth_flow_box(&self.store, &self.oauth_code, &agent, flow, key.clone(), p)
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .id("mcp-notice")
+                .debug_selector(|| "mcp-notice".into())
+                .w_full()
+                .gap_2()
+                .px_3()
+                .py_2p5()
+                .rounded(px(12.))
+                .bg(p.surface)
+                .border_1()
+                .border_color(p.border)
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// "Configure · N" of Session options, when the session has delegates.
+    pub(super) fn delegate_option_row(&self, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
+        let store = self.store.read(cx);
+        let skey = self.key(cx)?;
+        if !store.supports_delegate_routing(skey.agent.as_str()) {
+            return None;
+        }
+        let state = store.delegate_state(&skey).cloned().unwrap_or_default();
+        if !state.has_routes() {
+            return None;
+        }
+        let count = state.routes.as_ref().map_or(0, |r| r.assignments.len());
+        Some(
+            h_flex()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_medium().child("Delegate routing"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(p.muted)
+                                .child("Model per delegate."),
+                        ),
+                )
+                .child(
+                    kit::flat_btn("open-delegates", !state.loading, true, p)
+                        .child(if state.loading {
+                            kit::spinner("delegates-row-spin", 13., p.muted).into_any_element()
+                        } else {
+                            kit::icon(IconName::Waypoints, 14., p.text).into_any_element()
+                        })
+                        .child(if state.error.is_some() {
+                            "Retry".to_string()
+                        } else if count > 0 {
+                            format!("Configure · {count}")
+                        } else {
+                            "Configure".to_string()
+                        })
+                        .when(!state.loading, |el| {
+                            el.on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(SessionPaneEvent::Delegates)),
+                            )
+                        }),
+                ),
+        )
+    }
+
+    /// The composer's model pill: the chosen model (with the mesh icon when
+    /// another machine serves it), the reasoning badge, and the picker on click.
+    fn model_picker_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let view = self.view(cx);
+        let has_models = view.is_some_and(|v| !store.models(&v.agent_id).is_empty());
+        let model = view.and_then(|v| store.session_model(v)).cloned();
+        let label = model
+            .as_ref()
+            .map(|m| m.label.clone())
+            .or_else(|| view.and_then(|v| v.model_label()))
+            .unwrap_or_else(|| {
+                if has_models {
+                    "Choose model"
+                } else {
+                    "Model unknown"
+                }
+                .into()
+            });
+        let reasoning = view
+            .and_then(|v| v.reasoning_option())
+            .map(|r| (r.current_label(), r.current))
+            .filter(|(label, _)| !label.is_empty());
+        let pending = view.is_some_and(|v| v.pending_options.contains("model"));
+        let tip = model.as_ref().map(Model::describe);
+        let button =
+            super::start::model_toolbar_button("s-model", label, model.as_ref(), pending, p)
+                .when_some(tip, |el, tip| {
+                    el.tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
+                })
+                .when(has_models && !pending, |el| {
+                    el.on_click(cx.listener(|_, _, _, cx| cx.emit(SessionPaneEvent::ModelPicker)))
+                });
+        match reasoning {
+            Some((text, level)) => {
+                badged_tone(button, &text, super::start::reasoning_color(&level, p), p)
+                    .into_any_element()
+            }
+            None => button.into_any_element(),
+        }
+    }
+
+    /// The compact composer's model chip: the model's name, and the picker on
+    /// click (the quick panel renders the picker itself).
+    fn compact_model_chip(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let view = self.view(cx);
+        let has_models = view.is_some_and(|v| !store.models(&v.agent_id).is_empty());
+        let model = view.and_then(|v| store.session_model(v)).cloned();
+        let label = model
+            .as_ref()
+            .map(|m| m.label.clone())
+            .or_else(|| view.and_then(|v| v.model_label()))
+            .unwrap_or_else(|| "Model".into());
+        let pending = view.is_some_and(|v| v.pending_options.contains("model"));
+        toolbar_button("s-model-chip", p)
+            .max_w(px(160.))
+            .min_w_0()
+            .when(pending, |el| el.opacity(0.6))
+            .child(div().min_w_0().truncate().child(label))
+            .child(kit::icon(IconName::ChevronDown, 12., p.dim))
+            .tooltip(|window, cx| kit::wrap_tip("Change model (Cmd/Ctrl+M)").build(window, cx))
+            .when(has_models && !pending, |el| {
+                el.on_click(cx.listener(|_, _, _, cx| cx.emit(SessionPaneEvent::ModelPicker)))
+            })
+            .into_any_element()
     }
 
     // ---- header -------------------------------------------------------------
@@ -3842,14 +4285,14 @@ impl QmtApp {
     ) -> Option<(AnyElement, Vec<AnyElement>)> {
         let (view, summary, plan, model_context) = {
             let store = self.store.read(cx);
-            let session = store.session.as_ref()?;
+            let session = self.view(cx)?;
             let view = session.shallow();
             let summary = store
                 .session_summary(&view.agent_id, &view.session_id)
                 .cloned();
             // The model list's size, for when the agent reports none.
             let model_context = store
-                .session_model()
+                .session_model(session)
                 .and_then(|m| m.context)
                 .filter(|size| *size > 0);
             (view, summary, session.plan.clone(), model_context)
@@ -3878,14 +4321,14 @@ impl QmtApp {
         let back = kit::title_icon_button(
             "session-back",
             IconName::ArrowLeft,
-            if view.parent.is_some() {
+            if !self.back.is_empty() {
                 "Back to parent session"
             } else {
                 "Back to sessions"
             },
             p,
         )
-        .on_click(cx.listener(|this, _, _, cx| this.go_back_from_session(cx)));
+        .on_click(cx.listener(|this, _, _, cx| this.go_back(cx)));
         // Copy feedback follows the desktop's copy chips: for 1.2s the chip shows
         // an accent check + "copied" over itself and the tooltip says "Copied".
         let copied = |key: &str| self.copied.as_deref() == Some(key);
@@ -3983,8 +4426,8 @@ impl QmtApp {
 
         let details_trigger = {
             kit::title_chip("session-details", p)
-                .when(self.session_details_open, |el| el.bg(p.card))
-                .when(!self.session_details_open, |el| {
+                .when(self.details_open, |el| el.bg(p.card))
+                .when(!self.details_open, |el| {
                     el.tooltip(move |window, cx| {
                         let text = match usage {
                             Some((used, size)) if size > 0 => format!(
@@ -4016,15 +4459,15 @@ impl QmtApp {
                     if this.dismissed.closed_by("session-details", ev) {
                         return;
                     }
-                    this.session_details_open = !this.session_details_open;
-                    this.session_menu_open = false;
+                    this.details_open = !this.details_open;
+                    this.menu_open = false;
                     this.plan_open = false;
                     cx.notify();
                 }))
         };
         // Usage widget, ported from the desktop app's `SessionUsageBar`: context
         // meter, latest-request / session-total token rings, cost, active time.
-        let details_panel = self.session_details_open.then(|| {
+        let details_panel = (self.details_open && self.density.has_panels()).then(|| {
             let mono = |el: Div| el.font_family(kit::MONO);
             let section_rule = || kit::divider(p).bg(p.border.opacity(0.6));
 
@@ -4253,7 +4696,7 @@ impl QmtApp {
                 .occlude()
                 .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                     this.dismissed.record("session-details", ev);
-                    this.session_details_open = false;
+                    this.details_open = false;
                     this.usage_hovered = None;
                     cx.notify();
                 }))
@@ -4277,23 +4720,24 @@ impl QmtApp {
             "Session actions",
             p,
         )
-        .when(self.session_menu_open, |el| el.bg(p.card))
+        .when(self.menu_open, |el| el.bg(p.card))
         .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
             if this.dismissed.closed_by("session-menu", ev) {
                 return;
             }
-            this.session_menu_open = !this.session_menu_open;
-            this.session_details_open = false;
+            this.menu_open = !this.menu_open;
+            this.details_open = false;
             this.plan_open = false;
             cx.notify();
         }));
-        let menu_panel = self.session_menu_open.then(|| {
+        let menu_panel = self.menu_open.then(|| {
             let (can_create_worktree, can_handoff_worktree, developer) = {
                 let store = self.store.read(cx);
-                let busy = store.worktree_pending();
+                let skey = SessionKey::new(&agent_id, &session_id);
+                let busy = store.worktree_pending(&skey);
                 (
-                    !busy && store.can_create_worktree(),
-                    !busy && store.can_handoff_worktree(),
+                    !busy && store.can_create_worktree(&skey, cx),
+                    !busy && store.can_handoff_worktree(&skey, cx),
                     store.prefs.developer_mode,
                 )
             };
@@ -4327,7 +4771,7 @@ impl QmtApp {
                 .occlude()
                 .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                     this.dismissed.record("session-menu", ev);
-                    this.session_menu_open = false;
+                    this.menu_open = false;
                     cx.notify();
                 }))
                 .child(
@@ -4337,7 +4781,7 @@ impl QmtApp {
                         if pinned { "Unpin" } else { "Pin" }.into(),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.session_menu_open = false;
+                        this.menu_open = false;
                         this.store
                             .update(cx, |s, cx| s.set_pinned(&a1, &s1, !pinned, cx));
                     })),
@@ -4349,7 +4793,7 @@ impl QmtApp {
                         if resolved { "Reopen" } else { "Mark resolved" }.into(),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.session_menu_open = false;
+                        this.menu_open = false;
                         this.store.update(cx, |s, cx| {
                             s.set_lifecycle(&a2, &s2, Some(!resolved), None, cx)
                         });
@@ -4362,7 +4806,7 @@ impl QmtApp {
                         if archived { "Unarchive" } else { "Archive" }.into(),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.session_menu_open = false;
+                        this.menu_open = false;
                         this.store.update(cx, |s, cx| {
                             s.set_lifecycle(&a3, &s3, None, Some(!archived), cx)
                         });
@@ -4378,8 +4822,8 @@ impl QmtApp {
                             IconName::GitBranchPlus,
                             "New worktree session".into(),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_worktree_dialog(WorktreeAction::Create, window, cx)
+                        .on_click(cx.listener(|_this, _, _window, cx| {
+                            cx.emit(SessionPaneEvent::Worktree(WorktreeAction::Create))
                         })),
                     )
                 })
@@ -4390,8 +4834,8 @@ impl QmtApp {
                             IconName::GitBranch,
                             "Hand off worktree".into(),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_worktree_dialog(WorktreeAction::Handoff, window, cx)
+                        .on_click(cx.listener(|_this, _, _window, cx| {
+                            cx.emit(SessionPaneEvent::Worktree(WorktreeAction::Handoff))
                         })),
                     )
                 })
@@ -4454,27 +4898,21 @@ impl QmtApp {
                     el.child(div().my_1().child(kit::divider(p))).child(
                         item("m-debug-events", IconName::Bug, "Debug events…".into())
                             .debug_selector(|| "m-debug-events".into())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_debug_events(
-                                    &debug_agent,
-                                    Some(debug_session.clone()),
-                                    window,
-                                    cx,
-                                )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(SessionPaneEvent::DebugEvents {
+                                    agent: debug_agent.clone(),
+                                    session: debug_session.clone(),
+                                })
                             })),
                     )
                 })
         });
 
         // Plan: icon + `done/total`, items in a popover.
-        let plan_el = (!plan.is_empty()).then(|| {
-            let done = plan.iter().filter(|e| e.status == "completed").count();
-            let total = plan.len();
+        let plan_el = crate::session::PlanDigest::from_entries(&plan).map(|digest| {
+            let (done, total) = (digest.done, digest.total);
             let open = self.plan_open;
-            let current = plan
-                .iter()
-                .find(|e| e.status == "in_progress")
-                .map(|e| e.content.clone());
+            let current = digest.current().map(|e| e.content.clone());
             let hover = p.card;
             let trigger = h_flex()
                 .id("plan-toggle")
@@ -4513,8 +4951,8 @@ impl QmtApp {
                         return;
                     }
                     this.plan_open = !this.plan_open;
-                    this.session_details_open = false;
-                    this.session_menu_open = false;
+                    this.details_open = false;
+                    this.menu_open = false;
                     cx.notify();
                 }));
             let panel = open.then(|| {
@@ -4559,11 +4997,7 @@ impl QmtApp {
                             ),
                     )
                     .children(plan.iter().map(|e| {
-                        let (icon, color) = match e.status.as_str() {
-                            "completed" => (IconName::CircleCheck, p.success),
-                            "in_progress" => (IconName::CircleDashed, p.running),
-                            _ => (IconName::Circle, p.dim),
-                        };
+                        let (icon, color) = kit::plan_entry_mark(&e.status, p);
                         h_flex()
                             .items_start()
                             .gap_2()
@@ -4596,15 +5030,19 @@ impl QmtApp {
                 .into_any_element()
         });
 
+        // The context ring and the details panel are the main window's.
+        let details = self.density.has_panels().then(|| {
+            div()
+                .relative()
+                .flex_none()
+                .child(details_trigger)
+                .children(details_panel.map(|p| deferred(p).with_priority(1)))
+                .into_any_element()
+        });
         let right = plan_el
             .into_iter()
+            .chain(details)
             .chain([
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(details_trigger)
-                    .children(details_panel.map(|p| deferred(p).with_priority(1)))
-                    .into_any_element(),
                 div()
                     .relative()
                     .flex_none()
@@ -4618,7 +5056,7 @@ impl QmtApp {
                     p,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.store.update(cx, |s, cx| s.reload_session(cx));
+                    this.reload(cx);
                     this.transcript.list.set_follow_mode(FollowMode::Tail);
                 }))
                 .into_any_element(),
@@ -4661,7 +5099,7 @@ impl QmtApp {
             .occlude()
             .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 this.dismissed.record("session-options", ev);
-                this.session_options_open = false;
+                this.options_open = false;
                 this.restore_focus(window, cx);
                 cx.notify();
             }))
@@ -4686,38 +5124,35 @@ impl QmtApp {
                     .child(
                         kit::segment_bar(p)
                             .child(
-                                kit::segment("dl-steer", delivery == "steer", p)
+                                kit::segment("dl-steer", delivery == Delivery::Steer, p)
                                     .flex_1()
                                     .icon(IconName::Navigation)
                                     .label("Steer")
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.delivery = "steer";
+                                        this.delivery = Delivery::Steer;
                                         this.restore_focus(window, cx);
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                kit::segment("dl-queue", delivery == "queue", p)
+                                kit::segment("dl-queue", delivery == Delivery::Queue, p)
                                     .flex_1()
                                     .icon(IconName::Plus)
                                     .label("Queue")
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.delivery = "queue";
+                                        this.delivery = Delivery::Queue;
                                         this.restore_focus(window, cx);
                                         cx.notify();
                                     })),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.muted)
-                            .child(if delivery == "queue" {
-                                "Queued messages are delivered after the current turn finishes."
-                            } else {
-                                "Steering interrupts the current turn with your message."
-                            }),
-                    )
+                    .child(div().text_xs().text_color(p.muted).child(
+                        if delivery == Delivery::Queue {
+                            "Queued messages are delivered after the current turn finishes."
+                        } else {
+                            "Steering interrupts the current turn with your message."
+                        },
+                    ))
             })
             .children(self.delegate_option_row(p, cx).map(|row| {
                 v_flex()
@@ -4754,8 +5189,8 @@ impl QmtApp {
             .map(|(name, hint)| self.render_slash_hint(name, hint, p));
         let running = view.running();
         let loading = view.loading;
-        let has_text = !self.session_prompt.read(cx).value().trim().is_empty();
-        let has_draft = has_text || !self.session_attachments.is_empty();
+        let has_text = !self.prompt.read(cx).value().trim().is_empty();
+        let has_draft = has_text || !self.attachments.is_empty();
         let connected = self
             .store
             .read(cx)
@@ -4772,10 +5207,150 @@ impl QmtApp {
             .rounded_full()
             .tooltip(|window, cx| kit::wrap_tip("Attach files").build(window, cx))
             .child(kit::icon(IconName::Plus, 17., p.muted))
-            .on_click(cx.listener(|this, _, _, cx| this.attach_files(true, cx)));
+            .on_click(cx.listener(|this, _, _, cx| super::start::attach_files(this, cx)));
 
-        let model_button = self.model_picker_button(p, cx);
+        // A compact composer is one line at rest: no options panel.
+        let compact = self.density.is_compact();
+        let model_button = (!compact).then(|| self.model_picker_button(p, cx));
+        let model_chip = compact.then(|| self.compact_model_chip(p, cx));
+        let options =
+            (!compact).then(|| self.options_control(mode.as_ref(), control, &pending, p, cx));
 
+        let attachments = super::preview::attachment_strip(self, p, cx).map(|s| s.pt_1p5());
+
+        // Right side: stop / send, like the desktop composer.
+        let actions = self.composer_actions(running, control, has_draft, blocked, cx);
+
+        // While the command list shows, its keys come first (`slash_keys`).
+        let input = self
+            .slash_keys(div().relative(), cx)
+            .debug_selector(|| "composer-input".into())
+            .children(slash_list.map(|list| deferred(list).with_priority(1)))
+            .px_1()
+            .when(!compact, |el| el.min_h(px(64.)))
+            .when(compact, |el| el.flex_1().min_w_0())
+            .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                // A compact composer always sends on Enter and breaks the
+                // line on Shift+Enter, whatever the main window's setting.
+                let send = if this.density.is_compact() {
+                    crate::store::SendShortcut::Enter
+                } else {
+                    this.store.read(cx).prefs.send_shortcut
+                };
+                if this.density.is_compact() && a.secondary {
+                    // Cmd/Ctrl+Enter hands the session to the main window.
+                    cx.stop_propagation();
+                    cx.emit(SessionPaneEvent::OpenInMain);
+                } else if send.submits(a.shift, a.secondary) {
+                    cx.stop_propagation();
+                    this.send_session_prompt(window, cx);
+                }
+            }))
+            // Tab cycles modes instead of indenting (captured before the textarea).
+            .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
+                cx.stop_propagation();
+                this.cycle_session_mode(false, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
+                cx.stop_propagation();
+                this.cycle_session_mode(true, cx);
+            }))
+            .child(
+                Textarea::new(&self.prompt)
+                    .appearance(false)
+                    .on_paste(super::start::paste_handler(cx)),
+            );
+
+        // The HUD's composer floats: a pill of faint white over the glass
+        // (the pane's own surface where there is none), lit along its top
+        // edge by a 1 px highlight instead of a border.
+        v_flex()
+            .relative()
+            .w_full()
+            .pt_1()
+            .pb_2()
+            .px_2()
+            .gap_1p5()
+            .rounded(px(if compact { 22. } else { 18. }))
+            .bg(if compact && self.glass {
+                p.chip
+            } else {
+                p.surface
+            })
+            .when(!compact, |el| el.border_1().border_color(p.border))
+            .when(compact, |el| {
+                el.child(
+                    div()
+                        .debug_selector(|| "composer-highlight".into())
+                        .absolute()
+                        .top_0()
+                        .left(px(14.))
+                        .right(px(14.))
+                        .h(px(1.))
+                        .bg(white().opacity(0.22)),
+                )
+            })
+            // No shadow on a material: it would lie on the glass as a dark smudge.
+            .when(!(compact && self.glass), |el| el.shadow_md())
+            .children(slash_hint)
+            .when_some(self.attach_error.clone(), |el, err| {
+                el.child(
+                    h_flex()
+                        .gap_1p5()
+                        .px_1()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(p.danger)
+                        .child(kit::icon(IconName::CircleAlert, 13., p.danger))
+                        .child(div().flex_1().child(err))
+                        .child(
+                            kit::icon_button("s-dismiss-attach", IconName::X, "Dismiss")
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.attach_error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .map(|el| {
+                if compact {
+                    el.child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(plus)
+                            .child(input)
+                            .children(model_chip)
+                            .child(actions),
+                    )
+                    .children(attachments)
+                } else {
+                    el.child(input).children(attachments).child(
+                        h_flex()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(p.border.opacity(0.6))
+                            .child(plus)
+                            .children(model_button)
+                            .children(options)
+                            .child(div().flex_1())
+                            .child(actions),
+                    )
+                }
+            })
+    }
+
+    /// The Options button with its panel, for the comfortable composer.
+    fn options_control(
+        &self,
+        mode: Option<&SelectOption>,
+        control: bool,
+        pending: &HashSet<String>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let options_button = toolbar_button("s-options", p)
             .child(kit::icon(IconName::Settings2, 14., p.muted))
             .child("Options")
@@ -4784,8 +5359,8 @@ impl QmtApp {
                 if this.dismissed.closed_by("session-options", ev) {
                     return;
                 }
-                this.session_options_open = !this.session_options_open;
-                if !this.session_options_open {
+                this.options_open = !this.options_open;
+                if !this.options_open {
                     this.restore_focus(window, cx);
                 }
                 cx.notify();
@@ -4798,44 +5373,41 @@ impl QmtApp {
                 }
                 None => options_button.into_any_element(),
             };
-        let options =
-            div()
-                .relative()
-                .child(options_button)
-                .when(self.session_options_open, |el| {
-                    el.child(
-                        deferred(self.session_options_panel(
-                            mode.as_ref(),
-                            control,
-                            &pending,
-                            p,
-                            cx,
-                        ))
+        div()
+            .debug_selector(|| "composer-options".into())
+            .relative()
+            .child(options_button)
+            .when(self.options_open, |el| {
+                el.child(
+                    deferred(self.session_options_panel(mode, control, pending, p, cx))
                         .with_priority(1),
-                    )
-                });
+                )
+            })
+    }
 
-        let attachments = self.attachment_strip(true, p, cx).map(|s| s.pt_1p5());
-
-        // Right side: stop / send, like the desktop composer.
+    /// Stop / send (steer / queue while a run is active) at the composer's end.
+    fn composer_actions(
+        &self,
+        running: bool,
+        control: bool,
+        has_draft: bool,
+        blocked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let stop = kit::button("stop-turn")
             .ghost()
             .icon(IconName::Square)
             .tooltip("Stop agent")
-            .on_click(
-                cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.cancel_turn(cx))),
-            );
-        let actions: AnyElement = if running && (!control || !has_draft) {
+            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)));
+        if running && (!control || !has_draft) {
             kit::button("stop-primary")
                 .primary()
                 .icon(IconName::Square)
                 .tooltip("Stop agent")
-                .on_click(
-                    cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.cancel_turn(cx))),
-                )
+                .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
                 .into_any_element()
         } else if running && control {
-            let queue = self.delivery == "queue";
+            let queue = self.delivery == Delivery::Queue;
             h_flex()
                 .gap_1p5()
                 .child(stop)
@@ -4862,79 +5434,7 @@ impl QmtApp {
                 .inactive(blocked || !has_draft)
                 .on_click(cx.listener(|this, _, window, cx| this.send_session_prompt(window, cx)))
                 .into_any_element()
-        };
-
-        v_flex()
-            .w_full()
-            .pt_1()
-            .pb_2()
-            .px_2()
-            .gap_1p5()
-            .rounded(px(18.))
-            .bg(p.surface)
-            .border_1()
-            .border_color(p.border)
-            .shadow_md()
-            .when_some(self.session_attach_error.clone(), |el, err| {
-                el.child(
-                    h_flex()
-                        .gap_1p5()
-                        .px_1()
-                        .pt_1()
-                        .text_xs()
-                        .text_color(p.danger)
-                        .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-                        .child(div().flex_1().child(err))
-                        .child(
-                            kit::icon_button("s-dismiss-attach", IconName::X, "Dismiss")
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.session_attach_error = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
-            .children(slash_hint)
-            // Tab cycles modes instead of indenting (captured before the textarea).
-            // While the command list shows, its keys come first (`slash_keys`).
-            .child(
-                self.slash_keys(div().relative().px_1().min_h(px(64.)), cx)
-                    .children(slash_list.map(|list| deferred(list).with_priority(1)))
-                    .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                        let send = this.store.read(cx).prefs.send_shortcut;
-                        if send.submits(a.shift, a.secondary) {
-                            cx.stop_propagation();
-                            this.send_session_prompt(window, cx);
-                        }
-                    }))
-                    .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
-                        cx.stop_propagation();
-                        this.cycle_session_mode(false, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
-                        cx.stop_propagation();
-                        this.cycle_session_mode(true, cx);
-                    }))
-                    .child(
-                        Textarea::new(&self.session_prompt)
-                            .appearance(false)
-                            .on_paste(self.paste_handler(true, cx)),
-                    ),
-            )
-            .children(attachments)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(p.border.opacity(0.6))
-                    .child(plus)
-                    .child(model_button)
-                    .child(options)
-                    .child(div().flex_1())
-                    .child(actions),
-            )
+        }
     }
 
     // ---- page ---------------------------------------------------------------
@@ -4944,36 +5444,17 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let p = *palette(cx);
+        let p = self.palette(cx);
         let store = self.store.read(cx);
-        let Some(view) = store.session.as_ref() else {
-            let busy = store.launch.busy;
-            let err = store.launch.error.clone();
-            let progress = store.launch_progress_label();
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_color(p.muted)
-                .when(busy, |el| {
-                    el.child(kit::spinner("starting", 22., p.accent))
-                        .child(progress)
-                })
-                .when(!busy, |el| {
-                    el.child(err.unwrap_or_else(|| "No session open.".into()))
-                        .child(
-                            kit::button("back-start")
-                                .label("Back to Start")
-                                .on_click(cx.listener(|this, _, _, cx| this.go(Page::Start, cx))),
-                        )
-                })
-                .into_any_element();
+        let Some(session) = self.session.clone() else {
+            return div().into_any_element();
         };
+        let open = session.read(cx);
+        let view = &open.view;
 
         let key = format!("{}/{}", view.agent_id, view.session_id);
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let control = store.session_can_control_run();
+        let control = open.can_control_run();
         let running = view.running();
         let loading = view.loading;
         let error = view.error.clone();
@@ -4985,16 +5466,10 @@ impl QmtApp {
         let history_loading = view.history_loading;
         let history_error = view.history_error.clone();
         let empty = view.items.is_empty();
-        let requests: Vec<String> = store
-            .requests
-            .iter()
-            .filter(|r| {
-                r.is_pending()
-                    && r.agent_id == agent_id
-                    && r.session_id.as_deref() == Some(session_id.as_str())
-            })
-            .map(|r| r.key.clone())
-            .collect();
+        let requests: Vec<String> = self.cards.read(cx).keys(
+            &super::inbox::RequestFilter::Session(SessionKey::new(&agent_id, &session_id)),
+            cx,
+        );
         let (act_title, act_preview) = activity(view);
         // Untruncated shell command of the running tool, for the bar's tooltip.
         let act_full = match view.items.last().map(|i| &i.kind) {
@@ -5010,8 +5485,9 @@ impl QmtApp {
         let turn_end = view.turn_ends();
         let reverted_from = view.reverted_from();
         // Desktop: forks only from settled, live turns while nothing else runs.
-        let fork_ready = store.session_supports_fork()
-            && !store.fork_pending()
+        let skey = SessionKey::new(&agent_id, &session_id);
+        let fork_ready = store.session_supports_fork(&skey, cx)
+            && !store.fork_pending(&skey)
             && !running
             && !loading
             && !view.undo_pending;
@@ -5034,8 +5510,9 @@ impl QmtApp {
                 .highlight_theme
                 .clone(),
             weak: cx.entity().downgrade(),
+            density: self.density,
             smooth_scroll: self.smooth_scroll.clone(),
-            expanded: self.expanded_items.clone(),
+            expanded: self.expanded.clone(),
             running,
             last_turn_start: view.last_turn_start(),
             last_ix: view.items.len().saturating_sub(1),
@@ -5044,7 +5521,7 @@ impl QmtApp {
             block_scrolls: self.transcript.block_scrolls.clone(),
             cwd: view.cwd.clone(),
             turn_user: view.turn_users(),
-            undo_ready: store.session_supports_undo() && !running && !loading && !view.undo_pending,
+            undo_ready: open.supports_undo() && !running && !loading && !view.undo_pending,
             undoable: view.undoable(),
             redo_target: view.redo_target().map(str::to_owned),
             fork_points,
@@ -5053,7 +5530,7 @@ impl QmtApp {
             agent_id: view.agent_id.clone(),
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
             md: self.transcript.md.clone(),
-            tool_content: store.supports_tool_content(),
+            tool_content: open.supports_tool_content(),
             developer: store.prefs.developer_mode,
         });
         self.transcript.sync(&key, &view.items, &rc);
@@ -5064,7 +5541,7 @@ impl QmtApp {
                 let _ = weak.update(cx, |this, cx| {
                     // Near the top: fetch the preceding turns (no-op when none are left).
                     if ev.visible_range.start <= 2 {
-                        this.store.update(cx, |s, cx| s.load_older_history(cx));
+                        this.load_older(cx);
                     }
                     cx.notify()
                 });
@@ -5079,9 +5556,7 @@ impl QmtApp {
             && history_error.is_none()
             && self.transcript.list.item_is_above_viewport(0) == Some(false)
         {
-            cx.on_next_frame(window, |this, _, cx| {
-                this.store.update(cx, |s, cx| s.load_older_history(cx))
-            });
+            cx.on_next_frame(window, |this, _, cx| this.load_older(cx));
         }
 
         // Snapshot what the composer/header need before borrowing self mutably.
@@ -5106,13 +5581,13 @@ impl QmtApp {
                 .child("Loading transcript…")
                 .into_any_element()
         } else if let Some(err) = error.clone().filter(|_| empty) {
-            let details_open = self.expanded_items.contains(ERROR_DETAILS_KEY);
+            let details_open = self.expanded.contains(ERROR_DETAILS_KEY);
             let copied = self.copied.as_deref() == Some(COPIED_ERROR_DETAILS);
             let details_panel = error_details.clone().filter(|_| details_open).map(|text| {
                 div()
                     .id("load-error-details")
                     .w_full()
-                    .max_w(px(CHAT_MAX))
+                    .max_w(px(self.density.column_max()))
                     .max_h(px(320.))
                     .overflow_y_scroll()
                     .px_4()
@@ -5137,9 +5612,7 @@ impl QmtApp {
                 .child(
                     kit::button("retry-load")
                         .label("Retry")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.reload_session(cx))
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                 )
                 .when_some(error_details.clone(), |el, text| {
                     el.child(
@@ -5150,8 +5623,8 @@ impl QmtApp {
                                 "Show details"
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if !this.expanded_items.remove(ERROR_DETAILS_KEY) {
-                                    this.expanded_items.insert(ERROR_DETAILS_KEY.into());
+                                if !this.expanded.remove(ERROR_DETAILS_KEY) {
+                                    this.expanded.insert(ERROR_DETAILS_KEY.into());
                                 }
                                 cx.notify();
                             })),
@@ -5227,9 +5700,7 @@ impl QmtApp {
                                                     .ghost()
                                                     .label("Retry")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.store.update(cx, |s, cx| {
-                                                            s.retry_older_history(cx)
-                                                        })
+                                                        this.retry_older(cx)
                                                     })),
                                             ),
                                         _ => el
@@ -5296,19 +5767,25 @@ impl QmtApp {
                                 // fades from the background to transparent, and stacking
                                 // them builds the dense edge. Plain divs have no hitbox,
                                 // so the wheel still reaches the list.
-                                .children((0..COMPOSER_HALO_LAYERS).map(|_| {
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .h(px(TRANSCRIPT_TOP_FADE_H))
-                                        .bg(linear_gradient(
-                                            180.,
-                                            linear_color_stop(p.bg, 0.),
-                                            linear_color_stop(p.bg.opacity(0.), 1.),
-                                        ))
-                                })),
+                                // On a material there is no background colour to
+                                // fade to, so there is no fade.
+                                .children(
+                                    (0..if self.glass { 0 } else { COMPOSER_HALO_LAYERS }).map(
+                                        |_| {
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .right_0()
+                                                .h(px(TRANSCRIPT_TOP_FADE_H))
+                                                .bg(linear_gradient(
+                                                    180.,
+                                                    linear_color_stop(p.bg, 0.),
+                                                    linear_color_stop(p.bg.opacity(0.), 1.),
+                                                ))
+                                        },
+                                    ),
+                                ),
                         ),
                 )
                 .into_any_element()
@@ -5320,35 +5797,40 @@ impl QmtApp {
         // waiting-messages bubble, then the activity bar. Both use the halo
         // look: a page-coloured fill with a feathered page-coloured glow.
         let waiting = !requests.is_empty();
+        let glass = self.glass;
         let halo_pill = |el: Stateful<Div>| {
-            el.flex_none()
+            let el = el
+                .flex_none()
                 .h(px(32.))
                 .rounded(px(8.))
-                .bg(p.bg)
-                .shadow(vec![
-                    BoxShadow {
-                        color: p.bg,
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(4.),
-                        inset: false,
-                    },
-                    BoxShadow {
-                        color: p.bg.opacity(0.85),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(12.),
-                        spread_radius: px(4.),
-                        inset: false,
-                    },
-                    BoxShadow {
-                        color: p.bg.opacity(0.5),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(28.),
-                        spread_radius: px(9.),
-                        inset: false,
-                    },
-                ])
-                .text_color(p.muted)
+                .text_color(p.muted);
+            if glass {
+                // No page colour to glow with: a plain raised pill.
+                return el.bg(p.surface);
+            }
+            el.bg(p.bg).shadow(vec![
+                BoxShadow {
+                    color: p.bg,
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(4.),
+                    inset: false,
+                },
+                BoxShadow {
+                    color: p.bg.opacity(0.85),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(12.),
+                    spread_radius: px(4.),
+                    inset: false,
+                },
+                BoxShadow {
+                    color: p.bg.opacity(0.5),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(28.),
+                    spread_radius: px(9.),
+                    inset: false,
+                },
+            ])
         };
         let activity_bar = (running || waiting).then(|| {
             let tip_cmd = if waiting {
@@ -5454,10 +5936,11 @@ impl QmtApp {
                     cx.notify();
                 }))
         });
-        let can_discard = control && self.store.read(cx).can_discard_queued();
+        let can_discard = control && open.can_discard_queued();
         let waiting_panel = (waiting_open && count > 0).then(|| {
             let rows = pending_inputs.iter().map(|input| {
-                let queue = input.delivery == "queue";
+                let queue =
+                    Delivery::from_input_state_name(&input.delivery) == Some(Delivery::Queue);
                 let mut state = input.state.clone();
                 if let Some(first) = state.get_mut(0..1) {
                     first.make_ascii_uppercase();
@@ -5525,8 +6008,7 @@ impl QmtApp {
                                 })
                                 .child(kit::icon(IconName::X, 13., p.dim))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store
-                                        .update(cx, |s, cx| s.discard_queued_input(&id, cx));
+                                    this.discard_queued(&id, cx);
                                 })),
                         )
                     })
@@ -5596,10 +6078,14 @@ impl QmtApp {
         );
 
         // ---- requests + composer
-        let mcp_notice = self.render_mcp_notice(&p, cx);
+        let mcp_notice = self.mcp_notice(&p, cx);
         let request_cards: Vec<AnyElement> = requests
             .iter()
-            .filter_map(|k| self.request_card(k, false, false, window, cx))
+            .filter_map(|k| {
+                self.cards.update(cx, |cards, cx| {
+                    cards.request_card(k, false, false, window, cx)
+                })
+            })
             .collect();
         // A read-only session (worktree handed off or archived) shows why
         // instead of a composer (desktop `describeSessionAccess`).
@@ -5624,7 +6110,7 @@ impl QmtApp {
         // scrolling under it dissolves instead of meeting a hard edge.
         let halo = vec![
             BoxShadow {
-                color: p.bg,
+                color: if self.glass { p.bg.opacity(0.) } else { p.bg },
                 offset: point(px(0.), px(0.)),
                 blur_radius: px(COMPOSER_HALO_BLUR),
                 spread_radius: px(COMPOSER_HALO_SPREAD),
@@ -5635,8 +6121,7 @@ impl QmtApp {
         let composer = if read_only.is_some() {
             div().id("session-read-only").child(composer).shadow(halo)
         } else {
-            self.drop_zone("session-drop", true, composer, &p, cx)
-                .shadow(halo)
+            super::start::drop_zone("session-drop", composer, &p, cx).shadow(halo)
         };
         // Measure the floating area; re-render once when its height changes.
         let measure = {
@@ -5666,7 +6151,7 @@ impl QmtApp {
             .bottom_0()
             .flex()
             .justify_center()
-            .px_6()
+            .px(px(self.density.row_pad()))
             .pb_4()
             .pt(px(COMPOSER_FADE_H))
             // Fades in over the top strip, then stays a partial veil so text
@@ -5674,13 +6159,16 @@ impl QmtApp {
             .bg(linear_gradient(
                 180.,
                 linear_color_stop(p.bg.opacity(0.), 0.),
-                linear_color_stop(p.bg.opacity(COMPOSER_VEIL), 0.35),
+                linear_color_stop(
+                    p.bg.opacity(if self.glass { 0. } else { COMPOSER_VEIL }),
+                    0.35,
+                ),
             ))
             .child(measure)
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(CHAT_MAX))
+                    .max_w(px(self.density.column_max()))
                     .gap_2()
                     .children(mcp_notice)
                     .children(request_cards)
@@ -5690,11 +6178,14 @@ impl QmtApp {
 
         let chat = v_flex()
             .size_full()
+            .when(self.density.is_compact(), |el| {
+                el.font_family(kit::SYSTEM_UI)
+            })
             .when_some(error.filter(|_| !empty), |el, err| {
                 el.child(
                     h_flex()
                         .flex_none()
-                        .mx_6()
+                        .mx(px(self.density.row_pad()))
                         .gap_2()
                         .px_3()
                         .py_1p5()
@@ -5718,6 +6209,12 @@ impl QmtApp {
             )
             .into_any_element();
         self.with_turn_diff(chat, window, cx)
+    }
+}
+
+impl Render for SessionPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_session(window, cx)
     }
 }
 
@@ -6065,7 +6562,7 @@ mod perf {
     use gpui_kit::test::TestWindowExt as _;
     use serde_json::json;
 
-    use super::super::{Page, QmtApp};
+    use super::super::session_pane::open_pane_for_test;
     use crate::session::SessionView;
 
     /// A running turn of `calls` shell calls with realistic JSON results.
@@ -6102,22 +6599,15 @@ mod perf {
             gpui_kit::init(cx);
             crate::theme::apply(true, "orange", cx);
         });
-        let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| {
-                let mut store = crate::store::automations::schedule_ui_fixture();
-                store.session = Some(big_session(1600));
-                store
-            });
-            gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| QmtApp::new(store, window, cx))
-            })
-            .unwrap()
-        });
+        let (handle, app) = open_pane_for_test(
+            cx,
+            crate::store::automations::schedule_ui_fixture(),
+            big_session(1600),
+        );
         cx.update_window(handle, |_, window, cx| {
-            app.update(cx, |app, cx| {
-                app.go(Page::Session, cx);
+            app.update(cx, |app, _| {
                 // Expand the work group ("+N previous work entries").
-                app.expanded_items.insert("tool-t0".into());
+                app.expanded.insert("tool-t0".into());
             });
             for _ in 0..3 {
                 window.refresh();
@@ -6142,15 +6632,356 @@ mod perf {
 }
 
 #[cfg(test)]
+mod compact_tests {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    use super::super::session_pane::{SessionPane, open_pane_with_density_for_test};
+    use super::Density;
+    use super::perf::big_session;
+
+    fn pane(
+        cx: &mut gpui_kit::TestAppContext,
+        calls: usize,
+        density: Density,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<SessionPane>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, pane) = open_pane_with_density_for_test(
+            cx,
+            crate::store::automations::schedule_ui_fixture(),
+            big_session(calls),
+            density,
+        );
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        (handle, pane)
+    }
+
+    fn expand(
+        cx: &mut gpui_kit::TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        pane: &gpui_kit::Entity<SessionPane>,
+        key: &str,
+    ) {
+        cx.update_window(handle, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.expanded.insert(key.into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    // quick-panel / Tool call in the panel
+    #[gpui_kit::test]
+    fn compact_tool_call_is_one_row_until_expanded(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, pane) = pane(cx, 1, Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let row = vcx.debug_bounds("tool-row-t0").expect("the tool row shows");
+        assert!(
+            f32::from(row.size.height) <= 32.,
+            "one line, got {:?}",
+            row.size.height
+        );
+        assert!(
+            vcx.debug_bounds("tool-card-t0").is_none(),
+            "no output card while collapsed"
+        );
+        drop(vcx);
+
+        expand(cx, handle, &pane, "t0");
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(
+            vcx.debug_bounds("tool-card-t0").is_some(),
+            "expands inline when asked"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn compact_running_group_folds_to_its_last_block(cx: &mut gpui_kit::TestAppContext) {
+        // Comfortable shows up to three calls of a running turn whole.
+        let (handle, _pane) = pane(cx, 3, Density::Comfortable);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        for id in ["tool-row-t0", "tool-row-t1", "tool-row-t2"] {
+            assert!(vcx.debug_bounds(id).is_some(), "{id} in a comfortable pane");
+        }
+        drop(vcx);
+
+        // Compact keeps only the last one behind "+N previous work entries".
+        let (handle, _pane) = pane(cx, 3, Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("tool-row-t0").is_none());
+        assert!(vcx.debug_bounds("tool-row-t1").is_none());
+        assert!(vcx.debug_bounds("tool-row-t2").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn compact_composer_has_no_options_panel(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _main) = pane(cx, 1, Density::Comfortable);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(
+            vcx.debug_bounds("composer-options").is_some(),
+            "main window options"
+        );
+        let comfortable_h = vcx
+            .debug_bounds("composer-input")
+            .expect("input")
+            .size
+            .height;
+        drop(vcx);
+        let (handle, _pane) = pane(cx, 1, Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("composer-options").is_none());
+        let compact_h = vcx
+            .debug_bounds("composer-input")
+            .expect("input")
+            .size
+            .height;
+        assert!(
+            compact_h < comfortable_h,
+            "{compact_h:?} vs {comfortable_h:?}"
+        );
+    }
+
+    // quick-panel / Compact conversation: the HUD's composer floats and is lit
+    // along its top edge, where the main window's has a border and no highlight.
+    #[gpui_kit::test]
+    fn compact_composer_is_a_pill_with_a_top_highlight(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _main) = pane(cx, 1, Density::Comfortable);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("composer-highlight").is_none());
+        drop(vcx);
+        let (handle, _pane) = pane(cx, 1, Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let line = vcx
+            .debug_bounds("composer-highlight")
+            .expect("the highlight shows");
+        assert_eq!(f32::from(line.size.height), 1.);
+    }
+
+    /// An assistant reply from a view, and a render context at `density`.
+    fn agent_reply(
+        cx: &mut gpui_kit::TestAppContext,
+        density: Density,
+    ) -> (crate::session::Item, super::RenderCtx) {
+        use std::collections::{HashMap, HashSet};
+        let (_, pane) = pane(cx, 1, density);
+        let mut view = crate::session::SessionView::new("test-agent", "s", "/w", "t");
+        view.apply(&serde_json::json!({ "sessionUpdate": "agent_message_chunk",
+            "messageId": "a1", "content": { "type": "text", "text": "an answer" } }));
+        let item = view.items.last().expect("the reply").clone();
+        let rc = cx.update(|cx| super::RenderCtx {
+            p: *crate::theme::palette(cx),
+            syntax: gpui_kit::component::ActiveTheme::theme(&*cx)
+                .highlight_theme
+                .clone(),
+            weak: pane.downgrade(),
+            density,
+            smooth_scroll: Default::default(),
+            expanded: HashSet::new(),
+            running: false,
+            last_turn_start: 0,
+            last_ix: 0,
+            turn_end: HashMap::new(),
+            copied: None,
+            block_scrolls: Default::default(),
+            cwd: String::new(),
+            turn_user: HashMap::new(),
+            undo_ready: false,
+            undoable: HashSet::new(),
+            redo_target: None,
+            fork_points: HashSet::new(),
+            diff_open: None,
+            reverted_from: None,
+            agent_id: "test-agent".into(),
+            stream_fade: false,
+            md: Default::default(),
+            tool_content: false,
+            developer: false,
+        });
+        (item, rc)
+    }
+
+    // quick-panel / Looks like a HUD: assistant text without a card.
+    #[gpui_kit::test]
+    fn compact_assistant_message_has_no_card(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::Styled as _;
+        let (item, rc) = agent_reply(cx, Density::Compact);
+        let super::ItemKind::Agent { text } = &item.kind else {
+            panic!("an assistant message");
+        };
+        let mut message = super::agent_message(0, &item, text, None, &rc);
+        let style = message.style();
+        assert!(style.background.is_none(), "no fill");
+        assert!(style.border_color.is_none(), "no border");
+        assert!(style.corner_radii.top_left.is_none(), "no rounded card");
+    }
+
+    #[gpui_kit::test]
+    fn compact_prose_uses_the_system_font_at_hud_size(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::Styled as _;
+        for (density, size) in [(Density::Compact, Some(14.5)), (Density::Comfortable, None)] {
+            let (item, rc) = agent_reply(cx, density);
+            let super::ItemKind::Agent { text } = &item.kind else {
+                panic!("an assistant message");
+            };
+            let mut message = super::agent_message(0, &item, text, None, &rc);
+            let text_style = &message.style().text;
+            let font = text_style.font_family.as_ref().map(|f| f.as_ref());
+            match size {
+                Some(px) => {
+                    assert_eq!(font, Some(crate::ui::kit::SYSTEM_UI));
+                    assert_eq!(
+                        text_style.font_size,
+                        Some(gpui_kit::AbsoluteLength::Pixels(gpui_kit::px(px)))
+                    );
+                }
+                None => assert_eq!(font, None, "the main window keeps the theme's font"),
+            }
+        }
+    }
+
+    // quick-panel / Transcript uses the panel's colours
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui_kit::test]
+    fn a_pane_given_the_hud_palette_paints_its_transcript_with_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::quick::hud::hud_palette;
+        let (handle, pane) = pane(cx, 2, Density::Compact);
+        let global = cx.update(|cx| *crate::theme::palette(cx));
+        let hud = hud_palette(&crate::theme::Palette::light(), false);
+        assert_ne!(hud, global);
+        let render = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.refresh();
+                window.render_frame(cx)
+            })
+            .unwrap()
+        };
+        let unset = pane.read_with(cx, |p, _| p.transcript.sigs.clone());
+        assert!(!unset.is_empty());
+
+        // A pane without a palette uses the app's.
+        assert_eq!(pane.read_with(cx, |p, cx| p.palette(cx)), global);
+
+        // With one, the rows are built from it: their signatures change.
+        pane.update(cx, |p, cx| p.set_palette(Some(hud), cx));
+        render(cx);
+        assert_eq!(pane.read_with(cx, |p, cx| p.palette(cx)), hud);
+        let themed = pane.read_with(cx, |p, _| p.transcript.sigs.clone());
+        assert_ne!(themed, unset, "rows were rebuilt with the HUD palette");
+
+        // Back to none: the app's palette again, the same rows as before.
+        pane.update(cx, |p, cx| p.set_palette(None, cx));
+        render(cx);
+        assert_eq!(pane.read_with(cx, |p, cx| p.palette(cx)), global);
+        assert_eq!(pane.read_with(cx, |p, _| p.transcript.sigs.clone()), unset);
+    }
+
+    // quick-panel / Transcript uses the panel's colours: code and markdown take
+    // the palette they are given instead of reading the app's.
+    #[test]
+    fn code_markdown_and_diffs_take_the_palette_they_are_given() {
+        use gpui_kit::Styled as _;
+        let mut p = crate::theme::Palette::dark();
+        p.bg = gpui_kit::red();
+        p.muted = gpui_kit::green();
+        p.border = gpui_kit::blue();
+        let mut block = super::code_block("let x = 1;".into(), &p);
+        let style = block.style();
+        assert_eq!(style.background, Some(p.bg.into()));
+        assert_eq!(style.border_color, Some(p.border));
+        assert_eq!(style.text.color, Some(p.muted));
+
+        // The markdown view is handed the palette (no global read to override).
+        let md = super::md::Kept::default().markdown("m", "`code`", &p);
+        assert_eq!(md.palette(), &p);
+
+        // Diff rows are built from the palette: tinted from its success and
+        // danger colours, so they are as many rows as lines either way.
+        let diff = crate::session::Diff {
+            path: "a.rs".into(),
+            old: Some("a\nb\n".into()),
+            new: "a\nc\n".into(),
+            old_start: None,
+            new_start: None,
+            snippet: false,
+        };
+        let (rows, adds, dels, _) = super::diff_rows(&diff, 50, &p);
+        assert_eq!((adds, dels), (1, 1));
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn compact_limits_are_below_comfortable() {
+        let (c, k) = (Density::Comfortable, Density::Compact);
+        assert!(k.output_lines() < c.output_lines());
+        assert!(k.read_lines() < c.read_lines());
+        assert!(k.diff_lines() < c.diff_lines());
+        assert!(k.diff_block_h() < c.diff_block_h());
+        assert!(k.column_max() < c.column_max());
+        assert!(k.hover_actions() && !c.hover_actions());
+        assert!(!k.has_panels() && c.has_panels());
+        // One line at rest, growing to six; the main window's composer is
+        // taller at rest.
+        assert_eq!(k.composer_lines(), (1, 6));
+        assert!(k.composer_lines().0 < c.composer_lines().0);
+        assert!(k.composer_lines().1 < c.composer_lines().1);
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "timing measurement, run by hand"]
+    fn compact_frame_cost_stays_within_comfortable(cx: &mut gpui_kit::TestAppContext) {
+        fn measure(cx: &mut gpui_kit::TestAppContext, density: Density) -> f64 {
+            let (handle, pane) = pane(cx, 1600, density);
+            cx.update_window(handle, |_, window, cx| {
+                pane.update(cx, |pane, _| {
+                    pane.expanded.insert("tool-t0".into());
+                });
+                for _ in 0..3 {
+                    window.refresh();
+                    window.render_frame(cx);
+                }
+                let frames = 60;
+                let started = std::time::Instant::now();
+                for _ in 0..frames {
+                    pane.update(cx, |pane, _| {
+                        pane.transcript.list.scroll_by(gpui_kit::px(-40.))
+                    });
+                    window.refresh();
+                    window.render_frame(cx);
+                }
+                started.elapsed().as_secs_f64() * 1000. / f64::from(frames)
+            })
+            .unwrap()
+        }
+        let comfortable = measure(cx, Density::Comfortable);
+        let compact = measure(cx, Density::Compact);
+        eprintln!(
+            "compact_frame_cost: comfortable {comfortable:.1} ms/frame, compact {compact:.1} ms/frame"
+        );
+        assert!(
+            compact <= comfortable * 1.1,
+            "compact {compact:.1} ms vs comfortable {comfortable:.1} ms"
+        );
+    }
+}
+
+#[cfg(test)]
 mod split_tests {
     use serde_json::{Value, json};
 
-    use super::super::{Page, QmtApp};
+    use super::super::session_pane::{SessionPane, open_pane_for_test};
     use super::perf::big_session;
 
     struct Harness {
         handle: gpui_kit::AnyWindowHandle,
-        app: gpui_kit::Entity<QmtApp>,
+        app: gpui_kit::Entity<SessionPane>,
         rpc: std::rc::Rc<crate::rpc::RpcClient>,
         requests: async_channel::Receiver<String>,
     }
@@ -6160,7 +6991,6 @@ mod split_tests {
         view: crate::session::SessionView,
         methods: Value,
     ) -> Harness {
-        use gpui_kit::AppContext as _;
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::apply(true, "orange", cx);
@@ -6168,14 +6998,7 @@ mod split_tests {
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
         store.runtime_mut_for_test("test-agent").capabilities = Some(json!({ "methods": methods }));
-        store.session = Some(view);
-        let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
-            gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| QmtApp::new(store, window, cx))
-            })
-            .unwrap()
-        });
+        let (handle, app) = open_pane_for_test(cx, store, view);
         Harness {
             handle,
             app,
@@ -6190,23 +7013,22 @@ mod split_tests {
         use gpui_kit::test::TestWindowExt as _;
         let Harness { handle, app, .. } = app_with(cx, big_session(300), json!([]));
         cx.update_window(handle, |_, window, cx| {
-            app.update(cx, |app, cx| app.go(Page::Session, cx));
             window.render_frame(cx);
             // Running and collapsed: the user prompt, then one row with the
             // "+N previous" toggle and the last two calls.
-            let rows = |app: &gpui_kit::Entity<QmtApp>, cx: &mut gpui_kit::App| {
+            let rows = |app: &gpui_kit::Entity<SessionPane>, cx: &mut gpui_kit::App| {
                 app.read(cx).transcript.list.item_count()
             };
             assert_eq!(rows(&app, cx), 2);
             app.update(cx, |app, cx| {
-                app.expanded_items.insert("tool-t0".into());
+                app.expanded.insert("tool-t0".into());
                 cx.notify();
             });
             window.render_frame(cx);
             // Expanded: the prompt, the header, and a row per call.
             assert_eq!(rows(&app, cx), 1 + 1 + 300);
             app.update(cx, |app, cx| {
-                app.expanded_items.remove("tool-t0");
+                app.expanded.remove("tool-t0");
                 cx.notify();
             });
             window.render_frame(cx);
@@ -6242,13 +7064,11 @@ mod split_tests {
             requests,
         } = app_with(cx, view, json!(["querymt/session/toolContent"]));
         cx.update_window(handle, |_, window, cx| {
-            app.update(cx, |app, cx| {
-                app.go(Page::Session, cx);
-                app.expanded_items.insert("t1".into());
+            app.update(cx, |app, _| {
+                app.expanded.insert("t1".into());
             });
             window.render_frame(cx);
-            let store = app.read(cx).store.clone();
-            store.update(cx, |s, cx| s.load_tool_content("t1", "result", cx));
+            app.update(cx, |app, cx| app.load_tool_content("t1", "result", cx));
             window.render_frame(cx);
         })
         .unwrap();
@@ -6262,13 +7082,7 @@ mod split_tests {
         rpc.handle(&json!({ "id": request["id"], "result": { "content": full } }).to_string());
         cx.run_until_parked();
         cx.update(|cx| {
-            let store = app.read(cx).store.read(cx);
-            let call = store
-                .session
-                .as_ref()
-                .unwrap()
-                .truncated_tool("t1")
-                .unwrap();
+            let call = app.read(cx).view(cx).unwrap().truncated_tool("t1").unwrap();
             assert_eq!(call.truncated_result, None);
             assert_eq!(call.pretty_output(), "the whole output");
             assert!(call.fetch.is_none());
@@ -6283,7 +7097,7 @@ mod split_tests {
 mod perf_export {
     use gpui_kit::test::TestWindowExt as _;
 
-    use super::super::{Page, QmtApp};
+    use super::super::session_pane::open_pane_for_test;
     use super::perf::big_session;
 
     #[gpui_kit::test]
@@ -6298,21 +7112,14 @@ mod perf_export {
             gpui_kit::init(cx);
             crate::theme::apply(true, "orange", cx);
         });
-        let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| {
-                let mut store = crate::store::automations::schedule_ui_fixture();
-                store.session = Some(big_session(1600));
-                store
-            });
-            gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| QmtApp::new(store, window, cx))
-            })
-            .unwrap()
-        });
+        let (handle, app) = open_pane_for_test(
+            cx,
+            crate::store::automations::schedule_ui_fixture(),
+            big_session(1600),
+        );
         cx.update_window(handle, |_, window, cx| {
-            app.update(cx, |app, cx| {
-                app.go(Page::Session, cx);
-                app.expanded_items.insert("tool-t0".into());
+            app.update(cx, |app, _| {
+                app.expanded.insert("tool-t0".into());
             });
             for _ in 0..120 {
                 app.update(cx, |app, _| {

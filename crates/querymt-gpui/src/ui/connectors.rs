@@ -12,8 +12,10 @@ use gpui_kit::*;
 use super::kit::{accent_btn, flat_btn, subtle};
 use super::mesh::panel;
 use super::{QmtApp, kit};
+use crate::store::AgentsStore;
 use crate::store::{OAuthFlow, ProviderAuth};
 use crate::theme::Palette;
+use gpui_kit::component::input::InputState;
 
 fn signed_in(server: &ProviderAuth) -> bool {
     server.oauth_status.as_deref() == Some("connected")
@@ -31,218 +33,62 @@ fn sorted(mut servers: Vec<ProviderAuth>) -> Vec<ProviderAuth> {
     servers
 }
 
-impl QmtApp {
-    /// Finish a running OAuth flow of agent `agent` in place: paste the
-    /// callback (redirect flows) or confirm the device approval.
-    pub(super) fn oauth_flow_box(
-        &self,
-        agent: &str,
-        flow: &OAuthFlow,
-        key: SharedString,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let (a, a2) = (agent.to_string(), agent.to_string());
-        v_flex()
-            .gap_2()
-            .p_3()
-            .rounded(px(8.))
-            .bg(subtle(p).1)
-            .child(div().text_size(px(11.8)).text_color(p.muted).child(if flow.needs_code {
-                "A browser window opened. After approving, paste the callback URL or code here."
-            } else {
-                "A browser window opened. Approve the device there, then press Done."
-            }))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .when(flow.needs_code, |el| {
-                        el.child(Input::new(&self.oauth_code).small().flex_1())
-                    })
-                    .when(!flow.needs_code, |el| el.child(div().flex_1()))
-                    .child(
-                        flat_btn(kit::keyed("mcp-oauth-cancel", key.clone()), true, true, p)
-                            .child("Cancel")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |s, cx| s.cancel_oauth(&a, cx))
-                            })),
-                    )
-                    .child(
-                        accent_btn(kit::keyed("mcp-oauth-done", key), true, true, p)
-                            .child("Done")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let code = this.oauth_code.read(cx).value().trim().to_string();
-                                this.oauth_code.update(cx, |s, cx| {
-                                    s.set_value(SharedString::default(), window, cx)
-                                });
-                                this.store.update(cx, |s, cx| s.complete_oauth(&a2, code, cx));
-                            })),
-                    ),
-            )
-    }
-
-    /// Above the composer: MCP servers this session left out, with sign-in
-    /// (desktop `session-mcp-auth-notice`). Hidden for read-only sessions.
-    pub(super) fn render_mcp_notice(
-        &self,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let (agent, cwd, oauth, skipped) = {
-            let store = self.store.read(cx);
-            let view = store.session.as_ref().filter(|v| v.access.is_none())?;
-            let (agent, cwd) = (view.agent_id.clone(), view.cwd.clone());
-            let skipped: Vec<_> = store
-                .skipped_mcp()
-                .into_iter()
-                .map(|s| {
-                    let signed_in = store.mcp_signed_in(&agent, &s.provider);
-                    let busy = store.is_pending(&agent, &format!("oauth:{}", s.provider));
-                    (s, signed_in, busy)
-                })
-                .collect();
-            let oauth = store.runtime(&agent).and_then(|rt| rt.oauth.clone());
-            (agent, cwd, oauth, skipped)
-        };
-        if skipped.is_empty() {
-            return None;
-        }
-        let rows: Vec<AnyElement> = skipped
-            .iter()
-            .map(|(server, signed_in, busy)| {
-                let (signed_in, busy) = (*signed_in, *busy);
-                let key: SharedString = server.server.clone().into();
-                let signing = oauth.as_ref().filter(|f| f.provider == server.provider);
-                let text = if signed_in {
-                    format!(
-                        "Signed in to \"{}\". Start a new session to use its tools.",
-                        server.server
-                    )
+/// Finish a running OAuth flow of agent `agent` in place: paste the
+/// callback (redirect flows) or confirm the device approval.
+pub(super) fn oauth_flow_box(
+    store: &Entity<AgentsStore>,
+    oauth_code: &Entity<InputState>,
+    agent: &str,
+    flow: &OAuthFlow,
+    key: SharedString,
+    p: &Palette,
+) -> Div {
+    let (a, a2) = (agent.to_string(), agent.to_string());
+    let (cancel_store, done_store, code_input) = (store.clone(), store.clone(), oauth_code.clone());
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded(px(8.))
+        .bg(subtle(p).1)
+        .child(
+            div()
+                .text_size(px(11.8))
+                .text_color(p.muted)
+                .child(if flow.needs_code {
+                    "A browser window opened. After approving, paste the callback URL or code here."
                 } else {
-                    server.describe()
-                };
-                let tone = if server.error.is_some() {
-                    p.warn
-                } else {
-                    p.accent
-                };
-                let actions = h_flex()
-                    .flex_none()
-                    .gap_1p5()
-                    .when(signed_in, |el| {
-                        let (agent, cwd) = (agent.clone(), cwd.clone());
-                        el.child(
-                            accent_btn(kit::keyed("mcp-notice-new", key.clone()), true, true, p)
-                                .child("New session")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.new_session_in(cwd.clone(), agent.clone(), window, cx)
-                                })),
-                        )
-                    })
-                    .when(!signed_in, |el| {
-                        let enabled = signing.is_none() && oauth.is_none() && !busy;
-                        let (agent, provider) = (agent.clone(), server.provider.clone());
-                        let selector = format!("mcp-notice-signin-{}", server.server);
-                        el.child(
-                            flat_btn(
-                                kit::keyed("mcp-notice-signin", key.clone()),
-                                enabled,
-                                true,
-                                p,
-                            )
-                            .debug_selector(move || selector)
-                            .child(kit::icon(IconName::LogIn, 14., p.text))
-                            .child(if server.error.is_some() {
-                                "Retry sign-in"
-                            } else {
-                                "Sign in"
-                            })
-                            .when(enabled, |el| {
-                                el.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store
-                                        .update(cx, |s, cx| s.start_oauth(&agent, &provider, cx))
-                                }))
-                            }),
-                        )
-                        .when(server.error.is_some(), |el| {
-                            el.child(
-                                flat_btn(
-                                    kit::keyed("mcp-notice-settings", key.clone()),
-                                    true,
-                                    true,
-                                    p,
-                                )
-                                .child("Settings")
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.settings_tab =
-                                            super::settings::SettingsTab::Connectors;
-                                        this.go(super::Page::Settings, cx);
-                                    },
-                                )),
-                            )
-                        })
-                    })
-                    .child({
-                        let name = server.server.clone();
-                        kit::icon_button(
-                            kit::keyed("mcp-notice-dismiss", key.clone()),
-                            IconName::X,
-                            "Dismiss",
-                        )
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store
-                                .update(cx, |s, cx| s.dismiss_skipped_mcp(&name, cx))
-                        }))
-                    });
-                v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2p5()
-                            .child(kit::icon(
-                                if signed_in {
-                                    IconName::CircleCheck
-                                } else {
-                                    IconName::Plug
-                                },
-                                15.,
-                                if signed_in { p.success } else { tone },
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .text_color(p.text)
-                                    .child(text),
-                            )
-                            .child(actions),
-                    )
-                    .children(
-                        signing.map(|flow| self.oauth_flow_box(&agent, flow, key.clone(), p, cx)),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        Some(
-            v_flex()
-                .id("mcp-notice")
-                .debug_selector(|| "mcp-notice".into())
-                .w_full()
-                .gap_2()
-                .px_3()
-                .py_2p5()
-                .rounded(px(12.))
-                .bg(p.surface)
-                .border_1()
-                .border_color(p.border)
-                .children(rows)
-                .into_any_element(),
+                    "A browser window opened. Approve the device there, then press Done."
+                }),
         )
-    }
+        .child(
+            h_flex()
+                .gap_2()
+                .when(flow.needs_code, |el| {
+                    el.child(Input::new(oauth_code).small().flex_1())
+                })
+                .when(!flow.needs_code, |el| el.child(div().flex_1()))
+                .child(
+                    flat_btn(kit::keyed("mcp-oauth-cancel", key.clone()), true, true, p)
+                        .child("Cancel")
+                        .on_click(move |_, _, cx| {
+                            cancel_store.update(cx, |s, cx| s.cancel_oauth(&a, cx))
+                        }),
+                )
+                .child(
+                    accent_btn(kit::keyed("mcp-oauth-done", key), true, true, p)
+                        .child("Done")
+                        .on_click(move |_, window, cx| {
+                            let code = code_input.read(cx).value().trim().to_string();
+                            code_input.update(cx, |s, cx| {
+                                s.set_value(SharedString::default(), window, cx)
+                            });
+                            done_store.update(cx, |s, cx| s.complete_oauth(&a2, code, cx));
+                        }),
+                ),
+        )
+}
 
+impl QmtApp {
     /// The primary agent has MCP servers to sign in to: the tab is shown.
     pub(super) fn has_connectors(&self, cx: &App) -> bool {
         let store = self.store.read(cx);
@@ -355,7 +201,7 @@ impl QmtApp {
                 };
                 // Finish the OAuth flow in place, like a provider's.
                 let flow = oauth.as_ref().filter(|_| signing).map(|flow| {
-                    self.oauth_flow_box(&agent, flow, key.clone(), p, cx)
+                    oauth_flow_box(&self.store, &self.oauth_code, &agent, flow, key.clone(), p)
                         .mx(px(12.))
                         .mb(px(12.))
                 });
@@ -472,14 +318,13 @@ mod tests {
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (_rpc, requests) = store.rpc_for_test("test-agent");
-        store.session = Some(crate::session::SessionView::new(
-            "test-agent",
-            "s",
-            "/w",
-            "S",
-        ));
+        let main_view = crate::session::SessionView::new("test-agent", "s", "/w", "S");
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -523,8 +368,9 @@ mod tests {
                 s.runtime_mut_for_test("test-agent").mcp_servers =
                     vec![server("linear", "connected")];
                 assert!(s.mcp_signed_in("test-agent", "mcp:linear"));
-                s.dismiss_skipped_mcp("linear", cx);
-                assert!(s.skipped_mcp().is_empty(), "dismissed");
+                let key = crate::session::open::SessionKey::new("test-agent", "s");
+                s.dismiss_skipped_mcp(&key, "linear", cx);
+                assert!(s.skipped_mcp(&key).is_empty(), "dismissed");
             })
         });
     }

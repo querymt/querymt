@@ -10,10 +10,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
+use std::collections::HashMap;
+
 use super::mesh::panel;
 use super::{Page, QmtApp, kit};
+use crate::session::open::{SessionKey, SessionRef};
 use crate::store::{
-    FieldDraft, FieldKind, FieldOption, FormField, PendingRequest, RequestKind, RequestStatus,
+    AgentsStore, FieldDraft, FieldKind, FieldOption, FormField, PendingRequest, RequestKind,
+    RequestStatus,
 };
 use crate::theme::{Palette, palette};
 use crate::util::{now_ms, workspace_name};
@@ -249,7 +253,80 @@ fn value_text(v: &Value) -> String {
     }
 }
 
-impl QmtApp {
+/// Which requests a surface lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RequestFilter {
+    /// Every request, newest first (the Inbox page).
+    All,
+    /// The pending requests of one session (a session pane).
+    Session(SessionKey),
+}
+
+/// What the cards ask of the surface that shows them.
+#[derive(Clone, Debug)]
+pub(super) enum RequestCardsEvent {
+    /// "Open session" on an Inbox card.
+    OpenSession(SessionRef),
+}
+
+/// The state of the request cards of one surface: the form inputs the user
+/// types into and which cards are folded. The Inbox page and every session
+/// pane own one, so they never share a half-typed answer's input.
+pub(super) struct RequestCards {
+    store: Entity<AgentsStore>,
+    form_inputs: HashMap<(String, usize, bool), (Entity<InputState>, Subscription)>,
+    /// Cards the user expanded / collapsed (others use the default).
+    collapsed: HashMap<String, bool>,
+    _store: Subscription,
+}
+
+impl EventEmitter<RequestCardsEvent> for RequestCards {}
+
+impl RequestCards {
+    pub(super) fn new(store: Entity<AgentsStore>, cx: &mut Context<Self>) -> Self {
+        let observed = cx.observe(&store, |this, store, cx| {
+            // Drop inputs of requests that left the inbox.
+            let s = store.read(cx);
+            this.form_inputs
+                .retain(|(k, _, _), _| s.requests.iter().any(|r| &r.key == k));
+            this.collapsed
+                .retain(|k, _| s.requests.iter().any(|r| &r.key == k));
+            cx.notify();
+        });
+        Self {
+            store,
+            form_inputs: HashMap::new(),
+            collapsed: HashMap::new(),
+            _store: observed,
+        }
+    }
+
+    /// Keys of the requests `filter` lists.
+    pub(super) fn keys(&self, filter: &RequestFilter, cx: &App) -> Vec<String> {
+        let store = self.store.read(cx);
+        match filter {
+            RequestFilter::All => {
+                let mut keys: Vec<(f64, String)> = store
+                    .requests
+                    .iter()
+                    .map(|r| (r.received_ms, r.key.clone()))
+                    .collect();
+                keys.sort_by(|a, b| b.0.total_cmp(&a.0));
+                keys.into_iter().map(|(_, key)| key).collect()
+            }
+            RequestFilter::Session(session) => store
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.is_pending()
+                        && r.agent_id == session.agent.as_str()
+                        && r.session_id.as_deref() == Some(session.session.as_str())
+                })
+                .map(|r| r.key.clone())
+                .collect(),
+        }
+    }
+
     /// Text input of one field (`custom`: its "Custom answer…" input). Typing
     /// updates the request's draft in the store, so nothing is lost when the
     /// card re-renders or the question is re-delivered.
@@ -324,7 +401,7 @@ impl QmtApp {
     }
 
     /// Run a card button: a permission option, or accept / decline / cancel.
-    fn request_action(&mut self, key: &str, action: &str, cx: &mut Context<Self>) {
+    pub(super) fn request_action(&mut self, key: &str, action: &str, cx: &mut Context<Self>) {
         let Some(req) = self.store.read(cx).requests.iter().find(|r| r.key == key) else {
             return;
         };
@@ -602,7 +679,7 @@ impl QmtApp {
 
         let collapsed = page
             && self
-                .request_collapsed
+                .collapsed
                 .get(key)
                 .copied()
                 .unwrap_or(collapsed_default);
@@ -635,10 +712,7 @@ impl QmtApp {
                     p.muted,
                 ))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let c = this
-                        .request_collapsed
-                        .entry(k.clone())
-                        .or_insert(collapsed_default);
+                    let c = this.collapsed.entry(k.clone()).or_insert(collapsed_default);
                     *c = !*c;
                     cx.notify();
                 }))
@@ -696,12 +770,16 @@ impl QmtApp {
                 .child("Open session")
                 .child(kit::icon(IconName::ArrowUpRight, 12., p.text))
                 .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |_, _, _, cx| {
                     let (cwd, title) = summary
                         .as_ref()
                         .map(|s| (s.cwd.clone(), s.display_title()))
                         .unwrap_or_default();
-                    this.open_session(&agent, &sid, &cwd, &title, cx);
+                    cx.emit(RequestCardsEvent::OpenSession(SessionRef {
+                        key: SessionKey::new(&agent, &sid),
+                        cwd,
+                        title,
+                    }));
                 }))
         });
         let end = h_flex()
@@ -886,7 +964,9 @@ impl QmtApp {
                 .into_any_element(),
         )
     }
+}
 
+impl QmtApp {
     pub(super) fn render_inbox(
         &mut self,
         window: &mut Window,
@@ -896,12 +976,7 @@ impl QmtApp {
         let t = tones(&p);
         let store = self.store.read(cx);
         // Newest first; answered cards stay listed below the open ones' time order.
-        let mut keys: Vec<(f64, String)> = store
-            .requests
-            .iter()
-            .map(|r| (r.received_ms, r.key.clone()))
-            .collect();
-        keys.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let keys = self.inbox_cards.read(cx).keys(&RequestFilter::All, cx);
         let pending = store.pending_request_count();
         let disconnected = store.connected_ids().is_empty();
 
@@ -962,7 +1037,11 @@ impl QmtApp {
             let cards: Vec<AnyElement> = keys
                 .iter()
                 .enumerate()
-                .filter_map(|(ix, (_, k))| self.request_card(k, true, ix >= 3, window, cx))
+                .filter_map(|(ix, k)| {
+                    self.inbox_cards.update(cx, |cards, cx| {
+                        cards.request_card(k, true, ix >= 3, window, cx)
+                    })
+                })
                 .collect();
             v_flex().gap_3().children(cards).into_any_element()
         };

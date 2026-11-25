@@ -301,7 +301,7 @@ impl QmtApp {
     /// `agent/session` of the session open in the transcript.
     fn current_tab(&self, cx: &App) -> Option<String> {
         (self.page == Page::Session)
-            .then(|| self.store.read(cx).session.as_ref())
+            .then(|| self.main_view(cx))
             .flatten()
             .map(|v| format!("{}/{}", v.agent_id, v.session_id))
     }
@@ -857,7 +857,7 @@ impl QmtApp {
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    this.session_menu_open = false;
+                    this.pane.update(cx, |pane, _| pane.menu_open = false);
                     this.side.menu = Some(SideMenu {
                         session: menu_s.clone(),
                         list,
@@ -1537,7 +1537,7 @@ mod ui_tests {
             assert!(app.side.menu.is_none());
             assert_eq!(app.page, crate::ui::Page::Session);
             let store = app.store.read(cx);
-            let view = store.session.as_ref().expect("fork open");
+            let view = app.main_view(cx).expect("fork open");
             assert_eq!(
                 (view.session_id.as_str(), view.title.as_str()),
                 ("f1", "Fork of Session s2")
@@ -1560,7 +1560,7 @@ mod ui_tests {
         app.read_with(cx, |app, cx| {
             let menu = app.side.menu.as_ref().expect("menu stays open");
             assert!(menu.fork_error.as_deref().unwrap().contains("boom"));
-            assert!(app.store.read(cx).session.is_none());
+            assert!(app.main_view(cx).is_none());
         });
         assert!(has(handle, "side-fork-error", cx));
     }

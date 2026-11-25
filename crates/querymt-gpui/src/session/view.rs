@@ -673,7 +673,6 @@ impl SessionView {
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
             title: self.title.clone(),
-            parent: self.parent.clone(),
             loading: self.loading,
             error: self.error.clone(),
             error_details: self.error_details.clone(),

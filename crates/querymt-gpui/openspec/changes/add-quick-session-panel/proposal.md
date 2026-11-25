@@ -1,0 +1,37 @@
+# Proposal
+
+## Why
+
+QueryMT is used for long sessions in the main window, but many interactions are short: ask a quick question, nudge a running session, answer its permission prompt. Today each of them means bringing up the whole app and replacing the session that is open there, because the app can hold only one open session (`AgentsStore.session: Option<SessionView>`) and starting a session (`launch`) takes over the main window. A hotkey-summoned floating panel that holds its own conversation, independent of the main window, makes these interactions fast without disturbing the work open in the main window.
+
+## What Changes
+
+- **Several sessions open at once.** Each open session is its own `Entity<OpenSession>` holding its `SessionView`. The store routes agent inputs to every open session by `SessionKey` (agent id + session id) through a weak index, so a session stays open exactly as long as some surface shows it. The `session: Option<SessionView>` slot is removed.
+- **Surfaces choose what they show.** `launch` creates and returns the new session instead of installing it in the main window; `open` returns the open session for a key, reusing it when it is already open. The main window and the quick panel each hold their own session.
+- **One session pane for both windows.** The session view (transcript, composer, activity dock, requests for that session) is extracted from `QmtApp` into a `SessionPane` entity with a density (`Comfortable` for the main window, `Compact` for the panel). The transcript row renderers stay shared. App navigation (open a child session, fork, image viewer, open in main window) leaves the pane as events.
+- **Child/parent navigation moves out of the data model.** `SessionView.parent` is replaced by a per-pane back stack, so two panes can navigate independently.
+- **Quick panel.** A floating window summoned by a global hotkey, on top of other apps, closed by Esc or by losing focus. It starts a new quick chat (a normal session on the primary agent) or picks any existing session to converse in, shows that session's pending permission and input requests inline, and can hand its session to the main window. Reopening the panel returns to its last conversation.
+- **A HUD, not a small main window.** The panel is always dark, whatever the app theme, and has its own look: a larger corner radius, no header rule, a floating composer, assistant text straight on the glass, your messages as a tinted pill and tool calls as one-line chips. It uses its own palette for the whole transcript, markdown and diffs included.
+- **Panel chrome per desktop.** The panel uses the material the platform itself offers: on macOS a blurred, rounded view drawn dark and in its active state (Liquid Glass on macOS 26 and later), on Windows Mica or blur, on Wayland the compositor's blur where it exists, and a near-opaque dark surface everywhere else. Its own surfaces carry a dark tint, so they stay readable over a light backdrop that Windows or Linux chose. The panel is not pixel-identical across desktops, and is not meant to be.
+- **Motion.** The panel fades and scales in when it is summoned and grows with the conversation (bottom edge fixed, up to a cap, then it scrolls) instead of staying a fixed box. While the agent works a thin light travels along its edge and follows what the agent is doing (faster with faster text, a flare on a tool call, a slow breath while it waits for you, a red pulse on an error, a last lap at the end), the same on every desktop: drawn by Core Animation on macOS, without work on the app's main thread, and by GPUI elsewhere. The renderer sits behind a trait, so a Metal effect, or a renderer of its own on Windows and Linux off the main thread, can replace it later without touching the rest.
+- **Model switching in the panel.** The model picker leaves the start page and becomes a component both windows use. The panel changes the model of the session it shows, and the model its next quick chat starts with, without opening the main window.
+- **Background presence.** On desktop the app keeps running when the main window is closed while the quick panel is enabled, with a tray icon to reopen the main window, toggle the panel, or quit. A `--quick` command line flag toggles the panel of the running instance, so desktops without a global-shortcut API can bind it themselves.
+- **Shared helpers replace duplicates.** Prompt submission (optimistic prompt, `client_prompt_id`, completion) is one helper used by both launch and send; the repeated "is this the open session" filters become a lookup by `SessionKey`; delivery and input states become enums at the wire boundary.
+- Not in this change: the panel in the web build (no global hotkey or floating windows there), a separate quick-chat history, more than one quick panel.
+
+## Capabilities
+
+### New Capabilities
+- `open-sessions`: how the app keeps several sessions open at the same time: routing of agent inputs to each, sharing one open session between surfaces, lifetime, independence of what each surface shows, and launching without taking over another surface.
+- `quick-panel`: the hotkey-summoned floating conversation panel: summoning and dismissing, starting a quick chat, picking a session, compact conversation, inline requests, handing a session to the main window, the global shortcut on each platform, and running in the background.
+
+### Modified Capabilities
+- `session-transcript` (introduced by `use-agent-session-core`): "One reducer as the transcript source" applies to every open session, not to a single one.
+
+## Impact
+
+- **Prerequisite:** `use-agent-session-core` is archived first (its `session-transcript` spec is modified here, and both changes touch session routing in `src/store.rs`).
+- **Code:** `src/store.rs` (open/launch/route/prompt/undo/history/options/cancel per session, `LaunchState` per launcher), `src/store/{delegates,fork,mcp_notice,worktree}.rs` (session lookups by key), `src/session.rs` (`parent` removed), new `src/session/open.rs`; `src/ui/session_view.rs` split into a `SessionPane` (state and chrome) and the shared row renderers; `src/ui/mod.rs`, `src/ui/sidebar.rs`, `src/ui/inbox.rs` and the other UI files that read `store.session`; the model picker extracted from `src/ui/start.rs` into a component both windows use; new `src/quick/` (panel window, platform chrome and sizing under `src/quick/chrome/`, hotkey, tray, single instance); `src/main.rs` (quit mode, tray, hotkey, `--quick`).
+- **Dependencies (native only):** `global-hotkey` (macOS, Windows, X11), `tray-icon` with the `ksni` backend on Linux, and the `global_shortcuts` feature of `ashpd` on Linux (already in the tree through gpui-base). A local-socket crate for the single-instance toggle. On macOS only, `objc2`, `objc2-app-kit`, `objc2-foundation` and `raw-window-handle` for the panel's material and its animated resize; all four are already in the lock file through GPUI, so they add no new builds. None of them reach the wasm build.
+- **Behaviour:** starting a session from the start page still opens it in the main window (the caller now does it); with the panel enabled, closing the main window on Windows and Linux no longer quits the app. The panel's size follows its conversation instead of being fixed, and its look follows the desktop it runs on.
+- **Tests:** the `session_view.rs` harnesses that build a `QmtApp` around a `SessionView` are rebuilt around `SessionPane` and `OpenSession`.

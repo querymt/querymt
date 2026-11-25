@@ -25,10 +25,13 @@ impl QmtApp {
     /// `end` (desktop `openForkDialog`).
     pub(super) fn request_fork(&mut self, end: usize, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        if !store.session_supports_fork() || store.fork_pending() {
+        let Some(skey) = self.main_key(cx) else {
+            return;
+        };
+        if !store.session_supports_fork(&skey, cx) || store.fork_pending(&skey) {
             return;
         }
-        let Some(view) = store.session.as_ref() else {
+        let Some(view) = self.main_view(cx) else {
             return;
         };
         if view.loading || view.running() || view.undo_pending {
@@ -49,13 +52,16 @@ impl QmtApp {
     /// Create the fork; the store opens it, then the dialog closes. A
     /// failure stays in the dialog.
     pub(super) fn confirm_fork(&mut self, cx: &mut Context<Self>) {
+        let Some(skey) = self.main_key(cx) else {
+            return;
+        };
         let Some(dialog) = self.fork.as_mut().filter(|d| !d.pending) else {
             return;
         };
         let message_id = dialog.target.message_id.clone();
         let Some(task) = self
             .store
-            .update(cx, |s, cx| s.fork_session_at(message_id, cx))
+            .update(cx, |s, cx| s.fork_session_at(&skey, message_id, cx))
         else {
             dialog.error = Some("The session can't be forked right now.".into());
             cx.notify();
@@ -234,9 +240,13 @@ mod tests {
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
         store.runtime_mut_for_test("test-agent").can_fork_sessions = true;
-        store.session = Some(view);
+        let main_view = view;
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -290,7 +300,7 @@ mod tests {
             let app = h.app.read(cx);
             assert!(app.fork.is_none());
             let store = app.store.read(cx);
-            let view = store.session.as_ref().unwrap();
+            let view = app.main_view(cx).unwrap();
             assert_eq!(
                 (view.session_id.as_str(), view.title.as_str()),
                 ("f1", "Fork of Source")
@@ -298,7 +308,7 @@ mod tests {
             let fork = store.session_summary("test-agent", "f1").unwrap();
             assert_eq!(fork.parent.as_deref(), Some("s"));
             assert_eq!(fork.fork_origin.as_deref(), Some("user"));
-            assert!(!store.fork_pending());
+            assert!(!store.fork_pending(&crate::session::open::SessionKey::new("test-agent", "s")));
         });
     }
 
@@ -316,7 +326,7 @@ mod tests {
             let dialog = app.fork.as_ref().expect("dialog stays open");
             assert!(!dialog.pending);
             assert!(dialog.error.as_deref().unwrap().contains("boom"));
-            assert_eq!(app.store.read(cx).session.as_ref().unwrap().session_id, "s");
+            assert_eq!(app.main_view(cx).unwrap().session_id, "s");
         });
     }
 }

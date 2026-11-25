@@ -15,10 +15,11 @@ use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::kit;
+use super::session_pane::SessionPane;
 use super::session_view::{CHAT_MAX, ReadingQuip, TOOL_LINE_H, diff_rows, hunk_marker};
-use super::{QmtApp, kit};
 use crate::session::TurnDiffFile;
-use crate::theme::{Palette, palette};
+use crate::theme::Palette;
 
 /// Narrowest panel, and the room always left for the chat.
 const MIN_W: f32 = 320.;
@@ -67,12 +68,11 @@ fn session_key(agent_id: &str, session_id: &str) -> String {
     format!("{agent_id}/{session_id}")
 }
 
-impl QmtApp {
+impl SessionPane {
     /// Open the diff of the turn closing at item `end`, or close it when it
     /// is the one shown (desktop `toggleTurnDiff`).
     pub(super) fn toggle_turn_diff(&mut self, end: usize, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let Some(view) = store.session.as_ref() else {
+        let Some(view) = self.view(cx) else {
             return;
         };
         let Some(turn) = view.turn_key(end) else {
@@ -102,7 +102,7 @@ impl QmtApp {
     /// when closed, or once that turn is gone (undo, reload).
     pub(super) fn turn_diff_range(&self, cx: &App) -> Option<std::ops::Range<usize>> {
         let (session, turn) = self.turn_diff.open.as_ref()?;
-        let view = self.store.read(cx).session.as_ref()?;
+        let view = self.view(cx)?;
         (session_key(&view.agent_id, &view.session_id) == *session)
             .then(|| view.turn_range(turn))
             .flatten()
@@ -111,7 +111,7 @@ impl QmtApp {
     /// Panel width: dragged, remembered, or the default share, clamped so
     /// the chat keeps its room.
     fn turn_diff_width(&self, window: &Window, cx: &App) -> f32 {
-        let page = f32::from(window.viewport_size().width - self.sidebar_width(cx));
+        let page = f32::from(window.viewport_size().width - self.reserved_w);
         let default = (page * DEFAULT_SHARE).min(CHAT_MAX);
         let max = (page - MIN_CHAT_W - SEPARATOR_W).max(MIN_W);
         self.turn_diff
@@ -146,13 +146,10 @@ impl QmtApp {
             return chat;
         };
         let files = self
-            .store
-            .read(cx)
-            .session
-            .as_ref()
+            .view(cx)
             .map(|v| v.turn_diffs(range))
             .unwrap_or_default();
-        let p = *palette(cx);
+        let p = self.palette(cx);
         let width = self.turn_diff_width(window, cx);
         let dragging = self.turn_diff.drag.is_some();
         h_flex()
@@ -654,10 +651,14 @@ mod tests {
         view.apply(&text("agent_message_chunk", "r1", "done"));
         view.apply(&text("user_message_chunk", "u2", "thanks"));
         view.apply(&text("agent_message_chunk", "r2", "sure"));
-        let mut store = crate::store::automations::schedule_ui_fixture();
-        store.session = Some(view);
+        let store = crate::store::automations::schedule_ui_fixture();
+        let main_view = view;
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -674,19 +675,19 @@ mod tests {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
                 // Item 2 closes the first turn.
-                app.toggle_turn_diff(2, cx);
-                assert_eq!(app.turn_diff_range(cx), Some(0..3));
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
+                assert_eq!(app.pane.read(cx).turn_diff_range(cx), Some(0..3));
             });
             window.render_frame(cx);
             h.app.update(cx, |app, cx| {
                 // The same pill closes it.
-                app.toggle_turn_diff(2, cx);
-                assert!(app.turn_diff.open.is_none());
-                app.toggle_turn_diff(2, cx);
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
+                assert!(app.pane.read(cx).turn_diff.open.is_none());
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
                 // Escape closes it once no popover or dialog is open.
-                assert!(app.close_topmost());
-                assert!(app.turn_diff.open.is_none());
-                assert!(!app.close_topmost());
+                assert!(app.close_topmost(cx));
+                assert!(app.pane.read(cx).turn_diff.open.is_none());
+                assert!(!app.close_topmost(cx));
             });
         })
         .unwrap();
@@ -699,15 +700,16 @@ mod tests {
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.store.update(cx, |s, _| {
-                    let view = s.session.as_mut().unwrap();
-                    view.apply(
-                        &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
+                {
+                    app.edit_main_for_test(cx, |view| {
+                        view.apply(
+                            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
                         "content": { "type": "text", "text": "more" } }),
-                    );
-                    view.apply(&crate::session::undo_tests::edit("t3", "c.rs", "", "e\n"));
-                    view.prompting = true;
-                });
+                        );
+                        view.apply(&crate::session::undo_tests::edit("t3", "c.rs", "", "e\n"));
+                        view.prompting = true;
+                    });
+                }
             });
             window.render_frame(cx);
         })
@@ -721,21 +723,16 @@ mod tests {
         assert!(vcx.debug_bounds("diff-pill-2").is_some());
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
-                app.toggle_turn_diff(6, cx);
-                assert_eq!(app.turn_diff_range(cx), Some(5..7));
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(6, cx));
+                assert_eq!(app.pane.read(cx).turn_diff_range(cx), Some(5..7));
                 // A new edit while it runs joins the open panel.
-                app.store.update(cx, |s, _| {
-                    let view = s.session.as_mut().unwrap();
-                    view.apply(&crate::session::undo_tests::edit("t4", "d.rs", "", "f\n"));
-                });
-                let range = app.turn_diff_range(cx).unwrap();
-                let files = app
-                    .store
-                    .read(cx)
-                    .session
-                    .as_ref()
-                    .unwrap()
-                    .turn_diffs(range);
+                {
+                    app.edit_main_for_test(cx, |view| {
+                        view.apply(&crate::session::undo_tests::edit("t4", "d.rs", "", "f\n"));
+                    });
+                }
+                let range = app.pane.read(cx).turn_diff_range(cx).unwrap();
+                let files = app.main_view(cx).unwrap().turn_diffs(range);
                 assert_eq!(files.len(), 2);
             });
             window.render_frame(cx);
@@ -750,7 +747,7 @@ mod tests {
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.toggle_turn_diff(2, cx);
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
             });
             window.render_frame(cx);
         })
@@ -760,15 +757,15 @@ mod tests {
         assert!(vcx.debug_bounds("turn-diff-close").is_some());
         vcx.simulate_click(fold.center(), gpui_kit::Modifiers::none());
         cx.update(|cx| {
-            let collapsed = &h.app.read(cx).turn_diff.collapsed;
+            let collapsed = &h.app.read(cx).pane.read(cx).turn_diff.collapsed;
             assert!(collapsed.contains("a.rs") && collapsed.contains("b.rs"));
         });
         let fold = vcx.debug_bounds("turn-diff-fold").unwrap();
         vcx.simulate_click(fold.center(), gpui_kit::Modifiers::none());
-        cx.update(|cx| assert!(h.app.read(cx).turn_diff.collapsed.is_empty()));
+        cx.update(|cx| assert!(h.app.read(cx).pane.read(cx).turn_diff.collapsed.is_empty()));
         let close = vcx.debug_bounds("turn-diff-close").unwrap();
         vcx.simulate_click(close.center(), gpui_kit::Modifiers::none());
-        cx.update(|cx| assert!(h.app.read(cx).turn_diff.open.is_none()));
+        cx.update(|cx| assert!(h.app.read(cx).pane.read(cx).turn_diff.open.is_none()));
     }
 
     #[gpui_kit::test]
@@ -780,15 +777,16 @@ mod tests {
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.store.update(cx, |s, _| {
-                    let view = s.session.as_mut().unwrap();
-                    view.apply(
-                        &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
+                {
+                    app.edit_main_for_test(cx, |view| {
+                        view.apply(
+                            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u3",
                         "content": { "type": "text", "text": "big" } }),
-                    );
-                    view.apply(&crate::session::undo_tests::edit("t9", "big.rs", "", &long));
-                });
-                app.toggle_turn_diff(6, cx);
+                        );
+                        view.apply(&crate::session::undo_tests::edit("t9", "big.rs", "", &long));
+                    });
+                }
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(6, cx));
             });
             window.render_frame(cx);
         })
@@ -800,11 +798,13 @@ mod tests {
         // The row ends a 400-line change: scroll it into view first.
         let app = h.app.clone();
         vcx.update(|window, cx| {
-            app.update(cx, |app, _| {
-                let top = app.turn_diff.scroll.bounds().top();
-                app.turn_diff
-                    .scroll
-                    .set_offset(point(px(0.), top + px(200.) - laid_out.top()));
+            app.update(cx, |app, cx| {
+                app.pane.update(cx, |pane, _| {
+                    let top = pane.turn_diff.scroll.bounds().top();
+                    pane.turn_diff
+                        .scroll
+                        .set_offset(point(px(0.), top + px(200.) - laid_out.top()));
+                });
             });
             window.render_frame(cx);
         });
@@ -846,15 +846,16 @@ mod tests {
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.toggle_turn_diff(2, cx);
-                let store = app.store.clone();
-                store.update(cx, |s, _| {
-                    s.session = Some(SessionView::new("test-agent", "other", "/w", "Other"))
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
+                let other = app.store.update(cx, |s, cx| {
+                    s.adopt_for_test(SessionView::new("test-agent", "other", "/w", "Other"), cx)
                 });
+                app.pane.update(cx, |pane, cx| pane.show(other, cx));
             });
             window.render_frame(cx);
-            h.app
-                .update(cx, |app, _| assert!(app.turn_diff.open.is_none()));
+            h.app.update(cx, |app, cx| {
+                assert!(app.pane.read(cx).turn_diff.open.is_none())
+            });
         })
         .unwrap();
     }
@@ -868,12 +869,13 @@ mod tests {
             .update_window(h.handle, |_, window, cx| {
                 h.app.update(cx, |app, cx| {
                     app.go(Page::Session, cx);
-                    app.toggle_turn_diff(2, cx);
+                    app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
                 });
                 window.render_frame(cx);
                 let vw = f32::from(window.viewport_size().width);
                 (
-                    h.app.update(cx, |app, cx| app.turn_diff_width(window, cx)),
+                    h.app
+                        .update(cx, |app, cx| app.pane.read(cx).turn_diff_width(window, cx)),
                     vw,
                 )
             })
@@ -906,23 +908,28 @@ mod tests {
         cx.update_window(h.handle, |_, window, cx| {
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.toggle_turn_diff(2, cx);
-                let page = f32::from(window.viewport_size().width - app.sidebar_width(cx));
-                let default = app.turn_diff_width(window, cx);
+                app.pane.update(cx, |p, cx| p.toggle_turn_diff(2, cx));
+                let page = f32::from(window.viewport_size().width - app.pane.read(cx).reserved_w);
+                let default = app.pane.read(cx).turn_diff_width(window, cx);
                 assert_eq!(default, (page * 0.44).clamp(MIN_W, super::CHAT_MAX));
                 // A drag 60px to the left widens the panel by 60px…
-                app.turn_diff.drag = Some((gpui_kit::px(500.), default));
-                app.turn_diff.live_width = Some(default + 60.);
-                let live = app.turn_diff_width(window, cx);
-                app.finish_turn_diff_resize(cx);
+                app.pane.update(cx, |p, _| {
+                    p.turn_diff.drag = Some((gpui_kit::px(500.), default));
+                    p.turn_diff.live_width = Some(default + 60.);
+                });
+                let live = app.pane.read(cx).turn_diff_width(window, cx);
+                app.pane.update(cx, |p, cx| p.finish_turn_diff_resize(cx));
                 assert_eq!(app.store.read(cx).prefs.turn_diff_width, Some(live.round()));
-                assert!(app.turn_diff.drag.is_none() && app.turn_diff.live_width.is_none());
+                assert!(
+                    app.pane.read(cx).turn_diff.drag.is_none()
+                        && app.pane.read(cx).turn_diff.live_width.is_none()
+                );
                 // …and is kept for the next panel; it never squeezes the chat.
-                assert_eq!(app.turn_diff_width(window, cx), live.round());
+                assert_eq!(app.pane.read(cx).turn_diff_width(window, cx), live.round());
                 app.store.update(cx, |s, cx| {
                     s.update_prefs(|p| p.turn_diff_width = Some(99_999.), cx)
                 });
-                assert!(app.turn_diff_width(window, cx) < page);
+                assert!(app.pane.read(cx).turn_diff_width(window, cx) < page);
             });
             window.render_frame(cx);
         })

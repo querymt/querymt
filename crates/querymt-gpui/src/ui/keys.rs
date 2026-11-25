@@ -9,7 +9,6 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem};
-use gpui_kit::component::input::Position;
 use gpui_kit::component::{Icon, IndexPath, h_flex, v_flex};
 use gpui_kit::*;
 use serde::Deserialize;
@@ -28,6 +27,7 @@ gpui_kit::actions!(
         RedoWorkspace,
         OpenModelPicker,
         CycleReasoning,
+        ChooseFolder,
     ]
 );
 
@@ -59,6 +59,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(k("cmd-shift-z", "ctrl-shift-z"), RedoWorkspace, None),
         KeyBinding::new(k("cmd-m", "ctrl-m"), OpenModelPicker, None),
         KeyBinding::new(k("cmd-t", "ctrl-t"), CycleReasoning, None),
+        // Handled by the quick panel only.
+        KeyBinding::new(k("cmd-o", "ctrl-o"), ChooseFolder, None),
     ];
     let digits = if mac { DIGITS_CMD } else { DIGITS_CTRL };
     bindings.extend(
@@ -233,7 +235,7 @@ impl QmtApp {
                     .update(cx, |s, cx| s.set_launch_reasoning(next, cx));
             }
             Page::Session => {
-                let Some(option) = self.store.read(cx).session.as_ref().and_then(|v| {
+                let Some(option) = self.main_view(cx).and_then(|v| {
                     v.reasoning_option()
                         .filter(|o| !o.choices.is_empty() && !v.pending_options.contains(&o.id))
                 }) else {
@@ -245,8 +247,8 @@ impl QmtApp {
                     .position(|(v, _)| *v == option.current)
                     .unwrap_or(0);
                 let value = option.choices[(at + 1) % option.choices.len()].0.clone();
-                self.store
-                    .update(cx, |s, cx| s.set_session_option(&option.id, &value, cx));
+                self.pane
+                    .update(cx, |pane, cx| pane.set_option(&option.id, &value, cx));
             }
             _ => {}
         }
@@ -283,17 +285,13 @@ impl QmtApp {
             return;
         }
         if undo {
-            let target = self
-                .store
-                .read(cx)
-                .session
-                .as_ref()
-                .and_then(|v| v.undo_target());
+            let target = self.main_view(cx).and_then(|v| v.undo_target());
             if let Some(message_id) = target {
-                self.request_undo(message_id, cx);
+                self.pane
+                    .update(cx, |pane, cx| pane.request_undo(message_id, cx));
             }
         } else {
-            self.store.update(cx, |s, cx| s.redo_workspace(cx));
+            self.pane.update(cx, |pane, cx| pane.redo(cx));
         }
     }
 
@@ -302,7 +300,9 @@ impl QmtApp {
             self.restore_focus(window, cx);
         } else {
             self.palette_open = true;
-            self.model_open = false;
+            self.model_picker.update(cx, |picker, cx| {
+                picker.close(cx);
+            });
             self.options_open = false;
             self.palette.update(cx, |s, cx| {
                 s.set_query("", window, cx);
@@ -349,32 +349,10 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Names are bare (the core trims the slash); a prefix would send `//`.
-        let name = name.trim_start_matches('/');
-        if takes_input {
-            let text = format!("/{name} ");
-            let end = Position::new(0, text.chars().count() as u32);
-            self.session_prompt.update(cx, |state, cx| {
-                state.set_value(text, window, cx);
-                // Moves the caret and focuses the composer.
-                state.set_cursor_position(end, window, cx);
-            });
-            cx.notify();
-            return;
-        }
-        if !self.session_ready(cx) {
-            // Nothing is sent, but the palette is closed: hand the focus back.
-            self.restore_focus(window, cx);
-            cx.notify();
-            return;
-        }
-        let delivery = self.delivery;
-        self.store.update(cx, |s, cx| {
-            s.send_prompt(format!("/{name}"), Vec::new(), delivery, cx)
+        // The main window's session pane owns the composer.
+        self.pane.update(cx, |pane, cx| {
+            pane.run_slash_command(name, takes_input, window, cx)
         });
-        self.transcript.list.set_follow_mode(FollowMode::Tail);
-        self.transcript.list.scroll_to_end();
-        self.restore_focus(window, cx);
         cx.notify();
     }
 
@@ -552,7 +530,8 @@ impl QmtApp {
             entries: actions,
         }];
 
-        let commands = self.store.read(cx).session_slash_commands();
+        let pane = self.pane.read(cx);
+        let commands = pane.slash_commands(cx);
         if self.page == Page::Session && !commands.is_empty() {
             groups.push(PaletteGroup {
                 label: "Slash commands",
@@ -659,10 +638,16 @@ mod tests {
         });
         let mut store = crate::store::launch::peer_fixture();
         let (_rpc, requests) = store.rpc_for_test("test-agent");
-        store.session = view;
+        // Before the view: its session is bound to the agent as set up here.
         setup(&mut store);
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                if let Some(view) = view {
+                    store.install_main_for_test(view, cx);
+                }
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -996,7 +981,7 @@ mod tests {
         });
         // The composer was not touched.
         rig.app.read_with(cx, |app, cx| {
-            assert_eq!(app.session_prompt.read(cx).value().as_ref(), "");
+            assert_eq!(app.pane.read(cx).prompt.read(cx).value().as_ref(), "");
         });
     }
 
@@ -1092,7 +1077,7 @@ mod tests {
         pick(cx, &rig, target);
         assert!(sent(&rig).is_empty(), "nothing is sent");
         cx.update_window(rig.handle, |_, window, cx| {
-            let entity = rig.app.read(cx).session_prompt.clone();
+            let entity = rig.app.read(cx).pane.read(cx).prompt.clone();
             let state = entity.read(cx);
             assert_eq!(state.value().as_ref(), "/compact ");
             let cursor = state.cursor_position();
@@ -1107,11 +1092,11 @@ mod tests {
         cx.update_window(rig.handle, |_, window, cx| {
             let app = rig.app.read(cx);
             let prompt = if app.page == Page::Session {
-                &app.session_prompt
+                app.pane.read(cx).prompt.clone()
             } else {
-                &app.prompt
+                app.prompt.clone()
             };
-            gpui_kit::Focusable::focus_handle(prompt, cx).is_focused(window)
+            gpui_kit::Focusable::focus_handle(&prompt, cx).is_focused(window)
         })
         .unwrap()
     }
@@ -1190,7 +1175,7 @@ mod tests {
                 .all(|r| r["method"] != "_querymt/session/steer")
         );
         rig.app.read_with(cx, |app, cx| {
-            let view = app.store.read(cx).session.as_ref().unwrap();
+            let view = app.main_view(cx).unwrap();
             assert_eq!(view.pending_inputs.len(), 1);
             assert_eq!(view.pending_inputs[0].delivery, "queue");
             assert_eq!(view.pending_inputs[0].text, "/worktree");

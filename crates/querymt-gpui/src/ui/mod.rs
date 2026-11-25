@@ -8,13 +8,15 @@ mod connectors;
 mod delegates;
 mod fork;
 mod inbox;
-mod keys;
-mod kit;
+pub(crate) mod keys;
+pub(crate) mod kit;
 mod log_view;
 mod md;
 mod mesh;
+pub(crate) mod model_picker;
 mod preview;
 mod profile_select;
+mod session_pane;
 mod session_view;
 mod sessions;
 mod settings;
@@ -24,7 +26,7 @@ mod slash;
 mod smooth_scroll;
 mod start;
 mod turn_diff;
-mod workspace_select;
+pub(crate) mod workspace_select;
 mod workspaces;
 mod worktree;
 
@@ -37,12 +39,21 @@ use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::store::launch::{LaunchError, LaunchProgress, LaunchRequest};
 use crate::store::{AgentsStore, Attachment, SessionSummary};
 use crate::theme::{self, Palette, palette};
 use settings::SettingsTab;
 
 gpui_kit::actions!(querymt, [ToggleSidebar]);
 pub use keys::bind_keys;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use session_pane::{SessionPane, SessionPaneEvent};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use session_view::Density;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use sessions::matches_query;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use smooth_scroll::SmoothScroll;
 
 /// Width of the expanded sidebar column, without its 1px hairline.
 const SIDEBAR_W: f32 = 252.;
@@ -215,14 +226,8 @@ pub struct QmtApp {
     smooth_scroll: smooth_scroll::SmoothScroll,
     cwd: Entity<InputState>,
     prompt: Entity<TextareaState>,
-    model_open: bool,
-    model_query: Entity<InputState>,
-    /// Highlighted row of the model picker: position among its model rows.
-    model_cursor: usize,
-    /// Search text `model_cursor` was last reset for; programmatic resets of
-    /// the field (opening the picker) must not move the cursor again.
-    model_seen_query: String,
-    model_scroll: ScrollHandle,
+    /// The model picker of the main window (design D12).
+    model_picker: Entity<model_picker::ModelPicker>,
     options_open: bool,
     attachments: Vec<Attachment>,
     attach_error: Option<String>,
@@ -257,6 +262,12 @@ pub struct QmtApp {
     invite_ttl: &'static str,
     invite_uses: Entity<InputState>,
     settings_tab: SettingsTab,
+    /// Settings is recording the quick panel's shortcut: the next key
+    /// combination becomes it.
+    #[cfg(not(target_family = "wasm"))]
+    quick_recording: bool,
+    #[cfg(not(target_family = "wasm"))]
+    quick_focus: FocusHandle,
     key_editing: Option<String>,
     /// Providers settings: expanded provider rows, the open auth-method menu,
     /// and the Advanced maintenance / failed-plugin disclosures.
@@ -281,51 +292,27 @@ pub struct QmtApp {
     fork: Option<fork::ForkDialog>,
     /// New worktree session / worktree handoff dialog.
     worktree: Option<worktree::WorktreeDialog>,
-    /// Turn diff panel beside the chat.
-    turn_diff: turn_diff::TurnDiff,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
     appearance_scroll_open: bool,
     key_input: Entity<InputState>,
     oauth_code: Entity<InputState>,
-    session_prompt: Entity<TextareaState>,
-    transcript: session_view::Transcript,
-    session_attachments: Vec<Attachment>,
-    session_attach_error: Option<String>,
+    /// The session the main window shows.
+    pane: Entity<session_pane::SessionPane>,
+    /// Cards of the Inbox page.
+    inbox_cards: Entity<inbox::RequestCards>,
     /// Open image lightbox (composer or chat attachments).
     preview: Option<preview::Preview>,
     preview_focus: FocusHandle,
-    /// Options popover of the session composer.
-    session_options_open: bool,
-    /// The activity dock's waiting-messages panel is open.
-    waiting_open: bool,
     /// When Escape was last pressed during a running turn (double Esc cancels).
     last_escape: Option<std::time::Instant>,
-    /// Highlighted row of the composer's slash command list.
-    slash_cursor: usize,
-    /// Composer text at which Esc closed the slash command list; the list
-    /// stays closed until the text changes.
-    slash_dismissed: Option<String>,
-    slash_scroll: ScrollHandle,
-    /// Header details popover (context, token usage, cost, active time).
-    session_details_open: bool,
-    /// Details popover shows session totals instead of the latest request.
-    usage_totals: bool,
-    /// Token category pinned (clicked) / hovered in the usage rings.
-    usage_pinned: Option<crate::usage::TokenKey>,
-    usage_hovered: Option<crate::usage::TokenKey>,
-    /// Session actions (resolve / archive / pin) menu.
-    session_menu_open: bool,
-    /// `steer` or `queue`: how a message is delivered while a turn runs.
-    delivery: &'static str,
+    /// The model picker was open at its last notification: its closing
+    /// hands the focus back (`restore_focus`).
+    model_picker_was_open: bool,
+    /// The session this window is starting from the start page.
+    launch: LaunchProgress,
+    launch_task: Option<Task<()>>,
     /// Item key whose text was just copied (shows a check for a moment).
     copied: Option<String>,
-    /// Expanded tool calls / thoughts (by id).
-    expanded_items: HashSet<String>,
-    plan_open: bool,
-    /// Text inputs of request forms, by (request key, field, custom answer).
-    form_inputs: HashMap<(String, usize, bool), (Entity<InputState>, Subscription)>,
-    /// Inbox cards the user expanded / collapsed (others use the default).
-    request_collapsed: HashMap<String, bool>,
     /// Session id to open once its agent has listed it (deep link).
     pending_open: Option<String>,
     /// Focus of the app shell: keeps global shortcuts working when no
@@ -369,8 +356,11 @@ impl QmtApp {
                 .auto_grow(4, 14)
                 .placeholder("Ask QueryMT to inspect, change, debug, explain, or plan something.")
         });
-        let model_query = cx
-            .new(|cx| InputState::new(window, cx).placeholder("Search models, providers, nodes…"));
+        let smooth_scroll = smooth_scroll::SmoothScroll::default();
+        let model_picker = {
+            let (store, scroll) = (store.clone(), smooth_scroll.clone());
+            cx.new(|cx| model_picker::ModelPicker::new(store, scroll, window, cx))
+        };
         let session_query = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search sessions, workspaces, agents…")
         });
@@ -385,20 +375,9 @@ impl QmtApp {
         });
         let oauth_code =
             cx.new(|cx| InputState::new(window, cx).placeholder("Callback URL or code"));
-        let session_prompt = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 12)
-                .placeholder("Reply to the agent…")
-        });
 
         let mut subs = vec![
-            cx.observe(&store, |this, store, cx| {
-                // Drop inputs of requests that left the inbox.
-                let s = store.read(cx);
-                this.form_inputs
-                    .retain(|(k, _, _), _| s.requests.iter().any(|r| &r.key == k));
-                this.request_collapsed
-                    .retain(|k, _| s.requests.iter().any(|r| &r.key == k));
+            cx.observe(&store, |this, _, cx| {
                 this.open_pending_session(cx);
                 if this.page == Page::Automations {
                     this.load_automations(false, cx);
@@ -421,26 +400,19 @@ impl QmtApp {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(
-                &model_query,
-                window,
-                |this, _, ev: &InputEvent, window, cx| match ev {
-                    InputEvent::PressEnter { .. } => this.pick_highlighted_model(window, cx),
-                    InputEvent::Change => this.model_query_changed(cx),
-                    _ => {}
-                },
-            ),
-            cx.subscribe_in(
-                &session_prompt,
-                window,
-                |this, _, ev: &InputEvent, _, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        // A new query starts at the best match, and a
-                        // dismissal (Esc) ends with the first edit.
-                        this.slash_cursor = 0;
-                        this.slash_dismissed = None;
-                        cx.notify();
-                    }
+            cx.observe_in(&model_picker, window, |this, picker, window, cx| {
+                // Closing the picker (pick, Esc, Done, scrim) gives the
+                // keyboard back to the page's prompt.
+                let open = picker.read(cx).is_open();
+                if std::mem::replace(&mut this.model_picker_was_open, open) && !open {
+                    this.restore_focus(window, cx);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(
+                &model_picker,
+                |this, _, ev: &model_picker::ModelPickerEvent, cx| match ev {
+                    model_picker::ModelPickerEvent::Picked { key } => this.on_model_picked(key, cx),
                 },
             ),
             cx.subscribe_in(&session_query, window, |_, _, ev: &InputEvent, _, cx| {
@@ -482,7 +454,6 @@ impl QmtApp {
         ));
 
         let (page, details) = initial_view(&store, cx);
-        let smooth_scroll = smooth_scroll::SmoothScroll::default();
         let workspace = {
             let (store, cwd, scroll) = (store.clone(), cwd.clone(), smooth_scroll.clone());
             cx.new(|cx| workspace_select::WorkspaceField::new(store, cwd, false, scroll, cx))
@@ -492,17 +463,25 @@ impl QmtApp {
         subs.push(workspaces.subscribe(window, cx));
         let (log_view, log_sub) = log_view::LogView::new(window, cx);
         subs.push(log_sub);
+        let pane = {
+            let (store, scroll) = (store.clone(), smooth_scroll.clone());
+            cx.new(|cx| session_pane::SessionPane::new(store, scroll, window, cx))
+        };
+        subs.push(cx.subscribe_in(&pane, window, Self::on_pane_event));
+        subs.push(cx.observe(&pane, |_, _, cx| cx.notify()));
+        let inbox_cards = {
+            let store = store.clone();
+            cx.new(|cx| inbox::RequestCards::new(store, cx))
+        };
+        subs.push(cx.subscribe_in(&inbox_cards, window, Self::on_cards_event));
+        subs.push(cx.observe(&inbox_cards, |_, _, cx| cx.notify()));
         let mut this = Self {
             store,
             page,
             smooth_scroll,
             cwd,
             prompt,
-            model_open: false,
-            model_query,
-            model_cursor: 0,
-            model_seen_query: String::new(),
-            model_scroll: ScrollHandle::new(),
+            model_picker,
             options_open: false,
             attachments: Vec::new(),
             attach_error: None,
@@ -530,6 +509,10 @@ impl QmtApp {
             invite_ttl: "24h",
             invite_uses,
             settings_tab: SettingsTab::General,
+            #[cfg(not(target_family = "wasm"))]
+            quick_recording: false,
+            #[cfg(not(target_family = "wasm"))]
+            quick_focus: cx.focus_handle(),
             key_editing: None,
             provider_open: HashSet::new(),
             method_menu: None,
@@ -545,33 +528,18 @@ impl QmtApp {
             confirm_undo: None,
             fork: None,
             worktree: None,
-            turn_diff: Default::default(),
             appearance_scroll_open: false,
             key_input,
             oauth_code,
-            session_prompt,
-            transcript: session_view::Transcript::new(),
-            session_attachments: Vec::new(),
-            session_attach_error: None,
+            pane,
+            inbox_cards,
             preview: None,
             preview_focus: cx.focus_handle(),
-            session_options_open: false,
-            waiting_open: false,
             last_escape: None,
-            slash_cursor: 0,
-            slash_dismissed: None,
-            slash_scroll: ScrollHandle::new(),
-            session_details_open: false,
-            usage_totals: false,
-            usage_pinned: None,
-            usage_hovered: None,
-            session_menu_open: false,
-            delivery: "steer",
+            model_picker_was_open: false,
+            launch: LaunchProgress::default(),
+            launch_task: None,
             copied: None,
-            expanded_items: HashSet::new(),
-            plan_open: false,
-            form_inputs: HashMap::new(),
-            request_collapsed: HashMap::new(),
             pending_open: deep_link_session(),
             app_focus,
             palette,
@@ -590,6 +558,10 @@ impl QmtApp {
             _subs: subs,
         };
         this.watch_first_run(cx);
+        #[cfg(test)]
+        if let Some(session) = this.store.update(cx, |s, _| s.take_test_main()) {
+            this.pane.update(cx, |pane, cx| pane.show(session, cx));
+        }
         this
     }
 
@@ -614,9 +586,7 @@ impl QmtApp {
 
     fn go(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
-        self.session_options_open = false;
-        self.session_details_open = false;
-        self.session_menu_open = false;
+        self.pane.update(cx, |pane, _| pane.close_panels());
         if page == Page::Automations {
             self.load_automations(true, cx);
         }
@@ -635,28 +605,21 @@ impl QmtApp {
     pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         match self.page {
             Page::Start => self.prompt.update(cx, |s, cx| s.focus(window, cx)),
-            Page::Session
-                if self
-                    .store
-                    .read(cx)
-                    .session
-                    .as_ref()
-                    .is_some_and(|v| v.access.is_none()) =>
-            {
-                self.session_prompt.update(cx, |s, cx| s.focus(window, cx))
-            }
+            Page::Session if self.main_view(cx).is_some_and(|v| v.access.is_none()) => self
+                .pane
+                .update(cx, |pane, cx| pane.focus_composer(window, cx)),
             _ => self.app_focus.focus(window, cx),
         }
     }
 
     /// Whether a composer popover or picker is open: what Escape hands the
     /// focus back from (dialogs with fields of their own are not).
-    fn composer_popover_open(&self) -> bool {
+    fn composer_popover_open(&self, cx: &App) -> bool {
         !self.delegates.open
             && (self.palette_open
-                || self.model_open
+                || self.model_picker.read(cx).is_open()
                 || self.options_open
-                || self.session_options_open
+                || self.pane.read(cx).options_open
                 || self.option_menu.is_some())
     }
 
@@ -680,7 +643,7 @@ impl QmtApp {
     }
 
     /// Close the top-most overlay. Returns whether one was open.
-    fn close_topmost(&mut self) -> bool {
+    fn close_topmost(&mut self, cx: &mut Context<Self>) -> bool {
         if self.preview.take().is_some() || std::mem::take(&mut self.palette_open) {
             return true;
         }
@@ -690,14 +653,11 @@ impl QmtApp {
         if self.close_log_view() {
             return true;
         }
-        if std::mem::take(&mut self.options_open) || std::mem::take(&mut self.model_open) {
+        let model_closed = self.model_picker.update(cx, |picker, cx| picker.close(cx));
+        if std::mem::take(&mut self.options_open) || model_closed {
             return true;
         }
-        if std::mem::take(&mut self.session_options_open)
-            || std::mem::take(&mut self.waiting_open)
-            || std::mem::take(&mut self.session_details_open)
-            || std::mem::take(&mut self.session_menu_open)
-        {
+        if self.pane.update(cx, |pane, _| pane.close_popover()) {
             return true;
         }
         if std::mem::take(&mut self.confirm_reset)
@@ -714,7 +674,7 @@ impl QmtApp {
             return true;
         }
         // Below every popover and dialog: Escape closes those first.
-        self.page == Page::Session && self.close_turn_diff()
+        self.page == Page::Session && self.pane.update(cx, |pane, _| pane.close_turn_diff())
     }
 
     fn start_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -723,24 +683,64 @@ impl QmtApp {
         let Some(agent) = self.store.read(cx).primary_agent() else {
             return;
         };
-        if (prompt.is_empty() && self.attachments.is_empty()) || self.store.read(cx).launch.busy {
+        if (prompt.is_empty() && self.attachments.is_empty()) || self.launch.busy {
             return;
         }
         if cwd.is_empty() {
-            self.store.update(cx, |s, cx| {
-                s.launch.error =
-                    Some("Choose a workspace: an absolute path on the agent's machine.".into());
-                cx.notify();
-            });
+            self.launch.error =
+                Some("Choose a workspace: an absolute path on the agent's machine.".into());
+            cx.notify();
             return;
         }
         let attachments = std::mem::take(&mut self.attachments);
         self.attach_error = None;
-        self.store
-            .update(cx, |s, cx| s.launch(&agent, cwd, prompt, attachments, cx));
+        let placement = self.store.read(cx).placement();
+        self.launch = LaunchProgress {
+            busy: true,
+            creating_on: self.store.read(cx).creating_on(&agent, &placement),
+            ..Default::default()
+        };
+        let request = LaunchRequest {
+            agent_id: agent,
+            cwd,
+            prompt,
+            attachments,
+            placement,
+            model: None,
+            reasoning: None,
+        };
+        // The start page shows the new session in this window: the
+        // placeholder takes the place of the one it showed.
+        self.pane.update(cx, |pane, cx| pane.clear(cx));
+        let launched = self.store.update(cx, |s, cx| s.launch(request, cx));
+        self.launch_task = Some(cx.spawn(async move |this, cx| {
+            let result = launched.await;
+            let _ = this.update(cx, |app, cx| app.finish_launch(result, cx));
+        }));
         self.page = Page::Session;
         self.prompt
             .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
+    }
+
+    /// The launch of this window ended: show its session, or its error.
+    fn finish_launch(
+        &mut self,
+        result: Result<Entity<crate::session::open::OpenSession>, LaunchError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.launch.busy = false;
+        self.launch.creating_on = None;
+        match result {
+            Ok(session) => {
+                self.launch.last_started = Some(session.read(cx).key.session.to_string());
+                self.pane.update(cx, |pane, cx| {
+                    pane.back.clear();
+                    pane.show(session, cx)
+                });
+            }
+            Err(err) => self.launch.error = Some(err.to_string()),
+        }
+        cx.notify();
     }
 
     // ---- shell ---------------------------------------------------------------
@@ -1129,6 +1129,42 @@ impl QmtApp {
     }
 }
 
+/// Open the main window on `store` and return it with its root view.
+pub fn open_main_window(
+    store: &Entity<AgentsStore>,
+    cx: &mut App,
+) -> Result<(AnyWindowHandle, Entity<QmtApp>)> {
+    let options = if cfg!(target_family = "wasm") {
+        WindowOptions::default()
+    } else {
+        let bounds = Bounds::centered(None, size(px(1320.), px(860.)), cx);
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(900.), px(560.))),
+            // Keep our custom header; the upstream Linux frame needs a
+            // transparent surface around it for its rounded corners and shadow.
+            titlebar: Some(TitlebarOptions {
+                title: Some("QueryMT".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.), px(15.))),
+            }),
+            app_owns_titlebar_drag: true,
+            window_decorations: Some(WindowDecorations::Client),
+            window_background: if cfg!(target_os = "linux") {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            app_id: Some("querymt-gpui".into()),
+            ..Default::default()
+        }
+    };
+    let store = store.clone();
+    gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| QmtApp::new(store, window, cx))
+    })
+}
+
 /// `?session=<id>` on the web, `QMT_SESSION=<id>` natively.
 fn deep_link_session() -> Option<String> {
     #[cfg(target_family = "wasm")]
@@ -1204,6 +1240,7 @@ impl Render for QmtApp {
         // Sessions that came and went since the last frame take or leave
         // their place in the sidebar.
         self.store.update(cx, |s, _| s.sync_sidebar_order());
+        self.aim_model_picker(cx);
         if self.side.drop_target.is_some() && !cx.has_active_drag() {
             self.side.drop_target = None;
         }
@@ -1215,7 +1252,7 @@ impl Render for QmtApp {
             Page::Automations => self.render_automations(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
-            Page::Session => self.render_session(window, cx).into_any_element(),
+            Page::Session => self.render_session_page(cx),
             Page::Setup => self.render_setup(cx).into_any_element(),
             Page::Workspaces => self.render_workspaces(cx).into_any_element(),
         };
@@ -1242,7 +1279,10 @@ impl Render for QmtApp {
                     .then(|| self.render_worktree_dialog(radii, window, cx))
                     .flatten()
             })
-            .or_else(|| self.render_model_modal(radii, cx))
+            .or_else(|| {
+                self.model_picker
+                    .update(cx, |picker, cx| picker.render_modal(radii, cx))
+            })
             .or_else(|| self.render_automation_overlay(radii, cx))
             .or_else(|| self.render_workspace_overlay(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));
@@ -1286,15 +1326,19 @@ impl Render for QmtApp {
                 }
                 // The composer's command list is the innermost thing: its Esc
                 // closes only it, and does not count toward the double Esc.
-                if this.close_slash_list(window, cx) {
+                if this.page == Page::Session
+                    && this
+                        .pane
+                        .update(cx, |pane, cx| pane.close_slash_list(window, cx))
+                {
                     this.last_escape = None;
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
-                let popover = this.composer_popover_open();
+                let popover = this.composer_popover_open(cx);
                 if this.close_delegate_dialog(cx)
-                    || this.close_topmost()
+                    || this.close_topmost(cx)
                     || this.close_automation_overlay(cx)
                 {
                     if popover {
@@ -1306,13 +1350,8 @@ impl Render for QmtApp {
                     return;
                 }
                 // Desktop: a second Escape within 700ms stops the running turn.
-                let running = this.page == Page::Session
-                    && this
-                        .store
-                        .read(cx)
-                        .session
-                        .as_ref()
-                        .is_some_and(|v| v.running());
+                let running =
+                    this.page == Page::Session && this.main_view(cx).is_some_and(|v| v.running());
                 if !running {
                     this.last_escape = None;
                     return;
@@ -1323,7 +1362,7 @@ impl Render for QmtApp {
                     .is_some_and(|t| now.duration_since(t) <= std::time::Duration::from_millis(700))
                 {
                     this.last_escape = None;
-                    this.store.update(cx, |s, cx| s.cancel_turn(cx));
+                    this.pane.update(cx, |pane, cx| pane.cancel(cx));
                     cx.stop_propagation();
                 } else {
                     this.last_escape = Some(now);

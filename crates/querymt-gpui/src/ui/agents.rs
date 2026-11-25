@@ -666,10 +666,7 @@ impl QmtApp {
 
         if let Some(message_id) = self.confirm_undo.clone() {
             let affected = self
-                .store
-                .read(cx)
-                .session
-                .as_ref()
+                .main_view(cx)
                 .and_then(|v| v.undo_affected_turns(&message_id))
                 .unwrap_or(1);
             let body = if affected > 1 {
@@ -707,8 +704,8 @@ impl QmtApp {
                                     .label("Undo changes")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some(message_id) = this.confirm_undo.take() {
-                                            this.store.update(cx, |s, cx| {
-                                                s.undo_workspace_to(message_id, cx)
+                                            this.pane.update(cx, |pane, cx| {
+                                                pane.undo_to(message_id, cx)
                                             });
                                         }
                                         cx.notify();
@@ -755,7 +752,7 @@ impl QmtApp {
                                 .label("Delete")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.confirm_session_delete = None;
-                                    if this.store.read(cx).session.as_ref().is_some_and(|v| {
+                                    if this.main_view(cx).is_some_and(|v| {
                                         v.agent_id == s.agent_id && v.session_id == s.id
                                     }) && this.page == Page::Session
                                     {
@@ -1016,7 +1013,7 @@ impl QmtApp {
             .items_center()
             .justify_center()
             .on_click(cx.listener(|this, _, _, cx| {
-                if !this.close_delegate_dialog(cx) && !this.close_topmost() {
+                if !this.close_delegate_dialog(cx) && !this.close_topmost(cx) {
                     this.close_automation_overlay(cx);
                 }
                 cx.notify();

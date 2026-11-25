@@ -17,7 +17,7 @@ use gpui_kit::*;
 use super::kit;
 use super::smooth_scroll::SmoothScroll;
 use crate::store::{AgentsStore, Endpoint};
-use crate::theme::palette;
+use crate::theme::{Palette, palette};
 use crate::util::workspace_name;
 
 /// Known workspaces shown at most (they come before folders).
@@ -168,12 +168,12 @@ fn list_dirs(_base: &str) -> Vec<String> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(super) fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 #[cfg(target_family = "wasm")]
-pub(super) fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     None
 }
 
@@ -194,9 +194,18 @@ pub(super) fn local_fs(store: &AgentsStore, agent: Option<&str>) -> bool {
     }
 }
 
+/// What a field tells its owner.
+#[derive(Clone, Debug)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub(crate) enum WorkspaceEvent {
+    /// A suggestion was chosen with Enter or a click (Tab only completes
+    /// into it). The input holds the path.
+    Picked(String),
+}
+
 /// A workspace path input with completion. Owns the completion state; the
 /// input itself is shared with whoever reads the path.
-pub(super) struct WorkspaceField {
+pub(crate) struct WorkspaceField {
     store: Entity<AgentsStore>,
     input: Entity<InputState>,
     /// Agent whose machine the path is on; `None`: the primary agent.
@@ -204,6 +213,8 @@ pub(super) struct WorkspaceField {
     /// Dialog look (faint fill, faint focus border) rather than the composer's.
     dialog: bool,
     disabled: bool,
+    /// Colours in place of the app's, for a host with a look of its own.
+    palette: Option<Palette>,
     smooth_scroll: SmoothScroll,
     open: bool,
     cursor: usize,
@@ -216,8 +227,10 @@ pub(super) struct WorkspaceField {
     _subs: Vec<Subscription>,
 }
 
+impl EventEmitter<WorkspaceEvent> for WorkspaceField {}
+
 impl WorkspaceField {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Entity<AgentsStore>,
         input: Entity<InputState>,
         dialog: bool,
@@ -252,6 +265,7 @@ impl WorkspaceField {
             agent: None,
             dialog,
             disabled: false,
+            palette: None,
             smooth_scroll,
             open: false,
             cursor: 0,
@@ -260,6 +274,15 @@ impl WorkspaceField {
             loading: None,
             task: None,
             _subs: subs,
+        }
+    }
+
+    /// Paint with `palette` instead of the app's.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn set_palette(&mut self, palette: Option<Palette>, cx: &mut Context<Self>) {
+        if self.palette != palette {
+            self.palette = palette;
+            cx.notify();
         }
     }
 
@@ -386,9 +409,12 @@ impl WorkspaceField {
             path
         };
         self.input
-            .update(cx, |s, cx| s.set_value(value, window, cx));
+            .update(cx, |s, cx| s.set_value(value.clone(), window, cx));
         self.open = drill;
         self.refresh_dirs(cx);
+        if !drill {
+            cx.emit(WorkspaceEvent::Picked(value));
+        }
         cx.notify();
     }
 
@@ -421,7 +447,7 @@ impl WorkspaceField {
 
 impl Render for WorkspaceField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *palette(cx);
+        let p = self.palette.unwrap_or_else(|| *palette(cx));
         let items = self.items(cx);
         let cursor = self.cursor.min(items.len().saturating_sub(1));
         let shell = if self.dialog {

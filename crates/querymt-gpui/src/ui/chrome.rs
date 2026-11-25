@@ -176,7 +176,8 @@ impl QmtApp {
         // its actions on the right where the connection status used to be.
         let (session_title, session_actions) = match self.page {
             Page::Session => self
-                .session_chrome(&p, cx)
+                .pane
+                .update(cx, |pane, cx| pane.session_chrome(&p, cx))
                 .map(|(t, r)| (Some(t), r))
                 .unwrap_or((None, vec![])),
             _ => (None, vec![]),

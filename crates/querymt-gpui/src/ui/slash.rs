@@ -12,7 +12,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use querymt_agent_session_core::view::SlashCommandView;
 
-use super::{Page, QmtApp, kit};
+use super::kit;
+use super::session_pane::SessionPane;
 use crate::theme::Palette;
 
 /// Rows visible at once; more scroll.
@@ -66,25 +67,31 @@ pub(super) struct SlashList {
     pub(super) matches: Vec<SlashCommandView>,
 }
 
-impl QmtApp {
-    /// The list as it would render now, or `None` when it is not shown: not
-    /// on the session page, the composer unfocused, the text not a command
-    /// word, Esc having closed it for this text, or nothing to list. Every
-    /// slash key handler asks this, so keys act only while the list shows.
+impl SessionPane {
+    /// The slash commands the shown session's agent advertises, or none when
+    /// no session is shown (design D4). A read-only session has no composer,
+    /// so it advertises no commands.
+    pub(crate) fn slash_commands<'a>(&'a self, cx: &'a App) -> &'a [SlashCommandView] {
+        self.view(cx)
+            .filter(|view| view.access.is_none())
+            .map_or(&[], |view| view.slash_commands.as_slice())
+    }
+
+    /// The list as it would render now, or `None` when it is not shown: the
+    /// composer unfocused, the text not a command word, Esc having closed it
+    /// for this text, or nothing to list. Every slash key handler asks this,
+    /// so keys act only while the list shows.
     pub(super) fn slash_list(&self, window: &Window, cx: &App) -> Option<SlashList> {
-        if self.page != Page::Session {
+        if !Focusable::focus_handle(&self.prompt, cx).is_focused(window) {
             return None;
         }
-        if !Focusable::focus_handle(&self.session_prompt, cx).is_focused(window) {
-            return None;
-        }
-        let state = self.session_prompt.read(cx);
+        let state = self.prompt.read(cx);
         let text = state.value();
         let query = slash_query(&text, state.cursor())?;
         if self.slash_dismissed.as_deref() == Some(text.as_ref()) {
             return None;
         }
-        let commands = self.store.read(cx).session_slash_commands();
+        let commands = self.slash_commands(cx);
         // Names only: descriptions make short queries match unrelated
         // commands (the palette is where descriptions are searched).
         let ranked = crate::search::rank(query, commands, |c| vec![c.name.clone()]);
@@ -101,11 +108,8 @@ impl QmtApp {
 
     /// The command to hint at below the completed `/name `, as `(name, hint)`.
     pub(super) fn slash_hint(&self, cx: &App) -> Option<(String, String)> {
-        if self.page != Page::Session {
-            return None;
-        }
-        let text = self.session_prompt.read(cx).value();
-        let commands = self.store.read(cx).session_slash_commands();
+        let text = self.prompt.read(cx).value();
+        let commands = self.slash_commands(cx);
         hinted(&text, commands).map(|c| (c.name.clone(), c.input_hint.clone().unwrap_or_default()))
     }
 
@@ -144,9 +148,9 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = self.session_prompt.read(cx).value().to_string();
+        let text = self.prompt.read(cx).value().to_string();
         let (text, column) = complete(&text, name);
-        self.session_prompt.update(cx, |state, cx| {
+        self.prompt.update(cx, |state, cx| {
             state.set_value(text, window, cx);
             // Moves the caret and focuses the composer.
             state.set_cursor_position(Position::new(0, column), window, cx);
@@ -156,14 +160,52 @@ impl QmtApp {
         cx.notify();
     }
 
+    /// Picking a slash command in the palette. Without an input it is sent
+    /// as a prompt (`/name`), under the same rules as a typed one: nothing is
+    /// sent while the session is not ready, and while a turn runs
+    /// `send_prompt` queues it. With an input the composer gets `/name `, the
+    /// cursor at the end and the focus, so the arguments can be typed.
+    pub(crate) fn run_slash_command(
+        &mut self,
+        name: &str,
+        takes_input: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Names are bare (the core trims the slash); a prefix would send `//`.
+        let name = name.trim_start_matches('/');
+        if takes_input {
+            let text = format!("/{name} ");
+            let end = Position::new(0, text.chars().count() as u32);
+            self.prompt.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                // Moves the caret and focuses the composer.
+                state.set_cursor_position(end, window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        if let Some(session) = self.session.clone().filter(|_| self.session_ready(cx)) {
+            let delivery = self.delivery;
+            self.store.update(cx, |s, cx| {
+                s.send_prompt(&session, format!("/{name}"), Vec::new(), delivery, cx)
+            });
+            self.transcript.list.set_follow_mode(FollowMode::Tail);
+            self.transcript.list.scroll_to_end();
+        }
+        // Sent or not, the palette is closed: hand the focus back.
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
     /// Esc: close the list for the current text. Returns whether it was
     /// shown (the Esc is then spent: it neither closes anything else nor
     /// counts toward the double Esc that stops a turn).
-    pub(super) fn close_slash_list(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn close_slash_list(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         if self.slash_list(window, cx).is_none() {
             return false;
         }
-        self.slash_dismissed = Some(self.session_prompt.read(cx).value().to_string());
+        self.slash_dismissed = Some(self.prompt.read(cx).value().to_string());
         true
     }
 
@@ -182,7 +224,12 @@ impl QmtApp {
             }
         }))
         .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-            let send = this.store.read(cx).prefs.send_shortcut;
+            // A compact composer always sends on Enter (`session_composer`).
+            let send = if this.density.is_compact() {
+                crate::store::SendShortcut::Enter
+            } else {
+                this.store.read(cx).prefs.send_shortcut
+            };
             if send.submits(a.shift, a.secondary) && this.slash_complete_highlighted(window, cx) {
                 cx.stop_propagation();
             }
@@ -417,9 +464,12 @@ mod ui_tests {
                             "querymt/session/runtimeState"],
             }));
         }
-        store.session = Some(view);
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -428,7 +478,8 @@ mod ui_tests {
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.session_prompt.update(cx, |s, cx| s.focus(window, cx));
+                app.pane
+                    .update(cx, |pane, cx| pane.focus_composer(window, cx));
             });
             window.render_frame(cx);
         })
@@ -457,7 +508,7 @@ mod ui_tests {
 
     fn text(cx: &mut TestAppContext, rig: &Rig) -> String {
         rig.app.read_with(cx, |app, cx| {
-            app.session_prompt.read(cx).value().to_string()
+            app.pane.read(cx).prompt.read(cx).value().to_string()
         })
     }
 
@@ -465,7 +516,9 @@ mod ui_tests {
     fn listed(cx: &mut TestAppContext, rig: &Rig) -> Vec<String> {
         cx.update_window(rig.handle, |_, window, cx| {
             rig.app.read_with(cx, |app, cx| {
-                app.slash_list(window, cx)
+                app.pane
+                    .read(cx)
+                    .slash_list(window, cx)
                     .map(|l| l.matches.into_iter().map(|c| c.name).collect())
                     .unwrap_or_default()
             })
@@ -475,7 +528,7 @@ mod ui_tests {
 
     fn focused(cx: &mut TestAppContext, rig: &Rig) -> bool {
         cx.update_window(rig.handle, |_, window, cx| {
-            let prompt = rig.app.read(cx).session_prompt.clone();
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
             gpui_kit::Focusable::focus_handle(&prompt, cx).is_focused(window)
         })
         .unwrap()
@@ -496,11 +549,7 @@ mod ui_tests {
 
     fn mode(cx: &mut TestAppContext, rig: &Rig) -> Option<String> {
         rig.app.read_with(cx, |app, cx| {
-            app.store
-                .read(cx)
-                .session
-                .as_ref()
-                .and_then(|v| v.mode.clone())
+            app.pane.read(cx).view(cx).and_then(|v| v.mode.clone())
         })
     }
 
@@ -585,7 +634,7 @@ mod ui_tests {
         assert!(focused(cx, &rig), "the composer keeps focus");
         assert!(listed(cx, &rig).is_empty(), "completed, so closed");
         let cursor = rig.app.read_with(cx, |app, cx| {
-            let c = app.session_prompt.read(cx).cursor_position();
+            let c = app.pane.read(cx).prompt.read(cx).cursor_position();
             (c.line, c.character)
         });
         assert_eq!(cursor, (0, 10));
@@ -597,17 +646,24 @@ mod ui_tests {
         let rig = rig(cx, session(two_commands(), false), false);
         type_text(cx, &rig, "/");
         keys(cx, &rig, "down");
-        assert_eq!(rig.app.read_with(cx, |a, _| a.slash_cursor), 1);
+        assert_eq!(
+            rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
+            1
+        );
         assert_eq!(
             text(cx, &rig),
             "/",
             "the arrow did not move the text cursor"
         );
         keys(cx, &rig, "down");
-        assert_eq!(rig.app.read_with(cx, |a, _| a.slash_cursor), 0, "wraps");
+        assert_eq!(
+            rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
+            0,
+            "wraps"
+        );
         keys(cx, &rig, "up");
         assert_eq!(
-            rig.app.read_with(cx, |a, _| a.slash_cursor),
+            rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
             1,
             "wraps back"
         );
@@ -620,7 +676,10 @@ mod ui_tests {
         // A new query starts at the best match again.
         keys(cx, &rig, "cmd-a backspace");
         type_text(cx, &rig, "/");
-        assert_eq!(rig.app.read_with(cx, |a, _| a.slash_cursor), 0);
+        assert_eq!(
+            rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
+            0
+        );
     }
 
     #[gpui_kit::test]
@@ -653,7 +712,8 @@ mod ui_tests {
         // Back into the first word: the list returns, Tab keeps the rest.
         cx.update_window(rig.handle, |_, window, cx| {
             rig.app.update(cx, |app, cx| {
-                app.session_prompt.update(cx, |s, cx| {
+                let prompt = app.pane.read(cx).prompt.clone();
+                prompt.update(cx, |s, cx| {
                     s.set_cursor_position(
                         gpui_kit::component::input::Position::new(0, 4),
                         window,

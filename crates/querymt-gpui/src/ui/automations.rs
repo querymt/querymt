@@ -159,7 +159,7 @@ impl QmtApp {
         let store = self.store.read(cx);
         if current {
             self.page == Page::Session
-                && store.session.as_ref().is_some_and(|s| {
+                && self.main_view(cx).is_some_and(|s| {
                     !s.loading
                         && store
                             .runtime(&s.agent_id)
@@ -180,9 +180,7 @@ impl QmtApp {
         let store = self.store.read(cx);
         let choices = schedule_agents(store, Some(CREATE));
         let selected = if current {
-            store
-                .session
-                .as_ref()
+            self.main_view(cx)
                 .filter(|s| self.page == Page::Session && !s.loading)
                 .filter(|s| choices.iter().any(|(id, _)| id == &s.agent_id))
                 .map(|s| {

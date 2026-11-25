@@ -41,6 +41,50 @@ System graphics/windowing libraries are still required; this is not a fully stat
 portable Linux binary. Size optimization can reduce peak throughput; use debug
 builds when you need symbols and panic backtraces.
 
+### Quick panel
+
+A small floating chat you open from any application, for a quick question, nudging a running
+session or answering its permission prompt, without changing what the main window shows.
+Desktop only: the web build has no quick panel.
+
+Turn it on in **Settings → General → Quick panel**. It is off by default. While it is on:
+
+- A global shortcut toggles the panel: **Option+Space** on macOS, **Ctrl+Alt+Space** on Windows
+  and Linux. Change it in the same row (click the shortcut, press the new keys). If the shortcut
+  is taken by another application, Settings says so and the previous shortcut stays active.
+- **Esc**, the shortcut again, or clicking another window closes the panel. Reopening it within
+  15 minutes returns to the same conversation and draft; after that it starts on a new quick chat.
+- **Enter** sends, **Shift+Enter** breaks the line, **Cmd+Enter** (**Ctrl+Enter** elsewhere) opens
+  the session in the main window.
+- Closing the main window does not quit the app. A tray icon offers *Open QueryMT*, *Quick panel*
+  and *Quit*.
+
+`--quick` toggles the panel of the running instance and exits (it does not start a second app).
+When nothing is running it starts the app with only the panel open:
+
+```bash
+cargo run -- --quick              # from a checkout
+querymt-gpui --quick              # installed binary
+```
+
+Without the quick panel enabled, `--quick` is an ordinary start.
+
+**Wayland.** There is no global shortcut API on every compositor. QueryMT asks the desktop's
+GlobalShortcuts portal for the shortcut (KDE Plasma, GNOME 48 and later; the desktop may ask you to
+approve it). Where there is no such portal, Settings says the shortcut is unavailable. Bind the
+command `querymt-gpui --quick` to a key in your desktop's own keyboard shortcut settings instead
+(on GNOME: *Settings → Keyboard → Custom Shortcuts*).
+
+**Linux tray.** The tray icon uses the StatusNotifierItem D-Bus protocol: no GTK or
+libappindicator is needed, but the desktop must show such icons (KDE and most panels do; GNOME
+needs the AppIndicator/KStatusNotifierItem extension). Without a tray host the shortcut and
+`--quick` still work.
+
+**Window placement.** On macOS and Windows the panel is a floating window above other
+applications, centered on the main window's display (or the primary display). X11 uses a floating
+window and Wayland compositors with layer-shell a layer surface; GNOME opens a normal window,
+which may appear behind a fullscreen application.
+
 ## Web
 
 ```bash

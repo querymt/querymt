@@ -10,7 +10,8 @@ use std::time::Duration;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
-use super::{AgentsStore, SessionSummary};
+use super::{AgentsStore, SessionSummary, StoreEvent};
+use crate::session::open::{SessionKey, SessionRef};
 
 /// `AgentRuntime::pending` key while a fork is being created.
 const PENDING: &str = "fork";
@@ -31,20 +32,18 @@ fn fork_params(session_id: &str, cwd: &str, message_id: Option<&str>) -> Value {
 
 impl AgentsStore {
     /// The open session's agent advertised `sessionCapabilities.fork`.
-    pub fn session_supports_fork(&self) -> bool {
-        self.session
-            .as_ref()
-            .filter(|v| v.access.is_none())
-            .and_then(|v| self.runtime.get(&v.agent_id))
-            .is_some_and(|rt| rt.is_connected() && rt.can_fork_sessions)
+    pub fn session_supports_fork(&self, key: &SessionKey, cx: &App) -> bool {
+        self.with_session(key, cx, |v| v.access.is_none())
+            .is_some_and(|writable| writable)
+            && self
+                .runtime
+                .get(key.agent.as_str())
+                .is_some_and(|rt| rt.is_connected() && rt.can_fork_sessions)
     }
 
-    /// A fork of the open session is being created.
-    pub fn fork_pending(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|v| self.runtime.get(&v.agent_id))
-            .is_some_and(|rt| rt.pending.contains(PENDING))
+    /// A fork of a session of `key`'s agent is being created.
+    pub fn fork_pending(&self, key: &SessionKey) -> bool {
+        self.fork_pending_for(key.agent.as_str())
     }
 
     /// Fork the open session at `message_id` and open the fork. The task
@@ -52,18 +51,18 @@ impl AgentsStore {
     /// fork can start now (busy, unsupported, nothing open).
     pub fn fork_session_at(
         &mut self,
+        key: &SessionKey,
         message_id: String,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<String, String>>> {
-        if !self.session_supports_fork() || self.fork_pending() {
+        if !self.session_supports_fork(key, cx) || self.fork_pending(key) {
             return None;
         }
-        let view = self.session.as_ref()?;
-        if view.loading || view.running() || view.undo_pending {
-            return None;
-        }
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let (cwd, title) = (view.cwd.clone(), view.title.clone());
+        let (cwd, title) = self.with_session(key, cx, |view| {
+            let idle = !(view.loading || view.running() || view.undo_pending);
+            idle.then(|| (view.cwd.clone(), view.title.clone()))
+        })??;
+        let (agent_id, session_id) = (key.agent.to_string(), key.session.to_string());
         self.start_fork(agent_id, session_id, cwd, title, Some(message_id), true, cx)
     }
 
@@ -191,14 +190,16 @@ impl AgentsStore {
             rt.sessions.insert(0, fork);
         }
         self.schedule_sessions_refresh(agent_id, Duration::from_millis(500), cx);
-        // Open the fork only while its source is still the open session.
-        let still_open = open
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|v| v.agent_id == agent_id && v.session_id == source_id);
-        if still_open {
-            self.open_session(agent_id, fork_id, cwd, &fork_title, cx);
+        // A surface that still shows the source may switch to the fork.
+        if open {
+            cx.emit(StoreEvent::Spawned {
+                from: SessionKey::new(agent_id, source_id),
+                child: SessionRef {
+                    key: SessionKey::new(agent_id, fork_id),
+                    cwd: cwd.to_string(),
+                    title: fork_title,
+                },
+            });
         }
         cx.notify();
     }

@@ -107,9 +107,8 @@ impl QmtApp {
         let last = self.setup_steps(cx).len() - 1;
         self.setup.step = index.min(last);
         self.setup.visited = self.setup.visited.max(self.setup.step);
-        self.model_query
-            .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
-        self.reset_model_cursor(cx);
+        self.model_picker
+            .update(cx, |picker, cx| picker.clear_query(window, cx));
         cx.notify();
     }
 
@@ -673,17 +672,20 @@ impl QmtApp {
                         ),
                 );
         }
-        let rows = self.model_rows(cx);
+        let rows = self.model_picker.update(cx, |picker, cx| picker.rows(cx));
         v_flex()
             .gap_3()
             .child(head)
-            .child(self.model_search(&agent, p, cx))
+            .child(
+                self.model_picker
+                    .update(cx, |picker, cx| picker.search(&agent, p, cx)),
+            )
             .child(
                 v_flex()
                     .id("setup-model-list")
                     .h(px(MODEL_LIST_H))
                     .overflow_y_scroll()
-                    .track_scroll(&self.model_scroll)
+                    .track_scroll(&self.model_picker.read(cx).scroll_handle())
                     .children(rows)
                     .map(|el| self.smooth_scroll.region("setup-model-list", el)),
             )

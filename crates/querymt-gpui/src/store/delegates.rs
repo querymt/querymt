@@ -8,6 +8,7 @@ use gpui_kit::*;
 use serde_json::{Value, json};
 
 use super::{AgentsStore, Model, model_key};
+use crate::session::open::SessionKey;
 
 pub const GET: &str = "querymt/session/delegateModels";
 pub const SET: &str = "querymt/session/setDelegateModel";
@@ -208,12 +209,11 @@ impl AgentsStore {
             .is_some_and(|rt| rt.supports_method(GET) && rt.supports_method(SET))
     }
 
-    /// Delegate routing of the open session.
-    pub fn delegate_state(&self) -> Option<&DelegateState> {
-        let view = self.session.as_ref()?;
-        self.runtime(&view.agent_id)?
+    /// Delegate routing of the session `key`.
+    pub fn delegate_state(&self, key: &SessionKey) -> Option<&DelegateState> {
+        self.runtime(key.agent.as_str())?
             .delegates
-            .get(&view.session_id)
+            .get(key.session.as_str())
     }
 
     fn delegate_state_mut(&mut self, agent_id: &str, session_id: &str) -> &mut DelegateState {
@@ -225,16 +225,15 @@ impl AgentsStore {
             .or_default()
     }
 
-    /// Read the open session's delegate routes.
-    pub fn refresh_delegates(&mut self, cx: &mut Context<Self>) {
-        let Some((agent, session)) = self
-            .session
-            .as_ref()
-            .filter(|v| !v.loading)
-            .map(|v| (v.agent_id.clone(), v.session_id.clone()))
-        else {
+    /// Read the delegate routes of the open session `key`.
+    pub fn refresh_delegates(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
+        if !self
+            .with_session(key, cx, |v| !v.loading)
+            .is_some_and(|loaded| loaded)
+        {
             return;
-        };
+        }
+        let (agent, session) = (key.agent.to_string(), key.session.to_string());
         if !self.supports_delegate_routing(&agent) {
             return;
         }
@@ -280,20 +279,16 @@ impl AgentsStore {
         .detach();
     }
 
-    /// Route `delegate` of the open session. Unchanged choices are not sent.
+    /// Route `delegate` of the session `key`. Unchanged choices are not sent.
     pub fn set_delegate_route(
         &mut self,
+        key: &SessionKey,
         delegate: &str,
         change: RouteChange,
         cx: &mut Context<Self>,
     ) {
-        let Some((agent, session)) = self
-            .session
-            .as_ref()
-            .map(|v| (v.agent_id.clone(), v.session_id.clone()))
-        else {
-            return;
-        };
+        let (agent, session) = (key.agent.to_string(), key.session.to_string());
+        let key = key.clone();
         let Some(rpc) = self.runtime(&agent).and_then(|rt| rt.rpc.clone()) else {
             return;
         };
@@ -357,26 +352,23 @@ impl AgentsStore {
                     }
                 }
                 // Read back the agent's view either way: revision and sources.
-                s.refresh_delegates(cx);
+                s.refresh_delegates(&key, cx);
             });
         })
         .detach();
     }
 
-    /// Routes of the open session, as if the agent had answered.
+    /// Routes of the session `key`, as if the agent had answered.
     #[cfg(test)]
-    pub fn set_delegate_routes_for_test(&mut self, v: &Value) {
-        let view = self.session.as_ref().expect("a session is open");
-        let (agent, session) = (view.agent_id.clone(), view.session_id.clone());
-        self.delegate_state_mut(&agent, &session).routes = Routes::parse(v);
+    pub fn set_delegate_routes_for_test(&mut self, key: &SessionKey, v: &Value) {
+        self.delegate_state_mut(key.agent.as_str(), key.session.as_str())
+            .routes = Routes::parse(v);
     }
 
-    pub fn dismiss_delegate_conflict(&mut self, cx: &mut Context<Self>) {
-        if let Some(view) = self.session.as_ref() {
-            let (agent, session) = (view.agent_id.clone(), view.session_id.clone());
-            self.delegate_state_mut(&agent, &session).conflict = false;
-            cx.notify();
-        }
+    pub fn dismiss_delegate_conflict(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
+        self.delegate_state_mut(key.agent.as_str(), key.session.as_str())
+            .conflict = false;
+        cx.notify();
     }
 
     fn remember_delegate_model(&mut self, owner: &str, profile: &str, delegate: &str, key: &str) {
@@ -412,6 +404,7 @@ impl AgentsStore {
 #[cfg(test)]
 mod tests {
     use super::{Route, RouteChange, Routes, set_params};
+    use crate::session::open::SessionKey;
     use serde_json::{Value, json};
 
     fn routes() -> Value {
@@ -431,17 +424,16 @@ mod tests {
         use gpui_kit::AppContext as _;
         let (sender, requests) = async_channel::unbounded::<String>();
         let rpc = crate::rpc::RpcClient::new(sender);
-        let store = cx.new(|_| {
+        let key = SessionKey::new("test-agent", "s");
+        let store = cx.new(|cx| {
             let mut store = crate::store::automations::schedule_ui_fixture();
             let rt = store.runtime.get_mut("test-agent").unwrap();
             rt.rpc = Some(rpc.clone());
             rt.capabilities = Some(json!({ "methods": [super::GET, super::SET] }));
-            store.session = Some(crate::session::SessionView::new(
-                "test-agent",
-                "s",
-                "/w",
-                "t",
-            ));
+            store.install_main_for_test(
+                crate::session::SessionView::new("test-agent", "s", "/w", "t"),
+                cx,
+            );
             store
         });
         let next = || -> Value { serde_json::from_str(&requests.try_recv().unwrap()).unwrap() };
@@ -456,14 +448,14 @@ mod tests {
             rpc.handle(&message.to_string());
         };
 
-        cx.update(|cx| store.update(cx, |s, cx| s.refresh_delegates(cx)));
+        cx.update(|cx| store.update(cx, |s, cx| s.refresh_delegates(&key, cx)));
         cx.run_until_parked();
         let get = next();
         assert_eq!(get["method"], "_querymt/session/delegateModels");
         reply(&get, routes());
         cx.run_until_parked();
         cx.update(|cx| {
-            let state = store.read(cx).delegate_state().unwrap();
+            let state = store.read(cx).delegate_state(&key).unwrap();
             assert!(state.has_routes() && !state.loading);
         });
 
@@ -475,13 +467,22 @@ mod tests {
             }),
             reasoning: None,
         };
-        cx.update(|cx| store.update(cx, |s, cx| s.set_delegate_route("coder", pick, cx)));
+        cx.update(|cx| store.update(cx, |s, cx| s.set_delegate_route(&key, "coder", pick, cx)));
         cx.run_until_parked();
         let set = next();
         assert_eq!(set["method"], "_querymt/session/setDelegateModel");
         assert_eq!(set["params"]["model_id"], "anthropic/c");
         assert_eq!(set["params"]["expected_revision"], 4);
-        cx.update(|cx| assert!(store.read(cx).delegate_state().unwrap().pending.is_some()));
+        cx.update(|cx| {
+            assert!(
+                store
+                    .read(cx)
+                    .delegate_state(&key)
+                    .unwrap()
+                    .pending
+                    .is_some()
+            )
+        });
         reply(
             &set,
             json!({ "code": -32020, "message": "conflict",
@@ -489,7 +490,7 @@ mod tests {
         );
         cx.run_until_parked();
         cx.update(|cx| {
-            let state = store.read(cx).delegate_state().unwrap();
+            let state = store.read(cx).delegate_state(&key).unwrap();
             assert!(state.conflict && state.pending.is_none());
         });
         // The routes are read again after a conflict.

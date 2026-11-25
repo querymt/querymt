@@ -12,6 +12,8 @@ use crate::store::ConnState;
 use crate::theme::Palette;
 
 pub const MONO: &str = "IBM Plex Mono";
+/// The platform's own UI font (GPUI's special family name).
+pub const SYSTEM_UI: &str = ".SystemUIFont";
 
 /// Single-line sidebar title that fades into its row instead of showing an
 /// ellipsis. The row owns the hover group so the fade follows its background.
@@ -57,6 +59,16 @@ pub fn keyed(name: &'static str, key: impl Into<SharedString>) -> ElementId {
 
 pub fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
+}
+
+/// Icon and colour of a plan entry by its status: shared by the title-bar
+/// plan popover and the quick panel's session cards.
+pub fn plan_entry_mark(status: &str, p: &Palette) -> (IconName, Hsla) {
+    match status {
+        "completed" => (IconName::CircleCheck, p.success),
+        "in_progress" => (IconName::CircleDashed, p.running),
+        _ => (IconName::Circle, p.dim),
+    }
 }
 
 /// App button: gpui-component buttons keep the arrow cursor, ours show a
@@ -1236,6 +1248,11 @@ pub fn corner_mask(radius: f32, color: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |b, _, window, _| {
+            // A see-through colour (a card on a translucent material) cannot
+            // cover anything: it would only square the card's own corners.
+            if color.a < 1. {
+                return;
+            }
             let (x0, y0, x1, y1) = (b.origin.x, b.origin.y, b.right(), b.bottom());
             let r = px(radius);
             // Cubic handle length for a quarter circle.
