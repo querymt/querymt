@@ -2453,6 +2453,48 @@ fn skills_config_accepts_mcp_false_and_rejects_non_bool() {
 }
 
 #[test]
+fn skills_config_nested_depth_defaults_to_four() {
+    let parsed = parse_agent("[agent.skills]\nenabled = true\n");
+    assert_eq!(parsed.skills.nested_depth, 4);
+    assert_eq!(SkillsConfig::default().nested_depth, 4);
+}
+
+#[test]
+fn skills_config_accepts_nested_depth_in_range() {
+    for depth in [1, 4, 16] {
+        let parsed = parse_agent(&format!("[agent.skills]\nnested_depth = {depth}\n"));
+        assert_eq!(parsed.skills.nested_depth, depth);
+    }
+}
+
+#[test]
+fn out_of_range_nested_depth_fails_configuration_loading() {
+    let base = "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n[agent.skills]\n";
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[allow(dead_code)]
+        agent: AgentSettings,
+    }
+    for value in ["0", "17", "-1", "256", "\"deep\"", "2.5", "true"] {
+        let error = toml::from_str::<Wrapper>(&format!("{base}nested_depth = {value}\n"))
+            .err()
+            .unwrap_or_else(|| panic!("nested_depth = {value} must be rejected"));
+        assert!(
+            error.to_string().contains("nested_depth"),
+            "error for {value} must name the key: {error}"
+        );
+    }
+}
+
+#[test]
+fn skills_config_schema_bounds_nested_depth() {
+    let schema = serde_json::to_value(schemars::schema_for!(SkillsConfig)).unwrap();
+    let depth = &schema["properties"]["nested_depth"];
+    assert_eq!(depth["minimum"], 1, "{depth}");
+    assert_eq!(depth["maximum"], 16, "{depth}");
+}
+
+#[test]
 fn documented_skills_configuration_parses() {
     let doc = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2471,6 +2513,7 @@ fn documented_skills_configuration_parses() {
     let parsed = toml::from_str::<Wrapper>(&full).expect("documented TOML parses");
     let skills = parsed.agent.skills;
     assert!(skills.enabled && skills.mcp);
+    assert_eq!(skills.nested_depth, 4);
     assert_eq!(
         skills.permissions.check_mcp("docs", "x"),
         crate::skills::PermissionLevel::Allow

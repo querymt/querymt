@@ -5,12 +5,12 @@
 //! the `mcp` switch and the approval mode. A [`SkillTool`](super::SkillTool)
 //! is a cheap value bound to one session and turn on top of a catalog.
 
-use crate::config::SkillsConfig;
-use crate::skills::discovery;
+use crate::config::{SkillsConfig, ToolSpec};
+use crate::skills::discovery::{self, SkillScanOptions, SkillScanReport};
 use crate::skills::permissions::SkillPermissions;
 use crate::skills::registry::SkillRegistry;
 use crate::skills::tool::SkillTool;
-use crate::skills::types::{Skill, SkillSource};
+use crate::skills::types::{Skill, SkillInventoryEntry, SkillProblem, SkillSource};
 use crate::tools::ToolError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 /// Discovery function used by registry refreshes. Swappable in tests to
 /// inject deterministic discovery failures.
 pub(crate) type DiscoverFn =
-    dyn Fn(&[SkillSource], bool) -> anyhow::Result<Vec<Skill>> + Send + Sync;
+    dyn Fn(&[SkillSource], &SkillScanOptions) -> SkillScanReport + Send + Sync;
 
 /// Agent-level skill state shared by every session of an agent.
 pub struct SkillCatalog {
@@ -31,6 +31,7 @@ pub struct SkillCatalog {
     sources: Vec<SkillSource>,
     project_root: PathBuf,
     include_external: bool,
+    nested_depth: u8,
     mcp: bool,
     /// `(local source, server)` collision pairs already warned about.
     warned_collisions: Mutex<HashSet<(String, String)>>,
@@ -38,9 +39,36 @@ pub struct SkillCatalog {
     /// Source of refresh tickets: taken before discovery starts, so a larger
     /// ticket means a refresh that began later.
     refresh_tickets: AtomicU64,
-    /// Newest ticket published per workspace; an older refresh finishing
-    /// late is dropped instead of replacing newer state.
-    published_tickets: Mutex<HashMap<PathBuf, u64>>,
+    /// Ticket, problem and snapshot bookkeeping per workspace. Always locked
+    /// after `registries`.
+    refresh_state: Mutex<RefreshState>,
+}
+
+/// Everything one refresh needs to scan, captured before it starts.
+struct RefreshJob {
+    ticket: u64,
+    workspace: PathBuf,
+    sources: Vec<SkillSource>,
+    options: SkillScanOptions,
+    discovery_fn: Arc<DiscoverFn>,
+}
+
+impl RefreshJob {
+    fn scan(&self) -> SkillScanReport {
+        (self.discovery_fn)(&self.sources, &self.options)
+    }
+}
+
+/// Per-workspace refresh bookkeeping.
+#[derive(Default)]
+struct RefreshState {
+    /// Newest ticket recorded per workspace; an older refresh finishing late
+    /// is dropped instead of replacing newer state.
+    tickets: HashMap<PathBuf, u64>,
+    /// Problems of the newest refresh per workspace.
+    problems: HashMap<PathBuf, Vec<SkillProblem>>,
+    /// Workspaces that have a published skill set.
+    snapshots: HashSet<PathBuf>,
 }
 
 impl SkillCatalog {
@@ -52,50 +80,70 @@ impl SkillCatalog {
             search_paths.push(SkillSource::Configured(custom_path.clone()));
         }
 
-        let mut registry = SkillRegistry::new();
-        match registry.load_from_sources(&search_paths, config.include_external) {
-            Ok(count) => {
-                if count > 0 {
-                    log::info!("Skills system initialized: {count} skills discovered");
-                    log::debug!("Discovered skills: {}", registry.names().join(", "));
-                } else {
-                    log::debug!(
-                        "Skills system enabled but no skills found in {} search paths",
-                        search_paths.len()
-                    );
-                }
-            }
-            Err(error) => {
-                log::warn!(
-                    "Failed to discover skills: {}. The skill tool will have no discovered skills.",
-                    error
-                );
-            }
-        }
-
         let mut catalog = Self::from_parts(
-            Arc::new(Mutex::new(registry)),
+            SkillRegistry::new(),
             Arc::new(config.permissions.clone()),
             search_paths,
             config.include_external,
             project_root.to_path_buf(),
         );
         catalog.mcp = config.mcp;
+        catalog.nested_depth = config.nested_depth;
+
+        // Startup uses the same path as every later refresh. A failure
+        // leaves the catalog empty and is already logged.
+        let _ = catalog.refresh_registry(project_root);
+        let count = catalog.local_ids(project_root).len();
+        if count > 0 {
+            log::info!("Skills system initialized: {count} skills discovered");
+            log::debug!(
+                "Discovered skills: {}",
+                catalog.local_ids(project_root).join(", ")
+            );
+        } else {
+            log::debug!(
+                "Skills system enabled but no skills found in {} search paths",
+                catalog.sources.len()
+            );
+        }
         Arc::new(catalog)
+    }
+
+    /// Whether a tool list names the `skill` tool explicitly.
+    pub fn names_skill_tool(tools: &[ToolSpec]) -> bool {
+        tools
+            .iter()
+            .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME))
+    }
+
+    /// The catalog an agent gets, or `None` when it gets no skill tool: skills
+    /// must be configured and enabled, and the tool list must be empty
+    /// (every tool) or name `skill`.
+    pub fn for_agent(
+        skills: Option<&SkillsConfig>,
+        tools: &[ToolSpec],
+        project_root: &Path,
+    ) -> Option<Arc<Self>> {
+        let skills = skills.filter(|skills| skills.enabled)?;
+        if tools.is_empty() || Self::names_skill_tool(tools) {
+            Some(Self::from_config(skills, project_root))
+        } else {
+            None
+        }
     }
 
     /// Build a catalog from already-resolved parts.
     pub(crate) fn from_parts(
-        registry: Arc<Mutex<SkillRegistry>>,
+        initial_registry: SkillRegistry,
         permissions: Arc<SkillPermissions>,
         sources: Vec<SkillSource>,
         include_external: bool,
         project_root: PathBuf,
     ) -> Self {
-        let initial_registry = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let mut state = RefreshState::default();
+        if !initial_registry.names().is_empty() {
+            state.snapshots.insert(project_root.clone());
+        }
         let mut registries = HashMap::new();
         registries.insert(project_root.clone(), initial_registry);
 
@@ -105,11 +153,25 @@ impl SkillCatalog {
             sources,
             project_root,
             include_external,
+            nested_depth: discovery::DEFAULT_NESTED_DEPTH,
             mcp: true,
             warned_collisions: Mutex::new(HashSet::new()),
-            discovery_fn: Arc::new(discovery::discover_all_strict),
+            discovery_fn: Arc::new(discovery::discover),
             refresh_tickets: AtomicU64::new(0),
-            published_tickets: Mutex::new(HashMap::new()),
+            refresh_state: Mutex::new(state),
+        }
+    }
+
+    /// Set how deep a project `.agents/skills` folder is scanned.
+    pub fn with_nested_depth(mut self, nested_depth: u8) -> Self {
+        self.nested_depth = nested_depth;
+        self
+    }
+
+    fn scan_options(&self) -> SkillScanOptions {
+        SkillScanOptions {
+            include_external: self.include_external,
+            nested_depth: self.nested_depth,
         }
     }
 
@@ -209,69 +271,71 @@ impl SkillCatalog {
         sources
     }
 
+    /// Start a refresh: take the ticket and capture everything the scan needs,
+    /// so it can run inline or on a blocking thread.
+    fn begin_refresh(&self, workspace: &Path) -> RefreshJob {
+        RefreshJob {
+            ticket: self.refresh_tickets.fetch_add(1, Ordering::SeqCst) + 1,
+            workspace: workspace.to_path_buf(),
+            sources: self.sources_for_workspace(workspace),
+            options: self.scan_options(),
+            discovery_fn: Arc::clone(&self.discovery_fn),
+        }
+    }
+
     /// Re-discover skills for one workspace and atomically replace only that
     /// workspace's registry snapshot.
     pub(crate) fn refresh_registry(&self, workspace: &Path) -> anyhow::Result<()> {
-        let ticket = self.refresh_tickets.fetch_add(1, Ordering::SeqCst) + 1;
-        let sources = self.sources_for_workspace(workspace);
-        match (self.discovery_fn)(&sources, self.include_external) {
-            Ok(skills) => self.publish_refresh(workspace, ticket, skills),
-            Err(error) => {
-                log::warn!(
-                    "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
-                    workspace.display()
-                );
-                Err(error)
-            }
-        }
+        let job = self.begin_refresh(workspace);
+        let report = job.scan();
+        self.finish_refresh(&job.workspace, job.ticket, report)
     }
 
     /// Async variant of [`Self::refresh_registry`] for the tool-call path:
     /// discovery runs off the Tokio worker via `spawn_blocking`, and the
     /// registry lock is only held to publish the results.
     pub(crate) async fn refresh_registry_async(&self, workspace: &Path) -> anyhow::Result<()> {
-        let ticket = self.refresh_tickets.fetch_add(1, Ordering::SeqCst) + 1;
-        let workspace = workspace.to_path_buf();
-        let sources = self.sources_for_workspace(&workspace);
-        let include_external = self.include_external;
-        let discovery_fn = Arc::clone(&self.discovery_fn);
-
-        let discovered =
-            tokio::task::spawn_blocking(move || (discovery_fn)(&sources, include_external))
-                .await
-                .map_err(|e| anyhow::anyhow!("skill discovery task failed: {e}"))?;
-
-        let skills = match discovered {
-            Ok(skills) => skills,
-            Err(error) => {
-                log::warn!(
-                    "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
-                    workspace.display()
-                );
-                return Err(error);
-            }
-        };
-
-        self.publish_refresh(&workspace, ticket, skills)
+        let job = self.begin_refresh(workspace);
+        let (job, report) = tokio::task::spawn_blocking(move || {
+            let report = job.scan();
+            (job, report)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("skill discovery task failed: {e}"))?;
+        self.finish_refresh(&job.workspace, job.ticket, report)
     }
 
-    /// Publish a discovery result unless a refresh that started later has
-    /// already published for this workspace.
-    fn publish_refresh(
+    /// Record the problems of a scan and publish its skills, unless a
+    /// refresh that started later already published for this workspace.
+    ///
+    /// A scan with an unreadable source folder keeps the previously
+    /// published skill set and fails; when nothing was published yet for the
+    /// workspace, the skills of the readable sources are published instead.
+    /// Problems are recorded in every case.
+    fn finish_refresh(
         &self,
         workspace: &Path,
         ticket: u64,
-        skills: Vec<Skill>,
+        report: SkillScanReport,
     ) -> anyhow::Result<()> {
+        for problem in &report.problems {
+            log::warn!(
+                "Skill problem ({}) at {}: {}",
+                problem.kind,
+                problem.path.display(),
+                problem.message
+            );
+        }
         let mut registries = self
             .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
-        let mut published = self
-            .published_tickets
+        let mut state = self
+            .refresh_state
             .lock()
-            .map_err(|_| anyhow::anyhow!("refresh ticket lock poisoned"))?;
-        if published
+            .map_err(|_| anyhow::anyhow!("refresh state lock poisoned"))?;
+        if state
+            .tickets
             .get(workspace)
             .is_some_and(|newest| *newest > ticket)
         {
@@ -281,16 +345,56 @@ impl SkillCatalog {
             );
             return Ok(());
         }
-        published.insert(workspace.to_path_buf(), ticket);
+        state.tickets.insert(workspace.to_path_buf(), ticket);
+        state
+            .problems
+            .insert(workspace.to_path_buf(), report.problems);
+        if report.unreadable_sources && state.snapshots.contains(workspace) {
+            let error = anyhow::anyhow!("a skill source folder could not be read");
+            log::warn!(
+                "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
+                workspace.display()
+            );
+            return Err(error);
+        }
         let count = registries
             .entry(workspace.to_path_buf())
             .or_default()
-            .reload_with(skills);
+            .reload_with(report.skills);
+        state.snapshots.insert(workspace.to_path_buf());
         log::debug!(
             "Skill registry refreshed for {}: {count} local skills available",
             workspace.display()
         );
         Ok(())
+    }
+
+    /// The problems of the newest skill refresh of one workspace, ordered by
+    /// path. Empty when the workspace was never refreshed.
+    pub fn problems(&self, workspace: &Path) -> Vec<SkillProblem> {
+        self.refresh_state
+            .lock()
+            .ok()
+            .and_then(|state| state.problems.get(workspace).cloned())
+            .unwrap_or_default()
+    }
+
+    /// The local skills offered for one workspace, ordered by callable ID.
+    pub fn inventory(&self, workspace: &Path) -> Vec<SkillInventoryEntry> {
+        let Ok(registries) = self.registries.lock() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<SkillInventoryEntry> = registries
+            .get(workspace)
+            .map(|registry| {
+                registry
+                    .all()
+                    .map(|skill| SkillInventoryEntry::from_skill(skill))
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries
     }
 
     /// Whether a snapshot for `workspace` has been loaded.
@@ -352,7 +456,7 @@ impl SkillCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::types::SkillMetadata;
+    use crate::skills::types::{SkillMetadata, SkillProblemKind};
     use std::sync::mpsc;
 
     fn skill(name: &str) -> Skill {
@@ -386,19 +490,25 @@ mod tests {
         // The first discovery stalls and returns an outdated result; later
         // ones return the newer one.
         let discovery_fn = Arc::new(
-            move |_: &[SkillSource], _: bool| -> anyhow::Result<Vec<Skill>> {
+            move |_: &[SkillSource], _: &SkillScanOptions| -> SkillScanReport {
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     started_tx.lock().unwrap().send(()).unwrap();
                     release_rx.lock().unwrap().recv().unwrap();
-                    Ok(vec![skill("old")])
+                    SkillScanReport {
+                        skills: vec![skill("old")],
+                        ..Default::default()
+                    }
                 } else {
-                    Ok(vec![skill("new")])
+                    SkillScanReport {
+                        skills: vec![skill("new")],
+                        ..Default::default()
+                    }
                 }
             },
         );
         let catalog = Arc::new(
             SkillCatalog::from_parts(
-                Arc::new(Mutex::new(SkillRegistry::new())),
+                SkillRegistry::new(),
                 Arc::new(SkillPermissions::default()),
                 vec![],
                 false,
@@ -432,16 +542,242 @@ mod tests {
     #[test]
     fn has_workspace_reports_loaded_snapshots_only() {
         let catalog = SkillCatalog::from_parts(
-            Arc::new(Mutex::new(SkillRegistry::new())),
+            SkillRegistry::new(),
             Arc::new(SkillPermissions::default()),
             vec![],
             false,
             PathBuf::from("/root"),
         )
-        .with_discovery_fn(Arc::new(|_, _| Ok(vec![])));
+        .with_discovery_fn(Arc::new(|_, _| SkillScanReport::default()));
         assert!(catalog.has_workspace(Path::new("/root")));
         assert!(!catalog.has_workspace(Path::new("/other")));
         catalog.refresh_registry(Path::new("/other")).unwrap();
         assert!(catalog.has_workspace(Path::new("/other")));
+    }
+
+    fn empty_catalog(sources: Vec<SkillSource>) -> SkillCatalog {
+        SkillCatalog::from_parts(
+            SkillRegistry::new(),
+            Arc::new(SkillPermissions::default()),
+            sources,
+            true,
+            PathBuf::from("/root"),
+        )
+    }
+
+    fn problem(kind: SkillProblemKind, path: &str) -> SkillProblem {
+        SkillProblem {
+            path: PathBuf::from(path),
+            source: PathBuf::from("/src"),
+            kind,
+            message: "injected".to_string(),
+        }
+    }
+
+    fn write_skill_file(dir: &Path, name: &str, frontmatter: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\nBody\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn first_discovery_with_an_unreadable_source_offers_the_readable_sources() {
+        let catalog = empty_catalog(vec![]).with_discovery_fn(Arc::new(|_, _| SkillScanReport {
+            skills: vec![skill("readable")],
+            problems: vec![problem(SkillProblemKind::SourceUnreadable, "/locked")],
+            unreadable_sources: true,
+            visited_entries: 0,
+        }));
+        let workspace = Path::new("/ws");
+
+        // Nothing was published before, so the refresh succeeds.
+        catalog.refresh_registry(workspace).unwrap();
+        assert!(
+            catalog
+                .lookup_skill(workspace, "readable")
+                .unwrap()
+                .is_some()
+        );
+        let problems = catalog.problems(workspace);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, SkillProblemKind::SourceUnreadable);
+    }
+
+    #[test]
+    fn unreadable_source_is_recorded_while_the_earlier_skill_set_is_kept() {
+        let calls = AtomicU64::new(0);
+        let catalog = empty_catalog(vec![]).with_discovery_fn(Arc::new(move |_, _| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                SkillScanReport {
+                    skills: vec![skill("kept")],
+                    ..Default::default()
+                }
+            } else {
+                SkillScanReport {
+                    skills: vec![skill("partial")],
+                    problems: vec![problem(SkillProblemKind::SourceUnreadable, "/locked")],
+                    unreadable_sources: true,
+                    visited_entries: 0,
+                }
+            }
+        }));
+        let workspace = Path::new("/ws");
+
+        catalog.refresh_registry(workspace).unwrap();
+        assert!(catalog.problems(workspace).is_empty());
+
+        assert!(catalog.refresh_registry(workspace).is_err());
+        let problems = catalog.problems(workspace);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, SkillProblemKind::SourceUnreadable);
+        assert_eq!(problems[0].path, PathBuf::from("/locked"));
+        assert!(catalog.lookup_skill(workspace, "kept").unwrap().is_some());
+        assert!(
+            catalog
+                .lookup_skill(workspace, "partial")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_problem_disappears_on_the_next_refresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Missing `description` makes the definition malformed.
+        write_skill_file(dir.path(), "broken", "name: broken\n");
+        let catalog = empty_catalog(vec![SkillSource::Global(dir.path().to_path_buf())]);
+        let workspace = Path::new("/ws");
+
+        catalog.refresh_registry(workspace).unwrap();
+        let problems = catalog.problems(workspace);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, SkillProblemKind::InvalidDefinition);
+        assert_eq!(problems[0].path, dir.path().join("broken").join("SKILL.md"));
+
+        write_skill_file(
+            dir.path(),
+            "broken",
+            "name: broken\ndescription: Fixed now\n",
+        );
+        catalog.refresh_registry(workspace).unwrap();
+        assert!(catalog.problems(workspace).is_empty());
+        assert!(catalog.lookup_skill(workspace, "broken").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_entry_inside_a_source_does_not_fail_the_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill_file(dir.path(), "valid", "name: valid\ndescription: Valid\n");
+        write_skill_file(dir.path(), "locked", "name: locked\ndescription: Locked\n");
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: privileged user can still read the locked directory");
+            return;
+        }
+
+        let catalog = empty_catalog(vec![SkillSource::Global(dir.path().to_path_buf())]);
+        let workspace = Path::new("/ws");
+        let result = catalog.refresh_registry(workspace);
+        let ids = catalog.local_ids(workspace);
+        let problems = catalog.problems(workspace);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert_eq!(ids, vec!["valid".to_string()]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, SkillProblemKind::EntryUnreadable);
+        assert_eq!(problems[0].path, locked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_lists_offered_skills_with_their_origin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        write_skill_file(dir.path(), "plain", "name: plain\ndescription: Plain\n");
+        write_skill_file(
+            outside.path(),
+            "target",
+            "name: linked\ndescription: Linked\n",
+        );
+        std::os::unix::fs::symlink(outside.path().join("target"), dir.path().join("linked"))
+            .unwrap();
+
+        let catalog = empty_catalog(vec![SkillSource::Global(dir.path().to_path_buf())]);
+        let workspace = Path::new("/ws");
+        catalog.refresh_registry(workspace).unwrap();
+
+        let inventory = catalog.inventory(workspace);
+        let ids: Vec<&str> = inventory.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["linked", "plain"]);
+        assert_eq!(inventory[0].source_folder, dir.path());
+        assert_eq!(inventory[0].directory, dir.path().join("linked"));
+        assert_eq!(
+            inventory[0].link_target,
+            Some(outside.path().join("target").canonicalize().unwrap())
+        );
+        assert_eq!(inventory[1].link_target, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_records_the_target_of_a_linked_source_folder() {
+        let real = tempfile::TempDir::new().unwrap();
+        let holder = tempfile::TempDir::new().unwrap();
+        write_skill_file(real.path(), "review", "name: review\ndescription: Review\n");
+        let source = holder.path().join("skills-link");
+        std::os::unix::fs::symlink(real.path(), &source).unwrap();
+
+        let catalog = empty_catalog(vec![SkillSource::Global(source.clone())]);
+        let workspace = Path::new("/ws");
+        catalog.refresh_registry(workspace).unwrap();
+
+        let inventory = catalog.inventory(workspace);
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].directory, source.join("review"));
+        assert_eq!(
+            inventory[0].link_target,
+            Some(real.path().join("review").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn for_agent_applies_one_rule_for_the_skill_tool() {
+        use crate::config::{SkillsConfig, ToolSpec};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let enabled = SkillsConfig {
+            include_external: false,
+            ..Default::default()
+        };
+        let disabled = SkillsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (specs, error) = crate::delegation::member::parse_tool_specs(["skill"]);
+        assert!(error.is_none());
+        let (other, error) = crate::delegation::member::parse_tool_specs(["shell"]);
+        assert!(error.is_none());
+        let none: Vec<ToolSpec> = Vec::new();
+
+        let for_agent = |skills: Option<&SkillsConfig>, tools: &[ToolSpec]| {
+            SkillCatalog::for_agent(skills, tools, root.path()).is_some()
+        };
+        assert!(for_agent(Some(&enabled), &none), "empty list admits skill");
+        assert!(for_agent(Some(&enabled), &specs), "named skill is admitted");
+        assert!(!for_agent(Some(&enabled), &other), "other tools only");
+        assert!(!for_agent(Some(&disabled), &none), "skills disabled");
+        assert!(!for_agent(None, &none), "skills not configured");
+        assert!(SkillCatalog::names_skill_tool(&specs));
+        assert!(!SkillCatalog::names_skill_tool(&none));
     }
 }

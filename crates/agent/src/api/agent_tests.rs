@@ -3278,7 +3278,12 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     )
     .unwrap();
 
-    let mut skills = crate::config::SkillsConfig::default();
+    // Only MCP skills matter here: keep the developer's own global skill
+    // folders (for example `~/.agents/skills`) out of the listing.
+    let mut skills = crate::config::SkillsConfig {
+        include_external: false,
+        ..Default::default()
+    };
     skills
         .permissions
         .patterns

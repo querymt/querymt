@@ -1,6 +1,4 @@
-use crate::skills::discovery;
 use crate::skills::types::Skill;
-use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,36 +33,6 @@ impl SkillRegistry {
         let skill = Arc::new(skill);
         self.by_name.insert(id.clone(), skill);
         self.by_path.insert(path, id);
-    }
-
-    /// Load skills from discovery sources
-    pub fn load_from_sources(
-        &mut self,
-        sources: &[crate::skills::types::SkillSource],
-        include_external: bool,
-    ) -> Result<usize> {
-        let skills = discovery::discover_all(sources, include_external)?;
-        let count = skills.len();
-        for skill in skills {
-            self.register(skill);
-        }
-        Ok(count)
-    }
-
-    /// Transactionally replace the registry contents with a fresh discovery of
-    /// `sources` (replace semantics, not a merge).
-    ///
-    /// Replacement maps are built from strict discovery results and swapped in
-    /// only after complete success; on any discovery failure the previous
-    /// registry contents are retained unchanged. Returns the number of skills
-    /// in the published snapshot.
-    pub fn reload_from_sources(
-        &mut self,
-        sources: &[crate::skills::types::SkillSource],
-        include_external: bool,
-    ) -> Result<usize> {
-        let skills = discovery::discover_all_strict(sources, include_external)?;
-        Ok(self.reload_with(skills))
     }
 
     /// Atomically replace the registry contents with `skills`.
@@ -238,28 +206,10 @@ mod tests {
         assert_eq!(desc, "No skills available");
     }
 
-    #[test]
-    fn test_load_from_sources() {
-        let dir = TempDir::new().unwrap();
-        let skill_dir = dir.path().join("test-skill");
-        fs::create_dir(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            r#"---
-name: test-skill
-description: A test skill
----
-Content
-"#,
-        )
-        .unwrap();
-
-        let mut registry = SkillRegistry::new();
-        let sources = vec![SkillSource::Global(dir.path().to_path_buf())];
-        let count = registry.load_from_sources(&sources, true).unwrap();
-
-        assert_eq!(count, 1);
-        assert!(registry.get("test-skill").is_some());
+    /// Replace the registry with a fresh discovery of `sources`.
+    fn reload(registry: &mut SkillRegistry, sources: &[SkillSource]) -> usize {
+        let report = crate::skills::discovery::discover(sources, &Default::default());
+        registry.reload_with(report.skills)
     }
 
     /// Write a skill definition named `name` with the given description.
@@ -274,47 +224,13 @@ Content
     }
 
     #[test]
-    fn test_reload_from_sources_adds_and_removes_from_both_indexes() {
-        let dir = TempDir::new().unwrap();
-        write_skill(dir.path(), "kept-skill", "Survives reload");
-        write_skill(dir.path(), "stale-skill", "Removed by reload");
-
-        let mut registry = SkillRegistry::new();
-        registry.register(create_test_skill("manually-added", "Pre-existing", None));
-
-        let sources = vec![SkillSource::Global(dir.path().to_path_buf())];
-
-        // First reload: replaces the manual entry with the on-disk set.
-        let count = registry.reload_from_sources(&sources, true).unwrap();
-        assert_eq!(count, 2);
-        assert!(registry.get("kept-skill").is_some());
-        assert!(registry.get("stale-skill").is_some());
-        assert!(registry.get("manually-added").is_none());
-        assert_eq!(registry.by_name.len(), 2);
-
-        // Removal: delete one skill's directory and reload again.
-        fs::remove_dir_all(dir.path().join("stale-skill")).unwrap();
-        let count = registry.reload_from_sources(&sources, true).unwrap();
-        assert_eq!(count, 1);
-        assert!(registry.get("kept-skill").is_some());
-        assert!(registry.get("stale-skill").is_none());
-        // The stale path index entry must be gone too.
-        assert_eq!(registry.by_path.len(), 1);
-        assert!(
-            !registry
-                .by_path
-                .contains_key(&dir.path().join("stale-skill"))
-        );
-    }
-
-    #[test]
-    fn test_reload_from_sources_sees_edits() {
+    fn reload_sees_edits() {
         let dir = TempDir::new().unwrap();
         write_skill(dir.path(), "edited-skill", "Before edit");
 
         let mut registry = SkillRegistry::new();
         let sources = vec![SkillSource::Global(dir.path().to_path_buf())];
-        registry.reload_from_sources(&sources, true).unwrap();
+        reload(&mut registry, &sources);
         assert_eq!(
             registry.get("edited-skill").unwrap().metadata.description,
             "Before edit"
@@ -322,7 +238,7 @@ Content
 
         // Edit the definition file and confirm the reload picks it up.
         write_skill(dir.path(), "edited-skill", "After edit");
-        registry.reload_from_sources(&sources, true).unwrap();
+        reload(&mut registry, &sources);
         assert_eq!(
             registry.get("edited-skill").unwrap().metadata.description,
             "After edit"
@@ -366,7 +282,7 @@ Content
     }
 
     #[test]
-    fn test_reload_from_sources_resolves_precedence_by_effective_id() {
+    fn reload_resolves_precedence_by_effective_id() {
         let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
 
@@ -393,7 +309,7 @@ Content
         ];
 
         let mut registry = SkillRegistry::new();
-        let count = registry.reload_from_sources(&sources, true).unwrap();
+        let count = reload(&mut registry, &sources);
 
         assert_eq!(count, 1);
         let skill = registry.get("review").unwrap();
@@ -413,33 +329,5 @@ Content
         let desc = registry.list_for_description();
         assert!(desc.contains("- review: Reviews code changes."));
         assert!(desc.contains("display name: Code Review"));
-    }
-
-    #[test]
-    fn test_reload_from_sources_retains_contents_on_failed_discovery() {
-        let dir = TempDir::new().unwrap();
-        write_skill(dir.path(), "existing", "Existing skill");
-
-        let mut registry = SkillRegistry::new();
-        let sources = vec![SkillSource::Global(dir.path().to_path_buf())];
-        registry.reload_from_sources(&sources, true).unwrap();
-
-        // Make the source unreadable; strict discovery must fail and the
-        // registry must retain its previous contents. Skips under privileged
-        // users where permission bits do not block traversal.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o000)).unwrap();
-            if fs::read_dir(dir.path()).is_err() {
-                let result = registry.reload_from_sources(&sources, true);
-                assert!(result.is_err());
-                assert!(registry.get("existing").is_some());
-                assert_eq!(registry.by_path.len(), 1);
-            } else {
-                eprintln!("skipping: privileged user can still read the locked directory");
-            }
-            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        }
     }
 }

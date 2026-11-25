@@ -29,6 +29,22 @@
   multimodal and speculative (target) generation. Changing the adapter path
   reloads the model; changing only the scale does not. New exports
   `LoraAdapterConfig`, `LoraScale` and `LoraScaleError`.
+- **Skill discovery follows symbolic links.** A skill folder, or a category
+  folder holding skills, that is a symbolic link is now offered wherever the link
+  points. A broken link or a link loop is reported as a skill problem and no
+  longer hides the other skills of that folder, and a single unreadable entry no
+  longer fails a refresh. Supporting files of a linked skill are read from the
+  link target and may not leave it; links inside a skill folder are listed with
+  the skill's files. A source folder that is a dangling link is reported as a
+  problem. A skill definition must be a regular file of at most 1 MiB (a link to
+  a pipe or device no longer blocks a refresh), and a `SKILL.md` placed directly
+  in a source folder is no longer treated as a skill.
+- **`nested_depth` in every skills table** (`[agent.skills]`, a delegate's
+  `skills` table, the deprecated `[planner.skills]`): how many directory levels
+  below a project `.agents/skills` folder may hold a skill directory. Integer
+  from `1` to `16`, default `4`; `1` means direct children only. Any other value
+  fails configuration loading with an error naming the key. Other skill sources
+  accept direct children only, as before.
 
 - **Providers declare prompt-cache support; new `[agent.execution.prompt_cache]
   ttl_secs`.** `ChatCapabilities` has a new `prompt_cache` field
@@ -696,6 +712,21 @@
 
 ### Breaking
 
+- **BREAKING (`querymt_agent::skills`): skill discovery returns a scan report.**
+  `discover_all` and `discover_all_strict` are replaced by
+  `discover(sources, &SkillScanOptions) -> SkillScanReport` (skills, problems,
+  whether a source folder was unreadable, entries visited), and
+  `discover_from_source` takes the nested depth and returns a report.
+  `SkillRegistry::load_from_sources` and `SkillRegistry::reload_from_sources` are
+  removed; `SkillCatalog` refreshes through one path, including at startup. New:
+  `SkillProblem`, `SkillProblemKind`, `SkillInventoryEntry`, and
+  `SkillCatalog::problems` and `SkillCatalog::inventory` for a workspace.
+- **BREAKING: skill discovery no longer applies `.gitignore`** or other ignore
+  files. A skill folder that version control ignores is now offered; set
+  `enabled: false` in its frontmatter or a skill permission rule to hide it.
+- **BREAKING: a project `.agents/skills` folder is scanned to `nested_depth`
+  levels (default `4`)** instead of without limit. Skills nested deeper are no
+  longer found; raise `nested_depth` (up to `16`) to find them.
 - **BREAKING: the middleware trait is replaced by `Middleware` and
   `TurnMiddleware`** (`querymt_agent::middleware`). A middleware is now an
   agent-scoped `Middleware` (configuration and shared services) that creates one

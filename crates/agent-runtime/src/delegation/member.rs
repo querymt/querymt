@@ -430,14 +430,11 @@ pub(crate) fn build_local_member(
     .with_agent_id(spec.id.to_string())
     .with_event_fanout(ctx.event_fanout.clone());
 
-    if let Some(skills) = spec.skills.as_ref()
-        && skills.enabled
-        && (tools.is_empty()
-            || tools
-                .iter()
-                .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
-    {
-        let catalog = crate::skills::SkillCatalog::from_config(skills, &params.skills_project_root);
+    if let Some(catalog) = crate::skills::SkillCatalog::for_agent(
+        spec.skills.as_ref(),
+        tools,
+        &params.skills_project_root,
+    ) {
         b = b.with_skill_catalog(catalog);
     }
 

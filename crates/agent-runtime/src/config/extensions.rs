@@ -31,6 +31,37 @@ pub struct SkillsConfig {
     /// Offer skills published by connected MCP servers (default: true)
     #[serde(default = "default_true")]
     pub mcp: bool,
+
+    /// Directory levels below a project `.agents/skills` folder that may hold
+    /// a skill directory (default: 4; `1` means direct children only).
+    /// Other skill sources always accept direct children only.
+    #[serde(
+        default = "default_skill_nested_depth",
+        deserialize_with = "deserialize_skill_nested_depth"
+    )]
+    #[schemars(range(min = 1, max = 16))]
+    pub nested_depth: u8,
+}
+
+fn default_skill_nested_depth() -> u8 {
+    crate::skills::discovery::DEFAULT_NESTED_DEPTH
+}
+
+fn deserialize_skill_nested_depth<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::skills::discovery::{MAX_NESTED_DEPTH, MIN_NESTED_DEPTH};
+    let invalid = || {
+        <D::Error as serde::de::Error>::custom(format!(
+            "`nested_depth` must be an integer from {MIN_NESTED_DEPTH} to {MAX_NESTED_DEPTH}"
+        ))
+    };
+    let value = i64::deserialize(deserializer).map_err(|_| invalid())?;
+    u8::try_from(value)
+        .ok()
+        .filter(|depth| (MIN_NESTED_DEPTH..=MAX_NESTED_DEPTH).contains(depth))
+        .ok_or_else(invalid)
 }
 
 impl Default for SkillsConfig {
@@ -42,6 +73,7 @@ impl Default for SkillsConfig {
             urls: vec![],
             permissions: crate::skills::SkillPermissions::default(),
             mcp: true,
+            nested_depth: crate::skills::discovery::DEFAULT_NESTED_DEPTH,
         }
     }
 }

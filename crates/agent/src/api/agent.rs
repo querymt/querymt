@@ -831,19 +831,13 @@ impl AgentBuilder {
             builder = builder.with_execution_timeout_secs(execution_timeout_secs);
         }
 
-        if let Some(skills_config) = self.skills_config
-            && skills_config.enabled
-            && (self.tools.is_empty()
-                || self
-                    .tools
-                    .iter()
-                    .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
-        {
-            let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-            builder = builder.with_skill_catalog(crate::skills::SkillCatalog::from_config(
-                &skills_config,
-                project_root,
-            ));
+        let skills_project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        if let Some(catalog) = crate::skills::SkillCatalog::for_agent(
+            self.skills_config.as_ref(),
+            &self.tools,
+            skills_project_root,
+        ) {
+            builder = builder.with_skill_catalog(catalog);
         }
 
         if !self.tools.is_empty() {
@@ -2045,10 +2039,7 @@ impl ChatRunner for Agent {
 
 /// A `skill` tool needs skills to be configured and enabled for its agent.
 fn check_skill_tool(tools: &[ToolSpec], skills: Option<&SkillsConfig>, who: &str) -> Result<()> {
-    if !tools
-        .iter()
-        .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME))
-    {
+    if !crate::skills::SkillCatalog::names_skill_tool(tools) {
         return Ok(());
     }
     match skills {
