@@ -139,19 +139,14 @@ fn manifest_exposes_every_supported_collection() {
 
     manifest.skills.insert(
         "review".to_string(),
-        DotagentsSkill {
+        crate::skills::SkillInventoryEntry {
             id: "review".to_string(),
             name: "review".to_string(),
             description: "review code".to_string(),
-            enabled: true,
-            body: "body".to_string(),
-            extensions: BTreeMap::new(),
-            source: DotagentsSource::entry(
-                DotagentsLayer::Workspace,
-                "/ws/.agents/skills/review/skill.md",
-                "review",
-            ),
-            fingerprint: "fp-skill".to_string(),
+            source_kind: crate::skills::SkillSourceKind::Project,
+            source_folder: "/ws/.agents/skills".into(),
+            directory: "/ws/.agents/skills/review".into(),
+            link_target: None,
         },
     );
 
@@ -1323,4 +1318,208 @@ fn dotagents_sections_count_as_system_sections() {
     assert_eq!(hinted, [true, false, true]);
     assert_eq!(sections[0].text(), "agent system file");
     assert_eq!(sections[2].text(), "protocol instructions");
+}
+
+// ---- Manifest skill inventory ----
+
+mod skill_inventory {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write_skill(folder: &Path, dir: &str, file: &str, name: &str, extra: &str) {
+        let dir = folder.join(dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(file),
+            format!("---\nname: {name}\ndescription: {name} skill\n{extra}---\nBody\n"),
+        )
+        .unwrap();
+    }
+
+    fn load(workspace: &Path) -> DotagentsManifest {
+        DotagentsLoader::new(DotagentsLoadOptions::enabled().with_workspace(workspace))
+            .load()
+            .expect("compatibility resolution succeeds")
+    }
+
+    fn diagnostics_naming<'a>(
+        manifest: &'a DotagentsManifest,
+        path: &Path,
+    ) -> Vec<&'a DotagentsDiagnostic> {
+        let needle = path.display().to_string();
+        manifest
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains(&needle))
+            .collect()
+    }
+
+    #[test]
+    fn resolution_without_skill_settings_uses_the_defaults() {
+        let workspace = TempDir::new().unwrap();
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "review",
+            "SKILL.md",
+            "review",
+            "",
+        );
+
+        let options = DotagentsLoadOptions::enabled().with_workspace(workspace.path());
+        assert_eq!(options.skill_scan(), &DotagentsSkillScan::Defaults);
+        let manifest = DotagentsLoader::new(options).load().unwrap();
+
+        assert!(manifest.skills.contains_key("review"));
+    }
+
+    #[test]
+    fn skill_from_a_non_protocol_folder_is_listed_in_the_manifest() {
+        let workspace = TempDir::new().unwrap();
+        let folder = workspace.path().join(".claude/skills");
+        write_skill(&folder, "review", "SKILL.md", "review", "");
+
+        let manifest = load(workspace.path());
+
+        let entry = &manifest.skills["review"];
+        assert_eq!(entry.source_kind, crate::skills::SkillSourceKind::Project);
+        assert_eq!(entry.source_folder, folder);
+        assert_eq!(entry.directory, folder.join("review"));
+        assert_eq!(entry.link_target, None);
+    }
+
+    #[test]
+    fn disabled_skill_is_not_listed_in_the_manifest() {
+        let workspace = TempDir::new().unwrap();
+        let folder = workspace.path().join(".agents/skills");
+        write_skill(&folder, "draft", "skill.md", "draft", "enabled: false\n");
+        write_skill(&folder, "live", "skill.md", "live", "");
+
+        let manifest = load(workspace.path());
+
+        assert!(!manifest.skills.contains_key("draft"));
+        assert!(manifest.skills.contains_key("live"));
+        assert!(diagnostics_naming(&manifest, &folder.join("draft")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_skill_folder_outside_the_layer_is_accepted() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_skill(outside.path(), "shared-src", "SKILL.md", "shared", "");
+        let folder = workspace.path().join(".agents/skills");
+        fs::create_dir_all(&folder).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("shared-src"), folder.join("shared"))
+            .unwrap();
+
+        let manifest = load(workspace.path());
+
+        assert!(manifest.skills.contains_key("shared"));
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != DotagentsDiagnosticCode::PathEscape),
+            "{:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_skill_entry_records_its_target() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_skill(outside.path(), "shared-src", "SKILL.md", "shared", "");
+        let folder = workspace.path().join(".agents/skills");
+        fs::create_dir_all(&folder).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("shared-src"), folder.join("shared"))
+            .unwrap();
+
+        let manifest = load(workspace.path());
+
+        let entry = &manifest.skills["shared"];
+        assert_eq!(entry.directory, folder.join("shared"));
+        assert_eq!(
+            entry.link_target.as_deref(),
+            Some(
+                outside
+                    .path()
+                    .join("shared-src")
+                    .canonicalize()
+                    .unwrap()
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_skill_yields_a_manifest_warning() {
+        let workspace = TempDir::new().unwrap();
+        let folder = workspace.path().join(".agents/skills");
+        write_skill(&folder, "valid", "SKILL.md", "valid", "");
+        // A definition without a description is invalid.
+        let bad = folder.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("SKILL.md"), "---\nname: bad\n---\nBody\n").unwrap();
+
+        let manifest = load(workspace.path());
+
+        assert!(manifest.skills.contains_key("valid"));
+        assert!(!manifest.skills.contains_key("bad"));
+        let named = diagnostics_naming(&manifest, &bad.join("SKILL.md"));
+        assert_eq!(named.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(named[0].severity, DotagentsSeverity::Warning);
+        assert_eq!(named[0].code, DotagentsDiagnosticCode::ParseError);
+        assert!(named[0].message.starts_with("skill "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_resolution_succeeds_despite_a_skill_problem() {
+        let workspace = TempDir::new().unwrap();
+        let folder = workspace.path().join(".agents/skills");
+        write_skill(&folder, "valid", "SKILL.md", "valid", "");
+        let link = folder.join("dangling");
+        std::os::unix::fs::symlink(workspace.path().join("missing"), &link).unwrap();
+
+        let manifest = DotagentsLoader::new(
+            DotagentsLoadOptions::enabled()
+                .with_workspace(workspace.path())
+                .with_strictness(DotagentsStrictness::Strict),
+        )
+        .load()
+        .expect("a skill problem must not fail strict resolution");
+
+        assert!(manifest.skills.contains_key("valid"));
+        let named = diagnostics_naming(&manifest, &link);
+        assert_eq!(named.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(named[0].severity, DotagentsSeverity::Warning);
+        assert_eq!(named[0].code, DotagentsDiagnosticCode::IoError);
+        assert!(!manifest.has_errors());
+    }
+
+    #[test]
+    fn disabled_scan_lists_no_skills() {
+        let workspace = TempDir::new().unwrap();
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "review",
+            "SKILL.md",
+            "review",
+            "",
+        );
+
+        let manifest = DotagentsLoader::new(
+            DotagentsLoadOptions::enabled()
+                .with_workspace(workspace.path())
+                .with_skill_scan(DotagentsSkillScan::Disabled),
+        )
+        .load()
+        .unwrap();
+
+        assert!(manifest.skills.is_empty());
+    }
 }

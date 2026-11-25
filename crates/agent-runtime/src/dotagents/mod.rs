@@ -72,8 +72,8 @@ pub use loader::{compose_prompt, resolve_for_builder};
 pub use manifest::{
     DotagentsAgent, DotagentsAgentConfig, DotagentsAgentConnection, DotagentsAgentConnectionType,
     DotagentsAgentRole, DotagentsManifest, DotagentsMcpServer, DotagentsMcpTransport,
-    DotagentsMemory, DotagentsModelPreset, DotagentsPrompt, DotagentsSkill, DotagentsTask,
-    DotagentsTaskKind, DotagentsUnsupported, DotagentsUnsupportedKind,
+    DotagentsMemory, DotagentsModelPreset, DotagentsPrompt, DotagentsTask, DotagentsTaskKind,
+    DotagentsUnsupported, DotagentsUnsupportedKind,
 };
 pub use memory::{
     DotagentsMemoryDeactivation, DotagentsMemoryDeactivationReason, DotagentsMemoryIngest,
@@ -136,11 +136,11 @@ fn lexical_normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 pub use merge::{DotagentsLayerContent, insert_unique, merge_layers, normalize_id, source_of};
-pub use options::{DotagentsLoadOptions, DotagentsStrictness};
+pub use options::{DotagentsLoadOptions, DotagentsSkillScan, DotagentsStrictness};
 pub use parsers::{
     ParsedAgentDocument, ParsedMcpDocument, ParsedModelsDocument, fingerprint, parse_agent_config,
     parse_agent_document, parse_mcp_document, parse_memory_document, parse_models_document,
-    parse_prompt_document, parse_skill_document, parse_task_document,
+    parse_prompt_document, parse_task_document,
 };
 pub use settings::DotagentsSettings;
 pub use subagent::{DotagentsSubAgentPlan, DotagentsSubAgentPlans, plan_agent as plan_sub_agent};

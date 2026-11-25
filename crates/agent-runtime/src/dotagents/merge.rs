@@ -14,8 +14,11 @@
 //!   wholly replaces an earlier one;
 //! - `mcp.json` and `models.json` merge by **top-level key** (each key is an
 //!   independent entry, so unmatched earlier keys survive);
-//! - skills, agents, tasks, and memories merge by **stable entry ID**, with
-//!   later layers replacing matching IDs.
+//! - agents, tasks, and memories merge by **stable entry ID**, with later
+//!   layers replacing matching IDs.
+//!
+//! Skills are not merged here: the manifest's skill list is an inventory
+//! filled from the shared skill reader (see `DotagentsLoader::load`).
 //!
 //! Within a single layer, two entries that normalize to the same ID are an
 //! error rather than a filesystem-order-dependent winner. The merge keeps the
@@ -30,7 +33,7 @@ use super::diagnostics::{DotagentsDiagnostic, DotagentsDiagnosticCode};
 use super::layer::{DotagentsLayer, DotagentsSource};
 use super::manifest::{
     DotagentsAgent, DotagentsManifest, DotagentsMcpServer, DotagentsMemory, DotagentsModelPreset,
-    DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsUnsupported,
+    DotagentsPrompt, DotagentsTask, DotagentsUnsupported,
 };
 use std::collections::BTreeMap;
 
@@ -58,8 +61,6 @@ pub struct DotagentsLayerContent {
     pub mcp_servers: BTreeMap<String, DotagentsMcpServer>,
     /// Model presets keyed by name (`models.json` top-level keys).
     pub model_presets: BTreeMap<String, DotagentsModelPreset>,
-    /// Skills keyed by normalized ID.
-    pub skills: BTreeMap<String, DotagentsSkill>,
     /// Agents keyed by normalized ID.
     pub agents: BTreeMap<String, DotagentsAgent>,
     /// Tasks keyed by normalized ID.
@@ -129,9 +130,6 @@ pub fn merge_layers(layers: &[DotagentsLayerContent]) -> DotagentsManifest {
                 manifest.model_presets.insert(name.clone(), preset.clone());
             }
         }
-        for (id, skill) in &content.skills {
-            manifest.skills.insert(id.clone(), skill.clone());
-        }
         for (id, agent) in &content.agents {
             manifest.agents.insert(id.clone(), agent.clone());
         }
@@ -196,8 +194,7 @@ pub fn insert_unique<T: Clone>(
 pub mod source_of {
     use super::super::layer::DotagentsSource;
     use super::super::manifest::{
-        DotagentsAgent, DotagentsMcpServer, DotagentsMemory, DotagentsModelPreset, DotagentsSkill,
-        DotagentsTask,
+        DotagentsAgent, DotagentsMcpServer, DotagentsMemory, DotagentsModelPreset, DotagentsTask,
     };
 
     /// The source of an MCP server entry.
@@ -206,10 +203,6 @@ pub mod source_of {
     }
     /// The source of a model preset.
     pub fn model_preset(value: &DotagentsModelPreset) -> &DotagentsSource {
-        &value.source
-    }
-    /// The source of a skill.
-    pub fn skill(value: &DotagentsSkill) -> &DotagentsSource {
         &value.source
     }
     /// The source of an agent profile.
@@ -274,19 +267,6 @@ mod tests {
             parameters: BTreeMap::new(),
             extensions: BTreeMap::new(),
             source: source(layer, &format!("{layer}/models.json"), Some(name)),
-        }
-    }
-
-    fn skill(layer: DotagentsLayer, id: &str, body: &str) -> DotagentsSkill {
-        DotagentsSkill {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: "d".to_string(),
-            enabled: true,
-            body: body.to_string(),
-            extensions: BTreeMap::new(),
-            source: source(layer, &format!("{layer}/skills/{id}/skill.md"), Some(id)),
-            fingerprint: format!("fp-{body}"),
         }
     }
 
@@ -425,14 +405,6 @@ mod tests {
     #[test]
     fn collection_entries_merge_by_id() {
         let mut global = DotagentsLayerContent::new(DotagentsLayer::Global);
-        global.skills.insert(
-            "review".into(),
-            skill(DotagentsLayer::Global, "review", "global-body"),
-        );
-        global.skills.insert(
-            "format".into(),
-            skill(DotagentsLayer::Global, "format", "format-body"),
-        );
         global.tasks.insert(
             "digest".into(),
             task(DotagentsLayer::Global, "digest", "global-prompt"),
@@ -447,10 +419,6 @@ mod tests {
         );
 
         let mut workspace = DotagentsLayerContent::new(DotagentsLayer::Workspace);
-        workspace.skills.insert(
-            "review".into(),
-            skill(DotagentsLayer::Workspace, "review", "ws-body"),
-        );
         workspace.agents.insert(
             "helper".into(),
             agent(DotagentsLayer::Workspace, "helper", "ws"),
@@ -459,14 +427,12 @@ mod tests {
         let manifest = merge_layers(&[global, workspace]);
 
         // Workspace replaces matching IDs.
-        assert_eq!(manifest.skills["review"].body, "ws-body");
+        assert_eq!(manifest.agents["helper"].description, "ws");
         assert_eq!(
-            manifest.skills["review"].source.layer,
+            manifest.agents["helper"].source.layer,
             DotagentsLayer::Workspace
         );
-        assert_eq!(manifest.agents["helper"].description, "ws");
         // Unmatched global entries remain.
-        assert_eq!(manifest.skills["format"].body, "format-body");
         assert_eq!(manifest.tasks["digest"].prompt, "global-prompt");
         assert_eq!(manifest.memories["note"].body, "global-note");
     }
@@ -519,20 +485,20 @@ mod tests {
             insert_unique(
                 &mut collection,
                 "x",
-                skill(DotagentsLayer::Workspace, "x", &format!("body-{i}")),
-                source_of::skill,
+                agent(DotagentsLayer::Workspace, "x", &format!("body-{i}")),
+                source_of::agent,
                 &source(
                     DotagentsLayer::Workspace,
-                    &format!("ws/skills/{i}/skill.md"),
+                    &format!("ws/agents/{i}/agent.md"),
                     Some("x"),
                 ),
                 &mut diagnostics,
-                "skill",
+                "agent",
             );
         }
 
         assert_eq!(collection.len(), 1);
-        assert_eq!(collection["x"].body, "body-0");
+        assert_eq!(collection["x"].description, "body-0");
         assert_eq!(diagnostics.len(), 2);
     }
 
@@ -567,15 +533,15 @@ mod tests {
         let build = || {
             let mut global = DotagentsLayerContent::new(DotagentsLayer::Global);
             global
-                .skills
-                .insert("a".into(), skill(DotagentsLayer::Global, "a", "1"));
+                .agents
+                .insert("a".into(), agent(DotagentsLayer::Global, "a", "1"));
             global
-                .skills
-                .insert("b".into(), skill(DotagentsLayer::Global, "b", "2"));
+                .agents
+                .insert("b".into(), agent(DotagentsLayer::Global, "b", "2"));
             let mut workspace = DotagentsLayerContent::new(DotagentsLayer::Workspace);
             workspace
-                .skills
-                .insert("c".into(), skill(DotagentsLayer::Workspace, "c", "3"));
+                .agents
+                .insert("c".into(), agent(DotagentsLayer::Workspace, "c", "3"));
             merge_layers(&[global, workspace])
         };
         assert_eq!(build(), build());

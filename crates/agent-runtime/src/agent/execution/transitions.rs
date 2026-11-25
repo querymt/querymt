@@ -77,6 +77,63 @@ pub(super) enum ContextTrigger {
     UserPrompt,
 }
 
+/// Tell the session's clients about the skill problems of its workspace when
+/// the list differs from the one last announced to this session.
+///
+/// Runs right after tool collection, where the `skill` tool's definition has
+/// just refreshed the catalog, and only when that tool is offered. An empty
+/// list is announced only to a session that was told about a problem.
+fn announce_skill_problems(
+    config: &AgentConfig,
+    env: &TurnEnv,
+    tools: &[querymt::chat::Tool],
+    collect_span: &tracing::Span,
+) {
+    let Some(catalog) = &config.skill_catalog else {
+        return;
+    };
+    if !tools
+        .iter()
+        .any(|tool| tool.function.name == crate::skills::SkillTool::NAME)
+    {
+        return;
+    }
+    let workspace = env
+        .runtime
+        .cwd
+        .as_deref()
+        .unwrap_or_else(|| catalog.project_root());
+    if let Some(stats) = catalog.last_refresh_stats(workspace) {
+        collect_span.record("skill_refresh_us", stats.elapsed.as_micros() as u64);
+        collect_span.record("skill_refresh_entries", stats.visited_entries as u64);
+    }
+    let problems: Vec<querymt_agent_core::events::SkillProblemInfo> = catalog
+        .problems(workspace)
+        .into_iter()
+        .map(|problem| querymt_agent_core::events::SkillProblemInfo {
+            path: problem.path.display().to_string(),
+            source: problem.source.display().to_string(),
+            kind: problem.kind.as_str().to_string(),
+            message: problem.message,
+        })
+        .collect();
+    let current = (!problems.is_empty())
+        .then(|| serde_json::to_vec(&problems).ok())
+        .flatten()
+        .map(|bytes| querymt_agent_core::hash::RapidHash::new(&bytes));
+    {
+        let mut announced = env.runtime.announced_skill_problems.lock();
+        if *announced == current {
+            return;
+        }
+        *announced = current;
+    }
+    config.emit_event(
+        &env.session_id,
+        AgentEventKind::SkillProblemsChanged { problems },
+    );
+}
+
 /// Transition from BeforeLlmCall to CallLlm.
 ///
 /// This collects available tools, computes their hash, and emits a ToolsAvailable event
@@ -119,7 +176,9 @@ pub(super) async fn transition_before_llm_call(
     let collect_span = info_span!(
         "agent.tools.collect",
         tool_count = tracing::field::Empty,
-        tools_bytes = tracing::field::Empty
+        tools_bytes = tracing::field::Empty,
+        skill_refresh_us = tracing::field::Empty,
+        skill_refresh_entries = tracing::field::Empty
     );
     let capabilities = env.model.profile.capabilities;
     // Peer turns have a filtered tool set. Do not replay a host turn's tool
@@ -145,6 +204,7 @@ pub(super) async fn transition_before_llm_call(
             env.tool_set(),
         );
         tools.retain(|tool| env.allows_workflow_tool(&tool.function.name));
+        announce_skill_problems(config, env, &tools, &collect_span);
         if env.restricted_mesh_turn() {
             tools = tools
                 .into_iter()
@@ -4449,6 +4509,151 @@ mod tests {
             assert!(with.iter().any(|t| t.function.name == "skill"));
             let handle = crate::agent::LocalAgentHandle::from_config(Arc::new(config));
             assert!(handle.tool_registry().find("skill").is_none());
+        }
+
+        /// Skill problem announcements: a fixture whose catalog reads one
+        /// configured folder, and the problem lists announced per request.
+        struct SkillProblemRun {
+            folder: tempfile::TempDir,
+            config: AgentConfig,
+            exec: crate::agent::execution::turn::TurnEnv,
+            turn: crate::agent::execution::turn::Turn,
+            events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        }
+
+        impl SkillProblemRun {
+            async fn new() -> Self {
+                let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+                let folder = tempfile::tempdir().unwrap();
+                let mut config = (*fixture.config).clone();
+                config.skill_catalog = Some(Arc::new(crate::skills::SkillCatalog::from_parts(
+                    crate::skills::SkillRegistry::new(),
+                    Arc::new(crate::skills::SkillPermissions::default()),
+                    vec![crate::skills::SkillSource::Configured(
+                        folder.path().to_path_buf(),
+                    )],
+                    false,
+                    folder.path().to_path_buf(),
+                )));
+                let (exec, turn) = fixture.turn().await;
+                let exec = exec.tools_from(&config);
+                let events = config.subscribe_events();
+                Self {
+                    folder,
+                    config,
+                    exec,
+                    turn,
+                    events,
+                }
+            }
+
+            /// A skill definition without a description: an `invalid_definition`.
+            fn add_malformed(&self, name: &str) {
+                let dir = self.folder.path().join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("SKILL.md"),
+                    format!("---\nname: {name}\n---\nBody\n"),
+                )
+                .unwrap();
+            }
+
+            fn remove(&self, name: &str) {
+                std::fs::remove_dir_all(self.folder.path().join(name)).unwrap();
+            }
+
+            /// Prepare one model request and return the skill problem lists
+            /// announced while doing so.
+            async fn request(&mut self) -> Vec<Vec<querymt_agent_core::events::SkillProblemInfo>> {
+                let _ =
+                    transition_before_llm_call_in_test(&self.config, &self.exec, &mut self.turn)
+                        .await
+                        .expect("before llm call");
+                let mut announced = Vec::new();
+                // Delivery through the fanout is asynchronous: collect until
+                // the stream stays quiet.
+                let quiet = std::time::Duration::from_millis(150);
+                while let Ok(Ok(event)) = tokio::time::timeout(quiet, self.events.recv()).await {
+                    if let AgentEventKind::SkillProblemsChanged { problems } = event.kind() {
+                        announced.push(problems.clone());
+                    }
+                }
+                announced
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn problems_are_announced_on_the_first_model_request() {
+            let mut run = SkillProblemRun::new().await;
+            std::os::unix::fs::symlink(
+                run.folder.path().join("missing"),
+                run.folder.path().join("dangling"),
+            )
+            .unwrap();
+
+            let announced = run.request().await;
+
+            assert_eq!(announced.len(), 1, "{announced:?}");
+            assert_eq!(announced[0].len(), 1);
+            assert_eq!(announced[0][0].kind, "broken_link");
+            assert!(announced[0][0].path.ends_with("dangling"));
+        }
+
+        #[tokio::test]
+        async fn unchanged_problems_are_not_announced_again() {
+            let mut run = SkillProblemRun::new().await;
+            run.add_malformed("bad");
+
+            assert_eq!(run.request().await.len(), 1);
+            assert!(run.request().await.is_empty());
+            assert!(run.request().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn changed_problems_are_announced_again() {
+            let mut run = SkillProblemRun::new().await;
+            run.add_malformed("first");
+            assert_eq!(run.request().await.len(), 1);
+
+            run.add_malformed("second");
+            let announced = run.request().await;
+
+            assert_eq!(announced.len(), 1, "{announced:?}");
+            assert_eq!(announced[0].len(), 2);
+            assert!(announced[0].iter().any(|p| p.path.contains("first")));
+            assert!(announced[0].iter().any(|p| p.path.contains("second")));
+        }
+
+        #[tokio::test]
+        async fn resolved_problems_are_announced_with_an_empty_list() {
+            let mut run = SkillProblemRun::new().await;
+            run.add_malformed("bad");
+            assert_eq!(run.request().await.len(), 1);
+
+            run.remove("bad");
+            let announced = run.request().await;
+
+            assert_eq!(announced, vec![Vec::new()]);
+            assert!(
+                run.request().await.is_empty(),
+                "the empty list is announced once"
+            );
+        }
+
+        #[tokio::test]
+        async fn session_without_problems_receives_no_skill_notice() {
+            let mut run = SkillProblemRun::new().await;
+            let dir = run.folder.path().join("fine");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: fine\ndescription: A fine skill\n---\nBody\n",
+            )
+            .unwrap();
+
+            assert!(run.request().await.is_empty());
+            assert!(run.request().await.is_empty());
         }
 
         #[tokio::test]

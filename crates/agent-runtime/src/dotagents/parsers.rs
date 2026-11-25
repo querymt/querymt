@@ -31,7 +31,7 @@ use super::layer::DotagentsSource;
 use super::manifest::{
     DotagentsAgent, DotagentsAgentConfig, DotagentsAgentConnection, DotagentsAgentConnectionType,
     DotagentsAgentRole, DotagentsMcpServer, DotagentsMcpTransport, DotagentsModelPreset,
-    DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsTaskKind,
+    DotagentsPrompt, DotagentsTask, DotagentsTaskKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -914,58 +914,6 @@ pub fn parse_task_document(
         interval_minutes,
         profile_id,
         prompt,
-        extensions,
-        source: source.clone(),
-        fingerprint: fingerprint(text),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// `skills/<id>/skill.md` and `skills/<id>/SKILL.md`
-// ---------------------------------------------------------------------------
-
-/// Frontmatter keys recognized on a skill document.
-///
-/// Spellings must match what [`partition_fields`] re-keys to, so the
-/// frontmatter accessors find them regardless of the document's casing.
-const SKILL_KEYS: &[&str] = &["id", "name", "description", "enabled"];
-
-/// Parse a protocol skill document (`skill.md` or `SKILL.md`).
-///
-/// `entry_id` is the containing directory name, used as the stable ID unless
-/// the frontmatter provides an explicit `id`. Both spellings parse
-/// identically so existing uppercase skills remain discoverable after
-/// protocol support is enabled.
-pub fn parse_skill_document(
-    text: &str,
-    entry_id: &str,
-    source: DotagentsSource,
-) -> Result<DotagentsSkill, Box<DotagentsDiagnostic>> {
-    let parsed =
-        parse_frontmatter_markdown(text).map_err(|error| error.with_source(source.clone()))?;
-    let (recognized, extensions) = partition_fields(&parsed.fields, SKILL_KEYS);
-
-    let id = field_string(&recognized, "id").unwrap_or_else(|| entry_id.to_string());
-    let name = field_string(&recognized, "name").unwrap_or_else(|| id.clone());
-    let description = field_string(&recognized, "description").unwrap_or_default();
-    let enabled = field_bool(&recognized, "enabled").unwrap_or(true);
-
-    if description.trim().is_empty() {
-        return Err(Box::new(
-            DotagentsDiagnostic::error(
-                DotagentsDiagnosticCode::MissingField,
-                format!("skill `{id}` requires a `description` for discovery"),
-            )
-            .with_source(source),
-        ));
-    }
-
-    Ok(DotagentsSkill {
-        id,
-        name,
-        description,
-        enabled,
-        body: parsed.body,
         extensions,
         source: source.clone(),
         fingerprint: fingerprint(text),

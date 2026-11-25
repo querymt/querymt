@@ -10,8 +10,6 @@
 //! <root>/system-prompt.md           singleton
 //! <root>/mcp.json                   keyed by mcpServers entry name
 //! <root>/models.json                keyed by preset name
-//! <root>/skills/<id>/skill.md       keyed by id (or directory name)
-//! <root>/skills/<id>/SKILL.md       keyed by id (or directory name)
 //! <root>/agents/<id>/agent.md       keyed by id (or directory name)
 //! <root>/agents/<id>/config.json    adjacent supported settings
 //! <root>/tasks/<id>/task.md         keyed by id (or directory name)
@@ -30,7 +28,7 @@
 //! [`super::manifest::DotagentsUnsupported`] rather than silently ignored.
 
 use super::confine::{ConfineResult, ConfinementPolicy};
-use super::diagnostics::{DotagentsDiagnostic, DotagentsDiagnosticCode};
+use super::diagnostics::{DotagentsDiagnostic, DotagentsDiagnosticCode, DotagentsSeverity};
 use super::layer::{DotagentsLayer, DotagentsSource};
 use super::manifest::{DotagentsManifest, DotagentsUnsupported, DotagentsUnsupportedKind};
 use super::merge::{DotagentsLayerContent, insert_unique, normalize_id, source_of};
@@ -39,9 +37,10 @@ use super::parsers::{
     parse_models_document, parse_prompt_document, parse_task_document,
 };
 use super::{
-    DotagentsLoadOptions, DotagentsStrictness, ResolvedLayerRoot, discover_layer_roots,
-    merge_layers,
+    DotagentsLoadOptions, DotagentsSkillScan, DotagentsStrictness, ResolvedLayerRoot,
+    discover_layer_roots, merge_layers,
 };
+use crate::skills::{SkillInventoryEntry, SkillProblemKind};
 use std::path::{Path, PathBuf};
 
 /// Top-level protocol entry names this implementation does not interpret.
@@ -76,7 +75,6 @@ pub fn assemble_layer(
     read_singletons(&policy, &mut content);
     read_mcp(&policy, &mut content);
     read_models(&policy, &mut content);
-    read_skills(&policy, &mut content);
     read_agents(&policy, &mut content);
     read_tasks(&policy, &mut content);
     read_memories(&policy, &mut content);
@@ -130,6 +128,9 @@ impl DotagentsLoader {
             .collect();
         let mut manifest = merge_layers(&layers);
         manifest.layers = roots.iter().map(ResolvedLayerRoot::as_source_ref).collect();
+        let (skills, skill_diagnostics) = scan_skills(&self.options);
+        manifest.skills = skills;
+        manifest.diagnostics.extend(skill_diagnostics);
         manifest.sort_deterministically();
 
         if self.options.strictness() == DotagentsStrictness::Strict && manifest.has_errors() {
@@ -154,6 +155,91 @@ impl Default for DotagentsLoader {
     fn default() -> Self {
         Self::new(DotagentsLoadOptions::default())
     }
+}
+
+/// List the local skills the skill tool offers for the load options'
+/// workspace, with every skill problem as a warning diagnostic.
+///
+/// This is the shared skill reader: the same sources, the same scan and the
+/// same precedence as the skill tool, so the manifest and the tool agree.
+fn scan_skills(
+    options: &DotagentsLoadOptions,
+) -> (
+    std::collections::BTreeMap<String, SkillInventoryEntry>,
+    Vec<DotagentsDiagnostic>,
+) {
+    use crate::skills::{SkillSource, discovery};
+
+    let defaults;
+    let (include_external, paths, nested_depth) = match options.skill_scan() {
+        DotagentsSkillScan::Disabled => return Default::default(),
+        DotagentsSkillScan::Defaults => {
+            defaults = crate::config::SkillsConfig::default();
+            (
+                defaults.include_external,
+                defaults.paths.as_slice(),
+                defaults.nested_depth,
+            )
+        }
+        DotagentsSkillScan::Configured {
+            include_external,
+            paths,
+            nested_depth,
+        } => (*include_external, paths.as_slice(), *nested_depth),
+    };
+
+    // The skill tool's sources: global folders always, project folders only
+    // when there is a workspace, then the configured folders.
+    let mut sources: Vec<SkillSource> = match options.workspace() {
+        Some(workspace) => discovery::default_search_paths(workspace),
+        None => discovery::default_search_paths(Path::new(""))
+            .into_iter()
+            .filter(|source| matches!(source, SkillSource::Global(_)))
+            .collect(),
+    };
+    sources.extend(paths.iter().cloned().map(SkillSource::Configured));
+
+    let report = discovery::discover(
+        &sources,
+        &discovery::SkillScanOptions {
+            include_external,
+            nested_depth,
+        },
+    );
+
+    let skills = report
+        .skills
+        .iter()
+        .map(SkillInventoryEntry::from_skill)
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    let diagnostics = report
+        .problems
+        .iter()
+        .map(|problem| {
+            let code = match problem.kind {
+                SkillProblemKind::InvalidDefinition => DotagentsDiagnosticCode::ParseError,
+                SkillProblemKind::DuplicateDefinition | SkillProblemKind::DuplicateId => {
+                    DotagentsDiagnosticCode::DuplicateId
+                }
+                SkillProblemKind::SourceUnreadable
+                | SkillProblemKind::EntryUnreadable
+                | SkillProblemKind::BrokenLink => DotagentsDiagnosticCode::IoError,
+                SkillProblemKind::LinkLoop => DotagentsDiagnosticCode::Other,
+            };
+            DotagentsDiagnostic::new(
+                DotagentsSeverity::Warning,
+                code,
+                format!(
+                    "skill {}: {} ({})",
+                    problem.path.display(),
+                    problem.message,
+                    problem.kind
+                ),
+            )
+        })
+        .collect();
+    (skills, diagnostics)
 }
 
 fn assemble_resolved_layer(
@@ -334,90 +420,6 @@ fn read_models(policy: &ConfinementPolicy, content: &mut DotagentsLayerContent) 
         Err(error) => {
             content.invalid_models = true;
             push_error(content, *error);
-        }
-    }
-}
-
-/// Read `skills/<id>/{skill.md,SKILL.md}`.
-///
-/// Both spellings are accepted. When an entry directory contains both, that is
-/// a duplicate definition within one protocol entry, so it is an error rather
-/// than a platform-order-dependent choice.
-fn read_skills(policy: &ConfinementPolicy, content: &mut DotagentsLayerContent) {
-    let Some(entries) = sorted_subdirectories(policy, Path::new("skills")) else {
-        return;
-    };
-
-    for entry in entries {
-        let entry_id = entry.file_name_lossy();
-        let dir = PathBuf::from("skills").join(&entry_id);
-        let lower = dir.join("skill.md");
-        let upper = dir.join("SKILL.md");
-
-        // Inspect directory-entry names exactly. On case-insensitive
-        // filesystems, `Path::exists` reports both spellings for one file.
-        let exact_names: std::collections::BTreeSet<String> =
-            std::fs::read_dir(policy.allowed_root().join(&dir))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
-        let has_lower = exact_names.contains("skill.md");
-        let has_upper = exact_names.contains("SKILL.md");
-
-        if has_lower && has_upper {
-            let source = DotagentsSource::entry(
-                policy.layer(),
-                policy.allowed_root().join(&lower),
-                entry_id.clone(),
-            );
-            content.diagnostics.push(
-                DotagentsDiagnostic::error(
-                    DotagentsDiagnosticCode::DuplicateId,
-                    format!(
-                        "skill `{entry_id}` defines both `skill.md` and `SKILL.md`; \
-                         keep exactly one definition"
-                    ),
-                )
-                .with_source(source),
-            );
-            continue;
-        }
-
-        let relative = if has_lower {
-            lower
-        } else if has_upper {
-            upper
-        } else {
-            continue;
-        };
-
-        let source = DotagentsSource::entry(
-            policy.layer(),
-            policy.allowed_root().join(&relative),
-            entry_id.clone(),
-        );
-        match read_optional(policy, &relative) {
-            Some(Ok(text)) => {
-                match super::parsers::parse_skill_document(&text, &entry_id, source.clone()) {
-                    Ok(skill) => {
-                        let id = normalize_id(&skill.id);
-                        insert_unique(
-                            &mut content.skills,
-                            &id,
-                            skill,
-                            source_of::skill,
-                            &source,
-                            &mut content.diagnostics,
-                            "skill",
-                        );
-                    }
-                    Err(error) => push_error(content, *error),
-                }
-            }
-            Some(Err(error)) => push_error(content, *error),
-            None => {}
         }
     }
 }
@@ -623,7 +625,7 @@ impl DirEntry {
 /// List the sorted child entries of a layer-relative directory.
 ///
 /// Returns `None` when the directory is absent. Collection layout differs by
-/// kind: `skills/`, `agents/`, and `tasks/` are directory-per-entry, while
+/// kind: `agents/` and `tasks/` are directory-per-entry, while
 /// `memories/` is flat files. The caller decides which kind it expects by
 /// filtering on [`DirEntry::is_dir`].
 fn sorted_dir_entries(policy: &ConfinementPolicy, relative: &Path) -> Option<Vec<DirEntry>> {
@@ -644,7 +646,7 @@ fn sorted_dir_entries(policy: &ConfinementPolicy, relative: &Path) -> Option<Vec
     Some(entries)
 }
 
-/// List only directory children (for `skills/`, `agents/`, `tasks/`).
+/// List only directory children (for `agents/`, `tasks/`).
 fn sorted_subdirectories(policy: &ConfinementPolicy, relative: &Path) -> Option<Vec<DirEntry>> {
     let mut entries = sorted_dir_entries(policy, relative)?;
     entries.retain(|entry| entry.is_dir);
@@ -708,16 +710,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(
             tmp.path(),
-            "skills/a/skill.md",
-            "---\ndescription: a\n---\nA\n",
-        );
-        write(
-            tmp.path(),
-            "skills/b/SKILL.md",
-            "---\ndescription: b\n---\nB\n",
-        );
-        write(
-            tmp.path(),
             "agents/helper/agent.md",
             "---\ndescription: h\n---\nH\n",
         );
@@ -734,14 +726,11 @@ mod tests {
         write(tmp.path(), "memories/note.md", "Remember.\n");
 
         let content = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
-        assert_eq!(
-            content.skills.len(),
-            2,
+        assert!(
+            content.diagnostics.is_empty(),
             "diagnostics: {:?}",
             content.diagnostics
         );
-        assert!(content.skills.contains_key("a"));
-        assert!(content.skills.contains_key("b"));
         let agent = content.agents.get("helper").unwrap();
         assert_eq!(agent.config.model_preset.as_deref(), Some("fast"));
         assert_eq!(
@@ -801,67 +790,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_skill_spellings_in_one_entry_is_error_when_distinct() {
-        let tmp = TempDir::new().unwrap();
-        write(
-            tmp.path(),
-            "skills/review/skill.md",
-            "---\ndescription: a\n---\nA\n",
-        );
-        write(
-            tmp.path(),
-            "skills/review/SKILL.md",
-            "---\ndescription: b\n---\nB\n",
-        );
-
-        let exact_names: std::collections::BTreeSet<String> =
-            fs::read_dir(tmp.path().join("skills/review"))
-                .unwrap()
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
-        let content = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
-
-        if exact_names.contains("skill.md") && exact_names.contains("SKILL.md") {
-            // Case-sensitive filesystem: neither spelling wins by platform order.
-            assert!(!content.skills.contains_key("review"));
-            assert_eq!(content.diagnostics.len(), 1);
-            assert_eq!(
-                content.diagnostics[0].code,
-                DotagentsDiagnosticCode::DuplicateId
-            );
-        } else {
-            // Case-insensitive filesystem: both writes name one directory entry.
-            assert!(content.skills.contains_key("review"));
-            assert!(content.diagnostics.is_empty());
-        }
-    }
-
-    #[test]
-    fn duplicate_explicit_skill_ids_within_layer_are_rejected() {
-        let tmp = TempDir::new().unwrap();
-        write(
-            tmp.path(),
-            "skills/first/skill.md",
-            "---\nid: shared\ndescription: first\n---\nFirst\n",
-        );
-        write(
-            tmp.path(),
-            "skills/second/skill.md",
-            "---\nid: shared\ndescription: second\n---\nSecond\n",
-        );
-
-        let content = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
-        assert_eq!(content.skills.len(), 1);
-        assert_eq!(content.skills["shared"].description, "first");
-        assert_eq!(content.diagnostics.len(), 1);
-        assert_eq!(
-            content.diagnostics[0].code,
-            DotagentsDiagnosticCode::DuplicateId
-        );
-    }
-
-    #[test]
     fn unsupported_top_level_entries_are_recorded_as_warnings() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "speakmcp-settings.json", "{}");
@@ -909,12 +837,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(
             tmp.path(),
-            "skills/a/skill.md",
+            "agents/a/agent.md",
             "---\ndescription: a\n---\nA\n",
         );
         write(
             tmp.path(),
-            "skills/b/skill.md",
+            "agents/b/agent.md",
             "---\ndescription: b\n---\nB\n",
         );
         write(tmp.path(), "memories/m.md", "M\n");
@@ -922,8 +850,8 @@ mod tests {
         let first = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
         let second = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
         assert_eq!(
-            first.skills.keys().collect::<Vec<_>>(),
-            second.skills.keys().collect::<Vec<_>>()
+            first.agents.keys().collect::<Vec<_>>(),
+            second.agents.keys().collect::<Vec<_>>()
         );
         assert_eq!(first.memories.len(), second.memories.len());
     }

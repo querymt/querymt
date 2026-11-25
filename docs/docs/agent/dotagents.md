@@ -69,6 +69,9 @@ let manifest = builder.preview_dotagents_manifest()?.expect("layers resolved");
 for (id, server) in &manifest.mcp_servers {
     println!("{id}: {}", server.transport);
 }
+for (id, skill) in &manifest.skills {
+    println!("{id}: {} ({})", skill.directory.display(), skill.source_kind.as_str());
+}
 for diagnostic in &manifest.diagnostics {
     eprintln!("{diagnostic}");
 }
@@ -82,7 +85,7 @@ for diagnostic in &manifest.diagnostics {
   system-prompt.md           # system prompt (singleton)
   mcp.json                   # MCP servers, keyed by mcpServers entry name
   models.json                # model presets, keyed by preset name
-  skills/<id>/skill.md       # or SKILL.md; keyed by id or directory name
+  skills/<id>/skill.md       # or SKILL.md; read by skill discovery, see Skills
   agents/<id>/agent.md       # sub-agent profile; keyed by id or directory name
   agents/<id>/config.json    # adjacent supported settings
   tasks/<id>/task.md         # repeat task; keyed by id or directory name
@@ -105,7 +108,8 @@ Merge rules depend on the document type:
 |---------|------|
 | `agents.md`, `system-prompt.md` | Singleton: the workspace document replaces the global one |
 | `mcp.json`, `models.json` | Top-level keys merge; a workspace key replaces the matching global key |
-| `skills/`, `agents/`, `tasks/`, `memories/` | Entries merge by normalized ID; a workspace entry replaces the matching global entry |
+| `agents/`, `tasks/`, `memories/` | Entries merge by normalized ID; a workspace entry replaces the matching global entry |
+| skills | Not merged by layer: the manifest lists what skill discovery offers (see [Skills](#skills)) |
 
 Unmatched global content always remains available. Within a single layer, duplicate normalized IDs are an error rather than a filesystem-order-dependent winner.
 
@@ -148,7 +152,11 @@ Presets do not install providers and do not replace profile provider locks. An u
 
 ## Skills
 
-Skill discovery continues to cover configured sources, `.skills`, `.claude/skills`, `.qmt/skills`, and `.agents/skills`. Inside `.agents/skills`, both protocol `skill.md` and existing `SKILL.md` are accepted; protocol `id`, `name`, `description`, and `enabled` metadata are honored, and the directory name is the ID when `id` is absent. Disabled skills are not exposed to the skill tool.
+Skills are read by one reader, shared by the `skill` tool and the manifest, over these sources (later ones override earlier ones): the `skills` folder of the QueryMT config directory, `~/.claude/skills`, `~/.agents/skills`, then `<workspace>/.skills`, `.claude/skills`, `.agents/skills`, `.qmt/skills`, then the configured `paths`. The `.agents` Protocol switch, the layer switches and the root overrides do not apply to skill discovery. Inside `.agents/skills`, both protocol `skill.md` and existing `SKILL.md` are accepted; protocol `id`, `name`, `description`, and `enabled` metadata are honored, and the directory name is the ID when `id` is absent. Disabled skills are not offered. Symbolic links are followed wherever they point and ignore files such as `.gitignore` do not apply; see [Skills Configuration](configuration.md#skills-configuration).
+
+The resolved manifest's `skills` is an **inventory** of the local skills the `skill` tool offers for the resolved workspace, ordered by callable ID. Each entry (`SkillInventoryEntry`) has the callable ID, name, description, source kind (`global`, `project` or `configured`), source folder, skill directory and, for a skill reached through a link, the resolved target (`link_target`). Skill bodies are not part of it, and skills published by MCP servers are not listed. The list is empty for an agent whose skills are disabled or whose tool list does not name `skill`. Resolving without an agent configuration (`DotagentsLoader` used directly) scans with the defaults of the skills configuration; `DotagentsLoadOptions::with_skill_scan` selects other settings.
+
+Every skill problem found while resolving (a malformed definition, both `skill.md` and `SKILL.md` in one folder, a broken or looping link, an unreadable entry, a duplicate ID) is a **warning** diagnostic that starts with the affected path. Skill problems never fail a `Strict` resolution.
 
 ## Sub-Agents
 
@@ -216,7 +224,7 @@ If no knowledge store is configured, memories remain inspectable in the manifest
 
 ## Security
 
-- **Path confinement**: references may resolve within their owning layer root or an explicitly configured trusted root. `..` traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started.
+- **Path confinement**: references may resolve within their owning layer root or an explicitly configured trusted root. `..` traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started. Skill folders are the exception: a skill directory reached through a symbolic link is accepted wherever its target is, because a skill is text that reaches the model only when it is loaded under the configured skill permission, and the supporting files of a linked skill stay confined to the link target.
 - **No implicit creation**: workspace discovery only happens when `<workspace>/.agents` already exists.
 - **Secrets**: `${VAR}` references are interpolated at activation; diagnostics, debug output, and inspectable manifests redact resolved secret values while retaining enough context to fix errors. Secret values are never used as entry IDs or persisted as reconciliation keys.
 - **No executable sub-agents**: `stdio`/executable connection types never launch a process.
@@ -240,7 +248,7 @@ Invalid entries are isolated in both modes: a malformed file never hides valid s
 | `mcp.json` `stdio` | process-based MCP server |
 | `mcp.json` `streamable-http` | RMCP streamable HTTP MCP server |
 | `models.json` preset | LLM overlay (provider, model, credential, parameters) |
-| `skills/<id>/skill.md` | skill tool source under `.agents/skills` |
+| `skills/<id>/skill.md` | skill tool source under `.agents/skills`; the manifest lists every offered skill |
 | `agents/<id>/agent.md` | delegation registry target |
 | `tasks/<id>/task.md` | durable recurring task + interval schedule |
 | `memories/<id>.md` | knowledge store entry with a stable protocol source key |

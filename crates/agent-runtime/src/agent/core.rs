@@ -225,6 +225,10 @@ pub struct SessionRuntime {
     /// ("Allow for this session" on a skill approval). Never held across
     /// `.await`, never shared with other sessions.
     pub skill_grants: Arc<ParkingMutex<HashSet<String>>>,
+    /// Fingerprint of the skill problem list last announced to this session's
+    /// clients; `None` when none was announced or the last one was empty.
+    /// Never held across `.await`.
+    pub announced_skill_problems: ParkingMutex<Option<querymt_agent_core::hash::RapidHash>>,
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<querymt_agent_index::WorkspaceHandle>>,
@@ -315,6 +319,7 @@ impl SessionRuntime {
             mcp_tool_state,
             session_grants: ParkingMutex::new(crate::config::ToolSet::new()),
             skill_grants: Arc::new(ParkingMutex::new(HashSet::new())),
+            announced_skill_problems: ParkingMutex::new(None),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
             last_snapshot_tree: ParkingMutex::new(None),

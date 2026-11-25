@@ -289,6 +289,38 @@ Local skills are read from the global folders, the project folders and the confi
 - **`nested_depth`.** Path `agent.skills.nested_depth` (also the `skills` table of a `[[delegates]]` entry and the deprecated `[planner.skills]`). Integer, default `4`, range `1` to `16`; `1` means direct children only. It sets how many directory levels below a project `.agents/skills` folder may hold a skill directory, so with the default `.agents/skills/a/b/c/review/SKILL.md` is offered and `.agents/skills/a/b/c/d/review/SKILL.md` is not. Every other source accepts direct children only. A value outside the range, or one that is not an integer, fails configuration loading with an error that names `nested_depth`.
 - **Problems.** A refresh fails only when a source folder itself cannot be read; the previous skill set stays in place then. An entry that cannot be read, a malformed definition and a duplicate ID are recorded as problems and excluded.
 
+#### Skill problem notices
+
+Every problem the scan records (path, source folder, kind, message) is kept per workspace and refreshed with the skill list. The agent announces them to the client as an ACP `notice` session update, once per session and problem set:
+
+- **When.** Before a model request in which the `skill` tool is offered, when the workspace's problems differ from the list last announced to that session. The first request of a session with problems announces them; later requests announce only a changed list. A session that was never told about a problem gets nothing when there are none. After an announcement, a list that became empty is announced once with severity `info` and an empty array, so a client can clear what it shows.
+- **Who.** Only clients that advertise notice support (`clientCapabilities.session.notices`). The notice is live only: it is not stored in the session history and a loaded session does not replay it. A client that connects later, or does not advertise notices, is not told; the problems are still in the log, and `SkillCatalog::problems` returns them to Rust callers.
+- **Text.** Severity `warning` for a non-empty list. The title states the number (`2 skill problems`; `Skill problems resolved` for an empty list). The description lists at most 10 problems, one per line as `<path>: <message>`, followed by `and N more` when there are more.
+- **Metadata.** `_meta.querymt.skillProblems` always holds the complete list, even when the description is shortened. Each item is an object with the string fields `path`, `source`, `kind` and `message`. `kind` is one of `source_unreadable`, `entry_unreadable`, `broken_link`, `link_loop`, `duplicate_definition`, `invalid_definition` and `duplicate_id`.
+
+```json
+{
+  "sessionUpdate": "notice",
+  "severity": "warning",
+  "title": "1 skill problem",
+  "description": "/ws/.agents/skills/shared: broken link",
+  "_meta": {
+    "querymt": {
+      "skillProblems": [
+        {
+          "path": "/ws/.agents/skills/shared",
+          "source": "/ws/.agents/skills",
+          "kind": "broken_link",
+          "message": "broken link"
+        }
+      ]
+    }
+  }
+}
+```
+
+The runtime carries the list in the live-only event `AgentEventKind::SkillProblemsChanged` (`skill_problems_changed`, with a `problems` array of the same four fields), which is never written to the session journal.
+
 #### Skills from MCP servers
 
 An MCP server that declares the MCP Skills extension (`io.modelcontextprotocol/skills`) publishes skills that appear in the `skill` tool next to local skills. Set `mcp = false` to hide and refuse all of them.

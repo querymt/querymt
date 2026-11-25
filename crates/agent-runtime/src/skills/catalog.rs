@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Discovery function used by registry refreshes. Swappable in tests to
 /// inject deterministic discovery failures.
@@ -51,6 +52,16 @@ struct RefreshJob {
     sources: Vec<SkillSource>,
     options: SkillScanOptions,
     discovery_fn: Arc<DiscoverFn>,
+    started: Instant,
+}
+
+/// Cost of the newest skill refresh of one workspace.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkillRefreshStats {
+    /// Wall time from taking the ticket to the end of the scan.
+    pub elapsed: Duration,
+    /// Directory entries the scan visited.
+    pub visited_entries: usize,
 }
 
 impl RefreshJob {
@@ -69,6 +80,8 @@ struct RefreshState {
     problems: HashMap<PathBuf, Vec<SkillProblem>>,
     /// Workspaces that have a published skill set.
     snapshots: HashSet<PathBuf>,
+    /// Cost of the newest refresh per workspace.
+    stats: HashMap<PathBuf, SkillRefreshStats>,
 }
 
 impl SkillCatalog {
@@ -124,12 +137,18 @@ impl SkillCatalog {
         tools: &[ToolSpec],
         project_root: &Path,
     ) -> Option<Arc<Self>> {
+        Self::skills_for_agent(skills, tools).map(|skills| Self::from_config(skills, project_root))
+    }
+
+    /// The skills configuration under which an agent gets the skill tool, or
+    /// `None` when it gets none. This is the predicate behind [`Self::for_agent`],
+    /// for callers that need the decision without discovering skills.
+    pub fn skills_for_agent<'a>(
+        skills: Option<&'a SkillsConfig>,
+        tools: &[ToolSpec],
+    ) -> Option<&'a SkillsConfig> {
         let skills = skills.filter(|skills| skills.enabled)?;
-        if tools.is_empty() || Self::names_skill_tool(tools) {
-            Some(Self::from_config(skills, project_root))
-        } else {
-            None
-        }
+        (tools.is_empty() || Self::names_skill_tool(tools)).then_some(skills)
     }
 
     /// Build a catalog from already-resolved parts.
@@ -280,6 +299,7 @@ impl SkillCatalog {
             sources: self.sources_for_workspace(workspace),
             options: self.scan_options(),
             discovery_fn: Arc::clone(&self.discovery_fn),
+            started: Instant::now(),
         }
     }
 
@@ -288,7 +308,7 @@ impl SkillCatalog {
     pub(crate) fn refresh_registry(&self, workspace: &Path) -> anyhow::Result<()> {
         let job = self.begin_refresh(workspace);
         let report = job.scan();
-        self.finish_refresh(&job.workspace, job.ticket, report)
+        self.finish_refresh(&job, report)
     }
 
     /// Async variant of [`Self::refresh_registry`] for the tool-call path:
@@ -302,7 +322,7 @@ impl SkillCatalog {
         })
         .await
         .map_err(|e| anyhow::anyhow!("skill discovery task failed: {e}"))?;
-        self.finish_refresh(&job.workspace, job.ticket, report)
+        self.finish_refresh(&job, report)
     }
 
     /// Record the problems of a scan and publish its skills, unless a
@@ -312,12 +332,19 @@ impl SkillCatalog {
     /// published skill set and fails; when nothing was published yet for the
     /// workspace, the skills of the readable sources are published instead.
     /// Problems are recorded in every case.
-    fn finish_refresh(
-        &self,
-        workspace: &Path,
-        ticket: u64,
-        report: SkillScanReport,
-    ) -> anyhow::Result<()> {
+    fn finish_refresh(&self, job: &RefreshJob, report: SkillScanReport) -> anyhow::Result<()> {
+        let workspace = job.workspace.as_path();
+        let ticket = job.ticket;
+        let stats = SkillRefreshStats {
+            elapsed: job.started.elapsed(),
+            visited_entries: report.visited_entries,
+        };
+        log::debug!(
+            "Skill refresh for {}: {} entries visited in {:.3} ms",
+            workspace.display(),
+            stats.visited_entries,
+            stats.elapsed.as_secs_f64() * 1000.0
+        );
         for problem in &report.problems {
             log::warn!(
                 "Skill problem ({}) at {}: {}",
@@ -346,6 +373,7 @@ impl SkillCatalog {
             return Ok(());
         }
         state.tickets.insert(workspace.to_path_buf(), ticket);
+        state.stats.insert(workspace.to_path_buf(), stats);
         state
             .problems
             .insert(workspace.to_path_buf(), report.problems);
@@ -377,6 +405,15 @@ impl SkillCatalog {
             .ok()
             .and_then(|state| state.problems.get(workspace).cloned())
             .unwrap_or_default()
+    }
+
+    /// Wall time and visited entry count of the newest refresh of one
+    /// workspace, or `None` when it was never refreshed.
+    pub(crate) fn last_refresh_stats(&self, workspace: &Path) -> Option<SkillRefreshStats> {
+        self.refresh_state
+            .lock()
+            .ok()
+            .and_then(|state| state.stats.get(workspace).copied())
     }
 
     /// The local skills offered for one workspace, ordered by callable ID.
@@ -666,6 +703,57 @@ mod tests {
         catalog.refresh_registry(workspace).unwrap();
         assert!(catalog.problems(workspace).is_empty());
         assert!(catalog.lookup_skill(workspace, "broken").unwrap().is_some());
+    }
+
+    #[test]
+    fn refresh_records_visited_entries_and_wall_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill_file(dir.path(), "one", "name: one\ndescription: One\n");
+        write_skill_file(dir.path(), "two", "name: two\ndescription: Two\n");
+        let catalog = empty_catalog(vec![SkillSource::Global(dir.path().to_path_buf())]);
+        let workspace = Path::new("/ws");
+
+        assert!(catalog.last_refresh_stats(workspace).is_none());
+        catalog.refresh_registry(workspace).unwrap();
+        let stats = catalog.last_refresh_stats(workspace).unwrap();
+        // The source folder, two skill folders and two definition files.
+        assert!(stats.visited_entries >= 5, "{stats:?}");
+        assert!(stats.elapsed > Duration::ZERO);
+    }
+
+    /// Measurement for design D12, not a regression test: ten consecutive
+    /// refreshes over this repository's own project skill folders (including
+    /// the linked `.agents/skills/querymt-dev`).
+    /// Run with `--run-ignored only --no-capture`.
+    #[test]
+    #[ignore = "measurement against this repository's skill folders"]
+    fn measure_refresh_over_this_repository() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let sources: Vec<SkillSource> = discovery::default_search_paths(&root)
+            .into_iter()
+            .filter(|source| matches!(source, SkillSource::Project(_)))
+            .collect();
+        let catalog = SkillCatalog::from_parts(
+            SkillRegistry::new(),
+            Arc::new(SkillPermissions::default()),
+            sources,
+            true,
+            root.clone(),
+        );
+        for run in 1..=10 {
+            catalog.refresh_registry(&root).unwrap();
+            let stats = catalog.last_refresh_stats(&root).unwrap();
+            println!(
+                "refresh {run}: {} entries visited, {:.3} ms, {} skills offered, {} problems",
+                stats.visited_entries,
+                stats.elapsed.as_secs_f64() * 1000.0,
+                catalog.inventory(&root).len(),
+                catalog.problems(&root).len()
+            );
+        }
     }
 
     #[cfg(unix)]

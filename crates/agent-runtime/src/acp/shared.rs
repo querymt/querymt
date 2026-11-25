@@ -1183,6 +1183,52 @@ where
     )
 }
 
+/// Most problems a skill problem notice lists in its description.
+const SKILL_NOTICE_MAX_LISTED: usize = 10;
+
+/// The notice announcing the skill problems of a session's workspace.
+///
+/// The title states the count and the description lists at most
+/// [`SKILL_NOTICE_MAX_LISTED`] problems as `<path>: <message>`, then how many
+/// more there are, so a client that ignores `_meta` still shows them. The
+/// complete list is in `_meta.querymt.skillProblems`. A list that became empty
+/// is an `info` notice with an empty array, which lets a client clear it.
+fn skill_problems_notice(problems: &[querymt_agent_core::events::SkillProblemInfo]) -> Notice {
+    let (severity, title, description) = if problems.is_empty() {
+        (
+            NoticeSeverity::Info,
+            "Skill problems resolved".to_string(),
+            None,
+        )
+    } else {
+        let mut lines: Vec<String> = problems
+            .iter()
+            .take(SKILL_NOTICE_MAX_LISTED)
+            .map(|problem| format!("{}: {}", problem.path, problem.message))
+            .collect();
+        if problems.len() > SKILL_NOTICE_MAX_LISTED {
+            lines.push(format!(
+                "and {} more",
+                problems.len() - SKILL_NOTICE_MAX_LISTED
+            ));
+        }
+        let title = match problems.len() {
+            1 => "1 skill problem".to_string(),
+            count => format!("{count} skill problems"),
+        };
+        (NoticeSeverity::Warning, title, Some(lines.join("\n")))
+    };
+    let meta = crate::acp::protocol::Meta::from_iter([(
+        QUERYMT_META_NAMESPACE.to_string(),
+        serde_json::json!({
+            querymt_agent_core::replay::SKILL_PROBLEMS_META_KEY: problems,
+        }),
+    )]);
+    Notice::new(severity, title)
+        .description(description)
+        .meta(meta)
+}
+
 /// Notice title naming why a run stopped.
 fn stop_notice_title(stop_type: querymt_agent_core::events::StopType) -> &'static str {
     use querymt_agent_core::events::StopType;
@@ -1573,9 +1619,10 @@ fn materialize_replay_state(
             }
             AgentEventKind::CompactionSummaryChunk { .. }
             | AgentEventKind::HookNotice { .. }
+            | AgentEventKind::SkillProblemsChanged { .. }
             | AgentEventKind::MiddlewareStopped { .. }
             | AgentEventKind::OutputLimitRecovery { .. } => {
-                // Live-only content: notices (hook, stop and recovery) are never
+                // Live-only content: notices (hook, skill problem, stop and recovery) are never
                 // replayed and summary chunks would duplicate the materialized
                 // terminal summary.
             }
@@ -3158,6 +3205,12 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::Notice(
                     Notice::new(severity, title).description(message.clone()),
                 )]
+            }
+            AgentEventKind::SkillProblemsChanged { problems } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::Notice(skill_problems_notice(problems))]
             }
             AgentEventKind::MiddlewareStopped {
                 stop_type, reason, ..
@@ -6698,6 +6751,84 @@ mod tests {
         .await
     }
 
+    /// A skill problem notice is live-only: even when the event is found in
+    /// a stored journal, loading the session replays no `skillProblems`.
+    #[tokio::test]
+    async fn skill_problem_notice_is_not_replayed_on_session_load() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        for kind in [
+            AgentEventKind::SkillProblemsChanged {
+                problems: vec![querymt_agent_core::events::SkillProblemInfo {
+                    path: "/ws/.agents/skills/bad/SKILL.md".to_string(),
+                    source: "/ws/.agents/skills".to_string(),
+                    kind: "invalid_definition".to_string(),
+                    message: "missing description".to_string(),
+                }],
+            },
+            AgentEventKind::CompactionStart {
+                token_estimate: 10,
+                compaction_id: Some("compaction-1".to_string()),
+            },
+            AgentEventKind::CompactionEnd {
+                summary: "final summary".to_string(),
+                summary_len: 13,
+                compaction_id: Some("compaction-1".to_string()),
+                context_tokens: Some(5),
+            },
+        ] {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_seq: None,
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .expect("persist replay event");
+        }
+
+        let loaded = dispatch_session_load_with_capabilities(
+            fixture.handle.as_ref(),
+            &session_id,
+            AcpSessionUpdateCapabilities {
+                notices: true,
+                compaction: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(loaded.response.unwrap().error.is_none());
+        let updates: Vec<&serde_json::Value> = loaded
+            .notifications
+            .iter()
+            .filter_map(|notification| notification["params"].get("update"))
+            .collect();
+        // The replay ran: the compaction after the problem event came back.
+        assert!(
+            updates
+                .iter()
+                .any(|update| update["sessionUpdate"] == "compaction_update"),
+            "{updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|update| update["_meta"]["querymt"].get("skillProblems").is_none()),
+            "{updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|update| update["sessionUpdate"] != "notice"),
+            "{updates:?}"
+        );
+    }
+
     #[tokio::test]
     async fn session_load_replays_materialized_updates_for_connection_capabilities() {
         let fixture = crate::test_utils::TestAgent::new().await;
@@ -8654,6 +8785,102 @@ mod session_update_tests {
             plans_patch_removed(narrow.translate_updates(&plan)).as_slice(),
             [SessionUpdate::Plan(_)]
         ));
+    }
+
+    fn skill_problem_infos(count: usize) -> Vec<querymt_agent_core::events::SkillProblemInfo> {
+        (0..count)
+            .map(|index| querymt_agent_core::events::SkillProblemInfo {
+                path: format!("/ws/.agents/skills/skill-{index:02}/SKILL.md"),
+                source: "/ws/.agents/skills".to_string(),
+                kind: "invalid_definition".to_string(),
+                message: format!("problem {index}"),
+            })
+            .collect()
+    }
+
+    fn skill_notice_json(
+        translator: &mut AcpLiveEventTranslator,
+        problems: Vec<querymt_agent_core::events::SkillProblemInfo>,
+    ) -> Option<serde_json::Value> {
+        let updates = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SkillProblemsChanged { problems },
+        ));
+        match updates.as_slice() {
+            [] => None,
+            [update @ SessionUpdate::Notice(_)] => Some(serde_json::to_value(update).unwrap()),
+            other => panic!("expected at most one notice, got {other:?}"),
+        }
+    }
+
+    fn notice_translator(notices: bool) -> AcpLiveEventTranslator {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(AcpSessionUpdateCapabilities {
+            notices,
+            ..Default::default()
+        });
+        translator
+    }
+
+    #[test]
+    fn client_without_notice_support_receives_no_skill_notice() {
+        let mut translator = notice_translator(false);
+        assert!(skill_notice_json(&mut translator, skill_problem_infos(2)).is_none());
+        assert!(skill_notice_json(&mut translator, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn skill_notice_carries_severity_and_the_complete_list() {
+        let mut translator = notice_translator(true);
+
+        let warning = skill_notice_json(&mut translator, skill_problem_infos(1)).unwrap();
+        assert_eq!(warning["sessionUpdate"], "notice");
+        assert_eq!(warning["severity"], "warning");
+        let items = warning["_meta"]["querymt"]["skillProblems"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        for field in ["path", "source", "kind", "message"] {
+            assert!(items[0][field].is_string(), "{field}: {warning}");
+        }
+
+        let cleared = skill_notice_json(&mut translator, Vec::new()).unwrap();
+        assert_eq!(cleared["severity"], "info");
+        assert_eq!(
+            cleared["_meta"]["querymt"]["skillProblems"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn notice_text_names_each_problem_path() {
+        let mut translator = notice_translator(true);
+        let notice = skill_notice_json(&mut translator, skill_problem_infos(2)).unwrap();
+
+        assert!(notice["title"].as_str().unwrap().contains('2'), "{notice}");
+        let description = notice["description"].as_str().unwrap();
+        assert!(description.contains("/ws/.agents/skills/skill-00/SKILL.md: problem 0"));
+        assert!(description.contains("/ws/.agents/skills/skill-01/SKILL.md: problem 1"));
+        assert!(!description.contains("more"), "{description}");
+    }
+
+    #[test]
+    fn long_problem_list_is_shortened_in_the_description_only() {
+        let mut translator = notice_translator(true);
+        let notice = skill_notice_json(&mut translator, skill_problem_infos(12)).unwrap();
+
+        let description = notice["description"].as_str().unwrap();
+        let lines: Vec<&str> = description.lines().collect();
+        assert_eq!(lines.len(), 11, "{description}");
+        assert!(lines[..10].iter().all(|line| line.contains("SKILL.md")));
+        assert_eq!(lines[10], "and 2 more");
+        assert_eq!(
+            notice["_meta"]["querymt"]["skillProblems"]
+                .as_array()
+                .unwrap()
+                .len(),
+            12
+        );
     }
 
     fn cursor_json(entity: &querymt_agent_core::replay::CursorEntity) -> serde_json::Value {

@@ -1364,6 +1364,8 @@ Body
     /// in successive `definition()` snapshots.
     #[test]
     fn test_definition_refreshes_add_edit_remove() {
+        // Lets `RUST_LOG=querymt_agent_runtime::skills=debug` show the refresh line.
+        let _ = env_logger::builder().is_test(true).try_init();
         let dir = TempDir::new().unwrap();
         write_skill(dir.path(), "skill-a", "First version");
 

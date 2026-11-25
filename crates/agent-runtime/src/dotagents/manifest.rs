@@ -7,6 +7,7 @@
 
 use super::diagnostics::DotagentsDiagnostic;
 use super::layer::{DotagentsSource, DotagentsSourceRef};
+use crate::skills::SkillInventoryEntry;
 use std::collections::BTreeMap;
 
 pub use querymt_agent_core::dotagents::memory::DotagentsMemory;
@@ -140,27 +141,6 @@ pub struct DotagentsModelPreset {
     pub extensions: BTreeMap<String, serde_json::Value>,
     /// Where the effective entry came from.
     pub source: DotagentsSource,
-}
-
-/// A protocol skill entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DotagentsSkill {
-    /// Stable normalized ID (directory name unless `id` is provided).
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Description used for skill discovery.
-    pub description: String,
-    /// Whether the skill is enabled (defaults to true).
-    pub enabled: bool,
-    /// The skill Markdown body.
-    pub body: String,
-    /// Unknown frontmatter fields retained for forward compatibility.
-    pub extensions: BTreeMap<String, serde_json::Value>,
-    /// Where the effective entry came from.
-    pub source: DotagentsSource,
-    /// Content fingerprint of the raw source.
-    pub fingerprint: String,
 }
 
 /// The role a protocol agent profile declares.
@@ -358,8 +338,10 @@ pub struct DotagentsManifest {
     pub mcp_servers: BTreeMap<String, DotagentsMcpServer>,
     /// Effective model presets keyed by preset name.
     pub model_presets: BTreeMap<String, DotagentsModelPreset>,
-    /// Effective skills keyed by normalized ID.
-    pub skills: BTreeMap<String, DotagentsSkill>,
+    /// Inventory of the local skills the skill tool offers for the resolved
+    /// workspace, keyed by callable ID. It is filled from the shared skill
+    /// reader and is not limited to `.agents/skills`.
+    pub skills: BTreeMap<String, SkillInventoryEntry>,
     /// Effective agent profiles keyed by normalized ID.
     pub agents: BTreeMap<String, DotagentsAgent>,
     /// Effective repeat tasks keyed by normalized ID.

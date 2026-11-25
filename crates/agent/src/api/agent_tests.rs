@@ -3201,6 +3201,77 @@ async fn standalone_skill_catalog_only_when_enabled_and_admitted_by_tools() -> R
     Ok(())
 }
 
+#[tokio::test]
+async fn manifest_and_skill_tool_list_the_same_local_skills() -> Result<()> {
+    use crate::tools::Tool;
+
+    let write_skill = |folder: &std::path::Path, name: &str| {
+        let dir = folder.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} skill\n---\nBody\n"),
+        )
+        .unwrap();
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let configured = tempfile::tempdir().unwrap();
+    write_skill(&workspace.path().join(".agents/skills"), "from-agents");
+    write_skill(&workspace.path().join(".claude/skills"), "from-claude");
+    write_skill(configured.path(), "from-configured");
+
+    let (registry, _tmp) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    // Global folders (for example `~/.agents/skills`) are scanned too, by the
+    // manifest and by the tool alike, so equality is what matters.
+    let agent = Agent::builder()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(workspace.path())
+        .skills(crate::config::SkillsConfig {
+            paths: vec![configured.path().to_path_buf()],
+            ..Default::default()
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(workspace.path())
+                .with_global_enabled(false),
+        )
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let manifest_ids: Vec<String> = agent
+        .dotagents()
+        .expect("protocol state")
+        .manifest()
+        .skills
+        .keys()
+        .cloned()
+        .collect();
+    for expected in ["from-agents", "from-claude", "from-configured"] {
+        assert!(manifest_ids.iter().any(|id| id == expected), "{expected}");
+    }
+
+    let handle = agent.handle();
+    let catalog = handle.config.skill_catalog.clone().expect("catalog");
+    let tool = catalog.bind(
+        Some(workspace.path()),
+        crate::agent::core::McpToolState::empty(),
+        handle.config.tool_config.clone(),
+        Default::default(),
+    );
+    let mut listed = crate::skills::tool::listed_skill_ids(&tool.definition());
+    listed.sort();
+    assert_eq!(manifest_ids, listed);
+    Ok(())
+}
+
 // ── Task 5.3: target and parent MCP skills end to end ─────────────────
 
 struct NoPromptCtx;

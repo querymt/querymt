@@ -66,19 +66,6 @@ fn write_global_layer(root: &Path) {
     )
     .unwrap();
 
-    std::fs::create_dir_all(root.join("skills/review")).unwrap();
-    std::fs::write(
-        root.join("skills/review/skill.md"),
-        "---\nid: review\nname: Global Review\ndescription: Global review skill.\n---\nGlobal review body.\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.join("skills/global-only")).unwrap();
-    std::fs::write(
-        root.join("skills/global-only/skill.md"),
-        "---\nid: global-only\nname: Global Only\ndescription: Only in global.\n---\nBody.\n",
-    )
-    .unwrap();
-
     std::fs::create_dir_all(root.join("agents/helper")).unwrap();
     std::fs::write(
         root.join("agents/helper/agent.md"),
@@ -140,7 +127,6 @@ fn write_workspace_layer(workspace: &Path) {
     )
     .unwrap();
 
-    // Same skill ID as the global layer: the workspace definition must win.
     std::fs::write(
         agents.join("skills/review/skill.md"),
         "---\nid: review\nname: Workspace Review\ndescription: Workspace review skill.\n---\nWorkspace review body.\n",
@@ -196,6 +182,7 @@ fn runtime_manifest(
 ) -> querymt_agent::dotagents::DotagentsManifest {
     let builder = AgentBuilder::new()
         .cwd(workspace)
+        .skills(querymt_agent::config::SkillsConfig::default())
         .dotagents_options(both_layer_options(workspace, global).with_workspace_task_trust(trust));
     builder
         .preview_dotagents_manifest()
@@ -250,9 +237,8 @@ fn workspace_layer_overrides_global_singletons_and_collections() {
     assert!(manifest.model_presets.contains_key("global-only"));
     assert!(manifest.model_presets.contains_key("workspace-only"));
 
-    // Keyed skill and agent: workspace wins, unmatched global sibling remains.
+    // Skill inventory and keyed agent: workspace wins for the agent.
     assert_eq!(manifest.skills["review"].name, "Workspace Review");
-    assert!(manifest.skills.contains_key("global-only"));
     assert_eq!(manifest.agents["helper"].name, "Helper");
     assert!(manifest.agents["helper"].body.contains("workspace helper"));
 
@@ -580,7 +566,7 @@ async fn workspace_preset_definition_wins_over_the_global_definition() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn workspace_skill_overrides_global_skill_and_keeps_global_siblings() {
+fn workspace_skill_is_listed_in_the_manifest_inventory() {
     let workspace = TempDir::new().unwrap();
     let global = TempDir::new().unwrap();
     write_workspace_layer(workspace.path());
@@ -592,13 +578,20 @@ fn workspace_skill_overrides_global_skill_and_keeps_global_siblings() {
         DotagentsTaskTrustPolicy::Prompt,
     );
 
-    assert_eq!(manifest.skills.len(), 2, "review + global-only");
-    assert_eq!(manifest.skills["review"].name, "Workspace Review");
+    // The list is what the skill tool offers, not what the layers define:
+    // the global layer root override does not contribute skills, and skill
+    // folders outside the workspace (for example `~/.agents/skills`) may add
+    // entries of their own.
+    let review = &manifest.skills["review"];
+    assert_eq!(review.name, "Workspace Review");
     assert_eq!(
-        manifest.skills["review"].source.layer,
-        querymt_agent::dotagents::DotagentsLayer::Workspace
+        review.source_kind,
+        querymt_agent::skills::SkillSourceKind::Project
     );
-    assert_eq!(manifest.skills["global-only"].name, "Global Only");
+    assert_eq!(
+        review.source_folder,
+        workspace.path().join(".agents/skills")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +909,7 @@ fn quorum_builder_resolves_the_same_two_layer_manifest() {
 
     let builder = AgentBuilder::new()
         .cwd(workspace.path())
+        .skills(querymt_agent::config::SkillsConfig::default())
         .dotagents_options(both_layer_options(workspace.path(), global.path()));
     let manifest = builder
         .preview_dotagents_manifest()
@@ -925,7 +919,7 @@ fn quorum_builder_resolves_the_same_two_layer_manifest() {
     assert_eq!(manifest.layers.len(), 2);
     assert_eq!(manifest.mcp_servers.len(), 3);
     assert_eq!(manifest.model_presets.len(), 3);
-    assert_eq!(manifest.skills.len(), 2);
+    assert!(manifest.skills.contains_key("review"));
     assert!(manifest.mcp_servers.contains_key("workspace-only"));
     assert!(
         manifest.mcp_servers["shared-web"]
