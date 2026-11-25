@@ -25,10 +25,13 @@ use crate::worktree::domain::{
     ManagedBranch, WorkspaceId, WorkspaceLifecycle, WorkspaceRecord, baseline_ref_for,
 };
 use crate::worktree::error::{PathSample, WorktreeError, WorktreeResult};
-use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
+use crate::worktree::repo_ops::{RemoveCheckout, RepositoryOps, validate_ref_name};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Message of the unreferenced private commit written by the removal check.
+const REMOVAL_CHECK_COMMIT_MESSAGE: &str = "QueryMT removal check";
 
 /// Live, observed state of a managed workspace.
 ///
@@ -92,6 +95,10 @@ pub struct RemovalReport {
     /// Refs intentionally retained for recovery (managed branch and/or
     /// recorded result refs).
     pub retained_refs: Vec<String>,
+    /// The published result ref whose tree equals the working state that
+    /// was discarded with the checkout; `None` when the checkout was clean
+    /// or already absent.
+    pub preserved_by: Option<String>,
 }
 
 impl fmt::Display for RemovalReport {
@@ -108,6 +115,9 @@ impl fmt::Display for RemovalReport {
                 f,
                 "; branch {branch} was moved externally during removal and was retained, not deleted"
             )?;
+        }
+        if let Some(result_ref) = &self.preserved_by {
+            write!(f, "; working state preserved by {result_ref}")?;
         }
         if !self.retained_refs.is_empty() {
             write!(f, "; retained refs: {}", self.retained_refs.join(", "))?;
@@ -414,16 +424,13 @@ impl WorkspaceManager {
         }
 
         // 2. Content safety: any uncommitted, untracked, or ignored file
-        //    blocks removal.
+        //    blocks removal, unless the full working state is exactly the
+        //    tree of a retained published result.
+        let mut preserved_by = None;
         if checkout_exists {
             let live = self.observe(record).await?;
             if !live.is_clean_for_removal() {
-                return Err(WorktreeError::UnpreservedContent {
-                    workspace_id: record.id.to_string(),
-                    uncommitted: PathSample::new(&live.uncommitted),
-                    untracked: PathSample::new(&live.untracked),
-                    ignored: PathSample::new(&live.ignored),
-                });
+                preserved_by = Some(self.preserving_result(record, &live).await?);
             }
         }
 
@@ -481,6 +488,21 @@ impl WorkspaceManager {
             }
         }
 
+        // Re-verify preservation immediately before claiming removal: the
+        // checks above (ancestry, branch tip) take time, and a discarding
+        // removal must act on the freshest content observation. Ordinary
+        // editors ignore QueryMT's locks, so this narrows but cannot close
+        // the window between the last check and the delete; it never relaxes
+        // the content check.
+        if checkout_exists && preserved_by.is_some() {
+            let live = self.observe(record).await?;
+            if !live.is_clean_for_removal() {
+                preserved_by = Some(self.preserving_result(record, &live).await?);
+            } else {
+                preserved_by = None;
+            }
+        }
+
         // Claim removal before any destructive Git operation. Attaching an
         // owner uses a ready-only CAS, so it cannot race this transition.
         if record.lifecycle != WorkspaceLifecycle::Removing
@@ -498,7 +520,15 @@ impl WorkspaceManager {
         //    metadata of a checkout that already vanished.
         let mut checkout_removed = false;
         if checkout_exists {
-            self.git.remove_worktree(common_dir, &checkout).await?;
+            // Discarding is selected only by the content check above.
+            let mode = if preserved_by.is_some() {
+                RemoveCheckout::DiscardPreserved
+            } else {
+                RemoveCheckout::RefuseDirty
+            };
+            self.git
+                .remove_worktree(common_dir, &checkout, mode)
+                .await?;
             checkout_removed = true;
         }
         self.git.prune_worktrees(common_dir, &checkout).await?;
@@ -548,7 +578,126 @@ impl WorkspaceManager {
             removed_branch,
             branch_moved_during_removal,
             retained_refs,
+            preserved_by,
         })
+    }
+
+    /// Find the retained published result whose tree equals the checkout's
+    /// current full working state (newest first). Content identity, never
+    /// timestamps, decides preservation. Refuses with
+    /// [`WorktreeError::UnpreservedContent`] otherwise.
+    async fn preserving_result(
+        &self,
+        record: &WorkspaceRecord,
+        live: &WorkspaceStatus,
+    ) -> WorktreeResult<String> {
+        let refuse = |stale_result: Option<String>| WorktreeError::UnpreservedContent {
+            workspace_id: record.id.to_string(),
+            uncommitted: PathSample::new(&live.uncommitted),
+            untracked: PathSample::new(&live.untracked),
+            ignored: PathSample::new(&live.ignored),
+            stale_result,
+        };
+
+        // Capture excludes ignored files, so no result can preserve them.
+        if !live.ignored.is_empty() {
+            return Err(refuse(None));
+        }
+
+        // `list_results` is newest first. A result only preserves content
+        // while its ref is live and still pins the recorded commit: a deleted
+        // or moved ref leaves the provenance row naming an object that git
+        // may collect.
+        let common_dir = &record.repository.common_dir;
+        let mut results: Vec<(String, String)> = Vec::new();
+        for result in self
+            .registry
+            .list_results(&record.id)
+            .await
+            .unwrap_or_default()
+        {
+            let (Some(commit), Some(result_ref)) = (result.result_commit, result.result_ref) else {
+                continue;
+            };
+            if validate_ref_name(&result_ref).is_err() {
+                continue;
+            }
+            let pinned = self
+                .git
+                .resolve_commit(common_dir, &result_ref)
+                .await
+                .ok()
+                .flatten();
+            if pinned.as_deref() == Some(commit.as_str()) {
+                results.push((commit, result_ref));
+            } else {
+                tracing::warn!(
+                    workspace = %record.id,
+                    %result_ref,
+                    "published result ref is missing or no longer pins its commit"
+                );
+            }
+        }
+        let Some((_, newest_ref)) = results.first() else {
+            return Err(refuse(None));
+        };
+        let newest_ref = newest_ref.clone();
+
+        let captured = match crate::worktree::capture::capture_working_state_validated(
+            self.git.as_ref(),
+            &record.checkout_path,
+            crate::worktree::capture::CaptureRetryPolicy::default(),
+            REMOVAL_CHECK_COMMIT_MESSAGE,
+        )
+        .await
+        {
+            Ok(captured) => captured,
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %record.id,
+                    %error,
+                    "could not capture the working state to compare with published results"
+                );
+                return Err(refuse(None));
+            }
+        };
+
+        // Capture reads files from disk and ignores the real index, so a tree
+        // match alone does not prove staged content survives: content staged
+        // and then changed or deleted on disk is in no result. Refuse unless
+        // every index entry is recoverable from HEAD or the captured tree.
+        match self
+            .git
+            .unpreserved_staged_paths(&record.checkout_path, &captured.tree)
+            .await
+        {
+            Ok(paths) if paths.is_empty() => {}
+            Ok(paths) => {
+                tracing::warn!(
+                    workspace = %record.id,
+                    staged = ?paths,
+                    "staged content differs from the working files and is not preserved"
+                );
+                return Err(refuse(None));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %record.id,
+                    %error,
+                    "could not compare the index with the captured working state"
+                );
+                return Err(refuse(None));
+            }
+        }
+
+        for (commit, result_ref) in &results {
+            if self.git.commit_tree(common_dir, commit).await.as_deref()
+                == Some(captured.tree.as_str())
+            {
+                return Ok(result_ref.clone());
+            }
+        }
+        Err(refuse(Some(newest_ref)))
     }
 
     /// Best-effort diagnostic recording for refused or failed removals.
@@ -1023,6 +1172,316 @@ mod tests {
         assert!(record.checkout_path.is_dir());
     }
 
+    /// Provision a workspace whose manager and publisher share a recording
+    /// repository double.
+    async fn provision_publishable(
+        files: &[(&str, &str)],
+    ) -> (
+        TempDir,
+        TempDir,
+        WorkspaceRecord,
+        WorkspaceManager,
+        crate::worktree::WorkspaceService,
+        Arc<FaultInjectingRepoOps>,
+    ) {
+        let repo = init_repo();
+        commit_files(repo.path(), "init", files);
+        materialize(repo.path(), files);
+        let storage = TempDir::new().unwrap();
+        let (_conn, store) = shared_db();
+        let store = Arc::new(store);
+        let ops = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            ops.clone() as Arc<dyn RepositoryOps>,
+            store.clone(),
+            storage.path(),
+        );
+        let resolved = resolve_repository(repo.path()).unwrap();
+        let record = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap();
+        let manager = WorkspaceManager::new(
+            ops.clone() as Arc<dyn RepositoryOps>,
+            store.clone(),
+            storage.path(),
+        );
+        let service = crate::worktree::WorkspaceService::new(
+            ops.clone() as Arc<dyn RepositoryOps>,
+            store,
+            storage.path(),
+        );
+        (repo, storage, record, manager, service, ops)
+    }
+
+    #[tokio::test]
+    async fn remove_after_publishing_uncommitted_work() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        fs::write(record.checkout_path.join("new.txt"), "untracked").unwrap();
+        let published = service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        let result_ref = published.result_ref.clone().unwrap();
+
+        let report = manager.remove(&record).await.unwrap();
+
+        assert!(report.checkout_removed);
+        assert!(!record.checkout_path.exists(), "checkout deleted");
+        assert_eq!(report.preserved_by.as_deref(), Some(result_ref.as_str()));
+        assert!(report.retained_refs.contains(&result_ref));
+        assert!(report.to_string().contains("working state preserved by"));
+        assert_eq!(
+            ops.removal_modes(),
+            vec![RemoveCheckout::DiscardPreserved],
+            "discard selected only because a result preserved the state"
+        );
+        let review = service.review_result(&record, &published).await.unwrap();
+        let paths: Vec<&str> = review
+            .changed_paths
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"file.txt") && paths.contains(&"new.txt"),
+            "the result still presents the removed edits: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_after_publishing() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        let published = service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        fs::write(record.checkout_path.join("file.txt"), "edited again").unwrap();
+
+        let err = manager.remove(&record).await.unwrap_err();
+
+        match &err {
+            WorktreeError::UnpreservedContent { stale_result, .. } => {
+                assert_eq!(stale_result, &published.result_ref);
+            }
+            other => panic!("expected unpreserved content, got {other}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("file.txt"), "{message}");
+        assert!(
+            message.contains(published.result_ref.as_deref().unwrap()),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read_to_string(record.checkout_path.join("file.txt")).unwrap(),
+            "edited again"
+        );
+        assert!(
+            !ops.removal_modes()
+                .contains(&RemoveCheckout::DiscardPreserved),
+            "no discarding removal on refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpublished_dirty_checkout_names_no_stale_result() {
+        let (_repo, _storage, record, manager, _service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+
+        let err = manager.remove(&record).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorktreeError::UnpreservedContent {
+                stale_result: None,
+                ..
+            }
+        ));
+        assert!(ops.removal_modes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignored_files_with_a_matching_publication() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[(".gitignore", "ign*\n"), ("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        fs::write(record.checkout_path.join("ign.env"), "ignored").unwrap();
+
+        let err = manager.remove(&record).await.unwrap_err();
+
+        assert!(
+            matches!(&err, WorktreeError::UnpreservedContent { ignored, .. } if ignored.total == 1)
+        );
+        assert!(err.to_string().contains("ign.env"), "{err}");
+        assert!(record.checkout_path.join("ign.env").exists());
+        assert!(record.checkout_path.join("file.txt").exists());
+        assert!(
+            !ops.removal_modes()
+                .contains(&RemoveCheckout::DiscardPreserved),
+            "no discarding removal on refusal"
+        );
+    }
+
+    /// A result whose ref was deleted preserves nothing, even though its
+    /// provenance row still names a commit whose tree matches.
+    #[tokio::test]
+    async fn deleted_result_ref_does_not_preserve_working_state() {
+        let (repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        let published = service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        let result_ref = published.result_ref.clone().unwrap();
+        CliGit::new()
+            .run(repo.path(), &["update-ref", "-d", result_ref.as_str()])
+            .await
+            .unwrap()
+            .into_checked(&["update-ref"])
+            .unwrap();
+
+        let err = manager.remove(&record).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                WorktreeError::UnpreservedContent {
+                    stale_result: None,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(record.checkout_path.join("file.txt").exists());
+        assert!(ops.removal_modes().is_empty());
+    }
+
+    /// Staged content that differs from the published working files is in no
+    /// result; a tree match alone must not authorize discarding it.
+    #[tokio::test]
+    async fn staged_content_missing_from_the_result_blocks_removal() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "staged").unwrap();
+        CliGit::new()
+            .run(&record.checkout_path, &["add", "file.txt"])
+            .await
+            .unwrap()
+            .into_checked(&["add"])
+            .unwrap();
+        fs::write(record.checkout_path.join("file.txt"), "on disk").unwrap();
+        service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+
+        let err = manager.remove(&record).await.unwrap_err();
+
+        assert!(
+            matches!(err, WorktreeError::UnpreservedContent { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(record.checkout_path.join("file.txt")).unwrap(),
+            "on disk"
+        );
+        assert!(
+            !ops.removal_modes()
+                .contains(&RemoveCheckout::DiscardPreserved),
+            "no discarding removal on refusal"
+        );
+    }
+
+    /// Staging exactly what the result captured loses nothing.
+    #[tokio::test]
+    async fn staged_content_equal_to_the_result_allows_removal() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        CliGit::new()
+            .run(&record.checkout_path, &["add", "file.txt"])
+            .await
+            .unwrap()
+            .into_checked(&["add"])
+            .unwrap();
+        service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+
+        let report = manager.remove(&record).await.unwrap();
+
+        assert!(report.checkout_removed && report.preserved_by.is_some());
+        assert_eq!(ops.removal_modes(), vec![RemoveCheckout::DiscardPreserved]);
+    }
+
+    #[tokio::test]
+    async fn recovery_of_an_interrupted_removal_of_published_work() {
+        let (_repo, _storage, record, manager, service, ops) =
+            provision_publishable(&[("file.txt", "one")]).await;
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        let published = service
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+
+        // Removal claims the Removing intent, then dies before deleting.
+        ops.fail_next(
+            crate::worktree::repo_ops::FailurePoint::RemoveWorktree,
+            1,
+            "injected removal failure",
+        );
+        let err = manager.remove(&record).await.unwrap_err();
+        assert!(err.to_string().contains("injected removal failure"));
+        let interrupted = manager
+            .registry()
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.lifecycle, WorkspaceLifecycle::Removing);
+        assert!(record.checkout_path.is_dir());
+
+        // An edit while interrupted: recovery refuses and keeps the files.
+        fs::write(record.checkout_path.join("file.txt"), "edited later").unwrap();
+        let err = manager.remove(&interrupted).await.unwrap_err();
+        assert!(
+            matches!(&err, WorktreeError::UnpreservedContent { stale_result, .. }
+                if stale_result == &published.result_ref),
+            "recovery must refuse an edit after publishing: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(record.checkout_path.join("file.txt")).unwrap(),
+            "edited later"
+        );
+
+        // Back to the published content: recovery re-checks and completes.
+        fs::write(record.checkout_path.join("file.txt"), "edited").unwrap();
+        let report = manager.remove(&interrupted).await.unwrap();
+        assert!(report.checkout_removed);
+        assert_eq!(report.preserved_by, published.result_ref);
+        assert!(!record.checkout_path.exists());
+        assert_eq!(
+            manager
+                .registry()
+                .get_workspace(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            WorkspaceLifecycle::Removed
+        );
+    }
+
     #[tokio::test]
     async fn remove_refuses_externally_owned_directory() {
         let (_repo, _storage, record, manager) = provision(&[("file.txt", "one")]).await;
@@ -1333,8 +1792,17 @@ mod tests {
             self.inner.add_worktree(common_dir, path, branch).await
         }
 
-        async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
-            self.inner.remove_worktree(common_dir, path).await
+        async fn remove_worktree(
+            &self,
+            common_dir: &Path,
+            path: &Path,
+            mode: crate::worktree::repo_ops::RemoveCheckout,
+        ) -> WorktreeResult<()> {
+            self.inner.remove_worktree(common_dir, path, mode).await
+        }
+
+        async fn commit_tree(&self, common_dir: &Path, commit: &str) -> Option<String> {
+            self.inner.commit_tree(common_dir, commit).await
         }
 
         async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
@@ -1401,8 +1869,11 @@ mod tests {
         async fn capture_working_state(
             &self,
             checkout: &Path,
+            commit_message: &str,
         ) -> WorktreeResult<crate::worktree::repo_ops::CapturedWorkingState> {
-            self.inner.capture_working_state(checkout).await
+            self.inner
+                .capture_working_state(checkout, commit_message)
+                .await
         }
 
         async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
@@ -1411,6 +1882,14 @@ mod tests {
 
         async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool> {
             self.inner.has_unmerged_entries(checkout).await
+        }
+
+        async fn unpreserved_staged_paths(
+            &self,
+            checkout: &Path,
+            tree: &str,
+        ) -> WorktreeResult<Vec<String>> {
+            self.inner.unpreserved_staged_paths(checkout, tree).await
         }
 
         async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {

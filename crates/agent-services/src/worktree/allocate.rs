@@ -352,6 +352,7 @@ impl WorkspaceAllocator {
                         self.git.as_ref(),
                         &source.checkout.root,
                         Default::default(),
+                        crate::worktree::repo_ops::BASELINE_COMMIT_MESSAGE,
                     );
                     let captured = match mutation_gate {
                         Some(gate) => match gate.run(capture).await {
@@ -655,6 +656,7 @@ impl WorkspaceAllocator {
                         self.git.as_ref(),
                         &record.repository.origin_path,
                         Default::default(),
+                        crate::worktree::repo_ops::BASELINE_COMMIT_MESSAGE,
                     ))
                     .await??;
                 Ok(Baseline {

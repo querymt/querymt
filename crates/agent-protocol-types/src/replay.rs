@@ -6,7 +6,7 @@
 //! here and neither side keeps a copy: tool kinds, the todo plan, reasoning
 //! chunks, workspace announcements and compaction identity.
 
-use crate::events::{AgentEventKind, ReasoningPartStored};
+use crate::events::{AgentEventKind, ArchiveRemoval, ReasoningPartStored};
 use crate::protocol::{
     CompactionId, Content, ContentBlock, ContentChunk, CursorAnchor, CursorAnchorPosition,
     CursorCapabilities, CursorCompactionAnchor, CursorForkCapabilities, CursorMessageAnchor,
@@ -327,11 +327,29 @@ pub fn stored_summary_updates(
 
 /// Announcement of an archived workspace. The `message_id` is derived from the
 /// workspace so live delivery and replay agree on identity.
-pub fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
-    let text = format!(
-        "This session's workspace {workspace_id} was archived. This session is now \
-         read-only; run `/worktree remove` to delete the checkout."
-    );
+///
+/// `removal` is the outcome of a removal attempted together with the archive;
+/// without it the text points at `/worktree remove`, and with it the text
+/// states what happened instead of asking the user to run it again.
+pub fn worktree_archived_chunk(
+    workspace_id: &str,
+    by_session_id: Option<&str>,
+    removal: Option<&ArchiveRemoval>,
+) -> ContentChunk {
+    let text = match removal {
+        None => format!(
+            "This session's workspace {workspace_id} was archived. This session is now \
+             read-only; run `/worktree remove` to delete the checkout."
+        ),
+        Some(ArchiveRemoval::Removed) => format!(
+            "This session's workspace {workspace_id} was archived and removed. This \
+             session is now read-only."
+        ),
+        Some(ArchiveRemoval::Refused { code, message }) => format!(
+            "This session's workspace {workspace_id} was archived, but removal was \
+             refused ({code}): {message}. This session is now read-only."
+        ),
+    };
     let mut details = serde_json::json!({ "workspaceId": workspace_id });
     if let Some(by) = by_session_id {
         details["bySessionId"] = by.into();
@@ -341,6 +359,31 @@ pub fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) 
         .meta(serde_json::Map::from_iter([(
             QUERYMT_META_NAMESPACE.to_owned(),
             serde_json::json!({ "worktreeArchived": details }),
+        )]))
+}
+
+/// Reply to a mutating native `/worktree` command. The `message_id` is
+/// derived from the per-prompt `id` so live delivery and replay agree on
+/// identity.
+pub fn worktree_command_chunk(
+    id: &str,
+    command: &str,
+    code: Option<&str>,
+    archived: Option<bool>,
+    text: &str,
+) -> ContentChunk {
+    let mut details = serde_json::json!({ "command": command });
+    if let Some(code) = code {
+        details["code"] = code.into();
+    }
+    if let Some(archived) = archived {
+        details["archived"] = archived.into();
+    }
+    ContentChunk::new(text_block(text))
+        .message_id(MessageId::from(format!("worktree-cmd-{id}")))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_owned(),
+            serde_json::json!({ "worktreeCommand": details }),
         )]))
 }
 
@@ -468,6 +511,19 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
         AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
             ContentChunk::new(text_block(text)),
         )],
+        AgentEventKind::WorktreeCommandCompleted {
+            id,
+            command,
+            code,
+            archived,
+            text,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_command_chunk(
+            id,
+            command,
+            code.as_deref(),
+            *archived,
+            text,
+        ))],
         AgentEventKind::WorktreeOwnershipTransferred {
             workspace_id,
             successor_session_id,
@@ -480,9 +536,11 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
         AgentEventKind::WorktreeArchived {
             workspace_id,
             by_session_id,
+            removal,
         } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
             workspace_id,
             by_session_id.as_deref(),
+            removal.as_ref(),
         ))],
         _ => Vec::new(),
     }
@@ -1182,12 +1240,101 @@ mod tests {
         let archived = AgentEventKind::WorktreeArchived {
             workspace_id: "w1".into(),
             by_session_id: None,
+            removal: None,
         };
         let updates = replayable_updates(&archived);
         assert!(matches!(
             updates.as_slice(),
             [SessionUpdate::AgentMessageChunk(_)]
         ));
+    }
+
+    fn chunk_of(kind: &AgentEventKind) -> ContentChunk {
+        let mut updates = replayable_updates(kind);
+        let Some(SessionUpdate::AgentMessageChunk(chunk)) = updates.pop() else {
+            panic!("expected an agent message chunk");
+        };
+        chunk
+    }
+
+    fn chunk_text(chunk: &ContentChunk) -> String {
+        let value = serde_json::to_value(&chunk.content).unwrap();
+        value["text"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn mutating_command_reply_is_replayed() {
+        let refused = AgentEventKind::WorktreeCommandCompleted {
+            id: "c1".into(),
+            command: "remove".into(),
+            code: Some("unpreserved_content".into()),
+            archived: Some(true),
+            text: "refused: a.txt".into(),
+        };
+        let chunk = chunk_of(&refused);
+        assert_eq!(chunk_text(&chunk), "refused: a.txt");
+        let value = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(value["messageId"], "worktree-cmd-c1");
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE]["worktreeCommand"],
+            serde_json::json!({
+                "command": "remove",
+                "code": "unpreserved_content",
+                "archived": true
+            })
+        );
+
+        // A success has neither `code` nor `archived`.
+        let ok = AgentEventKind::WorktreeCommandCompleted {
+            id: "c2".into(),
+            command: "publish".into(),
+            code: None,
+            archived: None,
+            text: "published".into(),
+        };
+        let value = serde_json::to_value(chunk_of(&ok)).unwrap();
+        assert_eq!(value["messageId"], "worktree-cmd-c2");
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE]["worktreeCommand"],
+            serde_json::json!({ "command": "publish" })
+        );
+    }
+
+    #[test]
+    fn archived_update_replayed_with_the_removal_outcome() {
+        let archived = |removal| AgentEventKind::WorktreeArchived {
+            workspace_id: "w1".into(),
+            by_session_id: None,
+            removal,
+        };
+
+        let plain = chunk_text(&chunk_of(&archived(None)));
+        assert!(plain.contains("run `/worktree remove`"), "{plain}");
+
+        let removed = chunk_text(&chunk_of(&archived(Some(ArchiveRemoval::Removed))));
+        assert_eq!(
+            removed,
+            "This session's workspace w1 was archived and removed. This session is now read-only."
+        );
+
+        let refused = chunk_text(&chunk_of(&archived(Some(ArchiveRemoval::Refused {
+            code: "unpreserved_content".into(),
+            message: "3 uncommitted".into(),
+        }))));
+        assert_eq!(
+            refused,
+            "This session's workspace w1 was archived, but removal was refused \
+             (unpreserved_content): 3 uncommitted. This session is now read-only."
+        );
+        assert!(
+            !refused.contains("run `/worktree remove`"),
+            "removal was attempted: {refused}"
+        );
+
+        // The identity stays the workspace-derived id in every case.
+        let value =
+            serde_json::to_value(chunk_of(&archived(Some(ArchiveRemoval::Removed)))).unwrap();
+        assert_eq!(value["messageId"], "worktree-archived-w1");
     }
 
     fn compaction_update(id: &str) -> SessionUpdate {

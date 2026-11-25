@@ -2893,6 +2893,398 @@ async fn actorless_replay_is_refused_for_sessions_that_never_handed_off() {
     .expect_err("a non-transferred session must have a runtime ref");
 }
 
+// ── Durable native replies, removal after publish, cancel on read-only ───────
+
+/// A native `/worktree` prompt, returning the whole prompt response.
+async fn native_prompt(
+    handle: &LocalAgentHandle,
+    session_id: &str,
+    text: &str,
+) -> crate::acp::protocol::PromptResponse {
+    SendAgent::prompt(
+        handle,
+        crate::acp::protocol::PromptRequest::new(
+            session_id.to_owned(),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+fn event_tip(response: &crate::acp::protocol::PromptResponse) -> i64 {
+    response.meta.as_ref().unwrap()["querymt"]["eventTip"]
+        .as_i64()
+        .expect("event tip")
+}
+
+/// The journaled events of `session_id`, decoded.
+async fn journal_of(f: &WorktreeExtFixture, session_id: &str) -> Vec<crate::events::AgentEvent> {
+    f.storage
+        .event_journal()
+        .load_session_stream(session_id, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(crate::events::AgentEvent::from)
+        .collect()
+}
+
+/// Updates of a load-with-replay of `session_id`, as JSON.
+async fn replayed_updates(
+    handle: &Arc<LocalAgentHandle>,
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let outcome = crate::acp::load_session_with_replay(
+        handle,
+        crate::acp::protocol::LoadSessionRequest::new(session_id.to_owned(), cwd.to_path_buf()),
+    )
+    .await
+    .expect("load with replay");
+    outcome
+        .notifications
+        .iter()
+        .map(|n| serde_json::to_value(&n.update).unwrap())
+        .collect()
+}
+
+fn command_update<'a>(
+    updates: &'a [serde_json::Value],
+    command: &str,
+) -> Option<&'a serde_json::Value> {
+    updates
+        .iter()
+        .find(|u| u["_meta"]["querymt"]["worktreeCommand"]["command"] == command)
+}
+
+/// Removal accepts a dirty checkout whose working state a published result
+/// preserves: the response names the result ref and the files are gone.
+#[tokio::test]
+async fn remove_after_publishing_through_the_native_command() {
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+    std::fs::write(record.checkout_path.join("scratch.txt"), "work\n").unwrap();
+
+    let published = native_command(&f.handle, &owner, "/worktree publish")
+        .await
+        .unwrap();
+    let result_ref = published["result"]["result_ref"]
+        .as_str()
+        .expect("published result ref")
+        .to_owned();
+
+    let removed = native_command(&f.handle, &owner, "/worktree remove --archive")
+        .await
+        .unwrap();
+    assert_eq!(removed["checkout_removed"], true, "{removed}");
+    assert_eq!(removed["preserved_by"], result_ref.as_str());
+    assert!(
+        removed["retained_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == result_ref.as_str())
+    );
+    assert!(!record.checkout_path.exists());
+    f.handle.shutdown().await;
+}
+
+/// `/worktree remove --archive` from the dirty owner: the archive commits,
+/// removal is refused, and the owner's archived update (the reply) is recorded
+/// after the attempt and states the refusal.
+#[tokio::test]
+async fn archive_succeeds_removal_refused() {
+    use crate::events::{AgentEventKind, ArchiveRemoval};
+    use crate::worktree::WorkspaceLifecycle;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+    std::fs::write(record.checkout_path.join("scratch.txt"), "work\n").unwrap();
+
+    let response = native_prompt(&f.handle, &owner, "/worktree remove --archive").await;
+    let payload = &response.meta.as_ref().unwrap()["querymt.worktree"];
+    assert_eq!(payload["error"]["code"], "unpreserved_content");
+    assert_eq!(payload["error"]["archived"], true);
+
+    let journal = journal_of(&f, &owner).await;
+    let archived: Vec<_> = journal
+        .iter()
+        .filter_map(|event| match &event.kind {
+            AgentEventKind::WorktreeArchived { removal, .. } => {
+                Some((event.session_seq, removal.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(archived.len(), 1, "exactly one archived update");
+    let (seq, removal) = &archived[0];
+    match removal {
+        Some(ArchiveRemoval::Refused { code, message }) => {
+            assert_eq!(code, "unpreserved_content");
+            assert!(message.contains("scratch.txt"), "{message}");
+        }
+        other => panic!("expected a refused removal, got {other:?}"),
+    }
+    assert_eq!(
+        event_tip(&response),
+        *seq,
+        "the archived update is the reply, delivered before the response"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::WorktreeCommandCompleted { .. })),
+        "the announcement replaces the reply"
+    );
+    assert_eq!(
+        owned_workspace(&f, &owner).await.lifecycle,
+        WorkspaceLifecycle::Archived
+    );
+    assert!(record.checkout_path.join("scratch.txt").exists());
+    f.handle.shutdown().await;
+}
+
+/// `/worktree remove --archive` on a clean owner reports `Removed`.
+#[tokio::test]
+async fn one_step_cleanup() {
+    use crate::events::{AgentEventKind, ArchiveRemoval};
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+
+    let response = native_prompt(&f.handle, &owner, "/worktree remove --archive").await;
+    let payload = &response.meta.as_ref().unwrap()["querymt.worktree"];
+    assert_eq!(payload["checkout_removed"], true, "{payload}");
+    assert!(!record.checkout_path.exists());
+
+    let archived: Vec<_> = journal_of(&f, &owner)
+        .await
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            AgentEventKind::WorktreeArchived { removal, .. } => Some((event.session_seq, removal)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].1, Some(ArchiveRemoval::Removed));
+    assert_eq!(event_tip(&response), archived[0].0);
+    f.handle.shutdown().await;
+}
+
+/// A mutating command's reply is a durable update with a stable identity,
+/// replayed on load with the same identity and `_meta`.
+#[tokio::test]
+async fn mutating_command_reply_is_replayed() {
+    use crate::events::AgentEventKind;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+    std::fs::write(record.checkout_path.join("scratch.txt"), "work\n").unwrap();
+
+    let response = native_prompt(&f.handle, &owner, "/worktree publish").await;
+    let journal = journal_of(&f, &owner).await;
+    let replies: Vec<_> = journal
+        .iter()
+        .filter_map(|event| match &event.kind {
+            AgentEventKind::WorktreeCommandCompleted {
+                id, command, code, ..
+            } => Some((event.session_seq, id.clone(), command.clone(), code.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replies.len(), 1, "{journal:?}");
+    let (seq, id, command, code) = &replies[0];
+    assert_eq!(command, "publish");
+    assert_eq!(*code, None);
+    assert_eq!(event_tip(&response), *seq);
+
+    // The archived owner loads without an actor and replays the reply.
+    native_command(&f.handle, &owner, "/worktree archive")
+        .await
+        .unwrap();
+    let handle = Arc::new(f.handle);
+    let updates = replayed_updates(&handle, &owner, &record.session_cwd()).await;
+    let reply = command_update(&updates, "publish").expect("publish reply replayed");
+    assert_eq!(reply["messageId"], format!("worktree-cmd-{id}").as_str());
+    assert!(
+        reply["_meta"]["querymt"]["worktreeCommand"]
+            .get("code")
+            .is_none(),
+        "a success carries no code"
+    );
+    handle.shutdown().await;
+}
+
+/// A refused `/worktree remove` issued from another session is recorded on
+/// the issuing session's stream and survives a reload.
+#[tokio::test]
+async fn refused_removal_reply_survives_reload() {
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+    std::fs::write(record.checkout_path.join("scratch.txt"), "work\n").unwrap();
+    ops.archive(&f.handle, &WorkspaceTarget::Session(owner.clone()))
+        .await
+        .unwrap();
+
+    let other = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let reply = native_command(
+        &f.handle,
+        &other,
+        &format!("/worktree remove {}", record.id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["error"]["code"], "unpreserved_content");
+
+    let handle = Arc::new(f.handle);
+    let updates = replayed_updates(&handle, &other, f.repo.path()).await;
+    let replayed = command_update(&updates, "remove").expect("refusal replayed");
+    assert_eq!(
+        replayed["_meta"]["querymt"]["worktreeCommand"]["code"],
+        "unpreserved_content"
+    );
+    let text = replayed["content"]["text"].as_str().unwrap();
+    assert!(text.contains("scratch.txt"), "{text}");
+    assert!(text.contains("/worktree publish"), "{text}");
+    handle.shutdown().await;
+}
+
+/// The owner's own `/worktree archive` is answered by the archived update
+/// alone: no second reply is recorded.
+#[tokio::test]
+async fn announcement_replaces_the_reply() {
+    use crate::events::AgentEventKind;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+
+    let response = native_prompt(&f.handle, &owner, "/worktree archive").await;
+
+    let journal = journal_of(&f, &owner).await;
+    let worktree_events: Vec<_> = journal
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AgentEventKind::WorktreeArchived { .. }
+                    | AgentEventKind::WorktreeCommandCompleted { .. }
+                    | AgentEventKind::WorktreeCommandOutput { .. }
+            )
+        })
+        .collect();
+    assert_eq!(worktree_events.len(), 1, "{worktree_events:?}");
+    assert!(matches!(
+        worktree_events[0].kind,
+        AgentEventKind::WorktreeArchived { removal: None, .. }
+    ));
+    assert_eq!(event_tip(&response), worktree_events[0].session_seq);
+    f.handle.shutdown().await;
+}
+
+/// `list`, `status`, `result` and usage errors stay transient: nothing about
+/// them is journaled or replayed.
+#[tokio::test]
+async fn output_is_not_replayed() {
+    use crate::events::AgentEventKind;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = owned_workspace(&f, &owner).await;
+    for command in ["/worktree list", "/worktree status", "/worktree result"] {
+        native_command(&f.handle, &owner, command).await.unwrap();
+    }
+    let usage = native_command(&f.handle, &owner, "/worktree list extra")
+        .await
+        .unwrap();
+    assert_eq!(usage["error"]["code"], "invalid_options");
+
+    let journal = journal_of(&f, &owner).await;
+    assert!(
+        !journal.iter().any(|e| matches!(
+            e.kind,
+            AgentEventKind::WorktreeCommandOutput { .. }
+                | AgentEventKind::WorktreeCommandCompleted { .. }
+        )),
+        "inspection output is not journaled"
+    );
+
+    native_command(&f.handle, &owner, "/worktree archive")
+        .await
+        .unwrap();
+    let handle = Arc::new(f.handle);
+    let updates = replayed_updates(&handle, &owner, &record.session_cwd()).await;
+    assert!(
+        !updates.iter().any(|u| {
+            u["content"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("\"workspaces\"") || t.contains("invalid_options"))
+        }),
+        "no inspection output is replayed"
+    );
+    handle.shutdown().await;
+}
+
+/// `session/cancel` on the owner of an archived workspace is a no-op success.
+#[tokio::test]
+async fn cancel_an_archived_owner() {
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    native_command(&f.handle, &owner, "/worktree archive")
+        .await
+        .unwrap();
+    assert!(f.handle.registry.lock().await.get(&owner).is_none());
+
+    f.handle
+        .cancel(CancelNotification::new(SessionId::from(owner.clone())))
+        .await
+        .expect("cancel of an archived owner succeeds");
+    f.handle.shutdown().await;
+}
+
+/// `session/cancel` on a previous owner (workspace handed off) is a no-op
+/// success.
+#[tokio::test]
+async fn cancel_a_previous_owner() {
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    ops.handoff(
+        &f.handle,
+        &WorkspaceTarget::Session(previous.clone()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(f.handle.registry.lock().await.get(&previous).is_none());
+
+    f.handle
+        .cancel(CancelNotification::new(SessionId::from(previous.clone())))
+        .await
+        .expect("cancel of a previous owner succeeds");
+    f.handle.shutdown().await;
+}
+
 // ── Section 25: archive from any session ─────────────────────────────────────
 
 /// `(workspace_id, by_session_id)` of every `WorktreeArchived` event journaled
@@ -2911,6 +3303,7 @@ async fn archived_events(
             crate::events::AgentEventKind::WorktreeArchived {
                 workspace_id,
                 by_session_id,
+                ..
             } => Some((workspace_id, by_session_id)),
             _ => None,
         })
@@ -3006,7 +3399,7 @@ async fn owner_archives_itself_and_becomes_read_only() {
     assert_eq!(error_code(&undo).as_deref(), Some("workspace_archived"));
 
     // Mutating native commands are refused visibly; inspection stays available.
-    for mutating in ["/worktree create", "/worktree publish", "/worktree handoff"] {
+    for mutating in ["/worktree create", "/worktree handoff"] {
         let reply = native_command(&f.handle, &owner, mutating).await.unwrap();
         assert_eq!(reply["error"]["code"], "workspace_archived", "{mutating}");
     }
@@ -3014,6 +3407,16 @@ async fn owner_archives_itself_and_becomes_read_only() {
         .await
         .unwrap();
     assert_eq!(status["lifecycle"], "archived");
+
+    // Publication only pins a result ref, so the archived owner may publish
+    // (the recovery step after a refused `remove --archive`).
+    let published = native_command(&f.handle, &owner, "/worktree publish")
+        .await
+        .unwrap();
+    assert!(
+        published["result"]["result_ref"].as_str().is_some(),
+        "an archived owner can publish: {published:?}"
+    );
 
     // Load never materializes an actor; replay is history then the update.
     let handle = Arc::new(f.handle);

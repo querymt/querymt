@@ -79,6 +79,23 @@ pub enum OutputLimitRecoveryAction {
     Continue,
 }
 
+/// Outcome of the removal attempted together with an archive
+/// (`/worktree remove --archive`).
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ArchiveRemoval {
+    /// The checkout was removed after archiving.
+    Removed,
+    /// Removal was refused after the archive succeeded; the workspace stays archived.
+    Refused {
+        /// Stable error code of the refusal (for example `unpreserved_content`).
+        code: String,
+        message: String,
+    },
+}
+
 impl From<StopType> for StopReason {
     fn from(stop_type: StopType) -> Self {
         match stop_type {
@@ -759,10 +776,27 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "Option<number>")]
         revision: Option<u64>,
     },
-    /// Output of a native `/worktree` command, delivered to the issuing
-    /// session as an agent message. Transient: the authoritative state lives in
-    /// the workspace registry, so it is neither journaled nor replayed.
+    /// Output of a native `/worktree` inspection command (`create`, `list`,
+    /// `status`, `result`) or usage error, delivered to the issuing session as
+    /// an agent message. Transient: the authoritative state lives in the
+    /// workspace registry, so it is neither journaled nor replayed.
     WorktreeCommandOutput {
+        text: String,
+    },
+    /// Reply to a mutating native `/worktree` command (`publish`, `archive`,
+    /// `remove`, `recover`, `handoff`), successful or refused. Durable and
+    /// replayed on load with a stable message identity derived from `id`.
+    WorktreeCommandCompleted {
+        /// Unique per native prompt (UUIDv7).
+        id: String,
+        /// Subcommand name.
+        command: String,
+        /// Stable error code; absent on success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// A refused removal followed a successful archive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
         text: String,
     },
     /// Ownership of the session's managed checkout moved to a successor
@@ -779,6 +813,10 @@ pub enum AgentEventKind {
         /// The session that issued the archive, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by_session_id: Option<String>,
+        /// Outcome of the removal attempted with the archive; absent for a
+        /// plain archive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removal: Option<ArchiveRemoval>,
     },
     DelegationRequested {
         delegation: Delegation,
@@ -1155,6 +1193,7 @@ impl AgentEventKind {
             Self::ArtifactRecorded { .. } => "artifact_recorded",
             Self::DelegateModelsChanged { .. } => "delegate_models_changed",
             Self::WorktreeCommandOutput { .. } => "worktree_command_output",
+            Self::WorktreeCommandCompleted { .. } => "worktree_command_completed",
             Self::WorktreeOwnershipTransferred { .. } => "worktree_ownership_transferred",
             Self::WorktreeArchived { .. } => "worktree_archived",
             Self::DelegationRequested { .. } => "delegation_requested",
@@ -1916,6 +1955,14 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "type": "worktree_command_completed",
+                "data": {
+                    "id": "x",
+                    "command": "remove",
+                    "text": "x"
+                }
+            }),
+            serde_json::json!({
                 "type": "worktree_ownership_transferred",
                 "data": {
                     "workspace_id": "x",
@@ -2224,7 +2271,7 @@ mod tests {
         let samples = one_value_per_variant();
         // Update when a variant is added: `tag()`'s exhaustive match forces
         // the new tag, and this count forces a sample for it.
-        assert_eq!(samples.len(), 105, "one sample per AgentEventKind variant");
+        assert_eq!(samples.len(), 106, "one sample per AgentEventKind variant");
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
@@ -2271,6 +2318,82 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&kind).unwrap(),
             serde_json::json!({"type": "todo_plan_restored", "data": {"entries": []}})
+        );
+    }
+
+    #[test]
+    fn worktree_command_completed_round_trips() {
+        let kind = AgentEventKind::WorktreeCommandCompleted {
+            id: "c1".into(),
+            command: "remove".into(),
+            code: Some("unpreserved_content".into()),
+            archived: Some(true),
+            text: "refused".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+        assert_eq!(kind.tag(), "worktree_command_completed");
+        let value = serde_json::to_value(&kind).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "worktree_command_completed",
+                "data": {
+                    "id": "c1",
+                    "command": "remove",
+                    "code": "unpreserved_content",
+                    "archived": true,
+                    "text": "refused"
+                }
+            })
+        );
+        let back: AgentEventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            back,
+            AgentEventKind::WorktreeCommandCompleted { ref command, archived: Some(true), .. }
+                if command == "remove"
+        ));
+
+        // Success carries neither a code nor the archived flag.
+        let ok = AgentEventKind::WorktreeCommandCompleted {
+            id: "c2".into(),
+            command: "publish".into(),
+            code: None,
+            archived: None,
+            text: "done".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap()["data"],
+            serde_json::json!({"id": "c2", "command": "publish", "text": "done"})
+        );
+    }
+
+    #[test]
+    fn worktree_archived_removal_is_optional_and_tagged() {
+        let plain: AgentEventKind = serde_json::from_value(serde_json::json!({
+            "type": "worktree_archived",
+            "data": {"workspace_id": "w"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            plain,
+            AgentEventKind::WorktreeArchived { removal: None, .. }
+        ));
+        let refused = AgentEventKind::WorktreeArchived {
+            workspace_id: "w".into(),
+            by_session_id: None,
+            removal: Some(ArchiveRemoval::Refused {
+                code: "unpreserved_content".into(),
+                message: "m".into(),
+            }),
+        };
+        let value = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            value["data"]["removal"],
+            serde_json::json!({"type": "refused", "data": {"code": "unpreserved_content", "message": "m"}})
+        );
+        assert_eq!(
+            serde_json::to_value(ArchiveRemoval::Removed).unwrap(),
+            serde_json::json!({"type": "removed"})
         );
     }
 

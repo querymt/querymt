@@ -37,6 +37,18 @@ impl std::fmt::Display for PathSample {
     }
 }
 
+/// Trailing sentence of the `unpreserved_content` message when a published
+/// result exists but the working state has since diverged from it.
+fn stale_result_sentence(stale_result: &Option<String>) -> String {
+    match stale_result {
+        Some(result) => format!(
+            "; the working state differs from the last published result {result}; \
+             publish again to preserve it"
+        ),
+        None => String::new(),
+    }
+}
+
 /// Errors raised while resolving, provisioning, or administrating managed
 /// worktree workspaces.
 #[derive(Debug, Error)]
@@ -150,14 +162,18 @@ pub enum WorktreeError {
     /// Removal would discard working files that no ref preserves.
     #[error(
         "workspace {workspace_id} has unpreserved working state: uncommitted {uncommitted}, \
-         untracked {untracked}, ignored {ignored}; commit or delete the listed files \
-         before removal"
+         untracked {untracked}, ignored {ignored}; commit, publish (`/worktree publish`), \
+         or delete the listed files before removal{}",
+        stale_result_sentence(.stale_result)
     )]
     UnpreservedContent {
         workspace_id: String,
         uncommitted: PathSample,
         untracked: PathSample,
         ignored: PathSample,
+        /// Newest published result ref when one exists but the working state
+        /// no longer matches it.
+        stale_result: Option<String>,
     },
 
     /// Removal would discard commits beyond the baseline that no retained ref
@@ -226,3 +242,36 @@ impl WorktreeError {
 
 /// Convenience alias for [`WorktreeError`] results.
 pub type WorktreeResult<T> = Result<T, WorktreeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unpreserved(stale_result: Option<&str>) -> WorktreeError {
+        WorktreeError::UnpreservedContent {
+            workspace_id: "ws-1".into(),
+            uncommitted: PathSample::new(&["a.txt".to_string()]),
+            untracked: PathSample::default(),
+            ignored: PathSample::default(),
+            stale_result: stale_result.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unpreserved_content_names_publish_and_stale_result() {
+        let plain = unpreserved(None);
+        let text = plain.to_string();
+        assert!(text.contains("commit, publish (`/worktree publish`), or delete"));
+        assert!(!text.contains("last published result"));
+        assert_eq!(plain.code(), "unpreserved_content");
+
+        let stale = unpreserved(Some("refs/qmt/results/ws-1/abc"));
+        let text = stale.to_string();
+        assert!(text.contains("commit, publish (`/worktree publish`), or delete"));
+        assert!(text.contains(
+            "the working state differs from the last published result refs/qmt/results/ws-1/abc; \
+             publish again to preserve it"
+        ));
+        assert_eq!(stale.code(), "unpreserved_content");
+    }
+}

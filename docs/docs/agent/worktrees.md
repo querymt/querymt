@@ -297,9 +297,21 @@ current session's workspace when no ID is supplied; local sessions must supply
 an ID. Results are also returned in prompt response `_meta["querymt.worktree"]`.
 
 The command's output is also delivered as an `agent_message_chunk` session
-update on the issuing session (an ephemeral event, never journaled or replayed)
-before the prompt response, on stdio and WebSocket alike, so every client
-attached to the session sees it. No client bridge route is involved. The legacy
+update on the issuing session before the prompt response, on stdio and
+WebSocket alike, so every client attached to the session sees it. The replies
+to `list`, `status`, `result` and `create`, and usage errors, are ephemeral
+events, never journaled or replayed. The replies to the mutating commands
+`publish`, `archive`, `remove`, `recover` and `handoff`, successful or refused,
+are **durable**: they are recorded as a `worktree_command_completed` event,
+sent with the stable `message_id` `worktree-cmd-<id>` and
+`_meta.querymt.worktreeCommand = {command, code?, archived?}` (`code` is the
+stable error code and is absent on success; `archived: true` marks a refused
+removal that followed a successful archive), and replayed on load with the same
+identity. When the outcome is already recorded as a durable announcement on the
+issuing session's own stream (a handoff, or an archive or `remove --archive` of
+its own workspace), that announcement is the reply and no second update is
+recorded. If a durable reply cannot be recorded, it is sent as ephemeral output
+and the failure is logged. No client bridge route is involved. The legacy
 `AcpServer::run_stdio` forwarder does not track per-connection delivery, so
 there the update is sent but its ordering against the response is not
 guaranteed.
@@ -395,7 +407,7 @@ readable messages may be reworded; codes do not change.
 | `owner_conflict` | another session already owns the writable workspace |
 | `owner_active` | handoff, archive or removal refused: the owner has a running turn, queued input or steering, or shared delegates / another process are using the checkout |
 | `workspace_not_archived` | removal of an owned workspace before it was archived; run `archive` (or `remove --archive`) |
-| `unpreserved_content` | removal would discard uncommitted, untracked or ignored files; the (bounded) path lists are in the message |
+| `unpreserved_content` | removal would discard uncommitted, untracked or ignored files that no published result preserves; the (bounded) path lists are in the message, which names committing, publishing (`/worktree publish`) or deleting them as the way forward, and, when a published result exists but the files changed since, names that result as stale |
 | `unpreserved_commits` | removal would discard commits beyond the baseline that no retained ref contains; publish or integrate them |
 | `workspace_archived` | the session's workspace is archived: the session is read-only and only inspection and cleanup commands are accepted |
 | `owner_transferred` | the session handed its workspace off and is read-only; the current owner is in `ownerSessionId` |
@@ -425,12 +437,55 @@ readable messages may be reworded; codes do not change.
    `/worktree remove [id] --archive` for both). Without an id the command
    targets the issuing session's own workspace. See
    [Archiving from any session](#archiving-from-any-session).
-   Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
-   remain protected. There is no `--force`; successful removal reports retained refs.
+    Ignored, externally owned, or unpreserved-result checkouts, and dirty or
+    untracked files that no published result preserves, remain protected.
+    There is no `--force`; successful removal reports retained refs.
 
 Removal safety does not depend on Git status configuration: untracked and
 ignored files are detected even when `status.showUntrackedFiles=no` is set,
-and any such content refuses removal with nothing deleted.
+and any such content that is not preserved refuses removal with nothing
+deleted.
+
+### Removing after publishing
+
+`/worktree publish` captures the full working state (tracked changes,
+deletions and non-ignored untracked files) into a retained result ref. A
+checkout with uncommitted work can then be removed without committing or
+deleting that work first, as long as its working state is **exactly** the tree
+of one of the workspace's retained published results. The comparison is by
+content (Git tree ids), re-checked under the removal's exclusive lease just
+before the removal is claimed, never by timestamps or by the fact that a
+publish happened. A result only counts while its ref still exists and points
+at the recorded commit; a deleted or moved result ref preserves nothing.
+Content that is staged and then changed or deleted on disk is in no published
+result, so such a checkout is refused until the staged content is committed or
+discarded. Plain editors and Git commands do not honor QueryMT's locks, so an
+edit made in the instant between that final check and the deletion can still
+be lost.
+The checkout is then deleted and the response names the result ref that
+preserves the discarded files in `preserved_by` (it is also listed in
+`retained_refs`); `/worktree result` still presents those edits.
+
+```mermaid
+flowchart TD
+    A[remove requested] --> B{ignored files present?}
+    B -- yes --> R[refuse: unpreserved_content]
+    B -- no --> C{working state tree equals a published result tree?}
+    C -- yes --> D[delete checkout, report preserved_by]
+    C -- no --> R
+```
+
+If files changed after the last publication, removal is refused with
+`unpreserved_content`; the message states that the working state differs from
+the last published result, names it, and suggests publishing again. An
+archived owner session can still run `/worktree publish` (it only pins a
+result ref and never changes the checkout), so after a refused
+`remove --archive` publish again from that conversation (or run
+`/worktree publish <workspace_id>` from any other local session) and retry the
+removal. Ignored
+files are never captured by a publication, so they always block removal. An
+interrupted removal of published work re-runs the same check on recovery and
+completes only if the working state still matches.
 
 ### Removal, external writers, and retained refs
 
@@ -445,8 +500,9 @@ writers and is race-safe by construction:
   **retained, never deleted**, and the removal response discloses the race in
   `branch_moved_during_removal` plus the branch in `retained_refs`.
 - Removal responses always report exactly what remains:
-  `checkout_removed`, `removed_branch`, `branch_moved_during_removal`, and
-  `retained_refs`. A response never claims complete deletion when anything
+  `checkout_removed`, `removed_branch`, `branch_moved_during_removal`,
+  `retained_refs`, and, when uncommitted work was discarded because a
+  published result preserves it, `preserved_by`. A response never claims complete deletion when anything
   was retained or refused; baseline refs of removed workspaces are always
   retained and listed.
 - Interrupted `removing` state recovers through the same safety checks, run
@@ -762,7 +818,11 @@ owner stays listable and loadable but never materializes an actor:
 **Archive announcement.** Archiving an owned workspace records a durable
 `worktree_archived` event on the owner's stream, sent as an `agent_message_chunk`
 with the stable `message_id` `worktree-archived-<workspace_id>` and
-`_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}`. Every attached
+`_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}`. For
+`remove --archive` the update is recorded **after** the removal attempt and
+states its outcome (`removal` is `removed`, or `refused` with the code and
+reason); its text then says the workspace was archived and removed, or archived
+but not removed, instead of asking the user to run `/worktree remove`. Every attached
 client receives it before the response of a native command issued from the owner
 (except over the legacy `AcpServer::run_stdio` forwarder, where the update may
 arrive after the response; clients must not rely on that ordering there), and it
@@ -782,8 +842,16 @@ usage errors included, returns a successful prompt response whose
 `_meta["querymt.worktree"].error = {code, message}` and shows the message as a
 session update before the response (except over the legacy
 `AcpServer::run_stdio` forwarder, where the update may arrive after the response;
-clients must not rely on that ordering there). ACP extension methods keep returning
-JSON-RPC errors with `data.{code, message}`.
+clients must not rely on that ordering there). Refusals of mutating commands
+are durable replies (see above) and survive a reload. ACP extension methods keep
+returning JSON-RPC errors with `data.{code, message}`.
+
+**Cancel on read-only sessions.** `session/cancel` for an archived owner or a
+previous owner succeeds without effect (these sessions have no actor).
+
+A client should render `_meta.querymt.worktreeCommand` replies (with error
+styling by `code`) and switch the session to read-only live when
+`worktreeArchived` or `worktreeHandoff` metadata arrives.
 
 ## Undo, snapshots, and workspace references
 
