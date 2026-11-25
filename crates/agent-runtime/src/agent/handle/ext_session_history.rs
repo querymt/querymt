@@ -340,19 +340,49 @@ impl LocalAgentHandle {
             )
             .await
             .map_err(|error| error.to_acp_error())?;
+        let state = self
+            .config
+            .event_sink
+            .remote_sync(session_id, &bookmark.node_id);
+        // The authorization is the first call through a reused attachment;
+        // a dead one is replaced once (within the same budget).
+        let authorize = async move {
+            match Self::authorize_remote_history(&state, &connected.session_ref).await {
+                Ok(()) => Ok(connected),
+                Err(error) if connected.reused_attachment_failed(&error) => {
+                    log::info!(
+                        "remote session {session_id} history: reused attachment_id={} failed \
+                         ({error}); replacing it",
+                        connected.attachment_id,
+                    );
+                    let recovered = self
+                        .replace_failed_remote_attachment(
+                            session_id,
+                            connected.attachment_id,
+                            connected.session_ref.remote_node_id(),
+                            false,
+                        )
+                        .await
+                        .map_err(|error| error.to_acp_error())?;
+                    Self::authorize_remote_history(&state, &recovered.session_ref).await?;
+                    Ok(recovered)
+                }
+                Err(error) => Err(Error::from(error)),
+            }
+        };
+        let (connected, deadline) = authorize_before_history_transfer(
+            session_id,
+            super::model_registry::remote_transfer_budget(),
+            authorize,
+        )
+        .await?;
         let sync = crate::agent::remote::event_backfill::RemoteSync::new(
             self.config.event_sink.clone(),
-            connected.session_ref.clone(),
+            connected.session_ref,
             session_id,
             &bookmark.node_id,
             &bookmark.peer_label,
         );
-        let deadline = authorize_before_history_transfer(
-            session_id,
-            super::model_registry::remote_transfer_budget(),
-            Self::authorize_remote_history(sync.state(), &connected.session_ref),
-        )
-        .await?;
         Ok((sync, deadline))
     }
 
@@ -436,17 +466,19 @@ impl LocalAgentHandle {
     }
 }
 
+/// Run `authorization` within the history transfer budget; returns its value
+/// and the deadline the transfer itself must keep.
 #[cfg(feature = "remote")]
-async fn authorize_before_history_transfer(
+async fn authorize_before_history_transfer<T>(
     session_id: &str,
     budget: std::time::Duration,
-    authorization: impl Future<Output = Result<(), crate::error::AgentError>>,
-) -> Result<tokio::time::Instant, Error> {
+    authorization: impl Future<Output = Result<T, Error>>,
+) -> Result<(T, tokio::time::Instant), Error> {
     let deadline = tokio::time::Instant::now() + budget;
-    tokio::time::timeout_at(deadline, authorization)
+    let value = tokio::time::timeout_at(deadline, authorization)
         .await
         .map_err(|_| transfer_failed(session_id, "history authorization timed out".into()))??;
-    Ok(deadline)
+    Ok((value, deadline))
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -456,12 +488,13 @@ async fn history_transfer_deadline_includes_authorization_time() {
     use tokio::time::{Instant, sleep, timeout_at};
 
     let start = Instant::now();
-    let deadline = authorize_before_history_transfer("session", Duration::from_secs(10), async {
-        sleep(Duration::from_secs(6)).await;
-        Ok(())
-    })
-    .await
-    .unwrap();
+    let ((), deadline) =
+        authorize_before_history_transfer("session", Duration::from_secs(10), async {
+            sleep(Duration::from_secs(6)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     assert!(
         timeout_at(deadline, sleep(Duration::from_secs(5)))
             .await

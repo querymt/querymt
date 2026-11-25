@@ -266,28 +266,12 @@ impl LocalAgentHandle {
             retry_decision = tracing::field::Empty,
         );
         async move {
-            let stale = {
-                let mut registry = self.registry.lock().await;
-                registry.invalidate_remote_attachment_if_current(session_id, attachment_id)
-            };
-            if let Some(stale) = stale {
-                crate::agent::session_registry::cleanup_installed_remote_attachment(stale, false)
-                    .await;
-            }
-
             let recovered = self
-                .connect_remote_session(
+                .replace_failed_remote_attachment(
                     session_id,
-                    remote_connect::RemoteConnectOptions {
-                        node_hint: resolved.session_ref.remote_node_id(),
-                        peer_label: None,
-                        preferred_scope: None,
-                        reason: remote_connect::RemoteConnectReason::OperationRecovery,
-                        replace: remote_connect::RemoteReplacePolicy::ReplaceIfMatches(attachment_id),
-                        handoff: None,
-                        windowed: false,
-                        fork_origin: None,
-                    },
+                    attachment_id,
+                    resolved.session_ref.remote_node_id(),
+                    false,
                 )
                 .await
                 .map_err(|error| {

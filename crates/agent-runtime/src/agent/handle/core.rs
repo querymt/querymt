@@ -965,23 +965,31 @@ impl LocalAgentHandle {
                     },
                 )
                 .await;
-            let (snapshot, profile, config_options) = match connected {
+            use super::model_registry::RemoteLoadError;
+            let loaded = match connected {
+                // Snapshot (which also observes runtime status), profile and
+                // config options are independent: run them together. Only the
+                // snapshot can fail the load. A dead reused attachment is
+                // replaced once inside.
                 Ok(connected) => {
-                    // Snapshot (which also observes runtime status), profile
-                    // and config options are independent: run them together.
-                    // Only the snapshot can fail the load.
-                    super::model_registry::join_remote_load_requests(
+                    self.load_connected_remote_session(
                         &session_id,
-                        self.load_remote_snapshot(&session_id, &connected, load_window),
-                        self.remote_session_profile(&bookmark.node_id, &session_id),
-                        self.remote_session_config_options(&session_id),
+                        connected,
+                        load_window,
+                        || self.remote_session_profile(&bookmark.node_id, &session_id),
+                        || self.remote_session_config_options(&session_id),
                     )
-                    .await?
+                    .await
                 }
+                Err(error) => Err(RemoteLoadError::Connect(error)),
+            };
+            let (snapshot, profile, config_options) = match loaded {
+                Ok(loaded) => loaded,
+                Err(RemoteLoadError::Failed(error)) => return Err(error),
                 // The owner cannot be reached: a window that is already local
                 // is served as a stale snapshot; otherwise the connect error
                 // stands.
-                Err(error) => {
+                Err(RemoteLoadError::Connect(error)) => {
                     let stale = if error.owner_unreachable() {
                         self.stale_remote_snapshot(&session_id, load_window).await?
                     } else {

@@ -255,14 +255,20 @@ pub async fn create_remote_session(
             )
             .await
             .map_err(|error| error.to_acp_error())?;
-        let (snapshot, profile, config_options) =
-            crate::agent::handle::model_registry::join_remote_load_requests(
+        use crate::agent::handle::model_registry::RemoteLoadError;
+        let (snapshot, profile, config_options) = agent
+            .load_connected_remote_session(
                 &response.session_id,
-                agent.load_remote_snapshot(&response.session_id, &connected, None),
-                agent.remote_session_profile(&request.node_id, &response.session_id),
-                async { Ok(attached_remote_config_options(agent, &response.session_id).await) },
+                connected,
+                None,
+                || agent.remote_session_profile(&request.node_id, &response.session_id),
+                || async { Ok(attached_remote_config_options(agent, &response.session_id).await) },
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                RemoteLoadError::Connect(error) => error.to_acp_error(),
+                RemoteLoadError::Failed(error) => error,
+            })?;
         Ok(RemoteSessionAttachInfo {
             session_id: response.session_id,
             node_id: request.node_id,
@@ -290,8 +296,9 @@ pub async fn attach_remote_session(
 ) -> Result<RemoteSessionAttachInfo, Error> {
     #[cfg(feature = "remote")]
     {
+        use crate::agent::handle::model_registry::RemoteLoadError;
         let window = request.load_window();
-        let connected = match agent
+        let loaded = match agent
             .connect_remote_for_ext(
                 &request.node_id,
                 &request.session_id,
@@ -300,8 +307,28 @@ pub async fn attach_remote_session(
             )
             .await
         {
-            Ok(connected) => connected,
-            Err(error) => {
+            // Snapshot, profile and config options are independent once the
+            // session is connected; only the snapshot can fail the attach. A
+            // dead reused attachment is replaced once inside.
+            Ok(connected) => {
+                agent
+                    .load_connected_remote_session(
+                        &request.session_id,
+                        connected,
+                        window,
+                        || agent.remote_session_profile(&request.node_id, &request.session_id),
+                        || async {
+                            Ok(attached_remote_config_options(agent, &request.session_id).await)
+                        },
+                    )
+                    .await
+            }
+            Err(error) => Err(RemoteLoadError::Connect(error)),
+        };
+        let (snapshot, profile, config_options) = match loaded {
+            Ok(loaded) => loaded,
+            Err(RemoteLoadError::Failed(error)) => return Err(error),
+            Err(RemoteLoadError::Connect(error)) => {
                 // The owner cannot be reached: a window that is already local
                 // is served as a stale snapshot, without an attachment.
                 let stale = if error.owner_unreachable() {
@@ -325,16 +352,6 @@ pub async fn attach_remote_session(
                 };
             }
         };
-        // Snapshot, profile and config options are independent once the
-        // session is connected; only the snapshot can fail the attach.
-        let (snapshot, profile, config_options) =
-            crate::agent::handle::model_registry::join_remote_load_requests(
-                &request.session_id,
-                agent.load_remote_snapshot(&request.session_id, &connected, window),
-                agent.remote_session_profile(&request.node_id, &request.session_id),
-                async { Ok(attached_remote_config_options(agent, &request.session_id).await) },
-            )
-            .await?;
         Ok(RemoteSessionAttachInfo {
             session_id: request.session_id,
             node_id: request.node_id,
