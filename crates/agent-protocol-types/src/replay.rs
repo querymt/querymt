@@ -101,6 +101,11 @@ pub const COMPACTION_TOKENS_BEFORE_KEY: &str = "tokensBefore";
 /// Key of [`COMPACTION_META_KEY`]: the context tokens after the compaction.
 pub const COMPACTION_TOKENS_AFTER_KEY: &str = "tokensAfter";
 
+/// `_meta.querymt` key on a skill problem `notice`: the complete current list,
+/// an array of `{path, source, kind, message}` (empty when they were
+/// resolved). Live-only; it is never part of a replay.
+pub const SKILL_PROBLEMS_META_KEY: &str = "skillProblems";
+
 /// Run `edit` on the `_meta.querymt` object of `meta`, creating it (or
 /// replacing a value that is not an object) when needed.
 fn with_querymt_namespace(

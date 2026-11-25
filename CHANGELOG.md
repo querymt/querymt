@@ -46,6 +46,20 @@
   fails configuration loading with an error naming the key. Other skill sources
   accept direct children only, as before.
 
+- **Skill problems are announced to the client.** A skill that is found and not
+  offered (a malformed definition, a broken or looping link, an unreadable entry,
+  a duplicate ID, an unreadable source folder) is recorded per workspace and, for
+  a client that advertises notice support, announced as an ACP `notice` with
+  severity `warning`, a title with the count, a description listing at most 10
+  `<path>: <message>` lines, and the complete list in
+  `_meta.querymt.skillProblems` (items with the string fields `path`, `source`,
+  `kind` and `message`). It is sent before the first model request of a session
+  and again only when the set changes; a set that became empty is announced once
+  with severity `info` and an empty array. It is live only and never replayed.
+  New live-only event `AgentEventKind::SkillProblemsChanged`
+  (`skill_problems_changed`) with the typeshare type `SkillProblemInfo` (follow-up
+  for querymt-desktop), and `replay::SKILL_PROBLEMS_META_KEY`.
+
 - **Providers declare prompt-cache support; new `[agent.execution.prompt_cache]
   ttl_secs`.** `ChatCapabilities` has a new `prompt_cache` field
   (`explicit_breakpoints`, `max_ttl_secs`), `Copy` and defaulted, so a plugin that
@@ -727,6 +741,24 @@
 - **BREAKING: a project `.agents/skills` folder is scanned to `nested_depth`
   levels (default `4`)** instead of without limit. Skills nested deeper are no
   longer found; raise `nested_depth` (up to `16`) to find them.
+- **BREAKING (`querymt_agent::dotagents`): the resolved manifest's skill list is
+  an inventory.** `DotagentsManifest.skills` is now
+  `BTreeMap<String, SkillInventoryEntry>` and holds exactly the local skills the
+  skill tool offers for the resolved workspace, from every skill folder and not
+  only `.agents/skills`, each with its source kind, source folder, skill
+  directory and, for a linked skill, the link target. It is empty for an agent
+  with skills disabled or a tool list that does not name `skill`
+  (`DotagentsLoadOptions::with_skill_scan` and `DotagentsSkillScan` set the scan;
+  without it the defaults of the skills configuration apply). Skill bodies and
+  `enabled` flags are no longer in the manifest, and a skill under a layer root
+  override (`with_global_root`, `with_workspace_root`) is listed only when a
+  skill folder contains it. `DotagentsSkill`, `parse_skill_document` and
+  `DotagentsLayerContent::skills` are removed. A skill folder reached through a
+  link outside the layer is accepted.
+- **BREAKING: skill problems are manifest warnings.** A malformed skill
+  definition, a broken or looping link, an unreadable skill entry or a duplicate
+  skill ID is a warning diagnostic naming the path, no longer an error, so it
+  does not fail a `Strict` resolution (a malformed `skill.md` used to).
 - **BREAKING: the middleware trait is replaced by `Middleware` and
   `TurnMiddleware`** (`querymt_agent::middleware`). A middleware is now an
   agent-scoped `Middleware` (configuration and shared services) that creates one

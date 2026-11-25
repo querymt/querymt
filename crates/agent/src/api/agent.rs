@@ -543,7 +543,11 @@ impl AgentBuilder {
         let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
         crate::dotagents::resolve_for_builder(
             self.dotagents_manifest.clone(),
-            self.dotagents_options.clone(),
+            with_skill_scan(
+                self.dotagents_options.clone(),
+                self.skills_config.as_ref(),
+                &self.tools,
+            ),
             cwd.as_deref(),
         )
         .map_err(|error| anyhow::Error::new(*error))
@@ -654,7 +658,11 @@ impl AgentBuilder {
         let mut llm_config = self
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
-        let dotagents_options = self.dotagents_options.take();
+        let dotagents_options = with_skill_scan(
+            self.dotagents_options.take(),
+            self.skills_config.as_ref(),
+            &self.tools,
+        );
         let dotagents_strictness = dotagents_options
             .as_ref()
             .map(|options| options.strictness())
@@ -2035,6 +2043,23 @@ impl ChatRunner for Agent {
     fn server(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.storage.clone())
     }
+}
+
+/// Scan the manifest's skill list with the settings the agent's skill tool
+/// uses; an agent that gets no skill tool lists no skills.
+fn with_skill_scan(
+    options: Option<crate::dotagents::DotagentsLoadOptions>,
+    skills: Option<&SkillsConfig>,
+    tools: &[ToolSpec],
+) -> Option<crate::dotagents::DotagentsLoadOptions> {
+    options.map(|options| {
+        options.with_skill_scan(
+            match crate::skills::SkillCatalog::skills_for_agent(skills, tools) {
+                Some(skills) => crate::dotagents::DotagentsSkillScan::from_config(skills),
+                None => crate::dotagents::DotagentsSkillScan::Disabled,
+            },
+        )
+    })
 }
 
 /// A `skill` tool needs skills to be configured and enabled for its agent.

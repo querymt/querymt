@@ -29,6 +29,41 @@ impl DotagentsStrictness {
     }
 }
 
+/// Which skills the resolved manifest lists.
+///
+/// The manifest's skill list is an inventory of what the skill tool offers, so
+/// it is scanned with the same settings the agent's skill tool uses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DotagentsSkillScan {
+    /// No agent configuration: scan the default sources with the defaults of
+    /// the skills configuration.
+    #[default]
+    Defaults,
+    /// The agent gets no skill tool (skills disabled, or a tool list that does
+    /// not name `skill`): the list is empty.
+    Disabled,
+    /// Scan with an agent's skills configuration.
+    Configured {
+        /// Whether global and project sources are scanned besides `paths`.
+        include_external: bool,
+        /// Additional configured skill folders.
+        paths: Vec<PathBuf>,
+        /// Directory levels scanned below a project `.agents/skills` folder.
+        nested_depth: u8,
+    },
+}
+
+impl DotagentsSkillScan {
+    /// The scan an agent's skills configuration selects.
+    pub fn from_config(skills: &crate::config::SkillsConfig) -> Self {
+        Self::Configured {
+            include_external: skills.include_external,
+            paths: skills.paths.clone(),
+            nested_depth: skills.nested_depth,
+        }
+    }
+}
+
 /// Options controlling `.agents` Protocol discovery and parsing.
 ///
 /// The default options are disabled, so callers must explicitly opt in before
@@ -70,6 +105,9 @@ pub struct DotagentsLoadOptions {
 
     /// Trust policy for repository-controlled workspace repeat tasks.
     workspace_task_trust: DotagentsTaskTrustPolicy,
+
+    /// Settings of the skill scan behind the manifest's skill list.
+    skill_scan: DotagentsSkillScan,
 }
 
 impl Default for DotagentsLoadOptions {
@@ -92,6 +130,7 @@ impl DotagentsLoadOptions {
             trusted_roots: Vec::new(),
             strictness: DotagentsStrictness::default(),
             workspace_task_trust: DotagentsTaskTrustPolicy::Prompt,
+            skill_scan: DotagentsSkillScan::Defaults,
         }
     }
 
@@ -155,6 +194,17 @@ impl DotagentsLoadOptions {
     pub fn with_workspace_task_trust(mut self, policy: DotagentsTaskTrustPolicy) -> Self {
         self.workspace_task_trust = policy;
         self
+    }
+
+    /// Set the skill scan behind the manifest's skill list.
+    pub fn with_skill_scan(mut self, scan: DotagentsSkillScan) -> Self {
+        self.skill_scan = scan;
+        self
+    }
+
+    /// The skill scan behind the manifest's skill list.
+    pub fn skill_scan(&self) -> &DotagentsSkillScan {
+        &self.skill_scan
     }
 
     /// Add an explicitly trusted root for confined resolution.

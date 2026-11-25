@@ -6,10 +6,12 @@
 //! imported, and no protocol directory is created.
 
 use querymt_agent::api::AgentBuilder;
+use querymt_agent::config::SkillsConfig;
 use querymt_agent::dotagents::{
     DotagentsAgentConnectionType, DotagentsAgentRole, DotagentsLoadError, DotagentsLoadOptions,
     DotagentsMcpTransport, DotagentsStrictness, DotagentsTaskKind,
 };
+use querymt_agent::skills::SkillSourceKind;
 use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::TempDir;
@@ -170,6 +172,7 @@ fn preview_observes_all_effective_sections_with_zero_side_effects() {
 
     let builder = AgentBuilder::new()
         .cwd(workspace.path())
+        .skills(SkillsConfig::default())
         .dotagents_options(workspace_options(workspace.path(), global.path()));
 
     let manifest = builder
@@ -208,11 +211,18 @@ fn preview_observes_all_effective_sections_with_zero_side_effects() {
     assert_eq!(fast.provider, "anthropic");
     assert_eq!(fast.model, "claude-sonnet-4-20250514");
 
-    // Skills.
-    assert_eq!(manifest.skills.len(), 1);
+    // Skills: an inventory of what the skill tool offers. Skill folders
+    // outside the workspace (for example `~/.agents/skills`) may add entries,
+    // so only the workspace skill is asserted.
     let skill = &manifest.skills["review"];
-    assert!(skill.enabled);
     assert_eq!(skill.name, "Code Review");
+    assert_eq!(skill.source_kind, SkillSourceKind::Project);
+    assert_eq!(skill.source_folder, workspace.path().join(".agents/skills"));
+    assert_eq!(
+        skill.directory,
+        workspace.path().join(".agents/skills/review")
+    );
+    assert_eq!(skill.link_target, None);
 
     // Sub-agent profiles.
     assert_eq!(manifest.agents.len(), 1);
@@ -239,11 +249,31 @@ fn preview_observes_all_effective_sections_with_zero_side_effects() {
 
     // Provenance and diagnostics.
     assert_eq!(manifest.layers.len(), 2);
-    assert!(manifest.diagnostics.is_empty());
+    // Global skill folders (`~/.agents/skills`, ...) are scanned from the real
+    // home directory, so problems there are not this fixture's concern. Only
+    // diagnostics pointing into the fixture's own directories must be absent.
+    let fixture_roots = [
+        workspace.path().display().to_string(),
+        global.path().display().to_string(),
+    ];
+    let fixture_diagnostics: Vec<_> = manifest
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            fixture_roots
+                .iter()
+                .any(|root| diagnostic.message.contains(root.as_str()))
+        })
+        .collect();
+    assert!(
+        fixture_diagnostics.is_empty(),
+        "unexpected fixture diagnostics: {fixture_diagnostics:?}"
+    );
 
     // Preview is deterministic: resolving again yields the same manifest.
     let builder = AgentBuilder::new()
         .cwd(workspace.path())
+        .skills(SkillsConfig::default())
         .dotagents_options(workspace_options(workspace.path(), global.path()));
     let again = builder.preview_dotagents_manifest().unwrap().unwrap();
     assert_eq!(manifest, again);
@@ -354,4 +384,44 @@ fn quorum_builder_preview_resolves_manifest() {
     assert_eq!(manifest.tasks.len(), 1);
 
     assert_eq!(before, snapshot(workspace.path()));
+}
+
+#[test]
+fn agent_with_skills_disabled_resolves_an_empty_skill_list() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_fixture(workspace.path());
+
+    let manifest = AgentBuilder::new()
+        .cwd(workspace.path())
+        .skills(SkillsConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .dotagents_options(workspace_options(workspace.path(), global.path()))
+        .preview_dotagents_manifest()
+        .unwrap()
+        .expect("protocol layers are present and enabled");
+
+    assert!(manifest.skills.is_empty());
+    // The other sections are unaffected.
+    assert!(manifest.agents_md.is_some());
+}
+
+#[test]
+fn agent_without_the_skill_tool_resolves_an_empty_skill_list() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_fixture(workspace.path());
+
+    let manifest = AgentBuilder::new()
+        .cwd(workspace.path())
+        .skills(SkillsConfig::default())
+        .tools(["shell"])
+        .dotagents_options(workspace_options(workspace.path(), global.path()))
+        .preview_dotagents_manifest()
+        .unwrap()
+        .expect("protocol layers are present and enabled");
+
+    assert!(manifest.skills.is_empty());
 }

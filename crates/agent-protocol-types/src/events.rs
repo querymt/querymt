@@ -206,6 +206,24 @@ pub struct McpServerInfo {
     pub headers: Option<HashMap<String, String>>,
 }
 
+/// A skill that was found and is not offered to the model, with the reason.
+/// Carried by `AgentEventKind::SkillProblemsChanged`.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillProblemInfo {
+    /// Affected path (definition file, entry directory or link).
+    pub path: String,
+    /// The skill source folder the path belongs to.
+    pub source: String,
+    /// Machine-readable kind: `source_unreadable`, `entry_unreadable`,
+    /// `broken_link`, `link_loop`, `duplicate_definition`, `invalid_definition`
+    /// or `duplicate_id`.
+    pub kind: String,
+    /// Human-readable explanation.
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EventOrigin {
     #[default]
@@ -601,6 +619,13 @@ pub enum AgentEventKind {
     TodoPlanRestored {
         #[typeshare(serialized_as = "any")]
         entries: Vec<crate::protocol::PlanEntry>,
+    },
+    /// The skill problems of the session's workspace changed since this
+    /// session last heard of them (`problems` is the complete current list;
+    /// empty means they were resolved). Live-only: the skill catalog is
+    /// authoritative, so this only tells live observers (the ACP notice).
+    SkillProblemsChanged {
+        problems: Vec<SkillProblemInfo>,
     },
     HookNotice {
         event_name: String,
@@ -1103,6 +1128,7 @@ impl AgentEventKind {
             Self::ToolCallProgress { .. } => "tool_call_progress",
             Self::McpServerAuthRequired { .. } => "mcp_server_auth_required",
             Self::TodoPlanRestored { .. } => "todo_plan_restored",
+            Self::SkillProblemsChanged { .. } => "skill_problems_changed",
             Self::HookNotice { .. } => "hook_notice",
             Self::SnapshotStart { .. } => "snapshot_start",
             Self::SnapshotEnd { .. } => "snapshot_end",
@@ -1392,6 +1418,11 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // pruned journal are authoritative, and a durable kind older journal
         // loaders do not know would make rewound sessions unreadable there.
         AgentEventKind::TodoPlanRestored { .. } => Durability::Ephemeral,
+        // Rationale: live hint that the workspace's skill problems changed.
+        // The skill catalog is authoritative (it re-scans on every request),
+        // and a durable kind older journal loaders do not know would make
+        // stored sessions unreadable there.
+        AgentEventKind::SkillProblemsChanged { .. } => Durability::Ephemeral,
 
         // ── Durable: accounting ledger ──────────────────────────────
         // Rationale: the start must survive a crash to expose unresolved
@@ -1868,6 +1899,17 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "type": "skill_problems_changed",
+                "data": {
+                    "problems": [{
+                        "path": "/ws/.agents/skills/bad/SKILL.md",
+                        "source": "/ws/.agents/skills",
+                        "kind": "invalid_definition",
+                        "message": "missing description"
+                    }]
+                }
+            }),
+            serde_json::json!({
                 "type": "worktree_command_output",
                 "data": {
                     "text": "x"
@@ -2182,7 +2224,7 @@ mod tests {
         let samples = one_value_per_variant();
         // Update when a variant is added: `tag()`'s exhaustive match forces
         // the new tag, and this count forces a sample for it.
-        assert_eq!(samples.len(), 104, "one sample per AgentEventKind variant");
+        assert_eq!(samples.len(), 105, "one sample per AgentEventKind variant");
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
@@ -2229,6 +2271,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&kind).unwrap(),
             serde_json::json!({"type": "todo_plan_restored", "data": {"entries": []}})
+        );
+    }
+
+    #[test]
+    fn classify_skill_problems_changed_is_ephemeral() {
+        let kind = AgentEventKind::SkillProblemsChanged {
+            problems: Vec::new(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!({"type": "skill_problems_changed", "data": {"problems": []}})
         );
     }
 
