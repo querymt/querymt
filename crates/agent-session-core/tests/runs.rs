@@ -378,6 +378,95 @@ fn state_updates_take_the_decision_from_prompt_outcomes_and_runtime() {
     assert_eq!(core.header().active_run_id.as_deref(), Some("r1"));
 }
 
+fn completed_without_message(client_prompt_id: &str) -> SessionInput {
+    SessionInput::PromptCompleted {
+        client_prompt_id: Some(client_prompt_id.into()),
+        message_id: None,
+        stop_reason: StopReason::EndTurn,
+        at_ms: 9,
+    }
+}
+
+fn prompt_status(core: &SessionCore, turn: &str) -> PromptStatus {
+    match &core.turn(turn).expect("turn").entries[0].kind {
+        EntryKind::UserMessage(user) => user.status,
+        other => panic!("expected a user message, got {other:?}"),
+    }
+}
+
+/// A native command (`/worktree ...`) answers without a run: no echo, no
+/// state update, no message id. The response alone settles the prompt.
+#[test]
+fn prompt_answered_without_a_run_settles_after_earlier_runs() {
+    let mut core = SessionCore::new("s1");
+    // An earlier turn made the agent's state updates authoritative.
+    core.apply(&[state("running", "r1"), idle("r1", "end_turn")]);
+    core.apply(&[optimistic("c1")]);
+    assert_eq!(core.header().run_state, RunState::Submitting);
+
+    core.apply(&[
+        live(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "{\"session_id\":\"child\"}" }
+        })),
+        completed_without_message("c1"),
+    ]);
+
+    assert_eq!(core.header().run_state, RunState::Idle);
+    assert_eq!(prompt_status(&core, "pending-c1"), PromptStatus::Sent);
+}
+
+#[test]
+fn prompt_answered_without_a_run_settles_in_a_fresh_session() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[optimistic("c1"), completed_without_message("c1")]);
+    assert_eq!(core.header().run_state, RunState::Idle);
+    assert_eq!(prompt_status(&core, "pending-c1"), PromptStatus::Sent);
+}
+
+/// The response of an echoed prompt does not end the submission of a newer
+/// prompt the agent has not started yet.
+#[test]
+fn echoed_prompt_response_leaves_a_newer_submission_open() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[
+        optimistic("c1"),
+        state("running", "r1"),
+        live(json!({
+            "sessionUpdate": "user_message_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "hi" },
+            "_meta": { "querymt": { "client_prompt_id": "c1", "runId": "r1" } }
+        })),
+        idle("r1", "end_turn"),
+        optimistic("c2"),
+        completed_without_message("c1"),
+    ]);
+    assert_eq!(
+        core.header().run_state,
+        RunState::Submitting,
+        "turns: {:?}",
+        core.turn_ids()
+    );
+    assert_eq!(prompt_status(&core, "pending-c2"), PromptStatus::Pending);
+}
+
+/// A prompt settled without a run is not in the agent's history: a reload
+/// drops it, while unsent prompts stay.
+#[test]
+fn reload_drops_prompts_settled_without_a_run() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[
+        optimistic("native"),
+        completed_without_message("native"),
+        optimistic("pending"),
+    ]);
+    let events = vec![prompt(1, "u1", "q"), reply(2, "a1", "r")];
+    core.apply(&[SessionInput::SnapshotLoaded {
+        response: snapshot_response(&events, json!({})),
+    }]);
+    assert_eq!(core.turn_ids(), ["turn-u1", "pending-pending"]);
+}
+
 #[test]
 fn busy_runtime_observation_is_an_active_run() {
     for phase in [

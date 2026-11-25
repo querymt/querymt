@@ -245,6 +245,9 @@ pub trait ProfileRuntimeHost: Send + Sync {
     ) -> Result<Option<SessionProfileBinding>>;
     async fn materialized_runtimes(&self) -> Vec<Arc<ProfileRuntimeView>>;
     async fn mcp_servers(&self) -> Vec<(String, crate::config::McpServerConfig)>;
+    /// Ids and settings of the listed profiles that enable managed
+    /// worktrees, read from the catalog without building runtimes.
+    async fn workspace_profiles(&self) -> Vec<(String, crate::config::WorkspaceSettings)>;
     #[cfg(feature = "remote")]
     fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle);
     #[cfg(feature = "remote")]

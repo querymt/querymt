@@ -263,6 +263,11 @@ impl SessionCore {
             let crate::entry::EntryKind::UserMessage(user) = &entry.kind else {
                 continue;
             };
+            // A prompt settled without a turn (a native command) is not in
+            // the agent's history; like its ephemeral reply, it is gone.
+            if user.status == crate::entry::PromptStatus::Sent {
+                continue;
+            }
             let Some(prompt_id) = user.client_prompt_id.clone() else {
                 continue;
             };

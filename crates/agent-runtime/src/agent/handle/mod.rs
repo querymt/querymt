@@ -38,6 +38,7 @@ pub(crate) mod session_lifecycle;
 pub(crate) mod session_operation;
 pub(crate) mod utils;
 
+pub(crate) use self::session_control::SessionHost;
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,

@@ -254,37 +254,42 @@ pub(super) fn native_worktree_command(
     })
 }
 
-/// Session creation for [`WorktreeOps::create`] goes through the normal ACP
-/// materialization path, so isolation behaves exactly like `session/new`.
+/// Creates worktree sessions for [`WorktreeOps::create`] through the same
+/// path as `session/new`, in the runtime that hosts the source session (or,
+/// without a source, the runtime `session/new` would pick). The new session
+/// is bound to that runtime's profile before it can run.
+struct WorktreeSpawner<'a> {
+    connection: &'a LocalAgentHandle,
+    host: SessionHost<'a>,
+}
+
 #[async_trait::async_trait]
-impl IsolatedSessionSpawner for LocalAgentHandle {
+impl IsolatedSessionSpawner for WorktreeSpawner<'_> {
     async fn spawn(
         &self,
         cwd: PathBuf,
         session_workspace: serde_json::Value,
         name: Option<String>,
     ) -> Result<String, WorktreeOpError> {
-        let mut querymt_meta = serde_json::Map::new();
-        querymt_meta.insert(
-            crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
-            session_workspace,
-        );
-        let mut meta = serde_json::Map::new();
-        meta.insert("querymt".to_string(), querymt_meta.into());
-
+        let meta = serde_json::Map::from_iter([(
+            crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+            serde_json::json!({ crate::worktree::SESSION_WORKSPACE_META_KEY: session_workspace }),
+        )]);
         let response = self
-            .new_session(crate::acp::protocol::NewSessionRequest::new(cwd).meta(meta))
+            .connection
+            .materialize_new_session(&self.host, NewSessionRequest::new(cwd).meta(meta))
             .await
             // Preserve the stable isolation `code` attached by the session layer.
             .map_err(|err| WorktreeOpError::from_acp(&err))?;
         let session_id = response.session_id.to_string();
         if let Some(name) = name {
-            self.config
+            self.host
+                .handle()
+                .config
                 .storage
                 .session_store()
                 .set_session_name(&session_id, Some(name))
-                .await
-                .map_err(WorktreeOpError::from)?;
+                .await?;
         }
         Ok(session_id)
     }
@@ -294,6 +299,7 @@ impl IsolatedSessionSpawner for LocalAgentHandle {
         session_id: &str,
     ) -> Result<Option<PathBuf>, WorktreeOpError> {
         let Some(session) = self
+            .connection
             .config
             .storage
             .session_store()
@@ -303,11 +309,17 @@ impl IsolatedSessionSpawner for LocalAgentHandle {
             return Ok(None);
         };
         // Remote-hosted sessions have no local filesystem to isolate from.
-        match self.session_ref_for_agent_session(session_id).await {
-            Ok(actor) if actor.is_remote() => return Ok(None),
-            _ => {}
+        if let Ok(actor) = self
+            .connection
+            .session_ref_for_agent_session(session_id)
+            .await
+            && actor.is_remote()
+        {
+            return Ok(None);
         }
         let service = self
+            .host
+            .handle()
             .config
             .workspace_service()
             .ok_or(WorktreeOpError::ServiceUnavailable)?;
@@ -406,15 +418,17 @@ impl OwnerHost for LocalAgentHandle {
 #[async_trait::async_trait]
 impl HandoffHost for LocalAgentHandle {
     async fn summarize(&self, previous: &str) -> Result<Option<String>, WorktreeOpError> {
-        let hosted = self.hosting_handle(previous).await?;
-        self.runtime_of(&hosted)
+        self.op_host(previous)
+            .await?
+            .handle()
             .summarize_in_runtime(previous)
             .await
     }
 
     async fn seed_summary(&self, successor: &str, summary: &str) -> Result<(), WorktreeOpError> {
-        let hosted = self.hosting_handle(successor).await?;
-        self.runtime_of(&hosted)
+        self.op_host(successor)
+            .await?
+            .handle()
             .seed_summary_in_runtime(successor, summary)
             .await
     }
@@ -429,18 +443,18 @@ impl HandoffHost for LocalAgentHandle {
         record: &crate::worktree::WorkspaceRecord,
         name: Option<String>,
     ) -> Result<String, WorktreeOpError> {
-        let hosted = self.hosting_handle(previous).await?;
-        let successor = self
-            .runtime_of(&hosted)
+        let host = self.op_host(previous).await?;
+        let runtime = host.handle();
+        let successor = runtime
             .create_pending_successor_in_runtime(previous, record, name)
             .await?;
-        if let Some(profiles) = self.profiles()
-            && let Some(binding) = profiles.session_binding(previous).await
-            && let Err(err) = profiles.set_session_binding(&successor, binding).await
+        if let Some(binding) = host.binding()
+            && let Some(profiles) = self.profiles()
+            && let Err(err) = profiles
+                .set_session_binding(&successor, binding.clone())
+                .await
         {
-            self.runtime_of(&hosted)
-                .discard_successor_in_runtime(&successor)
-                .await;
+            runtime.discard_successor_in_runtime(&successor).await;
             return Err(WorktreeOpError::SessionStart(format!(
                 "failed to bind handoff successor to the owner's profile: {err}"
             )));
@@ -449,8 +463,9 @@ impl HandoffHost for LocalAgentHandle {
     }
 
     async fn publish_successor(&self, successor: &str) -> Result<(), WorktreeOpError> {
-        let hosted = self.hosting_handle(successor).await?;
-        self.runtime_of(&hosted)
+        self.op_host(successor)
+            .await?
+            .handle()
             .publish_successor_in_runtime(successor)
             .await
     }
@@ -485,30 +500,19 @@ impl HandoffHost for LocalAgentHandle {
     }
 
     async fn discard_successor(&self, successor: &str) {
-        let hosted = self.hosting_handle(successor).await.ok().flatten();
-        self.runtime_of(&hosted)
-            .discard_successor_in_runtime(successor)
-            .await;
+        match self.session_host(successor).await {
+            Ok(host) => host.handle().discard_successor_in_runtime(successor).await,
+            Err(_) => self.discard_successor_in_runtime(successor).await,
+        }
     }
 }
 
 impl LocalAgentHandle {
-    /// The profile runtime handle `session_id` is bound to (`None` when this
-    /// handle hosts it).
-    async fn hosting_handle(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<Arc<LocalAgentHandle>>, WorktreeOpError> {
-        self.bound_session_handle(session_id)
+    /// [`Self::session_host`] with the error as a typed operation error.
+    async fn op_host(&self, session_id: &str) -> Result<SessionHost<'_>, WorktreeOpError> {
+        self.session_host(session_id)
             .await
-            .map(|bound| bound.map(|(handle, _)| handle))
             .map_err(|err| WorktreeOpError::from_acp(&err))
-    }
-
-    /// The local handle to run session-layer steps on: the hosting runtime
-    /// when the session is profile-bound, otherwise `self`.
-    fn runtime_of<'a>(&'a self, hosted: &'a Option<Arc<LocalAgentHandle>>) -> &'a LocalAgentHandle {
-        hosted.as_deref().unwrap_or(self)
     }
 
     async fn summarize_in_runtime(
@@ -680,14 +684,8 @@ impl LocalAgentHandle {
     /// its own event sink, so session events must go through this one.
     /// `None` (logged) when the runtime cannot be resolved.
     pub(crate) async fn hosting_config(&self, session_id: &str) -> Option<Arc<AgentConfig>> {
-        match self.bound_session_handle(session_id).await {
-            Ok(Some((handle, _))) => Some(
-                handle
-                    .as_any()
-                    .downcast_ref::<LocalAgentHandle>()
-                    .map_or_else(|| self.config.clone(), |local| local.config.clone()),
-            ),
-            Ok(None) => Some(self.config.clone()),
+        match self.session_host(session_id).await {
+            Ok(host) => Some(host.handle().config.clone()),
             Err(err) => {
                 tracing::warn!(session_id, error = %err, "worktree: runtime lookup failed");
                 None
@@ -717,7 +715,9 @@ impl LocalAgentHandle {
             return Ok(None);
         };
         let previous = intent.source_session_id;
-        let ops = self.worktree_ops()?;
+        let ops = self
+            .worktree_ops(Some(&WorkspaceTarget::Workspace(workspace_id.clone())))
+            .await?;
         let record = ops.lookup(&workspace_id).await?;
         let owner = record.ownership.owner_session_id.as_deref();
         if owner == Some(successor) {
@@ -798,15 +798,152 @@ impl LocalAgentHandle {
     /// session actor (a handoff summary), on the runtime that hosts it.
     /// Returns whether there was one.
     pub(super) async fn cancel_admin_operation(&self, session_id: &str) -> bool {
-        let hosted = self.hosting_handle(session_id).await.ok().flatten();
-        self.runtime_of(&hosted).admin_cancels.cancel(session_id)
+        match self.session_host(session_id).await {
+            Ok(host) => host.handle().admin_cancels.cancel(session_id),
+            Err(_) => self.admin_cancels.cancel(session_id),
+        }
     }
 
-    fn worktree_ops(&self) -> Result<WorktreeOps, WorktreeOpError> {
-        self.config
-            .workspace_service()
+    /// Operations over the workspace service that administers `target`.
+    ///
+    /// Each runtime's service shares the host's workspace registry but owns
+    /// its storage root, where checkout locks live, so the choice matters:
+    ///
+    /// - a session: the service of the runtime hosting it, which is the one
+    ///   its `/worktree` catalog entry was advertised from;
+    /// - a workspace: its owner's, else the service whose storage root holds
+    ///   the checkout;
+    /// - nothing (listing): the first service, in [`Self::workspace_services`]
+    ///   order.
+    ///
+    /// # Errors
+    ///
+    /// [`WorktreeOpError::ServiceUnavailable`] when no service applies.
+    async fn worktree_ops(
+        &self,
+        target: Option<&WorkspaceTarget>,
+    ) -> Result<WorktreeOps, WorktreeOpError> {
+        let service = match target {
+            Some(WorkspaceTarget::Session(session_id)) => self
+                .op_host(session_id)
+                .await?
+                .handle()
+                .config
+                .workspace_service(),
+            Some(WorkspaceTarget::Workspace(workspace_id)) => {
+                self.workspace_service_for(workspace_id).await?
+            }
+            None => self.workspace_services().await.into_iter().next(),
+        };
+        service
             .map(WorktreeOps::new)
             .ok_or(WorktreeOpError::ServiceUnavailable)
+    }
+
+    /// Workspace services in a stable order: this handle's, then those of
+    /// the loaded profile runtimes by profile id.
+    async fn workspace_services(&self) -> Vec<Arc<crate::worktree::WorkspaceService>> {
+        let mut runtimes = match self.profiles() {
+            Some(profiles) => profiles.materialized_runtimes().await,
+            None => Vec::new(),
+        };
+        runtimes.sort_unstable_by(|a, b| a.profile_id().cmp(b.profile_id()));
+        self.config
+            .workspace_service()
+            .into_iter()
+            .chain(
+                runtimes
+                    .iter()
+                    .filter_map(|runtime| runtime.handle.config.workspace_service()),
+            )
+            .collect()
+    }
+
+    /// The service administering workspace `workspace_id` (see
+    /// [`Self::worktree_ops`]).
+    async fn workspace_service_for(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<Arc<crate::worktree::WorkspaceService>>, WorktreeOpError> {
+        let record = match self.config.storage.workspace_repository() {
+            Some(registry) => {
+                registry
+                    .get_workspace(&crate::worktree::WorkspaceId::from_raw(workspace_id))
+                    .await?
+            }
+            None => None,
+        };
+        if let Some(owner) = record
+            .as_ref()
+            .and_then(|record| record.ownership.owner_session_id.as_deref())
+            && let Ok(host) = self.session_host(owner).await
+            && let Some(service) = host.handle().config.workspace_service()
+        {
+            return Ok(Some(service));
+        }
+        let services = self.workspace_services().await;
+        let holding_checkout = record.as_ref().and_then(|record| {
+            services
+                .iter()
+                .find(|service| record.checkout_path.starts_with(service.storage_root()))
+        });
+        Ok(holding_checkout.or(services.first()).cloned())
+    }
+
+    /// The runtime a new worktree session is created in: the one hosting
+    /// its source session, or the one `session/new` would pick.
+    async fn worktree_creation_host(
+        &self,
+        source_session_id: Option<&str>,
+    ) -> Result<SessionHost<'_>, WorktreeOpError> {
+        let Some(source) = source_session_id else {
+            return match self.profiles() {
+                Some(profiles) => {
+                    let runtime = profiles
+                        .active_runtime()
+                        .await
+                        .map_err(|err| WorktreeOpError::SessionStart(format!("{err:#}")))?;
+                    Ok(SessionHost::Profile {
+                        handle: runtime.handle(),
+                        binding: runtime.session_binding(),
+                    })
+                }
+                None => Ok(SessionHost::Connection(self)),
+            };
+        };
+        // Like load/resume: a session from before profiles gets a binding,
+        // so its child lands where the source will run.
+        self.adopt_unbound_session_binding(source)
+            .await
+            .map_err(|err| WorktreeOpError::from_acp(&err))?;
+        self.op_host(source).await
+    }
+
+    /// Create a session with its own managed worktree, in the runtime that
+    /// hosts its source session (its workspace service, execution config and
+    /// profile binding), or where `session/new` would create it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with a stable [`WorktreeOpError::code`] when the hosting runtime
+    /// has no workspace service, the options are invalid, or isolation fails.
+    pub async fn create_worktree_session(
+        &self,
+        request: WorktreeCreateRequest,
+    ) -> Result<crate::worktree::WorktreeCreateResponse, WorktreeOpError> {
+        let host = self
+            .worktree_creation_host(request.source_session_id.as_deref())
+            .await?;
+        let service = host
+            .handle()
+            .config
+            .workspace_service()
+            .ok_or(WorktreeOpError::ServiceUnavailable)?;
+        let spawner = WorktreeSpawner {
+            connection: self,
+            host,
+        };
+        WorktreeOps::new(service).create(&spawner, request).await
     }
 
     pub(super) async fn handle_native_worktree_prompt(
@@ -819,13 +956,17 @@ impl LocalAgentHandle {
         let session_id = req.session_id.to_string();
         // Require an accessible, locally hosted session before any
         // administration. A read-only session has no actor, so locality comes
-        // from the session store rather than the actor registry.
+        // from the session store rather than the actor registry. A session
+        // that is not hosted here has no local stream to answer on, so this
+        // refusal is an error response, with a stable code like every other.
         if !OwnerHost::is_local(self, &session_id)
             .await
             .map_err(op_error_to_acp)?
         {
-            return Err(Error::invalid_request()
-                .data("worktree administration requires local filesystem execution"));
+            return Err(op_error_to_acp(WorktreeOpError::rejected(
+                "not_local",
+                "worktree administration requires local filesystem execution",
+            )));
         }
         // A previous owner has no workspace left to administer.
         let read_only = self
@@ -906,90 +1047,75 @@ impl LocalAgentHandle {
         fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, WorktreeOpError> {
             serde_json::to_value(value).map_err(|e| WorktreeOpError::Internal(e.to_string()))
         }
-        let ops = self.worktree_ops()?;
-        // A command without an explicit id targets the session's own workspace.
-        let own_or = |id: Option<String>| {
-            let ops = ops.clone();
-            async move {
-                match id {
-                    Some(id) => Ok(id),
-                    None => ops
-                        .workspace_of_session(session_id)
-                        .await
-                        .map(|r| r.id.to_string()),
-                }
-            }
-        };
-        let value = match command {
+        // Creation resolves the source's effective cwd (never a stale row cwd
+        // copied from a fork source) and its runtime itself.
+        let command = match command {
             NativeCommand::Create {
                 include_local_changes,
                 base_ref,
                 name,
             } => {
-                // Isolate from the session's effective workspace, never from a
-                // stale row cwd copied from a fork source.
-                let persisted = self
-                    .config
-                    .storage
-                    .session_store()
-                    .get_session(session_id)
-                    .await?
-                    .ok_or_else(|| WorktreeOpError::InvalidOptions("session not found".into()))?
-                    .cwd;
-                let source_cwd = ops
-                    .service()
-                    .resolve_session_cwd(session_id, persisted)
-                    .await?
-                    .ok_or_else(|| WorktreeOpError::InvalidOptions("session has no cwd".into()))?;
-                let response = ops
-                    .create(
-                        self,
-                        WorktreeCreateRequest {
-                            cwd: source_cwd.display().to_string(),
-                            include_local_changes: include_local_changes.then_some(true),
-                            base_ref,
-                            name,
-                            source_session_id: Some(session_id.to_string()),
-                        },
-                    )
+                let response = self
+                    .create_worktree_session(WorktreeCreateRequest {
+                        cwd: String::new(),
+                        include_local_changes: include_local_changes.then_some(true),
+                        base_ref,
+                        name,
+                        source_session_id: Some(session_id.to_string()),
+                    })
                     .await?;
-                to_value(&response)
+                return Ok((to_value(&response)?, None));
             }
+            other => other,
+        };
+        let own = WorkspaceTarget::Session(session_id.to_string());
+        let ops = self.worktree_ops(Some(&own)).await?;
+        // A mutation of another workspace runs under that workspace's service.
+        let ops_for = async |target: &WorkspaceTarget| match target {
+            WorkspaceTarget::Session(_) => Ok(ops.clone()),
+            WorkspaceTarget::Workspace(_) => self.worktree_ops(Some(target)).await,
+        };
+        // A read without an explicit id targets the session's own workspace.
+        let own_or = async |id: Option<String>| match id {
+            Some(id) => Ok(id),
+            None => ops
+                .workspace_of_session(session_id)
+                .await
+                .map(|record| record.id.to_string()),
+        };
+        let value = match command {
+            NativeCommand::Create { .. } => unreachable!("handled above"),
             // The owner actor is unloaded by the handoff, so the reply is the
             // durable announcement on the previous owner's stream.
             NativeCommand::Handoff(options) => {
-                let (response, tip) = ops
-                    .handoff_announced(
-                        self,
-                        &WorkspaceTarget::Session(session_id.to_string()),
-                        options,
-                    )
-                    .await?;
+                let (response, tip) = ops.handoff_announced(self, &own, options).await?;
                 return Ok((to_value(&response)?, tip));
             }
             NativeCommand::List => to_value(&ops.list().await?),
             NativeCommand::Status(id) => to_value(&ops.status(&own_or(id).await?).await?),
             NativeCommand::Result(id) => to_value(&ops.result(&own_or(id).await?).await?),
-            NativeCommand::Publish(Some(id)) => {
-                to_value(&ops.publish(&WorkspaceTarget::Workspace(id)).await?)
+            NativeCommand::Publish(id) => {
+                let target = native_target(id, session_id);
+                to_value(&ops_for(&target).await?.publish(&target).await?)
             }
-            NativeCommand::Publish(None) => to_value(
-                &ops.publish(&WorkspaceTarget::Session(session_id.to_string()))
-                    .await?,
-            ),
             NativeCommand::Remove { id, archive } => {
                 let target = native_target(id, session_id);
-                let (response, _) = ops
+                let (response, _) = ops_for(&target)
+                    .await?
                     .remove_announced(self, &target, archive, Some(session_id))
                     .await?;
                 to_value(&response)
             }
-            NativeCommand::Recover(id) => to_value(&ops.recover(&id).await?),
+            NativeCommand::Recover(id) => {
+                let target = WorkspaceTarget::Workspace(id);
+                to_value(&ops_for(&target).await?.recover(target.id()).await?)
+            }
             // The owner is unloaded by the archive, so when the issuing session
             // is the owner the reply is the durable announcement on its stream.
             NativeCommand::Archive(id) => {
                 let target = native_target(id, session_id);
-                let outcome = ops
+                let outcome = ops_for(&target)
+                    .await?
                     .archive_announced(self, &target, Some(session_id))
                     .await?;
                 let tip = outcome
@@ -1010,7 +1136,7 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: WorktreeCreateRequest = parse_workspace_op_request(req)?;
-        render(async { self.worktree_ops()?.create(self, parsed).await }.await)
+        render(self.create_worktree_session(parsed).await)
     }
 
     /// `querymt/worktree/handoff`: move ownership of a ready workspace to a
@@ -1023,7 +1149,8 @@ impl LocalAgentHandle {
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
-                self.worktree_ops()?
+                self.worktree_ops(Some(&target))
+                    .await?
                     .handoff(self, &target, parsed.options)
                     .await
             }
@@ -1033,7 +1160,7 @@ impl LocalAgentHandle {
 
     /// `querymt/worktree/list`: all managed workspaces, newest first.
     pub(super) async fn handle_ext_worktree_list(&self) -> Result<ExtResponse, Error> {
-        render(async { self.worktree_ops()?.list().await }.await)
+        render(async { self.worktree_ops(None).await?.list().await }.await)
     }
 
     /// `querymt/worktree/status`: durable record plus live Git state.
@@ -1042,7 +1169,16 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        render(async { self.worktree_ops()?.status(&parsed.workspace_id).await }.await)
+        render(
+            async {
+                let target = WorkspaceTarget::Workspace(parsed.workspace_id);
+                self.worktree_ops(Some(&target))
+                    .await?
+                    .status(target.id())
+                    .await
+            }
+            .await,
+        )
     }
 
     /// `querymt/worktree/result`: retained baseline-relative review of
@@ -1052,7 +1188,16 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        render(async { self.worktree_ops()?.result(&parsed.workspace_id).await }.await)
+        render(
+            async {
+                let target = WorkspaceTarget::Workspace(parsed.workspace_id);
+                self.worktree_ops(Some(&target))
+                    .await?
+                    .result(target.id())
+                    .await
+            }
+            .await,
+        )
     }
 
     /// `querymt/worktree/publish`: explicitly publish the current working
@@ -1064,10 +1209,12 @@ impl LocalAgentHandle {
         let parsed: WorktreePublishRequest = parse_workspace_op_request(req)?;
         render(
             async {
-                let ops = self.worktree_ops()?;
                 // Default to the caller's own workspace when only a session is given.
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
-                ops.publish(&target).await
+                self.worktree_ops(Some(&target))
+                    .await?
+                    .publish(&target)
+                    .await
             }
             .await,
         )
@@ -1083,7 +1230,8 @@ impl LocalAgentHandle {
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
-                self.worktree_ops()?
+                self.worktree_ops(Some(&target))
+                    .await?
                     .remove(self, &target, parsed.archive)
                     .await
             }
@@ -1100,7 +1248,10 @@ impl LocalAgentHandle {
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
-                self.worktree_ops()?.archive(self, &target).await
+                self.worktree_ops(Some(&target))
+                    .await?
+                    .archive(self, &target)
+                    .await
             }
             .await,
         )
@@ -1156,9 +1307,12 @@ impl LocalAgentHandle {
                 async {
                     // Rejects "both" and "neither" with the shared diagnostics.
                     match WorkspaceTarget::from_parts(workspace_id, session_id)? {
-                        WorkspaceTarget::Workspace(id) => {
-                            let recovered: WorktreeRecoverResponse =
-                                self.worktree_ops()?.recover(&id).await?;
+                        target @ WorkspaceTarget::Workspace(_) => {
+                            let recovered: WorktreeRecoverResponse = self
+                                .worktree_ops(Some(&target))
+                                .await?
+                                .recover(target.id())
+                                .await?;
                             Ok(recovered)
                         }
                         WorkspaceTarget::Session(_) => unreachable!("handled above"),

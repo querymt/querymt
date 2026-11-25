@@ -53,6 +53,15 @@ pub enum Config {
 }
 
 impl Config {
+    /// Managed-worktree settings of the root agent (`[agent.workspace]` or
+    /// `[quorum.workspace]`).
+    pub fn workspace_settings(&self) -> &WorkspaceSettings {
+        match self {
+            Self::Single(config) => &config.agent.workspace,
+            Self::Multi(config) => &config.quorum.workspace,
+        }
+    }
+
     /// Every MCP server the configuration declares: the top-level `[[mcp]]`
     /// entries and, for a quorum, each delegate's own `mcp` entries.
     ///

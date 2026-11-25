@@ -8,7 +8,49 @@ const UNLOAD_STATUS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const STOP_LOCAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const STOP_REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The runtime a session lives in, resolved once per request.
+pub(crate) enum SessionHost<'a> {
+    /// This handle: the session is unbound, or no profiles are attached.
+    Connection(&'a LocalAgentHandle),
+    /// The profile runtime (or one of its delegates) the session is bound to.
+    Profile {
+        handle: Arc<LocalAgentHandle>,
+        binding: crate::profile_host::SessionProfileBinding,
+    },
+}
+
+impl SessionHost<'_> {
+    /// The handle that runs the session's session-layer work.
+    pub(crate) fn handle(&self) -> &LocalAgentHandle {
+        match self {
+            Self::Connection(handle) => handle,
+            Self::Profile { handle, .. } => handle,
+        }
+    }
+
+    /// The session's profile binding, when it has one.
+    pub(crate) fn binding(&self) -> Option<&crate::profile_host::SessionProfileBinding> {
+        match self {
+            Self::Connection(_) => None,
+            Self::Profile { binding, .. } => Some(binding),
+        }
+    }
+}
+
 impl LocalAgentHandle {
+    /// The runtime hosting `session_id` (see [`SessionHost`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the session is bound to a profile that cannot be loaded or
+    /// to a delegate the profile no longer has.
+    pub(crate) async fn session_host(&self, session_id: &str) -> Result<SessionHost<'_>, Error> {
+        Ok(match self.bound_session_handle(session_id).await? {
+            Some((handle, binding)) => SessionHost::Profile { handle, binding },
+            None => SessionHost::Connection(self),
+        })
+    }
+
     /// In profile mode, give a locally stored session that has no usable profile
     /// binding one (see `ProfileRuntimeManager::adopt_unbound_session`), so history
     /// created before profiles existed, or by a config-file run, stays openable.

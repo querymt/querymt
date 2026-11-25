@@ -172,11 +172,13 @@ impl LocalAgentHandle {
         let mut update = if remote {
             crate::acp::protocol::AvailableCommandsUpdate::new(Vec::new())
         } else {
-            let bound = match self.bound_session_handle(session_id).await {
-                Ok(bound) => bound.map(|(handle, _)| handle),
+            let host = match self.session_host(session_id).await {
+                Ok(host) => host,
                 Err(error) => {
-                    log::debug!(
-                        "slash catalog: profile runtime lookup failed for session {session_id}: {error}"
+                    tracing::debug!(
+                        session_id,
+                        error = %error,
+                        "slash catalog: profile runtime lookup failed"
                     );
                     return Self::catalog_notification(
                         session_id,
@@ -188,10 +190,7 @@ impl LocalAgentHandle {
                     );
                 }
             };
-            let host = bound
-                .as_deref()
-                .and_then(|handle| handle.as_any().downcast_ref::<LocalAgentHandle>())
-                .unwrap_or(self);
+            let host = host.handle();
             workspace_service = host.config.workspace_service().is_some();
             let registry = host.session_user_registry(session_id).await;
             crate::slash_commands::acp::registry_to_acp_update(&registry)
@@ -778,136 +777,128 @@ impl LocalAgentHandle {
             }
         }
 
-        if let Some(profiles) = self.profiles() {
-            let profile_id = match requested_profile_id_from_meta(req.meta.as_ref()) {
-                Some(profile_id) => profile_id.to_string(),
-                None => profiles.active_profile_id().await,
-            };
-            let runtime = profiles.runtime_for_profile(&profile_id).await.map_err(|err| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": format_prefixed_error_chain(&format!("Failed to load profile '{profile_id}'"), &err),
-                    "profileId": profile_id,
-                }))
-            })?;
-            let profile_handle = runtime.handle();
-            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-            if let Some(bridge) = bridge {
-                profile_handle.set_bridge(bridge).await;
-            }
-            let prepared = profile_handle
-                .session_materializer
-                .prepare_new_session(req)
-                .await?;
-            let session_id = prepared.session_id.clone();
-            if let Err(error) = profiles
-                .bind_session_to_runtime(&session_id, &runtime)
-                .await
-            {
-                prepared.actor_ref.kill();
-                let cleanup = profile_handle
-                    .config
-                    .provider
-                    .history_store()
-                    .delete_session(&session_id)
-                    .await;
-                return Err(Error::internal_error().data(serde_json::json!({
-                    "message": format_prefixed_error_chain("Failed to bind session to profile", &error),
-                    "profileId": profile_id,
-                    "sessionId": session_id,
-                    "cleanupError": cleanup.err().map(|error| error.to_string()),
-                })));
-            }
-            let session_ref = crate::agent::session_registry::register_prepared_session(
-                &profile_handle.registry,
-                &prepared,
-            )
-            .await;
-            profile_handle
-                .session_materializer
-                .finalize_session(&prepared)
-                .await?;
-            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
-            let reasoning_effort = profile_handle
-                .session_reasoning_effort(&session_ref, &session_id)
+        let Some(profiles) = self.profiles() else {
+            return self
+                .materialize_new_session(&SessionHost::Connection(self), req)
                 .await;
-            let config_options = self
-                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
-                .await?;
-            let mut meta = serde_json::Map::new();
-            meta.insert(
-                "querymt".to_string(),
-                serde_json::json!({
-                    "profile_id": profile_id,
-                    "profile_source": "querymt_profile_manager",
-                }),
-            );
-            let meta = with_skipped_mcp_servers(Some(meta), &prepared.runtime.mcp_tool_state);
-            return Ok(NewSessionResponse::new(session_id)
-                .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(config_options)
-                .meta(meta));
+        };
+        let profile_id = match requested_profile_id_from_meta(req.meta.as_ref()) {
+            Some(profile_id) => profile_id.to_string(),
+            None => profiles.active_profile_id().await,
+        };
+        let runtime = profiles.runtime_for_profile(&profile_id).await.map_err(|err| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": format_prefixed_error_chain(&format!("Failed to load profile '{profile_id}'"), &err),
+                "profileId": profile_id,
+            }))
+        })?;
+        let host = SessionHost::Profile {
+            handle: runtime.handle(),
+            binding: runtime.session_binding(),
+        };
+        self.materialize_new_session(&host, req).await
+    }
+
+    /// Create a session in `host`: prepare it, bind it to the host's profile
+    /// before it is registered (removing it again when binding fails), then
+    /// register and finalize it. Every new session goes through here, so a
+    /// session is never runnable without its binding and an isolated
+    /// session always discloses its workspace.
+    ///
+    /// # Errors
+    ///
+    /// Fails when preparation, binding or finalization fails.
+    pub(crate) async fn materialize_new_session(
+        &self,
+        host: &SessionHost<'_>,
+        req: NewSessionRequest,
+    ) -> std::result::Result<NewSessionResponse, Error> {
+        let runtime = host.handle();
+        if let SessionHost::Profile { handle, .. } = host
+            && let Some(bridge) = self.bridge.lock().ok().and_then(|guard| guard.clone())
+        {
+            handle.set_bridge(bridge).await;
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
-        let prepared = self.session_materializer.prepare_new_session(req).await?;
-
+        let prepared = runtime
+            .session_materializer
+            .prepare_new_session(req)
+            .await?;
         let session_id = prepared.session_id.clone();
+        if let Some(binding) = host.binding()
+            && let Some(profiles) = self.profiles()
+            && let Err(error) = profiles
+                .set_session_binding(&session_id, binding.clone())
+                .await
+        {
+            prepared.actor_ref.kill();
+            let cleanup = runtime
+                .config
+                .provider
+                .history_store()
+                .delete_session(&session_id)
+                .await;
+            return Err(Error::internal_error().data(serde_json::json!({
+                "message": format_prefixed_error_chain("Failed to bind session to profile", &error),
+                "profileId": binding.profile_id,
+                "sessionId": session_id,
+                "cleanupError": cleanup.err().map(|error| error.to_string()),
+            })));
+        }
 
         // Phase 2: Register session (fast, registry lock held for microseconds only)
         let session_ref =
-            crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)
+            crate::agent::session_registry::register_prepared_session(&runtime.registry, &prepared)
                 .await;
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        self.session_materializer
+        runtime
+            .session_materializer
             .finalize_session(&prepared)
             .await?;
 
-        // Get current per-session settings for the response.
+        // Current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
-        let reasoning_effort = self
+        let reasoning_effort = runtime
             .session_reasoning_effort(&session_ref, &session_id)
             .await;
-
         let config_options = self
             .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
-        let response = NewSessionResponse::new(session_id.clone())
+        let mut namespace = serde_json::Map::new();
+        if let Some(binding) = host.binding() {
+            namespace.insert("profile_id".into(), binding.profile_id.clone().into());
+            namespace.insert("profile_source".into(), "querymt_profile_manager".into());
+        }
+        // Disclose the resolved binding for isolated sessions only.
+        if let Some(service) = runtime.config.workspace_service()
+            && let Some(workspace) = service
+                .resolve_existing_session(&session_id, None)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+        {
+            namespace.insert(
+                crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
+                serde_json::json!(workspace.disclosure()),
+            );
+        }
+        let meta = (!namespace.is_empty()).then(|| {
+            serde_json::Map::from_iter([(
+                crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::Value::Object(namespace),
+            )])
+        });
+        let response = NewSessionResponse::new(session_id)
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(config_options);
-
-        let skipped_meta = with_skipped_mcp_servers(None, &prepared.runtime.mcp_tool_state);
-        let response = match skipped_meta {
-            Some(meta) => response.meta(meta),
-            None => response,
-        };
-
-        // Disclose the resolved binding for isolated sessions only; a local
-        // session's response is unchanged.
-        let Some(service) = self.config.workspace_service() else {
-            return Ok(response);
-        };
-        let binding = service
-            .resolve_existing_session(&session_id, None)
-            .await
-            .map_err(|err| Error::internal_error().data(err.to_string()))?;
-        Ok(match binding {
-            Some(binding) => {
-                let mut meta = response.meta.clone().unwrap_or_default();
-                let namespace = meta
-                    .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(namespace) = namespace.as_object_mut() {
-                    namespace.insert(
-                        crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
-                        serde_json::json!(binding.disclosure()),
-                    );
-                }
-                response.meta(meta)
-            }
-            None => response,
-        })
+        Ok(
+            match with_skipped_mcp_servers(meta, &prepared.runtime.mcp_tool_state) {
+                Some(meta) => response.meta(meta),
+                None => response,
+            },
+        )
     }
 
     /// Load an existing session. MCP attachments are resolved internally by
