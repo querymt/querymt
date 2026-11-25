@@ -6395,6 +6395,100 @@ mod tests {
         );
     }
 
+    /// Spec "Scrolling past a diagram": a diagram row's height is known when
+    /// the list first builds it, so scrolling up past it leaves the anchor
+    /// where it is and later frames do not move it.
+    #[gpui_kit::test]
+    fn scrolling_past_a_diagram_does_not_jump(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{
+            AppContext as _, Context, IntoElement as _, ListAlignment, ListOffset, ListState,
+            ParentElement as _, Render, Styled as _, Window, div, list, point, px, size,
+        };
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        // Wide enough to be scaled down and tall enough to matter.
+        let mut diagram = String::from("```mermaid\nflowchart LR\n");
+        for i in 0..12 {
+            diagram.push_str(&format!(
+                "  node{i}[Step number {i}] --> node{}[Step {}]\n",
+                i + 1,
+                i + 1
+            ));
+            diagram.push_str(&format!("  node{i} --> branch{i}[Branch {i}]\n"));
+        }
+        diagram.push_str("```");
+        struct Fixture {
+            state: ListState,
+            kept: super::super::md::Kept,
+            diagram: String,
+        }
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                cx: &mut Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                let p = *crate::theme::palette(cx);
+                let (kept, diagram) = (self.kept.clone(), self.diagram.clone());
+                list(self.state.clone(), move |ix, _, _| {
+                    let key = format!("row-{ix}");
+                    kept.begin_row(&key);
+                    let row = match ix {
+                        1 => div()
+                            .w_full()
+                            .child(kept.markdown(key.clone(), diagram.clone(), &p))
+                            .into_any_element(),
+                        _ => div().h(px(120.)).w_full().into_any_element(),
+                    };
+                    kept.end_row();
+                    row
+                })
+                .size_full()
+            }
+        }
+        let cx = cx.add_empty_window();
+        let state = ListState::new(6, ListAlignment::Top, px(1200.));
+        let kept = super::super::md::Kept::default();
+        let draw = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.run_until_parked();
+            cx.draw(point(px(0.), px(0.)), size(px(600.), px(500.)), |_, cx| {
+                cx.new(|_| Fixture {
+                    state: state.clone(),
+                    kept: kept.clone(),
+                    diagram: diagram.clone(),
+                })
+                .into_any_element()
+            });
+        };
+        // Start below the diagram, then scroll up past it.
+        state.scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(0.),
+        });
+        draw(cx);
+        for _ in 0..6 {
+            state.scroll_by(px(-60.));
+            draw(cx);
+        }
+        let top = state.logical_scroll_top();
+        let rows: Vec<_> = (0..6).map(|ix| state.bounds_for_item(ix)).collect();
+        let height = rows[1].expect("diagram row was built").size.height;
+        assert!(
+            height > px(60.),
+            "the diagram has its own height: {height:?}"
+        );
+        // Later frames and a remeasure of the diagram row change nothing.
+        for _ in 0..3 {
+            state.remeasure_items(1..2);
+            draw(cx);
+        }
+        assert_eq!(state.logical_scroll_top(), top);
+        let after: Vec<_> = (0..6).map(|ix| state.bounds_for_item(ix)).collect();
+        assert_eq!(after, rows);
+    }
+
     fn thought(id: &str, part: Option<&str>) -> WorkEntry {
         WorkEntry::Thought(Thought {
             id: id.into(),

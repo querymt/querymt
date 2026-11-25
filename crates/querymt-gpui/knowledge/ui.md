@@ -2,7 +2,7 @@
 id: gpui-ui
 title: UI shell, pages and the session pane
 description: How the main window is put together (QmtApp, pages, sidebar, modals), how one SessionPane renders a session in both the main window and the quick panel (density, RenderCtx, row cache), and the shared pieces (model picker, keys, palette, fuzzy search).
-tags: ui, gpui, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
+tags: ui, gpui, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
 knowledge_paths: ["src/ui/**", "src/theme.rs", "src/search.rs"]
 knowledge_sources: ["src/ui/mod.rs", "src/ui/session_pane.rs", "src/ui/model_picker.rs", "src/ui/keys.rs#bind_keys"]
 ---
@@ -53,6 +53,77 @@ invariant when touching the projection (see [sessions.md](sessions.md)). Markdow
 `src/ui/md.rs`, highlighted code `src/ui/code.rs` (cached by language, text and theme),
 turn diffs `src/ui/turn_diff.rs`, slash commands `src/ui/slash.rs`.
 
+## Mermaid diagrams
+
+Closed `mermaid` fences in transcript Markdown are drawn as diagrams (spec:
+`openspec/specs/mermaid-diagrams`; history in `openspec/changes/archive/2026-11-25-render-mermaid-diagrams`).
+
+- **Interception** (`src/ui/md.rs`, `styled`): the block parser turns a `Node::Code` whose
+  language is `mermaid` (case-insensitive) into the custom `MERMAID_BLOCK` with
+  `.text(body)`, but only when `fence_closed` finds the closing fence (same fence character,
+  at least as long as the opener). An open fence is an unclosed code node running to the end
+  of the document, so it stays a native code block while streaming and becomes a diagram when
+  the closing fence arrives. Other languages are untouched.
+- **Card** (`MermaidCard` in `md.rs`): the code block's frame and `header_row` (shared with the
+  code-block header), with `mermaid`, the zoom controls (`−`, the percentage of natural size,
+  `+`, `Fit`; diagram view only, tooltips name the gestures), a Diagram / Source toggle and
+  `CopyButton`, which always copies the body. Card state is a `CardModes` owned by `Kept`
+  (`SourceShown`, an `Arc<Mutex<_>>` because the block renderer must be `Send + Sync`): the
+  `source` id set and `views`, the `mermaid::Views` store of zoom/pan and measures. It survives
+  rows being rebuilt and is cleared by `Kept::clear`. The old Fit / 100% toggle, its scroller,
+  `diagram_actual`, `natural_size` and `ACTUAL_MAX_HEIGHT` are gone.
+- **Fit and height cap**: a diagram starts at `mermaid::fit_scale`, the largest scale no greater
+  than 1 that fits the card's width and `MAX_H` = 480px, never scaled up. The diagram area is
+  that size, so the row height is final at first layout (a 1200px diagram is a 480px area at 40%).
+- **Zoom and pan** (`Viewport { zoom, x, y }` per block, design D7): `zoom` is relative to Fit
+  (so a resize keeps it), `(x, y)` is the paint offset inside the area. Range `1 ..= max(4,
+  2 / fit)`. Pure maths (`zoom_about` keeps the pointer's point fixed, `clamp` limits the offset
+  to the diagram edges and centres an axis it does not fill) is unit tested. Zoom and pan change
+  only the paint origin and scale inside the content mask: never layout, never the element's
+  size, so the card and the rows below do not move. `ViewHandle` is one block's entry in the
+  shared store; the element writes its `Metrics` (fit, area) in `prepaint` and refreshes when
+  they change, which is how the header buttons know the centre, limits and percentage.
+- **Wheel ownership**: only Cmd+wheel (Ctrl off macOS, `Modifiers::secondary`) and trackpad
+  pinch belong to the diagram. `DiagramElement::register_input` adds bubble-phase handlers over a
+  hitbox; the transcript `list` registers its scroll handler before painting its children, so the
+  child runs first and `stop_propagation` keeps the list from scrolling. A plain wheel or
+  scroll does nothing there and reaches the list, so scrolling never sticks on a diagram. Wheel up
+  zooms in (`exp(dy * 0.0025)` per pixel, 1.1 per line notch; the design's sign was DOM
+  convention), a pinch by `1 + delta`, the buttons by 1.25 about the area's centre.
+- **Smooth-scroll bypass** (`SmoothScroll::install`, `smooth_scroll.rs`): the capture handler
+  swallows wheel notches and replays them over later frames with whatever modifiers are held then,
+  so releasing Cmd mid-notch would turn a zoom into transcript scrolling. Events with the
+  platform or control modifier are now left alone (and drop any running scroll tail).
+- **Drag and selection**: a left press over the hitbox calls
+  `GlobalState::suppress_text_selection` (as buttons do) so the window-level selection does not
+  start; a drag pans while `zoom > 1` (cursor Grab / Grabbing, drag state in `Views`); a
+  double-click returns to Fit.
+- **Fallback**: a parse error, unsupported type or limit error (`mermaid::Unavailable`) shows
+  the source as plain lines plus `Diagram not drawn: <reason>`, with the toggle hidden. Never
+  an empty card.
+- **Layout and cache** (`src/ui/mermaid.rs`): `mermaid::scene` parses and lays out with `limu`,
+  measured by GPUI's text system (`paint::TextMeasurer`) in the app fonts, and caches the
+  result (a 128 entry LRU keyed by source and fonts; failures are cached too). The card calls
+  it while rendering, so a diagram's size is known when its row is first laid out and the
+  transcript does not jump.
+- **Element**: `DiagramElement` reports the scene size scaled down to the available width and
+  the height cap, never up; a resize only changes the fit. It sits in a flex row, where an item is
+  no narrower than its min-content width, so it has `min_size.width = 0` and answers a
+  min-content measure with 0 (otherwise it kept its natural width and the card cut it off on
+  both sides).
+- **Theme**: `mermaid::look(&Palette)` maps the palette onto limu's `Theme` with
+  `theme_only`, so author colours are ignored. It is applied at paint, so a theme switch
+  recolours without re-laying out.
+- **Painter**: `src/ui/mermaid/paint.rs` and `svg.rs` are a port of `limu-gpui` 0.2.1 (MIT),
+  which does not build against the `gpui-pre` 0.3.14 that gpui-kit pins (no lyon path
+  options). Only `limu` is a dependency; all limu calls stay inside `src/ui/mermaid`. Revisit
+  when a limu-gpui release supports the pinned GPUI.
+- **Known limitation (wasm)**: rotated labels and halos are painted as SVG text shaped by
+  usvg, which uses system fonts that the web build lacks, so they may be missing there
+  (axis titles, swimlane names).
+- **Find**: a diagram's text is its body (`.text(body)`), so `add-session-find` counts matches
+  in it but cannot paint highlights inside the card.
+
 ## Shared pieces
 
 - **Model picker** (`src/ui/model_picker.rs`): one `ModelPicker` entity for the main
@@ -87,5 +158,7 @@ turn diffs `src/ui/turn_diff.rs`, slash commands `src/ui/slash.rs`.
 | `../src/ui/model_picker.rs` | Shared model picker with reasoning effort. |
 | `../src/ui/keys.rs` | Key bindings and the command palette. |
 | `../src/ui/kit.rs` | Small shared presentational helpers. |
+| `../src/ui/md.rs` | Transcript Markdown: styling, code and table cards, the Mermaid card, `Kept`. |
+| `../src/ui/mermaid.rs` | Mermaid layout cache, `DiagramElement` (fit, zoom, pan), viewport maths, palette look; `mermaid/paint.rs` and `svg.rs` paint limu scenes with GPUI. |
 
 Related: [quick-panel.md](quick-panel.md) for the compact surface.

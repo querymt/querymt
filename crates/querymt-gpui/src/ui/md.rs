@@ -8,21 +8,45 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gpui_kit::component::text::{
     MarkdownNode, TextView, TextViewMotion, TextViewState, TextViewStyle, markdown_ast,
 };
-use gpui_kit::component::{Sizable as _, Theme, h_flex};
+use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::kit;
+use super::kit::ButtonExt as _;
+use super::{kit, mermaid};
 use crate::theme::Palette;
 
 /// Name of the custom markdown block that wraps tables (adds a copy button).
 const TABLE_BLOCK: &str = "qmt-table";
+/// Name of the custom markdown block that draws a closed `mermaid` fence.
+const MERMAID_BLOCK: &str = "qmt-mermaid";
+/// How the user changed Mermaid blocks from the default (the diagram, fitted
+/// to the card), by block id.
+#[derive(Default)]
+struct CardModes {
+    /// Blocks shown as their source.
+    source: HashSet<String>,
+    /// Zoom and pan of the diagrams, and what their elements measured.
+    views: mermaid::SharedViews,
+}
+
+impl CardModes {
+    fn clear(&mut self) {
+        self.source.clear();
+        self.views.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// [`CardModes`] shared by the block renderers of one [`Kept`] (cleared with
+/// it).
+type SourceShown = Arc<Mutex<CardModes>>;
 /// Language shown (and highlighted) for fences without one, as the desktop does.
 const DEFAULT_LANG: &str = "text";
 /// How long the copy button shows its check.
@@ -65,12 +89,18 @@ pub fn markdown(
     p: &Palette,
 ) -> TextView {
     let id: SharedString = id.into();
-    styled(TextView::markdown(id.clone(), text), id, p)
+    styled(
+        TextView::markdown(id.clone(), text),
+        id,
+        p,
+        SourceShown::default(),
+    )
 }
 
 /// Transcript styling and extensions; `id` prefixes the table ids.
-fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
-    let table_prefix = id;
+fn styled(view: TextView, id: SharedString, p: &Palette, sources: SourceShown) -> TextView {
+    let table_prefix = id.clone();
+    let mermaid_prefix = id;
     let p = *p;
     view.style(TextViewStyle {
         code_block: StyleRefinement::default()
@@ -83,19 +113,7 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
     .inline_code_style(inline_code_style(&p))
     .code_block_actions(move |block, _, cx| {
         let lang = block.lang();
-        let row = h_flex()
-            .w_full()
-            .id("code-header")
-            .justify_between()
-            .gap_3()
-            .h(px(30.))
-            .pl_3()
-            .pr_1()
-            .border_b_1()
-            .border_color(p.border)
-            .font_family(Theme::global(cx).font_family.clone())
-            .text_xs()
-            .text_color(p.muted)
+        let row = header_row("code-header", &p, cx)
             .child(
                 div()
                     .min_w_0()
@@ -125,7 +143,35 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
                     .markdown(source),
             )
         }
+        markdown_ast::Node::Code(code) => {
+            let lang = code.lang.as_deref()?;
+            if !lang.trim().eq_ignore_ascii_case("mermaid") {
+                return None;
+            }
+            let source = cx.node_source(node)?;
+            if !fence_closed(source) {
+                return None;
+            }
+            Some(
+                MarkdownNode::new(MERMAID_BLOCK, code.value.clone())
+                    .text(code.value.clone())
+                    .markdown(source.to_string()),
+            )
+        }
         _ => None,
+    })
+    .markdown_block_renderer(MERMAID_BLOCK, move |node, _, _| {
+        let Some(body) = node.data::<String>() else {
+            return div().into_any_element();
+        };
+        let start = node.source_range().map_or(0, |r| r.start);
+        MermaidCard {
+            id: SharedString::from(format!("{mermaid_prefix}-mermaid-{start}")),
+            source: body.clone().into(),
+            p,
+            sources: sources.clone(),
+        }
+        .into_any_element()
     })
     .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
         let Some(source) = node.data::<String>() else {
@@ -135,6 +181,44 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
         let id = format!("{table_prefix}-table-{start}");
         table_card(&id, source, p).into_any_element()
     })
+}
+
+/// The header strip of a code or diagram card: 30px, a hairline under it,
+/// the label on the left and controls on the right.
+fn header_row(id: impl Into<ElementId>, p: &Palette, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .w_full()
+        .id(id)
+        .justify_between()
+        .gap_3()
+        .h(px(30.))
+        .pl_3()
+        .pr_1()
+        .border_b_1()
+        .border_color(p.border)
+        .font_family(Theme::global(cx).font_family.clone())
+        .text_xs()
+        .text_color(p.muted)
+}
+
+/// Whether the source of a fenced code node ends with its closing fence: a
+/// line of only the opener's fence character, at least as long as the opener.
+/// mdast reports an unclosed fence as a node running to the end of the
+/// document, so this is what tells a streamed fence from a finished one.
+fn fence_closed(source: &str) -> bool {
+    let source = source.trim_end();
+    let mut lines = source.lines();
+    let Some(open) = lines.next().map(str::trim_start) else {
+        return false;
+    };
+    let Some(fence) = open.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+        return false;
+    };
+    let open_len = open.chars().take_while(|c| *c == fence).count();
+    let Some(close) = lines.next_back().map(str::trim) else {
+        return false;
+    };
+    close.len() >= open_len && close.chars().all(|c| c == fence)
 }
 
 /// Parsed Markdown of transcript rows, kept for the open session.
@@ -156,6 +240,8 @@ struct KeptInner {
     rows: HashMap<String, Vec<String>>,
     /// Row being rendered, which views built now belong to.
     row: Option<String>,
+    /// Mermaid blocks shown as source (survives rows being rebuilt).
+    sources: SourceShown,
 }
 
 struct KeptView {
@@ -180,7 +266,12 @@ impl KeptView {
 impl Kept {
     /// Drop every kept view (another session opened).
     pub fn clear(&self) {
-        *self.0.borrow_mut() = KeptInner::default();
+        let sources = self.0.borrow().sources.clone();
+        sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.0.borrow_mut() = KeptInner {
+            sources,
+            ..KeptInner::default()
+        };
     }
 
     /// Views built from now until [`Self::end_row`] belong to row `key`.
@@ -234,6 +325,7 @@ impl Kept {
             text: text.into(),
             p: *p,
             motion: None,
+            sources: self.0.borrow().sources.clone(),
         }
     }
 
@@ -283,6 +375,7 @@ pub struct KeptMarkdown {
     text: SharedString,
     p: Palette,
     motion: Option<TextViewMotion>,
+    sources: SourceShown,
 }
 
 impl KeptMarkdown {
@@ -301,7 +394,7 @@ impl KeptMarkdown {
 impl RenderOnce for KeptMarkdown {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = self.kept.state(&self.id, &self.text, cx);
-        let view = styled(TextView::new(&state), self.id, &self.p);
+        let view = styled(TextView::new(&state), self.id, &self.p, self.sources);
         match self.motion {
             Some(motion) => view.motion(motion),
             None => view,
@@ -515,6 +608,236 @@ impl RenderOnce for TableCard {
     }
 }
 
+/// A closed `mermaid` fence: the diagram in a card framed like a code block,
+/// its header showing `mermaid`, a Diagram/Source toggle and the copy button.
+/// A source that cannot be drawn shows as plain source with a note instead,
+/// and no toggle.
+#[derive(IntoElement)]
+struct MermaidCard {
+    id: SharedString,
+    source: SharedString,
+    p: Palette,
+    sources: SourceShown,
+}
+
+impl MermaidCard {
+    fn shown_as_source(&self) -> bool {
+        self.sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .source
+            .contains(self.id.as_ref())
+    }
+
+    /// This diagram's zoom and pan, kept for the open session.
+    fn view(&self) -> mermaid::ViewHandle {
+        let views = self
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .views
+            .clone();
+        mermaid::ViewHandle::new(views, self.id.to_string())
+    }
+
+    /// The Diagram / Source toggle. Segment ids are the block id and the
+    /// option's id.
+    fn toggle(&self, as_source: bool) -> impl IntoElement {
+        let p = self.p;
+        let option = |slug: &'static str, name: &'static str, source: bool| {
+            let (sources, id) = (self.sources.clone(), self.id.to_string());
+            kit::segment(
+                SharedString::from(format!("{}-{slug}", self.id)),
+                as_source == source,
+                &p,
+            )
+            .h(px(20.))
+            .label(name)
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                {
+                    let mut modes = sources.lock().unwrap_or_else(|e| e.into_inner());
+                    if source {
+                        modes.source.insert(id.clone());
+                    } else {
+                        modes.source.remove(&id);
+                    }
+                }
+                cx.refresh_windows();
+            })
+        };
+        kit::segment_bar(&p)
+            .h(px(24.))
+            .child(option("diagram", "Diagram", false))
+            .child(option("source", "Source", true))
+    }
+
+    /// `−`, the zoom, `+` and `Fit`. Disabled at the limits; the tooltips
+    /// name the gestures.
+    fn zoom_controls(&self, window: &Window) -> impl IntoElement {
+        let p = self.p;
+        let view = self.view();
+        let (can_out, can_in) = view.can_zoom();
+        let fit = view.metrics().map_or(1.0, |m| m.fit);
+        let percent = view.percent(fit);
+        let _ = window;
+        let control = |slug: &'static str,
+                       label: &'static str,
+                       tip: &'static str,
+                       enabled: bool,
+                       act: fn(&mermaid::ViewHandle)| {
+            let view = view.clone();
+            kit::button(SharedString::from(format!("{}-{slug}", self.id)))
+                .ghost()
+                .xsmall()
+                .label(label)
+                .tooltip(tip)
+                .inactive(!enabled)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    act(&view);
+                    cx.refresh_windows();
+                })
+        };
+        let readout = div()
+            .id(SharedString::from(format!("{}-zoom", self.id)))
+            .min_w(px(36.))
+            .text_center()
+            .text_color(p.muted)
+            .child(format!("{percent}%"));
+        #[cfg(test)]
+        let readout = {
+            use gpui_kit::test::TestSupportExt as _;
+            readout.test_support()
+        };
+        h_flex()
+            .items_center()
+            .child(control(
+                "zoom-out",
+                "\u{2212}",
+                "Zoom out (Cmd+scroll or pinch)",
+                can_out,
+                |v| v.zoom_by(1.0 / mermaid::BUTTON_STEP),
+            ))
+            .child(readout)
+            .child(control(
+                "zoom-in",
+                "+",
+                "Zoom in (Cmd+scroll or pinch)",
+                can_in,
+                |v| v.zoom_by(mermaid::BUTTON_STEP),
+            ))
+            .child(control(
+                "fit",
+                "Fit",
+                "Fit to the card (double-click)",
+                can_out,
+                |v| v.fit(),
+            ))
+    }
+
+    /// The diagram, centred in the card. It is fitted to the card's width and
+    /// a 480px height; zooming and panning stay inside that area.
+    fn diagram(&self, scene: &mermaid::SharedScene) -> AnyElement {
+        let fitted = div()
+            .id(SharedString::from(format!("{}-fitted", self.id)))
+            .min_w_0()
+            .child(mermaid::diagram(scene.clone(), &self.p, self.view()));
+        #[cfg(test)]
+        let fitted = {
+            use gpui_kit::test::TestSupportExt as _;
+            fitted.test_support()
+        };
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .justify_center()
+            .p_3()
+            .child(fitted)
+            .into_any_element()
+    }
+}
+
+/// The Mermaid source as plain monospace lines, as a code block shows it.
+fn source_lines(source: &str, p: &Palette) -> Div {
+    v_flex()
+        .w_full()
+        .px_3()
+        .py_3()
+        .font_family(kit::MONO)
+        .text_size(px(13.))
+        .line_height(relative(1.6))
+        .text_color(p.text)
+        .children(source.lines().map(|line| {
+            div().child(if line.is_empty() {
+                " ".to_string()
+            } else {
+                line.replace('\t', "    ")
+            })
+        }))
+}
+
+impl RenderOnce for MermaidCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = self.p;
+        let layout = mermaid::scene(&self.source, window, cx);
+        let as_source = layout.is_err() || self.shown_as_source();
+        let header = header_row(SharedString::from(format!("{}-header", self.id)), &p, cx)
+            .child(div().min_w_0().truncate().child("mermaid"))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .when(layout.is_ok() && !as_source, |el| {
+                        el.child(self.zoom_controls(window))
+                    })
+                    .when(layout.is_ok(), |el| el.child(self.toggle(as_source)))
+                    .child(CopyButton {
+                        id: SharedString::from(format!("{}-copy", self.id)),
+                        value: self.source.clone(),
+                        p,
+                    }),
+            );
+        let body = match (&layout, as_source) {
+            (Ok(scene), false) => self.diagram(scene),
+            _ => source_lines(&self.source, &p).into_any_element(),
+        };
+        let note = layout.as_ref().err().map(|why| {
+            div()
+                .px_3()
+                .pb_2()
+                .id(SharedString::from(format!("{}-note", self.id)))
+                .text_xs()
+                .text_color(p.muted)
+                .font_family(Theme::global(cx).font_family.clone())
+                .child(format!("Diagram not drawn: {}", why.reason()))
+        });
+        #[cfg(test)]
+        let note = {
+            use gpui_kit::test::TestSupportExt as _;
+            note.map(|n| n.test_support())
+        };
+        let card = v_flex()
+            .id(SharedString::from(format!("{}-card", self.id)))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.card)
+            .child(header)
+            .child(body)
+            .children(note);
+        #[cfg(test)]
+        let card = {
+            use gpui_kit::test::TestSupportExt as _;
+            card.test_support()
+        };
+        card
+    }
+}
+
 /// Copy icon that turns into a check for a moment after copying.
 #[derive(IntoElement)]
 struct CopyButton {
@@ -579,6 +902,7 @@ pub fn plain_text(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_LANG, code_lang, plain_text, stream_motion};
+    use gpui_kit::AppContext as _;
 
     /// A reply over the synchronous parse limit is not ready until its parse
     /// lands, and its document survives being rebuilt (scrolled back in).
@@ -607,6 +931,710 @@ mod tests {
         assert!(cx.update(|cx| kept.row_ready("row", cx)));
         // Rows the store never saw do not hold the list back.
         assert!(cx.update(|cx| kept.row_ready("other", cx)));
+    }
+
+    #[test]
+    fn closing_fence_decides_whether_a_fence_is_finished() {
+        use super::fence_closed;
+        assert!(fence_closed("```mermaid\nflowchart LR; a --> b\n```"));
+        assert!(fence_closed("```mermaid\nflowchart LR; a --> b\n```\n"));
+        assert!(fence_closed("~~~mermaid\na\n~~~~~"));
+        assert!(fence_closed("````mermaid\na\n````"));
+        assert!(fence_closed("  ```mermaid\n  a\n  ```"));
+        assert!(fence_closed("```mermaid\n```"));
+        // Still open: the body runs to the end of the document.
+        assert!(!fence_closed("```mermaid"));
+        assert!(!fence_closed("```mermaid\nflowchart LR\n  a --> b"));
+        // A shorter or different fence does not close it.
+        assert!(!fence_closed("````mermaid\na\n```"));
+        assert!(!fence_closed("```mermaid\na\n~~~"));
+        assert!(!fence_closed("```mermaid\na\n``` x"));
+        assert!(!fence_closed(""));
+    }
+
+    /// A transcript reply kept like the session view keeps it.
+    struct Doc {
+        kept: super::Kept,
+        text: gpui_kit::SharedString,
+        shown: bool,
+    }
+
+    impl gpui_kit::Render for Doc {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{IntoElement as _, ParentElement as _, Styled as _, div, px};
+            let p = *crate::theme::palette(cx);
+            let column = div().w(px(600.));
+            if self.shown {
+                column
+                    .child(self.kept.markdown("m", self.text.clone(), &p))
+                    .into_any_element()
+            } else {
+                column.into_any_element()
+            }
+        }
+    }
+
+    const BLOCK: &str = "m-mermaid-0";
+    const FLOW: &str = "```mermaid\nflowchart LR; a --> b\n```";
+
+    fn open_doc(
+        cx: &mut gpui_kit::TestAppContext,
+        text: &str,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Doc>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let text: gpui_kit::SharedString = text.to_string().into();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| {
+                cx.new(|_| Doc {
+                    kept: super::Kept::default(),
+                    text,
+                    shown: true,
+                })
+            })
+            .unwrap()
+        });
+        frames(cx, handle);
+        (handle, view)
+    }
+
+    /// Let parsing land and draw a couple of frames.
+    fn frames(cx: &mut gpui_kit::TestAppContext, handle: gpui_kit::AnyWindowHandle) {
+        use gpui_kit::test::TestWindowExt as _;
+        for _ in 0..2 {
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+    }
+
+    fn has(cx: &mut gpui_kit::TestAppContext, handle: gpui_kit::AnyWindowHandle, id: &str) -> bool {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update_window(handle, |_, window, _| {
+            window
+                .try_find(gpui_kit::SharedString::from(id.to_string()))
+                .is_some()
+        })
+        .unwrap()
+    }
+
+    fn height(
+        cx: &mut gpui_kit::TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        id: &str,
+    ) -> gpui_kit::Pixels {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update_window(handle, |_, window, _| {
+            window
+                .find(gpui_kit::SharedString::from(id.to_string()))
+                .bounds()
+                .size
+                .height
+        })
+        .unwrap()
+    }
+
+    fn set_text(cx: &mut gpui_kit::TestAppContext, view: &gpui_kit::Entity<Doc>, text: &str) {
+        let text: gpui_kit::SharedString = text.to_string().into();
+        cx.update(|cx| {
+            view.update(cx, |d, cx| {
+                d.text = text;
+                cx.notify();
+            })
+        });
+    }
+
+    /// Spec: "Flowchart in a reply" and "Other languages untouched".
+    #[gpui_kit::test]
+    fn mermaid_fence_is_a_diagram_and_other_fences_are_code(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _view) = open_doc(cx, FLOW);
+        assert!(has(cx, handle, &format!("{BLOCK}-card")));
+        assert!(
+            !has(cx, handle, "code-header"),
+            "no code block for a diagram"
+        );
+        let (handle, _view) = open_doc(cx, "```rust\nfn main() {}\n```");
+        assert!(has(cx, handle, "code-header"));
+        assert!(!has(cx, handle, &format!("{BLOCK}-card")));
+        // Language is case-insensitive.
+        let (handle, _view) = open_doc(cx, &FLOW.replace("mermaid", "Mermaid"));
+        assert!(has(cx, handle, &format!("{BLOCK}-card")));
+    }
+
+    /// Spec: "Diagram streams in".
+    #[gpui_kit::test]
+    fn diagram_streams_in_when_the_fence_closes(cx: &mut gpui_kit::TestAppContext) {
+        let open = "```mermaid\nflowchart LR\n  a --> b";
+        let (handle, view) = open_doc(cx, open);
+        assert!(has(cx, handle, "code-header"), "open fence stays code");
+        assert!(!has(cx, handle, &format!("{BLOCK}-card")));
+        set_text(cx, &view, &format!("{open}\n```"));
+        frames(cx, handle);
+        assert!(
+            has(cx, handle, &format!("{BLOCK}-card")),
+            "closed fence draws"
+        );
+        assert!(!has(cx, handle, "code-header"));
+        // The diagram's height is final as soon as it is first laid out.
+        let first = height(cx, handle, &format!("{BLOCK}-card"));
+        frames(cx, handle);
+        assert_eq!(first, height(cx, handle, &format!("{BLOCK}-card")));
+    }
+
+    /// Spec: "Copy the source".
+    #[gpui_kit::test]
+    fn copy_puts_the_source_on_the_clipboard(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (handle, _view) = open_doc(cx, FLOW);
+        cx.update_window(handle, |_, window, cx| {
+            window.click(gpui_kit::SharedString::from(format!("{BLOCK}-copy")), cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).unwrap(),
+                "flowchart LR; a --> b"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Spec: "Toggle to source" and "Scroll away and back".
+    #[gpui_kit::test]
+    fn source_toggle_survives_the_row_being_rebuilt(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (handle, view) = open_doc(cx, FLOW);
+        let card = format!("{BLOCK}-card");
+        let diagram = height(cx, handle, &card);
+        let click = |cx: &mut gpui_kit::TestAppContext, what: &str| {
+            let id = gpui_kit::SharedString::from(format!("{BLOCK}-{what}"));
+            cx.update_window(handle, |_, window, cx| window.click(id, cx))
+                .unwrap();
+            frames(cx, handle);
+        };
+        click(cx, "source");
+        let source = height(cx, handle, &card);
+        assert_ne!(source, diagram, "source replaces the diagram");
+        // The row scrolls out of view (not built) and back.
+        for shown in [false, true] {
+            cx.update(|cx| {
+                view.update(cx, |d, cx| {
+                    d.shown = shown;
+                    cx.notify();
+                })
+            });
+            frames(cx, handle);
+        }
+        assert_eq!(height(cx, handle, &card), source, "still showing source");
+        click(cx, "diagram");
+        assert_eq!(height(cx, handle, &card), diagram);
+    }
+
+    /// A flowchart far wider than the 600px column.
+    fn wide() -> String {
+        let nodes: Vec<String> = (0..24).map(|i| format!("node{i}")).collect();
+        format!("```mermaid\nflowchart LR; {}\n```", nodes.join(" --> "))
+    }
+
+    fn width(
+        cx: &mut gpui_kit::TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        id: &str,
+    ) -> gpui_kit::Pixels {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update_window(handle, |_, window, _| {
+            window
+                .find(gpui_kit::SharedString::from(id.to_string()))
+                .bounds()
+                .size
+                .width
+        })
+        .unwrap()
+    }
+
+    fn click(cx: &mut gpui_kit::TestAppContext, handle: gpui_kit::AnyWindowHandle, what: &str) {
+        use gpui_kit::test::TestWindowExt as _;
+        let id = gpui_kit::SharedString::from(format!("{BLOCK}-{what}"));
+        cx.update_window(handle, |_, window, cx| window.click(id, cx))
+            .unwrap();
+        frames(cx, handle);
+    }
+
+    /// A diagram wider than the card shrinks to fit it, inside the card's
+    /// flex row, instead of overflowing and being cut off.
+    #[gpui_kit::test]
+    fn wide_diagram_fits_the_card(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _view) = open_doc(cx, &wide());
+        let card = width(cx, handle, &format!("{BLOCK}-card"));
+        let fitted = width(cx, handle, &format!("{BLOCK}-fitted"));
+        // Card, minus its border and the body's padding.
+        let room = card - gpui_kit::px(2. + 24.);
+        assert!(fitted > gpui_kit::px(100.), "{fitted:?}");
+        assert!(
+            fitted <= room + gpui_kit::px(1.),
+            "{fitted:?} overflows {room:?}"
+        );
+    }
+
+    /// Spec: "Syntax error" and "Unsupported type": the source with a note,
+    /// no toggle, and copy still copies it.
+    #[gpui_kit::test]
+    fn undrawable_diagrams_fall_back_to_source(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        for body in ["flowchart LR; a -->", "notadiagram\n  a b"] {
+            let (handle, _view) = open_doc(cx, &format!("```mermaid\n{body}\n```"));
+            assert!(has(cx, handle, &format!("{BLOCK}-card")), "{body}");
+            assert!(has(cx, handle, &format!("{BLOCK}-note")), "{body}");
+            assert!(
+                !has(cx, handle, &format!("{BLOCK}-source")),
+                "toggle hidden: {body}"
+            );
+            cx.update_window(handle, |_, window, cx| {
+                window.click(gpui_kit::SharedString::from(format!("{BLOCK}-copy")), cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|c| c.text()).unwrap(),
+                    body
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    /// Zoom and pan (spec: "Zoom a diagram", "Pan a zoomed diagram", "Zoom
+    /// and pan leave the transcript alone"), in the real card inside a
+    /// transcript `list`.
+    mod zoom {
+        use super::{BLOCK, FLOW, click, frames, has, height, width};
+        use crate::ui::mermaid;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{
+            AnyWindowHandle, AppContext as _, Bounds, Context, Entity, InputEvent as _,
+            IntoElement as _, ListAlignment, ListOffset, ListState, Modifiers, MouseMoveEvent,
+            ParentElement as _, PinchEvent, Pixels, Render, ScrollDelta, ScrollEvent, SharedString,
+            Styled as _, TestAppContext, TouchPhase, Window, div, list, point, px,
+        };
+
+        /// A transcript: a short row, the reply holding the diagram, then
+        /// rows tall enough to scroll.
+        struct Transcript {
+            state: ListState,
+            kept: super::super::Kept,
+            text: SharedString,
+        }
+
+        impl Render for Transcript {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                cx: &mut Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                let p = *crate::theme::palette(cx);
+                let (kept, text) = (self.kept.clone(), self.text.clone());
+                list(self.state.clone(), move |ix, _, _| {
+                    let key = format!("row-{ix}");
+                    kept.begin_row(&key);
+                    let row = match ix {
+                        0 => div().h(px(40.)).w_full().into_any_element(),
+                        1 => div()
+                            .w_full()
+                            .child(kept.markdown("m", text.clone(), &p))
+                            .into_any_element(),
+                        _ => div().h(px(400.)).w_full().into_any_element(),
+                    };
+                    kept.end_row();
+                    row
+                })
+                .size_full()
+            }
+        }
+
+        struct Open {
+            handle: AnyWindowHandle,
+            state: ListState,
+            kept: super::super::Kept,
+            _view: Entity<Transcript>,
+        }
+
+        fn open(cx: &mut TestAppContext, text: &str) -> Open {
+            cx.update(|cx| {
+                gpui_kit::init(cx);
+                crate::theme::apply(true, "orange", cx);
+            });
+            let state = ListState::new(6, ListAlignment::Top, px(1200.));
+            let kept = super::super::Kept::default();
+            let text: SharedString = text.to_string().into();
+            let (handle, view) = cx.update(|cx| {
+                let (state, kept) = (state.clone(), kept.clone());
+                gpui_kit::open_window(Default::default(), cx, |_, cx| {
+                    cx.new(|_| Transcript { state, kept, text })
+                })
+                .unwrap()
+            });
+            frames(cx, handle);
+            Open {
+                handle,
+                state,
+                kept,
+                _view: view,
+            }
+        }
+
+        impl Open {
+            fn frames(&self, cx: &mut TestAppContext) {
+                frames(cx, self.handle);
+            }
+
+            /// This diagram's zoom and pan.
+            fn view(&self) -> mermaid::ViewHandle {
+                let views = self.kept.0.borrow().sources.lock().unwrap().views.clone();
+                mermaid::ViewHandle::new(views, BLOCK)
+            }
+
+            /// The diagram area.
+            fn area(&self, cx: &mut TestAppContext) -> Bounds<Pixels> {
+                cx.update_window(self.handle, |_, window, _| {
+                    window
+                        .find(SharedString::from(format!("{BLOCK}-fitted")))
+                        .bounds()
+                })
+                .unwrap()
+            }
+
+            fn centre(&self, cx: &mut TestAppContext) -> gpui_kit::Point<Pixels> {
+                self.area(cx).center()
+            }
+
+            fn card_height(&self, cx: &mut TestAppContext) -> Pixels {
+                height(cx, self.handle, &format!("{BLOCK}-card"))
+            }
+
+            fn move_to(&self, cx: &mut TestAppContext, position: gpui_kit::Point<Pixels>) {
+                cx.update_window(self.handle, |_, window, cx| {
+                    let modifiers = window.modifiers();
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            }
+
+            fn wheel(
+                &self,
+                cx: &mut TestAppContext,
+                position: gpui_kit::Point<Pixels>,
+                dy: f32,
+                modifiers: Modifiers,
+            ) {
+                self.move_to(cx, position);
+                cx.update_window(self.handle, |_, window, cx| {
+                    window.dispatch_event(
+                        ScrollEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                            modifiers,
+                            ..Default::default()
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            }
+
+            fn pinch(
+                &self,
+                cx: &mut TestAppContext,
+                position: gpui_kit::Point<Pixels>,
+                delta: f32,
+            ) {
+                self.move_to(cx, position);
+                cx.update_window(self.handle, |_, window, cx| {
+                    window.dispatch_event(
+                        PinchEvent {
+                            position,
+                            delta,
+                            modifiers: Modifiers::default(),
+                            phase: TouchPhase::Moved,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            }
+
+            fn secondary(&self, cx: &mut TestAppContext) -> Modifiers {
+                cx.update(|cx| Modifiers::secondary_key(cx))
+            }
+        }
+
+        fn near(a: f32, b: f32) -> bool {
+            (a - b).abs() < 0.01
+        }
+
+        /// Spec: "Modifier-wheel zoom".
+        #[gpui_kit::test]
+        fn modifier_wheel_zooms_about_the_pointer(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let area = t.area(cx);
+            let rel = point(area.size.width * 0.3, area.size.height * 0.4);
+            let cmd = t.secondary(cx);
+            t.wheel(cx, area.origin + rel, 120., cmd);
+            let vp = t.view().viewport();
+            assert!(vp.zoom > 1.0, "{vp:?}");
+            // The diagram point that was under the pointer still is.
+            let (rx, ry) = (f32::from(rel.x), f32::from(rel.y));
+            assert!(near((rx - vp.x) / vp.zoom, rx), "{vp:?}");
+            assert!(near((ry - vp.y) / vp.zoom, ry), "{vp:?}");
+            // Scrolling down zooms back out.
+            t.wheel(cx, area.origin + rel, -1000., cmd);
+            assert_eq!(t.view().viewport(), mermaid::Viewport::default());
+        }
+
+        /// Spec: "Pinch zoom".
+        #[gpui_kit::test]
+        fn pinch_zooms_in_around_the_pinch_point(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let area = t.area(cx);
+            let rel = point(area.size.width * 0.7, area.size.height * 0.5);
+            t.pinch(cx, area.origin + rel, 0.5);
+            let vp = t.view().viewport();
+            assert!(near(vp.zoom, 1.5), "{vp:?}");
+            assert!(near((f32::from(rel.x) - vp.x) / vp.zoom, f32::from(rel.x)));
+            assert!(near((f32::from(rel.y) - vp.y) / vp.zoom, f32::from(rel.y)));
+        }
+
+        /// Spec: "Plain scroll passes through": the transcript scrolls, the
+        /// diagram does not change.
+        #[gpui_kit::test]
+        fn plain_scroll_passes_through_a_zoomed_diagram(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            t.view().zoom_by(2.0);
+            t.frames(cx);
+            let zoomed = t.view().viewport();
+            assert_eq!(zoomed.zoom, 2.0);
+            let before = t.state.logical_scroll_top();
+            let at = t.centre(cx);
+            t.wheel(cx, at, -30., Modifiers::default());
+            assert_ne!(t.state.logical_scroll_top(), before, "the list scrolled");
+            assert_eq!(t.view().viewport(), zoomed);
+        }
+
+        /// Spec: "Zooming does not scroll the transcript".
+        #[gpui_kit::test]
+        fn zooming_does_not_scroll_the_transcript(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            // The harness scrolls: a plain wheel moves the list.
+            let at = t.centre(cx);
+            t.wheel(cx, at, -20., Modifiers::default());
+            let top = t.state.logical_scroll_top();
+            assert_ne!(top, ListOffset::default());
+            let cmd = t.secondary(cx);
+            let at = t.centre(cx);
+            t.wheel(cx, at, 80., cmd);
+            assert_eq!(t.state.logical_scroll_top(), top, "Cmd+wheel");
+            let zoomed = t.view().viewport().zoom;
+            assert!(zoomed > 1.0);
+            let at = t.centre(cx);
+            t.pinch(cx, at, 0.2);
+            assert_eq!(t.state.logical_scroll_top(), top, "pinch");
+            assert!(t.view().viewport().zoom > zoomed);
+        }
+
+        /// Spec: "Drag to pan": the diagram follows the pointer, no text is
+        /// selected, and it stops at its edges.
+        #[gpui_kit::test]
+        fn dragging_pans_within_the_edges_without_selecting(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let view = t.view();
+            view.zoom_by(3.0);
+            t.frames(cx);
+            let area = t.area(cx);
+            let (w, h) = (f32::from(area.size.width), f32::from(area.size.height));
+            let from = area.center();
+            let selected = |cx: &mut TestAppContext| {
+                cx.update_window(t.handle, |_, window, cx| {
+                    gpui_kit::base::TextSelection::selected_text(window, cx)
+                })
+                .unwrap()
+            };
+            let drag = |cx: &mut TestAppContext, dx: f32, dy: f32| {
+                cx.update_window(t.handle, |_, window, cx| {
+                    window.drag(from, from + point(px(dx), px(dy)), cx)
+                })
+                .unwrap();
+            };
+            let start = view.viewport();
+            drag(cx, -10., -5.);
+            let moved = view.viewport();
+            assert!(near(moved.x, start.x - 10.) && near(moved.y, start.y - 5.));
+            assert_eq!(moved.zoom, 3.0);
+            assert!(selected(cx).trim().is_empty(), "{:?}", selected(cx));
+            // Far past either edge stops at the edge.
+            drag(cx, -10_000., -10_000.);
+            let end = view.viewport();
+            assert!(
+                near(end.x, w - w * 3.0) && near(end.y, h - h * 3.0),
+                "{end:?}"
+            );
+            drag(cx, 10_000., 10_000.);
+            let top = view.viewport();
+            assert!(near(top.x, 0.) && near(top.y, 0.), "{top:?}");
+            assert!(selected(cx).trim().is_empty());
+        }
+
+        /// Spec: "Back to Fit", by the button and by double-click.
+        #[gpui_kit::test]
+        fn fit_button_and_double_click_return_to_fit(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let view = t.view();
+            view.zoom_by(2.0);
+            t.frames(cx);
+            click(cx, t.handle, "fit");
+            assert_eq!(view.viewport(), mermaid::Viewport::default());
+            view.zoom_by(2.0);
+            t.frames(cx);
+            assert_eq!(view.viewport().zoom, 2.0);
+            cx.update_window(t.handle, |_, window, cx| {
+                window.double_click(SharedString::from(format!("{BLOCK}-fitted")), cx)
+            })
+            .unwrap();
+            assert_eq!(view.viewport(), mermaid::Viewport::default());
+        }
+
+        /// Spec: "Zoom limits", and the controls are hidden in Source mode
+        /// and in the fallback.
+        #[gpui_kit::test]
+        fn zoom_controls_stop_at_the_limits_and_hide_with_the_diagram(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let view = t.view();
+            let controls = ["zoom-out", "zoom-in", "fit", "zoom"];
+            for what in controls {
+                assert!(has(cx, t.handle, &format!("{BLOCK}-{what}")), "{what}");
+            }
+            // At Fit: out and Fit are off, in is on.
+            assert_eq!(view.can_zoom(), (false, true));
+            click(cx, t.handle, "zoom-out");
+            click(cx, t.handle, "fit");
+            assert_eq!(view.viewport(), mermaid::Viewport::default());
+            // In steps by 25% until the maximum, where it is off.
+            click(cx, t.handle, "zoom-in");
+            assert!(near(view.viewport().zoom, 1.25), "{:?}", view.viewport());
+            for _ in 0..12 {
+                click(cx, t.handle, "zoom-in");
+            }
+            let fit = view.metrics().expect("measured").fit;
+            let max = mermaid::max_zoom(fit);
+            assert!(near(view.viewport().zoom, max), "{:?}", view.viewport());
+            assert_eq!(view.can_zoom(), (true, false));
+            click(cx, t.handle, "zoom-in");
+            assert!(near(view.viewport().zoom, max));
+            click(cx, t.handle, "zoom-out");
+            assert!(view.viewport().zoom < max);
+
+            // Source mode hides them.
+            click(cx, t.handle, "source");
+            for what in controls {
+                assert!(!has(cx, t.handle, &format!("{BLOCK}-{what}")), "{what}");
+            }
+            click(cx, t.handle, "diagram");
+            assert!(has(cx, t.handle, &format!("{BLOCK}-zoom-in")));
+
+            // So does the fallback.
+            let t = open(cx, "```mermaid\nflowchart LR; a -->\n```");
+            assert!(has(cx, t.handle, &format!("{BLOCK}-note")));
+            for what in controls {
+                assert!(!has(cx, t.handle, &format!("{BLOCK}-{what}")), "{what}");
+            }
+        }
+
+        /// Spec: "Zoom keeps the row height".
+        #[gpui_kit::test]
+        fn zooming_keeps_the_card_and_the_rows_below(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let card = t.card_height(cx);
+            let below = t.state.bounds_for_item(2);
+            let area = t.area(cx);
+            let cmd = t.secondary(cx);
+            t.wheel(cx, area.center(), 200., cmd);
+            click(cx, t.handle, "zoom-in");
+            assert!(t.view().viewport().zoom > 1.5);
+            t.frames(cx);
+            assert_eq!(t.area(cx), area, "the area keeps its size");
+            assert_eq!(t.card_height(cx), card);
+            assert_eq!(t.state.bounds_for_item(2), below);
+            click(cx, t.handle, "fit");
+            assert_eq!(t.card_height(cx), card);
+        }
+
+        /// Spec: "Zoomed diagram scrolls away and back".
+        #[gpui_kit::test]
+        fn zoom_and_pan_survive_the_row_scrolling_away(cx: &mut TestAppContext) {
+            let t = open(cx, FLOW);
+            let view = t.view();
+            view.zoom_by(2.0);
+            t.frames(cx);
+            let from = t.centre(cx);
+            cx.update_window(t.handle, |_, window, cx| {
+                window.drag(from, from + point(px(-12.), px(-6.)), cx)
+            })
+            .unwrap();
+            let shown = view.viewport();
+            assert!(
+                near(shown.zoom, 2.0) && shown.x < 0. && shown.y < 0.,
+                "{shown:?}"
+            );
+            for item_ix in [5, 0] {
+                t.state.scroll_to(ListOffset {
+                    item_ix,
+                    offset_in_item: px(0.),
+                });
+                t.frames(cx);
+            }
+            assert!(has(cx, t.handle, &format!("{BLOCK}-card")));
+            assert_eq!(view.viewport(), shown);
+        }
+
+        /// Spec: "Tall diagram": the area is 480px tall and the whole diagram
+        /// is visible, at the scale that makes it so.
+        #[gpui_kit::test]
+        fn tall_diagram_fits_the_height_cap(cx: &mut TestAppContext) {
+            let nodes: Vec<String> = (0..20).map(|i| format!("step{i}")).collect();
+            let source = format!("flowchart TD; {}", nodes.join(" --> "));
+            let t = open(cx, &format!("```mermaid\n{source}\n```"));
+            let natural = cx
+                .update_window(t.handle, |_, window, cx| {
+                    mermaid::scene(&source, window, cx)
+                })
+                .unwrap()
+                .expect("lays out");
+            let (w, h) = (natural.width as f32, natural.height as f32);
+            assert!(h > 480., "the diagram is taller than the cap: {h}");
+            let area = t.area(cx);
+            let scale = 480. / h;
+            assert!(near(f32::from(area.size.height), 480.), "{:?}", area.size);
+            assert!(
+                (f32::from(area.size.width) - w * scale).abs() < 0.6,
+                "{:?} vs {}",
+                area.size,
+                w * scale
+            );
+            assert!(near(t.view().metrics().unwrap().fit, scale));
+            // The width is not what limits it.
+            assert!(width(cx, t.handle, &format!("{BLOCK}-card")) > area.size.width);
+        }
     }
 
     #[test]
