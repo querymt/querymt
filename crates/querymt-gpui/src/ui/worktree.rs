@@ -36,19 +36,21 @@ impl QmtApp {
         cx: &mut Context<Self>,
     ) {
         let store = self.store.read(cx);
+        let Some(skey) = self.main_key(cx) else {
+            return;
+        };
         let allowed = match action {
-            WorktreeAction::Create => store.can_create_worktree(),
-            WorktreeAction::Handoff => store.can_handoff_worktree(),
+            WorktreeAction::Create => store.can_create_worktree(&skey, cx),
+            WorktreeAction::Handoff => store.can_handoff_worktree(&skey, cx),
         };
         if !allowed {
             return;
         }
-        let source = store
-            .session
-            .as_ref()
+        let source = self
+            .main_view(cx)
             .map(|v| v.title.clone())
             .unwrap_or_default();
-        let summary_supported = store.handoff_summary_supported();
+        let summary_supported = store.handoff_summary_supported(&skey, cx);
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
@@ -72,7 +74,7 @@ impl QmtApp {
             ));
         }
         name.update(cx, |s, cx| s.focus(window, cx));
-        self.session_menu_open = false;
+        self.pane.update(cx, |pane, _| pane.menu_open = false);
         self.worktree = Some(WorktreeDialog {
             action,
             source,
@@ -111,10 +113,12 @@ impl QmtApp {
         if options.problem(action).is_some() {
             return;
         }
-        let Some(task) = self
-            .store
-            .update(cx, |s, cx| s.start_worktree_action(action, options, cx))
-        else {
+        let Some(skey) = self.main_key(cx) else {
+            return;
+        };
+        let Some(task) = self.store.update(cx, |s, cx| {
+            s.start_worktree_action(&skey, action, options, cx)
+        }) else {
             if let Some(d) = self.worktree.as_mut() {
                 d.error = Some("This can't be done for the session right now.".into());
             }
@@ -389,9 +393,13 @@ mod tests {
             }),
             ..Default::default()
         }];
-        store.session = Some(SessionView::new("test-agent", "s", "/wt/s", "Source"));
+        let main_view = SessionView::new("test-agent", "s", "/wt/s", "Source");
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -476,7 +484,7 @@ mod tests {
             let app = h.app.read(cx);
             assert!(app.worktree.is_none());
             let store = app.store.read(cx);
-            let view = store.session.as_ref().unwrap();
+            let view = app.main_view(cx).unwrap();
             assert_eq!(
                 (
                     view.session_id.as_str(),
@@ -524,7 +532,7 @@ mod tests {
             let app = h.app.read(cx);
             assert!(app.worktree.is_none());
             let store = app.store.read(cx);
-            let view = store.session.as_ref().unwrap();
+            let view = app.main_view(cx).unwrap();
             assert_eq!(
                 (view.session_id.as_str(), view.title.as_str()),
                 ("h1", "Source")
@@ -560,8 +568,10 @@ mod tests {
                     .starts_with("Stop the running turn")
             );
             let store = app.store.read(cx);
-            assert_eq!(store.session.as_ref().unwrap().session_id, "s");
-            assert!(!store.worktree_pending());
+            assert_eq!(app.main_view(cx).unwrap().session_id, "s");
+            assert!(
+                !store.worktree_pending(&crate::session::open::SessionKey::new("test-agent", "s"))
+            );
         });
     }
 
@@ -581,7 +591,7 @@ mod tests {
                     rt.children.entry("p".into()).or_default().sessions = vec![child];
                     assert!(s.session_summary("test-agent", "s").is_some());
                 });
-                app.session_details_open = true;
+                app.pane.update(cx, |pane, _| pane.details_open = true);
             });
             window.render_frame(cx);
         })
@@ -598,12 +608,20 @@ mod tests {
         let h = harness(cx);
         cx.update(|cx| {
             let store = h.app.read(cx).store.clone();
-            store.update(cx, |s, _| {
+            store.update(cx, |s, cx| {
                 // After a restart the child is only in its parent's list.
                 let rt = s.runtime_mut_for_test("test-agent");
                 let child = rt.sessions.remove(0);
                 rt.children.entry("p".into()).or_default().sessions = vec![child];
-                assert!(s.can_create_worktree() && s.can_handoff_worktree());
+                assert!(
+                    s.can_create_worktree(
+                        &crate::session::open::SessionKey::new("test-agent", "s"),
+                        cx
+                    ) && s.can_handoff_worktree(
+                        &crate::session::open::SessionKey::new("test-agent", "s"),
+                        cx
+                    )
+                );
             });
         });
     }
@@ -615,16 +633,23 @@ mod tests {
         let h = harness(cx);
         cx.update_window(h.handle, |_, window, cx| {
             let store = h.app.read(cx).store.clone();
-            store.update(cx, |s, _| {
-                assert!(s.can_create_worktree() && s.can_handoff_worktree());
-                s.session.as_mut().unwrap().access = crate::session::SessionAccess::parse(
-                    &json!({ "_meta": { "querymt": { "sessionAccess": {
-                        "mode": "read_only", "reason": "owner_transferred", "ownerSessionId": "h1"
-                    } } } }),
-                );
-                assert!(!s.can_create_worktree() && !s.can_handoff_worktree());
-                assert!(!s.session_supports_fork() && !s.session_supports_undo());
+            let session = h.app.read(cx).pane.read(cx).session().cloned().unwrap();
+            let key = crate::session::open::SessionKey::new("test-agent", "s");
+            store.update(cx, |s, cx| {
+                assert!(s.can_create_worktree(&key, cx) && s.can_handoff_worktree(&key, cx));
             });
+            session.update(cx, |o, _| {
+                o.view.access = crate::session::SessionAccess::parse(&json!({
+                    "_meta": { "querymt": { "sessionAccess": {
+                        "mode": "read_only", "reason": "owner_transferred", "ownerSessionId": "h1"
+                    } } }
+                }));
+            });
+            store.update(cx, |s, cx| {
+                assert!(!s.can_create_worktree(&key, cx) && !s.can_handoff_worktree(&key, cx));
+                assert!(!s.session_supports_fork(&key, cx));
+            });
+            assert!(!session.read(cx).supports_undo());
             h.app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
                 app.open_worktree_dialog(WorktreeAction::Create, window, cx);

@@ -82,7 +82,7 @@ fn matches_refinements(s: &SessionSummary, f: &SessionFilters, needs_input: bool
     runtime && location
 }
 
-fn matches_query(s: &SessionSummary, agent_name: &str, query: &str) -> bool {
+pub(crate) fn matches_query(s: &SessionSummary, agent_name: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }

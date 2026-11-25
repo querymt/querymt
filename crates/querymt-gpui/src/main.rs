@@ -13,6 +13,8 @@
 
 mod highlight;
 mod profile_templates;
+#[cfg(not(target_family = "wasm"))]
+mod quick;
 mod rpc;
 mod rpc_log;
 mod search;
@@ -31,9 +33,23 @@ use gpui_kit::*;
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
+    // `--quick` toggles the quick panel of the running instance, or starts the
+    // app with only the panel. Without the panel enabled it is a normal start.
+    let quick = std::env::args().skip(1).any(|arg| arg == "--quick");
+    let panel_enabled = store::persisted_quick_prefs().enabled;
+    if panel_enabled {
+        let command = if quick {
+            quick::instance::Command::Quick
+        } else {
+            quick::instance::Command::Show
+        };
+        if quick::instance::forward(&quick::instance::Endpoint::for_user(), command) {
+            return;
+        }
+    }
     telemetry::init();
     let app = gpui_kit::application().with_assets(AppAssets(gpui_kit::assets::AllAssets));
-    run(app);
+    run(app, quick && panel_enabled);
 }
 
 gpui_kit::actions!(querymt, [Quit]);
@@ -126,8 +142,9 @@ fn install_fonts(cx: &mut App) {
 }
 
 /// Shared app bootstrap for every target.
-pub fn run(app: Application) {
-    app.run(|cx: &mut App| {
+/// `panel_only`: open the quick panel and no main window (`--quick`).
+pub fn run(app: Application, panel_only: bool) {
+    app.run(move |cx: &mut App| {
         // Must run before any gpui-component widget is used.
         gpui_kit::init(cx);
         // IBM Plex is the QueryMT typeface; embed it so both targets match.
@@ -166,37 +183,26 @@ pub fn run(app: Application) {
         ]);
         ui::bind_keys(cx);
 
-        let options = if cfg!(target_family = "wasm") {
-            WindowOptions::default()
-        } else {
-            let bounds = Bounds::centered(None, size(px(1320.), px(860.)), cx);
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(900.), px(560.))),
-                // Keep our custom header; the upstream Linux frame needs a
-                // transparent surface around it for its rounded corners and shadow.
-                titlebar: Some(TitlebarOptions {
-                    title: Some("QueryMT".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(14.), px(15.))),
-                }),
-                app_owns_titlebar_drag: true,
-                window_decorations: Some(WindowDecorations::Client),
-                window_background: if cfg!(target_os = "linux") {
-                    WindowBackgroundAppearance::Transparent
-                } else {
-                    WindowBackgroundAppearance::Opaque
-                },
-                app_id: Some("querymt-gpui".into()),
-                ..Default::default()
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = panel_only;
+            ui::open_main_window(&store, cx).expect("failed to open window");
+            cx.activate(true);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let main = if panel_only {
+                None
+            } else {
+                let main = ui::open_main_window(&store, cx).expect("failed to open window");
+                cx.activate(true);
+                Some(main)
+            };
+            let host = quick::QuickHost::install(store.clone(), main, cx);
+            if panel_only {
+                host.update(cx, |host, cx| host.show(cx));
             }
-        };
-
-        gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| ui::QmtApp::new(store, window, cx))
-        })
-        .expect("failed to open window");
-        cx.activate(true);
+        }
     });
 }
 
@@ -331,6 +337,6 @@ mod web {
         gpui_kit::platform::web_init();
         // Single-threaded: works on any static server, no COOP/COEP headers.
         let app = gpui_kit::platform::single_threaded_web().with_assets(super::AppAssets(WebIcons));
-        super::run(app);
+        super::run(app, false);
     }
 }

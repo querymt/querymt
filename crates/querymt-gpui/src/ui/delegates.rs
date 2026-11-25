@@ -11,6 +11,7 @@ use gpui_kit::*;
 use super::agents::modal_scrim;
 use super::kit::ButtonExt as _;
 use super::{QmtApp, kit};
+use crate::session::open::SessionKey;
 use crate::store::delegates::{Assignment, DelegateState, Orphan, REASONING, Route, RouteChange};
 use crate::store::find_model;
 use crate::theme::{Palette, palette};
@@ -27,15 +28,37 @@ pub(super) struct DelegateDialog {
 
 impl QmtApp {
     pub(super) fn open_delegate_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.session_options_open = false;
+        self.pane.update(cx, |pane, _| pane.options_open = false);
         self.delegates = DelegateDialog {
             open: true,
             picking: None,
         };
-        self.model_query
-            .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
-        self.store.update(cx, |s, cx| s.refresh_delegates(cx));
+        self.model_picker
+            .update(cx, |picker, cx| picker.clear_query(window, cx));
+        self.refresh_delegate_routes(cx);
         cx.notify();
+    }
+
+    /// The session the delegate dialog works on: the one in the main window.
+    fn session_key(&self, cx: &App) -> Option<SessionKey> {
+        self.main_key(cx)
+    }
+
+    fn refresh_delegate_routes(&mut self, cx: &mut Context<Self>) {
+        let Some(skey) = self.session_key(cx) else {
+            return;
+        };
+        self.store
+            .update(cx, |s, cx| s.refresh_delegates(&skey, cx));
+    }
+
+    fn route_delegate(&mut self, delegate: &str, change: RouteChange, cx: &mut Context<Self>) {
+        let Some(skey) = self.session_key(cx) else {
+            return;
+        };
+        self.store.update(cx, |s, cx| {
+            s.set_delegate_route(&skey, delegate, change, cx)
+        });
     }
 
     fn pick_delegate(
@@ -45,13 +68,13 @@ impl QmtApp {
         cx: &mut Context<Self>,
     ) {
         self.delegates.picking = agent;
-        self.model_query.update(cx, |s, cx| {
-            s.set_value(SharedString::default(), window, cx);
-            if self.delegates.picking.is_some() {
-                s.focus(window, cx);
+        let picking = self.delegates.picking.is_some();
+        self.model_picker.update(cx, |picker, cx| {
+            picker.clear_query(window, cx);
+            if picking {
+                picker.focus_query(window, cx);
             }
         });
-        self.reset_model_cursor(cx);
         cx.notify();
     }
 
@@ -61,11 +84,12 @@ impl QmtApp {
         if !self.delegates.open {
             return false;
         }
-        let busy = self
-            .store
-            .read(cx)
-            .delegate_state()
-            .is_some_and(|s| s.pending.is_some());
+        let busy = self.session_key(cx).is_some_and(|skey| {
+            self.store
+                .read(cx)
+                .delegate_state(&skey)
+                .is_some_and(|s| s.pending.is_some())
+        });
         if !busy && self.delegates.picking.take().is_none() {
             self.delegates.open = false;
         }
@@ -75,7 +99,8 @@ impl QmtApp {
     /// The model the picker shows as chosen while a delegate is open.
     pub(super) fn delegate_selected_key(&self, cx: &App) -> Option<Option<String>> {
         let agent = self.delegates.picking.as_ref()?;
-        let routes = self.store.read(cx).delegate_state()?.routes.as_ref()?;
+        let skey = self.session_key(cx)?;
+        let routes = self.store.read(cx).delegate_state(&skey)?.routes.as_ref()?;
         Some(
             routes
                 .assignments
@@ -92,7 +117,7 @@ impl QmtApp {
             return false;
         };
         let store = self.store.read(cx);
-        let Some(owner) = store.session.as_ref().map(|v| v.agent_id.clone()) else {
+        let Some(owner) = self.main_key(cx).map(|k| k.agent.to_string()) else {
             return true;
         };
         let Some(model) = find_model(store.models(&owner), key) else {
@@ -102,8 +127,7 @@ impl QmtApp {
             route: Some(Route::of(model)),
             reasoning: None,
         };
-        self.store
-            .update(cx, |s, cx| s.set_delegate_route(&agent, change, cx));
+        self.route_delegate(&agent, change, cx);
         true
     }
 
@@ -111,8 +135,14 @@ impl QmtApp {
     pub(super) fn delegate_recent_models(&self, cx: &App) -> Option<Vec<crate::store::Model>> {
         let agent = self.delegates.picking.as_ref()?;
         let store = self.store.read(cx);
-        let owner = store.session.as_ref()?.agent_id.clone();
-        let profile = store.delegate_state()?.routes.as_ref()?.profile_id.clone();
+        let skey = self.main_key(cx)?;
+        let owner = skey.agent.to_string();
+        let profile = store
+            .delegate_state(&skey)?
+            .routes
+            .as_ref()?
+            .profile_id
+            .clone();
         Some(
             store
                 .recent_delegate_models(&owner, &profile, agent)
@@ -132,13 +162,13 @@ impl QmtApp {
         }
         let p = *palette(cx);
         let store = self.store.read(cx);
-        let owner = store.session.as_ref()?.agent_id.clone();
-        let state = store.delegate_state().cloned().unwrap_or_default();
+        let skey = self.main_key(cx)?;
+        let owner = skey.agent.to_string();
+        let state = store.delegate_state(&skey).cloned().unwrap_or_default();
         let routes = state.routes.clone();
         let models = store.models(&owner).to_vec();
-        let reasoning_label = store
-            .session
-            .as_ref()
+        let reasoning_label = self
+            .main_view(cx)
             .and_then(|v| v.reasoning_option())
             .map(|r| r.current_label())
             .filter(|l| !l.is_empty());
@@ -249,9 +279,7 @@ impl QmtApp {
                                         route: None,
                                         reasoning: None,
                                     };
-                                    this.store.update(cx, |s, cx| {
-                                        s.set_delegate_route(&agent, change, cx)
-                                    });
+                                    this.route_delegate(&agent, change, cx);
                                 }))
                             }),
                     )
@@ -276,9 +304,7 @@ impl QmtApp {
                                         route: None,
                                         reasoning: reasoning.then_some(None),
                                     };
-                                    this.store.update(cx, |s, cx| {
-                                        s.set_delegate_route(&agent, change, cx)
-                                    });
+                                    this.route_delegate(&agent, change, cx);
                                     this.pick_delegate(None, window, cx);
                                 }))
                             }),
@@ -392,7 +418,10 @@ impl QmtApp {
                     kit::flat_btn("delegate-conflict-ok", true, true, p)
                         .child("Dismiss")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.dismiss_delegate_conflict(cx))
+                            if let Some(skey) = this.session_key(cx) {
+                                this.store
+                                    .update(cx, |s, cx| s.dismiss_delegate_conflict(&skey, cx))
+                            }
                         })),
                 ),
             );
@@ -402,9 +431,7 @@ impl QmtApp {
                 notice(IconName::CircleAlert, p.danger, error, p).child(
                     kit::flat_btn("delegate-retry", true, true, p)
                         .child("Retry")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.refresh_delegates(cx))
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_delegate_routes(cx))),
                 ),
             );
         }
@@ -468,9 +495,7 @@ impl QmtApp {
                     })
                     .child("Refresh")
                     .when(!busy, |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.refresh_delegates(cx))
-                        }))
+                        el.on_click(cx.listener(|this, _, _, cx| this.refresh_delegate_routes(cx)))
                     }),
             );
         out = out.child(persistence);
@@ -689,8 +714,10 @@ impl QmtApp {
             .filter(|r| !store.models(owner).iter().any(|m| m.key() == r.key()))
             .cloned();
         let busy = state.pending.is_some() || !routes.editable;
-        let rows = self.model_rows(cx);
-        let search = self.model_search(owner, p, cx);
+        let rows = self.model_picker.update(cx, |picker, cx| picker.rows(cx));
+        let search = self
+            .model_picker
+            .update(cx, |picker, cx| picker.search(owner, p, cx));
         let reasoning = routes.reasoning_supported.then(|| {
             let current = a.reasoning.clone();
             let inherit_label = match inherited {
@@ -726,10 +753,13 @@ impl QmtApp {
                                 if selected {
                                     return;
                                 }
+                                let Some(skey) = this.session_key(cx) else {
+                                    return;
+                                };
                                 let route = this
                                     .store
                                     .read(cx)
-                                    .delegate_state()
+                                    .delegate_state(&skey)
                                     .and_then(|s| s.routes.as_ref())
                                     .and_then(|r| {
                                         r.assignments.iter().find(|x| x.agent_id == agent)
@@ -739,8 +769,7 @@ impl QmtApp {
                                     route,
                                     reasoning: Some(value.clone()),
                                 };
-                                this.store
-                                    .update(cx, |s, cx| s.set_delegate_route(&agent, change, cx));
+                                this.route_delegate(&agent, change, cx);
                             }))
                     },
                 )))
@@ -771,62 +800,12 @@ impl QmtApp {
                     .id("delegate-model-list")
                     .h(px(LIST_H))
                     .overflow_y_scroll()
-                    .track_scroll(&self.model_scroll)
+                    .track_scroll(&self.model_picker.read(cx).scroll_handle())
                     .when(busy, |el| el.opacity(0.6))
                     .children(rows)
                     .map(|el| self.smooth_scroll.region("delegate-model-list", el)),
             )
             .children(reasoning)
-    }
-
-    /// "Configure · N" of Session options, when the session has delegates.
-    pub(super) fn delegate_option_row(&self, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
-        let store = self.store.read(cx);
-        let view = store.session.as_ref()?;
-        if !store.supports_delegate_routing(&view.agent_id) {
-            return None;
-        }
-        let state = store.delegate_state().cloned().unwrap_or_default();
-        if !state.has_routes() {
-            return None;
-        }
-        let count = state.routes.as_ref().map_or(0, |r| r.assignments.len());
-        Some(
-            h_flex()
-                .gap_2()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().text_sm().font_medium().child("Delegate routing"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child("Model per delegate."),
-                        ),
-                )
-                .child(
-                    kit::flat_btn("open-delegates", !state.loading, true, p)
-                        .child(if state.loading {
-                            kit::spinner("delegates-row-spin", 13., p.muted).into_any_element()
-                        } else {
-                            kit::icon(IconName::Waypoints, 14., p.text).into_any_element()
-                        })
-                        .child(if state.error.is_some() {
-                            "Retry".to_string()
-                        } else if count > 0 {
-                            format!("Configure · {count}")
-                        } else {
-                            "Configure".to_string()
-                        })
-                        .when(!state.loading, |el| {
-                            el.on_click(cx.listener(|this, _, window, cx| {
-                                this.open_delegate_dialog(window, cx)
-                            }))
-                        }),
-                ),
-        )
     }
 }
 
@@ -912,15 +891,16 @@ mod tests {
             crate::theme::apply(true, "orange", cx);
         });
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| {
+            let store = cx.new(|cx| {
                 let mut store = crate::store::automations::schedule_ui_fixture();
-                store.session = Some(crate::session::SessionView::new(
+                store.install_main_for_test(crate::session::SessionView::new(
                     "test-agent",
                     "s",
                     "/w",
                     "Session",
-                ));
+                ), cx);
                 store.set_delegate_routes_for_test(
+                    &crate::session::open::SessionKey::new("test-agent", "s"),
                     &serde_json::from_str(
                         r#"{"session_id":"s","profile_id":"dev","revision":2,"durable":true,
                             "editable":true,"reasoning_effort_supported":true,
@@ -979,13 +959,8 @@ mod tests {
         });
         let mut store = crate::store::launch::models_fixture(0);
         let (_rpc, requests) = store.rpc_for_test("test-agent");
-        store.session = Some(crate::session::SessionView::new(
-            "test-agent",
-            "s",
-            "/w",
-            "Session",
-        ));
         store.set_delegate_routes_for_test(
+            &crate::session::open::SessionKey::new("test-agent", "s"),
             &serde_json::from_str(
                 r#"{"session_id":"s","profile_id":"dev","revision":2,"durable":true,
                     "editable":true,"reasoning_effort_supported":true,
@@ -997,7 +972,14 @@ mod tests {
             .unwrap(),
         );
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(
+                    crate::session::SessionView::new("test-agent", "s", "/w", "Session"),
+                    cx,
+                );
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })

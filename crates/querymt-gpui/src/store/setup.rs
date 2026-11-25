@@ -308,13 +308,12 @@ mod tests {
             }],
             prefs: Prefs::default(),
             launch: LaunchState::default(),
-            session: None,
+            open_sessions: Default::default(),
             requests: Vec::new(),
             runtime: HashMap::from([("a".to_string(), AgentRuntime { state, ..runtime })]),
             first_run: false,
             sidebar: Default::default(),
             early_commands: Default::default(),
-            _launch_task: None,
         }
     }
 

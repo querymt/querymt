@@ -12,6 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::chrome::HEADER_HEIGHT;
+use super::start::AttachmentHost;
 use super::{QmtApp, kit};
 use crate::session::{ItemKind, UserAttachment};
 use crate::store::Attachment;
@@ -29,7 +30,8 @@ const INSET: f32 = 16.;
 const TOP_BAR: f32 = 48.;
 const BOTTOM_BAR: f32 = 44.;
 
-pub(super) struct PreviewImage {
+#[derive(Clone)]
+pub(crate) struct PreviewImage {
     pub name: String,
     pub image: Arc<Image>,
 }
@@ -91,71 +93,16 @@ impl QmtApp {
         cx.notify();
     }
 
-    /// Open the composer's image attachment `id`, with the composer's images as the gallery.
-    fn open_composer_image(
+    /// Open the start page composer's image attachment `id`, with the
+    /// composer's images as the gallery.
+    pub(super) fn open_composer_image(
         &mut self,
-        session: bool,
         id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let list = if session {
-            &self.session_attachments
-        } else {
-            &self.attachments
-        };
-        let images: Vec<_> = list
-            .iter()
-            .filter_map(|a| {
-                Some((
-                    a.id.clone(),
-                    PreviewImage {
-                        name: a.name.clone(),
-                        image: a.image.clone()?,
-                    },
-                ))
-            })
-            .collect();
-        let index = images.iter().position(|(aid, _)| aid == id).unwrap_or(0);
-        self.open_preview(
-            images.into_iter().map(|(_, i)| i).collect(),
-            index,
-            window,
-            cx,
-        );
-    }
-
-    /// Open attachment `ix` of transcript item `key`; every inline image of
-    /// the session's user messages is the gallery, like the desktop.
-    pub(super) fn open_chat_image(
-        &mut self,
-        key: &str,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut images = Vec::new();
-        let mut start = 0;
-        if let Some(view) = self.store.read(cx).session.as_ref() {
-            for item in &view.items {
-                let ItemKind::User { attachments, .. } = &item.kind else {
-                    continue;
-                };
-                for (i, a) in attachments.iter().enumerate() {
-                    let Some(image) = user_attachment_image(a) else {
-                        continue;
-                    };
-                    if item.key == key && i == ix {
-                        start = images.len();
-                    }
-                    images.push(PreviewImage {
-                        name: a.name.clone(),
-                        image,
-                    });
-                }
-            }
-        }
-        self.open_preview(images, start, window, cx);
+        let (images, index) = composer_gallery(&self.attachments, id);
+        self.open_preview(images, index, window, cx);
     }
 
     fn preview_step(&mut self, offset: isize, cx: &mut Context<Self>) {
@@ -198,82 +145,6 @@ impl QmtApp {
             cx.notify();
         }
         open
-    }
-
-    /// Composer attachment strip: image thumbnails (click to preview) and file chips.
-    pub(super) fn attachment_strip(
-        &self,
-        session: bool,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        let list = if session {
-            &self.session_attachments
-        } else {
-            &self.attachments
-        };
-        (!list.is_empty()).then(|| {
-            h_flex()
-                .flex_wrap()
-                .items_end()
-                .gap_1p5()
-                .px_1()
-                .children(list.iter().map(|a| {
-                    let remove = {
-                        let id = a.id.clone();
-                        cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            let list = if session {
-                                &mut this.session_attachments
-                            } else {
-                                &mut this.attachments
-                            };
-                            list.retain(|a| a.id != id);
-                            cx.notify();
-                        })
-                    };
-                    let tip = format!("{} · {}", a.name, human_size(a.size));
-                    match a.image.clone() {
-                        Some(image) => {
-                            composer_thumb(a, image, session, tip, remove, p, cx).into_any_element()
-                        }
-                        None => h_flex()
-                            .id(kit::keyed("att-file", a.id.clone()))
-                            .gap_1p5()
-                            .pl_2()
-                            .pr_1()
-                            .py_0p5()
-                            .rounded(px(8.))
-                            .bg(p.card)
-                            .text_xs()
-                            .child(kit::icon(
-                                if a.is_image() {
-                                    IconName::Image
-                                } else {
-                                    IconName::FileText
-                                },
-                                13.,
-                                p.muted,
-                            ))
-                            .child(
-                                div()
-                                    .max_w(px(200.))
-                                    .truncate()
-                                    .font_medium()
-                                    .child(a.name.clone()),
-                            )
-                            .child(div().text_color(p.dim).child(human_size(a.size)))
-                            .child(remove_button(
-                                kit::keyed("rm-attach-file", a.id.clone()),
-                                18.,
-                                p.muted,
-                                remove,
-                                p,
-                            ))
-                            .into_any_element(),
-                    }
-                }))
-        })
     }
 
     /// Full-window lightbox; `None` while no preview is open.
@@ -496,16 +367,126 @@ impl QmtApp {
     }
 }
 
+/// The composer's images as a gallery, and the index of attachment `id` in it.
+pub(super) fn composer_gallery(list: &[Attachment], id: &str) -> (Vec<PreviewImage>, usize) {
+    let images: Vec<_> = list
+        .iter()
+        .filter_map(|a| {
+            Some((
+                a.id.clone(),
+                PreviewImage {
+                    name: a.name.clone(),
+                    image: a.image.clone()?,
+                },
+            ))
+        })
+        .collect();
+    let index = images.iter().position(|(aid, _)| aid == id).unwrap_or(0);
+    (images.into_iter().map(|(_, i)| i).collect(), index)
+}
+
+/// Every inline image of the user messages of `view` as a gallery, and the
+/// index of attachment `ix` of transcript item `key` in it (like the desktop).
+pub(super) fn chat_gallery(
+    view: &crate::session::SessionView,
+    key: &str,
+    ix: usize,
+) -> (Vec<PreviewImage>, usize) {
+    let mut images = Vec::new();
+    let mut start = 0;
+    for item in &view.items {
+        let ItemKind::User { attachments, .. } = &item.kind else {
+            continue;
+        };
+        for (i, a) in attachments.iter().enumerate() {
+            let Some(image) = user_attachment_image(a) else {
+                continue;
+            };
+            if item.key == key && i == ix {
+                start = images.len();
+            }
+            images.push(PreviewImage {
+                name: a.name.clone(),
+                image,
+            });
+        }
+    }
+    (images, start)
+}
+
+/// Composer attachment strip: image thumbnails (click to preview) and file chips.
+pub(super) fn attachment_strip<T: AttachmentHost>(
+    host: &T,
+    p: &Palette,
+    cx: &mut Context<T>,
+) -> Option<Div> {
+    let list = host.attachments();
+    (!list.is_empty()).then(|| {
+        h_flex()
+            .flex_wrap()
+            .items_end()
+            .gap_1p5()
+            .px_1()
+            .children(list.iter().map(|a| {
+                let remove = {
+                    let id = a.id.clone();
+                    cx.listener(move |this: &mut T, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.attachments_mut().retain(|a| a.id != id);
+                        cx.notify();
+                    })
+                };
+                let tip = format!("{} · {}", a.name, human_size(a.size));
+                match a.image.clone() {
+                    Some(image) => composer_thumb(a, image, tip, remove, p, cx).into_any_element(),
+                    None => h_flex()
+                        .id(kit::keyed("att-file", a.id.clone()))
+                        .gap_1p5()
+                        .pl_2()
+                        .pr_1()
+                        .py_0p5()
+                        .rounded(px(8.))
+                        .bg(p.card)
+                        .text_xs()
+                        .child(kit::icon(
+                            if a.is_image() {
+                                IconName::Image
+                            } else {
+                                IconName::FileText
+                            },
+                            13.,
+                            p.muted,
+                        ))
+                        .child(
+                            div()
+                                .max_w(px(200.))
+                                .truncate()
+                                .font_medium()
+                                .child(a.name.clone()),
+                        )
+                        .child(div().text_color(p.dim).child(human_size(a.size)))
+                        .child(remove_button(
+                            kit::keyed("rm-attach-file", a.id.clone()),
+                            18.,
+                            p.muted,
+                            remove,
+                            p,
+                        ))
+                        .into_any_element(),
+                }
+            }))
+    })
+}
+
 /// 56px image thumbnail with a corner remove button (desktop `session-image-preview`).
 #[allow(clippy::too_many_arguments)]
-fn composer_thumb(
+fn composer_thumb<T: AttachmentHost>(
     a: &Attachment,
     image: Arc<Image>,
-    session: bool,
     tip: String,
     remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     p: &Palette,
-    cx: &mut Context<QmtApp>,
+    cx: &mut Context<T>,
 ) -> impl IntoElement {
     let id = a.id.clone();
     let (border, hover) = (p.border, p.accent);
@@ -521,9 +502,9 @@ fn composer_thumb(
         .cursor_pointer()
         .hover(move |s| s.border_color(hover))
         .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_composer_image(session, &id, window, cx)
-        }))
+        .on_click(
+            cx.listener(move |this, _, window, cx| this.open_attachment_image(&id, window, cx)),
+        )
         .child(
             div().size_full().rounded(px(9.)).overflow_hidden().child(
                 img(image)

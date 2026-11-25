@@ -12,6 +12,7 @@ use crate::usage::{Accounting, Breakdown};
 
 #[cfg(test)]
 mod golden;
+pub(crate) mod open;
 mod overlay;
 mod projection;
 mod view;
@@ -622,10 +623,245 @@ pub struct Item {
     pub kind: ItemKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEntry {
     pub content: String,
     pub status: String,
+}
+
+/// Plan id of the agent's todo list (`todowrite`).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // read by the desktop-only quick panel
+pub const TODO_PLAN_ID: &str = "querymt-todos";
+
+/// An `items` plan of a listed session (`_meta["querymt/plans"]` of a
+/// `session/list` entry, or `plans` of `querymt/session/plansChanged`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListedPlan {
+    pub id: String,
+    pub entries: Vec<PlanEntry>,
+}
+
+impl ListedPlan {
+    /// The `items` plans of a `plans` array, in order. A value that is not
+    /// an array, elements of another `type` and malformed entries leave
+    /// nothing behind.
+    pub fn parse_all(plans: Option<&Value>) -> Vec<ListedPlan> {
+        let Some(plans) = plans.and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        plans
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("items"))
+            .map(|p| ListedPlan {
+                id: p
+                    .get("planId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                entries: p
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|e| PlanEntry {
+                                content: e
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                status: e
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+/// A session's progress: its todo entries and how many are completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanDigest {
+    pub done: usize,
+    pub total: usize,
+    pub entries: Vec<PlanEntry>,
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // read by the desktop-only quick panel
+impl PlanDigest {
+    /// Digest of one plan's entries; no entries, no digest.
+    pub fn from_entries(entries: &[PlanEntry]) -> Option<Self> {
+        if entries.is_empty() {
+            return None;
+        }
+        Some(Self {
+            done: entries.iter().filter(|e| e.status == "completed").count(),
+            total: entries.len(),
+            entries: entries.to_vec(),
+        })
+    }
+
+    /// Digest of a session's plans: `querymt-todos` if present, else the
+    /// first one. An empty plan counts as none.
+    pub fn from_plans(plans: &[ListedPlan]) -> Option<Self> {
+        let plan = plans
+            .iter()
+            .find(|p| p.id == TODO_PLAN_ID)
+            .or_else(|| plans.first())?;
+        Self::from_entries(&plan.entries)
+    }
+
+    /// Share of completed entries, 0..=1.
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.done as f32 / self.total as f32
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.done == self.total
+    }
+
+    /// The first entry in progress.
+    pub fn current(&self) -> Option<&PlanEntry> {
+        self.entries.iter().find(|e| e.status == "in_progress")
+    }
+
+    /// The first `n` pending entries.
+    pub fn upcoming(&self, n: usize) -> Vec<&PlanEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == "pending")
+            .take(n)
+            .collect()
+    }
+
+    /// Unfinished entries (in progress or pending) a card does not show
+    /// when it shows `shown` lines. Completed entries are never counted.
+    pub fn hidden(&self, shown: usize) -> usize {
+        (self.total - self.done).saturating_sub(shown)
+    }
+}
+
+#[cfg(test)]
+mod plan_digest_tests {
+    use super::{ListedPlan, PlanDigest, PlanEntry, TODO_PLAN_ID};
+    use serde_json::json;
+
+    fn entries(statuses: &[&str]) -> Vec<PlanEntry> {
+        statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| PlanEntry {
+                content: format!("step {i}"),
+                status: (*s).into(),
+            })
+            .collect()
+    }
+
+    fn plan(id: &str, statuses: &[&str]) -> ListedPlan {
+        ListedPlan {
+            id: id.into(),
+            entries: entries(statuses),
+        }
+    }
+
+    #[test]
+    fn progress_of_a_todo_plan() {
+        let digest = PlanDigest::from_plans(&[plan(
+            TODO_PLAN_ID,
+            &["completed", "in_progress", "pending", "pending"],
+        )])
+        .unwrap();
+        assert_eq!((digest.done, digest.total), (1, 4));
+        assert_eq!(digest.fraction(), 0.25);
+        assert!(!digest.is_finished());
+    }
+
+    #[test]
+    fn empty_plan_shows_no_progress() {
+        assert_eq!(PlanDigest::from_plans(&[plan(TODO_PLAN_ID, &[])]), None);
+        assert_eq!(PlanDigest::from_plans(&[]), None);
+    }
+
+    #[test]
+    fn the_todo_plan_wins_over_the_first_one() {
+        let digest = PlanDigest::from_plans(&[
+            plan("other", &["completed", "completed"]),
+            plan(TODO_PLAN_ID, &["pending"]),
+        ])
+        .unwrap();
+        assert_eq!((digest.done, digest.total), (0, 1));
+        let digest = PlanDigest::from_plans(&[
+            plan("other", &["completed", "completed"]),
+            plan("second", &["pending"]),
+        ])
+        .unwrap();
+        assert_eq!((digest.done, digest.total), (2, 2));
+        assert!(digest.is_finished());
+    }
+
+    #[test]
+    fn upcoming_and_hidden_on_a_six_entry_plan() {
+        let digest = PlanDigest::from_entries(&entries(&[
+            "completed",
+            "completed",
+            "in_progress",
+            "pending",
+            "pending",
+            "pending",
+        ]))
+        .unwrap();
+        assert_eq!(digest.current().unwrap().content, "step 2");
+        let upcoming = digest.upcoming(2);
+        assert_eq!(
+            upcoming
+                .iter()
+                .map(|e| e.content.as_str())
+                .collect::<Vec<_>>(),
+            ["step 3", "step 4"]
+        );
+        // current + two upcoming are shown; one pending entry is left.
+        assert_eq!(digest.hidden(3), 1);
+        assert_eq!(digest.hidden(10), 0);
+        assert_eq!(digest.upcoming(5).len(), 3);
+    }
+
+    #[test]
+    fn only_items_plans_are_parsed() {
+        let plans = ListedPlan::parse_all(Some(&json!([
+            { "type": "markdown", "planId": "m", "markdown": "# x" },
+            { "type": "items", "planId": "querymt-todos", "entries": [
+                { "content": "a", "status": "completed", "priority": "high" },
+                { "content": "b", "status": "pending" }
+            ] }
+        ])));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, TODO_PLAN_ID);
+        assert_eq!(
+            plans[0].entries,
+            entries_named(&[("a", "completed"), ("b", "pending")])
+        );
+        assert!(ListedPlan::parse_all(Some(&json!("nope"))).is_empty());
+        assert!(ListedPlan::parse_all(None).is_empty());
+    }
+
+    fn entries_named(items: &[(&str, &str)]) -> Vec<PlanEntry> {
+        items
+            .iter()
+            .map(|(c, s)| PlanEntry {
+                content: (*c).into(),
+                status: (*s).into(),
+            })
+            .collect()
+    }
 }
 
 /// A message sent while a turn runs (steer / queue), shown in the activity
@@ -658,8 +894,6 @@ pub struct SessionView {
     pub session_id: String,
     pub cwd: String,
     pub title: String,
-    /// Session this one was opened from through a delegation pill; Back returns there.
-    pub parent: Option<Box<ParentSession>>,
     pub loading: bool,
     pub error: Option<String>,
     /// Copyable diagnostic report behind `error` (request, raw agent error).
@@ -744,17 +978,6 @@ impl std::ops::DerefMut for SessionView {
     fn deref_mut(&mut self) -> &mut Projection {
         &mut self.proj
     }
-}
-
-/// Where Back goes from a delegated child session.
-#[derive(Clone, Debug, Default)]
-pub struct ParentSession {
-    pub agent_id: String,
-    pub session_id: String,
-    pub cwd: String,
-    pub title: String,
-    /// The parent's own parent, so Back walks up a delegation chain.
-    pub parent: Option<Box<ParentSession>>,
 }
 
 /// One file a turn changed (desktop `SessionTurnDiffFile`).

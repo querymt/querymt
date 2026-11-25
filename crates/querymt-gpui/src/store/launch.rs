@@ -8,10 +8,88 @@ use std::collections::HashMap;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
-use super::{AgentsStore, DEFAULT_PROFILE, Profile};
+use std::fmt;
+
+use super::{AgentsStore, Attachment, DEFAULT_PROFILE, Profile};
 
 /// Profile id meaning "the owner's active profile" on a mesh peer.
 pub const OWNER_DEFAULT_PROFILE: &str = "querymt:owner-default";
+
+/// Where a new session runs: the start page's choice, or [`Placement::local`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Mesh peer the session runs on; `None`: the agent's machine.
+    pub target: Option<String>,
+    /// Profile on the target peer; `None`: the peer's active profile.
+    pub remote_profile: Option<String>,
+    /// Worktree placement of a local session.
+    pub worktree: WorktreeMode,
+}
+
+impl Placement {
+    /// The agent's own machine, in the folder itself.
+    #[allow(dead_code)] // the quick panel launches with it (group 6)
+    pub fn local() -> Self {
+        Self::default()
+    }
+}
+
+/// What a surface asks the store to start (design D5).
+pub struct LaunchRequest {
+    pub agent_id: String,
+    pub cwd: String,
+    pub prompt: String,
+    pub attachments: Vec<Attachment>,
+    pub placement: Placement,
+    /// Selection key ([`Model::key`]) of the model to start on; `None` uses
+    /// the launch default of the agent.
+    pub model: Option<String>,
+    /// Reasoning effort to start with; `None` uses the launch default.
+    pub reasoning: Option<String>,
+}
+
+/// Why a launch did not produce a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// The agent has no live connection.
+    NotConnected,
+    /// The agent refused or failed to create the session.
+    Create(String),
+    /// The profile chosen on the peer is gone from it.
+    PeerProfileGone,
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("The selected agent is not connected."),
+            Self::Create(reason) => f.write_str(reason),
+            Self::PeerProfileGone => f.write_str(MISSING_PEER_PROFILE),
+        }
+    }
+}
+
+/// A launch as its caller sees it: what to show while it runs and after.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchProgress {
+    pub busy: bool,
+    pub error: Option<String>,
+    /// Id of the session the last launch created.
+    pub last_started: Option<String>,
+    /// Peer the session being created runs on, for the placeholder.
+    pub creating_on: Option<String>,
+}
+
+impl LaunchProgress {
+    /// What the placeholder says while the next session is being created
+    /// (desktop `showLaunchProgress`).
+    pub fn label(&self) -> String {
+        match &self.creating_on {
+            Some(peer) => format!("Creating session on {peer}…"),
+            None => "Creating session…".into(),
+        }
+    }
+}
 
 /// Where the session's files live (desktop `ComposerWorkspaceMode`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -183,6 +261,40 @@ impl AgentsStore {
                 .is_some_and(|rt| rt.worktrees.is_some())
     }
 
+    /// The start page's current choice of where the next session runs.
+    pub fn placement(&self) -> Placement {
+        Placement {
+            target: self.launch.target.clone(),
+            remote_profile: self.launch.remote_profile.clone(),
+            worktree: self.launch.worktree,
+        }
+    }
+
+    /// Worktree placement of `placement` for `agent_id`: only a local session
+    /// on an agent that supports worktrees gets one.
+    pub(super) fn worktree_for(&self, agent_id: &str, placement: &Placement) -> WorktreeMode {
+        let supported = self
+            .runtime(agent_id)
+            .is_some_and(|rt| rt.worktrees.is_some());
+        if placement.target.is_none() && supported {
+            placement.worktree
+        } else {
+            WorktreeMode::Local
+        }
+    }
+
+    /// Peer a launch with `placement` creates its session on, for the
+    /// placeholder; `None` when it runs on the agent's machine.
+    pub fn creating_on(&self, agent_id: &str, placement: &Placement) -> Option<String> {
+        let node = placement.target.as_ref()?;
+        let label = self
+            .launch_targets(agent_id)
+            .into_iter()
+            .find(|t| t.node_id.as_ref() == Some(node))
+            .map(|t| t.label);
+        Some(label.unwrap_or_else(|| node.clone()))
+    }
+
     /// Worktree placement for the next session, valid for `agent_id`.
     pub fn launch_worktree(&self, agent_id: &str) -> WorktreeMode {
         if self.can_use_worktree(agent_id) {
@@ -316,15 +428,6 @@ impl AgentsStore {
             }
         }
     }
-
-    /// What the placeholder says while the next session is being created
-    /// (desktop `showLaunchProgress`).
-    pub fn launch_progress_label(&self) -> String {
-        match &self.launch.creating_on {
-            Some(peer) => format!("Creating session on {peer}…"),
-            None => "Creating session…".into(),
-        }
-    }
 }
 
 /// Peer profile lists, keyed by node id.
@@ -334,6 +437,33 @@ pub type PeerProfileMap = HashMap<String, PeerProfiles>;
 impl AgentsStore {
     pub(crate) fn runtime_mut_for_test(&mut self, agent: &str) -> &mut super::AgentRuntime {
         self.runtime.entry(agent.to_owned()).or_default()
+    }
+
+    /// `view` as an open session that was not loaded.
+    pub(crate) fn adopt_for_test(
+        &mut self,
+        view: crate::session::SessionView,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Entity<crate::session::open::OpenSession> {
+        self.adopt(view, cx)
+    }
+
+    /// `view` as an open session that the next window shows in its main pane.
+    pub(crate) fn install_main_for_test(
+        &mut self,
+        view: crate::session::SessionView,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Entity<crate::session::open::OpenSession> {
+        let session = self.adopt(view, cx);
+        self.open_sessions.test_main = Some(session.clone());
+        session
+    }
+
+    /// The session `install_main_for_test` prepared, once.
+    pub(crate) fn take_test_main(
+        &mut self,
+    ) -> Option<gpui_kit::Entity<crate::session::open::OpenSession>> {
+        self.open_sessions.test_main.take()
     }
 
     /// Connect `agent` to a test channel: requests arrive on the receiver,
@@ -472,13 +602,33 @@ mod tests {
             setup(&mut store);
             store
         });
-        cx.update(|cx| {
+        let task = cx.update(|cx| {
             store.update(cx, |s, cx| {
-                s.launch("test-agent", "/work".into(), "hi".into(), Vec::new(), cx)
+                let placement = s.placement();
+                s.launch(request("test-agent", "/work", "hi", placement), cx)
             })
         });
         cx.run_until_parked();
-        serde_json::from_str(&requests.try_recv().unwrap()).unwrap()
+        let first = serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        drop(task);
+        first
+    }
+
+    fn request(
+        agent: &str,
+        cwd: &str,
+        prompt: &str,
+        placement: super::Placement,
+    ) -> super::LaunchRequest {
+        super::LaunchRequest {
+            agent_id: agent.into(),
+            cwd: cwd.into(),
+            prompt: prompt.into(),
+            attachments: Vec::new(),
+            placement,
+            model: None,
+            reasoning: None,
+        }
     }
 
     #[gpui_kit::test]
@@ -516,15 +666,25 @@ mod tests {
     fn placeholder_names_the_peer_while_creating(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::AppContext as _;
         let store = cx.new(|_| super::peer_fixture());
-        let _requests = cx.update(|cx| {
-            store.update(cx, |s, cx| {
-                let (_, requests) = s.rpc_for_test("test-agent");
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
                 s.launch.target = Some("thor-id".into());
-                s.launch("test-agent", "/w".into(), "hi".into(), Vec::new(), cx);
-                assert_eq!(s.launch_progress_label(), "Creating session on thor…");
-                s.launch.creating_on = None;
-                assert_eq!(s.launch_progress_label(), "Creating session…");
-                requests
+                let placement = s.placement();
+                let progress = super::LaunchProgress {
+                    busy: true,
+                    creating_on: s.creating_on("test-agent", &placement),
+                    ..Default::default()
+                };
+                assert_eq!(progress.label(), "Creating session on thor…");
+                // On the agent's own machine there is no peer to name.
+                assert_eq!(
+                    s.creating_on("test-agent", &super::Placement::local()),
+                    None
+                );
+                assert_eq!(
+                    super::LaunchProgress::default().label(),
+                    "Creating session…"
+                );
             })
         });
     }
@@ -535,14 +695,16 @@ mod tests {
         let store = cx.new(|_| super::peer_fixture());
         let (rpc, requests) = cx.update(|cx| store.update(cx, |s, _| s.rpc_for_test("test-agent")));
         let launch = |cx: &mut gpui_kit::TestAppContext| {
-            cx.update(|cx| {
+            let task = cx.update(|cx| {
                 store.update(cx, |s, cx| {
                     s.launch.target = Some("thor-id".into());
                     s.launch.remote_profile = Some("coder".into());
-                    s.launch("test-agent", "/w".into(), "hi".into(), Vec::new(), cx)
+                    let placement = s.placement();
+                    s.launch(request("test-agent", "/w", "hi", placement), cx)
                 })
             });
             cx.run_until_parked();
+            task
         };
         let next = || -> Value { serde_json::from_str(&requests.try_recv().unwrap()).unwrap() };
         let reply = |request: &Value, profiles: Value| {
@@ -553,29 +715,125 @@ mod tests {
         };
 
         // The peer dropped the profile: no session is created.
-        launch(cx);
+        let task = launch(cx);
         let check = next();
         assert_eq!(check["method"], "_querymt/profiles");
         assert_eq!(check["params"]["node_id"], "thor-id");
         reply(&check, json!([{ "id": "reviewer" }]));
         cx.run_until_parked();
         assert!(requests.try_recv().is_err());
+        assert!(matches!(
+            futures::FutureExt::now_or_never(task),
+            Some(Err(super::LaunchError::PeerProfileGone))
+        ));
         store.read_with(cx, |s, _| {
-            assert!(!s.launch.busy);
-            assert_eq!(s.launch.error.as_deref(), Some(super::MISSING_PEER_PROFILE));
             // The Start options see the fresh list.
             let listed = &s.peer_profiles("test-agent", "thor-id").unwrap().profiles;
             assert_eq!(listed[0].id, "reviewer");
         });
 
         // Still there: the session is created with it.
-        launch(cx);
+        let _task = launch(cx);
         let check = next();
         reply(&check, json!([{ "id": "coder" }]));
         cx.run_until_parked();
         let create = next();
         assert_eq!(create["method"], "_querymt/remote/createSession");
         assert_eq!(create["params"]["profile_id"], "coder");
+    }
+
+    /// A first prompt (by launch) and a later one (by send) both go through
+    /// `start_prompt`: each carries its `client_prompt_id` and each turn ends
+    /// in `finish_prompt`, which clears `prompting`.
+    #[gpui_kit::test]
+    fn launch_and_send_start_prompts_the_same_way(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+
+        use crate::session::open::Delivery;
+
+        let store = cx.new(|_| crate::store::automations::schedule_ui_fixture());
+        let (rpc, requests) = cx.update(|cx| store.update(cx, |s, _| s.rpc_for_test("test-agent")));
+
+        // Answer everything but `session/prompt`, which is returned to the
+        // test (its reply ends the turn).
+        let pump = |cx: &mut gpui_kit::TestAppContext| -> Vec<Value> {
+            let mut prompts = Vec::new();
+            loop {
+                cx.run_until_parked();
+                let Ok(text) = requests.try_recv() else { break };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                match request["method"].as_str() {
+                    Some("session/prompt") => prompts.push(request),
+                    Some("session/new") => {
+                        let reply = json!({ "id": request["id"], "result": { "sessionId": "s1" } });
+                        rpc.handle(&reply.to_string());
+                    }
+                    _ => {
+                        let reply = json!({ "id": request["id"], "result": {} });
+                        rpc.handle(&reply.to_string());
+                    }
+                }
+            }
+            prompts
+        };
+        let shown: std::rc::Rc<
+            std::cell::RefCell<Option<gpui_kit::Entity<crate::session::open::OpenSession>>>,
+        > = Default::default();
+        let prompting = |cx: &mut gpui_kit::TestAppContext| {
+            shown
+                .borrow()
+                .as_ref()
+                .map(|session| session.read_with(cx, |o, _| o.view.prompting))
+        };
+        let prompt_id = |request: &Value| {
+            let params = &request["params"];
+            assert_eq!(params["sessionId"], "s1");
+            params
+                .pointer("/_meta/querymt/client_prompt_id")
+                .and_then(Value::as_str)
+                .expect("client_prompt_id")
+                .to_owned()
+        };
+        let finish = |cx: &mut gpui_kit::TestAppContext, request: &Value| {
+            let reply = json!({ "id": request["id"], "result": { "stopReason": "end_turn" } });
+            rpc.handle(&reply.to_string());
+            cx.run_until_parked();
+        };
+
+        let launched = cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.launch(
+                    request("test-agent", "/w", "first", super::Placement::local()),
+                    cx,
+                )
+            })
+        });
+        let first = pump(cx);
+        // The caller gets the session and shows it.
+        let session = futures::FutureExt::now_or_never(launched)
+            .expect("launch finished")
+            .expect("session");
+        *shown.borrow_mut() = Some(session.clone());
+        assert_eq!(first.len(), 1);
+        let first_id = prompt_id(&first[0]);
+        assert_eq!(prompting(cx), Some(true));
+        finish(cx, &first[0]);
+        assert_eq!(prompting(cx), Some(false));
+
+        cx.update(|cx| {
+            let session = shown.borrow().clone().expect("shown");
+            store.update(cx, |s, cx| {
+                s.send_prompt(&session, "second".into(), Vec::new(), Delivery::Steer, cx)
+            })
+        });
+        let second = pump(cx);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["method"], "session/prompt");
+        let second_id = prompt_id(&second[0]);
+        assert_ne!(first_id, second_id);
+        assert_eq!(prompting(cx), Some(true));
+        finish(cx, &second[0]);
+        assert_eq!(prompting(cx), Some(false));
     }
 
     #[test]

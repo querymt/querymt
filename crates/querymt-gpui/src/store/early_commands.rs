@@ -2,9 +2,9 @@
 //!
 //! `launch` creates its view only after `session/new` and the config round
 //! trips, and the agent advertises its commands right after answering
-//! `session/new`. Those updates arrive while no view matches, so the latest
-//! `available_commands_update` of each such session is kept here until a view
-//! for it is created.
+//! `session/new`. Those updates arrive while no open session matches, so the
+//! latest `available_commands_update` of each such session is kept here until
+//! a view for it is created.
 
 use std::collections::VecDeque;
 
@@ -59,30 +59,20 @@ impl EarlyCommands {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }
 
 impl AgentsStore {
-    /// Route one `session/update` of `agent_id`: to the open session's view
-    /// when it is the update's session (returns `true`: a flush is due),
-    /// otherwise keep it when it advertises commands.
-    pub(super) fn deliver_session_update(&mut self, agent_id: &str, params: &Value) -> bool {
+    /// A `session/update` of `agent_id` that no open session takes: keep it
+    /// when it advertises commands.
+    pub(super) fn note_early_commands(&mut self, agent_id: &str, params: &Value) {
         let session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if let Some(view) = self
-            .session
-            .as_mut()
-            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-        {
-            view.queue_session_update(params);
-            return true;
-        }
         self.early_commands.note(agent_id, session_id, params);
-        false
     }
 
     /// Hand a view that was just created the commands advertised for its
@@ -93,6 +83,21 @@ impl AgentsStore {
             view.queue_session_update(&params);
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn early_commands_len(&self) -> usize {
+        self.early_commands.len()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn commands_update(session: &str, names: &[&str]) -> Value {
+    let list: Vec<Value> = names
+        .iter()
+        .map(|n| serde_json::json!({ "name": n, "description": format!("{n} command") }))
+        .collect();
+    serde_json::json!({ "sessionId": session, "update": {
+        "sessionUpdate": "available_commands_update", "availableCommands": list } })
 }
 
 #[cfg(test)]
@@ -104,12 +109,7 @@ mod tests {
     use crate::store::launch::peer_fixture;
 
     fn commands(session: &str, names: &[&str]) -> Value {
-        let list: Vec<Value> = names
-            .iter()
-            .map(|n| json!({ "name": n, "description": format!("{n} command") }))
-            .collect();
-        json!({ "sessionId": session, "update": {
-            "sessionUpdate": "available_commands_update", "availableCommands": list } })
+        commands_update(session, names)
     }
 
     fn names(view: &SessionView) -> Vec<&str> {
@@ -130,9 +130,8 @@ mod tests {
     #[test]
     fn commands_sent_before_the_launch_view_are_applied() {
         let mut store = peer_fixture();
-        store.session = None;
         // `session/new` answered; the agent advertises before the view exists.
-        assert!(!store.deliver_session_update("a", &commands("new1", &["compact", "worktree"])));
+        store.note_early_commands("a", &commands("new1", &["compact", "worktree"]));
         let view = launch_view(&mut store, "new1");
         assert_eq!(names(&view), ["compact", "worktree"]);
         assert_eq!(store.early_commands.len(), 0, "the view took the entry");
@@ -141,9 +140,8 @@ mod tests {
     #[test]
     fn the_latest_early_update_wins() {
         let mut store = peer_fixture();
-        store.session = None;
-        store.deliver_session_update("a", &commands("new1", &["compact", "worktree"]));
-        store.deliver_session_update("a", &commands("new1", &["compact"]));
+        store.note_early_commands("a", &commands("new1", &["compact", "worktree"]));
+        store.note_early_commands("a", &commands("new1", &["compact"]));
         assert_eq!(store.early_commands.len(), 1);
         assert_eq!(names(&launch_view(&mut store, "new1")), ["compact"]);
     }
@@ -151,9 +149,8 @@ mod tests {
     #[test]
     fn early_commands_stay_with_their_session_and_agent() {
         let mut store = peer_fixture();
-        store.session = None;
-        store.deliver_session_update("a", &commands("s1", &["compact"]));
-        store.deliver_session_update("b", &commands("s1", &["other-agent"]));
+        store.note_early_commands("a", &commands("s1", &["compact"]));
+        store.note_early_commands("b", &commands("s1", &["other-agent"]));
         assert_eq!(names(&launch_view(&mut store, "s2")), Vec::<&str>::new());
         assert_eq!(names(&launch_view(&mut store, "s1")), ["compact"]);
     }
@@ -161,14 +158,13 @@ mod tests {
     #[test]
     fn only_commands_are_buffered() {
         let mut store = peer_fixture();
-        store.session = None;
-        store.deliver_session_update(
+        store.note_early_commands(
             "a",
             &json!({ "sessionId": "new1", "update": {
                 "sessionUpdate": "agent_message_chunk", "messageId": "m1",
                 "content": { "type": "text", "text": "hello" } } }),
         );
-        store.deliver_session_update(
+        store.note_early_commands(
             "a",
             &json!({ "sessionId": "new1", "update": {
                 "sessionUpdate": "current_mode_update", "currentModeId": "plan" } }),
@@ -181,9 +177,8 @@ mod tests {
     #[test]
     fn early_commands_are_bounded() {
         let mut store = peer_fixture();
-        store.session = None;
         for n in 0..40 {
-            store.deliver_session_update("a", &commands(&format!("s{n}"), &["compact"]));
+            store.note_early_commands("a", &commands(&format!("s{n}"), &["compact"]));
         }
         assert_eq!(store.early_commands.len(), CAPACITY);
         // The oldest insertions were dropped, the newest kept.
@@ -196,9 +191,8 @@ mod tests {
     #[test]
     fn a_new_connection_forgets_the_agents_early_commands() {
         let mut store = peer_fixture();
-        store.session = None;
-        store.deliver_session_update("a", &commands("s1", &["compact"]));
-        store.deliver_session_update("b", &commands("s2", &["compact"]));
+        store.note_early_commands("a", &commands("s1", &["compact"]));
+        store.note_early_commands("b", &commands("s2", &["compact"]));
         store.early_commands.clear_agent("a");
         assert!(names(&launch_view(&mut store, "s1")).is_empty());
         let mut view = SessionView::new("b", "s2", "/w", "t");
@@ -208,40 +202,22 @@ mod tests {
     }
 
     #[test]
-    fn a_view_for_the_session_gets_updates_directly() {
-        let mut store = peer_fixture();
-        store.session = Some(SessionView::new("a", "s1", "/w", "t"));
-        assert!(store.deliver_session_update("a", &commands("s1", &["compact"])));
-        assert_eq!(store.early_commands.len(), 0);
-        // Another session's update is buffered, not given to the open view.
-        assert!(!store.deliver_session_update("a", &commands("s2", &["other"])));
-        assert_eq!(store.early_commands.len(), 1);
-        let view = store.session.as_mut().unwrap();
-        view.flush();
-        assert_eq!(names(view), ["compact"]);
-    }
-
-    #[test]
     fn early_commands_survive_a_load_response() {
         let mut store = peer_fixture();
-        store.session = None;
+        let events = generate(TraceSpec::small(1)).events;
         // Opened, the agent advertises while the load is in flight, then the
         // load answers with a snapshot.
         let mut view = SessionView::new("a", "s1", "/w", "t");
         store.take_early_commands(&mut view);
         view.loading = true;
-        store.session = Some(view);
-        store.deliver_session_update("a", &commands("s1", &["compact", "worktree"]));
-        let events = generate(TraceSpec::small(1)).events;
-        let view = store.session.as_mut().unwrap();
+        view.queue_session_update(&commands("s1", &["compact", "worktree"]));
         view.loading = false;
         view.load(snapshot_response(&events, json!({})));
-        assert_eq!(names(view), ["compact", "worktree"]);
+        assert_eq!(names(&view), ["compact", "worktree"]);
         assert!(!view.items.is_empty(), "the snapshot was applied");
         // And an advertisement that arrived before the view was opened is
         // applied first, so the load does not drop it either.
-        store.session = None;
-        store.deliver_session_update("a", &commands("s3", &["compact"]));
+        store.note_early_commands("a", &commands("s3", &["compact"]));
         let mut view = SessionView::new("a", "s3", "/w", "t");
         store.take_early_commands(&mut view);
         view.load(snapshot_response(&events, json!({})));
@@ -253,7 +229,6 @@ mod tests {
     #[test]
     fn early_commands_survive_a_background_load() {
         let mut store = peer_fixture();
-        store.session = None;
         let events = generate(TraceSpec::small(1)).events;
         let load = |view: &mut SessionView| {
             let job = view
@@ -267,17 +242,14 @@ mod tests {
         let mut view = SessionView::new("a", "s1", "/w", "t");
         store.take_early_commands(&mut view);
         view.loading = true;
-        store.session = Some(view);
-        store.deliver_session_update("a", &commands("s1", &["compact", "worktree"]));
-        let view = store.session.as_mut().unwrap();
+        view.queue_session_update(&commands("s1", &["compact", "worktree"]));
         view.loading = false;
-        load(view);
-        assert_eq!(names(view), ["compact", "worktree"]);
+        load(&mut view);
+        assert_eq!(names(&view), ["compact", "worktree"]);
         assert!(!view.items.is_empty(), "the snapshot was applied");
 
         // Advertised before the view was opened.
-        store.session = None;
-        store.deliver_session_update("a", &commands("s3", &["compact"]));
+        store.note_early_commands("a", &commands("s3", &["compact"]));
         let mut view = SessionView::new("a", "s3", "/w", "t");
         store.take_early_commands(&mut view);
         load(&mut view);

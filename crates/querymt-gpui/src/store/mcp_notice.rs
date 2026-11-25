@@ -8,6 +8,7 @@ use gpui_kit::*;
 use serde_json::Value;
 
 use super::{AgentRuntime, AgentsStore};
+use crate::session::open::SessionKey;
 
 /// One skipped server (querymt `SkippedMcpServer`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +51,7 @@ impl SkippedMcp {
 
 /// `_meta.querymt.skippedMcpServers` of a session response; none listed
 /// means none skipped.
-pub(super) fn from_response(v: &Value) -> Vec<SkippedMcp> {
+pub(crate) fn from_response(v: &Value) -> Vec<SkippedMcp> {
     v.pointer("/_meta/querymt/skippedMcpServers")
         .and_then(Value::as_array)
         .into_iter()
@@ -82,16 +83,10 @@ pub(super) fn record(rt: &mut AgentRuntime, session: &str, servers: Vec<SkippedM
 
 impl AgentsStore {
     /// Skipped MCP servers of the open session, for its sign-in notice.
-    pub fn skipped_mcp(&self) -> Vec<SkippedMcp> {
-        self.session
-            .as_ref()
-            .and_then(|v| {
-                self.runtime
-                    .get(&v.agent_id)?
-                    .skipped_mcp
-                    .get(&v.session_id)
-                    .cloned()
-            })
+    pub fn skipped_mcp(&self, key: &SessionKey) -> Vec<SkippedMcp> {
+        self.runtime
+            .get(key.agent.as_str())
+            .and_then(|rt| rt.skipped_mcp.get(key.session.as_str()).cloned())
             .unwrap_or_default()
     }
 
@@ -105,17 +100,13 @@ impl AgentsStore {
     }
 
     /// Hide one server from the open session's notice.
-    pub fn dismiss_skipped_mcp(&mut self, server: &str, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_ref() else {
-            return;
-        };
-        let (agent, session) = (view.agent_id.clone(), view.session_id.clone());
-        if let Some(rt) = self.runtime.get_mut(&agent)
-            && let Some(list) = rt.skipped_mcp.get_mut(&session)
+    pub fn dismiss_skipped_mcp(&mut self, key: &SessionKey, server: &str, cx: &mut Context<Self>) {
+        if let Some(rt) = self.runtime.get_mut(key.agent.as_str())
+            && let Some(list) = rt.skipped_mcp.get_mut(key.session.as_str())
         {
             list.retain(|s| s.server != server);
             if list.is_empty() {
-                rt.skipped_mcp.remove(&session);
+                rt.skipped_mcp.remove(key.session.as_str());
             }
             cx.notify();
         }

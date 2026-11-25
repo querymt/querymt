@@ -19,7 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit;
-use crate::theme::{Palette, palette};
+use crate::theme::Palette;
 
 /// Name of the custom markdown block that wraps tables (adds a copy button).
 const TABLE_BLOCK: &str = "qmt-table";
@@ -71,6 +71,7 @@ pub fn markdown(
 /// Transcript styling and extensions; `id` prefixes the table ids.
 fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
     let table_prefix = id;
+    let p = *p;
     view.style(TextViewStyle {
         code_block: StyleRefinement::default()
             .rounded(px(8.))
@@ -79,9 +80,8 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
             .text_size(px(13.)),
         ..TextViewStyle::default()
     })
-    .inline_code_style(inline_code_style(p))
-    .code_block_actions(|block, _, cx| {
-        let p = *palette(cx);
+    .inline_code_style(inline_code_style(&p))
+    .code_block_actions(move |block, _, cx| {
         let lang = block.lang();
         let row = h_flex()
             .w_full()
@@ -105,6 +105,7 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
             .child(CopyButton {
                 id: "copy".into(),
                 value: block.code(),
+                p,
             });
         #[cfg(test)]
         let row = {
@@ -132,7 +133,7 @@ fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
         };
         let start = node.source_range().map_or(0, |r| r.start);
         let id = format!("{table_prefix}-table-{start}");
-        table_card(&id, source).into_any_element()
+        table_card(&id, source, p).into_any_element()
     })
 }
 
@@ -285,6 +286,12 @@ pub struct KeptMarkdown {
 }
 
 impl KeptMarkdown {
+    /// The palette this view is styled with.
+    #[cfg(test)]
+    pub fn palette(&self) -> &Palette {
+        &self.p
+    }
+
     pub fn motion(mut self, motion: TextViewMotion) -> Self {
         self.motion = Some(motion);
         self
@@ -400,10 +407,11 @@ fn inline_code_style(p: &Palette) -> StyleRefinement {
 /// this module's block hooks so it is not wrapped again) with a copy button
 /// in its corner, like the transcript's message copy buttons. Copies the
 /// table's markdown.
-fn table_card(id: &str, source: &str) -> impl IntoElement {
+fn table_card(id: &str, source: &str, p: Palette) -> impl IntoElement {
     TableCard {
         id: SharedString::from(id.to_string()),
         source: source.to_string().into(),
+        p,
     }
 }
 
@@ -431,11 +439,12 @@ impl TableChrome {
 struct TableCard {
     id: SharedString,
     source: SharedString,
+    p: Palette,
 }
 
 impl RenderOnce for TableCard {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let p = *palette(cx);
+        let p = self.p;
         let chrome = window.use_keyed_state(
             SharedString::from(format!("{}-chrome", self.id)),
             cx,
@@ -519,13 +528,14 @@ impl RenderOnce for TableCard {
 struct CopyButton {
     id: SharedString,
     value: SharedString,
+    p: Palette,
 }
 
 impl RenderOnce for CopyButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let copied = window.use_keyed_state(self.id.clone(), cx, |_, _| false);
         let done = *copied.read(cx);
-        let p = palette(cx);
+        let p = &self.p;
         let (icon, color) = if done {
             (IconName::Check, p.accent)
         } else {

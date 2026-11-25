@@ -11,8 +11,9 @@ use std::time::Duration;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
-use super::{AgentsStore, SessionSummary, Worktree};
+use super::{AgentsStore, SessionSummary, StoreEvent, Worktree};
 use crate::rpc::RpcError;
+use crate::session::open::{SessionKey, SessionRef};
 
 const CREATE: &str = "_querymt/worktree/create";
 const HANDOFF: &str = "_querymt/worktree/handoff";
@@ -154,13 +155,18 @@ fn describe_error(err: &RpcError, action: WorktreeAction) -> String {
 }
 
 impl AgentsStore {
-    /// The open session, listed, local and writable on an agent with
+    /// The open session `key`, listed, local and writable on an agent with
     /// managed worktrees.
-    fn worktree_source(&self) -> Option<(&SessionSummary, &super::launch::WorktreeSupport)> {
-        let view = self.session.as_ref().filter(|v| v.access.is_none())?;
+    fn worktree_source(
+        &self,
+        key: &SessionKey,
+        cx: &App,
+    ) -> Option<(&SessionSummary, &super::launch::WorktreeSupport)> {
+        self.with_session(key, cx, |v| v.access.is_none())
+            .filter(|writable| *writable)?;
         let rt = self
             .runtime
-            .get(&view.agent_id)
+            .get(key.agent.as_str())
             .filter(|rt| rt.is_connected())?;
         let support = rt.worktrees.as_ref()?;
         // Worktree children aren't in the root catalog: they are listed
@@ -169,20 +175,20 @@ impl AgentsStore {
             .sessions
             .iter()
             .chain(rt.children.values().flat_map(|c| c.sessions.iter()))
-            .find(|s| s.id == view.session_id)
+            .find(|s| s.id == key.session.as_str())
             .filter(|s| s.remote.is_none())?;
         Some((summary, support))
     }
 
     /// "New worktree session" can be offered for the open session.
-    pub fn can_create_worktree(&self) -> bool {
-        self.worktree_source().is_some()
+    pub fn can_create_worktree(&self, key: &SessionKey, cx: &App) -> bool {
+        self.worktree_source(key, cx).is_some()
     }
 
     /// "Hand off worktree" can be offered: the open session owns a
     /// worktree it hasn't handed off yet.
-    pub fn can_handoff_worktree(&self) -> bool {
-        self.worktree_source().is_some_and(|(s, support)| {
+    pub fn can_handoff_worktree(&self, key: &SessionKey, cx: &App) -> bool {
+        self.worktree_source(key, cx).is_some_and(|(s, support)| {
             support.handoff
                 && s.worktree.as_ref().is_some_and(|w| {
                     w.handed_off_to.is_none()
@@ -192,16 +198,15 @@ impl AgentsStore {
     }
 
     /// The agent can seed a handoff with a summary.
-    pub fn handoff_summary_supported(&self) -> bool {
-        self.worktree_source()
+    pub fn handoff_summary_supported(&self, key: &SessionKey, cx: &App) -> bool {
+        self.worktree_source(key, cx)
             .is_some_and(|(_, support)| support.handoff_summary)
     }
 
     /// A worktree action of the open session's agent is in flight.
-    pub fn worktree_pending(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|v| self.runtime.get(&v.agent_id))
+    pub fn worktree_pending(&self, key: &SessionKey) -> bool {
+        self.runtime
+            .get(key.agent.as_str())
             .is_some_and(|rt| rt.pending.contains(PENDING))
     }
 
@@ -210,18 +215,19 @@ impl AgentsStore {
     /// `None` when the action can't start now.
     pub fn start_worktree_action(
         &mut self,
+        key: &SessionKey,
         action: WorktreeAction,
         options: WorktreeOptions,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<String, String>>> {
         let allowed = match action {
-            WorktreeAction::Create => self.can_create_worktree(),
-            WorktreeAction::Handoff => self.can_handoff_worktree(),
+            WorktreeAction::Create => self.can_create_worktree(key, cx),
+            WorktreeAction::Handoff => self.can_handoff_worktree(key, cx),
         };
-        if !allowed || self.worktree_pending() || options.problem(action).is_some() {
+        if !allowed || self.worktree_pending(key) || options.problem(action).is_some() {
             return None;
         }
-        let (source, support) = self.worktree_source()?;
+        let (source, support) = self.worktree_source(key, cx)?;
         let source = source.clone();
         let (method, params) = match action {
             WorktreeAction::Create => {
@@ -339,13 +345,14 @@ impl AgentsStore {
             rt.sessions.insert(0, child);
         }
         self.schedule_sessions_refresh(agent_id, Duration::from_millis(500), cx);
-        let still_open = self
-            .session
-            .as_ref()
-            .is_some_and(|v| v.agent_id == agent_id && v.session_id == source.id);
-        if still_open {
-            self.open_session(agent_id, &created.session_id, &cwd, &title, cx);
-        }
+        cx.emit(StoreEvent::Spawned {
+            from: SessionKey::new(agent_id, &source.id),
+            child: SessionRef {
+                key: SessionKey::new(agent_id, &created.session_id),
+                cwd,
+                title,
+            },
+        });
         cx.notify();
     }
 }

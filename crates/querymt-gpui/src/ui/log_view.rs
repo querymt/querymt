@@ -381,7 +381,7 @@ impl QmtApp {
     fn open_log_view(&mut self, scope: LogScope, window: &mut Window, cx: &mut Context<Self>) {
         // One modal at a time: the sheet or menu this comes from closes.
         self.details = None;
-        self.session_menu_open = false;
+        self.pane.update(cx, |pane, _| pane.menu_open = false);
         let v = &mut self.log_view;
         v.scope = Some(scope);
         v.expanded.clear();
@@ -1310,7 +1310,7 @@ mod tests {
         let shown = |cx: &mut gpui_kit::TestAppContext| {
             app.read_with(cx, |app, _| app.log_view.shown.len())
         };
-        app.read_with(cx, |app, _| {
+        app.read_with(cx, |app, _cx| {
             assert_eq!(
                 app.log_view.scope,
                 Some(LogScope::Agent("test-agent".into()))
@@ -1385,14 +1385,13 @@ mod tests {
         let rt = store.runtime_mut_for_test("test-agent");
         rt.wire.set_enabled(true);
         rpc.set_wire_log(rt.wire.clone());
-        store.session = Some(crate::session::SessionView::new(
-            "test-agent",
-            "s1",
-            "/w",
-            "S",
-        ));
+        let main_view = crate::session::SessionView::new("test-agent", "s1", "/w", "S");
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -1405,14 +1404,14 @@ mod tests {
         cx.update(|cx| {
             app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.session_menu_open = true;
+                app.pane.update(cx, |pane, _| pane.menu_open = true);
             })
         });
         render(cx);
         let mut vcx = VisualTestContext::from_window(handle, cx);
         let item = vcx.debug_bounds("m-debug-events").expect("Debug events…");
         vcx.simulate_click(item.center(), Modifiers::none());
-        app.read_with(cx, |app, _| {
+        app.read_with(cx, |app, cx| {
             assert_eq!(
                 app.log_view.scope,
                 Some(LogScope::Events {
@@ -1420,7 +1419,7 @@ mod tests {
                     session: Some("s1".into())
                 })
             );
-            assert!(!app.session_menu_open);
+            assert!(!app.pane.read(cx).menu_open);
         });
 
         // Traffic: a prompt that fails, a streamed reply, another session.
@@ -1494,15 +1493,14 @@ mod tests {
             gpui_kit::init(cx);
             crate::theme::apply(true, "orange", cx);
         });
-        let mut store = crate::store::automations::schedule_ui_fixture();
-        store.session = Some(crate::session::SessionView::new(
-            "test-agent",
-            "s1",
-            "/w",
-            "S",
-        ));
+        let store = crate::store::automations::schedule_ui_fixture();
+        let main_view = crate::session::SessionView::new("test-agent", "s1", "/w", "S");
         let (handle, app) = cx.update(|cx| {
-            let store = cx.new(|_| store);
+            let store = cx.new(|cx| {
+                let mut store = store;
+                store.install_main_for_test(main_view, cx);
+                store
+            });
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 cx.new(|cx| QmtApp::new(store, window, cx))
             })
@@ -1511,7 +1509,7 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |app, cx| {
                 app.go(Page::Session, cx);
-                app.session_menu_open = true;
+                app.pane.update(cx, |pane, _| pane.menu_open = true);
             });
             window.render_frame(cx);
         })

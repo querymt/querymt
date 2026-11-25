@@ -635,12 +635,109 @@ impl QmtApp {
             p,
         ));
 
+        // The quick panel is a desktop feature: the web build has no section.
+        #[cfg(not(target_family = "wasm"))]
+        let quick = Some(self.settings_quick(&prefs, p, cx));
+        #[cfg(target_family = "wasm")]
+        let quick: Option<Div> = None;
+
         v_flex()
             .gap(px(12.8))
             .child(sidebar)
+            .children(quick)
             .child(setup)
             .child(advanced)
             .child(danger)
+    }
+
+    /// The quick panel: on or off, its global shortcut and whether that
+    /// shortcut is registered.
+    #[cfg(not(target_family = "wasm"))]
+    fn settings_quick(
+        &self,
+        prefs: &crate::store::Prefs,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        use crate::quick::hotkey;
+
+        let enabled = prefs.quick.enabled;
+        let recording = self.quick_recording;
+        let shortcut = if prefs.quick.shortcut.is_empty() {
+            hotkey::default_shortcut()
+        } else {
+            prefs.quick.shortcut.as_str()
+        };
+        let note = self.quick_shortcut_note(cx);
+        let recorder = div()
+            .id("quick-record-area")
+            .debug_selector(|| "quick-record".into())
+            .track_focus(&self.quick_focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if !this.quick_recording {
+                    return;
+                }
+                cx.stop_propagation();
+                if ev.keystroke.key == "escape" {
+                    this.quick_recording = false;
+                } else if let Some(shortcut) = hotkey::shortcut_from_keystroke(&ev.keystroke) {
+                    this.quick_recording = false;
+                    this.store
+                        .update(cx, |s, cx| s.set_quick_shortcut(&shortcut, cx));
+                }
+                cx.notify();
+            }))
+            .child(
+                flat_btn("quick-record", true, recording, p)
+                    .child(if recording {
+                        "Press the new shortcut…".to_string()
+                    } else {
+                        hotkey::describe(shortcut)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.quick_recording = !this.quick_recording;
+                        if this.quick_recording {
+                            this.quick_focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        settings_card(p)
+            .child(simple_row(
+                "Quick panel",
+                "A floating chat you open with a global shortcut from any app. While it is on, \
+                 QueryMT keeps running with a tray icon when the main window is closed.",
+                kit::switch("sw-quick")
+                    .checked(enabled)
+                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                        let v = *v;
+                        this.quick_recording = false;
+                        this.store.update(cx, |s, cx| s.set_quick_enabled(v, cx));
+                    })),
+                true,
+                p,
+            ))
+            .when(enabled, |card| {
+                card.child(simple_row("Shortcut", note, recorder, false, p))
+            })
+    }
+
+    /// What the Shortcut row says: the shortcut when it is registered, why
+    /// it is not otherwise, and the command to bind by hand.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn quick_shortcut_note(&self, cx: &App) -> String {
+        use crate::quick::{QuickHost, hotkey};
+
+        let (status, error) = QuickHost::global(cx)
+            .map(|host| {
+                let host = host.read(cx);
+                (host.hotkey_status(), host.hotkey_error().map(str::to_owned))
+            })
+            .unwrap_or((hotkey::HotkeyStatus::Off, None));
+        if self.quick_recording {
+            return "Press the keys to use, with at least one modifier. Esc cancels.".into();
+        }
+        hotkey::status_lines(&status, error.as_deref()).join(" ")
     }
 
     /// Theme mode cards and accent swatches (desktop `AppearanceControls`),
@@ -2084,6 +2181,49 @@ mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::test::TestWindowExt as _;
     use serde_json::{Value, json};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui_kit::test]
+    fn unavailable_hotkey_shows_cli_hint(cx: &mut gpui_kit::TestAppContext) {
+        use crate::quick::{QuickHost, hotkey::Hotkey};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let store = crate::store::automations::schedule_ui_fixture();
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            let window = gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store.clone(), window, cx))
+            })
+            .unwrap();
+            // The host starts with the panel off; a desktop without a
+            // shortcut service is stood in for before it is turned on, so
+            // that no real shortcut, tray icon or socket is created.
+            let host = QuickHost::install(store.clone(), Some(window.clone()), cx);
+            host.update(cx, |host, _| {
+                host.set_hotkey_for_test(Hotkey::Unavailable("no GlobalShortcuts portal".into()))
+            });
+            store.update(cx, |s, _| s.prefs.quick.enabled = true);
+            window
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.go(Page::Settings, cx);
+                app.settings_tab = SettingsTab::General;
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let note = cx.update(|cx| app.read(cx).quick_shortcut_note(cx));
+        assert!(note.contains("unavailable"), "{note}");
+        assert!(note.contains("no GlobalShortcuts portal"), "{note}");
+        assert!(note.contains("querymt-gpui --quick"), "{note}");
+        // The row with the recorder is on the page.
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("quick-record").is_some());
+    }
 
     #[gpui_kit::test]
     fn developer_mode_is_a_general_setting(cx: &mut gpui_kit::TestAppContext) {
