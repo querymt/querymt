@@ -100,15 +100,27 @@ The session's plan SHALL be the agent's current plan, replaced by each plan upda
 - **THEN** the plan shows the same entries and states
 
 ### Requirement: Usage and cost
-The context indicator, token breakdown and cost SHALL come from the agent's usage and accounting data, live and after a reload, including billing scope, incompleteness reasons and budget. A session with no model calls SHALL show no cost. After the model changes, the context indicator SHALL show no usage until a request with the new model reports it.
+The context indicator, token breakdown and cost SHALL come from the agent's usage and accounting data, live and after a reload, including billing scope, incompleteness reasons and budget. A session with no model calls SHALL show no cost. After the model or provider changes, the context indicator SHALL keep showing the last measured usage against the new model's context size, live and after the session is switched away from and reopened or reloaded, until a request with the new model reports its own usage. The size SHALL come from the agent; when the agent reports none, the size of the model in the client's model list SHALL be used. A session without any measurement SHALL show no usage.
 
 #### Scenario: Subscription usage
 - **WHEN** a session's accounting reports only subscription-excluded attempts
 - **THEN** the cost panel shows subscription usage and no dollar amount, live and after a reload
 
-#### Scenario: Model change hides stale context
-- **WHEN** the user switches the model after a request
-- **THEN** the context indicator shows no usage until the next request completes
+#### Scenario: Model change keeps the last usage
+- **WHEN** the user switches the model or provider after a request
+- **THEN** the context indicator shows the last measured usage against the new model's context size
+
+#### Scenario: Reopen after a model change
+- **WHEN** the user switches the model, opens another session and returns before sending a request
+- **THEN** the context indicator still shows the last measured usage against the new model's context size
+
+#### Scenario: Next request after a model change
+- **WHEN** a request with the new model completes
+- **THEN** the context indicator shows the usage that request reports
+
+#### Scenario: Agent reports no context size
+- **WHEN** the agent reports no context size for the session's model
+- **THEN** the context indicator uses the size of that model in the client's model list, and shows no usage when neither is known
 
 ### Requirement: Delegated sessions
 A delegate tool call SHALL link to the child session the agent reports for it, live and after a reload, and the user SHALL be able to open that child from the tool call.

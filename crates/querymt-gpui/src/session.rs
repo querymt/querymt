@@ -669,8 +669,17 @@ pub struct SessionView {
     /// A prompt sent from this client is in flight.
     pub prompting: bool,
     pub plan: Vec<PlanEntry>,
-    /// Context window (used, size) in tokens.
+    /// Context window (used, size) in tokens, as shown: the core's
+    /// measurement, else the last measured `used` against the current
+    /// model's size (after a model change, until the next request).
     pub usage: Option<(u64, u64)>,
+    /// The last context measurement of the session, kept across a model
+    /// change (the core drops it) and taken from the load summary.
+    pub last_used: Option<u64>,
+    /// The core's current measurement `(used, size)`.
+    measured: Option<(u64, u64)>,
+    /// Context size of the current model, as the agent reports it.
+    context_limit: Option<u64>,
     /// Latest-request / session-total token breakdown.
     pub breakdown: Option<Breakdown>,
     /// API-spend accounting.

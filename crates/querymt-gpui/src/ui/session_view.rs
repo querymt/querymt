@@ -3840,14 +3840,19 @@ impl QmtApp {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, Vec<AnyElement>)> {
-        let (view, summary, plan) = {
+        let (view, summary, plan, model_context) = {
             let store = self.store.read(cx);
             let session = store.session.as_ref()?;
             let view = session.shallow();
             let summary = store
                 .session_summary(&view.agent_id, &view.session_id)
                 .cloned();
-            (view, summary, session.plan.clone())
+            // The model list's size, for when the agent reports none.
+            let model_context = store
+                .session_model()
+                .and_then(|m| m.context)
+                .filter(|size| *size > 0);
+            (view, summary, session.plan.clone(), model_context)
         };
         let summary = summary.as_ref();
         let running = view.running();
@@ -3867,7 +3872,7 @@ impl QmtApp {
         } else {
             ("Ready", p.success)
         };
-        let usage = view.usage;
+        let usage = view.usage.or_else(|| view.last_used.zip(model_context));
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
 
         let back = kit::title_icon_button(

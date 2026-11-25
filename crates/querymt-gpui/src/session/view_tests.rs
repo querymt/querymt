@@ -758,3 +758,119 @@ fn commands_of_another_session_are_ignored() {
     v.session_update(&commands_update("other", json!([])));
     assert_eq!(command_names(&v), ["compact"]);
 }
+
+// ---- context indicator across a model change (design D10) -----------------
+
+/// A load response whose summary measured `used` at `context_position` and
+/// names a model selected at `model_position` with context size `limit`.
+fn usage_load(
+    used: Option<u64>,
+    context_position: i64,
+    model_position: i64,
+    limit: Option<u64>,
+) -> Value {
+    let events = querymt_agent_session_core::testing::generate(
+        querymt_agent_session_core::testing::TraceSpec::small(1),
+    )
+    .events;
+    let mut provider = json!({ "provider": "p", "model": "m2", "position": model_position });
+    if let Some(limit) = limit {
+        provider["contextLimit"] = json!(limit);
+    }
+    querymt_agent_session_core::testing::snapshot_response(
+        &events,
+        json!({ "summary": {
+            "usage": { "latestRequest": null, "sessionTotals": null, "partial": false,
+                       "requestCount": 1, "contextTokens": used,
+                       "contextPosition": used.map(|_| context_position),
+                       // `ScopeTotals` of the summary (snake case).
+                       "accounting": {
+                           "known_subtotal_usd": 0.0, "budget_known_subtotal_usd": 0.0,
+                           "components": { "input_usd": 0.0, "output_usd": 0.0,
+                               "cache_read_usd": 0.0, "cache_write_usd": 0.0,
+                               "cache_write_1h_usd": 0.0 },
+                           "priced_attempts": 0, "excluded_attempts": 0,
+                           "unresolved_attempts": 0, "incomplete_attempts": 0,
+                           "budget_incomplete_attempts": 0,
+                           "settled_reasons": [] } },
+            "provider": provider,
+            "pendingInputs": [],
+            "childSessions": []
+        } }),
+    )
+}
+
+fn usage_update(v: &mut SessionView, used: u64, size: u64) {
+    v.session_update(&json!({ "sessionId": "s1", "update": {
+        "sessionUpdate": "usage_update", "used": used, "size": size } }));
+}
+
+/// The agent's model-change signal (`model_changed_update`).
+fn model_changed(v: &mut SessionView, limit: u64) {
+    v.session_update(&json!({ "sessionId": "s1", "update": {
+        "sessionUpdate": "session_info_update",
+        "_meta": { "querymt": { "contextInvalidated": true,
+            "model": { "provider": "p2", "model": "m2", "contextLimit": limit } } } } }));
+}
+
+#[test]
+fn model_switch_keeps_the_last_usage() {
+    let mut v = view();
+    usage_update(&mut v, 12_000, 200_000);
+    assert_eq!(v.usage, Some((12_000, 200_000)));
+    // The conversation is the same; only the size is the new model's.
+    model_changed(&mut v, 1_000_000);
+    assert_eq!(v.usage, Some((12_000, 1_000_000)));
+    // The next request reports its own measurement.
+    usage_update(&mut v, 15_000, 1_000_000);
+    assert_eq!(v.usage, Some((15_000, 1_000_000)));
+    assert_eq!(v.last_used, Some(15_000));
+}
+
+#[test]
+fn reopen_after_a_model_switch_keeps_the_last_usage() {
+    // The measurement (position 3) predates the model change (position 7):
+    // the core drops it, the reopened view shows it against the new size.
+    let mut inline = view();
+    inline.load(usage_load(Some(12_000), 3, 7, Some(1_000_000)));
+    assert_eq!(inline.usage, Some((12_000, 1_000_000)));
+
+    // The same through the background load.
+    let mut v = view();
+    let job = v
+        .begin_load(usage_load(Some(12_000), 3, 7, Some(1_000_000)))
+        .unwrap_or_else(|_| panic!("a view with no turns hydrates"));
+    let hydrated = std::thread::spawn(move || job.hydrate()).join().unwrap();
+    v.finish_load(hydrated);
+    assert_eq!(v.usage, Some((12_000, 1_000_000)));
+    assert_eq!(
+        v.shallow().usage,
+        Some((12_000, 1_000_000)),
+        "the title bar's copy"
+    );
+
+    // A measurement after the model change is the core's own.
+    let mut fresh = view();
+    fresh.load(usage_load(Some(12_000), 8, 7, Some(1_000_000)));
+    assert_eq!(fresh.usage, Some((12_000, 1_000_000)));
+    usage_update(&mut fresh, 20_000, 1_000_000);
+    assert_eq!(fresh.usage, Some((20_000, 1_000_000)));
+}
+
+#[test]
+fn no_usage_without_a_measurement() {
+    // A size alone is no usage.
+    let mut v = view();
+    v.load(usage_load(None, 0, 7, Some(200_000)));
+    assert_eq!(v.usage, None);
+    assert_eq!(v.last_used, None);
+    model_changed(&mut v, 1_000_000);
+    assert_eq!(v.usage, None);
+
+    // No size from the agent: the view keeps the last `used` for the title
+    // bar, which takes the size from its model list.
+    let mut v = view();
+    v.load(usage_load(Some(12_000), 3, 7, None));
+    assert_eq!(v.usage, None);
+    assert_eq!(v.last_used, Some(12_000));
+}

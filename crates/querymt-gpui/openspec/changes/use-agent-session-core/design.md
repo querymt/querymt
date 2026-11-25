@@ -75,6 +75,13 @@ A test module `session::differential` (bin target) feeds the same inputs to the 
 ### D9. Dependency pinning
 `querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "<sha>" }`. Local development uses an uncommitted `[patch."https://github.com/querymt/querymt"]` to `../querymt/crates/agent-session-core`. `flake.nix` gets `cargoLock.outputHashes."querymt-agent-session-core-<version>" = "<hash>"`; a rev bump updates `Cargo.lock`, the hash and the dev-dependency's rev together.
 
+### D10. Context indicator across a model change
+The core drops its context measurement when the model changes: live on `session_info_update` with `_meta.querymt.contextInvalidated`, and on load when the summary's `contextPosition` precedes `provider.position` (the agent's `reliable_used` rule). A provider switch for the same model counts as a change too. The conversation itself does not change, only the token count of another tokenizer may differ slightly, so the view keeps the last measured `used` and shows it against the new size:
+- `HeaderFields` carries `usage` (the core's measurement) and `context_limit` (`header.provider.context_limit`, set live from `_meta.querymt.model.contextLimit` and on load from the summary).
+- `SessionView` keeps `last_used`: every measurement updates it; a load sets it from the snapshot's `summary.usage.contextTokens` before the core runs, because the core discards a stale value. The shown `usage` is the measurement, else `(last_used, context_limit)`.
+- When the agent reports no limit, the title bar takes the size from the store's model list (`session_model().context`).
+The value is not marked as an estimate (user decision); the next request replaces it with the measured one.
+
 ## Risks / Trade-offs
 
 - [The pinned rev lacks a prerequisite] → Task 1 checks each one against the rev before the dependency lands; the change does not start wiring until they pass.
