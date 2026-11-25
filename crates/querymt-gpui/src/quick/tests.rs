@@ -1450,6 +1450,266 @@ fn the_main_modifier_and_a_digit_shows_that_row_of_the_session_list(cx: &mut Tes
     assert_eq!(pane_key(cx, &panel).as_deref(), Some("b"));
 }
 
+fn composer_focused(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+) -> bool {
+    cx.update_window(window, |_, window, cx| {
+        panel
+            .read(cx)
+            .pane_for_test()
+            .read(cx)
+            .composer_focused_for_test(window, cx)
+    })
+    .unwrap()
+}
+
+fn list_search_focused(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+) -> bool {
+    cx.update_window(window, |_, window, cx| {
+        let query = panel.read(cx).picker_query_for_test().clone();
+        gpui_kit::Focusable::focus_handle(&query, cx).is_focused(window)
+    })
+    .unwrap()
+}
+
+// quick-panel / Session list by keyboard: opens with the search focused,
+// closes again with the composer focused, from the composer and from the
+// list's own search field.
+#[gpui_kit::test]
+fn cmd_k_opens_and_closes_the_session_list(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    rig.summaries(cx, vec![summary("a", "Session A", "idle", "1")]);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| {
+            p.pane_for_test()
+                .update(cx, |pane, cx| pane.focus_composer(window, cx))
+        })
+    })
+    .unwrap();
+    assert!(composer_focused(cx, window, &panel));
+
+    let key = secondary(cx, "k");
+    press(cx, window, &key);
+    assert!(panel.read_with(cx, |p, _| p.picker_open_for_test()));
+    assert!(list_search_focused(cx, window, &panel));
+
+    // The same key closes it from the search field.
+    press(cx, window, &key);
+    assert!(!panel.read_with(cx, |p, _| p.picker_open_for_test()));
+    assert!(composer_focused(cx, window, &panel));
+}
+
+#[gpui_kit::test]
+fn cmd_k_opens_the_session_list_from_a_new_quick_chats_bar(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    let key = secondary(cx, "k");
+    press(cx, window, &key);
+    assert!(panel.read_with(cx, |p, _| p.picker_open_for_test()));
+    press(cx, window, &key);
+    assert!(!panel.read_with(cx, |p, _| p.picker_open_for_test()));
+}
+
+// quick-panel / New quick chat from a conversation.
+#[gpui_kit::test]
+fn cmd_n_starts_a_new_quick_chat_in_the_panel(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    assert!(pane_key(cx, &panel).is_some());
+    let main_page = rig.app.read_with(cx, |app, _| app.page_for_test());
+
+    let key = secondary(cx, "n");
+    press(cx, window, &key);
+    settle(cx, window);
+    assert_eq!(pane_key(cx, &panel), None, "an empty quick chat");
+    assert!(bounds_of(cx, window, "quick-bar").is_some());
+    assert!(composer_focused(cx, window, &panel));
+    assert_eq!(
+        rig.app.read_with(cx, |app, _| app.page_for_test()),
+        main_page,
+        "the main window is unchanged"
+    );
+}
+
+/// `long_view` for an agent that offers Build, Plan and Review.
+fn view_in_mode(id: &str, mode: &str) -> SessionView {
+    let mut view = long_view(id, 1, "idle");
+    view.apply_modes(Some(&json!({
+        "currentModeId": mode,
+        "availableModes": [
+            { "id": "build", "name": "Build" },
+            { "id": "plan", "name": "Plan" },
+            { "id": "review", "name": "Review" },
+        ],
+    })));
+    view
+}
+
+// quick-panel / Tab changes the mode visibly.
+#[gpui_kit::test]
+fn tab_in_the_compact_composer_moves_the_chip(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, view_in_mode("chat", "build"));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "composer-mode:Build").is_some());
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| {
+            p.pane_for_test()
+                .update(cx, |pane, cx| pane.focus_composer(window, cx))
+        })
+    })
+    .unwrap();
+
+    press(cx, window, "tab");
+    let sent = rig.pump(cx);
+    let set = sent
+        .iter()
+        .find(|r| r["method"] == "session/set_mode")
+        .expect("the mode is changed on the agent");
+    assert_eq!(set["params"]["modeId"], "plan");
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "composer-mode:Plan").is_some());
+    assert!(bounds_of(cx, window, "composer-mode:Build").is_none());
+
+    // And back.
+    press(cx, window, "shift-tab");
+    let sent = rig.pump(cx);
+    let set = sent
+        .iter()
+        .find(|r| r["method"] == "session/set_mode")
+        .expect("and back");
+    assert_eq!(set["params"]["modeId"], "build");
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "composer-mode:Build").is_some());
+}
+
+/// `long_view` that has used `used` of `size` tokens of its context.
+fn view_with_usage(used: u64, size: u64) -> SessionView {
+    let mut view = long_view("chat", 1, "idle");
+    view.usage = Some((used, size));
+    view
+}
+
+// quick-panel / Context half full: a ring, no percentage.
+#[gpui_kit::test]
+fn header_shows_the_context_ring(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, view_with_usage(50_000, 100_000));
+    settle(cx, window);
+    let ring = bounds_of(cx, window, "quick-context").expect("the ring shows");
+    let header = bounds_of(cx, window, "quick-header").expect("in the header");
+    assert!(ring.top() >= header.top() && ring.bottom() <= header.bottom());
+    assert!(bounds_of(cx, window, "quick-context-percent").is_none());
+}
+
+// quick-panel / Context nearly full: the percentage too.
+#[gpui_kit::test]
+fn percentage_shows_when_nearly_full(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, view_with_usage(92_000, 100_000));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-context").is_some());
+    assert!(bounds_of(cx, window, "quick-context-percent").is_some());
+}
+
+// Just under 70% it is the ring alone.
+#[gpui_kit::test]
+fn the_percentage_waits_for_70(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, view_with_usage(69_000, 100_000));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-context").is_some());
+    assert!(bounds_of(cx, window, "quick-context-percent").is_none());
+}
+
+// quick-panel / Unknown context size: nothing shown.
+#[gpui_kit::test]
+fn no_ring_without_a_context_size(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-header").is_some());
+    assert!(bounds_of(cx, window, "quick-context").is_none());
+    assert!(bounds_of(cx, window, "quick-context-percent").is_none());
+}
+
+// quick-panel / Mode for the next quick chat: Tab in the bar moves the mode
+// of that chat only; the start page's launch mode is left alone.
+#[gpui_kit::test]
+fn mode_for_the_next_quick_chat_only(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    cx.update(|cx| {
+        rig.store
+            .update(cx, |s, _| s.prefs.launch_mode = "build".into())
+    });
+    let (window, panel) = rig.open_panel(cx);
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-mode:Build").is_some());
+
+    press(cx, window, "tab");
+    settle(cx, window);
+    assert_eq!(
+        panel
+            .read_with(cx, |p, _| p.picks_for_test().mode)
+            .as_deref(),
+        Some("plan")
+    );
+    assert!(bounds_of(cx, window, "quick-mode:Plan").is_some());
+    press(cx, window, "shift-tab");
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-mode:Build").is_some());
+    press(cx, window, "tab");
+
+    type_draft(cx, window, &panel, "plan the work");
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.submit(window, cx))
+    })
+    .unwrap();
+    let sent = rig.pump(cx);
+    assert!(sent.iter().any(|r| r["method"] == "session/prompt"));
+
+    let started = pane_entity(cx, &panel).expect("the quick chat started");
+    assert_eq!(
+        started.read_with(cx, |o, _| o.view.mode.clone()).as_deref(),
+        Some("plan"),
+        "the new session starts in Plan"
+    );
+    assert_eq!(
+        rig.store.read_with(cx, |s, _| s.prefs.launch_mode.clone()),
+        "build",
+        "the start page's launch mode is untouched"
+    );
+
+    // The choice was for that chat: the next one starts from the default.
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.new_chat(window, cx))
+    })
+    .unwrap();
+    settle(cx, window);
+    assert_eq!(panel.read_with(cx, |p, _| p.picks_for_test().mode), None);
+    assert!(bounds_of(cx, window, "quick-mode:Build").is_some());
+}
+
 #[gpui_kit::test]
 fn the_folder_is_the_panels_choice_and_the_quick_chat_starts_in_it(cx: &mut TestAppContext) {
     let rig = rig(cx);

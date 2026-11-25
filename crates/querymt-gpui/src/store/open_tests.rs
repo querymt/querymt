@@ -341,6 +341,7 @@ fn launch_request(agent: &str, cwd: &str, prompt: &str) -> super::launch::Launch
         placement: super::launch::Placement::local(),
         model: None,
         reasoning: None,
+        mode: None,
     }
 }
 

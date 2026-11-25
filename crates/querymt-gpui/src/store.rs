@@ -2903,6 +2903,7 @@ impl AgentsStore {
             placement,
             model,
             reasoning,
+            mode,
         } = request;
         let agent_id = agent_id.as_str();
         let Some(rpc) = self.runtime.get(agent_id).and_then(|r| r.rpc.clone()) else {
@@ -2946,7 +2947,7 @@ impl AgentsStore {
                     .is_some_and(|rt| rt.supports_method("querymt/profiles"))
             });
         let image_mode = self.prefs.image_send_mode;
-        let mode = self.prefs.mode().to_string();
+        let mode = mode.unwrap_or_else(|| self.prefs.mode().to_string());
         let reasoning = reasoning.unwrap_or_else(|| self.prefs.reasoning().to_string());
         self.set_cwd(cwd.clone());
         cx.notify();

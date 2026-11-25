@@ -471,6 +471,74 @@ pub fn wrap_tip(text: impl Into<SharedString>) -> gpui_kit::component::tooltip::
     })
 }
 
+/// The key bound without a key context to `action`, as a keystroke. When
+/// several keys are bound it is the highest-precedence one.
+fn global_keystroke(action: &dyn Action, window: &Window) -> Option<Keystroke> {
+    let binding =
+        window.highest_precedence_binding_for_action_in_context(action, KeyContext::default())?;
+    let first = binding.keystrokes().first()?;
+    Some(Keystroke {
+        modifiers: *first.modifiers(),
+        key: first.key().into(),
+        key_char: None,
+    })
+}
+
+/// The shortcut of `action` in the platform's notation (⌘K on macOS, Ctrl+K
+/// elsewhere), read from the keymap so a rebinding cannot leave a stale hint.
+/// `None` when the action has no global binding. Shows the highest-precedence
+/// binding when there are several.
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub fn shortcut_label(action: &dyn Action, window: &Window) -> Option<SharedString> {
+    let stroke = global_keystroke(action, window)?;
+    Some(gpui_kit::component::kbd::Kbd::format(&stroke).into())
+}
+
+/// A [`wrap_tip`] that also shows the key bound to `action`.
+pub fn tip_with_key(
+    text: impl Into<SharedString>,
+    action: &dyn Action,
+    window: &Window,
+) -> gpui_kit::component::tooltip::Tooltip {
+    let kbd = global_keystroke(action, window).map(gpui_kit::component::kbd::Kbd::new);
+    wrap_tip(text).key_binding(kbd)
+}
+
+/// A [`wrap_tip`] that shows `stroke` (for example `"tab"`) in the platform's
+/// notation, for a key that is not an action of the keymap.
+pub fn tip_with_stroke(
+    text: impl Into<SharedString>,
+    stroke: &'static str,
+) -> gpui_kit::component::tooltip::Tooltip {
+    let kbd = Keystroke::parse(stroke)
+        .ok()
+        .map(gpui_kit::component::kbd::Kbd::new);
+    wrap_tip(text).key_binding(kbd)
+}
+
+/// What an agent mode chip holds: a dot in the mode's tone and its label.
+/// The label carries the meaning and the tone is only a hint, so the chip
+/// does not rely on colour alone. The caller draws the chip around it.
+pub fn mode_chip_body<'a>(
+    label: impl Into<SharedString>,
+    ids: impl IntoIterator<Item = &'a str>,
+    current: &str,
+    p: &Palette,
+) -> Div {
+    let tone = super::start::mode_tone(ids, current, p);
+    h_flex()
+        .gap(px(6.))
+        .items_center()
+        .child(div().flex_none().size(px(7.)).rounded_full().bg(tone))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text)
+                .child(label.into()),
+        )
+}
+
 /// Title-bar icon items share the session-details/plan look: a 30px square
 /// with 6px corners, `card` background on hover or while its popover is open.
 pub const TITLE_BTN: f32 = 30.;
@@ -1179,6 +1247,53 @@ fn hexagon_at(corners: &Hexagon, by: Point<Pixels>) -> Option<Path> {
     path.build().ok()
 }
 
+/// The colour of a context ring `fraction` full: warning above 70%, danger
+/// above 90%, the accent otherwise.
+pub fn context_colour(fraction: f32, p: &Palette) -> Hsla {
+    if fraction > 0.9 {
+        p.danger
+    } else if fraction > 0.7 {
+        p.warn
+    } else {
+        p.accent
+    }
+}
+
+/// What the context ring's tooltip says: the tokens used, the size and the
+/// percentage.
+pub fn context_tip(used: u64, size: u64) -> String {
+    format!(
+        "Context: {} of {} tokens ({:.0}%)",
+        short_num(used),
+        short_num(size),
+        used as f64 * 100. / size as f64
+    )
+}
+
+/// The context ring alone, 18 px, in its threshold colour; `None` when the
+/// size is unknown (0).
+pub fn context_ring(used: u64, size: u64, p: &Palette) -> Option<impl IntoElement> {
+    (size > 0).then(|| {
+        let fraction = used as f32 / size as f32;
+        ring(fraction, 18., context_colour(fraction, p), p.border)
+    })
+}
+
+/// The context ring with its tooltip, for a surface that has no details panel
+/// to hang them on; `None` when the size is unknown (0).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub fn context_meter(used: u64, size: u64, p: &Palette) -> Option<Stateful<Div>> {
+    let ring = context_ring(used, size, p)?;
+    let tip = context_tip(used, size);
+    Some(
+        div()
+            .id("context-meter")
+            .flex_none()
+            .child(ring)
+            .tooltip(move |window, cx| wrap_tip(tip.clone()).build(window, cx)),
+    )
+}
+
 /// Thin progress ring (context usage), like the desktop header dial.
 pub fn ring(fraction: f32, size: f32, color: Hsla, track: Hsla) -> impl IntoElement {
     canvas(
@@ -1541,7 +1656,34 @@ pub fn loading_icon_button(
 
 #[cfg(test)]
 mod tests {
-    use super::{boot_mark_nodes, spinner_phase};
+    use super::{boot_mark_nodes, context_colour, context_meter, context_tip, spinner_phase};
+
+    // The one place the context ring's thresholds live, for both windows.
+    #[gpui_kit::test]
+    fn the_context_ring_turns_warning_above_70_and_danger_above_90(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let p = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+            *crate::theme::palette(cx)
+        });
+        assert_eq!(context_colour(0.69, &p), p.accent);
+        assert_eq!(context_colour(0.71, &p), p.warn);
+        assert_eq!(context_colour(0.91, &p), p.danger);
+        assert_ne!(p.accent, p.warn);
+        assert_ne!(p.warn, p.danger);
+        // An unknown size draws nothing.
+        assert!(context_meter(10, 0, &p).is_none());
+        assert!(context_meter(10, 100, &p).is_some());
+    }
+
+    #[test]
+    fn the_context_tip_gives_tokens_size_and_percentage() {
+        let tip = context_tip(50_000, 100_000);
+        assert!(tip.starts_with("Context: "), "{tip}");
+        assert!(tip.ends_with("(50%)"), "{tip}");
+    }
 
     #[test]
     fn spinner_advances_and_wraps_without_losing_long_running_precision() {

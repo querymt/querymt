@@ -3878,6 +3878,23 @@ fn usage_ring(
 }
 
 impl SessionPane {
+    /// Tokens used and the context size of the session shown, as the usage
+    /// ring draws them: what the agent reports, else the last request's
+    /// tokens against the model list's size. `None` when the size is unknown.
+    pub(crate) fn context_usage(&self, cx: &App) -> Option<(u64, u64)> {
+        let session = self.view(cx)?;
+        let model_context = self
+            .store
+            .read(cx)
+            .session_model(session)
+            .and_then(|m| m.context)
+            .filter(|size| *size > 0);
+        session
+            .usage
+            .or_else(|| session.last_used.zip(model_context))
+            .filter(|(_, size)| *size > 0)
+    }
+
     /// Tab / Shift+Tab in the session composer: next / previous agent mode.
     pub(super) fn cycle_session_mode(&mut self, back: bool, cx: &mut Context<Self>) {
         let Some(option) = self.view(cx).and_then(|v| {
@@ -4266,9 +4283,52 @@ impl SessionPane {
             .when(pending, |el| el.opacity(0.6))
             .child(div().min_w_0().truncate().child(label))
             .child(kit::icon(IconName::ChevronDown, 12., p.dim))
-            .tooltip(|window, cx| kit::wrap_tip("Change model (Cmd/Ctrl+M)").build(window, cx))
+            .tooltip(|window, cx| {
+                kit::tip_with_key("Change model", &super::keys::OpenModelPicker, window)
+                    .build(window, cx)
+            })
             .when(has_models && !pending, |el| {
                 el.on_click(cx.listener(|_, _, _, cx| cx.emit(SessionPaneEvent::ModelPicker)))
+            })
+            .into_any_element()
+    }
+
+    /// The agent mode chip of the compact composer: a dot, the mode's name,
+    /// and the next mode on click (the previous one with Shift), like Tab and
+    /// Shift+Tab in the composer. Dimmed and inert while a change is pending.
+    fn mode_chip(&self, option: &SelectOption, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let key = if option.id.is_empty() {
+            "mode"
+        } else {
+            option.id.as_str()
+        };
+        let pending = self
+            .view(cx)
+            .is_some_and(|v| v.pending_options.contains(key));
+        let label = option.current_label();
+        let tip = format!("Agent mode: {label}");
+        let selector = format!("composer-mode:{label}");
+        toolbar_button("s-mode-chip", p)
+            .debug_selector(|| "composer-mode".into())
+            .min_w_0()
+            .max_w(px(140.))
+            .when(pending, |el| el.opacity(0.6))
+            .child(
+                div()
+                    .min_w_0()
+                    .debug_selector(move || selector.clone())
+                    .child(kit::mode_chip_body(
+                        label,
+                        option.choices.iter().map(|(v, _)| v.as_str()),
+                        &option.current,
+                        p,
+                    )),
+            )
+            .tooltip(move |window, cx| kit::tip_with_stroke(tip.clone(), "tab").build(window, cx))
+            .when(!pending, |el| {
+                el.on_click(cx.listener(|this, _, window, cx| {
+                    this.cycle_session_mode(window.modifiers().shift, cx)
+                }))
             })
             .into_any_element()
     }
@@ -4283,19 +4343,14 @@ impl SessionPane {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, Vec<AnyElement>)> {
-        let (view, summary, plan, model_context) = {
+        let (view, summary, plan) = {
             let store = self.store.read(cx);
             let session = self.view(cx)?;
             let view = session.shallow();
             let summary = store
                 .session_summary(&view.agent_id, &view.session_id)
                 .cloned();
-            // The model list's size, for when the agent reports none.
-            let model_context = store
-                .session_model(session)
-                .and_then(|m| m.context)
-                .filter(|size| *size > 0);
-            (view, summary, session.plan.clone(), model_context)
+            (view, summary, session.plan.clone())
         };
         let summary = summary.as_ref();
         let running = view.running();
@@ -4315,7 +4370,7 @@ impl SessionPane {
         } else {
             ("Ready", p.success)
         };
-        let usage = view.usage.or_else(|| view.last_used.zip(model_context));
+        let usage = self.context_usage(cx);
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
 
         let back = kit::title_icon_button(
@@ -4430,31 +4485,25 @@ impl SessionPane {
                 .when(!self.details_open, |el| {
                     el.tooltip(move |window, cx| {
                         let text = match usage {
-                            Some((used, size)) if size > 0 => format!(
-                                "Session details\nContext: {} of {} tokens ({:.0}%)",
-                                kit::short_num(used),
-                                kit::short_num(size),
-                                used as f64 * 100. / size as f64
-                            ),
-                            _ => "Session details".to_string(),
+                            Some((used, size)) => {
+                                format!("Session details\n{}", kit::context_tip(used, size))
+                            }
+                            None => "Session details".to_string(),
                         };
                         kit::wrap_tip(text).build(window, cx)
                     })
                 })
-                .child(match usage {
-                    Some((used, size)) if size > 0 => {
-                        let frac = used as f32 / size as f32;
-                        let color = if frac > 0.9 {
-                            p.danger
-                        } else if frac > 0.7 {
-                            p.warn
-                        } else {
-                            p.accent
-                        };
-                        kit::ring(frac, 18., color, p.border).into_any_element()
-                    }
-                    _ => kit::icon(IconName::Info, kit::TITLE_ICON, p.muted).into_any_element(),
-                })
+                .child(
+                    usage
+                        .and_then(|(used, size)| kit::context_ring(used, size, p))
+                        .map_or_else(
+                            || {
+                                kit::icon(IconName::Info, kit::TITLE_ICON, p.muted)
+                                    .into_any_element()
+                            },
+                            IntoElement::into_any_element,
+                        ),
+                )
                 .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
                     if this.dismissed.closed_by("session-details", ev) {
                         return;
@@ -5213,6 +5262,11 @@ impl SessionPane {
         let compact = self.density.is_compact();
         let model_button = (!compact).then(|| self.model_picker_button(p, cx));
         let model_chip = compact.then(|| self.compact_model_chip(p, cx));
+        // Only an agent that offers modes has one to show.
+        let mode_chip = mode
+            .as_ref()
+            .filter(|m| compact && !m.choices.is_empty() && !m.current_label().is_empty())
+            .map(|m| self.mode_chip(m, p, cx));
         let options =
             (!compact).then(|| self.options_control(mode.as_ref(), control, &pending, p, cx));
 
@@ -5324,6 +5378,7 @@ impl SessionPane {
                             .items_center()
                             .child(plus)
                             .child(input)
+                            .children(mode_chip)
                             .children(model_chip)
                             .child(actions),
                     )
@@ -6748,6 +6803,90 @@ mod compact_tests {
             compact_h < comfortable_h,
             "{compact_h:?} vs {comfortable_h:?}"
         );
+    }
+
+    /// `big_session` where the agent offers Build, Plan and Review.
+    fn with_modes(current: &str) -> crate::session::SessionView {
+        let mut view = big_session(1);
+        view.apply_modes(Some(&serde_json::json!({
+            "currentModeId": current,
+            "availableModes": [
+                { "id": "build", "name": "Build" },
+                { "id": "plan", "name": "Plan" },
+                { "id": "review", "name": "Review" },
+            ],
+        })));
+        view
+    }
+
+    fn pane_of(
+        cx: &mut gpui_kit::TestAppContext,
+        view: crate::session::SessionView,
+        density: Density,
+    ) -> gpui_kit::AnyWindowHandle {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, _pane) = open_pane_with_density_for_test(
+            cx,
+            crate::store::automations::schedule_ui_fixture(),
+            view,
+            density,
+        );
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        handle
+    }
+
+    // quick-panel / Mode in a conversation
+    #[gpui_kit::test]
+    fn compact_composer_shows_the_mode(cx: &mut gpui_kit::TestAppContext) {
+        let handle = pane_of(cx, with_modes("plan"), Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let chip = vcx
+            .debug_bounds("composer-mode")
+            .expect("a mode chip is shown");
+        assert!(
+            vcx.debug_bounds("composer-mode:Plan").is_some(),
+            "named Plan"
+        );
+        let model = vcx.debug_bounds("s-model-chip");
+        // Before the model chip, on the composer's row.
+        if let Some(model) = model {
+            assert!(chip.right() <= model.left(), "{chip:?} vs {model:?}");
+        }
+        drop(vcx);
+
+        // The comfortable composer has the Options control instead.
+        let handle = pane_of(cx, with_modes("plan"), Density::Comfortable);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("composer-mode:Plan").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn no_mode_chip_when_the_agent_offers_no_modes(cx: &mut gpui_kit::TestAppContext) {
+        let handle = pane_of(cx, big_session(1), Density::Compact);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("composer-options").is_none());
+        assert!(
+            vcx.debug_bounds("composer-mode").is_none(),
+            "no chip without modes"
+        );
+    }
+
+    // quick-panel / Mode in a conversation: the chip is the mode's name, not
+    // colour alone.
+    #[gpui_kit::test]
+    fn the_mode_chip_follows_the_session_mode(cx: &mut gpui_kit::TestAppContext) {
+        for (mode, selector) in [
+            ("build", "composer-mode:Build"),
+            ("review", "composer-mode:Review"),
+        ] {
+            let handle = pane_of(cx, with_modes(mode), Density::Compact);
+            let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+            assert!(vcx.debug_bounds(selector).is_some(), "{selector}");
+        }
     }
 
     // quick-panel / Compact conversation: the HUD's composer floats and is lit

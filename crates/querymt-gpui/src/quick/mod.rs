@@ -67,6 +67,8 @@ pub(crate) struct Picks {
     pub(crate) cwd: Option<String>,
     /// Reasoning effort.
     pub(crate) reasoning: Option<String>,
+    /// Agent mode, by id.
+    pub(crate) mode: Option<String>,
 }
 
 /// What the panel remembers while it is closed.

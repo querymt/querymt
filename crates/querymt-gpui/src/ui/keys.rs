@@ -28,6 +28,7 @@ gpui_kit::actions!(
         OpenModelPicker,
         CycleReasoning,
         ChooseFolder,
+        ToggleSessionList,
     ]
 );
 
@@ -61,6 +62,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(k("cmd-t", "ctrl-t"), CycleReasoning, None),
         // Handled by the quick panel only.
         KeyBinding::new(k("cmd-o", "ctrl-o"), ChooseFolder, None),
+        // Handled by the quick panel only; the main window ignores it. A
+        // future main-window use of this key needs a key context on one side.
+        KeyBinding::new(k("cmd-k", "ctrl-k"), ToggleSessionList, None),
     ];
     let digits = if mac { DIGITS_CMD } else { DIGITS_CTRL };
     bindings.extend(
@@ -1107,6 +1111,51 @@ mod tests {
             window.render_frame(cx);
         })
         .unwrap();
+    }
+
+    /// The session list's key belongs to the quick panel: the main window
+    /// shows the same page, with the palette as it was.
+    #[gpui_kit::test]
+    fn toggle_session_list_changes_nothing_in_the_main_window(cx: &mut TestAppContext) {
+        cx.update(super::bind_keys);
+        for page in [Page::Start, Page::Session] {
+            let rig = rig(cx, page, Some(session_with(two_commands())), |_| {});
+            let mac = cx.update(|cx| cx.platform_info().is_mac());
+            let key = if mac { "cmd-k" } else { "ctrl-k" };
+            cx.update_window(rig.handle, |_, window, cx| window.press(key, cx))
+                .unwrap();
+            cx.run_until_parked();
+            rig.app.read_with(cx, |app, _| {
+                assert_eq!(app.page, page);
+                assert!(!app.palette_open);
+            });
+        }
+    }
+
+    /// A shortcut's hint is read from the keymap in the platform's notation.
+    #[gpui_kit::test]
+    fn shortcut_label_shows_the_bound_key_in_the_platforms_notation(cx: &mut TestAppContext) {
+        cx.update(super::bind_keys);
+        let rig = rig(cx, Page::Start, None, |_| {});
+        let mac = cx.update(|cx| cx.platform_info().is_mac());
+        let (model, list) = cx
+            .update_window(rig.handle, |_, window, _| {
+                (
+                    crate::ui::kit::shortcut_label(&super::OpenModelPicker, window),
+                    crate::ui::kit::shortcut_label(&super::ToggleSessionList, window),
+                )
+            })
+            .unwrap();
+        // The notation follows the OS the app is built for, the key the
+        // platform it believes it runs on.
+        let main = match (cfg!(target_os = "macos"), mac) {
+            (true, true) => "⌘",
+            (true, false) => "⌃",
+            (false, true) => "Win+",
+            (false, false) => "Ctrl+",
+        };
+        assert_eq!(model.as_deref(), Some(format!("{main}M").as_str()));
+        assert_eq!(list.as_deref(), Some(format!("{main}K").as_str()));
     }
 
     #[gpui_kit::test]

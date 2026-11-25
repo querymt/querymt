@@ -9,7 +9,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Enter, InputEvent, InputState, MoveDown, MoveUp, Textarea};
+use gpui_kit::component::input::{
+    Enter, IndentInline, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
+};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,9 +24,14 @@ use super::{Picks, Resume};
 use crate::session::PlanDigest;
 use crate::session::open::{OpenSession, SessionKey, SessionRef};
 use crate::store::launch::{LaunchError, LaunchRequest, Placement};
-use crate::store::{AgentsStore, LAUNCH_REASONING, PickerLayout, QuickPosition, SessionSummary};
+use crate::store::{
+    AgentsStore, LAUNCH_MODES, LAUNCH_REASONING, PickerLayout, QuickPosition, SessionSummary,
+};
 use crate::theme::{Palette, palette};
-use crate::ui::keys::{ChooseFolder, CycleReasoning, OpenModelPicker, OpenSidebarSession};
+use crate::ui::keys::{
+    ChooseFolder, CycleReasoning, NewSession, OpenModelPicker, OpenSidebarSession,
+    ToggleSessionList,
+};
 use crate::ui::model_picker::{ModelPicker, ModelPickerEvent, PickerFrame, Target};
 use crate::ui::workspace_select::{WorkspaceEvent, WorkspaceField, home_dir};
 use crate::ui::{Density, SessionPane, SessionPaneEvent, SmoothScroll, kit};
@@ -678,6 +685,7 @@ impl QuickPanel {
         self.error = None;
         self.picker_open = false;
         self.folder_open = false;
+        self.picks.mode = None;
         self.pane.update(cx, |pane, cx| {
             pane.clear(cx);
             pane.focus_composer(window, cx);
@@ -958,6 +966,28 @@ impl QuickPanel {
         cx.notify();
     }
 
+    /// The agent mode the next quick chat starts in.
+    fn mode_now(&self, cx: &App) -> String {
+        self.picks
+            .mode
+            .clone()
+            .unwrap_or_else(|| self.store.read(cx).prefs.mode().to_string())
+    }
+
+    /// Tab and Shift+Tab in the bar: the next or previous mode for the next
+    /// quick chat only. The start page's launch mode is not changed.
+    fn cycle_mode(&mut self, back: bool, cx: &mut Context<Self>) {
+        let n = LAUNCH_MODES.len();
+        let current = self.mode_now(cx);
+        let at = LAUNCH_MODES
+            .iter()
+            .position(|(id, ..)| *id == current)
+            .unwrap_or(0);
+        let next = if back { (at + n - 1) % n } else { (at + 1) % n };
+        self.picks.mode = Some(LAUNCH_MODES[next].0.to_string());
+        cx.notify();
+    }
+
     /// Cmd/Ctrl+Enter: start the quick chat and show it in the main window.
     pub(crate) fn submit_and_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.submit(window, cx);
@@ -996,6 +1026,7 @@ impl QuickPanel {
             placement: Placement::local(),
             model: self.picks.model.clone(),
             reasoning: self.picks.reasoning.clone(),
+            mode: self.picks.mode.clone(),
         };
         let launched = self.store.update(cx, |s, cx| s.launch(request, cx));
         self.launching = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1016,6 +1047,8 @@ impl QuickPanel {
         self.launching = None;
         match result {
             Ok(session) => {
+                // The mode chosen was for this quick chat only.
+                self.picks.mode = None;
                 self.make_room(window, cx);
                 self.pane.update(cx, |pane, cx| {
                     pane.show(session, cx);
@@ -1226,14 +1259,17 @@ impl QuickPanel {
         hud_palette(palette(cx), self.chrome.glass)
     }
 
-    /// A square icon button in the panel's colours.
+    /// A square icon button in the panel's colours. Its tooltip shows the
+    /// key bound to `key`, when there is one.
     fn icon_button(
         id: &'static str,
         icon: IconName,
         tip: &'static str,
+        key: Option<&dyn Action>,
         p: &Palette,
     ) -> Stateful<Div> {
         let hover = p.card_hover;
+        let key = key.map(|action| action.boxed_clone());
         h_flex()
             .id(id)
             // Over a drag area: a press here is the button's (design D18).
@@ -1244,7 +1280,10 @@ impl QuickPanel {
             .rounded(px(8.))
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
-            .tooltip(move |window, cx| kit::wrap_tip(tip).build(window, cx))
+            .tooltip(move |window, cx| match &key {
+                Some(action) => kit::tip_with_key(tip, action.as_ref(), window).build(window, cx),
+                None => kit::wrap_tip(tip).build(window, cx),
+            })
             .child(kit::icon(icon, 16., p.muted))
     }
 
@@ -1253,6 +1292,7 @@ impl QuickPanel {
         let pane = self.pane.read(cx);
         let session = pane.session().is_some();
         let can_back = pane.can_go_back();
+        let usage = pane.context_usage(cx);
         let title = pane
             .view(cx)
             .map(|v| v.title.clone())
@@ -1282,6 +1322,7 @@ impl QuickPanel {
                         IconName::MessageSquarePlus
                     },
                     if can_back { "Back" } else { "New quick chat" },
+                    (!can_back).then_some(&NewSession as &dyn Action),
                     &p,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -1315,6 +1356,9 @@ impl QuickPanel {
                             .child(title),
                     )
                     .child(kit::icon(IconName::ChevronDown, 14., p.muted))
+                    .tooltip(|window, cx| {
+                        kit::tip_with_key("Sessions", &ToggleSessionList, window).build(window, cx)
+                    })
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx))),
             )
             .child(
@@ -1323,12 +1367,43 @@ impl QuickPanel {
                     .flex_1()
                     .h_full(),
             )
+            // How full the context is: the main window's ring, and from 70%
+            // its percentage too. It has no details panel to open here.
+            .when_some(
+                usage.and_then(|(used, size)| {
+                    kit::context_meter(used, size, &p).map(|meter| (meter, used, size))
+                }),
+                |el, (meter, used, size)| {
+                    let fraction = used as f32 / size as f32;
+                    let colour = kit::context_colour(fraction, &p);
+                    el.child(
+                        h_flex()
+                            .debug_selector(|| "quick-context".into())
+                            .flex_none()
+                            .gap_1()
+                            .px_1()
+                            .items_center()
+                            .child(meter)
+                            .when(fraction >= 0.7, |el| {
+                                el.child(
+                                    div()
+                                        .debug_selector(|| "quick-context-percent".into())
+                                        .font_family(kit::MONO)
+                                        .text_xs()
+                                        .text_color(colour)
+                                        .child(format!("{:.0}%", fraction * 100.)),
+                                )
+                            }),
+                    )
+                },
+            )
             .when(session, |el| {
                 el.child(
                     Self::icon_button(
                         "quick-open-main",
                         IconName::ExternalLink,
                         "Open in main window",
+                        None,
                         &p,
                     )
                     .on_click(cx.listener(|this, _, _, cx| this.open_in_main(None, cx))),
@@ -1456,7 +1531,7 @@ impl QuickPanel {
     /// no card, border or shadow, rows straight on the panel's surface. In a
     /// new quick chat it lies above the bar. The search row stays in view and
     /// the rows scroll under it once the window cannot be taller.
-    fn render_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_picker(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.hud(cx);
         let layout = self.picker_layout(cx);
         let rows = self.picker_rows(cx);
@@ -1489,7 +1564,7 @@ impl QuickPanel {
                     ),
             )
             .child(
-                Self::icon_button("quick-picker-layout", toggle_icon, toggle_tip, &p)
+                Self::icon_button("quick-picker-layout", toggle_icon, toggle_tip, None, &p)
                     .debug_selector(|| "quick-picker-layout".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.set_picker_layout(layout.other(), window, cx)
@@ -1499,11 +1574,9 @@ impl QuickPanel {
             PickerLayout::List => (
                 v_flex()
                     .gap_1()
-                    .children(
-                        rows.into_iter()
-                            .enumerate()
-                            .map(|(ix, row)| self.picker_list_row(ix, row, ix == cursor, &p, cx)),
-                    )
+                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                        self.picker_list_row(ix, row, ix == cursor, &p, window, cx)
+                    }))
                     .into_any_element(),
                 "quick-picker-list",
             ),
@@ -1599,15 +1672,13 @@ impl QuickPanel {
         row: PickerRow,
         selected: bool,
         p: &Palette,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = *p;
-        // Cmd/Ctrl+1… shows the row, as Spotlight does.
-        let hint = if cx.platform_info().is_mac() {
-            "⌘"
-        } else {
-            "Ctrl+"
-        };
+        // The main modifier and a digit shows the row, as Spotlight does; the
+        // hint is the key bound to it.
+        let hint = kit::shortcut_label(&OpenSidebarSession { index: ix }, window);
         let id = kit::keyed("quick-pick", format!("{}/{}", row.agent_id, row.id));
         let summary = row.summary.clone();
         let tone = Self::picker_tone(&row, &p);
@@ -1677,14 +1748,8 @@ impl QuickPanel {
             .when_some(tone, |el, (label, color)| {
                 el.child(kit::tone_chip(label, color))
             })
-            .when(ix < 9, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(p.dim)
-                        .child(format!("{hint}{}", ix + 1)),
-                )
+            .when_some(hint.filter(|_| ix < 9), |el, hint| {
+                el.child(div().flex_none().text_xs().text_color(p.dim).child(hint))
             })
             .on_click(cx.listener(move |this, _, window, cx| this.pick(&summary, window, cx)))
             .into_any_element()
@@ -1846,10 +1911,14 @@ impl QuickPanel {
                 let model = self.model_label(cx);
                 // The agent is named in the bar only when there is a choice.
                 let several = self.store.read(cx).configs.len() > 1;
-                let folder_tip = format!(
-                    "{agent} · {}: change the folder (Cmd/Ctrl+O)",
-                    self.chosen_cwd(cx)
-                );
+                let folder_tip = format!("{agent} · {}: change the folder", self.chosen_cwd(cx));
+                let mode = self.mode_now(cx);
+                let mode_label = LAUNCH_MODES
+                    .iter()
+                    .find(|(id, ..)| *id == mode)
+                    .map_or(mode.as_str(), |(_, label, _)| *label)
+                    .to_string();
+                let mode_tip = format!("Agent mode for this chat: {mode_label}");
                 let reasoning = self.reasoning_now(cx);
                 let auto = reasoning == "auto";
                 let reasoning_label = LAUNCH_REASONING
@@ -1857,7 +1926,7 @@ impl QuickPanel {
                     .find(|(id, ..)| *id == reasoning)
                     .map_or(reasoning.as_str(), |(_, label, _)| *label)
                     .to_string();
-                let reasoning_tip = format!("Reasoning effort: {reasoning_label} (Cmd/Ctrl+T)");
+                let reasoning_tip = format!("Reasoning effort: {reasoning_label}");
                 // One shape for the chips, all the height of the model chip.
                 let chip = |id: &'static str| {
                     h_flex()
@@ -1892,12 +1961,13 @@ impl QuickPanel {
                     .child(
                         chip("quick-folder")
                             .tooltip(move |window, cx| {
-                                kit::wrap_tip(folder_tip.clone()).build(window, cx)
+                                kit::tip_with_key(folder_tip.clone(), &ChooseFolder, window)
+                                    .build(window, cx)
                             })
                             .child(kit::icon(IconName::Folder, 12., p.muted))
                             .child(
                                 div()
-                                    .max_w(px(100.))
+                                    .max_w(px(90.))
                                     .truncate()
                                     .text_color(p.text)
                                     .child(cwd.unwrap_or_else(|| "Choose folder".into())),
@@ -1907,9 +1977,32 @@ impl QuickPanel {
                             })),
                     )
                     .child(
+                        chip("quick-mode")
+                            .tooltip(move |window, cx| {
+                                kit::tip_with_stroke(mode_tip.clone(), "tab").build(window, cx)
+                            })
+                            .child(
+                                div()
+                                    .debug_selector({
+                                        let label = mode_label.clone();
+                                        move || format!("quick-mode:{label}")
+                                    })
+                                    .child(kit::mode_chip_body(
+                                        mode_label.clone(),
+                                        LAUNCH_MODES.iter().map(|(id, ..)| *id),
+                                        &mode,
+                                        &p,
+                                    )),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cycle_mode(window.modifiers().shift, cx)
+                            })),
+                    )
+                    .child(
                         chip("quick-model")
                             .tooltip(|window, cx| {
-                                kit::wrap_tip("Model for this chat (Cmd/Ctrl+M)").build(window, cx)
+                                kit::tip_with_key("Model for this chat", &OpenModelPicker, window)
+                                    .build(window, cx)
                             })
                             .child(
                                 div()
@@ -1926,7 +2019,8 @@ impl QuickPanel {
                     .child(
                         chip("quick-reasoning")
                             .tooltip(move |window, cx| {
-                                kit::wrap_tip(reasoning_tip.clone()).build(window, cx)
+                                kit::tip_with_key(reasoning_tip.clone(), &CycleReasoning, window)
+                                    .build(window, cx)
                             })
                             .child(kit::icon(
                                 IconName::Brain,
@@ -1960,6 +2054,16 @@ impl QuickPanel {
                     cx.stop_propagation();
                     this.submit(window, cx);
                 }
+            }))
+            // Tab and Shift+Tab move the mode of the next quick chat, as they
+            // do in a conversation's composer.
+            .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
+                cx.stop_propagation();
+                this.cycle_mode(false, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
+                cx.stop_propagation();
+                this.cycle_mode(true, cx);
             }))
             // Placeholder, selection and caret in the panel's colours.
             .child(kit::input_colours(self.pane.read(cx).prompt_input(), &p))
@@ -2000,6 +2104,7 @@ impl QuickPanel {
                     "quick-picker-toggle",
                     IconName::MessagesSquare,
                     "Sessions",
+                    Some(&ToggleSessionList),
                     &p,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx))),
@@ -2312,7 +2417,7 @@ impl Render for QuickPanel {
             Some(sheet) => Some(sheet),
             None => match self.render_model_sheet(session, cx) {
                 Some(sheet) => Some(sheet),
-                None => self.picker_open.then(|| self.render_picker(cx)),
+                None => self.picker_open.then(|| self.render_picker(window, cx)),
             },
         };
         // A new quick chat is only its bar.
@@ -2372,6 +2477,14 @@ impl Render for QuickPanel {
             .on_action(cx.listener(|this, _: &ChooseFolder, window, cx| {
                 this.open_folder_chooser(window, cx)
             }))
+            // Cmd/Ctrl+K opens and closes the session list.
+            .on_action(
+                cx.listener(|this, _: &ToggleSessionList, window, cx| {
+                    this.toggle_picker(window, cx)
+                }),
+            )
+            // Cmd/Ctrl+N starts a new quick chat in the panel.
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_chat(window, cx)))
             // Cmd/Ctrl+1… shows the nth session of the open list.
             .on_action(cx.listener(|this, a: &OpenSidebarSession, window, cx| {
                 this.pick_nth(a.index, window, cx);
