@@ -376,7 +376,7 @@ impl Hotkey {
 mod portal {
     use async_channel::Sender;
     use futures::StreamExt as _;
-    use gpui_kit::{App, Task};
+    use gpui_kit::{App, AppContext as _, Task};
 
     use super::{HotkeyStatus, Signal, portal_trigger};
 
