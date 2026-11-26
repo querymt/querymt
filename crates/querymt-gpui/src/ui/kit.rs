@@ -539,6 +539,118 @@ pub fn mode_chip_body<'a>(
         )
 }
 
+/// The mode's colour by its place in the agent's list (see `start::mode_tone`).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub fn mode_tone<'a>(ids: impl IntoIterator<Item = &'a str>, current: &str, p: &Palette) -> Hsla {
+    super::start::mode_tone(ids, current, p)
+}
+
+/// The colour of a reasoning effort (see `start::reasoning_color`).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub fn reasoning_tone(level: &str, p: &Palette) -> Hsla {
+    super::start::reasoning_color(level, p)
+}
+
+/// How big a badge's tags are, and where they sit on the control's top edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BadgeSize {
+    /// Height of a tag.
+    pub height: f32,
+    /// Size of its text.
+    pub text: f32,
+    /// Offset of the tags' top from the control's top edge (negative: above).
+    pub top: f32,
+}
+
+impl BadgeSize {
+    /// The main window's: a 14 px tag for a 12 px toolbar, notched into the
+    /// pill's top edge (desktop's `.composer-badge`).
+    pub const TOOLBAR: Self = Self {
+        height: 14.,
+        text: 8.25,
+        top: -6.,
+    };
+    /// The quick panel's bar, next to an 18 px input: centred on the chip's
+    /// top edge.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub const HUD: Self = Self {
+        height: 16.,
+        text: 10.,
+        top: -8.,
+    };
+}
+
+/// A badge in `color`: the text in it over a 19% tint of it on the card fill,
+/// cut out of the control with the palette's `surface`.
+pub fn badged_tone(el: impl IntoElement, text: &str, color: Hsla, p: &Palette) -> Div {
+    badged(
+        el,
+        None,
+        Some(
+            badge_tag(
+                text,
+                color,
+                p.card.blend(color.opacity(0.19)),
+                Some(p.surface),
+                BadgeSize::TOOLBAR,
+            )
+            .into_any_element(),
+        ),
+        BadgeSize::TOOLBAR,
+    )
+}
+
+/// One tag of a badge: `text` in `fg` on `bg`, lowercased. `cut_out` is the
+/// colour of the ring that cuts the tag out of the control (the colour the
+/// control sits on); none leaves the tag filled over the control's edge. The
+/// caller may give it an id and handlers.
+pub fn badge_tag(text: &str, fg: Hsla, bg: Hsla, cut_out: Option<Hsla>, size: BadgeSize) -> Div {
+    div()
+        .h(px(size.height))
+        .px(px(4.))
+        .rounded(px(4.))
+        .bg(bg)
+        .when_some(cut_out, |el, surface| {
+            el.shadow(vec![BoxShadow {
+                color: surface,
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(2.),
+                inset: false,
+            }])
+        })
+        .text_size(px(size.text))
+        .line_height(px(size.height))
+        .font_semibold()
+        .text_color(fg)
+        .text_center()
+        .truncate()
+        .child(text.to_lowercase())
+}
+
+/// `el` with a tag at its top-left and one at its top-right edge, either
+/// optional (build them with [`badge_tag`]).
+pub fn badged(
+    el: impl IntoElement,
+    left: Option<AnyElement>,
+    right: Option<AnyElement>,
+    size: BadgeSize,
+) -> Div {
+    let row = h_flex()
+        .absolute()
+        // CSS positions from inside the pill's 1px border; this wrapper is outside it.
+        .top(px(size.top))
+        .left(px(6.))
+        .right(px(6.))
+        .h(px(size.height))
+        .when(left.is_some(), |el| el.justify_between())
+        .when(left.is_none(), |el| el.justify_end())
+        // Each tag truncates at half the control's width.
+        .children(left.map(|tag| div().min_w_0().max_w(relative(0.5)).child(tag)))
+        .children(right.map(|tag| div().min_w_0().max_w(relative(0.5)).child(tag)));
+    div().relative().flex_none().child(el).child(row)
+}
+
 /// Title-bar icon items share the session-details/plan look: a 30px square
 /// with 6px corners, `card` background on hover or while its popover is open.
 pub const TITLE_BTN: f32 = 30.;

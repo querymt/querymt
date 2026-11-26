@@ -417,54 +417,6 @@ pub(super) fn mode_tone<'a>(
     rgb(if p.dark { DARK[ix] } else { LIGHT[ix] }).into()
 }
 
-/// A badge in `color`: the text in it over a 19% tint of it on the card fill.
-pub(super) fn badged_tone(el: impl IntoElement, text: &str, color: Hsla, p: &Palette) -> Div {
-    badged(
-        el,
-        text,
-        color,
-        p.card.blend(color.opacity(0.19)),
-        p.surface,
-    )
-}
-
-/// Match desktop's `.composer-badge`: a 14px tag notched into the pill's top edge.
-pub(super) fn badged(el: impl IntoElement, text: &str, fg: Hsla, bg: Hsla, surface: Hsla) -> Div {
-    div().relative().flex_none().child(el).child(
-        h_flex()
-            .absolute()
-            // CSS positions from inside the pill's 1px border; this wrapper is outside it.
-            .top(px(-6.))
-            .left(px(6.))
-            .right(px(6.))
-            .h(px(14.))
-            .justify_end()
-            .child(
-                div()
-                    .max_w_full()
-                    .h(px(14.))
-                    .px(px(4.))
-                    .rounded(px(4.))
-                    .bg(bg)
-                    // The 2px surface-colored halo cuts the tag out of the button.
-                    .shadow(vec![BoxShadow {
-                        color: surface,
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(2.),
-                        inset: false,
-                    }])
-                    .text_size(px(8.25))
-                    .line_height(px(14.))
-                    .font_semibold()
-                    .text_color(fg)
-                    .text_center()
-                    .truncate()
-                    .child(text.to_lowercase()),
-            ),
-    )
-}
-
 pub(super) fn toolbar_button(id: &'static str, p: &Palette) -> Stateful<Div> {
     let hover = p.card_hover;
     h_flex()
@@ -585,7 +537,7 @@ impl QmtApp {
             .when(has_models, |el| {
                 el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
             });
-        badged_tone(button, &level, reasoning_color(&level, p), p).into_any_element()
+        kit::badged_tone(button, &level, reasoning_color(&level, p), p).into_any_element()
     }
 
     /// What the model picker applies to: the open session on the Session
@@ -876,7 +828,7 @@ impl QmtApp {
             }));
         let options = div()
             .relative()
-            .child(badged_tone(
+            .child(kit::badged_tone(
                 options_button,
                 &mode,
                 mode_tone(LAUNCH_MODES.iter().map(|m| m.0), &mode, &p),

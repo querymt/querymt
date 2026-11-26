@@ -1813,10 +1813,134 @@ fn the_bars_controls_share_the_inputs_centre_line(cx: &mut TestAppContext) {
         f32::from(b.origin.y) + f32::from(b.size.height) / 2.
     };
     let input = centre("quick-composer", cx);
-    for id in ["quick-model", "quick-folder", "quick-reasoning"] {
+    for id in ["quick-model", "quick-folder"] {
         let c = centre(id, cx);
         assert!((c - input).abs() <= 1., "{id}: {c} vs {input}");
     }
+    // The mode and the reasoning are not chips of the bar's: they are tags
+    // on the model chip's top edge, within its width.
+    let chip = bounds_of(cx, window, "quick-model").expect("the model chip");
+    for id in ["quick-mode", "quick-reasoning"] {
+        let tag = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
+        assert!(
+            tag.top() < chip.top() && tag.bottom() > chip.top(),
+            "{id} lies on the top edge"
+        );
+        assert!(
+            tag.left() >= chip.left() && tag.right() <= chip.right(),
+            "{id} is within the chip: {tag:?} vs {chip:?}"
+        );
+    }
+    let (mode, reasoning) = (
+        bounds_of(cx, window, "quick-mode").unwrap(),
+        bounds_of(cx, window, "quick-reasoning").unwrap(),
+    );
+    assert!(mode.right() <= reasoning.left(), "the tags do not overlap");
+}
+
+// quick-panel / Long prompt in the bar: past two lines the controls stack
+// beside the input, and they stay stacked until it is one line or empty.
+#[gpui_kit::test]
+fn the_bar_stacks_its_controls_past_two_lines(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let top_of = |cx: &mut TestAppContext, id: &'static str| {
+        f32::from(
+            bounds_of(cx, window, id)
+                .unwrap_or_else(|| panic!("{id} is drawn"))
+                .origin
+                .y,
+        )
+    };
+    // At rest: one row, the folder and the model on one line.
+    assert!((top_of(cx, "quick-folder") - top_of(cx, "quick-model")).abs() <= 1.);
+
+    type_draft(cx, window, &panel, "one\ntwo\nthree\nfour");
+    settle(cx, window);
+    settle(cx, window);
+    let (folder, model, input) = (
+        bounds_of(cx, window, "quick-folder").expect("folder"),
+        bounds_of(cx, window, "quick-model").expect("model"),
+        bounds_of(cx, window, "quick-composer").expect("input"),
+    );
+    assert!(
+        folder.bottom() <= model.top(),
+        "the folder is above the model: {folder:?} {model:?}"
+    );
+    assert!(folder.left() >= input.right() - gpui_kit::px(1.));
+    assert!(model.left() >= input.right() - gpui_kit::px(1.));
+    // The column ends with the picker button, bottom-aligned with the input.
+    let picker = bounds_of(cx, window, "quick-picker-toggle").expect("picker button");
+    assert!(model.bottom() <= picker.top());
+    assert!(
+        (f32::from(picker.bottom()) - f32::from(input.bottom())).abs() <= 12.,
+        "{picker:?} vs {input:?}"
+    );
+
+    // A draft that wraps back to two lines while stacked stays stacked.
+    type_draft(cx, window, &panel, "one\ntwo");
+    settle(cx, window);
+    settle(cx, window);
+    let (folder, model) = (
+        bounds_of(cx, window, "quick-folder").expect("folder"),
+        bounds_of(cx, window, "quick-model").expect("model"),
+    );
+    assert!(folder.bottom() <= model.top(), "still stacked at two lines");
+
+    // Cleared, the controls are one row again.
+    type_draft(cx, window, &panel, "");
+    settle(cx, window);
+    settle(cx, window);
+    assert!((top_of(cx, "quick-folder") - top_of(cx, "quick-model")).abs() <= 1.);
+}
+
+#[test]
+fn the_bar_stacks_by_the_inputs_height_with_hysteresis() {
+    use super::panel::bar_stacked as stacked;
+    let line = 26.;
+    assert!(!stacked(false, 0., true), "not laid out yet");
+    assert!(!stacked(false, line, false) && !stacked(false, 2. * line, false));
+    assert!(stacked(false, 3. * line, false));
+    assert!(stacked(true, 2. * line, false), "two lines while stacked");
+    assert!(!stacked(true, line, false), "one line again");
+    assert!(!stacked(true, 2. * line, true), "an empty draft");
+}
+
+// quick-panel / Mode and reasoning on the model: the tags are buttons.
+#[gpui_kit::test]
+fn the_model_chips_tags_change_mode_and_reasoning(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.update(|cx| {
+        rig.store.update(cx, |s, _| {
+            s.prefs.launch_mode = "build".into();
+            s.prefs.launch_reasoning = "auto".into();
+        })
+    });
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let picks = |cx: &mut TestAppContext| panel.read_with(cx, |p, _| p.picks_for_test());
+    let at = |cx: &mut TestAppContext, id: &'static str| {
+        centre(bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn")))
+    };
+
+    let tag = at(cx, "quick-mode");
+    press_at(cx, window, tag);
+    assert_eq!(picks(cx).mode.as_deref(), Some("plan"));
+    assert!(bounds_of(cx, window, "quick-mode:Plan").is_some());
+    let tag = at(cx, "quick-mode");
+    press_at_with(cx, window, tag, gpui_kit::Modifiers::shift());
+    assert_eq!(picks(cx).mode.as_deref(), Some("build"));
+
+    let tag = at(cx, "quick-reasoning");
+    press_at(cx, window, tag);
+    assert_eq!(picks(cx).reasoning.as_deref(), Some("low"));
+
+    assert!(
+        !panel.read_with(cx, |p, cx| p.models_for_test().read(cx).is_open()),
+        "the model picker stays closed"
+    );
+    assert_eq!(drags(cx, &panel), 0, "a tag is not a drag area");
 }
 
 // ---- progress and the card grid in the session picker ----------------------------
@@ -2641,10 +2765,19 @@ fn press_at(
     window: AnyWindowHandle,
     at: gpui_kit::Point<gpui_kit::Pixels>,
 ) {
+    press_at_with(cx, window, at, gpui_kit::Modifiers::none());
+}
+
+fn press_at_with(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    at: gpui_kit::Point<gpui_kit::Pixels>,
+    modifiers: gpui_kit::Modifiers,
+) {
     let mut vcx = VisualTestContext::from_window(window, cx);
-    vcx.simulate_mouse_move(at, None, gpui_kit::Modifiers::none());
-    vcx.simulate_mouse_down(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::none());
-    vcx.simulate_mouse_up(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::none());
+    vcx.simulate_mouse_move(at, None, modifiers);
+    vcx.simulate_mouse_down(at, gpui_kit::MouseButton::Left, modifiers);
+    vcx.simulate_mouse_up(at, gpui_kit::MouseButton::Left, modifiers);
     cx.run_until_parked();
 }
 
@@ -2670,6 +2803,11 @@ fn the_bar_drags_around_its_controls_only(cx: &mut TestAppContext) {
     let chip = bounds_of(cx, window, "quick-model").expect("the model chip");
     press_at(cx, window, centre(chip));
     assert_eq!(drags(cx, &panel), 0, "a chip is a button");
+    for tag in ["quick-mode", "quick-reasoning"] {
+        let tag = bounds_of(cx, window, tag).expect("a tag of the model chip");
+        press_at(cx, window, centre(tag));
+        assert_eq!(drags(cx, &panel), 0, "a tag is a button");
+    }
 
     // The bar's padding, left of the text.
     let edge = gpui_kit::point(bar.left() + gpui_kit::px(4.), centre(bar).y);
