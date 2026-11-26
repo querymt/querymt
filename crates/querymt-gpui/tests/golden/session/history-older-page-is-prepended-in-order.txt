@@ -1,0 +1,5 @@
+User { text: "first", local: false }
+Tool { status: "completed", output: "ok", child: None }
+Agent("reply 1")
+User { text: "second", local: false }
+Agent("reply 2")

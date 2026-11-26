@@ -1,0 +1,35 @@
+name: querymt-gpui
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+release: "1"
+section: devel
+maintainer: QueryMT
+vendor: QueryMT
+description: Native desktop control center for QueryMT (GPUI)
+homepage: https://github.com/querymt/querymt-gpui
+license: MIT
+
+contents:
+  - src: ${PKGROOT}/usr/
+    dst: /usr
+    type: tree
+    expand: true
+
+overrides:
+  deb:
+    # GPUI links libxcb and libxkbcommon(-x11), and loads Vulkan/EGL, Wayland
+    # and fontconfig at runtime. GPU drivers always come from the host.
+    depends:
+      - libegl1
+      - libfontconfig1
+      - libfreetype6
+      - libvulkan1
+      - libwayland-client0
+      - libwayland-egl1
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+    recommends:
+      - xdg-desktop-portal
+      - xdg-utils

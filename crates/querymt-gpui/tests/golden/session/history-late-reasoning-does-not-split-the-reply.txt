@@ -1,0 +1,3 @@
+User { text: "go", local: false }
+Thought("**Inspecting replay test mocks**")
+Agent("in qmacp.")

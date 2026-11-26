@@ -1,0 +1,2 @@
+Thought("**Inspecting fixtures**")
+Thought("**Adding checks**raw")

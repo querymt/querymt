@@ -1,0 +1,116 @@
+{
+  "document": "knowledge/sessions.md",
+  "entries": {
+    "row:src/session.rs": {
+      "dependencies": {
+        "src/session.rs": "sha256-v1:ff617a80dbe0ec13042d678d21a6afd6361f589513735488d5d74c335835033e"
+      },
+      "text": "sha256-v1:737dd7400ce72b76192ee6c238ddf4395b8fc74ae960b6241c1bc91ad18c6bbc"
+    },
+    "row:src/session/open.rs": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf"
+      },
+      "text": "sha256-v1:9233f3da282ae5596a8c85aa3812b7c23d30a08c034e23fed15ad0f316523d6d"
+    },
+    "row:src/session/overlay.rs": {
+      "dependencies": {
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595"
+      },
+      "text": "sha256-v1:ba5c7f62ab7ee30cd35cb11d3d2288a8d77ee2b5f3840195d45dc44e12d9354f"
+    },
+    "row:src/session/projection.rs": {
+      "dependencies": {
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a"
+      },
+      "text": "sha256-v1:bb3dee12199156dcdb4a229876ed5f1a5cf634ded107d7f166fad0bae5eb2084"
+    },
+    "row:src/session/view.rs": {
+      "dependencies": {
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8"
+      },
+      "text": "sha256-v1:3f833dae123b1ba68e227492269a7e7d0b0d6b8442422606c97f0f7b192effe1"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Calls go one way\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:b0c84d092fd9a9a9c8bfcdac1aa1ce6aef5679133cc224cc4d750e53d0845e6e"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Files\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:8b72ab2fb9c2225a57d8b29a291bd0e64877009ae28729697130f6b0a2b8fa40"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"From agent inputs to rows\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:a6c9cf1a1b20ed71c3b74f90143bae60a49ad8064ba109686180060a82b987f8"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Ownership: one entity per open session\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:5eda7ae04ca19da37d5069fe99a86bb0cfb693e431e3fb330a18bcc70d1ca36a"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Sending\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:590c139608b74732eaf5940369700620f067761868a94f281ca673d3947a20b1"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Testing\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:e18e4fd266d9baa93b370790d75e552f5194de49603377f8d6ec95d51f3bc622"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\",\"Turns, undo and fork\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:48c8e9924f0f24301cca3d556a890ec9dbfed7d89f12343deccff92d00160044"
+    },
+    "section:[\"Open sessions, the session core and the transcript projection\"]": {
+      "dependencies": {
+        "src/session/open.rs": "sha256-v1:0df7056c1b9a9294ef8488d5dbe836cd83b95e92d9ec281d2733ec6845e264bf",
+        "src/session/overlay.rs": "sha256-v1:26020c0044a23748256e432a432c0818dbefc04e1914d2bee1d78ccd4d3d0595",
+        "src/session/projection.rs": "sha256-v1:428ed8de4646e9861695a09fc811041660bda6fc12caeab72ea8176fed23095a",
+        "src/session/view.rs": "sha256-v1:5519fd44007513ec89e0a5ec7287104b93064597be93337431e25a02bef341f8",
+        "src/store.rs#AgentsStore::open": "symbol-v1:7ab2dd751ae6c36c"
+      },
+      "text": "sha256-v1:e8a16adbf71167e3c138db48951cc5b0c18280aa2f13908c2c636a308662fd11"
+    }
+  },
+  "version": 1
+}

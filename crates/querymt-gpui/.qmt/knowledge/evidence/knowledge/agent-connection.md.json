@@ -1,0 +1,176 @@
+{
+  "document": "knowledge/agent-connection.md",
+  "entries": {
+    "row:src/store/agent_log.rs": {
+      "dependencies": {
+        "src/store/agent_log.rs": "sha256-v1:8806987c675c9da838ccf2977741fe86e653e4c4ee4ff54af715fda4da52be85"
+      },
+      "text": "sha256-v1:8a693f006765682252aada4e16125cf9e047197ea0dd8db7f31107dd0bbcf8f3"
+    },
+    "row:src/store/automations.rs": {
+      "dependencies": {
+        "src/store/automations.rs": "sha256-v1:1796680bc65f5c5c8a85166c5cfa85d4fec6a2229266462fc762bed5cc07778e"
+      },
+      "text": "sha256-v1:31a01176e94e47a705f3284240388c356e6fd2627e5e5c2c6e022f3e36baf308"
+    },
+    "row:src/store/delegates.rs": {
+      "dependencies": {
+        "src/store/delegates.rs": "sha256-v1:44ae3279fcc0bd238486778e996cef7869b7adf4bded44462d915ff7f9753903"
+      },
+      "text": "sha256-v1:18099e287ee61587d28ec942d0b300c08d0ee3d58d73520a58841037567069d1"
+    },
+    "row:src/store/devtools.rs": {
+      "dependencies": {
+        "src/store/devtools.rs": "sha256-v1:062637ae25734ee49f232f90554d98548653bb3f264d251a41884e6071c9c307"
+      },
+      "text": "sha256-v1:a84a7dbb8be206a0cdcd0e54f7d16d8910cd4ca14cdb5a93e7caafb995177bb9"
+    },
+    "row:src/store/early_commands.rs": {
+      "dependencies": {
+        "src/store/early_commands.rs": "sha256-v1:e6a62fec1b5614373cad9d841d0884a451f2a1dc2c0e0256797252293b5afcd2"
+      },
+      "text": "sha256-v1:abe932c67798d92ff29c8485a810a09217c39524a37cc7b2a36884ed3f7c60d0"
+    },
+    "row:src/store/fork.rs": {
+      "dependencies": {
+        "src/store/fork.rs": "sha256-v1:d36b2c3aa3e7188ea9e5fffa43be4b6adfd8eb993eb7befbbecb05e85ddb9f2f"
+      },
+      "text": "sha256-v1:858989104df87b172a77bdd57487719f49417e8c17f4c328e7e4ba42f28aec29"
+    },
+    "row:src/store/launch.rs": {
+      "dependencies": {
+        "src/store/launch.rs": "sha256-v1:3c0d8ac2218dcdd143ec83cf0ca36ed02ff68c17f14c1cc4ef3340e96b2d629b"
+      },
+      "text": "sha256-v1:e35df6dd6512ffe89eb69bea9e115564473b9a179d862d2a5aae6f473eaa41c8"
+    },
+    "row:src/store/mcp_notice.rs": {
+      "dependencies": {
+        "src/store/mcp_notice.rs": "sha256-v1:725d067866b7de287343ab4608b31b98010ca18b007f11f2373c5821243f0338"
+      },
+      "text": "sha256-v1:a00b82232fb2b215de4ae899dd92a9e1ebee497ff7bd5e28dbe06cc7f153d358"
+    },
+    "row:src/store/mesh_live.rs": {
+      "dependencies": {
+        "src/store/mesh_live.rs": "sha256-v1:d041e5cd7156d882ca30241277a2587a6b576a3fcf52df3c289372891f77e035"
+      },
+      "text": "sha256-v1:c6c25f6f9601425c8f5589b322c81ebe21deb91abc9339ce1a6a24a508cb4065"
+    },
+    "row:src/store/pins.rs": {
+      "dependencies": {
+        "src/store/pins.rs": "sha256-v1:aadba2fb5d1e04a36e3d5f2e0ff5750de8007395834853e85a323e4c4ec66310"
+      },
+      "text": "sha256-v1:de19d0db996245b091753eed469a47505af55776543814ab4a8b702ce76786f1"
+    },
+    "row:src/store/plans.rs": {
+      "dependencies": {
+        "src/store/plans.rs": "sha256-v1:f2115d1a6d5a40460e4174eae892b631ef07f87f271c2b406627078eae212dd3"
+      },
+      "text": "sha256-v1:1fa8daba94d12c2dc8b95089c10772b80840f8ced12fce75015b246770b30278"
+    },
+    "row:src/store/plugins.rs": {
+      "dependencies": {
+        "src/store/plugins.rs": "sha256-v1:b19d2a2e9f1b0fd8ef445ce09c47bd5a93a0da0782ceef6f784e6809fea864ca"
+      },
+      "text": "sha256-v1:90a1eb45f981fc81e0854995ab6ae0a9532e2ca2068b8f812d527a18246b36ca"
+    },
+    "row:src/store/setup.rs": {
+      "dependencies": {
+        "src/store/setup.rs": "sha256-v1:0bbf9add955b0d942c77401a2ccf93b56f9905b1f6c52d6d1b15c2514051d76e"
+      },
+      "text": "sha256-v1:af192cb0d593b41b459f7c2399f291318c7fdcd121400248fa9e9aefcaf7b866"
+    },
+    "row:src/store/sidebar.rs": {
+      "dependencies": {
+        "src/store/sidebar.rs": "sha256-v1:3e2b86720887ba99124b2274a6357a4c15e7b30d78a2ced1a4cc832e5a059956"
+      },
+      "text": "sha256-v1:98fdc4061a89840a15fde1822e75b00f57e47434419e4ebbae18334220be2bc4"
+    },
+    "row:src/store/worktree.rs": {
+      "dependencies": {
+        "src/store/worktree.rs": "sha256-v1:9f2a1c11e153a21573c85c4265b0f050a96292f651805a93ed33279b4bd807b0"
+      },
+      "text": "sha256-v1:fb1d46a4c95d0c79b395fafedabf3a36c50d32ae2fcb45329a5a809cd4fa217f"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Connecting\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:c767aad5c809d01d1ba50f3cb7c2af4b993def642a7002a25bffc640f0ab9d4c"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Extension calls\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:7b188a734d773a15281d9fb05c1f73d7062aa507fbcd44e778470bcd6c220f2e"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Failure and reconnect\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:eebd8ba66f3dac9ac9e620535c22241d88e8a950f5fe5bf8574864ddca4f5870"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Files\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:ea5f2b4fa61a783c9f04562e80c7e5d2cd1179da380b9d498c6a3e71d0f54099"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Generations\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:2fd29fe94002535678f13380411e7ecba7ea26f9c47e5ea38b89a5e94d70a327"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Inbound routing (`on_incoming`)\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:6e0728990dff66e16157ced4d9c02b714f33b13e7fbb93cbb858206a67c3b794"
+    },
+    "section:[\"Agent connections, RPC routing and the store\",\"Persistence\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:658756aecfa08c28520b06e067036e8212cc2e4dc2940cda2fbeee270f591c93"
+    },
+    "section:[\"Agent connections, RPC routing and the store\"]": {
+      "dependencies": {
+        "src/rpc.rs": "sha256-v1:8d4fde80b80320ad3d6bf6b5804a67737293bacf7c5466cf34b14f6a88fdd7e1",
+        "src/store.rs#AgentsStore::connect": "symbol-v1:d67ef57c608d6ad9",
+        "src/store.rs#AgentsStore::fail": "symbol-v1:a96b846eb15f215a",
+        "src/store.rs#AgentsStore::on_incoming": "symbol-v1:1333c746b3aa8b78",
+        "src/transport.rs": "sha256-v1:52e2c8b4ae2d65f9d1f9efb7333954a1998ad2d1d631c938d5ee6efb63882983"
+      },
+      "text": "sha256-v1:22da13ae3861bfb2c3624c2192ca4ecf2b0454136823d35deebd5ff9ac90b36a"
+    }
+  },
+  "version": 1
+}

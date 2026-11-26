@@ -1,0 +1,132 @@
+[package]
+name = "querymt-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "querymt-gpui"
+path = "src/main.rs"
+
+[dependencies]
+# gpui-kit pins a matching GPUI snapshot and re-exports gpui, gpui-base,
+# gpui-component and the Lucide icon assets, keeping their versions in sync.
+gpui-kit = { version = "0.11.0", features = ["syntect"] }
+# Standalone tool-output highlighting uses the same backend and features as the
+# component library, without depending on its private highlighting API.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+# Session reducer, pinned to a pushed revision of querymt/querymt
+# (branch feat/agent-session-core). Bumping it means: change `rev` here and in
+# [dev-dependencies], refresh `cargoLock.outputHashes` in flake.nix, and run
+# the tests (they read the core's golden cases from the pinned rev).
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73" }
+async-channel = "2"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+similar = "2"
+qrcode = { version = "0.14", default-features = false }
+# Already built for gpui-kit's TextView; used to turn markdown into plain text.
+markdown = "1.0.0"
+# Instrumentation; spans and events cost nothing without a subscriber.
+tracing = "0.1"
+# The system time zone, default of the automation time zone picker.
+iana-time-zone = "0.1"
+# Fuzzy, typo-tolerant matching behind every search box (src/search.rs).
+frizbee = "0.13"
+limu = "~0.2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+dirs = "6"
+# Native WebSocket client (ws:// and wss://) on a background thread.
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# OpenTelemetry export, same stack and versions as querymt-utils::telemetry.
+# OTLP over gRPC (tonic), as QueryMT exports.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace", "logs", "metrics"] }
+tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
+# Runs the tonic gRPC channel; the UI itself does not use Tokio.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = "0.32"
+# Quick panel (desktop only): the global shortcut on macOS, Windows and X11,
+# the tray icon, and the local socket a second instance forwards `--quick` over.
+global-hotkey = "0.10"
+# Linux tray through StatusNotifierItem (ksni): no GTK3 or libappindicator.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+interprocess = "2"
+# Decodes the app icon for the tray.
+png = "0.17"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Panel material and sizing (src/quick/chrome). Same versions GPUI already
+# builds, so they add no new compilation.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std", "NSAppearance", "NSGlassEffectView", "NSGraphics", "NSResponder", "NSView",
+  "NSScreen", "NSVisualEffectView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std", "NSGeometry", "NSObject", "NSProcessInfo", "NSString", "NSArray", "NSValue",
+  "objc2-core-foundation",
+] }
+raw-window-handle = "0.6"
+# The panel's edge light (src/quick/chrome/rim.rs, design D14): the versions
+# GPUI builds, so `Cargo.lock` only gains the edges.
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+  "std", "CALayer", "CAShapeLayer", "CAAnimation", "CAMediaTiming", "CAMediaTimingFunction",
+  "CATransaction", "CABase", "objc2-core-foundation", "objc2-core-graphics",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+  "std", "CGColor", "CGPath", "CGAffineTransform", "CGGeometry",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland shortcuts go through the GlobalShortcuts portal. Only the feature is
+# added: gpui-base already selects the async runtime of the crate.
+ashpd = { version = "0.13", default-features = false, features = ["global_shortcuts"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Must match the wasm-bindgen CLI version in flake.nix exactly.
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Same `Instant` gpui's executor clock uses on wasm.
+web-time = "1"
+web-sys = { version = "0.3", features = [
+  "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Window", "Location", "Storage",
+] }
+
+[dev-dependencies]
+gpui-kit = { version = "0.11.0", features = ["test-support"] }
+# Same rev as above: tests replay the core's seeded golden cases
+# (`testing::golden_cases()`) instead of storing trace files.
+querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73", features = ["test-support"] }
+
+[build-dependencies]
+dirs = "6"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# Prioritize the shipped executable's size over compile time and peak throughput.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+debug = 0
+strip = "symbols"
+panic = "abort"
+incremental = false
+
+[profile.release-web]
+inherits = "release"
+# wasm-bindgen needs target-feature metadata; wasm-opt strips names afterward.
+strip = "debuginfo"

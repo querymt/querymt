@@ -1,0 +1,300 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  versions:
+    name: Version consistency
+    uses: ./.github/workflows/versions.yml
+    permissions:
+      contents: read
+
+  web-ui:
+    name: Web UI
+    needs: versions
+    uses: ./.github/workflows/web-ui.yml
+    permissions:
+      contents: read
+
+  publish-web-ui:
+    name: Publish Web UI
+    needs: web-ui
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download web UI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: querymt-gpui-web
+          path: web-ui
+
+      - name: Name versioned release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test -f web-ui/querymt-gpui-web.tar.gz
+          test -f web-ui/dist/index.html
+          test -s web-ui/dist/querymt_gpui_bg.wasm
+
+          cp web-ui/querymt-gpui-web.tar.gz "querymt-gpui-web-${RELEASE_TAG}.tar.gz"
+          sha256sum "querymt-gpui-web-${RELEASE_TAG}.tar.gz" > "querymt-gpui-web-${RELEASE_TAG}.tar.gz.sha256"
+
+      - name: Upload web UI to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --title "QueryMT GPUI ${RELEASE_TAG}" \
+              --notes "Release of QueryMT GPUI." \
+              || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "querymt-gpui-web-${RELEASE_TAG}.tar.gz" \
+            "querymt-gpui-web-${RELEASE_TAG}.tar.gz.sha256" \
+            --clobber
+
+  # Everything that must be true before anything is built or published.
+  resolve:
+    name: Resolve release inputs
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Test release scripts
+        run: bash scripts/release/test-release-scripts.sh
+
+      # A tag build publishes `vX.Y.Z`. A manual run on a branch builds a dry run
+      # named after the project version and never publishes (publish-release only
+      # runs for tags).
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(scripts/release/package-version.sh Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_name=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+  release:
+    name: ${{ matrix.name }}
+    needs: [versions, resolve]
+    runs-on: ${{ matrix.platform }}
+    env:
+      VERSION_NAME: ${{ needs.resolve.outputs.version_name }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CARGO_TERM_COLOR: always
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            target: aarch64-apple-darwin
+            asset_prefix: QueryMT-GPUI
+            asset_suffix: macos-aarch64
+          - name: macOS Intel
+            platform: macos-latest
+            target: x86_64-apple-darwin
+            asset_prefix: QueryMT-GPUI
+            asset_suffix: macos-x86_64
+          - name: Windows x64
+            platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_prefix: QueryMT-GPUI
+            asset_suffix: windows-x64-setup
+          - name: Linux x64
+            platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_prefix: QueryMT-GPUI
+            asset_suffix: linux-x86_64
+            arch: x86_64
+            nfpm_arch: x86_64
+            nfpm_sha256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+            appimagetool_sha256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+            appimage_runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - name: Linux arm64
+            platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_prefix: QueryMT-GPUI
+            asset_suffix: linux-aarch64
+            arch: aarch64
+            nfpm_arch: arm64
+            nfpm_sha256: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
+            appimagetool_sha256: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+            appimage_runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.platform, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Linux packaging tools
+        if: startsWith(matrix.platform, 'ubuntu-')
+        env:
+          NFPM_ARCH: ${{ matrix.nfpm_arch }}
+          NFPM_VERSION: '2.48.0'
+          NFPM_SHA256: ${{ matrix.nfpm_sha256 }}
+          APPIMAGE_ARCH: ${{ matrix.arch }}
+          APPIMAGETOOL_SHA256: ${{ matrix.appimagetool_sha256 }}
+          APPIMAGE_RUNTIME_VERSION: '20251108'
+          APPIMAGE_RUNTIME_SHA256: ${{ matrix.appimage_runtime_sha256 }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
+          echo "${NFPM_SHA256}  /tmp/nfpm.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/nfpm.tar.gz -C "$HOME/.local/bin" nfpm
+          curl -fsSL -o "$HOME/.local/bin/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-${APPIMAGE_ARCH}.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  $HOME/.local/bin/appimagetool" | sha256sum --check --strict
+          curl -fsSL -o "$HOME/.local/bin/appimage-runtime" \
+            "https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-${APPIMAGE_ARCH}"
+          echo "${APPIMAGE_RUNTIME_SHA256}  $HOME/.local/bin/appimage-runtime" | sha256sum --check --strict
+          chmod +x "$HOME/.local/bin/nfpm" "$HOME/.local/bin/appimagetool" \
+            "$HOME/.local/bin/appimage-runtime"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # GPUI compiles its Metal shaders with `xcrun metal`; Xcode 26 ships the
+      # Metal toolchain as a separate component.
+      - name: Install Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if ! xcrun -f metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -f metal
+
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) {
+            choco install nsis -y --no-progress
+          }
+
+      - name: Build app
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package macOS bundles
+        if: runner.os == 'macOS'
+        run: bash scripts/package/macos.sh "$VERSION" ${{ matrix.target }}
+
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/package/windows.sh "$VERSION" ${{ matrix.target }}
+
+      - name: Package Linux bundles
+        if: runner.os == 'Linux'
+        run: |
+          APPIMAGE_RUNTIME_FILE="$HOME/.local/bin/appimage-runtime" \
+            bash scripts/package/linux.sh "$VERSION" ${{ matrix.target }}
+
+      - name: Collect release assets
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_PREFIX: ${{ matrix.asset_prefix }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: bash scripts/release/collect-bundles.sh
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Release
+    needs: [resolve, release, publish-web-ui]
+    if: success() && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      VERSION_NAME: ${{ needs.resolve.outputs.version_name }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          pattern: 'release-*'
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Release of QueryMT GPUI.
+
+          Version: \`${VERSION}\`
+          EOF
+
+      # One combined checksum file instead of a .sha256 file per asset.
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          test "$VERSION_NAME" = "$RELEASE_TAG"
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          # 2 macOS x (dmg + app.tar.gz), Windows setup, 2 Linux x (AppImage + deb), SHA256SUMS.
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 10
+
+      - name: Upload assets to the draft release
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber
+          gh release edit "$RELEASE_TAG" --notes-file notes.md
+
+      - name: Publish completed release
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest --verify-tag
+
+      - name: Verify published assets
+        run: |
+          set -euo pipefail
+          for _ in 1 2 3 4 5; do
+            curl -fsSL "https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS" -o published.txt && break
+            sleep 5
+          done
+          test "$(wc -l < published.txt)" -eq 9
+          cat published.txt

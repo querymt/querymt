@@ -1,0 +1,6 @@
+User { text: "prompt", local: false }
+Agent("reply")
+Tool { status: "completed", output: "", child: None }
+Tool { status: "completed", output: "", child: None }
+User { text: "next", local: false }
+Tool { status: "completed", output: "", child: None }

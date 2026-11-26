@@ -1,0 +1,380 @@
+//! Byte pipes to an ACP agent. Every transport yields the same shape: a sender
+//! for outgoing JSON-RPC lines and a receiver of inbound events.
+//!
+//! - native: WebSocket (`ws://`, `wss://`) on a background thread, or a local
+//!   process speaking ACP over stdio (`qmtcode --acp`).
+//! - web: the browser's `WebSocket`.
+//!
+//! Closing the outgoing sender (`Sender::close`) tears the transport down.
+
+use async_channel::{Receiver, Sender};
+
+#[derive(Clone, Debug)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub enum Target {
+    /// Command line of a local ACP process (native only).
+    Command(String),
+    /// Full WebSocket URL, e.g. `ws://127.0.0.1:42069/acp/ws`.
+    WebSocket(String),
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub enum Inbound {
+    Message(String),
+    /// A line the agent process wrote to stderr.
+    Log(String),
+    /// Something the transport itself reports (the process it started).
+    Note(String),
+    Closed(String),
+}
+
+pub struct Connection {
+    pub outgoing: Sender<String>,
+    pub incoming: Receiver<Inbound>,
+    pub pid: Option<u32>,
+}
+
+pub async fn connect(target: Target) -> Result<Connection, String> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        native::connect(target).await
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        web::connect(target).await
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod native {
+    use super::*;
+    use async_channel::TryRecvError;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tungstenite::{Message, stream::MaybeTlsStream};
+
+    pub async fn connect(target: Target) -> Result<Connection, String> {
+        let (out_tx, out_rx) = async_channel::unbounded::<String>();
+        let (in_tx, in_rx) = async_channel::unbounded::<Inbound>();
+        match target {
+            Target::WebSocket(url) => {
+                let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+                std::thread::Builder::new()
+                    .name("qmt-ws".into())
+                    .spawn(move || ws_thread(url, out_rx, in_tx, ready_tx))
+                    .map_err(|e| e.to_string())?;
+                ready_rx
+                    .await
+                    .map_err(|_| "Connection thread exited.".to_string())??;
+                Ok(Connection {
+                    outgoing: out_tx,
+                    incoming: in_rx,
+                    pid: None,
+                })
+            }
+            Target::Command(command_line) => {
+                let pid = spawn_process(&command_line, out_rx, in_tx)?;
+                Ok(Connection {
+                    outgoing: out_tx,
+                    incoming: in_rx,
+                    pid: Some(pid),
+                })
+            }
+        }
+    }
+
+    fn ws_thread(
+        url: String,
+        out_rx: Receiver<String>,
+        in_tx: Sender<Inbound>,
+        ready: futures::channel::oneshot::Sender<Result<(), String>>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut socket = match tungstenite::connect(url.as_str()) {
+            Ok((socket, _)) => socket,
+            Err(err) => {
+                let _ = ready.send(Err(format!("Unable to connect to {url}: {err}")));
+                return;
+            }
+        };
+        // Short read timeout so the same thread can also flush outgoing frames.
+        let timeout = Some(Duration::from_millis(15));
+        let _ = match socket.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp.set_read_timeout(timeout),
+            MaybeTlsStream::Rustls(tls) => tls.get_ref().set_read_timeout(timeout),
+            _ => Ok(()),
+        };
+        let _ = ready.send(Ok(()));
+
+        loop {
+            loop {
+                match out_rx.try_recv() {
+                    Ok(text) => {
+                        if let Err(err) = socket.send(Message::Text(text.into())) {
+                            let _ = in_tx.send_blocking(Inbound::Closed(format!(
+                                "WebSocket send failed: {err}"
+                            )));
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => {
+                        let _ = socket.close(None);
+                        let _ = socket.flush();
+                        return;
+                    }
+                }
+            }
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    if in_tx
+                        .send_blocking(Inbound::Message(text.as_str().to_owned()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Message::Binary(bytes)) => {
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        let _ = in_tx.send_blocking(Inbound::Message(text));
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    let reason = frame
+                        .map(|f| {
+                            format!(
+                                "WebSocket closed: {} ({})",
+                                f.reason.as_str(),
+                                u16::from(f.code)
+                            )
+                        })
+                        .unwrap_or_else(|| "WebSocket closed.".into());
+                    let _ = in_tx.send_blocking(Inbound::Closed(reason));
+                    return;
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => {
+                    let _ = in_tx.send_blocking(Inbound::Closed(format!("WebSocket error: {err}")));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn spawn_process(
+        command_line: &str,
+        out_rx: Receiver<String>,
+        in_tx: Sender<Inbound>,
+    ) -> Result<u32, String> {
+        let parts = split_command_line(command_line)?;
+        let (program, args) = parts.split_first().ok_or("Command line is empty.")?;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("Failed to start `{program}`: {err}"))?;
+        let pid = child.id();
+        let mut stdin = child.stdin.take().ok_or("No stdin")?;
+        let stdout = child.stdout.take().ok_or("No stdout")?;
+        let stderr = child.stderr.take().ok_or("No stderr")?;
+        let _ = in_tx.try_send(Inbound::Note(format!(
+            "Started `{command_line}` (pid {pid})."
+        )));
+
+        let tx = in_tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.trim().is_empty() => {}
+                    Ok(line) => {
+                        if tx.send_blocking(Inbound::Message(line)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send_blocking(Inbound::Closed("Agent process exited.".into()));
+        });
+        let tx = in_tx;
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send_blocking(Inbound::Log(line));
+            }
+        });
+        std::thread::spawn(move || {
+            while let Ok(line) = out_rx.recv_blocking() {
+                if writeln!(stdin, "{line}")
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        Ok(pid)
+    }
+
+    /// Minimal shell-style splitting: whitespace, single and double quotes, backslash escapes.
+    fn split_command_line(input: &str) -> Result<Vec<String>, String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_word = false;
+        let mut quote: Option<char> = None;
+        let mut chars = input.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some('"'), '\\') => current.extend(chars.next()),
+                (Some(_), c) => current.push(c),
+                (None, '"' | '\'') => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                (None, '\\') => {
+                    current.extend(chars.next());
+                    in_word = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if in_word {
+                        parts.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                (None, c) => {
+                    current.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        if quote.is_some() {
+            return Err("Unterminated quote in command line.".into());
+        }
+        if in_word {
+            parts.push(current);
+        }
+        Ok(parts)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod web {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+    use wasm_bindgen::{JsCast, prelude::*};
+    use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+
+    pub async fn connect(target: Target) -> Result<Connection, String> {
+        let url = match target {
+            Target::WebSocket(url) => url,
+            Target::Command(_) => {
+                return Err("Local processes cannot be started from the browser.".into());
+            }
+        };
+        let ws = WebSocket::new(&url).map_err(|e| format!("Invalid WebSocket URL {url}: {e:?}"))?;
+        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+        let (out_tx, out_rx) = async_channel::unbounded::<String>();
+        let (in_tx, in_rx) = async_channel::unbounded::<Inbound>();
+        let (open_tx, open_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+        let open_tx = Rc::new(RefCell::new(Some(open_tx)));
+
+        let on_open = {
+            let open_tx = open_tx.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                if let Some(tx) = open_tx.borrow_mut().take() {
+                    let _ = tx.send(Ok(()));
+                }
+            })
+        };
+        let on_error = {
+            let (open_tx, in_tx, url) = (open_tx.clone(), in_tx.clone(), url.clone());
+            Closure::<dyn FnMut(Event)>::new(move |_| {
+                if let Some(tx) = open_tx.borrow_mut().take() {
+                    let _ = tx.send(Err(format!("Unable to connect to {url}.")));
+                } else {
+                    let _ = in_tx.try_send(Inbound::Closed("WebSocket error.".into()));
+                }
+            })
+        };
+        let on_message = {
+            let in_tx = in_tx.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let data = event.data();
+                let text = data.as_string().or_else(|| {
+                    // Proxies may forward JSON-RPC as binary frames.
+                    let buffer = data.dyn_into::<js_sys::ArrayBuffer>().ok()?;
+                    String::from_utf8(js_sys::Uint8Array::new(&buffer).to_vec()).ok()
+                });
+                if let Some(text) = text {
+                    let _ = in_tx.try_send(Inbound::Message(text));
+                }
+            })
+        };
+        let on_close = {
+            let (open_tx, in_tx) = (open_tx.clone(), in_tx.clone());
+            Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+                let reason = if event.reason().is_empty() {
+                    format!("WebSocket closed (code {}).", event.code())
+                } else {
+                    format!("WebSocket closed: {}", event.reason())
+                };
+                if let Some(tx) = open_tx.borrow_mut().take() {
+                    let _ = tx.send(Err(reason.clone()));
+                }
+                let _ = in_tx.try_send(Inbound::Closed(reason));
+            })
+        };
+        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+
+        let detach = |ws: &WebSocket| {
+            ws.set_onopen(None);
+            ws.set_onerror(None);
+            ws.set_onmessage(None);
+            ws.set_onclose(None);
+            let _ = ws.close();
+        };
+
+        match open_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                detach(&ws);
+                return Err(err);
+            }
+            Err(_) => {
+                detach(&ws);
+                return Err("Connection cancelled.".into());
+            }
+        }
+
+        let socket = ws.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // The closures must outlive the socket's use of them.
+            let _closures = (on_open, on_error, on_message, on_close);
+            while let Ok(text) = out_rx.recv().await {
+                if socket.send_with_str(&text).is_err() {
+                    break;
+                }
+            }
+            detach(&socket);
+        });
+        drop(in_tx);
+        Ok(Connection {
+            outgoing: out_tx,
+            incoming: in_rx,
+            pid: None,
+        })
+    }
+}

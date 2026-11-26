@@ -1,0 +1,118 @@
+name: Test querymt-gpui
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/test.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/test.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Job 1: Check formatting (fast, fails first)
+  format:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Job 2: Run Clippy (parallel with format)
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings
+
+  # Job 3: Run tests with coverage
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [format, clippy]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      # The crate is a single binary: its unit tests live in the bin target.
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package querymt-gpui \
+            --bins \
+            --locked \
+            --codecov --output-path ./coverage/codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov.json
+          flags: querymt-gpui
+          verbose: true
+          fail_ci_if_error: false

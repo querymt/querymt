@@ -1,0 +1,2 @@
+Tool { status: "failed", output: "Run ended before a tool result was recorded.", child: None }
+Tool { status: "failed", output: "Run ended before a tool result was recorded.", child: None }

@@ -1,0 +1,78 @@
+{
+  "document": "knowledge/development.md",
+  "entries": {
+    "section:[\"Building, testing and changing querymt-gpui\",\"Bumping the session core\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:958a00530eb092e03cba0fda5f775598cf14dade81129176deeb76b0b7454a23"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Changing behaviour: OpenSpec\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:58cf133b7f2da6cabedb10ae6bb8054f553aef3a89d3c5ddc695e571f71fb030"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Commands\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:46e3fd666389573f493e20cbf24e67bd17757f16860b0a7182f72c91096e87fb"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Fonts\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:4f755b4c531ca1170fc9fc935fefd4b5ce8d0c559119aeb7626ee394ba71ce94"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Golden session files\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:2ced0c21c14d3445f8b7646a3c31b9ecb2853602feb797616289c588ac4498c4"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"One binary crate\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:1f39d11db86ab784ef99e4d5415222bb484614fe64caeae92a39ec8ac1a175e6"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Repository knowledge\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:7fb235ff7fdf3035fdb15e58b8f1b859c4f3098ccbc911f1e06cf9cbcf87e029"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\",\"Web build\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:5154b9e558c1c4771e90479f9ddf9c7b05c87bc0bb39f192229cc1c87f4bba20"
+    },
+    "section:[\"Building, testing and changing querymt-gpui\"]": {
+      "dependencies": {
+        ".github/workflows/test.yml": "sha256-v1:0085c5ce11dd1d4ba9b9a0ac5b5d70fc17bd428c971fa23d61179a2601b20889",
+        "Cargo.toml": "sha256-v1:a80d764d195325de0b33ddb24bfb29bcab2f09a5530bedd6fec92b92a364b556",
+        "web/build.sh": "sha256-v1:5565e391f912ce11da7ea13e9cfb55f473668fa950a928fdf5e817ddbc018bc4"
+      },
+      "text": "sha256-v1:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "version": 1
+}

@@ -1,0 +1,114 @@
+{
+  "document": "knowledge/ui.md",
+  "entries": {
+    "row:src/ui/inbox.rs": {
+      "dependencies": {
+        "src/ui/inbox.rs": "sha256-v1:23f2f96cfaa254673c675affad68154c334e1ffe7d8b971e0e2d71758d095f6d"
+      },
+      "text": "sha256-v1:8917017da1ef1ffc2228aab2f1924b082ffe05355a72a405b4c4f551349a76b0"
+    },
+    "row:src/ui/keys.rs": {
+      "dependencies": {
+        "src/ui/keys.rs": "sha256-v1:3f9307f8760dda57f14d2aa74d9738aa27d45c197d49c31027893711795982e2"
+      },
+      "text": "sha256-v1:57f0c41531cb320a29294e37fbde12c2c9ec3bcdf10b77e4bf3f8b82393b4390"
+    },
+    "row:src/ui/kit.rs": {
+      "dependencies": {
+        "src/ui/kit.rs": "sha256-v1:fd47fd854f8a8b1731f1e1b21e7273c9bd6078b5e9e481db1df5be90be073430"
+      },
+      "text": "sha256-v1:94c5d3714ba73d41e83e91c54c8dd020e25cc661c944725a56f4015e1a683bdb"
+    },
+    "row:src/ui/mod.rs": {
+      "dependencies": {
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20"
+      },
+      "text": "sha256-v1:10e349f36a812a74857ffd9c514cbc3efc95ada839e7755aa4fef4f238e97ce6"
+    },
+    "row:src/ui/model_picker.rs": {
+      "dependencies": {
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd"
+      },
+      "text": "sha256-v1:763efaad35eb1e642ab9ad353b37369fda4360e79b500c35620b5ef178ecbdf3"
+    },
+    "row:src/ui/session_pane.rs": {
+      "dependencies": {
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:34c4828acbd00a50d725d7ed829c0254c0b7e9cec053c7f2456deed34c0c4688"
+    },
+    "row:src/ui/session_view.rs": {
+      "dependencies": {
+        "src/ui/session_view.rs": "sha256-v1:065a53810670763151f47e7ae8fc34db5bb8a09337f872987bc5da1e23b267e8"
+      },
+      "text": "sha256-v1:49ebba4d37c0d218f50f1a61fff8c70e1198f5e596f6eb231e7984ea3d1c01e0"
+    },
+    "row:src/ui/sidebar.rs": {
+      "dependencies": {
+        "src/ui/sidebar.rs": "sha256-v1:721dd4c962770774371714da3d46380cc5110c5e0bffad7296ecef212aac339a"
+      },
+      "text": "sha256-v1:2c3271b7dac9cca6ffb6bef0c5762bd4934bf749b5621adff7081b80e094e666"
+    },
+    "row:src/ui/start.rs": {
+      "dependencies": {
+        "src/ui/start.rs": "sha256-v1:9f4776c1072b0546fbc4a24198169d4ed3175a864e20f4713e1eb8137ca127ef"
+      },
+      "text": "sha256-v1:8626fa351e17fa994fed24b946e097199a780c3daea099c5968ddf8432bb39b4"
+    },
+    "section:[\"UI shell, pages and the session pane\",\"Files\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:6500ba4500a0b8b9a64dfeb47e13f3bd72041b44ec2daf000fdeb793540e984d"
+    },
+    "section:[\"UI shell, pages and the session pane\",\"SessionPane: one session surface, two densities\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:15daa87c662b25d6fea3f304a7f82cd50b7f7b7351bb0838fbd2c2b0723c399b"
+    },
+    "section:[\"UI shell, pages and the session pane\",\"Shared pieces\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:cd4af099c57549b6013ca66d33a1f2827337baf5c821d005e15ccd26486617b2"
+    },
+    "section:[\"UI shell, pages and the session pane\",\"The shell\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:5d27343b7be2015da3c73a6adc17e6e42cd8fefbb14cc2518ef5020b028ff201"
+    },
+    "section:[\"UI shell, pages and the session pane\",\"Transcript rendering\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:26dee43b895ce88fb5ab4446f17fc6bf786d377887574603b5d693bcf2fe6f7d"
+    },
+    "section:[\"UI shell, pages and the session pane\"]": {
+      "dependencies": {
+        "src/ui/keys.rs#bind_keys": "symbol-v1:e523ee81cf521dd1",
+        "src/ui/mod.rs": "sha256-v1:db64fdabefbfd40180d89ec202e551f482c00ecc51b7c10cdca7a892c3032c20",
+        "src/ui/model_picker.rs": "sha256-v1:015f12345992668a15db6575528c18e373ccf1176f35354f6d3af4f42975fffd",
+        "src/ui/session_pane.rs": "sha256-v1:81e30b26b48e15312ca671a5d4ea26281023f087fbdf398cafbbaf323a3b4e3a"
+      },
+      "text": "sha256-v1:99274f7ff55c248206138bb7fcc340bef1b8612c7377501800bee8f89b9525f4"
+    }
+  },
+  "version": 1
+}
