@@ -23,6 +23,7 @@ members = [
     "crates/querymt-mobile-ffi",
     "crates/py/querymt-py",
     "crates/py/querymt-agent-py",
+    "crates/querymt-gpui",
     "crates/workspace-hack",
 ]
 # What plain `cargo build/run/test/check` selects from the repository root.
@@ -31,8 +32,10 @@ members = [
 # are cdylibs, so compiling them for the host fails at link time with undefined
 # `extism` host symbols (`alloc`, `error_set`, `qmt_http_request`, ...). Also
 # excluded are the packages that need external tooling (Python extension
-# modules, the mobile FFI) and the heavy native providers (llama-cpp, izwi,
-# mrs). Use `--workspace` or `-p <package>` to select those explicitly.
+# modules, the mobile FFI), the heavy native providers (llama-cpp, izwi,
+# mrs) and the GPUI desktop app (querymt-gpui, which needs GPUI's system
+# libraries on Linux). Use `--workspace` or `-p <package>` to select those
+# explicitly.
 default-members = [
     "crates/agent",
     "crates/agent-core",
@@ -100,3 +103,21 @@ pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runti
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+
+# The QueryMT Desktop app (crates/querymt-gpui): prioritize the shipped
+# executable's size over compile time and peak throughput. Kept as named
+# profiles so qmt/qmtcode release builds are unaffected.
+[profile.release-gpui]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+debug = 0
+strip = "symbols"
+panic = "abort"
+incremental = false
+
+[profile.release-gpui-web]
+inherits = "release-gpui"
+# wasm-bindgen needs target-feature metadata; wasm-opt strips names afterward.
+strip = "debuginfo"
