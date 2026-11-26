@@ -46,6 +46,9 @@ pub(crate) struct Chrome {
     /// opaque surface 0). The legibility contract is held against it
     /// (design D11).
     pub(crate) white_through: f32,
+    /// The window's root frames the panel ([`frame`]): the frame's hairline
+    /// is the panel's, so the panel paints none of its own.
+    pub(crate) framed: bool,
 }
 
 /// The colours of the panel's root, picked by [`Chrome`]. Everything inside
@@ -68,6 +71,7 @@ impl Chrome {
             rimmed: false,
             native_motion: false,
             white_through: 0.,
+            framed: false,
         }
     }
 
@@ -84,6 +88,7 @@ impl Chrome {
             // Mica and compositor blur are the system's to choose, and a white
             // window behind them comes through whole.
             white_through: 1.,
+            framed: false,
         }
     }
 
@@ -104,7 +109,19 @@ impl Chrome {
             rimmed,
             native_motion: true,
             white_through,
+            framed: false,
         }
+    }
+
+    /// Where the window's root frames the panel ([`frame`]), the panel takes
+    /// the frame's corners, so no gap shows between the frame's rounded
+    /// hairline and the panel's surface, and leaves the hairline to it.
+    pub(crate) fn within_frame(mut self, window: &Window, cx: &App) -> Self {
+        if frame(window) != Edges::default() {
+            self.radius = gpui_kit::component::window_corner_radii(window, cx).top_left;
+            self.framed = true;
+        }
+        self
     }
 
     /// The root's colours for `p`, the HUD palette (design D15): over a
@@ -112,6 +129,18 @@ impl Chrome {
     /// (none where the material has its own edge); without a material the
     /// palette's own, which are opaque.
     pub(crate) fn surfaces(&self, p: &Palette) -> Surfaces {
+        let surfaces = self.material_surfaces(p);
+        if self.framed {
+            Surfaces {
+                border: gpui_kit::transparent_black(),
+                ..surfaces
+            }
+        } else {
+            surfaces
+        }
+    }
+
+    fn material_surfaces(&self, p: &Palette) -> Surfaces {
         if self.glass {
             Surfaces {
                 bg: gpui_kit::black().opacity(self.tint),
@@ -227,16 +256,62 @@ pub(crate) fn low_power() -> bool {
     false
 }
 
-/// Give the window `size`. On macOS the **bottom edge stays fixed**, so the
-/// composer does not move under the cursor while the panel grows; elsewhere
-/// GPUI has no reposition call and the top left stays (design D13).
+/// What the window's root draws around the panel, inside the window's size:
+/// on Linux, gpui-component frames a client-decorated window (GNOME, and any
+/// layer-shell surface) with a shadow margin and a hairline. Zero elsewhere.
+pub(crate) fn frame(window: &Window) -> Edges<Pixels> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        Edges::default()
+    }
+}
+
+/// The window size that leaves `size` for the panel inside `frame`.
+fn framed_size(size: Size<Pixels>, frame: &Edges<Pixels>) -> Size<Pixels> {
+    Size {
+        width: size.width + frame.left + frame.right,
+        height: size.height + frame.top + frame.bottom,
+    }
+}
+
+/// Give the panel `size`; the window is larger by the [`frame`] around it.
+/// On macOS the **bottom edge stays fixed**, so the composer does not move
+/// under the cursor while the panel grows; elsewhere GPUI has no reposition
+/// call and the top left stays (design D13).
 pub(crate) fn resize(window: &mut Window, size: Size<Pixels>, cx: &App) {
     #[cfg(target_os = "macos")]
     if macos::set_height(window, size, cx) {
         return;
     }
     let _ = cx;
+    let size = framed_size(size, &frame(window));
     window.resize(size);
+}
+
+/// The window takes a size asked of it only after the frame that asked for it
+/// has been drawn: GPUI's Linux backends apply a resize from a task, so a
+/// frame can still be drawn, and shown, in the old size. The panel then holds
+/// what is on screen until the window has the new size (design D13). AppKit
+/// and Windows resize at once.
+pub(crate) const RESIZE_LAGS: bool = cfg!(target_os = "linux");
+
+/// Keep the bottom edge where it was while the panel's height goes from
+/// `from` to `to`, as macOS does in [`resize`] itself (design D13). Call it
+/// while drawing the first frame of height `to`: on Wayland a toplevel cannot
+/// place itself, and the move (`wl_surface.offset`) is applied by the next
+/// commit, which must be the one that brings the new size. A move sent with
+/// the resize would be applied to a frame of the old size, which would jump
+/// by the difference. A no-op elsewhere.
+pub(crate) fn keep_bottom(window: &Window, from: f32, to: f32) {
+    #[cfg(target_os = "linux")]
+    linux::keep_bottom(window, from, to);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, from, to);
 }
 
 #[cfg(test)]
@@ -316,5 +391,34 @@ mod tests {
     #[test]
     fn the_panel_is_rounder_than_a_card() {
         assert_eq!(super::RADIUS, 20.);
+    }
+
+    #[test]
+    fn a_framed_panel_leaves_the_hairline_to_the_frame() {
+        let p = hud_palette(&Palette::dark(), false);
+        let framed = Chrome {
+            framed: true,
+            ..Chrome::solid()
+        };
+        let (own, inside) = (Chrome::solid().surfaces(&p), framed.surfaces(&p));
+        assert_eq!(inside.bg, own.bg);
+        assert_eq!(inside.border.a, 0.);
+    }
+
+    #[test]
+    fn the_window_is_larger_than_the_panel_by_its_frame() {
+        use gpui_kit::{Edges, px, size};
+        let frame = Edges {
+            top: px(21.),
+            right: px(21.),
+            bottom: px(21.),
+            left: px(21.),
+        };
+        let panel = size(px(super::super::panel::WIDTH), px(64.));
+        assert_eq!(
+            super::framed_size(panel, &frame),
+            size(px(super::super::panel::WIDTH + 42.), px(106.))
+        );
+        assert_eq!(super::framed_size(panel, &Edges::default()), panel);
     }
 }

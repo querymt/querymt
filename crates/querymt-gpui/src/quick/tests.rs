@@ -1627,6 +1627,52 @@ fn cmd_k_opens_the_session_list_from_a_new_quick_chats_bar(cx: &mut TestAppConte
     assert!(!panel.read_with(cx, |p, _| p.picker_open_for_test()));
 }
 
+// quick-panel / The panel changes with its height (Linux): GPUI applies a
+// resize after the frame that asked for it, which would show the list
+// squeezed into the bar, or the bar under an empty panel. A frame drawn before
+// the window has its new height shows what was on screen.
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn the_session_list_appears_and_goes_with_the_windows_height(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![
+            summary("a", "Session A", "idle", "2"),
+            summary("b", "Session B", "idle", "1"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    settle(cx, window);
+    let bar = panel_height(cx, &panel);
+    let toggle = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |p, cx| p.toggle_picker_for_test(window, cx))
+        })
+        .unwrap();
+    };
+    // One frame, before the resize it asks for is made.
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    };
+    let shown = |cx: &mut TestAppContext| panel.read_with(cx, |p, _| p.picker_shown_for_test());
+
+    toggle(cx);
+    draw(cx);
+    assert!(!shown(cx), "the list is not drawn in the bar's height");
+    settle(cx, window);
+    assert!(shown(cx));
+    assert!(panel_height(cx, &panel) > bar);
+
+    toggle(cx);
+    draw(cx);
+    assert!(shown(cx), "the bar is not drawn in the list's height");
+    settle(cx, window);
+    assert!(!shown(cx));
+    assert_eq!(panel_height(cx, &panel), bar);
+}
+
 // quick-panel / New quick chat from a conversation.
 #[gpui_kit::test]
 fn cmd_n_starts_a_new_quick_chat_in_the_panel(cx: &mut TestAppContext) {
