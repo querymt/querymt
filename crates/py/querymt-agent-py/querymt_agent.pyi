@@ -12,10 +12,15 @@ class WorktreeError(RuntimeError):
     ``workspace_service_unavailable``, ``invalid_options``, ``removal_refused``,
     ``owner_active``, ``workspace_not_archived``, ``unpreserved_content``,
     ``unpreserved_commits``, ``workspace_archived``, ``workspace_not_found``, ``owner_conflict``, ``conflicting_cwd`` or
-    ``isolation_unsupported_layout``.
+    ``isolation_unsupported_layout``. Merge refusals add ``merge_conflict``,
+    ``touches_local_changes``, ``source_missing``, ``source_active`` and
+    ``commit_not_on_workspace_branch``.
+
+    ``paths`` lists the files a refusal names (empty when it names none).
     """
 
     code: str
+    paths: list[str]
 
 class SubagentError(RuntimeError):
     """Changing the agent's subagents failed; the set is unchanged.
@@ -104,6 +109,23 @@ class Worktrees:
         archive: bool = False,
     ) -> dict[str, Any]: ...
     async def recover(self, workspace_id: str) -> dict[str, Any]: ...
+    async def merge(
+        self,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
+        commit: str | None = None,
+        archive: bool = False,
+        remove: bool = False,
+    ) -> dict[str, Any]:
+        """Merge a workspace into its source checkout as one squashed commit.
+
+        Takes exactly one of ``workspace_id`` or ``session_id`` (the owner).
+        By default the working state is snapshotted (the owner must be idle)
+        and merged; ``commit`` merges a retained result or a commit on the
+        worktree branch instead. ``archive`` / ``remove`` (mutually
+        exclusive) run once the source contains the result; a failure there
+        is reported under ``follow_up["error"]`` and never undoes the merge.
+        Refusals raise :class:`WorktreeError` with ``.code`` and ``.paths``."""
 
 class AgentSession:
     @property

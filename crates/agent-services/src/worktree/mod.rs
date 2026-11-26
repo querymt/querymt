@@ -72,15 +72,16 @@ pub use identity::{
 pub use integrate::{
     AcceptRequest, AppliedIntegration, ApplyOutcome, FinalizeFault, FinalizeOutcome,
     FinalizeRequest, FinalizeStage, INTEGRATION_REF_PREFIX, IntegratedCommit, IntegrationOutcome,
-    PrepareOutcome, PrepareRequest, PreparedIntegration, RecoveryOutcome, Refusal,
+    MergeRequest, PrepareOutcome, PrepareRequest, PreparedIntegration, RecoveryOutcome, Refusal,
     sanitize_subject,
 };
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
-    Announcement, ArchiveOutcome, HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost,
-    RemoveOutcome, WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse,
-    WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError, WorktreeOps,
+    Announcement, ArchiveOutcome, FollowUp, FollowUpOutcome, HandoffHost, HandoffOptions,
+    IsolatedSessionSpawner, MergeOptions, MergeOutcome, OwnerHost, RemoveOutcome, WorkspaceTarget,
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeFollowUpError, WorktreeHandoffResponse,
+    WorktreeListResponse, WorktreeMergeResponse, WorktreeOpError, WorktreeOps,
     WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry,
     WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };

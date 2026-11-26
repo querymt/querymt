@@ -95,8 +95,8 @@ print(isolated.workspace["sessionCwd"])   # the directory it actually runs in
 ```
 
 `agent.worktrees` is `None` when worktrees are not enabled; otherwise it
-exposes `create`, `handoff`, `list`, `status`, `result`, `publish`, `archive`,
-`remove` and `recover`, each returning a dict with the same shape as the ACP
+exposes `create`, `handoff`, `list`, `status`, `result`, `publish`, `merge`,
+`archive`, `remove` and `recover`, each returning a dict with the same shape as the ACP
 `querymt/worktree/*` extensions. Removal is conservative and never forces.
 
 `archive` and `remove` work from any session and take exactly one of
@@ -117,11 +117,29 @@ If `remove(..., archive=True)` archives the workspace but removal is then refuse
 itself is refused (for example `owner_active`), nothing changes and the workspace
 is not archived.
 
+`merge` brings a worktree's result back to the checkout it was created from as
+one squashed commit that contains only the worktree's own changes (not the
+uncommitted files its baseline inherited). It takes exactly one of
+`workspace_id` or `session_id`. By default it snapshots the working state (the
+owner must be idle) and merges that; `commit=` merges a retained result or a
+commit on the worktree branch instead. The source checkout's commit hooks run.
+`archive=True` or `remove=True` (not both) archive, or archive and remove, the
+workspace once the source contains the result; a failure there is reported
+under `follow_up["error"]` and never undoes the merge:
+
+```python
+merged = await agent.worktrees.merge(session_id=isolated.id, archive=True)
+print(merged["outcome"])   # "merged", "already_merged" or "no_changes"
+```
+
 Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) with a stable
 `.code` such as `workspace_service_unavailable`, `invalid_options`,
 `owner_active`, `workspace_not_archived`, `unpreserved_content`,
 `unpreserved_commits`, `workspace_archived`, `removal_refused` or
-`workspace_not_found`. Unknown keys in the `worktrees`
+`workspace_not_found`. Merge refusals add `merge_conflict`,
+`touches_local_changes`, `source_missing`, `source_active` and
+`commit_not_on_workspace_branch`, and carry the offending files in `.paths`
+(an empty list for errors that name none). Unknown keys in the `worktrees`
 dict raise `ValueError`. Isolation is a separate checkout, not a sandbox.
 
 `Agent.from_config(path)` reads `[agent.workspace]` (and `[quorum.workspace]` of the

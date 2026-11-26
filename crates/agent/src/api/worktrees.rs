@@ -12,10 +12,11 @@
 
 use crate::agent::LocalAgentHandle;
 use crate::worktree::{
-    BaselineMode, ExecutionMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError,
-    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
-    WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
+    BaselineMode, ExecutionMode, HandoffOptions, MergeOptions, WorkspaceTarget,
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeHandoffResponse, WorktreeListResponse,
+    WorktreeMergeResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
+    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultResponse,
+    WorktreeStatusResponse, WorktreeSummary,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -257,6 +258,25 @@ impl AgentWorktrees {
         target: WorkspaceTarget,
     ) -> Result<WorktreePublishResponse, WorktreeOpError> {
         self.ops.publish(&target).await
+    }
+
+    /// Merge a worktree into its source checkout as one squashed commit on
+    /// that checkout's current branch.
+    ///
+    /// By default the working state is published first and that result is
+    /// merged; `options.commit` merges a retained result or a commit on the
+    /// worktree branch instead. Refusals carry a stable
+    /// [`code`](WorktreeOpError::code) (`merge_conflict`,
+    /// `touches_local_changes`, `source_active`, ...) and, where relevant,
+    /// the offending paths in [`error_data`](WorktreeOpError::error_data). A
+    /// failed `options.follow_up` is reported in the response and never
+    /// undoes the merge.
+    pub async fn merge(
+        &self,
+        target: WorkspaceTarget,
+        options: MergeOptions,
+    ) -> Result<WorktreeMergeResponse, WorktreeOpError> {
+        self.ops.merge(self.handle.as_ref(), &target, options).await
     }
 
     /// Retire a workspace's execution, preserving history and ownership.

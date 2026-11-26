@@ -243,8 +243,13 @@ Local / Worktree choice at creation. Agents without the service omit it.
 ```json
 { "supported": true, "defaultBaseline": "commit",
   "executionModes": ["local", "worktree"],
-  "baselines": ["commit", "current_working_tree"] }
+  "baselines": ["commit", "current_working_tree"],
+  "sourceSession": true, "handoff": true, "handoffSummary": true,
+  "merge": true }
 ```
+
+`merge: true` tells a client it can offer "Merge into source" for a worktree
+session (see [Merging a worktree](#merging-a-worktree)).
 
 A host serving profiles also advertises support when only some profiles enable
 worktrees (`[agent.workspace]` or `[quorum.workspace]`), and adds `profiles`:
@@ -281,6 +286,7 @@ to run Git commands:
 /worktree status <workspace-id>
 /worktree result <workspace-id>
 /worktree publish [workspace-id]
+/worktree merge [workspace-id] [--commit <rev>] [--archive|--remove]
 /worktree archive [workspace-id]
 /worktree remove [workspace-id] [--archive]
 /worktree recover <workspace-id>
@@ -301,15 +307,15 @@ update on the issuing session before the prompt response, on stdio and
 WebSocket alike, so every client attached to the session sees it. The replies
 to `list`, `status`, `result` and `create`, and usage errors, are ephemeral
 events, never journaled or replayed. The replies to the mutating commands
-`publish`, `archive`, `remove`, `recover` and `handoff`, successful or refused,
+`publish`, `merge`, `archive`, `remove`, `recover` and `handoff`, successful or refused,
 are **durable**: they are recorded as a `worktree_command_completed` event,
 sent with the stable `message_id` `worktree-cmd-<id>` and
 `_meta.querymt.worktreeCommand = {command, code?, archived?}` (`code` is the
 stable error code and is absent on success; `archived: true` marks a refused
 removal that followed a successful archive), and replayed on load with the same
 identity. When the outcome is already recorded as a durable announcement on the
-issuing session's own stream (a handoff, or an archive or `remove --archive` of
-its own workspace), that announcement is the reply and no second update is
+issuing session's own stream (a handoff, or an archive, `remove --archive` or
+`merge --archive|--remove` of its own workspace), that announcement is the reply and no second update is
 recorded. If a durable reply cannot be recorded, it is sent as ephemeral output
 and the failure is logged. No client bridge route is involved. The legacy
 `AcpServer::run_stdio` forwarder does not track per-connection delivery, so
@@ -326,6 +332,7 @@ The same service backs additive ACP extension methods:
 | `querymt/worktree/status` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/result` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/publish` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` |
+| `querymt/worktree/merge` | `{"workspace_id":"<id>"}` or `{"session_id":"<owner>"}`, optional `"commit":"<rev>"`, `"archive":true` or `"remove":true` (not both: `invalid_options`) |
 | `querymt/worktree/archive` | `{"workspace_id":"<id>"}` or `{"session_id":"<owner>"}` |
 | `querymt/worktree/remove` | `{"workspace_id":"<id>"}` or `{"session_id":"<owner>"}`, optional `"archive":true` |
 | `querymt/worktree/recover` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` (pending isolated forks) |
@@ -371,6 +378,15 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.
     // None when the agent has no workspace service.
     let worktrees = agent.worktrees().expect("enabled");
     let listed = worktrees.list().await?;
+
+    // Merge a worktree back into its source checkout.
+    use querymt_agent::worktree::{FollowUp, MergeOptions, WorkspaceTarget};
+    let merged = worktrees
+        .merge(
+            WorkspaceTarget::Session(owner),
+            MergeOptions { commit: None, follow_up: Some(FollowUp::Archive) },
+        )
+        .await?;
     ```
 
 === "Python"
@@ -383,12 +399,13 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.
     wt = agent.worktrees                         # None when not enabled
     await wt.list(); await wt.status(wid); await wt.result(wid)
     await wt.publish(workspace_id=wid)
+    await wt.merge(workspace_id=wid)              # or merge(session_id=owner, commit=rev, archive=True)
     await wt.archive(workspace_id=wid)            # or archive(session_id=owner)
     await wt.remove(workspace_id=wid)             # or remove(session_id=owner, archive=True)
     ```
 
     Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) carrying a
-    `.code`.
+    `.code` and, for merge refusals that name files, `.paths`.
 
 #### Error codes
 
@@ -412,6 +429,10 @@ readable messages may be reworded; codes do not change.
 | `workspace_archived` | the session's workspace is archived: the session is read-only and only inspection and cleanup commands are accepted |
 | `owner_transferred` | the session handed its workspace off and is read-only; the current owner is in `ownerSessionId` |
 | `not_owner`, `workspace_not_ready`, `owner_not_local` | handoff refused: the target does not own a ready, locally hosted workspace (nothing is created) |
+| `merge_conflict`, `touches_local_changes`, `baseline_local_edits`, `commit_rejected` and the other [acceptance refusal codes](#refusal-codes) | merge refused; the offending files are in `paths` (ACP `data.paths`, Python `.paths`) |
+| `source_missing` | merge: the source checkout no longer exists or is not a checkout of the same repository |
+| `source_active` | merge: the session the worktree was created from is mid-turn |
+| `commit_not_on_workspace_branch` | merge `--commit`: the revision is neither a retained result nor a commit on the worktree branch after its baseline |
 | `summary_failed` | handoff with `summary` failed before the transfer; ownership is unchanged |
 | `summary_cancelled` | the summary was cancelled (`session/cancel` for the owner session) before the transfer; ownership is unchanged and the workspace is released |
 | `handoff_incomplete` | ownership moved but the successor is not runnable yet; run `recover` with its `session_id` |
@@ -1039,9 +1060,108 @@ Delegation completion does not mean the objective succeeded: a delegate that
 stopped without changing anything reports a result with no baseline-relative
 changes, and the summary says so instead of offering it for acceptance.
 
+## Merging a worktree
+
+`/worktree merge` brings a top-level worktree's work back to the checkout it was
+created from, using the same native pipeline as
+[accepting a delegate result](#accepting-a-delegate-result): a three-way merge of
+exactly the baseline-relative delta, refusal on local edits, the repository's
+commit hooks, a compare-and-swap branch update and crash recovery.
+
+```text
+/worktree merge                       # snapshot this session's worktree and merge it
+/worktree merge <workspace-id>        # from the source session or any other
+/worktree merge --commit 3f9a2c1      # merge a chosen version, no snapshot
+/worktree merge --archive             # then archive the worktree
+/worktree merge --remove              # then archive and remove it
+```
+
+```mermaid
+flowchart TD
+  A[/worktree merge/] --> B{--commit?}
+  B -- no --> C[owner idle?<br/>else owner_active]
+  C --> D[snapshot working state<br/>as a retained result]
+  B -- yes --> E{retained result or<br/>commit on the worktree branch?}
+  E -- no --> X[commit_not_on_workspace_branch]
+  E -- yes --> F[retain it as a result]
+  D --> G[source session idle?<br/>else source_active]
+  F --> G
+  G --> H[three-way merge of baseline to result<br/>into the source branch]
+  H --> I{outcome}
+  I -- merged / already merged / no changes --> J[optional archive or remove]
+  I -- conflict or refusal --> K[nothing changed, code and paths]
+```
+
+**What is merged.** By default merge first publishes the worktree's current
+working state as a retained result, exactly like `/worktree publish` (commits,
+staged, unstaged and non-ignored untracked files; ignored files are reported, not
+captured), and merges that result. It refuses with `owner_active` while the
+worktree's owner session is mid-turn, so a half-finished tool write is never
+captured. `--commit <rev>` takes no snapshot: it merges a retained result (a full
+id or at least 7 hex digits) or a commit on the worktree branch after its
+baseline, which is then retained like a published result. An archived worktree can
+only merge an explicit `--commit`, because its live state is retired.
+
+**Squash semantics.** The result lands as **one commit** on the source
+checkout's current branch, containing only the worktree's own changes. The
+worktree branch's individual commits are not kept as history and the commit has
+one parent. Its message is `Merge worktree <name>` with `QueryMT-Workspace`,
+`QueryMT-Result` and `QueryMT-Baseline` trailers. Because only the
+baseline-relative delta is applied, uncommitted files the worktree inherited from
+a dirty source are not committed, unlike `git merge <managed-branch>`.
+
+**Target.** The source checkout is the effective checkout of the session the
+worktree was created from, otherwise the worktree's recorded source cwd. If that
+checkout is gone, merge refuses with `source_missing`. The source session must
+not be mid-turn (`source_active`). This is checked once, before the merge starts;
+it does not block a turn started afterwards, so do not start work in the source
+session while a merge is running.
+
+**Hooks and local work.** `pre-commit`, `prepare-commit-msg` and `commit-msg` run
+with no way to skip them, and a rejection is `commit_rejected`. Paths the merge
+writes that have staged, unstaged, untracked or ignored local state in the source
+are refused (`touches_local_changes`); overlapping edits are reported as
+`merge_conflict` with the paths. Either way nothing changes. See the
+[hooks](#hooks) and [refusal codes](#refusal-codes) above; they apply unchanged.
+
+**Repeating a merge.** Merging a version that is already contained in the source
+reports `already_merged` with the original commit, and a version with no changes
+reports `no_changes`. The reply states `merged`, `already_merged` or `no_changes`,
+the commit and branch, the changed paths, the merged result and whether this
+merge published it.
+
+**`--archive` / `--remove`.** Once the source contains the result (merged,
+already merged or no changes) the worktree is archived, or archived and removed
+under the usual safety rules. They are mutually exclusive. A follow-up refusal is
+reported next to the merge outcome (`follow_up.error`) and never undoes or hides
+the merge. After a refused merge the follow-up is skipped. When a session merges
+and archives its own worktree, the archive announcement on its stream carries the
+merge outcome.
+
+!!! warning "`--include-local-changes` worktrees"
+    A worktree created with `--include-local-changes` starts from a baseline that
+    already holds the source's uncommitted edits. If the worktree then changes a
+    file that was uncommitted in the source, merge refuses it
+    (`baseline_local_edits`), because it cannot tell your edit from the
+    worktree's. Commit or stash the source edits and create the worktree again, or
+    apply the published delta yourself. Stash or commit anything already staged
+    first (so `git commit` records only the worktree's changes), and apply the
+    whole baseline-to-result delta rather than cherry-picking the result commit,
+    which would omit earlier commits on the worktree branch:
+
+    ```sh
+    git diff "refs/qmt/baselines/<workspace-id>" \
+             "refs/qmt/results/<workspace-id>/<result-id>" | git apply --index
+    git commit
+    ```
+
+    `git apply` refuses a path whose source content differs from the baseline, so
+    for the file with your uncommitted edit, merge that file by hand.
+
 ## Reviewing and integrating results
 
-Nothing is ever merged back automatically. Delegates publish their uncommitted
+Nothing is ever merged back automatically; `/worktree merge` is an explicit
+request. Delegates publish their uncommitted
 output automatically on completion; top-level workspaces publish explicitly
 with `/worktree publish` or `querymt/worktree/publish`. Either way the
 workspace — checkout path, managed branch, baseline, and a captured immutable
@@ -1095,8 +1215,10 @@ workspace's changes since its baseline.
     or, if the workspace produced real commits and the parent was clean,
     cherry-pick the commit range. If the parent was dirty, either commit the
     parent's state coherently first, or apply the baseline-relative patch as
-    above. A clean worktree or a completed status never implies the result has
-    been applied or accepted — review the delta and integrate it yourself.
+    above. For a top-level worktree, [`/worktree merge`](#merging-a-worktree)
+    does this for you. A clean worktree or a completed status never implies the
+    result has been applied or accepted — review the delta and integrate it
+    yourself.
 
 ## What isolation does not do
 

@@ -144,7 +144,10 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
     }
 
     if agent.config.workspace_service().is_some() {
-        methods.push("querymt/worktree/handoff".to_string());
+        methods.extend([
+            "querymt/worktree/handoff".to_string(),
+            "querymt/worktree/merge".to_string(),
+        ]);
     }
 
     if agent.profiles().is_some() {

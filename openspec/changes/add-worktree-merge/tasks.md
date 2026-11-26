@@ -1,0 +1,80 @@
+# Tasks
+
+Prerequisite: `allow-removal-of-published-worktrees` is merged (durable
+native replies, `ArchiveRemoval`, result commit message).
+
+Scenario references below are `git-worktree-workspaces / <Scenario name>`.
+
+## 1. Shared integration core (querymt-agent-services)
+
+- [x] 1.1 In `worktree::integrate`, rename `AcceptPlan` to `pub(crate) IntegrationPlan`, extract `plan_integration(record, result_commit, target_cwd, message)` (baseline, target resolution, `wrong_repository`, `wrong_target`, integration ref), `match_result(record, prefix)` and `integrate(plan, gate)`; rebuild `accept_delegation_result` on them. Verify behaviour is unchanged: `cargo t-services -E 'test(/accept/)'` passes with no test edits, then `cargo check -p querymt-agent-services`.
+  - Ran: `cargo t-services -E 'test(/accept/)'` 19 passed; `cargo t-services -E 'test(/worktree::/)'` 292 passed, 0 failed (no test edits); `cargo check -p querymt-agent-services --tests` clean. `plan_integration` and `match_result` return `Stop` so registry/repository read failures stay errors while refusals stay outcomes; `match_result` yields `Ok(None)` for non-hex or unmatched input so `--commit <branch rev>` can fall through.
+- [x] 1.2 Split `WorkspaceService::publish_result` into capture plus `retain_result(record, commit, captured_head, verification)`; keep publish behaviour identical. Verify with `cargo t-services -E 'test(/publish/)'`.
+  - Ran: `cargo t-services -E 'test(/publish/)'` 13 passed.
+- [x] 1.3 Add `WorktreeOpError::Refused { code, message, paths }` built from `Refusal`, with `code()` and `error_data()` carrying `paths` when non-empty; add a unit test `refused_error_data_carries_paths` in `worktree::ops`. Verify with `cargo t-services -E 'test(/refused_error_data_carries_paths/)'`.
+  - Ran: `cargo t-services -E 'test(/refused_error_data_carries_paths/)'` 1 passed.
+
+## 2. Merge service and operation (querymt-agent-services)
+
+- [x] 2.1 Implement `WorkspaceService::merge_workspace` (target cwd from the source session's effective cwd, else `source_cwd`; `source_missing`; target gate from `get_workspace_by_checkout` or fallback; commit message with `QueryMT-Workspace/Result/Baseline` trailers) on top of `plan_integration` + `integrate`. Cover git-worktree-workspaces / Merge commits only the worktree's own changes, / Merge layers onto a moved source branch, / Merge is a single squashed commit, / Merge source checkout no longer exists with service tests `merge_commits_only_the_worktrees_own_changes`, `merge_layers_onto_a_moved_source_branch`, `merge_is_a_single_squashed_commit`, `merge_source_checkout_no_longer_exists`. Verify with `cargo t-services -E 'test(/merge_/)'`.
+- [x] 2.2 Implement version selection in `WorktreeOps::merge`: snapshot via `publish_result` (Ready only, owner idle), `--commit` via `match_result` or branch membership (`is_ancestor` baseline→rev→head) plus `retain_result`; lifecycle refusals. Cover / Default merge snapshots the working state, / Merge a previously published result, / Merge a commit on the worktree branch, / Merge refuses an unrelated commit, / Merge refused for an unmergeable workspace with tests `default_merge_snapshots_the_working_state`, `merge_a_previously_published_result`, `merge_a_commit_on_the_worktree_branch`, `merge_refuses_an_unrelated_commit`, `merge_refused_for_an_unmergeable_workspace`. Verify with `cargo t-services -E 'test(/merge/)'`.
+  - Ran: `cargo t-services -E 'test(/merge|merging|source_already|busy|follow_up/)'` 29 passed (includes the five 2.2 tests). Tests live in `worktree/ops_merge_tests.rs` (`worktree::ops::merge_tests`). `ambiguous_result_commit` is covered inside `merge_refuses_an_unrelated_commit` with two injected result rows sharing a 7-digit prefix. Lifecycle refusals: `workspace_archived` (archived without `--commit`), `workspace_not_ready` (any other state).
+- [x] 2.3 Add `OwnerHost::ensure_idle(session_id)` (refuses `owner_active` without unloading) and use it for the owner before a snapshot and for the source session (`source_active`) before integrating; implement it on the test host in `worktree::ops` tests. Cover / Snapshot while the owner is busy, / Merge refused while the source session is busy with tests `snapshot_while_the_owner_is_busy`, `merge_refused_while_the_source_session_is_busy`. Verify with `cargo t-services -E 'test(/busy/)'`.
+  - Ran: same 29-test run (busy tests pass). `OwnerHost::ensure_idle` is required; the source check runs before any snapshot so a refusal leaves no result. Added a defaulted `OwnerHost::session_cwd` (returns `None`) so the source session's persisted cwd can be used when it is not bound to a workspace; the agent handle implements it in 4.1.
+- [x] 2.4 Map `IntegrationOutcome` to `WorktreeMergeResponse` (`merged`/`already_merged`/`no_changes`, commit, branch, changed paths, published result, ignored files) and to `Refused` errors (`merge_conflict` + paths). Cover / Merge refuses touched paths with local edits, / Merge refuses inherited uncommitted edits, / Merge reports overlapping edits as a conflict, / Merge rejected by a commit hook, / Merge refused for unsupported source state, / Merging the same version again, / Source already contains the changes, / Merge interrupted by a crash with tests `merge_refuses_touched_paths_with_local_edits`, `merge_refuses_inherited_uncommitted_edits`, `merge_reports_overlapping_edits_as_a_conflict`, `merge_rejected_by_a_commit_hook`, `merge_refused_for_unsupported_source_state` (detached HEAD and `commit.gpgSign`), `merging_the_same_version_again`, `source_already_contains_the_changes`, `merge_interrupted_by_a_crash` (fault injection via `FinalizeFault`, then a second merge recovers). Verify with `cargo t-services -E 'test(/merge|merging|source_already/)'`.
+  - Ran: same 29-test run. `merge_refuses_inherited_uncommitted_edits` sets up the case the pipeline defines: the source committed the inherited WIP itself so the three-way merge is clean (a reverted source edit is a genuine `merge_conflict`). Crash test uses `FaultInjectingRepoOps` (`FinalizeCommit`, `FinalizeRefTransaction`, `FinalizeIndexUpdate`).
+- [x] 2.5 Add `MergeOptions { commit, follow_up: Option<FollowUp> }` and the follow-up step (`archive_announced` / `remove_announced(archive: true)` after merged, already merged or no changes; errors into `follow_up.error`). Cover / Merge then remove, / Merge succeeds but removal is refused, / Follow-up skipped after a refused merge with tests `merge_then_remove`, `merge_succeeds_but_removal_is_refused`, `follow_up_skipped_after_a_refused_merge`. Verify with `cargo t-services -E 'test(/merge_then|merge_succeeds|follow_up_skipped/)'`.
+  - Ran: same 29-test run (`merge_then_remove`, `merge_then_archive_announces_the_merge`, `merge_succeeds_but_removal_is_refused`, `follow_up_skipped_after_a_refused_merge` pass).
+- [x] 2.6 Add `"merge": true` to `WorkspaceService::capability_meta_for`. Cover / Merge capability advertised with `merge_capability_advertised` in `worktree::service` tests. Verify with `cargo t-services -E 'test(/merge_capability_advertised/)'`.
+  - Ran: `cargo t-services -E 'test(/merge_capability_advertised/)'` 1 passed.
+- [x] 2.7 Run `cargo fmt -p querymt-agent-services -- --check` and `cargo cl-services`; both clean.
+  - Ran: `cargo fmt -p querymt-agent-services -- --check` clean; `cargo cl-services` clean; full `cargo t-services` 1080 passed, 0 failed.
+
+## 3. Archived update carries the merge (querymt-agent-protocol-types)
+
+- [x] 3.1 Add typeshare `ArchiveMerge { commit, branch }` and optional `merged` on `AgentEventKind::WorktreeArchived`; project it in replay text. Add `worktree_archived_with_merge_round_trips` and a replay projection test. Verify with `cargo t-protocol -E 'test(/worktree_archived/)'`, `cargo fmt -p querymt-agent-protocol-types -- --check`, `cargo cl-protocol`.
+  - Ran: `cargo t-protocol -E 'test(/worktree_archived/) | test(/archived_update/)'` 4 passed; full `cargo t-protocol` 129 passed; `cargo fmt -p querymt-agent-protocol-types -- --check` clean; `cargo cl-protocol` clean.
+  - Deviation to note: `ArchiveMerge` is `{ outcome, commit?, branch? }` rather than `{ commit, branch }`. `already_merged` has no branch and `no_changes` has no commit, and the spec says the archived update states the merge outcome, so `outcome` is carried and both others are optional.
+
+## 4. Runtime surfaces (querymt-agent-runtime, querymt-agent)
+
+- [x] 4.1 Implement `ensure_idle` and the `merged` parameter of `announce_archived` on the agent handle's `OwnerHost`; route merge through `worktree_ops(Some(&target))` and pass the merge commit to the self-archive announcement. Verify with `cargo check -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api`.
+  - Ran: `cargo check -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api` clean. Added `LocalAgentHandle::session_is_busy` (non-unloading busy check) for `ensure_idle`, and `session_cwd` from the session store.
+- [x] 4.2 Add `NativeCommand::Merge { id, commit, follow_up }` (mutating, `durable_reply() == "merge"`), `MERGE_USAGE`, update `NATIVE_USAGE`, and parser tests including `archive_and_remove_together_are_rejected`. Covers / Archive and remove together are rejected. Verify with `cargo t-runtime -E 'test(/native_command_tests/)'`.
+  - Ran: `cargo t-runtime -E 'test(/native_command_tests/)'` 5 passed (`parses_merge_commands`, `archive_and_remove_together_are_rejected`, `rejects_malformed_merge_commands` are new). Also updated the `/worktree` input hint in `slash_commands/builtin.rs` and listed `querymt/worktree/merge` next to handoff in `control/capabilities.rs`.
+- [x] 4.3 Add the `querymt/worktree/merge` extension method and dispatch entry (`archive && remove` → `invalid_options`). Verify with `cargo check -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api` and the runtime tests in 4.5.
+  - Ran: runtime check as in 4.1; exercised by the 4.5 tests (`querymt/worktree/merge` in the profile test and in `equivalent_merge_across_surfaces`). `Refused` maps to `invalid_request`; durable reply text lists refusal paths (`Refused` display includes them) so a replayed refusal keeps them.
+- [x] 4.4 Add `AgentWorktrees::merge(target, MergeOptions)` delegating to the operation core. Verify with `cargo check -p querymt-agent --features remote`.
+  - Ran: `cargo check -p querymt-agent --features remote` clean (only pre-existing unused-dependency warnings).
+- [x] 4.5 Add facade runtime tests in `crates/agent/src/runtime_tests/handle/worktree_slash_commands.rs` with a real repository: `merge_from_the_source_session_by_id` (/ Merge from the source session by id), `merge_reply_survives_reload` (/ Merge reply survives reload), `self_archiving_merge_reply` (/ Self-archiving merge reply), `equivalent_merge_across_surfaces` (/ Equivalent merge across surfaces: native, `querymt/worktree/merge` and `AgentWorktrees::merge` report the same outcome and refusal code/paths), and a profile-hosted merge using the two-profile fixture. Verify with `cargo t-agent -E 'test(/merge/)'` (QMT_UI_DIST set).
+  - Ran: `cargo t-agent -E 'test(/merge/)'` (QMT_UI_DIST set) passes for `merge_from_the_source_session_by_id`, `merge_reply_survives_reload`, `self_archiving_merge_reply`, `worktree_merge_runs_in_the_profile_runtime_hosting_the_worktree`, `equivalent_merge_across_surfaces`.
+  - Deviation (location only): the first three live in `runtime_tests/handle/worktree_ops_ext.rs`, next to the durable-reply fixtures they reuse (`worktree_fixture`, `journal_of`, `replayed_updates`), which are private to that file. The profile-hosted test is in `worktree_slash_commands.rs` as specified. `equivalent_merge_across_surfaces` is in `api/agent_tests.rs` (`workspace_api`), where a real `Agent` gives it `AgentWorktrees::merge` plus native and extension access.
+- [x] 4.6 Re-run the existing scenarios of the modified requirements (/ Equivalent results across surfaces, / Service unavailable, / Typed failure code, / Client offers an explicit choice, / Binding disclosed at creation, / Handoff capability advertised) via `cargo t-agent -E 'test(/worktree/)'` and `cargo t-runtime -E 'test(/worktree/)'`; all pass.
+  - Ran: `cargo t-runtime -E 'test(/worktree/)'` 52 passed; `cargo t-agent -E 'test(/worktree/)'` 75 passed. The existing capability test now also asserts `merge: true`.
+- [x] 4.7 Run `cargo fmt -p querymt-agent-runtime -p querymt-agent -- --check`, `cargo cl-runtime`, `cargo cl-agent`; all clean.
+  - Ran: `cargo fmt -p querymt-agent-runtime -p querymt-agent` (rustfmt-only changes in four files this change already modified), then `--check` clean; `cargo cl-runtime` clean; `cargo cl-agent` (QMT_UI_DIST set) clean.
+
+## 5. Python binding (querymt-agent-py)
+
+- [x] 5.1 Add `Worktrees.merge(workspace_id=None, session_id=None, commit=None, archive=False, remove=False)`, the `.pyi` stub and the README error-code section (`merge_conflict`, `touches_local_changes`, `source_missing`, `source_active`, `commit_not_on_workspace_branch`). Verify with `PYO3_PYTHON=<python3.10+> cargo check -p querymt-agent-py` and the package's Python tests for worktrees.
+  - Ran: `PYO3_PYTHON=/opt/homebrew/bin/python3.14 cargo check -p querymt-agent-py` clean; `cargo fmt -p querymt-agent-py -- --check` clean; `maturin develop` into a venv outside the repo, then `QMT_HOME=<tmp> python -m pytest crates/py/querymt-agent-py/tests` 20 passed (two new: `test_merge_lands_the_worktree_as_one_commit_in_the_source`, `test_merge_refusals_carry_code_and_paths`).
+  - Addition beyond the task text: `WorktreeError` now also carries `.paths` (the offending files of a `Refused` error, else `[]`), which the design requires ("raise the existing coded exception with `paths`"); documented in the `.pyi` and README.
+
+## 6. Documentation and changelog
+
+- [x] 6.1 Add "Merging a worktree" to `docs/docs/agent/worktrees.md`: what a snapshot captures, squash semantics, target resolution, hooks, refusal codes, `--commit`, `--archive/--remove`, the `--include-local-changes` caveat with the manual `git cherry-pick --no-commit <result>` alternative, and a mermaid flow. Update the capability JSON example with `merge`. Verify by building the docs (`mkdocs build` in `docs/`) or rendering the page.
+  - Ran: the docs use zensical (`docs/requirements.txt`), not mkdocs; `zensical build --clean --strict` on a copy of `docs/` in `/tmp` (venv outside the repo): "No issues found", the page renders the new section and its mermaid block. Also updated the native command list, durable-reply paragraph, extension table, Rust/Python snippets, error-code table, and the dirty-parent warning now points at merge.
+- [x] 6.2 Add CHANGELOG "Unreleased" entries, marking the ACP and journal additions **BREAKING**. Verify by review of the diff.
+  - Reviewed `git diff CHANGELOG.md`: one "Added" entry for the feature; three "Behavior changes" entries marked **BREAKING** (ACP wire shape, journal/typeshare `worktree_archived.merged`, Rust `OwnerHost` API).
+
+## 7. Integration checks
+
+- [x] 7.1 Build downstream packages: `cargo check -p querymt-mobile-ffi`, `cargo t-agent --no-run`, and Python as in 5.1.
+  - Ran: `cargo check -p querymt-mobile-ffi` clean (23 pre-existing dead-code warnings, none in changed code); `cargo t-agent --no-run` (QMT_UI_DIST set) builds, only a macOS linker `__eh_frame` warning; `cargo t-agent -E 'test(/merge/)'` after the rustfmt pass 7 passed (the 5 merge tests plus two name matches); Python as in 5.1 (`cargo check` clean, 20 pytest passed). The zbus/systemd features only take effect on Linux and stay unverified on macOS.
+- [x] 7.2 Run `openspec validate add-worktree-merge --strict`; it passes.
+  - Ran: `openspec validate add-worktree-merge --strict` -> "Change 'add-worktree-merge' is valid".
+
+## Workflow follow-up
+
+- Report the querymt-desktop / querymt-gpui follow-up: "Merge into source" action when `merge` is advertised, version picker, archive/remove options, refusal rendering with paths.
+- Archive the change after review.

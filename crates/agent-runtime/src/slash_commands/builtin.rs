@@ -118,7 +118,7 @@ impl Builtin {
             )
             .input(AvailableCommandInput::Unstructured(
                 UnstructuredCommandInput::new(
-                    "create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | handoff [name] [--summary] | archive [id] | remove [id] [--archive] | recover <id>",
+                    "create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | handoff [name] [--summary] | merge [id] [--commit <rev>] [--archive|--remove] | archive [id] | remove [id] [--archive] | recover <id>",
                 ),
             )),
         }

@@ -2168,6 +2168,7 @@ async fn handoff_surfaces_agree_and_advertise_capabilities() {
     let meta = f.service.capability_meta();
     assert_eq!(meta["handoff"], true);
     assert_eq!(meta["handoffSummary"], true);
+    assert_eq!(meta["merge"], true);
 
     // Native command from the owner session.
     let owner = isolated_session(&f, f.repo.path()).await;
@@ -3990,4 +3991,224 @@ async fn prompt_racing_archive_never_leaves_an_actor_in_an_archived_checkout() {
         }
         handle.shutdown().await;
     }
+}
+
+// ── Merge into the source checkout ───────────────────────────────────────────
+
+/// Run `git` in `path` (the source repository's fixture has no index until
+/// `git reset` builds it).
+fn git_cmd(path: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A plain source session and a worktree created from it with `/worktree
+/// create`, whose checkout holds one new file, `b.txt`.
+struct MergeWorld {
+    f: WorktreeExtFixture,
+    source: String,
+    child: String,
+    record: crate::worktree::WorkspaceRecord,
+}
+
+async fn merge_world() -> MergeWorld {
+    let f = worktree_fixture(true).await;
+    git_cmd(f.repo.path(), &["reset", "-q"]);
+    let source = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let created = native_command(&f.handle, &source, "/worktree create HEAD w1")
+        .await
+        .unwrap();
+    assert!(created.get("error").is_none(), "create failed: {created}");
+    let child = created["session_id"].as_str().unwrap().to_owned();
+    let record = owned_workspace(&f, &child).await;
+    std::fs::write(record.checkout_path.join("b.txt"), "worktree work\n").unwrap();
+    MergeWorld {
+        f,
+        source,
+        child,
+        record,
+    }
+}
+
+/// The source session merges a worktree by id: the commit lands on the
+/// source checkout's branch exactly as when the worktree session runs it.
+#[tokio::test]
+async fn merge_from_the_source_session_by_id() {
+    let w = merge_world().await;
+
+    let reply = native_command(
+        &w.f.handle,
+        &w.source,
+        &format!("/worktree merge {}", w.record.id),
+    )
+    .await
+    .unwrap();
+
+    assert!(reply.get("error").is_none(), "merge failed: {reply}");
+    assert_eq!(reply["outcome"], "merged", "{reply}");
+    assert_eq!(reply["published"], true);
+    let head = git_cmd(w.f.repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(reply["commit"], head.as_str());
+    assert_eq!(reply["changed_paths"][0]["path"], "b.txt");
+    assert_eq!(
+        std::fs::read_to_string(w.f.repo.path().join("b.txt")).unwrap(),
+        "worktree work\n"
+    );
+    assert_eq!(
+        git_cmd(
+            w.f.repo.path(),
+            &["show", "--name-only", "--format=", "HEAD"]
+        ),
+        "b.txt"
+    );
+    // The worktree is untouched and still owned.
+    assert!(w.record.checkout_path.join("b.txt").exists());
+    assert_eq!(
+        owned_workspace(&w.f, &w.child).await.lifecycle,
+        crate::worktree::WorkspaceLifecycle::Ready
+    );
+    // The reply is the issuing (source) session's durable record.
+    let journal = journal_of(&w.f, &w.source).await;
+    assert!(
+        journal.iter().any(|e| matches!(
+            &e.kind,
+            crate::events::AgentEventKind::WorktreeCommandCompleted { command, .. }
+                if command == "merge"
+        )),
+        "{journal:?}"
+    );
+    w.f.handle.shutdown().await;
+}
+
+/// A refused merge and a successful one are both recorded on the issuing
+/// session's stream and replayed in order after a reload, the refusal with
+/// its code and paths.
+#[tokio::test]
+async fn merge_reply_survives_reload() {
+    let w = merge_world().await;
+    std::fs::write(w.f.repo.path().join("b.txt"), "mine\n").unwrap();
+
+    let refused = native_command(&w.f.handle, &w.child, "/worktree merge")
+        .await
+        .unwrap();
+    assert_eq!(
+        refused["error"]["code"], "touches_local_changes",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["paths"], serde_json::json!(["b.txt"]));
+
+    std::fs::remove_file(w.f.repo.path().join("b.txt")).unwrap();
+    let merged = native_command(&w.f.handle, &w.child, "/worktree merge")
+        .await
+        .unwrap();
+    assert_eq!(merged["outcome"], "merged", "{merged}");
+
+    // The archived owner loads without an actor and replays both replies.
+    native_command(&w.f.handle, &w.child, "/worktree archive")
+        .await
+        .unwrap();
+    let cwd = w.record.session_cwd();
+    let handle = Arc::new(w.f.handle);
+    let updates = replayed_updates(&handle, &w.child, &cwd).await;
+    let replies: Vec<_> = updates
+        .iter()
+        .filter(|u| u["_meta"]["querymt"]["worktreeCommand"]["command"] == "merge")
+        .collect();
+    assert_eq!(replies.len(), 2, "{updates:?}");
+    assert_eq!(
+        replies[0]["_meta"]["querymt"]["worktreeCommand"]["code"],
+        "touches_local_changes"
+    );
+    let text = replies[0]["content"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("b.txt"),
+        "the refusal keeps its paths: {text}"
+    );
+    assert!(
+        replies[1]["_meta"]["querymt"]["worktreeCommand"]
+            .get("code")
+            .is_none(),
+        "the success carries no code"
+    );
+    assert!(
+        replies[1]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"outcome\":\"merged\"")
+    );
+    handle.shutdown().await;
+}
+
+/// `/worktree merge --archive` in the worktree's own session: the archived
+/// update names the merge commit and is the reply; the session is read-only.
+#[tokio::test]
+async fn self_archiving_merge_reply() {
+    use crate::events::AgentEventKind;
+    use crate::worktree::WorkspaceLifecycle;
+
+    let w = merge_world().await;
+
+    let response = native_prompt(&w.f.handle, &w.child, "/worktree merge --archive").await;
+
+    let payload = &response.meta.as_ref().unwrap()["querymt.worktree"];
+    assert_eq!(payload["outcome"], "merged", "{payload}");
+    assert_eq!(payload["follow_up"]["archived"], true);
+    let head = git_cmd(w.f.repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(payload["commit"], head.as_str());
+    assert_eq!(
+        owned_workspace(&w.f, &w.child).await.lifecycle,
+        WorkspaceLifecycle::Archived
+    );
+
+    let journal = journal_of(&w.f, &w.child).await;
+    let archived: Vec<_> = journal
+        .iter()
+        .filter_map(|event| match &event.kind {
+            AgentEventKind::WorktreeArchived { merged, .. } => {
+                Some((event.session_seq, merged.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(archived.len(), 1, "{journal:?}");
+    let merged = archived[0].1.as_ref().expect("the merge is stated");
+    assert_eq!(merged.outcome, "merged");
+    assert_eq!(merged.commit.as_deref(), Some(head.as_str()));
+    assert_eq!(event_tip(&response), archived[0].0);
+    assert!(
+        !journal
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::WorktreeCommandCompleted { .. })),
+        "the archived update replaces the reply"
+    );
+
+    // Replayed on load, read-only.
+    let cwd = w.record.session_cwd();
+    let handle = Arc::new(w.f.handle);
+    let updates = replayed_updates(&handle, &w.child, &cwd).await;
+    let archived_update = updates
+        .iter()
+        .find(|u| u["_meta"]["querymt"]["worktreeArchived"].is_object())
+        .expect("archived update replayed");
+    let text = archived_update["content"]["text"].as_str().unwrap();
+    assert!(text.contains(&head), "names the merge commit: {text}");
+    assert!(text.contains("read-only"), "{text}");
+    handle.shutdown().await;
 }

@@ -24,7 +24,7 @@
 //! Callers serialize integrations on a checkout with the cooperative
 //! [`CheckoutMutationGate`](crate::worktree::CheckoutMutationGate).
 
-use crate::worktree::domain::{Baseline, ChangedPath};
+use crate::worktree::domain::{Baseline, ChangedPath, WorkspaceRecord};
 use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
 use crate::worktree::hooks::{HookOutcome, HookRequest, HookedIntegration};
@@ -306,14 +306,79 @@ pub struct AcceptRequest<'a> {
     pub mutation_gate: Option<&'a CheckoutMutationGate>,
 }
 
+/// A request to merge a worktree's retained result into its source
+/// checkout.
+#[derive(Debug, Clone)]
+pub struct MergeRequest<'a> {
+    pub record: &'a WorkspaceRecord,
+    /// Full id of a retained result of `record` (see
+    /// [`WorkspaceService::match_result`] / `retain_result`).
+    pub result_commit: &'a str,
+    /// The persisted cwd of the session the worktree was created from, when
+    /// it still exists; used when that session is not itself bound to a
+    /// workspace. A bound session resolves to its own checkout.
+    pub source_session_cwd: Option<PathBuf>,
+}
+
 /// Everything the serialized transaction needs, resolved from durable state.
-struct AcceptPlan {
-    target_root: PathBuf,
-    common_dir: PathBuf,
-    baseline: Baseline,
-    result_commit: String,
-    integration_ref: String,
+/// Shared by delegate acceptance and worktree merge.
+#[derive(Debug, Clone)]
+pub(crate) struct IntegrationPlan {
+    pub(crate) target_root: PathBuf,
+    pub(crate) common_dir: PathBuf,
+    pub(crate) baseline: Baseline,
+    pub(crate) result_commit: String,
+    pub(crate) integration_ref: String,
+    pub(crate) message: String,
+}
+
+/// The checks every integration shares: the workspace has a baseline, the
+/// target checkout belongs to the same repository and is not the
+/// workspace's own checkout. Resolves the integration record ref.
+pub(crate) fn plan_integration(
+    record: &WorkspaceRecord,
+    result_commit: &str,
+    target_cwd: &Path,
     message: String,
+) -> Result<IntegrationPlan, Stop> {
+    let Some(baseline) = record.baseline.clone() else {
+        return Err(refuse(
+            "no_baseline",
+            "the workspace has no recorded baseline",
+        ));
+    };
+    let target = resolve_repository(target_cwd)?;
+    if target.identity.common_dir != record.repository.common_dir {
+        return Err(refuse(
+            "wrong_repository",
+            "the requesting session's checkout belongs to a different repository",
+        ));
+    }
+    let own_checkout = std::fs::canonicalize(&record.checkout_path)
+        .unwrap_or_else(|_| record.checkout_path.clone());
+    if target.checkout.root == own_checkout {
+        return Err(refuse(
+            "wrong_target",
+            "the requesting session runs in the delegate's own workspace",
+        ));
+    }
+    Ok(IntegrationPlan {
+        target_root: target.checkout.root.clone(),
+        common_dir: record.repository.common_dir.clone(),
+        baseline,
+        integration_ref: format!("{INTEGRATION_REF_PREFIX}/{}/{result_commit}", record.id),
+        message,
+        result_commit: result_commit.to_string(),
+    })
+}
+
+/// Report a [`Stop`] as the transaction outcome: refusals are outcomes,
+/// failures are errors.
+pub(crate) fn stop_outcome(stop: Stop) -> WorktreeResult<IntegrationOutcome> {
+    match stop {
+        Stop::Refused(refusal) => Ok(IntegrationOutcome::Refused(refusal)),
+        Stop::Failed(err) => Err(err),
+    }
 }
 
 fn same_checkout(a: &Path, b: &Path) -> bool {
@@ -363,10 +428,127 @@ impl WorkspaceService {
                 "only the session that created the delegation may accept its result",
             );
         }
-        let Some(baseline) = record.baseline.clone() else {
+        if record.baseline.is_none() {
+            return refused("no_baseline", "the workspace has no recorded baseline");
+        }
+        let result_commit = match self.match_result(&record, request.result_commit).await {
+            Ok(Some(commit)) => commit,
+            Ok(None) => {
+                return refused(
+                    "result_not_found",
+                    format!(
+                        "workspace {} has no retained result matching {}",
+                        record.id, request.result_commit
+                    ),
+                );
+            }
+            Err(stop) => return stop_outcome(stop),
+        };
+
+        let baseline_commit = record
+            .baseline
+            .as_ref()
+            .map(|b| b.baseline_commit.clone())
+            .unwrap_or_default();
+        let message = format!(
+            "{}\n\nQueryMT-Delegation: {}\nQueryMT-Workspace: {}\nQueryMT-Result: \
+             {result_commit}\nQueryMT-Baseline: {}\n",
+            sanitize_subject(request.objective),
+            request.delegation_id,
+            record.id,
+            baseline_commit
+        );
+        let plan = match plan_integration(&record, &result_commit, request.target_cwd, message) {
+            Ok(plan) => plan,
+            Err(stop) => return stop_outcome(stop),
+        };
+        self.integrate(&plan, request.mutation_gate).await
+    }
+
+    /// Merge a worktree's retained result into its source checkout as one
+    /// commit on that checkout's current branch.
+    ///
+    /// The target is the effective checkout of the session the worktree was
+    /// created from, else the recorded source cwd; neither resolving to a
+    /// checkout of the worktree's repository is `source_missing`. The
+    /// transaction is the one delegate acceptance uses. It is serialized on
+    /// the checkout-keyed gate under the service's storage root, which is the
+    /// same gate a managed target's owner actor holds (gates are keyed by the
+    /// canonical checkout path), so no separate lookup of the target's
+    /// workspace is needed.
+    pub async fn merge_workspace(
+        &self,
+        request: &MergeRequest<'_>,
+    ) -> WorktreeResult<IntegrationOutcome> {
+        let record = request.record;
+        let Some(baseline) = record.baseline.as_ref() else {
             return refused("no_baseline", "the workspace has no recorded baseline");
         };
-        let results = self.registry().list_results(&record.id).await?;
+        let Some(target_cwd) = self
+            .merge_target_cwd(record, request.source_session_cwd.clone())
+            .await
+        else {
+            return refused(
+                "source_missing",
+                "neither the session this worktree was created from nor its recorded source \
+                 directory resolves to a checkout of the same repository",
+            );
+        };
+        let message = format!(
+            "{}\n\nQueryMT-Workspace: {}\nQueryMT-Result: {}\nQueryMT-Baseline: {}\n",
+            sanitize_subject(&format!("Merge worktree {}", record.branch.as_str())),
+            record.id,
+            request.result_commit,
+            baseline.baseline_commit
+        );
+        let plan = match plan_integration(record, request.result_commit, &target_cwd, message) {
+            Ok(plan) => plan,
+            Err(stop) => return stop_outcome(stop),
+        };
+        self.integrate(&plan, None).await
+    }
+
+    /// The first of the source session's effective cwd and the recorded
+    /// source cwd that is a checkout of the worktree's repository.
+    async fn merge_target_cwd(
+        &self,
+        record: &WorkspaceRecord,
+        source_session_cwd: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(parent) = record.ownership.parent_session_id.as_deref()
+            && let Ok(Some(cwd)) = self.resolve_session_cwd(parent, source_session_cwd).await
+        {
+            candidates.push(cwd);
+        }
+        if !record.source_cwd.is_empty() {
+            candidates.push(PathBuf::from(&record.source_cwd));
+        }
+        candidates.into_iter().find(|cwd| {
+            resolve_repository(cwd).is_ok_and(|target| {
+                target.identity.common_dir == record.repository.common_dir
+                    && target.checkout.root.is_dir()
+            })
+        })
+    }
+
+    /// Find the retained result of `record` that `prefix` names: `Ok(None)`
+    /// when `prefix` is not a hex prefix of at least 7 digits or matches no
+    /// retained result, a refusal when it matches several.
+    pub(crate) async fn match_result(
+        &self,
+        record: &WorkspaceRecord,
+        prefix: &str,
+    ) -> Result<Option<String>, Stop> {
+        let wanted = prefix.to_ascii_lowercase();
+        if wanted.len() < 7 || !wanted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let results = self
+            .registry()
+            .list_results(&record.id)
+            .await
+            .map_err(WorktreeError::from)?;
         let mut matching: Vec<&str> = results
             .iter()
             .filter_map(|r| r.result_commit.as_deref())
@@ -375,76 +557,42 @@ impl WorkspaceService {
         matching.sort_unstable();
         matching.dedup();
         if matching.len() > 1 {
-            return Ok(IntegrationOutcome::Refused(
+            return Err(Stop::Refused(
                 Refusal::new(
                     "ambiguous_result_commit",
-                    format!(
-                        "{} matches more than one retained result; give more digits",
-                        request.result_commit
-                    ),
+                    format!("{prefix} matches more than one retained result; give more digits"),
                 )
                 .with_paths(matching.iter().map(|c| c.to_string()).collect()),
             ));
         }
-        let Some(result_commit) = matching.first().copied() else {
-            return refused(
-                "result_not_found",
-                format!(
-                    "workspace {} has no retained result matching {}",
-                    record.id, request.result_commit
-                ),
-            );
-        };
+        Ok(matching.first().map(|c| c.to_string()))
+    }
 
-        let target = resolve_repository(request.target_cwd)?;
-        if target.identity.common_dir != record.repository.common_dir {
-            return refused(
-                "wrong_repository",
-                "the requesting session's checkout belongs to a different repository",
-            );
-        }
-        let own_checkout = std::fs::canonicalize(&record.checkout_path)
-            .unwrap_or_else(|_| record.checkout_path.clone());
-        if target.checkout.root == own_checkout {
-            return refused(
-                "wrong_target",
-                "the requesting session runs in the delegate's own workspace",
-            );
-        }
-
-        let baseline_commit = baseline.baseline_commit.clone();
-        let plan = AcceptPlan {
-            target_root: target.checkout.root.clone(),
-            common_dir: record.repository.common_dir.clone(),
-            baseline,
-            integration_ref: format!("{INTEGRATION_REF_PREFIX}/{}/{result_commit}", record.id),
-            message: format!(
-                "{}\n\nQueryMT-Delegation: {}\nQueryMT-Workspace: {}\nQueryMT-Result: \
-                 {result_commit}\nQueryMT-Baseline: {}\n",
-                sanitize_subject(request.objective),
-                request.delegation_id,
-                record.id,
-                baseline_commit
-            ),
-            result_commit: result_commit.to_string(),
-        };
-
-        // Serialize on the requesting session's gate (or the checkout-keyed
-        // fallback) for the whole transaction.
+    /// Run the integration transaction for `plan`, serialized on `gate` when
+    /// it guards the target checkout, else on the checkout-keyed gate under
+    /// the service's storage root.
+    pub(crate) async fn integrate(
+        &self,
+        plan: &IntegrationPlan,
+        gate: Option<&CheckoutMutationGate>,
+    ) -> WorktreeResult<IntegrationOutcome> {
         let fallback;
-        let gate: &CheckoutMutationGate = match request.mutation_gate {
+        let gate: &CheckoutMutationGate = match gate {
             Some(gate) if same_checkout(gate.checkout_root(), &plan.target_root) => gate,
             _ => {
                 fallback = CheckoutMutationGate::new(self.storage_root(), &plan.target_root)?;
                 &fallback
             }
         };
-        gate.run(self.integrate_under_gate(&plan)).await?
+        gate.run(self.integrate_under_gate(plan)).await?
     }
 
     /// The transaction: recover, replay guard, prepare, apply, hooks,
     /// finalize. Callers hold the checkout mutation gate.
-    async fn integrate_under_gate(&self, plan: &AcceptPlan) -> WorktreeResult<IntegrationOutcome> {
+    async fn integrate_under_gate(
+        &self,
+        plan: &IntegrationPlan,
+    ) -> WorktreeResult<IntegrationOutcome> {
         let ops = self.ops();
 
         // 1. An earlier acceptance that did not finish is resolved first.

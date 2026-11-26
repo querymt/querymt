@@ -17,17 +17,20 @@ use crate::acp::delivery::with_event_tip;
 use crate::acp::protocol::{ContentBlock, StopReason};
 use crate::agent::session_materializer::ReadOnlyReason;
 use crate::worktree::{
-    HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost, WorkspaceTarget,
-    WorktreeCreateRequest, WorktreeError, WorktreeOpError, WorktreeOps, WorktreeRecoverResponse,
+    FollowUp, HandoffHost, HandoffOptions, IsolatedSessionSpawner, MergeOptions, OwnerHost,
+    WorkspaceTarget, WorktreeCreateRequest, WorktreeError, WorktreeOpError, WorktreeOps,
+    WorktreeRecoverResponse,
 };
-use querymt_agent_core::events::{AgentEventKind, ArchiveRemoval};
+use querymt_agent_core::events::{AgentEventKind, ArchiveMerge, ArchiveRemoval};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const NATIVE_USAGE: &str = "usage: /worktree create [ref] [name] | create --include-local-changes [name], \
-     handoff [name] [--summary], list, status [id], result [id], publish [id], archive [id], \
+     handoff [name] [--summary], list, status [id], result [id], publish [id], \
+     merge [id] [--commit <rev>] [--archive|--remove], archive [id], \
      remove [id] [--archive], recover <id>; no force removal";
 const REMOVE_USAGE: &str = "usage: /worktree remove [id] [--archive]";
+const MERGE_USAGE: &str = "usage: /worktree merge [id] [--commit <rev>] [--archive|--remove]";
 const HANDOFF_USAGE: &str = "usage: /worktree handoff [name] [--summary]";
 const CREATE_USAGE: &str =
     "usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]";
@@ -51,7 +54,9 @@ fn op_error_to_acp(err: WorktreeOpError) -> Error {
         WorktreeOpError::Rejected { code, .. } if code == "invalid_options" => {
             Error::invalid_params()
         }
-        WorktreeOpError::Rejected { .. } => Error::invalid_request(),
+        WorktreeOpError::Rejected { .. } | WorktreeOpError::Refused { .. } => {
+            Error::invalid_request()
+        }
         WorktreeOpError::UnknownWorkspace(_) | WorktreeOpError::RemovalRefused { .. } => {
             Error::invalid_request()
         }
@@ -86,6 +91,38 @@ struct WorktreeTargetRequest {
     session_id: Option<String>,
     #[serde(default)]
     archive: bool,
+}
+
+/// Merge target and options: a workspace id, or the id of the session that
+/// owns it, plus the version to merge and an optional follow-up.
+/// `archive` and `remove` are mutually exclusive.
+#[derive(Debug, Deserialize)]
+struct WorktreeMergeRequest {
+    #[serde(default, alias = "workspaceId")]
+    workspace_id: Option<String>,
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    archive: bool,
+    #[serde(default)]
+    remove: bool,
+}
+
+impl WorktreeMergeRequest {
+    /// The follow-up the flags ask for; both together is `invalid_options`.
+    fn follow_up(&self) -> Result<Option<FollowUp>, WorktreeOpError> {
+        match (self.archive, self.remove) {
+            (true, true) => Err(WorktreeOpError::rejected(
+                "invalid_options",
+                "archive and remove cannot be combined; remove already archives first",
+            )),
+            (true, false) => Ok(Some(FollowUp::Archive)),
+            (false, true) => Ok(Some(FollowUp::Remove)),
+            (false, false) => Ok(None),
+        }
+    }
 }
 
 /// Explicit publication target: a workspace id, or (defaulting to the
@@ -136,6 +173,11 @@ enum NativeCommand {
     Status(Option<String>),
     Result(Option<String>),
     Publish(Option<String>),
+    Merge {
+        id: Option<String>,
+        commit: Option<String>,
+        follow_up: Option<FollowUp>,
+    },
     Remove {
         id: Option<String>,
         archive: bool,
@@ -153,7 +195,7 @@ impl NativeCommand {
     fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::Create { .. } | Self::Handoff(_) | Self::Archive(_)
+            Self::Create { .. } | Self::Handoff(_) | Self::Archive(_) | Self::Merge { .. }
         )
     }
 
@@ -167,6 +209,7 @@ impl NativeCommand {
             Self::Remove { .. } => Some("remove"),
             Self::Recover(_) => Some("recover"),
             Self::Handoff(_) => Some("handoff"),
+            Self::Merge { .. } => Some("merge"),
             Self::Create { .. } | Self::List | Self::Status(_) | Self::Result(_) => None,
         }
     }
@@ -229,6 +272,37 @@ impl NativeCommand {
             "status" => optional_id().map(Self::Status),
             "result" => optional_id().map(Self::Result),
             "publish" => optional_id().map(Self::Publish),
+            "merge" => {
+                let (mut id, mut commit) = (None, None);
+                let (mut archive, mut remove) = (false, false);
+                let mut words = args.iter();
+                while let Some(word) = words.next() {
+                    match word.as_str() {
+                        "--archive" if !archive => archive = true,
+                        "--remove" if !remove => remove = true,
+                        "--commit" if commit.is_none() => match words.next() {
+                            Some(rev) if !rev.starts_with('-') => commit = Some(rev.clone()),
+                            _ => return Err(WorktreeOpError::InvalidOptions(MERGE_USAGE.into())),
+                        },
+                        positional if !positional.starts_with('-') && id.is_none() => {
+                            id = Some(positional.to_owned());
+                        }
+                        _ => return Err(WorktreeOpError::InvalidOptions(MERGE_USAGE.into())),
+                    }
+                }
+                let request = WorktreeMergeRequest {
+                    workspace_id: None,
+                    session_id: None,
+                    commit: None,
+                    archive,
+                    remove,
+                };
+                Ok(Self::Merge {
+                    id,
+                    commit,
+                    follow_up: request.follow_up()?,
+                })
+            }
             "remove" => {
                 const ARCHIVE: &str = "--archive";
                 let flags = args.iter().filter(|a| a.as_str() == ARCHIVE).count();
@@ -402,12 +476,37 @@ impl OwnerHost for LocalAgentHandle {
         Ok(())
     }
 
+    async fn ensure_idle(&self, session_id: &str) -> Result<(), WorktreeOpError> {
+        let busy = self
+            .session_is_busy(session_id)
+            .await
+            .map_err(|err| WorktreeOpError::from_acp(&err))?;
+        if busy {
+            return Err(WorktreeOpError::rejected(
+                "owner_active",
+                format!("session {session_id} has a running turn or queued input"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn session_cwd(&self, session_id: &str) -> Result<Option<PathBuf>, WorktreeOpError> {
+        Ok(self
+            .config
+            .storage
+            .session_store()
+            .get_session(session_id)
+            .await?
+            .and_then(|session| session.cwd))
+    }
+
     async fn announce_archived(
         &self,
         owner: &str,
         workspace_id: &str,
         by_session_id: Option<&str>,
         removal: Option<ArchiveRemoval>,
+        merged: Option<ArchiveMerge>,
     ) -> Option<i64> {
         let config = self.hosting_config(owner).await?;
         let event = config
@@ -417,6 +516,7 @@ impl OwnerHost for LocalAgentHandle {
                     workspace_id: workspace_id.to_string(),
                     by_session_id: by_session_id.map(str::to_owned),
                     removal,
+                    merged,
                 },
             )
             .await;
@@ -1165,6 +1265,29 @@ impl LocalAgentHandle {
                 let target = native_target(id, session_id);
                 to_value(&ops_for(&target).await?.publish(&target).await?)
             }
+            // Like `archive`, a merge that archives the issuer's own workspace
+            // unloads the owner, so the archived update is the reply.
+            NativeCommand::Merge {
+                id,
+                commit,
+                follow_up,
+            } => {
+                let target = native_target(id, session_id);
+                let outcome = ops_for(&target)
+                    .await?
+                    .merge_announced(
+                        self,
+                        &target,
+                        MergeOptions { commit, follow_up },
+                        Some(session_id),
+                    )
+                    .await?;
+                *tip = outcome
+                    .announcement
+                    .filter(|announcement| announcement.session_id == session_id)
+                    .map(|announcement| announcement.seq);
+                return to_value(&outcome.response);
+            }
             NativeCommand::Remove { id, archive } => {
                 let target = native_target(id, session_id);
                 let outcome = ops_for(&target)
@@ -1287,6 +1410,35 @@ impl LocalAgentHandle {
                 self.worktree_ops(Some(&target))
                     .await?
                     .publish(&target)
+                    .await
+            }
+            .await,
+        )
+    }
+
+    /// `querymt/worktree/merge`: merge a worktree into its source checkout
+    /// as one squashed commit. `{workspace_id | session_id, commit?,
+    /// archive?, remove?}`; `archive` and `remove` together are
+    /// `invalid_options`.
+    pub(super) async fn handle_ext_worktree_merge(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: WorktreeMergeRequest = parse_workspace_op_request(req)?;
+        render(
+            async {
+                let follow_up = parsed.follow_up()?;
+                let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
+                self.worktree_ops(Some(&target))
+                    .await?
+                    .merge(
+                        self,
+                        &target,
+                        MergeOptions {
+                            commit: parsed.commit,
+                            follow_up,
+                        },
+                    )
                     .await
             }
             .await,
@@ -1473,9 +1625,10 @@ mod native_command_tests {
             parse("archive ws-1").unwrap(),
             NativeCommand::Archive(Some("ws-1".into()))
         );
-        for mutating in ["create", "handoff", "archive"] {
+        for mutating in ["create", "handoff", "archive", "merge"] {
             assert!(parse(mutating).unwrap().is_mutating(), "{mutating}");
         }
+        assert_eq!(parse("merge").unwrap().durable_reply(), Some("merge"));
         // `publish` stays available to an archived owner: it only pins a
         // result ref, which a refused `remove --archive` needs.
         for allowed in [
@@ -1487,6 +1640,61 @@ mod native_command_tests {
             "recover ws-1",
         ] {
             assert!(!parse(allowed).unwrap().is_mutating(), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn parses_merge_commands() {
+        let merge = |id: Option<&str>, commit: Option<&str>, follow_up| NativeCommand::Merge {
+            id: id.map(str::to_owned),
+            commit: commit.map(str::to_owned),
+            follow_up,
+        };
+        assert_eq!(parse("merge").unwrap(), merge(None, None, None));
+        assert_eq!(
+            parse("merge ws-1").unwrap(),
+            merge(Some("ws-1"), None, None)
+        );
+        assert_eq!(
+            parse("merge --commit abc1234").unwrap(),
+            merge(None, Some("abc1234"), None)
+        );
+        assert_eq!(
+            parse("merge ws-1 --commit HEAD~1 --archive").unwrap(),
+            merge(Some("ws-1"), Some("HEAD~1"), Some(FollowUp::Archive))
+        );
+        assert_eq!(
+            parse("merge --remove ws-1").unwrap(),
+            merge(Some("ws-1"), None, Some(FollowUp::Remove))
+        );
+    }
+
+    /// `--archive --remove` together is `invalid_options` before anything runs.
+    #[test]
+    fn archive_and_remove_together_are_rejected() {
+        for line in ["merge --archive --remove", "merge ws-1 --remove --archive"] {
+            let err = parse(line).unwrap_err();
+            assert_eq!(err.code(), "invalid_options", "{line}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_merge_commands() {
+        for invalid in [
+            "merge a b",
+            "merge --commit",
+            "merge --commit --archive",
+            "merge --commit a --commit b",
+            "merge --archive --archive",
+            "merge --remove --remove",
+            "merge --force",
+            "merge -x",
+        ] {
+            let err = parse(invalid).unwrap_err();
+            assert!(
+                matches!(&err, WorktreeOpError::InvalidOptions(m) if m == MERGE_USAGE),
+                "{invalid}: {err:?}"
+            );
         }
     }
 

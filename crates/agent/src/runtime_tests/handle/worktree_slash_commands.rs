@@ -853,3 +853,101 @@ async fn initialize_advertises_profile_worktree_support() {
 
     f.handle.shutdown().await;
 }
+
+/// A worktree owned by a session of a profile runtime is merged by that
+/// runtime's service, from the source session (native, by id) and by the
+/// extension method alike, even though the connection's root runtime has no
+/// workspace service of its own.
+#[tokio::test]
+async fn worktree_merge_runs_in_the_profile_runtime_hosting_the_worktree() {
+    let repo = committed_repo();
+    // gix fixtures leave no index: build it so the checkout is clean.
+    let status = std::process::Command::new("git")
+        .args(["reset", "-q"])
+        .current_dir(repo.path())
+        .status()
+        .expect("run git");
+    assert!(status.success());
+    let storage_root = tempfile::tempdir().expect("storage root");
+    let (f, _profiles) = two_profile_fixture(storage_root.path()).await;
+
+    let source_id = f
+        .handle
+        .new_session(new_session_in(repo.path(), "isolated", None))
+        .await
+        .expect("source session")
+        .session_id
+        .to_string();
+
+    // Native: the source session merges the first worktree by id.
+    let created = native_command(&f.handle, &source_id, "/worktree create HEAD w1")
+        .await
+        .expect("native create answers");
+    assert!(created.get("error").is_none(), "create failed: {created}");
+    let first_checkout = std::path::PathBuf::from(created["checkout_path"].as_str().unwrap());
+    std::fs::write(first_checkout.join("one.txt"), "first\n").unwrap();
+    let merged = native_command(
+        &f.handle,
+        &source_id,
+        &format!(
+            "/worktree merge {}",
+            created["workspace_id"].as_str().unwrap()
+        ),
+    )
+    .await
+    .expect("native merge answers");
+    assert!(merged.get("error").is_none(), "merge failed: {merged}");
+    assert_eq!(merged["outcome"], "merged", "{merged}");
+    assert_eq!(merged["changed_paths"][0]["path"], "one.txt");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
+        "first\n"
+    );
+
+    // Extension method: a second worktree, merged by workspace id.
+    let ext = ext_method_json(
+        &f.handle,
+        "querymt/worktree/create",
+        serde_json::json!({ "cwd": "", "source_session_id": source_id, "name": "w2" }),
+    )
+    .await;
+    let second_checkout = std::path::PathBuf::from(ext["checkout_path"].as_str().unwrap());
+    std::fs::write(second_checkout.join("two.txt"), "second\n").unwrap();
+    let ext_merged = ext_method_json(
+        &f.handle,
+        "querymt/worktree/merge",
+        serde_json::json!({ "workspace_id": ext["workspace_id"] }),
+    )
+    .await;
+    assert_eq!(ext_merged["outcome"], "merged", "{ext_merged}");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("two.txt")).unwrap(),
+        "second\n"
+    );
+    // Two squashed commits on top of the initial one.
+    let count = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .expect("run git");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "3");
+
+    // A profile without worktrees cannot merge another runtime's workspace
+    // as its own: the unavailable code is stable.
+    let plain = f
+        .handle
+        .new_session(new_session_in(repo.path(), "alpha", None))
+        .await
+        .expect("plain session")
+        .session_id
+        .to_string();
+    let reply = native_command(&f.handle, &plain, "/worktree merge")
+        .await
+        .expect("native merge answers");
+    assert_eq!(
+        reply["error"]["code"], "workspace_service_unavailable",
+        "{reply}"
+    );
+
+    f.handle.shutdown().await;
+}

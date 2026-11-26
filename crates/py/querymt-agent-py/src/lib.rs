@@ -8,7 +8,8 @@ use ::querymt_agent::agent::core::AgentMode;
 use ::querymt_agent::api::{AgentWorktrees, SessionOptions};
 use ::querymt_agent::config::{Permissions, ToolSpec, WorkspaceSettings};
 use ::querymt_agent::worktree::{
-    BaselineMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
+    BaselineMode, FollowUp, HandoffOptions, MergeOptions, WorkspaceTarget, WorktreeCreateRequest,
+    WorktreeOpError,
 };
 
 use ::querymt_agent::api::DelegateConfigBuilder;
@@ -726,6 +727,41 @@ impl PyWorktrees {
     fn recover<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
         worktree_future!(py, self.inner, |w| w.recover(&workspace_id))
     }
+
+    /// Merge a workspace into its source checkout as one squashed commit.
+    /// Provide exactly one of `workspace_id` or `session_id` (the owner).
+    ///
+    /// By default the workspace's current working state is snapshotted (the
+    /// owner must be idle) and merged. `commit` merges a retained result or a
+    /// commit on the worktree branch instead, with no snapshot. `archive=True`
+    /// or `remove=True` (mutually exclusive) then archives, or archives and
+    /// removes, the workspace once the source contains the result; a failure
+    /// there is reported under `follow_up.error` and never undoes the merge.
+    /// Refusals raise `WorktreeError` with a stable `.code` and `.paths`.
+    #[pyo3(signature = (workspace_id=None, session_id=None, commit=None, archive=false, remove=false))]
+    fn merge<'py>(
+        &self,
+        py: Python<'py>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+        commit: Option<String>,
+        archive: bool,
+        remove: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = WorkspaceTarget::from_parts(workspace_id, session_id).map_err(worktree_err)?;
+        let follow_up = match (archive, remove) {
+            (true, true) => {
+                return Err(worktree_err(WorktreeOpError::InvalidOptions(
+                    "`archive` and `remove` are mutually exclusive".to_owned(),
+                )));
+            }
+            (true, false) => Some(FollowUp::Archive),
+            (false, true) => Some(FollowUp::Remove),
+            (false, false) => None,
+        };
+        let options = MergeOptions { commit, follow_up };
+        worktree_future!(py, self.inner, |w| w.merge(target, options))
+    }
 }
 
 #[pymodule]
@@ -852,11 +888,20 @@ fn session_options(
     Ok((workspace.is_some() || refined).then_some(options))
 }
 
-/// Raise `WorktreeError` carrying the stable `.code`.
+/// Raise `WorktreeError` carrying the stable `.code` and, for refusals that
+/// name offending files (for example `merge_conflict`), `.paths`.
 fn worktree_err(err: WorktreeOpError) -> PyErr {
+    let paths = match &err {
+        WorktreeOpError::Refused { paths, .. } => paths.clone(),
+        _ => Vec::new(),
+    };
     Python::attach(|py| {
         let py_err = WorktreeError::new_err(err.to_string());
-        match py_err.value(py).setattr("code", err.code()) {
+        let value = py_err.value(py);
+        match value
+            .setattr("code", err.code())
+            .and_then(|()| value.setattr("paths", paths))
+        {
             Ok(()) => py_err,
             Err(set_err) => set_err,
         }
