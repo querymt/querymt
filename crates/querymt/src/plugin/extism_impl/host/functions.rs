@@ -125,27 +125,25 @@ pub(crate) fn reqwest_http(
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let http_req_clone = http_req.clone();
 
     std::thread::spawn(move || {
         let res = handle_tokio.block_on(async move {
-            let http_req = http_req_clone;
             let cancelled_response = || {
                 http::Response::builder()
                     .status(499)
                     .body(b"cancelled".to_vec())
                     .map_err(|e| format!("{}", e))
             };
-            let method = reqwest::Method::from_bytes(http_req.method().as_str().as_bytes())
+            let (parts, body) = http_req.into_parts();
+            let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
                 .map_err(|e| format!("Invalid HTTP method: {}", e))?;
-            let url = http_req.uri().to_string();
+            let url = parts.uri.to_string();
             let mut reqwest_req = client.request(method, &url);
-            for (name, value) in http_req.headers() {
+            for (name, value) in &parts.headers {
                 if let Ok(val_str) = value.to_str() {
                     reqwest_req = reqwest_req.header(name.as_str(), val_str);
                 }
             }
-            let body = http_req.body().clone();
             if !body.is_empty() {
                 reqwest_req = reqwest_req.body(body);
             }

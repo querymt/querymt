@@ -3,7 +3,7 @@
 //! Provides real-time file indexing with file system watching for client autocomplete
 //! and incremental function index updates.
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::{Override, OverrideBuilder};
@@ -202,7 +202,9 @@ impl Default for FileIndexConfig {
 
 /// A file system index with automatic updates via file watching.
 pub struct FileIndexWatcher {
-    index: Arc<ArcSwap<Option<FileIndex>>>,
+    /// Current snapshot. Snapshots are immutable and shared by `Arc`, so readers
+    /// and subscribers never copy the file list.
+    index: Arc<ArcSwapOption<FileIndex>>,
     /// Current gitignore matcher, swapped atomically when .gitignore changes.
     /// Kept alive here so the Arc isn't dropped; the task holds a clone.
     #[allow(dead_code)]
@@ -211,7 +213,7 @@ pub struct FileIndexWatcher {
     config: FileIndexConfig,
 
     // Broadcast the full index (for UI file listing)
-    index_tx: broadcast::Sender<FileIndex>,
+    index_tx: broadcast::Sender<Arc<FileIndex>>,
 
     // Broadcast granular changes (for FunctionIndex)
     changes_tx: broadcast::Sender<FileChangeSet>,
@@ -221,6 +223,23 @@ pub struct FileIndexWatcher {
 
     // Keep rebuild task alive
     _rebuild_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Make `new_index` the current snapshot and broadcast it to subscribers.
+///
+/// The snapshot is wrapped in a single `Arc` that is shared by the stored
+/// value, every subscriber and the returned handle, so publishing never copies
+/// the file list.
+fn publish_index(
+    index: &ArcSwapOption<FileIndex>,
+    index_tx: &broadcast::Sender<Arc<FileIndex>>,
+    new_index: FileIndex,
+) -> Arc<FileIndex> {
+    let new_index = Arc::new(new_index);
+    index.store(Some(Arc::clone(&new_index)));
+    // An error only means there are currently no subscribers.
+    let _ = index_tx.send(Arc::clone(&new_index));
+    new_index
 }
 
 async fn build_file_index_blocking(
@@ -245,7 +264,7 @@ impl FileIndexWatcher {
         root: PathBuf,
         config: FileIndexConfig,
     ) -> Result<Self, FileIndexError> {
-        let index = Arc::new(ArcSwap::from_pointee(None));
+        let index = Arc::new(ArcSwapOption::empty());
         let (index_tx, _) = broadcast::channel(16);
         let (changes_tx, _) = broadcast::channel(64);
         // Unbounded on purpose: the callback runs on the notify thread, and a
@@ -276,20 +295,15 @@ impl FileIndexWatcher {
         watcher.watch(&root, RecursiveMode::Recursive)?;
 
         // Build initial index using spawn_blocking to avoid blocking the async runtime
-        let root_clone = root.clone();
-        let config_clone = config.clone();
-        let overrides_clone = overrides.clone();
-        let gitignore_clone_init = gitignore.clone();
         let initial_index = build_file_index_blocking(
-            root_clone,
-            config_clone,
-            overrides_clone,
+            root.clone(),
+            config.clone(),
+            overrides.clone(),
             "Failed to build initial index",
         )
         .await?;
 
-        index.store(Arc::new(Some(initial_index.clone())));
-        let _ = index_tx.send(initial_index);
+        publish_index(&index, &index_tx, initial_index);
 
         // Spawn the event processing task
         let index_clone = index.clone();
@@ -298,7 +312,7 @@ impl FileIndexWatcher {
         let root_clone = root.clone();
         let config_clone = config.clone();
         let overrides_clone = overrides.clone();
-        let gitignore_clone = gitignore_clone_init;
+        let gitignore_clone = gitignore.clone();
 
         let rebuild_handle = tokio::spawn(async move {
             let mut pending_events: Vec<Event> = Vec::new();
@@ -326,8 +340,7 @@ impl FileIndexWatcher {
                         .await
                         {
                             Ok(new_index) => {
-                                index_clone.store(Arc::new(Some(new_index.clone())));
-                                let _ = index_tx_clone.send(new_index);
+                                publish_index(&index_clone, &index_tx_clone, new_index);
                             }
                             Err(err) => {
                                 log::warn!("FileIndexWatcher: {}", err);
@@ -439,13 +452,12 @@ impl FileIndexWatcher {
                                 .await
                                 {
                                     Ok(new_index) => {
-                                        index_clone.store(Arc::new(Some(new_index.clone())));
                                         log::debug!(
                                             "FileIndexWatcher: Broadcasting rebuilt index with {} files ({})",
                                             new_index.files.len(),
                                             reason
                                         );
-                                        let _ = index_tx_clone.send(new_index);
+                                        publish_index(&index_clone, &index_tx_clone, new_index);
                                     }
                                     Err(err) => {
                                         log::warn!("FileIndexWatcher: {}", err);
@@ -459,7 +471,7 @@ impl FileIndexWatcher {
                                     change_set.changes.len()
                                 );
                                 let _ = changes_tx_clone.send(change_set.clone());
-                                if let Some(current) = (**index_clone.load()).clone() {
+                                if let Some(current) = index_clone.load_full() {
                                     let updated = apply_changes_to_index(
                                         &current,
                                         &change_set,
@@ -468,12 +480,11 @@ impl FileIndexWatcher {
                                         &overrides_clone,
                                         &current_gitignore,
                                     );
-                                    index_clone.store(Arc::new(Some(updated.clone())));
                                     log::debug!(
                                         "FileIndexWatcher: Broadcasting updated index with {} files",
                                         updated.files.len()
                                     );
-                                    let _ = index_tx_clone.send(updated);
+                                    publish_index(&index_clone, &index_tx_clone, updated);
                                 } else {
                                     // No current index, do full rebuild in spawn_blocking
                                     log::debug!("FileIndexWatcher: No current index, performing full rebuild");
@@ -490,12 +501,15 @@ impl FileIndexWatcher {
                                     .await
                                     {
                                         Ok(new_index) => {
-                                            index_clone.store(Arc::new(Some(new_index.clone())));
                                             log::debug!(
                                                 "FileIndexWatcher: Broadcasting rebuilt index with {} files",
                                                 new_index.files.len()
                                             );
-                                            let _ = index_tx_clone.send(new_index);
+                                            publish_index(
+                                                &index_clone,
+                                                &index_tx_clone,
+                                                new_index,
+                                            );
                                         }
                                         Err(err) => {
                                             log::warn!("FileIndexWatcher: {}", err);
@@ -524,13 +538,15 @@ impl FileIndexWatcher {
     }
 
     /// Get the current file index, if available.
-    /// This is a lock-free operation that never blocks.
-    pub fn get_index(&self) -> Option<FileIndex> {
-        (**self.index.load()).clone()
+    ///
+    /// This is a lock-free operation that never blocks and never copies the
+    /// file list: it returns a shared handle to the immutable snapshot.
+    pub fn get_index(&self) -> Option<Arc<FileIndex>> {
+        self.index.load_full()
     }
 
     /// Subscribe to full index updates (for UI autocomplete).
-    pub fn subscribe_index(&self) -> broadcast::Receiver<FileIndex> {
+    pub fn subscribe_index(&self) -> broadcast::Receiver<Arc<FileIndex>> {
         self.index_tx.subscribe()
     }
 
@@ -540,7 +556,7 @@ impl FileIndexWatcher {
     }
 
     /// Force an immediate index rebuild.
-    pub async fn refresh(&self) -> Result<FileIndex, FileIndexError> {
+    pub async fn refresh(&self) -> Result<Arc<FileIndex>, FileIndexError> {
         let overrides = compile_overrides(&self.root, &self.config)?;
         let root = self.root.clone();
         let config = self.config.clone();
@@ -548,9 +564,7 @@ impl FileIndexWatcher {
         let new_index =
             build_file_index_blocking(root, config, overrides, "Failed to refresh index").await?;
 
-        self.index.store(Arc::new(Some(new_index.clone())));
-        let _ = self.index_tx.send(new_index.clone());
-        Ok(new_index)
+        Ok(publish_index(&self.index, &self.index_tx, new_index))
     }
 
     /// Get the root directory being watched.
@@ -871,6 +885,16 @@ fn is_ignored(
         .is_ignore()
 }
 
+/// A pending edit to one path while applying a [`FileChangeSet`].
+enum PathEdit {
+    /// The path is gone.
+    Remove,
+    /// The path exists with exactly this entry (replaces any existing one).
+    Put(FileIndexEntry),
+    /// The path exists; add this entry only if the index does not have one.
+    PutIfAbsent(FileIndexEntry),
+}
+
 fn apply_changes_to_index(
     current: &FileIndex,
     change_set: &FileChangeSet,
@@ -879,11 +903,9 @@ fn apply_changes_to_index(
     overrides: &Override,
     gitignore: &Gitignore,
 ) -> FileIndex {
-    let mut entries: HashMap<String, FileIndexEntry> = current
-        .files
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.clone()))
-        .collect();
+    // Fold the change set into one edit per path first, so the (large) current
+    // list is walked once and only entries that survive are copied.
+    let mut edits: HashMap<String, PathEdit> = HashMap::new();
 
     for change in &change_set.changes {
         let relative_path = match change.path.strip_prefix(root) {
@@ -899,45 +921,71 @@ fn apply_changes_to_index(
 
         match &change.kind {
             FileChangeKind::Created => {
-                entries.insert(
-                    relative_path.clone(),
-                    FileIndexEntry {
-                        path: relative_path,
-                        is_dir: change.is_dir,
-                    },
-                );
+                let entry = FileIndexEntry {
+                    path: relative_path.clone(),
+                    is_dir: change.is_dir,
+                };
+                edits.insert(relative_path, PathEdit::Put(entry));
             }
             FileChangeKind::Removed => {
-                entries.remove(&relative_path);
+                edits.insert(relative_path, PathEdit::Remove);
             }
             FileChangeKind::Renamed { from } => {
                 if let Ok(from_rel) = from.strip_prefix(root) {
-                    let from_rel = from_rel.to_string_lossy().to_string();
-                    entries.remove(&from_rel);
+                    edits.insert(from_rel.to_string_lossy().to_string(), PathEdit::Remove);
                 }
-                entries.insert(
-                    relative_path.clone(),
-                    FileIndexEntry {
-                        path: relative_path,
-                        is_dir: change.is_dir,
-                    },
-                );
+                let entry = FileIndexEntry {
+                    path: relative_path.clone(),
+                    is_dir: change.is_dir,
+                };
+                edits.insert(relative_path, PathEdit::Put(entry));
             }
-            FileChangeKind::Modified => {
-                if !entries.contains_key(&relative_path) {
-                    entries.insert(
-                        relative_path.clone(),
-                        FileIndexEntry {
-                            path: relative_path,
-                            is_dir: change.is_dir,
-                        },
-                    );
+            FileChangeKind::Modified => match edits.get(&relative_path) {
+                // Already (re)created by an earlier change in this batch.
+                Some(PathEdit::Put(_) | PathEdit::PutIfAbsent(_)) => {}
+                // Removed earlier in this batch, so it must be added back.
+                Some(PathEdit::Remove) => {
+                    let entry = FileIndexEntry {
+                        path: relative_path.clone(),
+                        is_dir: change.is_dir,
+                    };
+                    edits.insert(relative_path, PathEdit::Put(entry));
+                }
+                None => {
+                    let entry = FileIndexEntry {
+                        path: relative_path.clone(),
+                        is_dir: change.is_dir,
+                    };
+                    edits.insert(relative_path, PathEdit::PutIfAbsent(entry));
+                }
+            },
+        }
+    }
+
+    let mut files: Vec<FileIndexEntry> = Vec::with_capacity(current.files.len() + edits.len());
+    let mut present: HashSet<&str> = HashSet::new();
+    for entry in &current.files {
+        match edits.get(entry.path.as_str()) {
+            Some(PathEdit::Remove | PathEdit::Put(_)) => {}
+            Some(PathEdit::PutIfAbsent(_)) => {
+                present.insert(entry.path.as_str());
+                files.push(entry.clone());
+            }
+            None => files.push(entry.clone()),
+        }
+    }
+    for (path, edit) in edits.iter() {
+        match edit {
+            PathEdit::Remove => {}
+            PathEdit::Put(entry) => files.push(entry.clone()),
+            PathEdit::PutIfAbsent(entry) => {
+                if !present.contains(path.as_str()) {
+                    files.push(entry.clone());
                 }
             }
         }
     }
 
-    let mut files: Vec<FileIndexEntry> = entries.into_values().collect();
     files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
@@ -1938,5 +1986,245 @@ mod tests {
 
         println!("\n  ✓ Index correctly reflects the file move");
         println!("\n✓ File move integration test passed");
+    }
+}
+
+#[cfg(test)]
+mod incremental_update_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn entry(path: &str, is_dir: bool) -> FileIndexEntry {
+        FileIndexEntry {
+            path: path.to_string(),
+            is_dir,
+        }
+    }
+
+    fn change(root: &Path, rel: &str, kind: FileChangeKind, is_dir: bool) -> FileChange {
+        FileChange {
+            path: root.join(rel),
+            kind,
+            is_dir,
+        }
+    }
+
+    fn renamed(root: &Path, from: &str) -> FileChangeKind {
+        FileChangeKind::Renamed {
+            from: root.join(from),
+        }
+    }
+
+    /// The straightforward map-based algorithm `apply_changes_to_index`
+    /// replaced; kept as the behavioural reference.
+    fn reference(
+        current: &FileIndex,
+        changes: &[FileChange],
+        root: &Path,
+        config: &FileIndexConfig,
+        overrides: &Override,
+        gitignore: &Gitignore,
+    ) -> Vec<FileIndexEntry> {
+        let mut entries: HashMap<String, FileIndexEntry> = current
+            .files
+            .iter()
+            .map(|e| (e.path.clone(), e.clone()))
+            .collect();
+        for change in changes {
+            let Ok(rel) = change.path.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().to_string();
+            if rel.is_empty() || is_ignored(&rel, change.is_dir, overrides, gitignore) {
+                continue;
+            }
+            match &change.kind {
+                FileChangeKind::Created => {
+                    entries.insert(rel.clone(), entry(&rel, change.is_dir));
+                }
+                FileChangeKind::Removed => {
+                    entries.remove(&rel);
+                }
+                FileChangeKind::Renamed { from } => {
+                    if let Ok(from_rel) = from.strip_prefix(root) {
+                        entries.remove(&from_rel.to_string_lossy().to_string());
+                    }
+                    entries.insert(rel.clone(), entry(&rel, change.is_dir));
+                }
+                FileChangeKind::Modified => {
+                    entries
+                        .entry(rel.clone())
+                        .or_insert_with(|| entry(&rel, change.is_dir));
+                }
+            }
+        }
+        let mut files: Vec<_> = entries.into_values().collect();
+        files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.path.cmp(&b.path),
+        });
+        files.truncate(config.max_files);
+        files
+    }
+
+    fn check(batches: Vec<Vec<(&str, FileChangeKind, bool)>>, max_files: usize) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let config = FileIndexConfig {
+            max_files,
+            ..FileIndexConfig::default()
+        };
+        let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = build_gitignore(root);
+
+        let mut current = FileIndex {
+            files: vec![
+                entry("src", true),
+                entry("a.txt", false),
+                entry("b.txt", false),
+                entry("src/lib.rs", false),
+                entry("src/main.rs", false),
+            ],
+            generated_at: 0,
+            root: root.to_path_buf(),
+        };
+
+        for batch in batches {
+            let changes: Vec<FileChange> = batch
+                .into_iter()
+                .map(|(rel, kind, is_dir)| change(root, rel, kind, is_dir))
+                .collect();
+            let set = FileChangeSet {
+                changes: changes.clone(),
+                timestamp: 0,
+            };
+            let expected = reference(&current, &changes, root, &config, &overrides, &gitignore);
+            let actual =
+                apply_changes_to_index(&current, &set, root, &config, &overrides, &gitignore);
+            assert_eq!(actual.files, expected);
+            assert_eq!(actual.root, root);
+            current = actual;
+        }
+    }
+
+    #[test]
+    fn matches_reference_for_single_changes() {
+        check(
+            vec![
+                vec![("new.txt", FileChangeKind::Created, false)],
+                vec![("a.txt", FileChangeKind::Removed, false)],
+                vec![("b.txt", renamed(Path::new(""), "b.txt"), false)],
+                vec![("src/lib.rs", FileChangeKind::Modified, false)],
+                vec![("fresh.rs", FileChangeKind::Modified, false)],
+                vec![("missing.txt", FileChangeKind::Removed, false)],
+            ],
+            10_000,
+        );
+    }
+
+    #[test]
+    fn matches_reference_for_order_dependent_batches() {
+        let r = Path::new("");
+        check(
+            vec![
+                // Remove then Modify re-adds; Modify then Remove drops.
+                vec![
+                    ("a.txt", FileChangeKind::Removed, false),
+                    ("a.txt", FileChangeKind::Modified, false),
+                    ("b.txt", FileChangeKind::Modified, false),
+                    ("b.txt", FileChangeKind::Removed, false),
+                ],
+                // Create replaces an existing entry of a different kind.
+                vec![("src/main.rs", FileChangeKind::Created, true)],
+                // Rename chain: x -> y -> z, plus a rename onto an existing path.
+                vec![
+                    ("x.txt", FileChangeKind::Created, false),
+                    ("y.txt", renamed(r, "x.txt"), false),
+                    ("z.txt", renamed(r, "y.txt"), false),
+                    ("src/lib.rs", renamed(r, "src/main.rs"), false),
+                ],
+                // Modify after Create keeps the created entry.
+                vec![
+                    ("m.txt", FileChangeKind::Created, false),
+                    ("m.txt", FileChangeKind::Modified, true),
+                ],
+                // Paths outside the root are skipped.
+                vec![],
+            ],
+            10_000,
+        );
+    }
+
+    #[test]
+    fn matches_reference_when_truncated_to_max_files() {
+        check(
+            vec![vec![
+                ("c.txt", FileChangeKind::Created, false),
+                ("d", FileChangeKind::Created, true),
+                ("e.txt", FileChangeKind::Created, false),
+            ]],
+            4,
+        );
+    }
+
+    #[test]
+    fn ignores_paths_outside_root() {
+        let temp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let root = temp.path();
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = build_gitignore(root);
+        let current = FileIndex {
+            files: vec![entry("a.txt", false)],
+            generated_at: 0,
+            root: root.to_path_buf(),
+        };
+        let set = FileChangeSet {
+            changes: vec![FileChange {
+                path: other.path().join("evil.txt"),
+                kind: FileChangeKind::Created,
+                is_dir: false,
+            }],
+            timestamp: 0,
+        };
+        let updated = apply_changes_to_index(&current, &set, root, &config, &overrides, &gitignore);
+        assert_eq!(updated.files, current.files);
+    }
+
+    #[test]
+    fn publish_shares_one_snapshot_between_store_and_subscribers() {
+        let index = ArcSwapOption::empty();
+        let (tx, mut rx) = broadcast::channel(4);
+        let published = publish_index(
+            &index,
+            &tx,
+            FileIndex {
+                files: vec![entry("a.txt", false)],
+                generated_at: 1,
+                root: PathBuf::from("/r"),
+            },
+        );
+        let stored = index.load_full().expect("stored");
+        let received = rx.try_recv().expect("broadcast");
+        assert!(Arc::ptr_eq(&published, &stored));
+        assert!(Arc::ptr_eq(&published, &received));
+    }
+
+    #[test]
+    fn publish_without_subscribers_still_stores() {
+        let index = ArcSwapOption::empty();
+        let (tx, _) = broadcast::channel::<Arc<FileIndex>>(4);
+        let published = publish_index(
+            &index,
+            &tx,
+            FileIndex {
+                files: Vec::new(),
+                generated_at: 0,
+                root: PathBuf::from("/r"),
+            },
+        );
+        assert!(Arc::ptr_eq(&published, &index.load_full().unwrap()));
     }
 }

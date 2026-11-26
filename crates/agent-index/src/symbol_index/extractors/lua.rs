@@ -83,7 +83,7 @@ fn collect_assignment_statement(
             &value_node,
             source,
             parent,
-            name,
+            &name,
         )),
         "function_call" if is_require_call(&value_node, source) => {
             symbols.push(import_symbol(node, &value_node, source, parent))
@@ -142,10 +142,10 @@ fn function_assignment_symbol(
     function: &Node,
     source: &str,
     parent: Option<&str>,
-    raw_name: String,
+    raw_name: &str,
 ) -> SymbolEntry {
-    let kind = function_kind(&raw_name);
-    let name = display_name_for_kind(&raw_name, kind);
+    let kind = function_kind(raw_name);
+    let name = display_name_for_kind(raw_name, kind);
     let kind = if is_test_name(&name) {
         SymbolKind::Test
     } else {

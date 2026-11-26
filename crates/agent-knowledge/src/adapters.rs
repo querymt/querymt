@@ -89,7 +89,7 @@ fn content_version(citation: &str, summary: Option<&str>, evidence: EvidenceStat
 
 /// Prefix `body` with its provenance line. `id` goes last so identities that
 /// contain spaces remain unambiguous.
-fn seal(id: &str, version: &str, body: String) -> String {
+fn seal(id: &str, version: &str, body: &str) -> String {
     format!("{MARKER_PREFIX}version={version} card={id}]\n{body}")
 }
 
@@ -196,7 +196,7 @@ pub fn render_orientation_card(card: &OrientationCard, fetch_available: bool) ->
     evidence_lines(card.evidence, &mut out);
     fetch_line(&card.section_key, fetch_available, &mut out);
     let version = content_version(&cited, summary, card.evidence);
-    seal(&card.section_key, &version, out)
+    seal(&card.section_key, &version, &out)
 }
 
 fn path_kind_label(card: &PathCard) -> String {
@@ -243,7 +243,7 @@ pub fn render_path_card(card: &PathCard, fetch_available: bool) -> String {
     evidence_lines(card.evidence, &mut out);
     fetch_line(&card.retrieval_id, fetch_available, &mut out);
     let version = content_version(&cited, summary, card.evidence);
-    seal(&card.retrieval_id, &version, out)
+    seal(&card.retrieval_id, &version, &out)
 }
 
 // --- user-prompt orientation ---------------------------------------------

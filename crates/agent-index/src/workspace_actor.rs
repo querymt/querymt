@@ -53,7 +53,11 @@ pub struct WorkspaceHandle {
 
 impl WorkspaceHandle {
     /// Get the current file index snapshot (lock-free via `ArcSwap`).
-    pub fn file_index(&self) -> Option<FileIndex> {
+    ///
+    /// Returns a shared handle to the immutable snapshot; the file list is not
+    /// copied. Use [`FileIndexWatcher::root`] (via `file_watcher`) when only the
+    /// workspace root is needed.
+    pub fn file_index(&self) -> Option<Arc<FileIndex>> {
         self.file_watcher.get_index()
     }
 }
@@ -127,11 +131,10 @@ impl Actor for WorkspaceIndexActor {
     /// `tokio::spawn` background task in the old `WorkspaceIndex`.
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let mut changes_rx = args.file_watcher.subscribe_changes();
-        let actor_ref_clone = actor_ref.clone();
         tokio::spawn(async move {
             while let Ok(change_set) = changes_rx.recv().await {
                 if change_set.has_source_changes()
-                    && let Err(e) = actor_ref_clone.tell(ApplyChanges { change_set }).await
+                    && let Err(e) = actor_ref.tell(ApplyChanges { change_set }).await
                 {
                     log::debug!("WorkspaceIndexActor: failed to send ApplyChanges: {:?}", e);
                 }
@@ -310,7 +313,7 @@ impl Message<ApplyChanges> for WorkspaceIndexActor {
 }
 
 impl Message<GetFileIndex> for WorkspaceIndexActor {
-    type Reply = Option<FileIndex>;
+    type Reply = Option<Arc<FileIndex>>;
 
     async fn handle(
         &mut self,

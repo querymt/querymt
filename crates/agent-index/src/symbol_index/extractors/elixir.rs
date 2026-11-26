@@ -212,7 +212,7 @@ fn body_uses_exunit_case(node: &Node, source: &str) -> bool {
         if child.kind() == "call" {
             let text = node_text(&child, source).trim_start();
             if call_keyword(text) == Some("use")
-                && import_name(text, "use").is_some_and(is_exunit_case_use)
+                && import_name(text, "use").is_some_and(|name| is_exunit_case_use(&name))
             {
                 return true;
             }
@@ -226,7 +226,7 @@ fn body_uses_exunit_case(node: &Node, source: &str) -> bool {
     false
 }
 
-fn is_exunit_case_use(name: String) -> bool {
+fn is_exunit_case_use(name: &str) -> bool {
     let name = name.trim_start_matches('(').trim_start();
     name == "ExUnit.Case" || name.starts_with("ExUnit.Case,")
 }

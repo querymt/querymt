@@ -128,7 +128,7 @@ fn container_symbol(
         node,
         source,
         kind,
-        name.clone(),
+        name,
         signature,
         parent.map(|value| value.to_string()),
         body_start_line,
