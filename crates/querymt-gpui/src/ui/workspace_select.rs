@@ -478,9 +478,7 @@ impl Render for WorkspaceField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.unwrap_or_else(|| *palette(cx));
         let items = self.items(cx);
-        let cursor = self
-            .cursor
-            .map(|c| c.min(items.len().saturating_sub(1)));
+        let cursor = self.cursor.map(|c| c.min(items.len().saturating_sub(1)));
         let shell = if self.dialog {
             let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
             kit::field_shell(focused, &p).h(px(36.))

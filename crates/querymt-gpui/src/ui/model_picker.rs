@@ -938,7 +938,10 @@ impl ModelPicker {
             (None, last) => last,
             (Some(_), None) => None,
         };
-        let extent = match (rows.bounds_for_item(0), end.and_then(|e| rows.bounds_for_item(e))) {
+        let extent = match (
+            rows.bounds_for_item(0),
+            end.and_then(|e| rows.bounds_for_item(e)),
+        ) {
             (Some(first), Some(end)) => f32::from(end.bottom() - first.top()),
             _ => 0.,
         };

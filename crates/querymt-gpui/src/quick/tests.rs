@@ -1292,7 +1292,12 @@ fn with_many_models(rig: &Rig, cx: &mut TestAppContext, n: usize) {
 /// Every model row is shown: the rows' box does not scroll.
 fn every_model_shown(cx: &mut TestAppContext, panel: &Entity<QuickPanel>) -> bool {
     panel.read_with(cx, |p, cx| {
-        p.models_for_test().read(cx).rows_scroll_for_test().max_offset().y <= gpui_kit::px(0.5)
+        p.models_for_test()
+            .read(cx)
+            .rows_scroll_for_test()
+            .max_offset()
+            .y
+            <= gpui_kit::px(0.5)
     })
 }
 
@@ -1741,7 +1746,12 @@ fn changing_the_effort_moves_nothing_in_the_header(cx: &mut TestAppContext) {
     for effort in ["low", "medium", "high", "max"] {
         let rig = rig(cx);
         let (window, panel) = rig.open_panel(cx);
-        show_view(cx, &rig, &panel, view_running_with("chat", "build", Some(effort)));
+        show_view(
+            cx,
+            &rig,
+            &panel,
+            view_running_with("chat", "build", Some(effort)),
+        );
         settle(cx, window);
         let model = bounds_of(cx, window, "quick-run-model").expect("the model");
         let shown = bounds_of(cx, window, "quick-run-effort").expect("the effort");
