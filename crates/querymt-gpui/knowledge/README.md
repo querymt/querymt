@@ -3,8 +3,8 @@ id: gpui-repository-map
 title: querymt-gpui repository map
 description: What the app is, how its layers stack (transport, RPC, store, open sessions, UI, quick panel) and which note explains each.
 tags: architecture, map, overview, layers, modules
-knowledge_paths: ["src/main.rs", "src/ui/mod.rs"]
-knowledge_sources: ["src/main.rs"]
+knowledge_paths: ["crates/querymt-gpui/src/main.rs", "crates/querymt-gpui/src/ui/mod.rs"]
+knowledge_sources: ["crates/querymt-gpui/src/main.rs"]
 ---
 
 # querymt-gpui repository map

@@ -3,8 +3,8 @@ id: gpui-agent-connection
 title: Agent connections, RPC routing and the store
 description: How AgentsStore connects to an agent (transport, initialize, generations, reconnect), routes inbound JSON-RPC, handles permission and elicitation requests, and persists configs and prefs.
 tags: store, connection, transport, rpc, websocket, acp, reconnect, generation, notifications, requests, permission, elicitation, prefs, persistence
-knowledge_paths: ["src/store.rs", "src/store/*.rs", "src/transport.rs", "src/rpc.rs", "src/rpc_log.rs"]
-knowledge_sources: ["src/store.rs#AgentsStore::connect", "src/store.rs#AgentsStore::on_incoming", "src/store.rs#AgentsStore::fail", "src/transport.rs", "src/rpc.rs"]
+knowledge_paths: ["crates/querymt-gpui/src/store.rs", "crates/querymt-gpui/src/store/*.rs", "crates/querymt-gpui/src/transport.rs", "crates/querymt-gpui/src/rpc.rs", "crates/querymt-gpui/src/rpc_log.rs"]
+knowledge_sources: ["crates/querymt-gpui/src/store.rs#AgentsStore::connect", "crates/querymt-gpui/src/store.rs#AgentsStore::on_incoming", "crates/querymt-gpui/src/store.rs#AgentsStore::fail", "crates/querymt-gpui/src/transport.rs", "crates/querymt-gpui/src/rpc.rs"]
 ---
 
 # Agent connections, RPC routing and the store

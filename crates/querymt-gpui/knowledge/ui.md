@@ -3,8 +3,8 @@ id: gpui-ui
 title: UI shell, pages and the session pane
 description: How the main window is put together (QmtApp, pages, sidebar, modals), how one SessionPane renders a session in both the main window and the quick panel (density, RenderCtx, row cache), and the shared pieces (model picker, keys, palette, fuzzy search).
 tags: ui, gpui, find, search in session, cmd-f, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
-knowledge_paths: ["src/ui/**", "src/theme.rs", "src/search.rs"]
-knowledge_sources: ["src/ui/mod.rs", "src/ui/session_pane.rs", "src/ui/model_picker.rs", "src/ui/keys.rs#bind_keys"]
+knowledge_paths: ["crates/querymt-gpui/src/ui/**", "crates/querymt-gpui/src/theme.rs", "crates/querymt-gpui/src/search.rs"]
+knowledge_sources: ["crates/querymt-gpui/src/ui/mod.rs", "crates/querymt-gpui/src/ui/session_pane.rs", "crates/querymt-gpui/src/ui/model_picker.rs", "crates/querymt-gpui/src/ui/keys.rs#bind_keys"]
 ---
 
 # UI shell, pages and the session pane

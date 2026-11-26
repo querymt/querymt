@@ -3,8 +3,8 @@ id: gpui-quick-panel
 title: Quick panel
 description: The native-only floating HUD chat - QuickHost state and lifetime, window kinds per platform, global shortcut backends, single instance and --quick, tray, chrome/material per desktop, the edge light and its renderers.
 tags: quick panel, hud, floating window, hotkey, global shortcut, tray, single instance, socket, material, blur, glass, edge light, activity, animation, wayland, macos, windows, x11
-knowledge_paths: ["src/quick/**"]
-knowledge_sources: ["src/quick/mod.rs", "src/quick/panel.rs", "src/quick/hotkey.rs", "src/quick/instance.rs", "src/quick/edge.rs", "src/quick/activity.rs"]
+knowledge_paths: ["crates/querymt-gpui/src/quick/**"]
+knowledge_sources: ["crates/querymt-gpui/src/quick/mod.rs", "crates/querymt-gpui/src/quick/panel.rs", "crates/querymt-gpui/src/quick/hotkey.rs", "crates/querymt-gpui/src/quick/instance.rs", "crates/querymt-gpui/src/quick/edge.rs", "crates/querymt-gpui/src/quick/activity.rs"]
 ---
 
 # Quick panel

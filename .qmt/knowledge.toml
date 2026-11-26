@@ -16,6 +16,7 @@ include = [
   "crates/agent-services/knowledge/*.md",
   "crates/agent-knowledge/knowledge/*.md",
   "crates/agent/knowledge/*.md",
+  "crates/querymt-gpui/knowledge/*.md",
   "openspec/specs/*/spec.md",
 ]
 exclude = []
@@ -38,16 +39,43 @@ include = [
   "crates/agent-runtime/src/config/*.rs",
   "crates/agent-core/src/delegation/*.rs",
   "crates/agent-runtime/src/delegation/*.rs",
+  # querymt-gpui (the desktop app). src/ui alone is ~40k lines, so only the files
+  # its notes explain are selected.
+  "crates/querymt-gpui/Cargo.toml",
+  "crates/querymt-gpui/build.rs",
+  "crates/querymt-gpui/web/build.sh",
+  ".github/workflows/test-gpui.yml",
+  "crates/querymt-gpui/src/main.rs",
+  "crates/querymt-gpui/src/transport.rs",
+  "crates/querymt-gpui/src/rpc.rs",
+  "crates/querymt-gpui/src/rpc_log.rs",
+  "crates/querymt-gpui/src/store.rs",
+  "crates/querymt-gpui/src/store/*.rs",
+  "crates/querymt-gpui/src/session.rs",
+  "crates/querymt-gpui/src/session/*.rs",
+  "crates/querymt-gpui/src/quick/*.rs",
+  "crates/querymt-gpui/src/quick/chrome/*.rs",
+  "crates/querymt-gpui/src/ui/mod.rs",
+  "crates/querymt-gpui/src/ui/session_pane.rs",
+  "crates/querymt-gpui/src/ui/model_picker.rs",
+  "crates/querymt-gpui/src/ui/keys.rs",
+  "crates/querymt-gpui/src/search.rs",
+  "crates/querymt-gpui/src/theme.rs",
 ]
 # The evaluation harness is not part of the subject matter being documented, and
 # the config test module is large enough to bury the config note in search results.
 exclude = [
   "crates/agent-knowledge/src/evaluation.rs",
   "crates/agent-runtime/src/config/tests.rs",
+  # querymt-gpui test modules are large and would bury its notes.
+  "crates/querymt-gpui/src/store/open_tests.rs",
+  "crates/querymt-gpui/src/session/golden.rs",
+  "crates/querymt-gpui/src/session/view_tests.rs",
+  "crates/querymt-gpui/src/quick/tests.rs",
 ]
 
 [orientation]
-entrypoints = ["crates/agent-runtime/knowledge/README.md"]
+entrypoints = ["crates/agent-runtime/knowledge/README.md", "crates/querymt-gpui/knowledge/README.md"]
 # Specs stay searchable but are never attached unasked: their normative
 # wording matches ordinary requests and produced false cards.
 retrieval_only = ["openspec/specs/**"]
