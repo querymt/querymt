@@ -2,100 +2,104 @@
 
 ## Context
 
-- **Catalog:** the runtime advertises commands from `slash_commands/acp.rs` (registry commands) and `Builtin::entry` (`/compact`, `/worktree`). The only input signal is `AvailableCommandInput::Unstructured { hint }`, set when a command has an argument hint or its template contains `$ARGUMENTS`. `/compact`'s hint is "[optional instructions, …]"; `/worktree`'s hint is its whole subcommand grammar.
-- **Native rules:** `Builtin::accepts(via)` already decides delivery per built-in. `/compact` accepts prompt and queue, not steer. `/worktree` accepts the prompt only. The client does not know this, so the palette can queue a `/worktree` that the agent then rejects.
-- **Client view:** `SlashCommandView { name, description, input_hint }` in `agent-session-core` (`view.rs:163`), stored as `SessionView.slash_commands` (`src/session.rs:935`).
-- **Palette:** `palette_groups` builds `PaletteTarget::SlashCommand { name, takes_input: input_hint.is_some() }` (`src/ui/keys.rs:547`). `SessionPane::run_slash_command` (`src/ui/slash.rs:170`) either fills the composer or sends. When the session is not ready, it returns silently after the palette has already closed (`slash.rs:188`).
-- **Kit:** `CommandItem` implements `Disableable`, and disabled rows are skipped by selection and confirm (gpui-component `command/state.rs:259`, `443`). The `Command` context binds only Esc, Enter, Up and Down. `on_confirm` receives an `IndexPath` and no modifier.
-- **Transcript:** every `UserMessage` becomes `ItemKind::User` (`src/session/projection.rs:569`) and is drawn as the accent bubble (`src/ui/session_view.rs:3229`). `/worktree` output is `AgentEventKind::WorktreeCommandOutput`, replayed as `SessionUpdate::AgentMessageChunk` (querymt `agent-protocol-types/src/replay.rs:463`) and marked `Durability::Ephemeral` (`events.rs:1384`). It therefore renders as an assistant reply and is lost on reload. A compaction already has its own row (`render_compaction`).
+See proposal.md for the motivation. The current state:
+
+- **Catalog in the app.** `SessionView.slash_commands` (`src/session.rs`) holds `querymt_agent_session_core::view::SlashCommandView { name, description, input_hint }`. `SessionPane::slash_commands` (`src/ui/slash.rs`) returns it, or nothing for a read-only session.
+- **Palette.** `App::palette_groups` (`src/ui/keys.rs`) builds `PaletteTarget::SlashCommand { name, takes_input: input_hint.is_some() }`. `App::run_palette` sets `palette_open = false` before it looks at the target. `SessionPane::run_slash_command` then fills the composer or sends; when the session is not ready it does neither.
+- **Readiness.** `SessionPane::session_ready` (`src/ui/session_view.rs`) is one boolean: connected, not read-only, loaded, no load error, and a running turn can be controlled. `send_session_prompt` returns silently when it is false.
+- **Delivery.** `OpenSession::send` (`src/session/open.rs`) queues any text that starts with `/` while a turn runs, and otherwise follows the caller's `Delivery`. `SessionPane.delivery` defaults to steer.
+- **Kit.** gpui-component 0.11 `Command`:
+  - binds Esc, Enter, Up and Down only;
+  - has `on_select`, `on_confirm(IndexPath)`, `footer`, and `CommandItem::child` for custom row content;
+  - skips disabled items when it picks the highlighted row (`CommandState::selected_index`), so the highlight moves to the first enabled row.
+- **Agent rules** (querymt `add-slash-command-records`): `SlashCommandView` gains `source`, `effect`, `input` and `accepts`, each absent when the agent sends no descriptor. No command is steerable. `/worktree` accepts only `session/prompt`.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- One source of truth for how a command behaves: the agent. The client derives nothing from hint text.
-- History renders exactly like the live session.
+- One function answers "what is this command and can the session take it now", used by the palette, the composer and the send path.
+- The app decides nothing from hint text or from a leading `/`.
 
 **Non-Goals:**
-- Subcommands (`slash-subcommands`).
-- Structured argument forms.
-- Changes to the composer's own slash list beyond reading the same metadata.
+- See proposal.md. In addition: no change to palette ranking or grouping.
 
 ## Decisions
 
-### D1. Command metadata in `_meta.querymt` on each `AvailableCommand`
+### D1. One resolver turns the agent's view into what the app acts on
 
-- **Shape:** `{"input": "none"|"optional"|"required", "native": bool, "accepts": ["prompt","queue","steer"]}`.
-- **Built-ins:** derive it from `Builtin` (`accepts` already exists).
-- **Registry commands:**
-  - `input` is `required` when the template uses `$ARGUMENTS` without a default, `optional` with an `argument-hint` and no required use, and `none` otherwise;
-  - `native` is false;
-  - `accepts` is all three.
-  - A frontmatter key `argument-required: bool` overrides the derivation.
-- **Client view:** `agent-session-core` parses this into `SlashCommandView { input: CommandInput, native: bool, accepts: Deliveries }`. Missing `_meta` gives `CommandInput::Required` when a hint exists, else `None`, plus `native: false` and all deliveries. This is the spec's "today's behaviour" fallback.
-- **Alternative considered (rejected by the user):** inferring "optional" from a fully bracketed hint in the client. It is fragile and wrong for `/worktree`.
+- New module `src/session/commands.rs` (no UI types, so `open.rs` can use it):
+  - `CommandTraits::of(&SlashCommandView) -> CommandTraits { input: InputNeed, accepts_queue: bool, prompt: bool, source: Option<Source> }`;
+  - `recognise(text, &[SlashCommandView]) -> Option<&SlashCommandView>`.
+- `CommandTraits::of` is the only place with the no-descriptor fallback: a hint means `Required`, no hint means `None`, `accepts_queue` is true, `prompt` is false, `source` is `None`.
+- `recognise` follows the agent's own rule (querymt `Builtin::parse`, `try_parse_invocation`): leading whitespace skipped, then `/`, then a word that equals an advertised name exactly and is followed by whitespace or the end.
+- Alternative considered: keeping the fallback in `agent-session-core`. Rejected: the core reports what the agent sent; what an absent field means is this app's policy.
 
-### D2. Palette targets carry the metadata; Tab is the secondary pick
+### D2. `OpenSession::send` asks `recognise`, not `starts_with('/')`
 
-- **Target:** `PaletteTarget::SlashCommand { name, input: CommandInput }` replaces `takes_input`.
-- **Enter and click:** `none` and `optional` send; `required` prefills.
-- **Tab:** caught with `capture_key_down` on the palette card while a slash row is selected. It reads `CommandState::selected_index()`, maps it through the same `targets` vector, and prefills. Tab on other rows does nothing.
-- **Hints:** the tooltip for optional-input rows reads "Enter runs · Tab adds instructions". A `Kbd` hint in the row's second line is used only if the row stays readable at 560 px.
-- **Labels:** a required-input label gets a trailing `…`, following the existing "Schedule a prompt…" convention for actions that ask for more.
-- **Alternative considered:** a second palette item per command ("compact" and "compact with instructions…"). It doubles the list and splits search ranking.
+- The queue-or-steer choice in `send` becomes: a recognised command or `Delivery::Queue` queues; everything else steers.
+- A recognised command that does not accept queueing must not reach the running-turn branch. The pane blocks it (D3). `send` keeps a guard for other callers: it adds the notice "Available when the turn ends" and sends nothing.
+- Callers do not change: `SessionPane::run_slash_command`, `send_session_prompt`, and the two test callers pass text and the pane's delivery as today.
 
-### D3. Disabled rows instead of silent no-ops
+### D3. Readiness returns a reason
 
-- **Readiness:** `palette_groups` asks `SessionPane::command_readiness(&SlashCommandView, cx) -> Result<(), Blocked>`.
-  - It combines `session_ready` (connected, loaded, not read-only) with the delivery the send would need: prompt when idle; queue or steer, per `Delivery`, while running.
-  - It checks that delivery against `accepts`.
-- **Blocked rows:** use `.disabled(true)` through `Disableable`. The reason is the second line, in `muted`, not `dim` (design guides: a disabled state needs an explanation, not only lower contrast).
-- **Reasons:**
+- `SessionPane::readiness(command: Option<&SlashCommandView>, cx) -> Result<(), Blocked>` replaces the body of `session_ready`, which becomes `readiness(None, cx).is_ok()`.
+- Checks, in order:
 
-  | Blocked | Copy |
-  | --- | --- |
-  | `NotConnected` | "Agent not connected" |
-  | `Loading` | "Session is loading" |
-  | `ReadOnly` | "Session is read-only" |
-  | `NotWhileRunning` | "Available when the agent is idle" |
+  | Condition | `Blocked` | Copy |
+  | --- | --- | --- |
+  | agent not connected | `NotConnected` | "Agent not connected" |
+  | session loading | `Loading` | "Session is loading" |
+  | load error | `LoadFailed` | "Session could not be loaded" |
+  | turn running and it cannot be controlled, or the command does not accept queueing | `TurnRunning` | "Available when the turn ends" |
 
-- `run_slash_command` keeps its guard as a second line of defence, but now logs at debug level.
+- A read-only session keeps listing no commands (`SessionPane::slash_commands`), so it needs no reason.
+- `send_session_prompt` calls `readiness(recognise(text), cx)`. When it is blocked and the text is a command, the text stays and the reason shows in the composer's hint row (`slash_hint` / `render_slash_hint`), which already sits under the composer.
 
-### D4. Command invocations are recorded by the core, not guessed by the client
+### D4. Unavailable palette rows stay selectable
 
-- **Core:** `UserMessage` gains `command: Option<CommandRun { name, args, native }>`, set by the runtime when `Builtin::parse` or registry expansion matched. For registry commands, the expanded prompt the model sees stays out of the user row; the row shows what the user typed.
-- **Native output:** it becomes a durable event replayed as a new update kind. A `querymt/command_output` extension `session/update` carries `{ user_message_id, text }`, so ACP clients that do not know it ignore it instead of showing it as a model reply. `agent-session-core` attaches it to the `UserMessage` as `command.output`.
-- **Client projection:**
-  - `UserMessage` with a `command` becomes a new `ItemKind::Command { name, args, output, status }`;
-  - `/compact` is skipped when the turn's next entry is a compaction, and its args are passed into that compaction row's details.
-- **Fallback for older agents:** a user message whose first word is an advertised command name is projected as `ItemKind::Command` without output. Older native output still arrives as assistant text; that is accepted until the agent upgrades.
-- **Alternative considered:** client-only classification. It cannot fix the ephemeral output or the history of sessions whose catalog has not arrived yet.
+- `PaletteTarget::SlashCommand { name, input: InputNeed, blocked: Option<Blocked> }` replaces `takes_input`.
+- `App::run_palette` returns before `palette_open = false` when the target is a blocked slash command.
+- The row is drawn dimmed (label and icon in `p.dim`, the reason in `p.muted`) but is not a kit-disabled item.
+- Why not `Disableable::disabled(true)`: the kit would move the highlight to the first enabled row. With `worktree` typed and its row disabled, Enter would run whatever is listed next. The main spec promises that the first row is the best match and the one Enter acts on.
+- Trade-off: the highlight can rest on a row that does nothing. The reason on the row explains it.
 
-### D5. The command row's look
+### D5. Row content
 
-- **Row:** full-width, left-aligned like the agent's column, not right-aligned like prompts, because it is an action taken on the session, not a message to the model.
-  - `SquareSlash` icon in `muted`;
-  - `/name` in `text` with `MONO`; args in `muted` `MONO`, truncated with the full text in a tooltip;
-  - a status mark on the right: spinner while running, check, or `CircleAlert` in `danger`;
-  - no fill, and a 1 px `border` outline at the theme radius, so it reads as a control record, not a bubble.
-- **Output:** below the row, in a collapsible mono block using the existing tool-output block and its line caps (`Density::output_lines`), collapsed by default in compact density. Copy is on hover, as for prompts.
-- **Tokens only:** `p.text`, `p.muted`, `p.border`, `p.danger`, `kit::MONO`; no raw colours (design guides, "Tokens before values").
-- **Both densities:** the same row; compact density uses the 26 px chip height already used for tool rows.
+- Every slash row uses `CommandItem::child` (rows with a description already do):
+  - first line: the bare name, plus `…` when `input` is `Required`; at the row's end, `Prompt` in `text_xs` and `p.muted` when `prompt` is true;
+  - second line: the description, or the `Blocked` copy.
+- `PaletteEntry` gains `mark: Option<SharedString>`; `description` carries the reason when blocked.
+- Keywords add the source name (`builtin`, `global`, `project`, `configured`) and `prompt` for prompt commands.
+- Tokens only (`p.text`, `p.muted`, `p.dim`); no new colours, and no chip or fill for the mark, to keep the row at its current height.
+- Alternative considered: two groups ("Commands", "Prompt commands"). Rejected: it changes the group-order requirement and splits ranking for a one-word distinction.
+
+### D6. Enter, Tab and the key hint
+
+- Enter and click on an available row: `None` and `Optional` submit; `Required` prefills.
+- Tab: `capture_key_down` on the palette card. For an unmodified Tab it resolves the highlighted target (`CommandState::selected_index` into the groups `filter_palette(self.palette_groups(cx), query)` gives, the same ones `palette_view` renders) and:
+  - on an available slash row with `Optional` or `Required` input, prefills and closes the palette;
+  - on any other row, stops the key and does nothing, so focus cannot leave the search field.
+- Key hint: `Command::footer` renders "Enter to run · Tab to add arguments" with kit `Kbd` while the highlighted target is an available slash row with `Optional` input. `Command::on_select` notifies `App` so the footer follows the highlight.
+- Alternative considered: a tooltip on the row. Rejected: the palette is driven from the keyboard, and a hover tooltip is not seen.
+
+### D7. Prefill keeps the draft
+
+- `SessionPane::run_slash_command(name, input, window, cx)` prefills through one helper:
+  - an empty composer becomes `/name `;
+  - a draft whose first word is `/word` has that word replaced (the existing `complete`);
+  - any other draft becomes the arguments: `/name <draft>`.
+- Submitting (`None`, `Optional`) leaves the composer's draft untouched, as today.
 
 ## Risks / Trade-offs
 
-- [The core change is in another repository and gates D1 and D4] → The client parts are written against the new `SlashCommandView` behind defaults. Tasks 1.x land the core first; client tasks start after the pinned revision is bumped.
-- [New `session/update` kind ignored by other ACP clients] → That is intended: they currently show it as a model reply, which is the bug.
-- [Registry arity derivation could misclassify a template] → The `argument-required` frontmatter override; the default for a hint without `$ARGUMENTS` is `optional`, the safer side, because sending without arguments is visible and reversible.
-- [Tab in the palette may surprise users who expect focus traversal] → The palette's search input has no other focus target; the tooltip names the key.
+- **Enter on `compact` compacts at once.** A mis-pick replaces the context with a summary. → The footer names what Enter does. `slash-subcommands` adds the rule for destructive commands; if `compact` needs a guard, the descriptor is where it would be stated, in a later change.
+- **The descriptor is in another repository.** → Task 1.1 pins the revision first. With no descriptor every decision falls back to today's behaviour (D1).
+- **Tab is taken from the search field.** → The palette has no other focus target.
+- **A prompt-only command waits for the turn to end although the agent would take it.** → Accepted for now: starting a prompt while a turn runs would need its own run-state handling in `OpenSession`.
+- **`…` and `Prompt` add text to a 560 px row.** → The name truncates before the mark; task 2.3 checks the longest advertised names.
 
 ## Migration Plan
 
-1. Land the querymt change. Old clients ignore `_meta` and the new update kind.
-2. Bump `querymt-agent-session-core` here.
-3. Ship the client.
-
-Rollback is reverting the client; the agent's additions are inert for old clients.
-
-## Open Questions
-
-- Whether `/compact`'s instructions should also be visible in the collapsed compaction row or only in its details. This is a visual choice that can be settled in review of task 4.3.
+1. Merge querymt `add-slash-command-records` and pin its revision here.
+2. Ship this change. No stored data changes.
+3. Rollback: revert this change; the agent's descriptor is ignored by the previous build.

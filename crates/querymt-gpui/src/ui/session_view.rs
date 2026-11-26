@@ -3888,6 +3888,29 @@ fn usage_ring(
         .child(key)
 }
 
+/// Strength of the composer's outline in the mode's tone. A starting value,
+/// tuned by hand over a bright and a dark window (design D20).
+const MODE_OUTLINE_STRENGTH: f32 = 0.45;
+
+/// What a conversation runs with, as the quick panel's header shows it
+/// (design D20).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub(crate) struct RunLabels {
+    /// The model's name.
+    pub model: String,
+    /// A model change is in flight.
+    pub model_pending: bool,
+    /// The agent lists models to choose from.
+    pub can_pick_model: bool,
+    /// The reasoning effort's name; `None` when the agent offers none.
+    pub effort: Option<String>,
+    /// The names of every effort the agent offers, so the effort's box can
+    /// be as wide as the widest and changing it moves nothing.
+    pub efforts: Vec<String>,
+    /// An effort change is in flight.
+    pub effort_pending: bool,
+}
+
 impl SessionPane {
     /// Tokens used and the context size of the session shown, as the usage
     /// ring draws them: what the agent reports, else the last request's
@@ -4275,39 +4298,42 @@ impl SessionPane {
         }
     }
 
-    /// The compact composer's model chip: the model's name, and the picker on
-    /// click (the quick panel renders the picker itself).
-    fn compact_model_chip(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// What the session shown runs with, as text for the quick panel's header
+    /// (design D20): the model's name and, when the agent offers a reasoning
+    /// option, the effort's name. `None` without a session.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn run_labels(&self, cx: &App) -> Option<RunLabels> {
         let store = self.store.read(cx);
-        let view = self.view(cx);
-        let has_models = view.is_some_and(|v| !store.models(&v.agent_id).is_empty());
-        let model = view.and_then(|v| store.session_model(v)).cloned();
-        let label = model
-            .as_ref()
+        let view = self.view(cx)?;
+        let model = store
+            .session_model(view)
             .map(|m| m.label.clone())
-            .or_else(|| view.and_then(|v| v.model_label()))
+            .or_else(|| view.model_label())
             .unwrap_or_else(|| "Model".into());
-        let pending = view.is_some_and(|v| v.pending_options.contains("model"));
-        toolbar_button("s-model-chip", p)
-            .max_w(px(160.))
-            .min_w_0()
-            .when(pending, |el| el.opacity(0.6))
-            .child(div().min_w_0().truncate().child(label))
-            .child(kit::icon(IconName::ChevronDown, 12., p.dim))
-            .tooltip(|window, cx| {
-                kit::tip_with_key("Change model", &super::keys::OpenModelPicker, window)
-                    .build(window, cx)
-            })
-            .when(has_models && !pending, |el| {
-                el.on_click(cx.listener(|_, _, _, cx| cx.emit(SessionPaneEvent::ModelPicker)))
-            })
-            .into_any_element()
+        let reasoning = view.reasoning_option().filter(|o| !o.choices.is_empty());
+        let effort = reasoning
+            .as_ref()
+            .map(|o| (o.current_label(), view.pending_options.contains(&o.id)))
+            .filter(|(label, _)| !label.is_empty());
+        let efforts = reasoning
+            .map(|o| o.choices.into_iter().map(|(_, label)| label).collect())
+            .unwrap_or_default();
+        Some(RunLabels {
+            model,
+            model_pending: view.pending_options.contains("model"),
+            can_pick_model: !store.models(&view.agent_id).is_empty(),
+            effort: effort.as_ref().map(|(label, _)| label.clone()),
+            efforts,
+            effort_pending: effort.is_some_and(|(_, pending)| pending),
+        })
     }
 
-    /// The agent mode chip of the compact composer: a dot, the mode's name,
-    /// and the next mode on click (the previous one with Shift), like Tab and
-    /// Shift+Tab in the composer. Dimmed and inert while a change is pending.
-    fn mode_chip(&self, option: &SelectOption, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// The agent mode of the compact composer, as its name in text: a box as
+    /// wide as the widest of the agent's mode names (the other names are laid
+    /// out at no height beside the shown one), so changing the mode moves
+    /// nothing. Click moves to the next mode, Shift+click to the previous one,
+    /// like Tab and Shift+Tab. Dimmed and inert while a change is pending.
+    fn mode_name(&self, option: &SelectOption, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let key = if option.id.is_empty() {
             "mode"
         } else {
@@ -4319,21 +4345,35 @@ impl SessionPane {
         let label = option.current_label();
         let tip = format!("Agent mode: {label}");
         let selector = format!("composer-mode:{label}");
-        toolbar_button("s-mode-chip", p)
+        let (chip, text) = (p.chip, p.text);
+        let others = option
+            .choices
+            .iter()
+            .filter(|(v, _)| *v != option.current)
+            .map(|(_, name)| div().h_0().overflow_hidden().child(name.clone()))
+            .collect::<Vec<_>>();
+        h_flex()
+            .id("s-mode")
             .debug_selector(|| "composer-mode".into())
-            .min_w_0()
-            .max_w(px(140.))
+            .flex_none()
+            .h(px(24.))
+            .px_2()
+            .items_center()
+            .rounded(px(6.))
+            .text_xs()
+            .text_color(p.muted)
+            .cursor_pointer()
             .when(pending, |el| el.opacity(0.6))
+            .hover(move |s| s.bg(chip).text_color(text))
             .child(
-                div()
-                    .min_w_0()
-                    .debug_selector(move || selector.clone())
-                    .child(kit::mode_chip_body(
-                        label,
-                        option.choices.iter().map(|(v, _)| v.as_str()),
-                        &option.current,
-                        p,
-                    )),
+                v_flex()
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .debug_selector(move || selector.clone())
+                            .child(label),
+                    )
+                    .children(others.into_iter().map(|d| d.whitespace_nowrap())),
             )
             .tooltip(move |window, cx| kit::tip_with_stroke(tip.clone(), "tab").build(window, cx))
             .when(!pending, |el| {
@@ -5261,6 +5301,7 @@ impl SessionPane {
         let mode = view.mode_option();
 
         let plus = toolbar_button("s-attach", p)
+            .debug_selector(|| "composer-attach".into())
             .w(px(32.))
             .px_0()
             .justify_center()
@@ -5272,12 +5313,16 @@ impl SessionPane {
         // A compact composer is one line at rest: no options panel.
         let compact = self.density.is_compact();
         let model_button = (!compact).then(|| self.model_picker_button(p, cx));
-        let model_chip = compact.then(|| self.compact_model_chip(p, cx));
-        // Only an agent that offers modes has one to show.
-        let mode_chip = mode
+        // Only an agent that offers modes has one to show: its name in the
+        // composer, and its colour on the pill's outline (design D20).
+        let compact_mode = mode
             .as_ref()
-            .filter(|m| compact && !m.choices.is_empty() && !m.current_label().is_empty())
-            .map(|m| self.mode_chip(m, p, cx));
+            .filter(|m| compact && !m.choices.is_empty() && !m.current_label().is_empty());
+        let mode_name = compact_mode.map(|m| self.mode_name(m, p, cx));
+        let mode_outline = compact_mode.map(|m| {
+            mode_tone(m.choices.iter().map(|(v, _)| v.as_str()), &m.current, p)
+                .opacity(MODE_OUTLINE_STRENGTH)
+        });
         let options =
             (!compact).then(|| self.options_control(mode.as_ref(), control, &pending, p, cx));
 
@@ -5332,11 +5377,14 @@ impl SessionPane {
         // The HUD's composer floats: a pill of faint white over the glass
         // (the pane's own surface where there is none), lit along its top
         // edge by a 1 px highlight instead of a border.
+        // The compact pill is one row: as much room above it as below, so
+        // its buttons, input and mode share the pill's centre line. The main
+        // window's composer keeps less above its input than below its toolbar.
         v_flex()
             .relative()
             .w_full()
-            .pt_1()
-            .pb_2()
+            .when(compact, |el| el.py(px(6.)))
+            .when(!compact, |el| el.pt_1().pb_2())
             .px_2()
             .gap_1p5()
             .rounded(px(if compact { 22. } else { 18. }))
@@ -5346,7 +5394,15 @@ impl SessionPane {
                 p.surface
             })
             .when(!compact, |el| el.border_1().border_color(p.border))
-            .when(compact, |el| {
+            // An agent with modes: a 1 px outline all round in the mode's
+            // tone, and no highlight. The border is there whatever the mode,
+            // so changing it moves nothing.
+            .when_some(mode_outline, |el, tone| {
+                el.debug_selector(|| "composer-outline".into())
+                    .border_1()
+                    .border_color(tone)
+            })
+            .when(compact && mode_outline.is_none(), |el| {
                 el.child(
                     div()
                         .debug_selector(|| "composer-highlight".into())
@@ -5389,8 +5445,7 @@ impl SessionPane {
                             .items_center()
                             .child(plus)
                             .child(input)
-                            .children(mode_chip)
-                            .children(model_chip)
+                            .children(mode_name)
                             .child(actions),
                     )
                     .children(attachments)
@@ -5468,7 +5523,8 @@ impl SessionPane {
             .icon(IconName::Square)
             .tooltip("Stop agent")
             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)));
-        if running && (!control || !has_draft) {
+        // Whichever it is, it is one box at the composer's end.
+        let actions = if running && (!control || !has_draft) {
             kit::button("stop-primary")
                 .primary()
                 .icon(IconName::Square)
@@ -5503,7 +5559,11 @@ impl SessionPane {
                 .inactive(blocked || !has_draft)
                 .on_click(cx.listener(|this, _, window, cx| this.send_session_prompt(window, cx)))
                 .into_any_element()
-        }
+        };
+        div()
+            .debug_selector(|| "composer-send".into())
+            .child(actions)
+            .into_any_element()
     }
 
     // ---- page ---------------------------------------------------------------
@@ -6959,11 +7019,9 @@ mod compact_tests {
             vcx.debug_bounds("composer-mode:Plan").is_some(),
             "named Plan"
         );
-        let model = vcx.debug_bounds("s-model-chip");
-        // Before the model chip, on the composer's row.
-        if let Some(model) = model {
-            assert!(chip.right() <= model.left(), "{chip:?} vs {model:?}");
-        }
+        // The send button follows it, with no model chip between (design D20).
+        let send = vcx.debug_bounds("composer-send").expect("the send button");
+        assert!(chip.right() <= send.left(), "{chip:?} vs {send:?}");
         drop(vcx);
 
         // The comfortable composer has the Options control instead.

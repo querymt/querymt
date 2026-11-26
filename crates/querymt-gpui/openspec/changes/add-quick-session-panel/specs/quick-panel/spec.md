@@ -142,6 +142,11 @@ The panel SHALL let the user start a new session by typing a prompt and pressing
 - **WHEN** the user presses Cmd/Ctrl+T in the panel
 - **THEN** the next quick chat, or the session shown, moves to the next reasoning effort
 
+#### Scenario: A typed folder
+- **GIVEN** the folder chooser suggests a recent folder that matches what is typed
+- **WHEN** the user presses Enter without moving to a suggestion
+- **THEN** the next quick chat starts in the folder as typed
+
 ### Requirement: Pick a session
 The panel SHALL let the user switch to any existing session by searching sessions by title, workspace or agent, with sessions that wait for the user or are running listed first. Switching SHALL change only the panel. In the list, Up and Down SHALL move over the rows, Enter SHALL show the marked row, and Cmd/Ctrl+1 to 8 SHALL show that row, which carries its shortcut as a hint. The model picker SHALL be navigable the same way (Up, Down, Enter).
 
@@ -162,6 +167,10 @@ The session list, the model picker and the folder chooser SHALL each open in pla
 - **GIVEN** the folder chooser offers suggestions
 - **WHEN** it is open
 - **THEN** every suggestion is inside the panel, or, once they need more room than the panel's limit, they scroll
+
+#### Scenario: The model picker is a list
+- **WHEN** the user opens the model picker in the panel
+- **THEN** it shows a search field and the models, with no title, reasoning control or Done button, and closes on a pick or Esc
 
 ### Requirement: Move the panel
 The user SHALL be able to move the panel by dragging its header, or the empty parts of a new quick chat's bar, with the pointer; dragging SHALL NOT start from the text field or a button. The panel SHALL reopen where it was last left on that display, also after the app restarts, kept inside the display's visible area. Where the desktop places the panel itself (Wayland layer-shell), it cannot be moved.
@@ -207,7 +216,7 @@ The panel SHALL open at a compact height and SHALL grow as its conversation grow
 #### Scenario: Picker in a small panel
 - **GIVEN** the panel is at its compact height
 - **WHEN** the user opens the session picker or the model picker
-- **THEN** the whole picker is visible inside the panel
+- **THEN** the whole session picker is visible inside the panel, and the model picker shows its search field and at least its first five models, the rest scrolling under the search field
 
 #### Scenario: Every listed session is visible
 - **GIVEN** the session list holds as many sessions as it shows, at any text size the app offers
@@ -276,6 +285,31 @@ The panel SHALL let the user choose the model it uses, with the same picker as t
 - **GIVEN** the panel shows an existing session
 - **WHEN** the user picks another model
 - **THEN** that session's model changes, as it would in the main window
+
+### Requirement: What a conversation runs with
+While a conversation is shown, the panel SHALL show the session's model and reasoning effort in its header, and its agent mode in the composer, as text, without chips, badges or other controls for them. Clicking the model SHALL open the model picker, clicking the reasoning effort SHALL move to the next effort, and clicking the mode SHALL move to the next mode. Changing any of them SHALL NOT move anything else in the header or the composer.
+
+#### Scenario: Shown at a glance
+- **GIVEN** the panel shows a session on "claude-opus-5" with reasoning effort "High" in the "Build" mode
+- **THEN** the header shows "claude-opus-5 · High", the composer shows "Build", and the composer has no model or mode chip
+
+#### Scenario: The mode by its name and its colour
+- **GIVEN** the panel shows a session in the "Plan" mode
+- **THEN** the composer shows "Plan" and its outline takes the mode's colour
+
+#### Scenario: Changing the mode moves nothing
+- **GIVEN** the composer has focus
+- **WHEN** the user presses Tab
+- **THEN** the mode's name changes, and the input and the send button keep their place
+
+#### Scenario: Changing the effort moves nothing
+- **GIVEN** the header shows the reasoning effort "Low"
+- **WHEN** the user moves to "Medium" and then "High"
+- **THEN** the effort's name changes, and the model's name keeps its place
+
+#### Scenario: No reasoning option
+- **GIVEN** the session's agent offers no reasoning effort
+- **THEN** the header shows the model only
 
 ### Requirement: Requests in the panel
 The panel SHALL show the pending permission and input requests of the session it shows, above its composer, and let the user answer them there.

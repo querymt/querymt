@@ -27,20 +27,20 @@ Cmd+N on macOS and Ctrl+N elsewhere SHALL start a new quick chat in the panel, e
 Every tooltip in the panel that names a shortcut SHALL show the key actually bound to that action, in the platform's notation (for example ⌘K on macOS and Ctrl+K on Windows and Linux).
 
 #### Scenario: Tooltip on macOS
-- **WHEN** the user hovers the model chip on macOS
+- **WHEN** the user hovers the model label in the bar on macOS
 - **THEN** its tooltip shows ⌘M, not "Cmd/Ctrl+M"
 
 ### Requirement: Agent mode shown in the panel
-The panel SHALL show the agent mode next to the model, as a label. In a conversation it SHALL be the session's mode; in a new quick chat it SHALL be the mode the chat will start in. Clicking it, or Tab and Shift+Tab in the composer, SHALL move to the next or previous mode. A mode chosen before the first prompt SHALL apply to that quick chat only, without changing the start page's launch mode. When the agent offers no modes, nothing SHALL be shown.
+The panel SHALL show the agent mode as its name: in a conversation the session's mode, in the composer; in a new quick chat the mode the chat will start in, in the bar. Clicking it, or Tab and Shift+Tab in the composer, SHALL move to the next or previous mode. A mode chosen before the first prompt SHALL apply to that quick chat only, without changing the start page's launch mode. When the agent offers no modes, nothing SHALL be shown.
 
 #### Scenario: Mode in a conversation
 - **GIVEN** the panel shows a session in the "Plan" mode
-- **THEN** a "Plan" chip is shown next to the model chip
+- **THEN** the composer shows "Plan"
 
 #### Scenario: Tab changes the mode visibly
 - **GIVEN** the panel shows a session in the "Build" mode and the composer has focus
 - **WHEN** the user presses Tab
-- **THEN** the session moves to the next mode and the chip shows it
+- **THEN** the session moves to the next mode and the composer shows its name
 
 #### Scenario: Mode for the next quick chat
 - **GIVEN** the panel is on an empty quick chat and the start page's launch mode is "Build"

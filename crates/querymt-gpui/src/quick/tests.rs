@@ -1057,10 +1057,11 @@ fn a_new_quick_chat_is_one_bar_and_a_conversation_has_the_header(cx: &mut TestAp
     assert!(bounds_of(cx, window, "quick-header").is_none());
     let bar = bounds_of(cx, window, "quick-bar").expect("the bar shows");
     let input = bounds_of(cx, window, "quick-composer").expect("with the input in it");
-    // One line of large text at rest: a 26 px line, where the conversation's
-    // composer has 20 px lines.
+    // One line of large text at rest: a 26 px line with no padding of the
+    // kit's around it (design D19), where the conversation's composer has
+    // 20 px lines.
     let line = f32::from(input.size.height);
-    assert!((40. ..48.).contains(&line), "one 26 px line, got {line}");
+    assert!((25. ..27.).contains(&line), "one 26 px line, got {line}");
     assert!(f32::from(bar.size.height) <= BAR_HEIGHT);
 
     show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
@@ -1115,8 +1116,11 @@ fn the_bar_and_the_composer_rest_at_one_line(cx: &mut TestAppContext) {
         .expect("the composer's input")
         .size
         .height;
-    // One 20 px line is shorter than one 26 px line, not two lines tall.
-    assert!(composer <= bar, "{composer:?} vs {bar:?}");
+    // One 20 px line is shorter than one 26 px line, not two lines tall. The
+    // composer keeps the kit's 8 px above and below its lines, which the
+    // bar's input drops.
+    let padding = gpui_kit::px(16.);
+    assert!(composer <= bar + padding, "{composer:?} vs {bar:?}");
 }
 
 // ---- model switching (design D12) -------------------------------------------
@@ -1288,16 +1292,17 @@ fn with_many_models(rig: &Rig, cx: &mut TestAppContext, n: usize) {
 /// Every model row is shown: the rows' box does not scroll.
 fn every_model_shown(cx: &mut TestAppContext, panel: &Entity<QuickPanel>) -> bool {
     panel.read_with(cx, |p, cx| {
-        p.models_for_test().read(cx).rows_scroll().max_offset().y <= gpui_kit::px(0.5)
+        p.models_for_test().read(cx).rows_scroll_for_test().max_offset().y <= gpui_kit::px(0.5)
     })
 }
 
 // quick-panel / Picker in a small panel: the floor is what the picker lays
-// out to (design D13), not an estimate.
+// out to (design D13), not an estimate. It makes room for five models; a
+// longer list scrolls.
 #[gpui_kit::test]
 fn open_model_picker_raises_the_height_floor(cx: &mut TestAppContext) {
     let rig = rig(cx);
-    with_many_models(&rig, cx, 10);
+    with_many_models(&rig, cx, 3);
     let (window, panel) = rig.open_panel(cx);
     panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
     cx.update_window(window, |_, window, cx| {
@@ -1307,8 +1312,8 @@ fn open_model_picker_raises_the_height_floor(cx: &mut TestAppContext) {
     settle(cx, window);
     finish_opening(cx, window);
     let height = panel_height(cx, &panel);
-    let done = bounds_of(cx, window, "model-done").expect("the Done button");
-    assert!(bottom(done) <= height + 0.5, "{done:?} in {height}");
+    let sheet = bounds_of(cx, window, "quick-models").expect("the picker");
+    assert!(bottom(sheet) <= height + 0.5, "{sheet:?} in {height}");
     assert!(every_model_shown(cx, &panel), "the rows do not scroll");
     // In a new quick chat it lies above the bar.
     let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
@@ -1316,11 +1321,83 @@ fn open_model_picker_raises_the_height_floor(cx: &mut TestAppContext) {
     assert!(bottom(sheet) <= top(bar) + 0.5, "{sheet:?} above {bar:?}");
 }
 
+// quick-panel / Picker in a small panel: a long model list does not make the
+// panel as tall as the display; the rows past the fifth scroll.
+#[gpui_kit::test]
+fn a_long_model_list_scrolls_in_a_short_sheet(cx: &mut TestAppContext) {
+    let few = {
+        let rig = rig(cx);
+        with_many_models(&rig, cx, 5);
+        let (window, panel) = rig.open_panel(cx);
+        panel.update(cx, |p, _| p.set_display_height_for_test(1400.));
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |p, cx| p.open_model_picker(window, cx))
+        })
+        .unwrap();
+        settle(cx, window);
+        finish_opening(cx, window);
+        assert!(every_model_shown(cx, &panel), "five models fit");
+        panel_height(cx, &panel)
+    };
+    let rig = rig(cx);
+    with_many_models(&rig, cx, 40);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1400.));
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_model_picker(window, cx))
+    })
+    .unwrap();
+    settle(cx, window);
+    finish_opening(cx, window);
+    assert!(!every_model_shown(cx, &panel), "the rest scroll");
+    let height = panel_height(cx, &panel);
+    assert!(
+        height < few + 80.,
+        "{height} is about the height of five models ({few}), not the display's"
+    );
+    let sheet = bounds_of(cx, window, "quick-models").expect("the picker");
+    assert!(bottom(sheet) <= height + 0.5, "{sheet:?} in {height}");
+}
+
+// quick-panel / The model picker is a list: a search field and the models,
+// with no title, reasoning control, close button or Done (design D20), for a
+// launch target (a new quick chat) and a session target (a conversation).
+#[gpui_kit::test]
+fn the_model_sheet_is_search_and_list(cx: &mut TestAppContext) {
+    for in_conversation in [false, true] {
+        let rig = rig(cx);
+        with_many_models(&rig, cx, 4);
+        let (window, panel) = rig.open_panel(cx);
+        panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+        if in_conversation {
+            show_view(cx, &rig, &panel, long_view("long", 20, "idle"));
+            settle(cx, window);
+        }
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |p, cx| p.open_model_picker(window, cx))
+        })
+        .unwrap();
+        settle(cx, window);
+        finish_opening(cx, window);
+        assert!(
+            bounds_of(cx, window, "quick-models").is_some(),
+            "the sheet is open (conversation: {in_conversation})"
+        );
+        for id in ["model-done", "model-close", "model-reasoning"] {
+            assert!(
+                bounds_of(cx, window, id).is_none(),
+                "{id} is absent (conversation: {in_conversation})"
+            );
+        }
+        assert!(every_model_shown(cx, &panel), "the list shows the models");
+    }
+}
+
 // quick-panel / List in place of the conversation: the model picker
 #[gpui_kit::test]
 fn the_model_picker_replaces_the_conversation(cx: &mut TestAppContext) {
     let rig = rig(cx);
-    with_many_models(&rig, cx, 6);
+    with_many_models(&rig, cx, 4);
     let (window, panel) = rig.open_panel(cx);
     panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
     show_view(cx, &rig, &panel, long_view("long", 20, "idle"));
@@ -1598,6 +1675,240 @@ fn tab_in_the_compact_composer_moves_the_chip(cx: &mut TestAppContext) {
     assert!(bounds_of(cx, window, "composer-mode:Build").is_some());
 }
 
+/// `view_in_mode` on a model, with the reasoning effort `effort` among
+/// low, medium, high and max (none when `effort` is `None`).
+fn view_running_with(id: &str, mode: &str, effort: Option<&str>) -> SessionView {
+    let mut view = view_in_mode(id, mode);
+    view.model = Some("m-a".into());
+    view.options = vec![json!({
+        "id": "model", "type": "select", "currentValue": "m-a",
+        "options": [{ "value": "m-a", "name": "Model A" }],
+    })];
+    if let Some(effort) = effort {
+        view.options.push(json!({
+            "id": "thought_level", "type": "select", "currentValue": effort,
+            "options": [
+                { "value": "low", "name": "Low" },
+                { "value": "medium", "name": "Medium" },
+                { "value": "high", "name": "High" },
+                { "value": "max", "name": "Max" },
+            ],
+        }));
+    }
+    view
+}
+
+// quick-panel / What a conversation runs with: shown at a glance, as text.
+#[gpui_kit::test]
+fn a_conversation_shows_its_model_effort_and_mode_as_text(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        view_running_with("chat", "build", Some("high")),
+    );
+    settle(cx, window);
+    let header = bounds_of(cx, window, "quick-header").expect("the header");
+    let model = bounds_of(cx, window, "quick-run-model").expect("the model in the header");
+    let effort = bounds_of(cx, window, "quick-run-effort").expect("the effort in the header");
+    for part in [model, effort] {
+        assert!(top(part) >= top(header) && bottom(part) <= bottom(header) + 0.5);
+    }
+    assert!(model.right() <= effort.left(), "{model:?} then {effort:?}");
+    // Before the context meter / the open-in-main button, after the drag area.
+    let open = bounds_of(cx, window, "quick-open-main");
+    if let Some(open) = open {
+        assert!(effort.right() <= open.left());
+    }
+    assert!(bounds_of(cx, window, "composer-mode:Build").is_some());
+    assert!(
+        bounds_of(cx, window, "composer-outline").is_some(),
+        "the composer is outlined in the mode's tone"
+    );
+    assert!(
+        bounds_of(cx, window, "composer-highlight").is_none(),
+        "instead of the white highlight"
+    );
+}
+
+// quick-panel / Changing the effort moves nothing: whatever effort is shown,
+// the model and the effort keep their bounds in the header.
+#[gpui_kit::test]
+fn changing_the_effort_moves_nothing_in_the_header(cx: &mut TestAppContext) {
+    let mut seen = None;
+    for effort in ["low", "medium", "high", "max"] {
+        let rig = rig(cx);
+        let (window, panel) = rig.open_panel(cx);
+        show_view(cx, &rig, &panel, view_running_with("chat", "build", Some(effort)));
+        settle(cx, window);
+        let model = bounds_of(cx, window, "quick-run-model").expect("the model");
+        let shown = bounds_of(cx, window, "quick-run-effort").expect("the effort");
+        match seen {
+            None => seen = Some((model, shown)),
+            Some(first) => assert_eq!((model, shown), first, "moved at {effort}"),
+        }
+    }
+}
+
+// quick-panel / Compact conversation: the pill is one row, its attach button,
+// input, mode and send button on the pill's centre line.
+#[gpui_kit::test]
+fn the_composer_row_is_centred_in_its_pill(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        view_running_with("chat", "build", Some("high")),
+    );
+    settle(cx, window);
+    let pill = bounds_of(cx, window, "composer-outline").expect("the pill");
+    let middle = |b: gpui_kit::Bounds<gpui_kit::Pixels>| f32::from(b.center().y);
+    for id in [
+        "composer-attach",
+        "composer-input",
+        "composer-mode",
+        "composer-send",
+    ] {
+        let part = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
+        assert!(
+            (middle(part) - middle(pill)).abs() <= 0.5,
+            "{id} {part:?} is centred in the pill {pill:?}"
+        );
+    }
+}
+
+// quick-panel / No reasoning option: the header shows the model only.
+#[gpui_kit::test]
+fn without_a_reasoning_option_the_header_shows_the_model_only(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, view_running_with("chat", "build", None));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "quick-run-model").is_some());
+    assert!(bounds_of(cx, window, "quick-run-effort").is_none());
+}
+
+// A session whose agent offers no modes keeps the white highlight.
+#[gpui_kit::test]
+fn without_modes_the_composer_keeps_its_highlight(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    assert!(bounds_of(cx, window, "composer-highlight").is_some());
+    assert!(bounds_of(cx, window, "composer-outline").is_none());
+    assert!(bounds_of(cx, window, "composer-mode").is_none());
+}
+
+// quick-panel / What a conversation runs with: clicking the model opens the
+// model picker.
+#[gpui_kit::test]
+fn clicking_the_model_in_the_header_opens_the_sheet(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    with_models(&rig, cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        view_running_with("chat", "build", Some("high")),
+    );
+    settle(cx, window);
+    let at = centre(bounds_of(cx, window, "quick-run-model").expect("the model"));
+    press_at(cx, window, at);
+    settle(cx, window);
+    assert!(panel.read_with(cx, |p, cx| p.models_for_test().read(cx).is_open()));
+    assert_eq!(drags(cx, &panel), 0, "the text is not a drag area");
+}
+
+// quick-panel / What a conversation runs with: clicking the effort sends the
+// next one, and nothing while a change is pending.
+#[gpui_kit::test]
+fn clicking_the_effort_in_the_header_sends_the_next_one(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        view_running_with("chat", "build", Some("high")),
+    );
+    settle(cx, window);
+    rig.pump(cx);
+    let at = centre(bounds_of(cx, window, "quick-run-effort").expect("the effort"));
+    press_at(cx, window, at);
+    let sent = rig.pump(cx);
+    let set = sent
+        .iter()
+        .find(|r| r["method"] == "session/set_config_option")
+        .expect("the next effort is sent");
+    assert_eq!(set["params"]["configId"], "thought_level");
+    assert_eq!(set["params"]["value"], "max");
+}
+
+// quick-panel / What a conversation runs with: while a change is pending the
+// effort is inert.
+#[gpui_kit::test]
+fn the_effort_is_inert_while_a_change_is_pending(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    let mut view = view_running_with("chat", "build", Some("high"));
+    view.pending_options.insert("thought_level".into());
+    show_view(cx, &rig, &panel, view);
+    settle(cx, window);
+    rig.pump(cx);
+    let at = centre(bounds_of(cx, window, "quick-run-effort").expect("the effort"));
+    press_at(cx, window, at);
+    let sent = rig.pump(cx);
+    assert!(
+        sent.iter()
+            .all(|r| r["method"] != "session/set_config_option"),
+        "inert while pending: {sent:?}"
+    );
+}
+
+// quick-panel / Changing the mode moves nothing: through every mode the input
+// and the send button keep their bounds, and so does the composer's pill.
+#[gpui_kit::test]
+fn tab_through_every_mode_leaves_the_input_and_send_where_they_are(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        view_running_with("chat", "build", Some("high")),
+    );
+    settle(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| {
+            p.pane_for_test()
+                .update(cx, |pane, cx| pane.focus_composer(window, cx))
+        })
+    })
+    .unwrap();
+    let layout = |cx: &mut TestAppContext| {
+        (
+            bounds_of(cx, window, "composer-input").expect("the input"),
+            bounds_of(cx, window, "composer-send").expect("the send button"),
+            bounds_of(cx, window, "composer-mode").expect("the mode"),
+            bounds_of(cx, window, "composer-outline").expect("the pill"),
+        )
+    };
+    let before = layout(cx);
+    for name in ["Plan", "Review", "Build"] {
+        press(cx, window, "tab");
+        rig.pump(cx);
+        settle(cx, window);
+        assert_eq!(layout(cx), before, "nothing moved at {name}");
+    }
+}
+
 /// `long_view` that has used `used` of `size` tokens of its context.
 fn view_with_usage(used: u64, size: u64) -> SessionView {
     let mut view = long_view("chat", 1, "idle");
@@ -1803,113 +2114,120 @@ fn the_main_modifier_and_enter_starts_the_chat_in_the_main_window(cx: &mut TestA
     assert!(closed(cx, &rig));
 }
 
+// quick-panel / The bar's controls: One size for the labels. The labels lie
+// on one line under the input, their text starting on its leading edge.
 #[gpui_kit::test]
-fn the_bars_controls_share_the_inputs_centre_line(cx: &mut TestAppContext) {
-    let rig = rig(cx);
-    let (window, _panel) = rig.open_panel(cx);
-    settle(cx, window);
-    let centre = |id: &'static str, cx: &mut TestAppContext| {
-        let b = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
-        f32::from(b.origin.y) + f32::from(b.size.height) / 2.
-    };
-    let input = centre("quick-composer", cx);
-    for id in ["quick-model", "quick-folder"] {
-        let c = centre(id, cx);
-        assert!((c - input).abs() <= 1., "{id}: {c} vs {input}");
-    }
-    // The mode and the reasoning are not chips of the bar's: they are tags
-    // on the model chip's top edge, within its width.
-    let chip = bounds_of(cx, window, "quick-model").expect("the model chip");
-    for id in ["quick-mode", "quick-reasoning"] {
-        let tag = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
-        assert!(
-            tag.top() < chip.top() && tag.bottom() > chip.top(),
-            "{id} lies on the top edge"
-        );
-        assert!(
-            tag.left() >= chip.left() && tag.right() <= chip.right(),
-            "{id} is within the chip: {tag:?} vs {chip:?}"
-        );
-    }
-    let (mode, reasoning) = (
-        bounds_of(cx, window, "quick-mode").unwrap(),
-        bounds_of(cx, window, "quick-reasoning").unwrap(),
-    );
-    assert!(mode.right() <= reasoning.left(), "the tags do not overlap");
-}
-
-// quick-panel / Long prompt in the bar: past two lines the controls stack
-// beside the input, and they stay stacked until it is one line or empty.
-#[gpui_kit::test]
-fn the_bar_stacks_its_controls_past_two_lines(cx: &mut TestAppContext) {
+fn the_bars_labels_lie_on_one_line_under_the_input(cx: &mut TestAppContext) {
     let rig = rig(cx);
     let (window, panel) = rig.open_panel(cx);
     finish_opening(cx, window);
-    let top_of = |cx: &mut TestAppContext, id: &'static str| {
-        f32::from(
-            bounds_of(cx, window, id)
-                .unwrap_or_else(|| panic!("{id} is drawn"))
-                .origin
-                .y,
-        )
+    let input = bounds_of(cx, window, "quick-composer").expect("the input");
+    let centre_y = |b: gpui_kit::Bounds<gpui_kit::Pixels>| {
+        f32::from(b.origin.y) + f32::from(b.size.height) / 2.
     };
-    // At rest: one row, the folder and the model on one line.
-    assert!((top_of(cx, "quick-folder") - top_of(cx, "quick-model")).abs() <= 1.);
+    let ids = [
+        "quick-folder",
+        "quick-mode",
+        "quick-model",
+        "quick-reasoning",
+    ];
+    let labels: Vec<_> = ids
+        .iter()
+        .map(|id| bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn")))
+        .collect();
+    for (id, b) in ids.iter().zip(&labels) {
+        assert!(
+            (centre_y(*b) - centre_y(labels[0])).abs() <= 1.,
+            "{id} shares the folder's centre line"
+        );
+        assert!(b.top() >= input.bottom(), "{id} is under the input");
+        assert!(
+            (f32::from(b.size.height) - f32::from(labels[0].size.height)).abs() <= 0.5,
+            "{id} is as high as the folder"
+        );
+        assert!(
+            b.size.height < input.size.height,
+            "{id} is smaller than the input"
+        );
+    }
+    // Left to right, without overlap.
+    for pair in labels.windows(2) {
+        assert!(pair[0].right() <= pair[1].left(), "{pair:?}");
+    }
+    // The leftmost label (the agent's name when there is a choice) has its
+    // text where the prompt's text starts, which is the caret of the empty
+    // input, not the input's own edge: the kit insets its lines.
+    let first = bounds_of(cx, window, "quick-agent").unwrap_or(labels[0]);
+    let text_left = f32::from(first.left()) + 6.;
+    let caret = caret_bounds(cx, window, &panel)
+        .into_iter()
+        .find(|c| c.top() >= input.top() && c.bottom() <= input.bottom())
+        .expect("the input's caret");
+    let caret_left = f32::from(caret.left());
+    assert!(
+        (text_left - caret_left).abs() <= 1.,
+        "labels' text at {text_left}, the prompt's caret at {caret_left}"
+    );
+    assert!(
+        (caret_left - f32::from(input.left()) - super::panel::BAR_TEXT_INSET).abs() <= 1.,
+        "the kit's inset is still {} px",
+        super::panel::BAR_TEXT_INSET
+    );
+    // The session picker is at the row's trailing end.
+    let picker = bounds_of(cx, window, "quick-picker-toggle").expect("picker button");
+    assert!(picker.left() >= labels[3].right());
+    assert!((centre_y(picker) - centre_y(labels[0])).abs() <= 1.);
+}
+
+// quick-panel / Long prompt in the bar: a long draft keeps the input's full
+// width and the labels on one line under it; the bar grows.
+#[gpui_kit::test]
+fn a_long_prompt_keeps_the_full_width(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let ids = [
+        "quick-folder",
+        "quick-mode",
+        "quick-model",
+        "quick-reasoning",
+    ];
+    let at_rest = bounds_of(cx, window, "quick-composer").expect("the input");
+    let bar_at_rest = bounds_of(cx, window, "quick-bar").expect("the bar");
 
     type_draft(cx, window, &panel, "one\ntwo\nthree\nfour");
     settle(cx, window);
     settle(cx, window);
-    let (folder, model, input) = (
-        bounds_of(cx, window, "quick-folder").expect("folder"),
-        bounds_of(cx, window, "quick-model").expect("model"),
-        bounds_of(cx, window, "quick-composer").expect("input"),
-    );
+    let input = bounds_of(cx, window, "quick-composer").expect("the input");
+    assert_eq!(input.size.width, at_rest.size.width, "the full width");
+    assert!(input.size.height > at_rest.size.height, "the input grows");
+    let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
+    assert!(bar.size.height > bar_at_rest.size.height, "the bar grows");
+    let tops: Vec<f32> = ids
+        .iter()
+        .map(|id| {
+            let b = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
+            assert!(b.top() >= input.bottom(), "{id} is under the input");
+            f32::from(b.origin.y)
+        })
+        .collect();
     assert!(
-        folder.bottom() <= model.top(),
-        "the folder is above the model: {folder:?} {model:?}"
-    );
-    assert!(folder.left() >= input.right() - gpui_kit::px(1.));
-    assert!(model.left() >= input.right() - gpui_kit::px(1.));
-    // The column ends with the picker button, bottom-aligned with the input.
-    let picker = bounds_of(cx, window, "quick-picker-toggle").expect("picker button");
-    assert!(model.bottom() <= picker.top());
-    assert!(
-        (f32::from(picker.bottom()) - f32::from(input.bottom())).abs() <= 12.,
-        "{picker:?} vs {input:?}"
+        tops.iter().all(|t| (t - tops[0]).abs() <= 1.),
+        "the labels stay on one line: {tops:?}"
     );
 
-    // A draft that wraps back to two lines while stacked stays stacked.
-    type_draft(cx, window, &panel, "one\ntwo");
-    settle(cx, window);
-    settle(cx, window);
-    let (folder, model) = (
-        bounds_of(cx, window, "quick-folder").expect("folder"),
-        bounds_of(cx, window, "quick-model").expect("model"),
-    );
-    assert!(folder.bottom() <= model.top(), "still stacked at two lines");
-
-    // Cleared, the controls are one row again.
+    // Cleared, the bar is the resting bar again.
     type_draft(cx, window, &panel, "");
     settle(cx, window);
     settle(cx, window);
-    assert!((top_of(cx, "quick-folder") - top_of(cx, "quick-model")).abs() <= 1.);
+    let bar = bounds_of(cx, window, "quick-bar").expect("the bar");
+    assert_eq!(bar.size.height, bar_at_rest.size.height);
 }
 
-#[test]
-fn the_bar_stacks_by_the_inputs_height_with_hysteresis() {
-    use super::panel::bar_stacked as stacked;
-    let line = 26.;
-    assert!(!stacked(false, 0., true), "not laid out yet");
-    assert!(!stacked(false, line, false) && !stacked(false, 2. * line, false));
-    assert!(stacked(false, 3. * line, false));
-    assert!(stacked(true, 2. * line, false), "two lines while stacked");
-    assert!(!stacked(true, line, false), "one line again");
-    assert!(!stacked(true, 2. * line, true), "an empty draft");
-}
-
-// quick-panel / Mode and reasoning on the model: the tags are buttons.
+// quick-panel / The bar's controls: Mode and reasoning as labels. Each is a
+// button; the model picker stays closed.
 #[gpui_kit::test]
-fn the_model_chips_tags_change_mode_and_reasoning(cx: &mut TestAppContext) {
+fn the_mode_and_reasoning_labels_cycle(cx: &mut TestAppContext) {
     let rig = rig(cx);
     cx.update(|cx| {
         rig.store.update(cx, |s, _| {
@@ -1924,13 +2242,27 @@ fn the_model_chips_tags_change_mode_and_reasoning(cx: &mut TestAppContext) {
         centre(bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn")))
     };
 
-    let tag = at(cx, "quick-mode");
-    press_at(cx, window, tag);
-    assert_eq!(picks(cx).mode.as_deref(), Some("plan"));
-    assert!(bounds_of(cx, window, "quick-mode:Plan").is_some());
+    // The mode's label is as wide as its widest name, so the labels after it
+    // stay where they are whatever mode is shown.
+    let model_at = |cx: &mut TestAppContext| bounds_of(cx, window, "quick-model").unwrap();
+    let (model, mode) = (model_at(cx), bounds_of(cx, window, "quick-mode").unwrap());
+    for (next, name) in [("plan", "Plan"), ("review", "Review"), ("build", "Build")] {
+        let tag = at(cx, "quick-mode");
+        press_at(cx, window, tag);
+        settle(cx, window);
+        assert_eq!(picks(cx).mode.as_deref(), Some(next));
+        let shown = Box::leak(format!("quick-mode:{name}").into_boxed_str());
+        assert!(bounds_of(cx, window, shown).is_some(), "{name} is shown");
+        assert_eq!(
+            bounds_of(cx, window, "quick-mode").unwrap(),
+            mode,
+            "the mode label keeps its size at {name}"
+        );
+        assert_eq!(model_at(cx), model, "the model label stays put at {name}");
+    }
     let tag = at(cx, "quick-mode");
     press_at_with(cx, window, tag, gpui_kit::Modifiers::shift());
-    assert_eq!(picks(cx).mode.as_deref(), Some("build"));
+    assert_eq!(picks(cx).mode.as_deref(), Some("review"));
 
     let tag = at(cx, "quick-reasoning");
     press_at(cx, window, tag);
@@ -1940,7 +2272,7 @@ fn the_model_chips_tags_change_mode_and_reasoning(cx: &mut TestAppContext) {
         !panel.read_with(cx, |p, cx| p.models_for_test().read(cx).is_open()),
         "the model picker stays closed"
     );
-    assert_eq!(drags(cx, &panel), 0, "a tag is not a drag area");
+    assert_eq!(drags(cx, &panel), 0, "a label is not a drag area");
 }
 
 // ---- progress and the card grid in the session picker ----------------------------
@@ -2624,6 +2956,63 @@ fn every_folder_suggestion_is_inside_the_window(cx: &mut TestAppContext) {
     assert!(bottom(last) <= bottom(sheet) + 0.5, "inside the chooser");
 }
 
+/// Open the chooser, type `text` into its field and press `keys` in turn.
+fn type_in_folder_chooser(
+    cx: &mut TestAppContext,
+    rig: &Rig,
+    text: &str,
+    keys: &[&str],
+) -> Option<String> {
+    list_sessions(rig, cx, 6);
+    let (window, panel) = rig.open_panel(cx);
+    panel.update(cx, |p, _| p.set_display_height_for_test(1000.));
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| p.open_folder_chooser(window, cx))
+    })
+    .unwrap();
+    let field = panel.read_with(cx, |p, cx| p.folder_input_for_test(cx));
+    // The chooser opens on the current folder: replace it.
+    cx.update_window(window, |_, window, cx| {
+        field.update(cx, |f, cx| f.set_value("", window, cx));
+        field.update(cx, |f, cx| {
+            gpui_kit::EntityInputHandler::replace_text_in_range(f, None, text, window, cx)
+        })
+    })
+    .unwrap();
+    settle(cx, window);
+    for key in keys {
+        press(cx, window, key);
+    }
+    panel.read_with(cx, |p, _| p.picks_for_test().cwd)
+}
+
+// quick-panel / Enter takes the typed folder: a suggestion that only matches
+// what is typed is not used until an arrow key moves to it.
+#[gpui_kit::test]
+fn enter_in_the_folder_field_takes_what_is_typed(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let cwd = type_in_folder_chooser(cx, &rig, "/work/s", &["enter"]);
+    assert_eq!(cwd.as_deref(), Some("/work/s"), "not /work/s0");
+}
+
+#[gpui_kit::test]
+fn enter_takes_a_typed_folder_next_to_a_longer_recent_one(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let cwd = type_in_folder_chooser(cx, &rig, "/work/s1", &["enter"]);
+    assert_eq!(cwd.as_deref(), Some("/work/s1"));
+}
+
+#[gpui_kit::test]
+fn enter_after_an_arrow_key_takes_the_suggestion(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let cwd = type_in_folder_chooser(cx, &rig, "/work/s", &["down", "enter"]);
+    let cwd = cwd.expect("a folder was chosen");
+    assert!(
+        cwd.starts_with("/work/s") && cwd != "/work/s",
+        "the highlighted suggestion: {cwd}"
+    );
+}
+
 // ---- moving the panel (design D18) -------------------------------------------
 
 mod placement {
@@ -2800,13 +3189,16 @@ fn the_bar_drags_around_its_controls_only(cx: &mut TestAppContext) {
 
     press_at(cx, window, centre(composer));
     assert_eq!(drags(cx, &panel), 0, "pressing in the text does not drag");
-    let chip = bounds_of(cx, window, "quick-model").expect("the model chip");
-    press_at(cx, window, centre(chip));
-    assert_eq!(drags(cx, &panel), 0, "a chip is a button");
-    for tag in ["quick-mode", "quick-reasoning"] {
-        let tag = bounds_of(cx, window, tag).expect("a tag of the model chip");
-        press_at(cx, window, centre(tag));
-        assert_eq!(drags(cx, &panel), 0, "a tag is a button");
+    for id in [
+        "quick-folder",
+        "quick-mode",
+        "quick-model",
+        "quick-reasoning",
+        "quick-picker-toggle",
+    ] {
+        let label = bounds_of(cx, window, id).unwrap_or_else(|| panic!("{id} is drawn"));
+        press_at(cx, window, centre(label));
+        assert_eq!(drags(cx, &panel), 0, "{id} is a button");
     }
 
     // The bar's padding, left of the text.
@@ -2849,6 +3241,34 @@ fn caret_colours(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<gpui_k
             .iter()
             .filter(|q| q.bounds.size.width.0 <= 4. && q.bounds.size.height.0 >= 8.)
             .filter_map(|q| q.background.as_solid())
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Bounds of the panel's carets painted in the last frame (thin quads in its
+/// accent).
+fn caret_bounds(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+) -> Vec<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    let accent = panel.read_with(cx, |p, cx| p.hud_for_test(cx)).accent;
+    cx.update_window(window, |_, window, _| {
+        // Painted quads are in device pixels.
+        let scale = window.scale_factor();
+        let logical = |v: gpui_kit::ScaledPixels| gpui_kit::px(v.0 / scale);
+        window
+            .painted_quads()
+            .iter()
+            .filter(|q| q.bounds.size.width.0 <= 4. && q.bounds.size.height.0 >= 8.)
+            .filter(|q| q.background.as_solid() == Some(accent))
+            .map(|q| {
+                gpui_kit::Bounds::new(
+                    gpui_kit::point(logical(q.bounds.origin.x), logical(q.bounds.origin.y)),
+                    gpui_kit::size(logical(q.bounds.size.width), logical(q.bounds.size.height)),
+                )
+            })
             .collect()
     })
     .unwrap()

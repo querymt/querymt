@@ -9,7 +9,7 @@ Verification commands: `cargo nextest run --package querymt-gpui --bins --locked
 
 ## 2. Agent mode
 
-- [x] 2.1 Add `SessionPane::mode_chip` and put it in the compact composer row before the model chip (design D3). Verify: compact tests `compact_composer_shows_the_mode` and `tab_in_the_compact_composer_moves_the_chip` (spec: Mode in a conversation, Tab changes the mode visibly); a test that no chip is drawn when `mode_option()` is `None`; `compact_composer_has_no_options_panel` still passes.
+- [x] 2.1 Add `SessionPane::mode_chip` and put it in the compact composer row before the model chip (design D3). Verify: compact tests `compact_composer_shows_the_mode` and `tab_in_the_compact_composer_moves_the_chip` (spec: Mode in a conversation, Tab changes the mode visibly); a test that no chip is drawn when `mode_option()` is `None`; `compact_composer_has_no_options_panel` still passes. *Superseded by `add-quick-session-panel` 7.38.*
 - [x] 2.2 Add `Picks.mode` and `LaunchRequest.mode`, use it in `AgentsStore::launch`, draw the chip in the bar, and cycle it with Tab / Shift+Tab in the bar's input (design D4). Verify: quick test `mode_for_the_next_quick_chat_only` asserting the launch request's mode and that `prefs.launch_mode` is unchanged (spec: Mode for the next quick chat); `new_chat` clears it; the bar tests from `add-quick-session-panel` 7.17 still pass.
 - [x] 2.3 Manual check on macOS of the bar and the composer with three modes and a long model name: nothing overlaps, and the input keeps at least 240 px. Verify: result and a screenshot noted here.
 

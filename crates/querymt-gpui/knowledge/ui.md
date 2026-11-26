@@ -188,10 +188,15 @@ The bar and its state live on `SessionPane` (`find: Option<FindBar>`, in `find.r
   `Target::Session` the picker has already set the session's model; for
   `Target::Launch { agent }` the event is all that happens and the caller decides (Start
   writes the launch preference, the quick panel keeps it for its next chat).
-- **Badges** (`src/ui/kit.rs`): `badged` puts an optional left and right tag
-  (`badge_tag`) on a control's top edge, at a `BadgeSize`. The main window's model pills
-  use `badged_tone` (one tag at the right, `BadgeSize::TOOLBAR`, cut out with `surface`);
-  the quick panel's bar passes both tags as buttons (`BadgeSize::HUD`).
+  `PickerFrame::Card` (the main window's modal) has the title, reasoning footer, close
+  button and Done; `PickerFrame::Sheet` (the quick panel) is the search row and the list.
+  In a compact `SessionPane` the model and effort are the panel header's text and the mode
+  is the composer's name (`SessionPane::run_labels`, `mode_name`), not chips.
+- **Badges** (`src/ui/kit.rs`): `badged` puts one tag (`badge_tag`) at the right of a
+  control's top edge, at a `BadgeSize`. Only the main window's model pills and mode button
+  use it, through `badged_tone` (`BadgeSize::TOOLBAR`, cut out with `surface`). The quick
+  panel's bar has no badges: its mode and reasoning are labels in a row under the input
+  (see the quick panel's bar in `quick-panel.md`).
 - **Keys** (`src/ui/keys.rs`): actions (`NewSession`, `ToggleCommandPalette`,
   `UndoWorkspace`, `OpenModelPicker`, `OpenSidebarSession { index }`, …) bound with no key
   context so they reach `QmtApp`'s root even with nothing focused; Cmd on macOS, Ctrl

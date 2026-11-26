@@ -115,14 +115,6 @@ pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
     }
 }
 
-/// The fill of a mode or reasoning tag on the model chip (design D19): the
-/// tone at 32 % on the panel's near-black. It is opaque, so the chip's edge
-/// does not show through the tag and the same whatever lies under the panel;
-/// the label on it is `text`, not the tone, which is only a hint.
-pub(crate) fn tag_fill(tone: Hsla) -> Hsla {
-    hex(0x14161a).blend(tone.opacity(0.32))
-}
-
 /// Strength of the progress fill behind a picker row. Text lies over it,
 /// so it stays faint; the cards' bar uses the colour at full strength.
 pub(crate) const PROGRESS_FILL_ALPHA: f32 = 0.14;
@@ -314,37 +306,6 @@ mod tests {
                         let ratio = contrast(colour, under);
                         assert!(ratio >= 4.5, "{kind}: {name} on {ground} is {ratio:.2}:1");
                     }
-                }
-            }
-        }
-    }
-
-    // quick-panel / The bar's controls: the label of a tag on the model chip
-    // keeps 4.5:1 on its fill, for every tone, over every kind of chrome.
-    #[test]
-    fn tag_text_passes_on_its_tint_for_every_chrome() {
-        use super::tag_fill;
-        use crate::ui::kit::{mode_tone, reasoning_tone};
-        let ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
-        for user in [Palette::light(), Palette::dark()] {
-            for (kind, chrome) in every_chrome() {
-                let p = hud_palette(&user, chrome.glass);
-                let backdrop = Hsla {
-                    a: 1.,
-                    ..gpui_kit::hsla(0., 0., chrome.white_through, 1.)
-                };
-                let surface = over(chrome.surfaces(&p).bg, backdrop);
-                let tones = ids.iter().map(|id| mode_tone(ids, id, &p)).chain(
-                    ["auto", "low", "medium", "high", "max"]
-                        .iter()
-                        .map(|level| reasoning_tone(level, &p)),
-                );
-                for tone in tones {
-                    let fill = tag_fill(tone);
-                    assert!((fill.a - 1.).abs() < 1e-6, "{kind}: the tag is opaque");
-                    let ground = over(fill, surface);
-                    let ratio = contrast(p.text, ground);
-                    assert!(ratio >= 4.5, "{kind}: tag text on {tone:?} is {ratio:.2}:1");
                 }
             }
         }

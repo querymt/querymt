@@ -220,7 +220,10 @@ pub(crate) struct WorkspaceField {
     inline: bool,
     smooth_scroll: SmoothScroll,
     open: bool,
-    cursor: usize,
+    /// The suggestion an arrow key moved to. `None` until then (and again
+    /// after every edit): Enter then takes what is typed, not a suggestion
+    /// that merely matches it.
+    cursor: Option<usize>,
     scroll: ScrollHandle,
     /// Last folder listing: base dir and folder names.
     dirs: Option<(String, Vec<String>)>,
@@ -278,7 +281,7 @@ impl WorkspaceField {
             inline: false,
             smooth_scroll,
             open: false,
-            cursor: 0,
+            cursor: None,
             scroll: ScrollHandle::new(),
             dirs: None,
             loading: None,
@@ -385,10 +388,10 @@ impl WorkspaceField {
         )
     }
 
-    /// The field changed or gained focus: reset the highlight and list the
+    /// The field changed or gained focus: clear the highlight and list the
     /// typed directory in the background when it is not listed yet.
     fn refresh_dirs(&mut self, cx: &mut Context<Self>) {
-        self.cursor = 0;
+        self.cursor = None;
         self.scroll.scroll_to_item(0);
         if !self.local_fs(cx) {
             return;
@@ -441,21 +444,29 @@ impl WorkspaceField {
         if len == 0 {
             return false;
         }
-        let cursor = self.cursor.min(len - 1);
-        self.cursor = if down {
-            (cursor + 1) % len
-        } else {
-            (cursor + len - 1) % len
+        let next = match (self.cursor.map(|c| c.min(len - 1)), down) {
+            (None, true) => 0,
+            (None, false) => len - 1,
+            (Some(c), true) => (c + 1) % len,
+            (Some(c), false) => (c + len - 1) % len,
         };
-        self.scroll.scroll_to_item(self.cursor);
+        self.cursor = Some(next);
+        self.scroll.scroll_to_item(next);
         cx.notify();
         true
     }
 
     /// Pick the highlighted suggestion; `drill` completes into it instead.
+    /// With nothing highlighted, Enter is left alone (false) so the typed
+    /// text is used as it is; Tab (`drill`) completes into the first match.
     fn accept(&mut self, drill: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let items = self.items(cx);
-        let Some(item) = items.get(self.cursor.min(items.len().saturating_sub(1))) else {
+        let ix = match self.cursor {
+            Some(c) => c,
+            None if drill => 0,
+            None => return false,
+        };
+        let Some(item) = items.get(ix.min(items.len().saturating_sub(1))) else {
             return false;
         };
         self.pick(item.path.clone(), drill, window, cx);
@@ -467,7 +478,9 @@ impl Render for WorkspaceField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.unwrap_or_else(|| *palette(cx));
         let items = self.items(cx);
-        let cursor = self.cursor.min(items.len().saturating_sub(1));
+        let cursor = self
+            .cursor
+            .map(|c| c.min(items.len().saturating_sub(1)));
         let shell = if self.dialog {
             let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
             kit::field_shell(focused, &p).h(px(36.))
@@ -537,7 +550,7 @@ impl Render for WorkspaceField {
                         .cursor_pointer()
                         .text_size(px(12.))
                         .hover(move |s| s.bg(hover))
-                        .when(ix == cursor, |el| el.bg(hover))
+                        .when(cursor == Some(ix), |el| el.bg(hover))
                         .child(kit::icon(
                             if item.workspace {
                                 IconName::FolderClock

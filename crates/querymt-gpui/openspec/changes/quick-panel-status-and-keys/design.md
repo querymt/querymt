@@ -55,6 +55,7 @@
 - **Placement:** the compact composer row becomes `plus, input, mode_chip, model_chip, actions`.
 - **Why a dot and a label, not the notched badge:** the badge's cut-out is a `p.surface` shadow (`start.rs:449-455`), which shows as a dark ring on glass. Colour as the only signal also fails the guides' accessibility checklist, so the label carries the meaning and the tone is a hint.
 - **Pending option:** while the option change is pending (`pending_options`), the chip is shown at 60% opacity and is inert, as the model chip already is.
+- *Superseded in a conversation by `add-quick-session-panel` D20 (2026-11-26): the mode is plain text in a reserved width with the composer's outline in its tone; the chip and `compact_model_chip` go.*
 
 ### D4. Mode for the next quick chat
 
