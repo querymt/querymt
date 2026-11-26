@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Package a Linux release build as AppImage and deb.
 #
-#   scripts/package/linux.sh <version> <target>
+#   crates/querymt-gpui/scripts/package/linux.sh <version> <target>
 #
-# Reads target/<target>/release/querymt-gpui and writes
-# target/<target>/release/bundle/{appimage,deb}/. Follows querymt-desktop's
+# Reads <workspace target>/<target>/<profile>/querymt-gpui (profile from
+# CARGO_PROFILE, default release-gpui) and writes
+# <workspace target>/<target>/<profile>/bundle/{appimage,deb}/. Follows querymt-desktop's
 # scripts/cef/package.sh: appimagetool (optionally with a pinned runtime in
 # APPIMAGE_RUNTIME_FILE) and nfpm. GPUI renders through the host's Vulkan/EGL
 # drivers, so no graphics libraries are bundled.
 set -euo pipefail
 
+# The crate directory: packaging/ paths below are relative to it.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKSPACE="$(cd "$ROOT/../.." && pwd)"
 cd "$ROOT"
 
 VERSION="${1:?usage: linux.sh <version> <target>}"
@@ -21,11 +24,12 @@ case "$TARGET" in
   *) echo "unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
-TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
-BINARY="$TARGET_ROOT/$TARGET/release/querymt-gpui"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
+PROFILE="${CARGO_PROFILE:-release-gpui}"
+BINARY="$TARGET_ROOT/$TARGET/$PROFILE/querymt-gpui"
 [ -x "$BINARY" ] || { echo "binary not found at $BINARY" >&2; exit 1; }
 
-OUT="$TARGET_ROOT/$TARGET/release/bundle"
+OUT="$TARGET_ROOT/$TARGET/$PROFILE/bundle"
 WORK="$TARGET_ROOT/$TARGET/package-linux"
 rm -rf "$WORK" "$OUT/appimage" "$OUT/deb"
 mkdir -p "$WORK" "$OUT/appimage" "$OUT/deb"
@@ -56,7 +60,7 @@ fi
 # appimagetool reads the target architecture from ARCH.
 export ARCH
 APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGETOOL" "${APPIMAGE_ARGS[@]}" "$APPDIR" \
-  "$OUT/appimage/QueryMT-GPUI-$VERSION-linux-$ARCH.AppImage"
+  "$OUT/appimage/QueryMT-Desktop-$VERSION-linux-$ARCH.AppImage"
 
 # --- deb ---------------------------------------------------------------------
 NFPM="${NFPM:-$(command -v nfpm || true)}"
@@ -69,6 +73,6 @@ chmod 755 "$PKGROOT/usr/bin/querymt-gpui"
 cp packaging/linux/querymt-gpui.desktop "$PKGROOT/usr/share/applications/"
 cp packaging/icons/128x128@2x.png "$PKGROOT/usr/share/icons/hicolor/256x256/apps/querymt-gpui.png"
 PKGROOT="$PKGROOT" PKG_ARCH="$PKG_ARCH" PKG_VERSION="$VERSION" "$NFPM" pkg \
-  -f packaging/nfpm.yaml -p deb -t "$OUT/deb/QueryMT-GPUI-$VERSION-linux-$ARCH.deb"
+  -f packaging/nfpm.yaml -p deb -t "$OUT/deb/QueryMT-Desktop-$VERSION-linux-$ARCH.deb"
 
 echo "Linux packages written to $OUT"

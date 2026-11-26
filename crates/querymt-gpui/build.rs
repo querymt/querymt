@@ -52,6 +52,21 @@ fn main() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     prepare_fonts().unwrap_or_else(|err| panic!("failed to prepare embedded fonts: {err}"));
+    set_build_version();
+}
+
+/// The version the app reports (`util::APP_VERSION`): release and nightly CI pass
+/// the published version (`v0.6.0`, `0.6.0-nightly.<timestamp>`) as `QMT_VERSION`,
+/// like the qmt binaries; local builds fall back to the crate version.
+fn set_build_version() {
+    println!("cargo:rerun-if-env-changed=QMT_VERSION");
+    let version = env::var("QMT_VERSION")
+        .ok()
+        .filter(|version| !version.trim().is_empty())
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
+    let version = version.trim();
+    let normalized = version.strip_prefix('v').unwrap_or(version);
+    println!("cargo:rustc-env=QMT_BUILD_VERSION={normalized}");
 }
 
 fn prepare_fonts() -> Result<(), String> {

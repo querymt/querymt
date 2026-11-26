@@ -124,6 +124,10 @@ if gate v0.6.0 0.6.0 "$old" none; then
 if gate v0.6.0 0.6.0 "$old" "$tmp/missing.json"; then
   fail "gate: missing release.json path fails"; else pass "gate: missing release.json path fails"; fi
 
+# --- QueryMT Desktop (crates/querymt-gpui) bundle collection -----------------
+if bash "$here/../../crates/querymt-gpui/scripts/release/test-release-scripts.sh"; then
+  pass "desktop: release script tests"; else fail "desktop: release script tests"; fi
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures test(s) failed" >&2
   exit 1
