@@ -94,6 +94,12 @@ qmtcode and checks in headless Chrome that the app starts. The agent's own check
 (`cargo t-agent`, `cargo cl-agent`, `test-agent.yml`) use `dashboard-server`, which
 serves a placeholder page and never builds this crate.
 
+The embedded files are stored gzipped (`compress_assets` in `gpui_web.rs`: text and wasm
+over 1 KiB become `<name>.gz`), and `crates/agent/src/server.rs` sends them with
+`Content-Encoding: gzip`, `ETag` and `Cache-Control: no-cache` (304 on a matching
+`If-None-Match`). The `Content-Type` comes from the requested name, so the wasm stays
+`application/wasm`.
+
 ## Changing behaviour: OpenSpec
 
 Non-trivial changes go through OpenSpec in the repository root (`openspec/`, skills

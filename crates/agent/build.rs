@@ -1,3 +1,9 @@
+// `dep:flate2` in `dashboard-server` also enables the flate2 build-dependency
+// (Cargo cannot enable only one kind of a dependency); without `dashboard` this
+// script prepares no UI and does not use it.
+#[cfg(all(feature = "dashboard-server", not(feature = "dashboard")))]
+use flate2 as _;
+
 #[cfg(feature = "dashboard")]
 #[path = "build_support/gpui_web.rs"]
 mod gpui_web;

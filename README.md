@@ -109,6 +109,8 @@ cargo run --example qmtcode --features dashboard -- --dashboard
 cargo run --example qmtcode --features dashboard -- --dashboard=127.0.0.1:31337
 ```
 
+The assets are embedded gzipped (about 7 MiB) and served with `ETag` revalidation, so the dashboard also loads reasonably over the LAN (`--dashboard=0.0.0.0:<port>`; there is no access control yet, so only do this on a trusted network).
+
 `QMT_UI_DIST` names a prebuilt UI directory to embed instead (for example the output of `crates/querymt-gpui/web/build.sh --release`). For backend work, the `dashboard-server` feature builds the same server code with a placeholder page and no wasm build; `cargo t-agent` and `cargo cl-agent` use it.
 
 By default it reads config from `examples/confs/coder_agent.toml`.

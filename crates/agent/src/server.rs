@@ -4,7 +4,7 @@ use axum::Router;
 use axum::routing::get;
 #[cfg(feature = "dashboard-server")]
 use axum::{
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 #[cfg(feature = "dashboard-server")]
@@ -119,42 +119,165 @@ impl AgentServer {
 }
 
 #[cfg(feature = "dashboard-server")]
-async fn dashboard_index_handler() -> impl IntoResponse {
-    serve_asset::<DashboardAssets>("index.html")
+async fn dashboard_index_handler(headers: HeaderMap) -> impl IntoResponse {
+    serve_asset::<DashboardAssets>("index.html", &headers)
 }
 
 #[cfg(feature = "dashboard-server")]
-async fn dashboard_static_handler(uri: axum::http::Uri) -> impl IntoResponse {
-    serve_static_path::<DashboardAssets>(&uri)
+async fn dashboard_static_handler(uri: axum::http::Uri, headers: HeaderMap) -> impl IntoResponse {
+    serve_static_path::<DashboardAssets>(&uri, &headers)
 }
 
 #[cfg(feature = "dashboard-server")]
-fn serve_static_path<A: RustEmbed>(uri: &axum::http::Uri) -> Response {
+fn serve_static_path<A: RustEmbed>(uri: &axum::http::Uri, headers: &HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.is_empty() {
-        return serve_asset::<A>("index.html");
+        return serve_asset::<A>("index.html", headers);
     }
-    serve_asset::<A>(path)
+    serve_asset::<A>(path, headers)
 }
 
 #[cfg(feature = "dashboard-server")]
-fn serve_asset<A: RustEmbed>(path: &str) -> Response {
-    match A::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
-                .body(axum::body::Body::from(content.data))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
+fn serve_asset<A: RustEmbed>(path: &str, headers: &HeaderMap) -> Response {
+    match find_asset::<A>(path) {
+        Some(asset) => asset_response(path, asset, headers),
         None => {
+            // Client-side routes: unknown paths get the app.
             if path != "index.html" {
-                return serve_asset::<A>("index.html");
+                return serve_asset::<A>("index.html", headers);
             }
             StatusCode::NOT_FOUND.into_response()
         }
     }
+}
+
+/// An embedded dashboard file as stored: build.rs replaces compressible files
+/// with `<name>.gz` (crates/agent/build_support/gpui_web.rs).
+#[cfg(feature = "dashboard-server")]
+struct EmbeddedAsset {
+    bytes: std::borrow::Cow<'static, [u8]>,
+    gzipped: bool,
+    /// SHA-256 of `bytes`, computed by rust-embed at build time.
+    sha256: [u8; 32],
+}
+
+#[cfg(feature = "dashboard-server")]
+fn find_asset<A: RustEmbed>(path: &str) -> Option<EmbeddedAsset> {
+    let (file, gzipped) = match A::get(&format!("{path}.gz")) {
+        Some(file) => (file, true),
+        None => (A::get(path)?, false),
+    };
+    Some(EmbeddedAsset {
+        sha256: file.metadata.sha256_hash(),
+        bytes: file.data,
+        gzipped,
+    })
+}
+
+/// The response for an embedded file: gzip bytes as-is when the client accepts
+/// gzip (every browser does), decompressed otherwise, and revalidation through
+/// `ETag`/`If-None-Match` so a reload transfers nothing until the binary changes.
+#[cfg(feature = "dashboard-server")]
+fn asset_response(path: &str, asset: EmbeddedAsset, request: &HeaderMap) -> Response {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let send_gzip = asset.gzipped && accepts_gzip(request);
+    let hash = hex::encode(&asset.sha256[..16]);
+    // The decompressed variant is a different representation, so a different tag.
+    let etag = if asset.gzipped && !send_gzip {
+        format!("\"{hash}-identity\"")
+    } else {
+        format!("\"{hash}\"")
+    };
+
+    let mut response = Response::builder()
+        .header(header::ETAG, &etag)
+        // Cache, but ask the server before every use: a new qmtcode build changes
+        // the tags, an unchanged one answers 304.
+        .header(header::CACHE_CONTROL, "no-cache");
+    if asset.gzipped {
+        response = response.header(header::VARY, "accept-encoding");
+    }
+
+    if if_none_match(request, &etag) {
+        return response
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let body = if asset.gzipped && !send_gzip {
+        match gunzip(&asset.bytes) {
+            Ok(bytes) => axum::body::Body::from(bytes),
+            Err(err) => {
+                log::error!("failed to decompress embedded dashboard asset {path}: {err}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    } else {
+        axum::body::Body::from(asset.bytes)
+    };
+    if send_gzip {
+        response = response.header(header::CONTENT_ENCODING, "gzip");
+    }
+    response
+        .status(StatusCode::OK)
+        // From the requested name, so `.wasm` stays `application/wasm` (needed for
+        // streaming compilation) even though the stored file is `.wasm.gz`.
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(feature = "dashboard-server")]
+fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::with_capacity(bytes.len() * 3);
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Whether `Accept-Encoding` allows gzip: an explicit `gzip`/`x-gzip` entry decides,
+/// otherwise `*`; `q=0` refuses.
+#[cfg(feature = "dashboard-server")]
+fn accepts_gzip(request: &HeaderMap) -> bool {
+    let mut wildcard = None;
+    for value in request.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for entry in value.split(',') {
+            let mut parts = entry.split(';');
+            let coding = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let allowed = parts
+                .filter_map(|param| {
+                    let (name, value) = param.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().ok())
+                        .flatten()
+                })
+                .next_back()
+                .is_none_or(|q| q > 0.0);
+            match coding.as_str() {
+                "gzip" | "x-gzip" => return allowed,
+                "*" => wildcard = Some(allowed),
+                _ => {}
+            }
+        }
+    }
+    wildcard.unwrap_or(false)
+}
+
+/// Whether `If-None-Match` names `etag` (weak comparison, as for GET) or is `*`.
+#[cfg(feature = "dashboard-server")]
+fn if_none_match(request: &HeaderMap, etag: &str) -> bool {
+    request
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|tag| tag.trim())
+        .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +552,199 @@ mod dashboard_tests {
             .await
             .expect("missing legacy websocket route");
         assert_eq!(legacy_ws.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_index_revalidates_with_etag() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let dashboard = AgentServer::new(fixture.handle.clone(), fixture.storage.clone())
+            .build_app(ServerMode::Dashboard)
+            .expect("dashboard router");
+
+        let first = dashboard
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("dashboard response");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = first.headers()[header::ETAG].clone();
+
+        let revalidated = dashboard
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::IF_NONE_MATCH, etag.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("conditional dashboard response");
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()[header::ETAG], etag);
+        assert!(response_text(revalidated).await.is_empty());
+    }
+
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(name.clone(), value.parse().unwrap());
+        }
+        map
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    const WASM: &[u8] = b"\0asm\x01\0\0\0 pretend module";
+
+    fn gzipped_wasm() -> EmbeddedAsset {
+        EmbeddedAsset {
+            bytes: gzip(WASM).into(),
+            gzipped: true,
+            sha256: [7; 32],
+        }
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn gzipped_asset_is_sent_as_is_to_gzip_clients() {
+        let stored = gzip(WASM);
+        let response = asset_response(
+            "app_bg.wasm",
+            gzipped_wasm(),
+            &headers(&[(header::ACCEPT_ENCODING, "gzip, deflate")]),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+        assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(response.headers()[header::VARY], "accept-encoding");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = response.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+        assert_eq!(body_bytes(response).await, stored);
+    }
+
+    #[tokio::test]
+    async fn gzipped_asset_is_decompressed_for_other_clients() {
+        let gzip_etag = asset_response(
+            "app_bg.wasm",
+            gzipped_wasm(),
+            &headers(&[(header::ACCEPT_ENCODING, "gzip")]),
+        )
+        .headers()[header::ETAG]
+            .clone();
+
+        for request in [
+            headers(&[]),
+            headers(&[(header::ACCEPT_ENCODING, "br, zstd")]),
+            headers(&[(header::ACCEPT_ENCODING, "gzip;q=0, *")]),
+        ] {
+            let response = asset_response("app_bg.wasm", gzipped_wasm(), &request);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+            assert_eq!(response.headers()[header::VARY], "accept-encoding");
+            assert_ne!(response.headers()[header::ETAG], gzip_etag);
+            assert_eq!(body_bytes(response).await, WASM);
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_if_none_match_gets_not_modified() {
+        let accept = (header::ACCEPT_ENCODING, "gzip");
+        let etag = asset_response(
+            "app_bg.wasm",
+            gzipped_wasm(),
+            &headers(std::slice::from_ref(&accept)),
+        )
+        .headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        for tags in [
+            etag.clone(),
+            format!("\"other\", {etag}"),
+            format!("W/{etag}"),
+            "*".to_owned(),
+        ] {
+            let response = asset_response(
+                "app_bg.wasm",
+                gzipped_wasm(),
+                &headers(&[accept.clone(), (header::IF_NONE_MATCH, &tags)]),
+            );
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{tags}");
+            assert_eq!(response.headers()[header::ETAG], etag.as_str());
+            assert!(body_bytes(response).await.is_empty());
+        }
+
+        let stale = asset_response(
+            "app_bg.wasm",
+            gzipped_wasm(),
+            &headers(&[accept, (header::IF_NONE_MATCH, "\"older-build\"")]),
+        );
+        assert_eq!(stale.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn plain_asset_has_an_etag_but_no_encoding() {
+        let asset = EmbeddedAsset {
+            bytes: b"{}".as_slice().into(),
+            gzipped: false,
+            sha256: [1; 32],
+        };
+        let response = asset_response(
+            "querymt-ui.json",
+            asset,
+            &headers(&[(header::ACCEPT_ENCODING, "gzip")]),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::VARY).is_none());
+        assert!(response.headers().contains_key(header::ETAG));
+        assert_eq!(body_bytes(response).await, b"{}");
+    }
+
+    #[test]
+    fn accept_encoding_parsing() {
+        let cases = [
+            ("gzip, deflate", true),
+            ("gzip, deflate, br, zstd", true),
+            ("GZIP", true),
+            ("x-gzip", true),
+            ("br;q=1.0, gzip;q=0.8", true),
+            ("*", true),
+            ("br, *;q=0.1", true),
+            ("gzip;q=0", false),
+            ("gzip;q=0.0, *", false),
+            ("*;q=0", false),
+            ("br, zstd", false),
+            ("identity", false),
+            ("", false),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                accepts_gzip(&headers(&[(header::ACCEPT_ENCODING, value)])),
+                expected,
+                "{value:?}"
+            );
+        }
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 }
 

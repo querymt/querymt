@@ -4,6 +4,16 @@
 
 ### Added
 
+- **The embedded dashboard is served gzipped and cached.** `qmtcode
+  --dashboard` embeds the QueryMT Desktop web assets gzipped (level 9,
+  reproducible): the wasm drops from 17.6 MiB to 7.2 MiB in the binary and on
+  the wire. Gzip is used because browsers accept it over plain HTTP from
+  another machine on the LAN, where Brotli and Zstandard are only offered to
+  secure origins. Responses carry `Content-Encoding: gzip` (decompressed for
+  clients that do not accept gzip), `Vary: Accept-Encoding`, `Cache-Control:
+  no-cache` and an `ETag`; a matching `If-None-Match` gets `304 Not Modified`,
+  so reloading the page transfers no assets until qmtcode itself changes.
+  Assets from `QMT_UI_DIST` are gzipped the same way.
 - **`dashboard-server` feature for `querymt-agent`.** The dashboard server code
   (dashboard routes, the same-origin ACP guard, asset serving and qmtcode's
   `--dashboard`) without the embedded UI: it serves a placeholder page and
