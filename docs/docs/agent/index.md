@@ -7,7 +7,7 @@ The `querymt-agent` crate is a high-level agent runtime for QueryMaTe, providing
 QueryMT Agent is a Rust library that enables you to:
 
 - **Build AI agents** with configurable tools, models, and behaviors
-- **Run agents in multiple modes**: ACP stdio, embedded Svelte dashboard over ACP, or mesh networking
+- **Run agents in multiple modes**: ACP stdio, embedded QueryMT Desktop web dashboard over ACP, or mesh networking
 - **Support multi-agent workflows** with planner-delegate delegation patterns
 - **Manage context efficiently** with automatic compaction and pruning
 - **Enable cross-machine collaboration** via libp2p mesh networking

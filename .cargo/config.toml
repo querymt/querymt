@@ -8,7 +8,8 @@
 #
 # Aliases cannot set environment variables: `dashboard` builds (t-agent,
 # cl-agent) still need QMT_UI_DIST pointing at the minimal UI fixture from
-# test-agent.yml. Extra arguments are appended, for example
+# test-agent.yml; without it build.rs compiles the real dashboard
+# (crates/querymt-gpui for wasm32). Extra arguments are appended, for example
 #   cargo t-runtime -E 'test(/compaction/)'
 #   cargo t-agent --no-run
 

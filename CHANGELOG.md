@@ -763,6 +763,20 @@
 
 ### Breaking
 
+- **The `qmtcode --dashboard` UI is QueryMT Desktop web (BREAKING, build
+  inputs).** The `dashboard` feature of `querymt-agent` now embeds the wasm
+  build of `crates/querymt-gpui` instead of the querymt-desktop Svelte
+  dashboard. `crates/agent/build.rs` compiles it for `wasm32-unknown-unknown`
+  (profile `release-gpui-web`, cached in `target/querymt-gpui-web`), runs
+  wasm-bindgen as a library and `wasm-opt` when it is on `PATH`; Node.js and
+  npm are no longer needed. The page connects to the serving qmtcode's
+  same-origin `/acp/ws` and `/querymt-ui.json` now reports
+  `"app": "querymt-gpui"`. `QMT_UI_DIST` still embeds a prebuilt directory
+  (`.tar.gz` archives are no longer accepted); `QMT_UI_REVISION`,
+  `crates/agent/embedded-ui-revision` and the `querymt-desktop` flake input
+  are removed, and the flake's `dashboard-ui` package is now
+  `querymt-gpui-web`. Building `querymt-agent` with `dashboard` outside this
+  workspace requires `QMT_UI_DIST`.
 - **Worktree removal accepts published work; native `/worktree` replies are
   durable (BREAKING, ACP session updates).** `/worktree remove` now removes a
   checkout with uncommitted or untracked files when its full working state is

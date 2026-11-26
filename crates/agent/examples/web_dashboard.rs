@@ -1,6 +1,6 @@
 //! Web Dashboard Example
 //!
-//! Demonstrates the embedded Svelte UI over same-origin ACP WebSocket.
+//! Demonstrates the embedded QueryMT Desktop web UI over same-origin ACP WebSocket.
 //! Requires the `dashboard` feature, which resolves the pinned querymt-desktop UI.
 //!
 //! ## Usage

@@ -38,13 +38,13 @@ The `crates/agent/examples/` directory contains runnable examples:
 ## qmtcode
 
 The primary example — a full-featured coding assistant with multiple run modes.
-The `dashboard` feature automatically resolves and builds the pinned querymt-desktop UI; this source build requires Node.js and npm.
+The `dashboard` feature embeds QueryMT Desktop web (`crates/querymt-gpui` built for wasm32); the first build compiles it, which takes a few minutes. Set `QMT_UI_DIST` to a prebuilt UI directory to skip that.
 
 ```bash
 # ACP stdio mode (for subprocess integration)
 cargo run --example qmtcode -- --acp
 
-# Embedded Svelte dashboard over same-origin ACP (default: http://127.0.0.1:3000)
+# Embedded QueryMT Desktop web dashboard over same-origin ACP (default: http://127.0.0.1:3000)
 cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard on custom address
@@ -264,7 +264,7 @@ cargo run --example replay_session -- <session-id>
 
 ## web_dashboard
 
-Starts the embedded Svelte dashboard without using the `qmtcode` binary. The browser communicates with the agent through same-origin ACP at `/acp/ws`.
+Starts the embedded QueryMT Desktop web dashboard without using the `qmtcode` binary. The browser communicates with the agent through same-origin ACP at `/acp/ws`.
 
 ```bash
 cargo run --example web_dashboard --features dashboard
