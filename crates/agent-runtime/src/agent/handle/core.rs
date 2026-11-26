@@ -421,6 +421,14 @@ impl LocalAgentHandle {
             .get_session_control()
             .await
             .map_err(Error::from)?;
+        Ok(Self::remote_config_options(state))
+    }
+
+    /// Configuration options of an owner's session control state.
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_config_options(
+        state: crate::agent::session_control::SessionControlState,
+    ) -> Vec<SessionConfigOption> {
         let mut options = crate::agent::session_registry::config_options(
             state.active_mode,
             state.reasoning_effort,
@@ -431,7 +439,91 @@ impl LocalAgentHandle {
             &binding.model,
             binding.provider_node_id.as_deref(),
         ));
-        Ok(options)
+        options
+    }
+
+    /// The bookmark of a session another node owns, or `None` for a local or
+    /// unknown session. A session that is both local and bookmarked is
+    /// rejected: load, resume and fork must not pick one of the two.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_owner_bookmark(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::session::store::RemoteSessionBookmark>, Error> {
+        let store = self.config.provider.history_store();
+        let Some(bookmark) = store
+            .get_remote_session_bookmark(session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if store
+            .get_session(session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?
+            .is_some()
+        {
+            return Err(Error::invalid_params().data(serde_json::json!({
+                "message": "Session ID exists both locally and remotely",
+                "sessionId": session_id,
+            })));
+        }
+        Ok(Some(bookmark))
+    }
+
+    /// `session/load` of a session another node owns.
+    #[cfg(feature = "remote")]
+    fn load_bookmarked_remote_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        bookmark: crate::session::store::RemoteSessionBookmark,
+        window: Option<crate::session::history_window::LoadWindow>,
+    ) -> futures_util::future::BoxFuture<'a, Result<LoadSessionResponse, Error>> {
+        use crate::agent::handle::remote_connect::{RemoteConnectOptions, RemoteConnectReason};
+        Box::pin(async move {
+            let opened = self
+                .open_remote_session(
+                    session_id,
+                    &bookmark.node_id,
+                    RemoteConnectOptions {
+                        node_hint: Some(&bookmark.node_id),
+                        peer_label: None,
+                        preferred_scope: None,
+                        reason: RemoteConnectReason::Open,
+                        replace: RemoteConnectReason::Open.default_replace_policy(),
+                        handoff: None,
+                        windowed: window.is_some(),
+                        fork_origin: None,
+                    },
+                    window,
+                    None,
+                )
+                .await?;
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.into(),
+                opened.snapshot,
+            );
+            meta.insert("location".into(), serde_json::json!("remote"));
+            meta.insert("nodeId".into(), serde_json::json!(bookmark.node_id));
+            meta.insert("nodeLabel".into(), serde_json::json!(bookmark.peer_label));
+            meta.insert("cwd".into(), serde_json::json!(bookmark.cwd));
+            meta.insert("title".into(), serde_json::json!(bookmark.title));
+            if let Some(profile) = opened.profile {
+                meta.insert(
+                    "profileId".into(),
+                    serde_json::json!(profile.as_ref().map(|value| &value.profile_id)),
+                );
+                meta.insert(
+                    "profileLabel".into(),
+                    serde_json::json!(profile.as_ref().map(|value| &value.profile_label)),
+                );
+            }
+            Ok(LoadSessionResponse::new()
+                .config_options(opened.config_options)
+                .meta(meta))
+        })
     }
 
     /// Acquire the registry lock with tracing for wait and hold durations.
@@ -909,7 +1001,20 @@ impl LocalAgentHandle {
     /// 2. Prepare (NO lock): DB validation, MCP init, actor spawn
     /// 3. Register (lock held): Insert into in-memory maps (microseconds)
     /// 4. Finalize (NO lock): DHT registration, event emission
-    pub async fn load_session(
+    ///
+    /// The load future is built and boxed here, so callers hold a pointer
+    /// instead of the load's whole state (large in unoptimized builds).
+    pub fn load_session(
+        &self,
+        req: crate::acp::protocol::LoadSessionRequest,
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        std::result::Result<crate::acp::protocol::LoadSessionResponse, Error>,
+    > {
+        Box::pin(self.load_session_unboxed(req))
+    }
+
+    async fn load_session_unboxed(
         &self,
         req: crate::acp::protocol::LoadSessionRequest,
     ) -> std::result::Result<crate::acp::protocol::LoadSessionResponse, Error> {
@@ -920,101 +1025,10 @@ impl LocalAgentHandle {
         // materialization. A bookmark lookup is local I/O; mesh recovery is
         // only attempted when this ID is actually remote.
         #[cfg(feature = "remote")]
-        if let Some(bookmark) = self
-            .config
-            .provider
-            .history_store()
-            .get_remote_session_bookmark(&session_id)
-            .await
-            .map_err(|error| Error::internal_error().data(error.to_string()))?
-        {
-            use crate::agent::handle::remote_connect::RemoteConnectReason;
-            let store = self.config.provider.history_store();
-            if store
-                .get_session(&session_id)
-                .await
-                .map_err(|error| Error::internal_error().data(error.to_string()))?
-                .is_some()
-            {
-                return Err(Error::invalid_params().data(serde_json::json!({
-                    "message": "Session ID exists both locally and remotely",
-                    "sessionId": session_id,
-                })));
-            }
-            let connected = self
-                .connect_remote_session(
-                    &session_id,
-                    crate::agent::handle::remote_connect::RemoteConnectOptions {
-                        node_hint: Some(&bookmark.node_id),
-                        peer_label: None,
-                        preferred_scope: None,
-                        reason: RemoteConnectReason::Open,
-                        replace: RemoteConnectReason::Open.default_replace_policy(),
-                        handoff: None,
-                        windowed: load_window.is_some(),
-                        fork_origin: None,
-                    },
-                )
+        if let Some(bookmark) = self.remote_owner_bookmark(&session_id).await? {
+            return self
+                .load_bookmarked_remote_session(&session_id, bookmark, load_window)
                 .await;
-            use super::model_registry::RemoteLoadError;
-            let loaded = match connected {
-                // Snapshot (which also observes runtime status), profile and
-                // config options are independent: run them together. Only the
-                // snapshot can fail the load. A dead reused attachment is
-                // replaced once inside.
-                Ok(connected) => {
-                    self.load_connected_remote_session(
-                        &session_id,
-                        connected,
-                        load_window,
-                        || self.remote_session_profile(&bookmark.node_id, &session_id),
-                        || self.remote_session_config_options(&session_id),
-                    )
-                    .await
-                }
-                Err(error) => Err(RemoteLoadError::Connect(error)),
-            };
-            let (snapshot, profile, config_options) = match loaded {
-                Ok(loaded) => loaded,
-                Err(RemoteLoadError::Failed(error)) => return Err(error),
-                // The owner cannot be reached: a window that is already local
-                // is served as a stale snapshot; otherwise the connect error
-                // stands.
-                Err(RemoteLoadError::Connect(error)) => {
-                    let stale = if error.owner_unreachable() {
-                        self.stale_remote_snapshot(&session_id, load_window).await?
-                    } else {
-                        None
-                    };
-                    match stale {
-                        Some(snapshot) => (snapshot, None, Default::default()),
-                        None => return Err(error.to_acp_error()),
-                    }
-                }
-            };
-            let mut meta = serde_json::Map::new();
-            meta.insert(
-                crate::acp::shared::SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.into(),
-                snapshot,
-            );
-            meta.insert("location".into(), serde_json::json!("remote"));
-            meta.insert("nodeId".into(), serde_json::json!(bookmark.node_id));
-            meta.insert("nodeLabel".into(), serde_json::json!(bookmark.peer_label));
-            meta.insert("cwd".into(), serde_json::json!(bookmark.cwd));
-            meta.insert("title".into(), serde_json::json!(bookmark.title));
-            if let Some(profile) = profile {
-                meta.insert(
-                    "profileId".into(),
-                    serde_json::json!(profile.as_ref().map(|value| &value.profile_id)),
-                );
-                meta.insert(
-                    "profileLabel".into(),
-                    serde_json::json!(profile.as_ref().map(|value| &value.profile_label)),
-                );
-            }
-            return Ok(LoadSessionResponse::new()
-                .config_options(config_options)
-                .meta(meta));
         }
 
         // A read-only session (previous owner, archived workspace) replays its
@@ -1075,7 +1089,7 @@ impl LocalAgentHandle {
                         "sessionId": session_id,
                     }))
                 })?;
-                return Box::pin(delegate_handle.load_session(req)).await;
+                return delegate_handle.load_session(req).await;
             }
 
             let profile_handle = runtime.handle();

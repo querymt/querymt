@@ -3829,149 +3829,16 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         req.params,
                     ) {
                         Ok(params) => {
-                            let session_id = params.session_id.to_string();
-                            // Live events of the session wait from here until the
-                            // response is out (see `ConnectionDelivery::begin_load`).
-                            let hold = context
-                                .delivery
-                                .as_ref()
-                                .map(|delivery| delivery.begin_load(&session_id));
-                            // MCP attachments are now resolved internally by the
-                            // materializer via the runtime attachment source.
-                            let response = agent.load_session(params).await;
-                            match response {
-                                Ok(r) => {
-                                    // The cut and the translator seed read the
-                                    // snapshot together, once.
-                                    let snapshot = LoadSnapshotView::from_meta(r.meta.as_ref());
-                                    let mut cut = snapshot.as_ref().map(|snapshot| snapshot.cut);
-                                    if let Some(translator) = context.translator.as_ref() {
-                                        let recovered = seed_translator_from_load(
-                                            agent.as_any().downcast_ref::<AgentHandle>(),
-                                            &session_id,
-                                            &r,
-                                            snapshot.as_ref(),
-                                            translator,
-                                        )
-                                        .await;
-                                        notifications.extend(
-                                            recovered
-                                                .unwrap_or_default()
-                                                .into_iter()
-                                                .map(delegation_update_notification),
-                                        );
-                                    }
-                                    let request_lock =
-                                        session_owners.request_lock(&session_id, conn_id).await;
-                                    let _request_guard = request_lock.lock().await;
-                                    let ownership_inserted = attach_rpc_session_locked(
-                                        agent,
-                                        session_owners,
-                                        conn_id,
-                                        &context,
-                                        &session_id,
-                                        false,
-                                    )
-                                    .await?;
-                                    let mut value = serde_json::to_value(r).unwrap();
-                                    let capabilities = context.session_update_capabilities();
-                                    scope_load_cursor_updates(
-                                        value.get_mut("_meta").and_then(serde_json::Value::as_object_mut),
-                                        &capabilities,
-                                    );
-                                    let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
-                                    if let (Some(hooks), Some(local_agent)) =
-                                        (context.session_hooks.as_ref(), local_agent)
-                                        && let Err(error) = hooks
-                                            .on_session_loaded(local_agent, &session_id, &mut value)
-                                            .await
-                                    {
-                                        if ownership_inserted {
-                                            unsubscribe_connection(
-                                                session_owners,
-                                                &session_id,
-                                                conn_id,
-                                            )
-                                            .await;
-                                        }
-                                        return Err(error);
-                                    }
-                                    if local_agent.is_some() && context.prefers_snapshot_history() {
-                                        // The client hydrates conversation
-                                        // history from the load-response
-                                        // snapshot, so the expensive event and
-                                        // message reads that only feed replay
-                                        // are skipped entirely.
-                                        tracing::debug!(
-                                            session.id = %session_id,
-                                            "skipping ACP history replay for snapshot-capable client"
-                                        );
-                                    } else if let Some(local_agent) = local_agent {
-                                        let replay =
-                                            crate::acp::stdio::replay_loaded_session_with_cut(
-                                                local_agent,
-                                                &session_id,
-                                                &capabilities,
-                                            )
-                                            .await;
-                                        let (replay, _, replay_cut) = match replay {
-                                            Ok(replay) => replay,
-                                            Err(error) => {
-                                                if ownership_inserted {
-                                                    unsubscribe_connection(
-                                                        session_owners,
-                                                        &session_id,
-                                                        conn_id,
-                                                    )
-                                                    .await;
-                                                }
-                                                return Err(error);
-                                            }
-                                        };
-                                        cut = Some(replay_cut);
-                                        for notification in replay {
-                                            let mut params = serde_json::to_value(notification)
-                                                .map_err(Error::into_internal_error)?;
-                                            params["_meta"]["querymtReplay"] = serde_json::Value::Bool(true);
-                                            notifications.push(serde_json::json!({
-                                                "jsonrpc": "2.0",
-                                                "method": "session/update",
-                                                "params": params,
-                                            }));
-                                        }
-                                    }
-                                    if let Some(notification) =
-                                        available_commands_session_update(agent, &session_id).await
-                                    {
-                                        notifications.push(notification);
-                                    }
-                                    if let Some(hold) = hold {
-                                        // More live events than the connection can
-                                        // buffer arrived: answering would leave a
-                                        // gap, so the load fails and can be retried.
-                                        if hold.check().is_err() {
-                                            if ownership_inserted {
-                                                unsubscribe_connection(
-                                                    session_owners,
-                                                    &session_id,
-                                                    conn_id,
-                                                )
-                                                .await;
-                                            }
-                                            return Err(Error::internal_error().data(
-                                                serde_json::json!({
-                                                    "message": "Too many live events arrived while loading the session; retry the load",
-                                                    "sessionId": session_id,
-                                                }),
-                                            ));
-                                        }
-                                        load_release = Some((hold, cut));
-                                    }
-                                    Ok(value)
-                                }
-
-                                Err(e) => Err(e),
-                            }
+                            rpc_session_load(
+                                agent,
+                                session_owners,
+                                conn_id,
+                                &context,
+                                params,
+                                &mut notifications,
+                                &mut load_release,
+                            )
+                            .await
                         }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
@@ -4209,165 +4076,17 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 }
 
                 // Forward QueryMT extension methods to the agent's ext_method handler.
-                // ACP extension methods carry a leading underscore on the wire and
-                // the SDK keeps it; WebSocket clients may send either shape, so
-                // normalize here (stdio does the same via
-                // `normalize_querymt_ext_request`).
                 m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
-                    let ext_method = normalize_querymt_ext_method(m);
-                    let session_id_for_owner =
-                        querymt_session_id_from_request(ext_method, &req.params);
-                    let raw_params = serde_json::value::RawValue::from_string(
-                        serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
+                    rpc_querymt_ext_method(
+                        agent,
+                        session_owners,
+                        conn_id,
+                        &context,
+                        m,
+                        &req.params,
+                        &mut notifications,
                     )
-                    .unwrap_or_else(|_| {
-                        serde_json::value::RawValue::from_string("null".to_string()).unwrap()
-                    });
-                    let ext_req = crate::acp::protocol::ExtRequest::new(
-                        ext_method,
-                        std::sync::Arc::from(raw_params),
-                    );
-                    let attached_before_request = attach_before_querymt_ext_method(ext_method);
-                    let _ownership_request_guard = if attached_before_request {
-                        if let Some(session_id) = session_id_for_owner.as_deref() {
-                            Some(
-                                session_owners
-                                    .request_lock(session_id, conn_id)
-                                    .await
-                                    .lock_owned()
-                                    .await,
-                            )
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let ownership_inserted = if attached_before_request {
-                        if let Some(session_id) = session_id_for_owner.as_deref() {
-                            attach_rpc_session_locked(
-                                agent,
-                                session_owners,
-                                conn_id,
-                                &context,
-                                session_id,
-                                matches!(ext_method, "querymt/session/steer" | "querymt/session/queue"),
-                            )
-                            .await?
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    let response = agent.ext_method(ext_req).await.map(|r| {
-                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
-                    });
-                    match response {
-                        Ok(mut value) => {
-                            scope_ext_response_cursor_updates(
-                                ext_method,
-                                &mut value,
-                                &context.session_update_capabilities(),
-                            );
-                            let session_id = session_id_for_owner.clone().or_else(|| {
-                                querymt_session_id_from_response(ext_method, &value)
-                            });
-                            if let Some(session_id) = session_id {
-                                let mut post_attach_guard = None;
-                                let mut post_attach_inserted = false;
-                                if !attached_before_request {
-                                    let request_lock =
-                                        session_owners.request_lock(&session_id, conn_id).await;
-                                    post_attach_guard = Some(request_lock.lock_owned().await);
-                                    post_attach_inserted = attach_rpc_session_locked(
-                                        agent,
-                                        session_owners,
-                                        conn_id,
-                                        &context,
-                                        &session_id,
-                                        false,
-                                    )
-                                    .await?;
-                                }
-
-                                // `createSession` with `attach: false` returns a session that
-                                // exists only on the owner host; there is nothing attached to
-                                // post-process until the client attaches it.
-                                let attached = !(normalize_querymt_ext_method(ext_method)
-                                    == "querymt/remote/createSession"
-                                    && value.get("attached").and_then(serde_json::Value::as_bool)
-                                        == Some(false));
-                                if attached
-                                    && let (Some(hooks), Some(local_agent)) = (
-                                        context.session_hooks.as_ref(),
-                                        agent.as_any().downcast_ref::<AgentHandle>(),
-                                    )
-                                    && let Err(error) = hooks
-                                    .on_remote_session_attached(
-                                        local_agent,
-                                        &session_id,
-                                        &mut value,
-                                    )
-                                    .await
-                                {
-                                    if ownership_inserted || post_attach_inserted {
-                                        unsubscribe_connection(
-                                            session_owners,
-                                            &session_id,
-                                            conn_id,
-                                        )
-                                        .await;
-                                    }
-                                    return Err(error);
-                                }
-                                drop(post_attach_guard);
-                                if ext_method == "querymt/session/runtimeState"
-                                    && rpc_params["wait_for_updates"] == true
-                                    && value["phase"] == "idle"
-                                    && let Some(delivery) = context.delivery.as_ref()
-                                    && let Some(local) = agent.as_any().downcast_ref::<AgentHandle>()
-                                {
-                                    use crate::acp::delivery::{PROMPT_WAIT_LIMIT, WaitOutcome};
-                                    let runtime = serde_json::from_value(value.clone())
-                                        .map_err(Error::into_internal_error)?;
-                                    let synced = tokio::time::timeout(PROMPT_WAIT_LIMIT, async {
-                                        let marker = local.session_delivery_barrier(&session_id, runtime).await?;
-                                        if marker.tip > 0
-                                            && marker.runtime.phase == crate::agent::messages::SessionRuntimePhase::Idle
-                                            && delivery.wait_for_tip(&session_id, marker.tip, PROMPT_WAIT_LIMIT).await != WaitOutcome::Delivered
-                                        {
-                                            return Err(Error::internal_error().data("session update delivery could not be confirmed"));
-                                        }
-                                        serde_json::to_value(marker.runtime).map_err(Error::into_internal_error)
-                                    }).await;
-                                    match synced {
-                                        Ok(Ok(observed)) => value = observed,
-                                        Ok(Err(error)) => return Err(error),
-                                        _ => return Err(Error::internal_error().data("session update delivery could not be confirmed")),
-                                    }
-                                }
-                                if let Some(attached_id) = remote_attached_session_id(
-                                    ext_method,
-                                    &rpc_params,
-                                    &value,
-                                ) && let Some(notification) =
-                                    available_commands_session_update(agent, &attached_id).await
-                                {
-                                    notifications.push(notification);
-                                }
-                            }
-                            Ok(value)
-                        }
-                        Err(e) => {
-                            if ownership_inserted
-                                && let Some(session_id) = session_id_for_owner.as_deref()
-                            {
-                                unsubscribe_connection(session_owners, session_id, conn_id).await;
-                            }
-                            Err(e)
-                        }
-                    }
+                    .await
                 }
 
                 _ => Err(Error::method_not_found()),
@@ -4403,6 +4122,322 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
         notify_before_response: rpc_method == AGENT_METHOD_NAMES.session_load,
         load_release,
     }
+}
+
+/// `session/load` of the ACP dispatcher.
+///
+/// Each large dispatcher arm runs in its own boxed future, so the
+/// dispatcher's stack frame does not grow with the sum of all arms
+/// (unoptimized builds give every arm's temporaries their own slots).
+fn rpc_session_load<'a, S: SendAgent>(
+    agent: &'a S,
+    session_owners: &'a SessionOwnerMap,
+    conn_id: &'a str,
+    context: &'a RpcDispatchContext,
+    params: crate::acp::protocol::LoadSessionRequest,
+    notifications: &'a mut Vec<serde_json::Value>,
+    load_release: &'a mut Option<(
+        crate::acp::delivery::LoadHold,
+        Option<crate::acp::delivery::LoadCut>,
+    )>,
+) -> futures_util::future::BoxFuture<'a, Result<serde_json::Value, Error>> {
+    Box::pin(async move {
+        let session_id = params.session_id.to_string();
+        // Live events of the session wait from here until the
+        // response is out (see `ConnectionDelivery::begin_load`).
+        let hold = context
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.begin_load(&session_id));
+        // MCP attachments are now resolved internally by the
+        // materializer via the runtime attachment source.
+        let response = agent.load_session(params).await;
+        match response {
+            Ok(r) => {
+                // The cut and the translator seed read the
+                // snapshot together, once.
+                let snapshot = LoadSnapshotView::from_meta(r.meta.as_ref());
+                let mut cut = snapshot.as_ref().map(|snapshot| snapshot.cut);
+                if let Some(translator) = context.translator.as_ref() {
+                    let recovered = seed_translator_from_load(
+                        agent.as_any().downcast_ref::<AgentHandle>(),
+                        &session_id,
+                        &r,
+                        snapshot.as_ref(),
+                        translator,
+                    )
+                    .await;
+                    notifications.extend(
+                        recovered
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(delegation_update_notification),
+                    );
+                }
+                let request_lock = session_owners.request_lock(&session_id, conn_id).await;
+                let _request_guard = request_lock.lock().await;
+                let ownership_inserted = attach_rpc_session_locked(
+                    agent,
+                    session_owners,
+                    conn_id,
+                    context,
+                    &session_id,
+                    false,
+                )
+                .await?;
+                let mut value = serde_json::to_value(r).unwrap();
+                let capabilities = context.session_update_capabilities();
+                scope_load_cursor_updates(
+                    value
+                        .get_mut("_meta")
+                        .and_then(serde_json::Value::as_object_mut),
+                    &capabilities,
+                );
+                let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
+                if let (Some(hooks), Some(local_agent)) =
+                    (context.session_hooks.as_ref(), local_agent)
+                    && let Err(error) = hooks
+                        .on_session_loaded(local_agent, &session_id, &mut value)
+                        .await
+                {
+                    if ownership_inserted {
+                        unsubscribe_connection(session_owners, &session_id, conn_id).await;
+                    }
+                    return Err(error);
+                }
+                if local_agent.is_some() && context.prefers_snapshot_history() {
+                    // The client hydrates conversation
+                    // history from the load-response
+                    // snapshot, so the expensive event and
+                    // message reads that only feed replay
+                    // are skipped entirely.
+                    tracing::debug!(
+                        session.id = %session_id,
+                        "skipping ACP history replay for snapshot-capable client"
+                    );
+                } else if let Some(local_agent) = local_agent {
+                    let replay = crate::acp::stdio::replay_loaded_session_with_cut(
+                        local_agent,
+                        &session_id,
+                        &capabilities,
+                    )
+                    .await;
+                    let (replay, _, replay_cut) = match replay {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            if ownership_inserted {
+                                unsubscribe_connection(session_owners, &session_id, conn_id).await;
+                            }
+                            return Err(error);
+                        }
+                    };
+                    cut = Some(replay_cut);
+                    for notification in replay {
+                        let mut params = serde_json::to_value(notification)
+                            .map_err(Error::into_internal_error)?;
+                        params["_meta"]["querymtReplay"] = serde_json::Value::Bool(true);
+                        notifications.push(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": params,
+                        }));
+                    }
+                }
+                if let Some(notification) =
+                    available_commands_session_update(agent, &session_id).await
+                {
+                    notifications.push(notification);
+                }
+                if let Some(hold) = hold {
+                    // More live events than the connection can
+                    // buffer arrived: answering would leave a
+                    // gap, so the load fails and can be retried.
+                    if hold.check().is_err() {
+                        if ownership_inserted {
+                            unsubscribe_connection(session_owners, &session_id, conn_id).await;
+                        }
+                        return Err(Error::internal_error().data(
+                                serde_json::json!({
+                                    "message": "Too many live events arrived while loading the session; retry the load",
+                                    "sessionId": session_id,
+                                }),
+                            ));
+                    }
+                    *load_release = Some((hold, cut));
+                }
+                Ok(value)
+            }
+
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// A QueryMT extension method of the ACP dispatcher (see
+/// [`rpc_session_load`]). ACP extension methods carry a leading underscore
+/// on the wire and the SDK keeps it; WebSocket clients may send either
+/// shape, so `method` is normalized here (stdio does the same via
+/// `normalize_querymt_ext_request`).
+fn rpc_querymt_ext_method<'a, S: SendAgent>(
+    agent: &'a S,
+    session_owners: &'a SessionOwnerMap,
+    conn_id: &'a str,
+    context: &'a RpcDispatchContext,
+    method: &'a str,
+    params: &'a serde_json::Value,
+    notifications: &'a mut Vec<serde_json::Value>,
+) -> futures_util::future::BoxFuture<'a, Result<serde_json::Value, Error>> {
+    Box::pin(async move {
+        let ext_method = normalize_querymt_ext_method(method);
+        let session_id_for_owner = querymt_session_id_from_request(ext_method, params);
+        let raw_params = serde_json::value::RawValue::from_string(
+            serde_json::to_string(params).unwrap_or_else(|_| "null".to_string()),
+        )
+        .unwrap_or_else(|_| serde_json::value::RawValue::from_string("null".to_string()).unwrap());
+        let ext_req =
+            crate::acp::protocol::ExtRequest::new(ext_method, std::sync::Arc::from(raw_params));
+        let attached_before_request = attach_before_querymt_ext_method(ext_method);
+        let _ownership_request_guard = if attached_before_request {
+            if let Some(session_id) = session_id_for_owner.as_deref() {
+                Some(
+                    session_owners
+                        .request_lock(session_id, conn_id)
+                        .await
+                        .lock_owned()
+                        .await,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ownership_inserted = if attached_before_request {
+            if let Some(session_id) = session_id_for_owner.as_deref() {
+                attach_rpc_session_locked(
+                    agent,
+                    session_owners,
+                    conn_id,
+                    context,
+                    session_id,
+                    matches!(
+                        ext_method,
+                        "querymt/session/steer" | "querymt/session/queue"
+                    ),
+                )
+                .await?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let response = agent
+            .ext_method(ext_req)
+            .await
+            .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
+        match response {
+            Ok(mut value) => {
+                scope_ext_response_cursor_updates(
+                    ext_method,
+                    &mut value,
+                    &context.session_update_capabilities(),
+                );
+                let session_id = session_id_for_owner
+                    .clone()
+                    .or_else(|| querymt_session_id_from_response(ext_method, &value));
+                if let Some(session_id) = session_id {
+                    let mut post_attach_guard = None;
+                    let mut post_attach_inserted = false;
+                    if !attached_before_request {
+                        let request_lock = session_owners.request_lock(&session_id, conn_id).await;
+                        post_attach_guard = Some(request_lock.lock_owned().await);
+                        post_attach_inserted = attach_rpc_session_locked(
+                            agent,
+                            session_owners,
+                            conn_id,
+                            context,
+                            &session_id,
+                            false,
+                        )
+                        .await?;
+                    }
+
+                    // `createSession` with `attach: false` returns a session that
+                    // exists only on the owner host; there is nothing attached to
+                    // post-process until the client attaches it.
+                    let attached = !(normalize_querymt_ext_method(ext_method)
+                        == "querymt/remote/createSession"
+                        && value.get("attached").and_then(serde_json::Value::as_bool)
+                            == Some(false));
+                    if attached
+                        && let (Some(hooks), Some(local_agent)) = (
+                            context.session_hooks.as_ref(),
+                            agent.as_any().downcast_ref::<AgentHandle>(),
+                        )
+                        && let Err(error) = hooks
+                            .on_remote_session_attached(local_agent, &session_id, &mut value)
+                            .await
+                    {
+                        if ownership_inserted || post_attach_inserted {
+                            unsubscribe_connection(session_owners, &session_id, conn_id).await;
+                        }
+                        return Err(error);
+                    }
+                    drop(post_attach_guard);
+                    if ext_method == "querymt/session/runtimeState"
+                        && params["wait_for_updates"] == true
+                        && value["phase"] == "idle"
+                        && let Some(delivery) = context.delivery.as_ref()
+                        && let Some(local) = agent.as_any().downcast_ref::<AgentHandle>()
+                    {
+                        use crate::acp::delivery::{PROMPT_WAIT_LIMIT, WaitOutcome};
+                        let runtime = serde_json::from_value(value.clone())
+                            .map_err(Error::into_internal_error)?;
+                        let synced = tokio::time::timeout(PROMPT_WAIT_LIMIT, async {
+                            let marker =
+                                local.session_delivery_barrier(&session_id, runtime).await?;
+                            if marker.tip > 0
+                                && marker.runtime.phase
+                                    == crate::agent::messages::SessionRuntimePhase::Idle
+                                && delivery
+                                    .wait_for_tip(&session_id, marker.tip, PROMPT_WAIT_LIMIT)
+                                    .await
+                                    != WaitOutcome::Delivered
+                            {
+                                return Err(Error::internal_error()
+                                    .data("session update delivery could not be confirmed"));
+                            }
+                            serde_json::to_value(marker.runtime).map_err(Error::into_internal_error)
+                        })
+                        .await;
+                        match synced {
+                            Ok(Ok(observed)) => value = observed,
+                            Ok(Err(error)) => return Err(error),
+                            _ => {
+                                return Err(Error::internal_error()
+                                    .data("session update delivery could not be confirmed"));
+                            }
+                        }
+                    }
+                    if let Some(attached_id) =
+                        remote_attached_session_id(ext_method, params, &value)
+                        && let Some(notification) =
+                            available_commands_session_update(agent, &attached_id).await
+                    {
+                        notifications.push(notification);
+                    }
+                }
+                Ok(value)
+            }
+            Err(e) => {
+                if ownership_inserted && let Some(session_id) = session_id_for_owner.as_deref() {
+                    unsubscribe_connection(session_owners, session_id, conn_id).await;
+                }
+                Err(e)
+            }
+        }
+    })
 }
 
 async fn available_commands_session_update<S: SendAgent>(

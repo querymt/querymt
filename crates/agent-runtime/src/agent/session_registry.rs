@@ -1109,9 +1109,13 @@ pub(crate) async fn prepare_remote_attachment(
             data.get("category").and_then(serde_json::Value::as_str) == Some("remote_transport")
                 && data.get("kind").and_then(serde_json::Value::as_str) == Some("actor_unavailable")
         });
-        cleanup_attachment_parts(candidate.cleanup_parts(), !unavailable).await;
+        // An owner that refused the subscription holds nothing to
+        // unsubscribe; only an uncertain outcome (timeout, transport) may
+        // have left a forwarder behind.
+        let denied = AgentError::is_acp_mesh_access_denied(&error);
+        cleanup_attachment_parts(candidate.cleanup_parts(), !unavailable && !denied).await;
         candidate.armed = false;
-        if AgentError::is_acp_mesh_access_denied(&error) {
+        if denied {
             return Err(AgentError::MeshAccessDenied);
         }
         return Err(AgentError::RemoteActor(format!(

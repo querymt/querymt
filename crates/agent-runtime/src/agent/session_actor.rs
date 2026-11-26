@@ -3852,7 +3852,17 @@ async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<Prompt
     execute_authorized_prompt(exec, &TurnAuthority::Local).await
 }
 
-async fn execute_authorized_prompt(
+/// The run of an authorized prompt, built and boxed here so that its callers
+/// (the run task, the panic guard) hold a pointer rather than the run's whole
+/// state, which is large in unoptimized builds.
+fn execute_authorized_prompt(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+) -> futures_util::future::BoxFuture<'_, Result<PromptRun, AgentError>> {
+    Box::pin(execute_authorized_prompt_unboxed(exec, authority))
+}
+
+async fn execute_authorized_prompt_unboxed(
     exec: DetachedPromptExecution,
     authority: &TurnAuthority,
 ) -> Result<PromptRun, AgentError> {
@@ -3950,7 +3960,20 @@ async fn execute_prompt_with_span(
     .await
 }
 
-async fn execute_prompt_inner(
+/// Boxed like [`execute_authorized_prompt`].
+fn execute_prompt_inner(
+    exec: DetachedPromptExecution,
+    authority: &TurnAuthority,
+    pinned_session: Option<crate::session::provider::SessionHandle>,
+) -> futures_util::future::BoxFuture<'_, Result<PromptRun, AgentError>> {
+    Box::pin(execute_prompt_inner_unboxed(
+        exec,
+        authority,
+        pinned_session,
+    ))
+}
+
+async fn execute_prompt_inner_unboxed(
     exec: DetachedPromptExecution,
     authority: &TurnAuthority,
     pinned_session: Option<crate::session::provider::SessionHandle>,

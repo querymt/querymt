@@ -147,28 +147,13 @@ impl LocalAgentHandle {
         // A session another node owns is forked by its owner, so the fork is
         // remote too; a durable local/remote conflict is rejected.
         #[cfg(feature = "remote")]
+        if let Some(bookmark) = self
+            .remote_owner_bookmark(req.session_id.0.as_ref())
+            .await?
         {
-            let store = self.config.provider.history_store();
-            match crate::session::location::resolve_session_location(
-                store.as_ref(),
-                req.session_id.0.as_ref(),
-            )
-            .await
-            .map_err(Error::into_internal_error)?
-            {
-                crate::session::location::SessionLocation::Remote { bookmark } => {
-                    return self
-                        .fork_remote_hosted_session(&bookmark.node_id, req)
-                        .await;
-                }
-                crate::session::location::SessionLocation::Conflict { .. } => {
-                    return Err(Error::invalid_params().data(serde_json::json!({
-                        "message": "Session ID exists both locally and remotely",
-                        "sessionId": req.session_id.to_string(),
-                    })));
-                }
-                _ => {}
-            }
+            return self
+                .fork_remote_hosted_session(&bookmark.node_id, req)
+                .await;
         }
         self.session_materializer
             .ensure_writable(req.session_id.0.as_ref())
@@ -190,64 +175,10 @@ impl LocalAgentHandle {
         // Resolve durable ownership before touching a local actor registry, just
         // as load does. A second runtime would own a competing event counter.
         #[cfg(feature = "remote")]
-        if let Some(bookmark) = self
-            .config
-            .provider
-            .history_store()
-            .get_remote_session_bookmark(&session_id)
-            .await
-            .map_err(|error| Error::internal_error().data(error.to_string()))?
-        {
-            if self
-                .config
-                .provider
-                .history_store()
-                .get_session(&session_id)
-                .await
-                .map_err(|error| Error::internal_error().data(error.to_string()))?
-                .is_some()
-            {
-                return Err(Error::invalid_params().data(serde_json::json!({
-                    "message": "Session ID exists both locally and remotely",
-                    "sessionId": session_id,
-                })));
-            }
-            let connected = self
-                .ensure_remote_session_connected(
-                    &session_id,
-                    Some(&bookmark.node_id),
-                    crate::agent::handle::remote_connect::RemoteConnectReason::Open,
-                )
-                .await
-                .map_err(|error| error.to_acp_error())?;
-            // The first call through a reused attachment shows whether it
-            // still reaches a live actor; a dead one is replaced once.
-            let current_mode = match connected.session_ref.get_mode().await {
-                Ok(mode) => mode,
-                Err(error) if connected.reused_attachment_failed(&error) => {
-                    log::info!(
-                        "remote session {session_id} resume: reused attachment_id={} failed \
-                         ({error}); replacing it",
-                        connected.attachment_id,
-                    );
-                    self.replace_failed_remote_attachment(
-                        &session_id,
-                        connected.attachment_id,
-                        connected.session_ref.remote_node_id(),
-                        false,
-                    )
-                    .await
-                    .map_err(|error| error.to_acp_error())?
-                    .session_ref
-                    .get_mode()
-                    .await
-                    .map_err(Error::from)?
-                }
-                Err(error) => return Err(Error::from(error)),
-            };
-            return Ok(ResumeSessionResponse::new()
-                .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(self.remote_session_config_options(&session_id).await?));
+        if let Some(bookmark) = self.remote_owner_bookmark(&session_id).await? {
+            return self
+                .resume_bookmarked_remote_session(&session_id, bookmark)
+                .await;
         }
 
         self.adopt_unbound_session_binding(&session_id).await?;
@@ -444,5 +375,45 @@ impl LocalAgentHandle {
                 .clear_parent(session_id)
                 .await;
         }
+    }
+
+    /// `session/resume` of a session another node owns: its mode and
+    /// configuration come from one owner control read, which is also the
+    /// first call through a reused attachment (a dead one is replaced once).
+    #[cfg(feature = "remote")]
+    fn resume_bookmarked_remote_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        bookmark: crate::session::store::RemoteSessionBookmark,
+    ) -> futures_util::future::BoxFuture<'a, Result<ResumeSessionResponse, Error>> {
+        use super::remote_connect::{RemoteAttachmentCallError, attachment_unreachable};
+        Box::pin(async move {
+            let connected = self
+                .ensure_remote_session_connected(
+                    session_id,
+                    Some(&bookmark.node_id),
+                    super::remote_connect::RemoteConnectReason::Open,
+                )
+                .await
+                .map_err(|error| error.to_acp_error())?;
+            let (state, _) = self
+                .call_through_remote_attachment(
+                    session_id,
+                    "resume",
+                    connected,
+                    false,
+                    attachment_unreachable,
+                    |connected| async move { connected.session_ref.get_session_control().await },
+                )
+                .await
+                .map_err(|error| match error {
+                    RemoteAttachmentCallError::Replace(error) => error.to_acp_error(),
+                    RemoteAttachmentCallError::Failed(error) => Error::from(error),
+                })?;
+            let mode = state.active_mode;
+            Ok(ResumeSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(mode))
+                .config_options(Self::remote_config_options(state)))
+        })
     }
 }

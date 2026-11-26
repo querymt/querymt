@@ -37,12 +37,15 @@ impl LocalAgentHandle {
     /// Resolve a `SessionHandoff` into a concrete remote actor reference.
     ///
     /// - `DirectRemote` → return the embedded ref directly.
-    /// - `LookupOnly` → DHT lookup for the session.
+    /// - `LookupOnly` → DHT lookup for the session in every scope, keeping
+    ///   only an actor on `node_id` (a lookup error in one scope does not stop
+    ///   the others).
     /// - `NoAttachPath` → error.
     #[cfg(feature = "remote")]
-    pub async fn resolve_handoff(
+    pub(crate) async fn resolve_handoff(
         &self,
         session_id: &str,
+        node_id: &str,
         handoff: crate::agent::remote::node_manager::SessionHandoff,
     ) -> Result<
         kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
@@ -58,30 +61,23 @@ impl LocalAgentHandle {
                 let mesh = self.mesh().ok_or_else(|| {
                     agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped)
                 })?;
-                let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-                for scope in runtime.active_scopes() {
-                    let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
-                    if let Some(found) = runtime
-                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                        .await
-                        .map_err(|e| {
-                            agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                                key: session_id.to_string(),
-                                reason: e.to_string(),
-                            })
-                        })?
-                    {
-                        return Ok(found);
-                    }
+                match Self::lookup_remote_session_actor(&mesh, session_id, node_id).await {
+                    Ok(Some((found, _))) => Ok(found),
+                    Ok(None) => Err(agent_client_protocol::Error::from(
+                        AgentError::RemoteSessionNotFound {
+                            details: format!(
+                                "session {} registered but not found in DHT after lookup",
+                                session_id
+                            ),
+                        },
+                    )),
+                    Err(reason) => Err(agent_client_protocol::Error::from(
+                        AgentError::SwarmLookupFailed {
+                            key: session_id.to_string(),
+                            reason,
+                        },
+                    )),
                 }
-                Err(agent_client_protocol::Error::from(
-                    AgentError::RemoteSessionNotFound {
-                        details: format!(
-                            "session {} registered but not found in DHT after lookup",
-                            session_id
-                        ),
-                    },
-                ))
             }
             crate::agent::remote::node_manager::SessionHandoff::NoAttachPath => Err(
                 agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
@@ -120,46 +116,124 @@ impl LocalAgentHandle {
         Cf: std::future::Future<Output = Result<C, agent_client_protocol::Error>>,
         C: Default,
     {
-        let first = join_remote_load_requests(
+        use super::remote_connect::RemoteAttachmentCallError;
+        self.call_through_remote_attachment(
             session_id,
-            self.load_remote_snapshot(session_id, &connected, window),
-            profile(),
-            config(),
-        )
-        .await;
-        let error = match first {
-            Ok(loaded) => return Ok(loaded),
-            Err(RemoteSnapshotError::Failed(error)) => return Err(RemoteLoadError::Failed(error)),
-            Err(RemoteSnapshotError::DeadAttachment(error)) => error,
-        };
-        log::info!(
-            "remote session {session_id} load: reused attachment_id={} failed ({error}); \
-             replacing it and loading again",
-            connected.attachment_id,
-        );
-        let recovered = self
-            .replace_failed_remote_attachment(
-                session_id,
-                connected.attachment_id,
-                connected.session_ref.remote_node_id(),
-                window.is_some(),
-            )
-            .await
-            .map_err(RemoteLoadError::Connect)?;
-        // `recovered` may itself be `Reused` when another caller installed a
-        // newer generation meanwhile; this load is not repeated a second time.
-        join_remote_load_requests(
-            session_id,
-            async {
-                self.load_remote_snapshot(session_id, &recovered, window)
-                    .await
-                    .map_err(|error| error.into_acp(session_id))
+            "load",
+            connected,
+            window.is_some(),
+            |error| matches!(error, RemoteSnapshotError::DeadAttachment(_)),
+            // Boxed inside the closure: the retry helper then holds pointers,
+            // not two copies of the joined load futures.
+            |connected| {
+                Box::pin(join_remote_load_requests(
+                    session_id,
+                    async move {
+                        self.load_remote_snapshot(session_id, &connected, window)
+                            .await
+                    },
+                    profile(),
+                    config(),
+                ))
             },
-            profile(),
-            config(),
         )
         .await
-        .map_err(RemoteLoadError::Failed)
+        .map(|(loaded, _)| loaded)
+        .map_err(|error| match error {
+            RemoteAttachmentCallError::Replace(error) => RemoteLoadError::Connect(error),
+            RemoteAttachmentCallError::Failed(error) => {
+                RemoteLoadError::Failed(error.into_acp(session_id))
+            }
+        })
+    }
+
+    /// Connect to a remote session and load it: the one path behind
+    /// `session/load` of a bookmarked session, `remote/attachSession` and
+    /// `remote/createSession`.
+    ///
+    /// The snapshot, the owner's profile and its configuration are read
+    /// concurrently once connected (see [`Self::load_connected_remote_session`]).
+    /// When the owner cannot be reached, a window that is already local is
+    /// served as a stale snapshot without an attachment (`attached: false`).
+    ///
+    /// `node_manager` is the owner's node manager when the caller already
+    /// found it (it is looked up for the profile otherwise).
+    ///
+    /// The future is built and boxed here so that callers hold only a
+    /// pointer: the connect and load futures are large in unoptimized builds.
+    #[cfg(feature = "remote")]
+    pub(crate) fn open_remote_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        node_id: &'a str,
+        options: super::remote_connect::RemoteConnectOptions<'a>,
+        window: Option<crate::session::history_window::LoadWindow>,
+        node_manager: Option<NodeManagerRef>,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<OpenedRemoteSession, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            let loaded = match self.connect_remote_session(session_id, options).await {
+                Ok(connected) => {
+                    self.load_opened_remote_session(
+                        session_id,
+                        node_id,
+                        connected,
+                        window,
+                        node_manager,
+                    )
+                    .await
+                }
+                Err(error) => Err(RemoteLoadError::Connect(error)),
+            };
+            match loaded {
+                Ok((snapshot, profile, config_options)) => Ok(OpenedRemoteSession {
+                    snapshot,
+                    profile,
+                    config_options,
+                    attached: true,
+                }),
+                Err(RemoteLoadError::Failed(error)) => Err(error),
+                Err(RemoteLoadError::Connect(error)) => {
+                    let stale = if error.owner_unreachable() {
+                        self.stale_remote_snapshot(session_id, window).await?
+                    } else {
+                        None
+                    };
+                    match stale {
+                        Some(snapshot) => Ok(OpenedRemoteSession {
+                            snapshot,
+                            profile: None,
+                            config_options: Vec::new(),
+                            attached: false,
+                        }),
+                        None => Err(error.to_acp_error()),
+                    }
+                }
+            }
+        })
+    }
+
+    /// [`Self::load_connected_remote_session`] with the owner's profile and
+    /// configuration as the concurrent requests, boxed (see
+    /// [`Self::open_remote_session`]).
+    #[cfg(feature = "remote")]
+    fn load_opened_remote_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        node_id: &'a str,
+        connected: super::remote_connect::ConnectedRemoteSession,
+        window: Option<crate::session::history_window::LoadWindow>,
+        node_manager: Option<NodeManagerRef>,
+    ) -> futures_util::future::BoxFuture<'a, Result<OpenedRemoteLoad, RemoteLoadError>> {
+        Box::pin(self.load_connected_remote_session(
+            session_id,
+            connected,
+            window,
+            move || self.remote_session_profile(node_id, session_id, node_manager.clone()),
+            move || self.remote_session_config_options(session_id),
+        ))
     }
 
     /// Make a connected remote session's history local, then build its load
@@ -207,9 +281,18 @@ impl LocalAgentHandle {
             Ok(()) => Ok(()),
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        self.build_remote_attach_snapshot_with_budget(session_id, window, sync, remaining)
-            .await
-            .map_err(RemoteSnapshotError::Failed)
+        // The connect coordinator already read the bookmark under its gate.
+        match connected.bookmark.clone() {
+            Some(bookmark) => {
+                self.build_remote_snapshot(session_id, bookmark, window, sync, remaining)
+                    .await
+            }
+            None => {
+                self.build_remote_attach_snapshot_with_budget(session_id, window, sync, remaining)
+                    .await
+            }
+        }
+        .map_err(RemoteSnapshotError::Failed)
     }
 
     /// The full event history of an attached remote session, read from the
@@ -379,6 +462,38 @@ impl LocalAgentHandle {
         sync: Result<(), crate::error::AgentError>,
         budget: std::time::Duration,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        let bookmark = self
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(session_id)
+            .await
+            .map_err(|error| {
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "message": error.to_string(),
+                    "sessionId": session_id,
+                }))
+            })?
+            .ok_or_else(|| {
+                agent_client_protocol::Error::from(crate::error::AgentError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })
+            })?;
+        self.build_remote_snapshot(session_id, bookmark, window, sync, budget)
+            .await
+    }
+
+    /// [`Self::build_remote_attach_snapshot_with_budget`] for a session
+    /// whose bookmark the caller already holds.
+    #[cfg(feature = "remote")]
+    async fn build_remote_snapshot(
+        &self,
+        session_id: &str,
+        bookmark: crate::session::store::RemoteSessionBookmark,
+        window: Option<crate::session::history_window::LoadWindow>,
+        sync: Result<(), crate::error::AgentError>,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
         use crate::error::AgentError;
         let transfer_failed = |message: String| {
             agent_client_protocol::Error::from(AgentError::RemoteTransferFailed {
@@ -392,18 +507,6 @@ impl LocalAgentHandle {
                 "sessionId": session_id,
             }))
         };
-        let bookmark = self
-            .config
-            .provider
-            .history_store()
-            .get_remote_session_bookmark(session_id)
-            .await
-            .map_err(|error| internal(error.to_string()))?
-            .ok_or_else(|| {
-                agent_client_protocol::Error::from(AgentError::SessionNotFound {
-                    session_id: session_id.to_string(),
-                })
-            })?;
         let sink = self.config.event_sink.clone();
         let state = sink.remote_sync(session_id, &bookmark.node_id);
         if matches!(&sync, Err(AgentError::MeshAccessDenied)) {
@@ -570,6 +673,42 @@ impl RemoteSnapshotError {
         }
     }
 }
+
+#[cfg(feature = "remote")]
+impl std::fmt::Display for RemoteSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadAttachment(error) => error.fmt(f),
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+/// A remote session opened by [`LocalAgentHandle::open_remote_session`].
+#[cfg(feature = "remote")]
+pub(crate) struct OpenedRemoteSession {
+    /// The load snapshot (`querymt/sessionLoadSnapshot.v1`).
+    pub(crate) snapshot: serde_json::Value,
+    /// The owner's profile binding; `None` when the owner did not answer.
+    pub(crate) profile: Option<Option<crate::agent::remote::RemoteSessionProfile>>,
+    /// The owner's configuration; empty when it was unavailable.
+    pub(crate) config_options: Vec<crate::acp::protocol::SessionConfigOption>,
+    /// `false` when the owner was unreachable and a local copy was served.
+    pub(crate) attached: bool,
+}
+
+/// A reference to a mesh node's node manager.
+#[cfg(feature = "remote")]
+pub(crate) type NodeManagerRef =
+    kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>;
+
+/// Snapshot, profile and configuration of a loaded remote session.
+#[cfg(feature = "remote")]
+type OpenedRemoteLoad = (
+    serde_json::Value,
+    Option<Option<crate::agent::remote::RemoteSessionProfile>>,
+    Vec<crate::acp::protocol::SessionConfigOption>,
+);
 
 /// Why loading a connected remote session failed.
 #[cfg(feature = "remote")]
