@@ -96,7 +96,7 @@ The transport flags are mutually exclusive.
 
 ### Quick start
 
-Run these commands from the workspace root. The `dashboard` feature automatically resolves and builds the pinned querymt-desktop UI; this source build requires Node.js and npm.
+Run these commands from the workspace root. The `dashboard` feature embeds QueryMT Desktop web, the wasm build of `crates/querymt-gpui`, and serves it over same-origin ACP. The first build compiles it for `wasm32-unknown-unknown` (a few minutes; the target is listed in `rust-toolchain.toml`) into `target/querymt-gpui-web`. Later builds reuse it and rebuild only when the app or the crates it uses change. `wasm-opt` (binaryen) shrinks the wasm when it is on `PATH`.
 
 ```bash
 # ACP stdio mode
@@ -106,10 +106,10 @@ cargo run --example qmtcode -- --acp
 cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard mode on a custom address
-cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
+cargo run --example qmtcode --features dashboard -- --dashboard=127.0.0.1:31337
 ```
 
-For advanced use, `QMT_UI_DIST` can select a prebuilt local directory/archive, while a plain `QMT_UI_REVISION` selects a Git SHA, tag, or ref to build instead of the pinned revision.
+`QMT_UI_DIST` names a prebuilt UI directory to embed instead (for example the output of `crates/querymt-gpui/web/build.sh --release`, or a minimal fixture for backend-only builds).
 
 By default it reads config from `examples/confs/coder_agent.toml`.
 You can also pass your own config path before the mode flag.

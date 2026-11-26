@@ -102,7 +102,8 @@ nix develop -c crates/querymt-gpui/web/build.sh --release
 nix develop -c miniserve --index index.html crates/querymt-gpui/dist   # http://localhost:8080
 ```
 
-- Served by qmtcode itself (embedded): the page connects to its own origin `/acp/ws` automatically.
+- Served by qmtcode itself: `qmtcode --dashboard` embeds this build (the `dashboard` feature of
+  `querymt-agent` compiles it); the page connects to its own origin `/acp/ws` automatically.
 - `?agent=host:port` points the page at another server. `?page=agents&details=1` deep-links.
 - qmtcode rejects WebSocket upgrades from a different Origin (HTTP 403). Cross-origin testing needs
   the page served from the same origin as qmtcode, or a proxy such as

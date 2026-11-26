@@ -83,6 +83,13 @@ The version is the workspace version; CI passes the exact release or nightly ver
 Native release builds use the `release-gpui` profile (size-optimized, fat LTO, abort on
 panic) and are packaged by `scripts/package/{macos,windows,linux}.sh`.
 
+The web build is also the `qmtcode --dashboard` UI: the `dashboard` feature of
+`querymt-agent` embeds it. `crates/agent/build.rs` (`build_support/gpui_web.rs`) builds
+this crate for wasm32 with `release-gpui-web` in `target/querymt-gpui-web`, unless
+`QMT_UI_DIST` names a prebuilt directory (CI passes the `desktop-web` job's output; Nix
+passes `packages.querymt-gpui-web`). A web-breaking change here therefore breaks
+`cargo build -p querymt-agent --features dashboard` without `QMT_UI_DIST`.
+
 ## Changing behaviour: OpenSpec
 
 Non-trivial changes go through OpenSpec in the repository root (`openspec/`, skills

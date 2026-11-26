@@ -93,7 +93,8 @@
   runs share build artifacts: `cargo t-<pkg> [filter args]` (nextest) and
   `cargo cl-<pkg>` (clippy, `-D warnings`) for `agent`, `runtime`, `services`, `sqlite`,
   `knowledge`, `index` and `core`; for example `cargo t-runtime -E 'test(/compaction/)'`.
-  `agent` builds with `dashboard`, so set `QMT_UI_DIST` (see Dashboard Boundary).
+  `agent` builds with `dashboard`, so set `QMT_UI_DIST` to the fixture (see Dashboard
+  Boundary); without it the build compiles the real dashboard (minutes).
   Loop: test the package you changed with its `t-<pkg>` alias, and build the facade
   (`cargo t-agent --no-run`) before pushing. Measured edit cost with incremental on:
   runtime/sqlite/services/facade edits 5-16 s and core edits 15-19 s (everything above
@@ -122,12 +123,13 @@
 
 ## Dashboard Boundary
 
-- The embedded web dashboard belongs to the separate `querymt-desktop` repository.
-  Report required dashboard follow-up rather than expanding backend work into that
-  repo. The GPUI app (`crates/querymt-gpui`) lives here and is changed in the same
-  pull request when a backend change needs it.
+- The `dashboard` feature embeds QueryMT Desktop web: `crates/agent/build.rs` builds
+  `crates/querymt-gpui` for `wasm32-unknown-unknown` (profile `release-gpui-web`, in
+  `target/querymt-gpui-web`). The app lives here and is changed in the same pull
+  request when a backend change needs it. The Tauri `querymt-desktop` repository is
+  separate; report required follow-up there instead of expanding into it.
 - For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
-  from `.github/actions/rust-setup/action.yml` instead of rebuilding the frontend.
+  from `.github/actions/rust-setup/action.yml` instead of building the wasm app.
 
 ## Code Conventions
 
