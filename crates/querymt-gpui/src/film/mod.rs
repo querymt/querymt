@@ -255,7 +255,10 @@ fn open(resolved: &Resolved) -> Film {
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| QmtApp::new(shared, window, cx))
         })
-        .expect("open the window")
+        .expect(
+            "open the window (on Linux this needs a Vulkan or GL driver, \
+             e.g. mesa-vulkan-drivers for lavapipe)",
+        )
     });
     let has_session = scene.world.session.is_some();
     cx.update_window(main, |_, window, cx| {
