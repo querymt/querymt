@@ -316,7 +316,7 @@ impl RepositoryService {
         if request.max_cards == 0 {
             return Ok(outcome);
         }
-        outcome.file = file.clone();
+        outcome.file.clone_from(&file);
 
         self.refresh()?;
         let (generation, source) = self

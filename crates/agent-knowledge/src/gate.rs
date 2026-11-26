@@ -263,15 +263,36 @@ impl GateOutcome {
     }
 }
 
-fn anchored(document: &StoredDocument, reason: GateReason, out: &mut Vec<GateSection>) {
-    for section in &document.sections {
+/// Add every section of `document` not already in `out`.
+///
+/// Takes the document by value so sections are moved, not copied, and skips
+/// duplicates before building anything.
+fn anchored(
+    document: StoredDocument,
+    reason: GateReason,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<GateSection>,
+) {
+    let StoredDocument {
+        path,
+        id,
+        title,
+        status,
+        description,
+        sections,
+        ..
+    } = document;
+    for section in sections {
+        if !seen.insert(section.key.clone()) {
+            continue;
+        }
         out.push(GateSection {
-            doc_path: document.path.clone(),
-            doc_id: document.id.clone(),
-            doc_title: document.title.clone(),
-            doc_status: document.status.clone(),
-            doc_description: document.description.clone(),
-            section: section.clone(),
+            doc_path: path.clone(),
+            doc_id: id.clone(),
+            doc_title: title.clone(),
+            doc_status: status.clone(),
+            doc_description: description.clone(),
+            section,
             reason,
         });
     }
@@ -324,11 +345,6 @@ impl RepositoryService {
                 .map_err(ServiceError::unavailable)?;
             let mut sections: Vec<GateSection> = Vec::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
-            let mut push = |found: GateSection, sections: &mut Vec<GateSection>| {
-                if seen.insert(found.section.key.clone()) {
-                    sections.push(found);
-                }
-            };
 
             // (a) Paths and qualified identifiers the prompt names.
             let (_, named) = self
@@ -368,17 +384,18 @@ impl RepositoryService {
                         .document(&path)
                         .map_err(ServiceError::unavailable)?;
                     if let Some(document) = document {
-                        let mut found = Vec::new();
-                        anchored(&document, reason, &mut found);
-                        for section in found {
-                            push(section, &mut sections);
-                        }
+                        anchored(document, reason, &mut seen, &mut sections);
                     }
                 }
             }
 
             // (b) Token thresholds over full-text candidates, best first.
-            for found in &snapshot.sections {
+            // `snapshot.sections` is consumed here so each passing section is
+            // moved into the outcome rather than copied.
+            for found in snapshot.sections {
+                if seen.contains(&found.section.key) {
+                    continue;
+                }
                 let mut metadata = String::new();
                 for part in found
                     .section
@@ -403,18 +420,16 @@ impl RepositoryService {
                         continue;
                     }
                 };
-                push(
-                    GateSection {
-                        doc_path: found.doc_path.clone(),
-                        doc_id: found.doc_id.clone(),
-                        doc_title: found.doc_title.clone(),
-                        doc_status: found.doc_status.clone(),
-                        doc_description: found.doc_description.clone(),
-                        section: found.section.clone(),
-                        reason,
-                    },
-                    &mut sections,
-                );
+                seen.insert(found.section.key.clone());
+                sections.push(GateSection {
+                    doc_path: found.doc_path,
+                    doc_id: found.doc_id,
+                    doc_title: found.doc_title,
+                    doc_status: found.doc_status,
+                    doc_description: found.doc_description,
+                    section: found.section,
+                    reason,
+                });
             }
 
             let paths: BTreeSet<&str> = sections.iter().map(|s| s.doc_path.as_str()).collect();

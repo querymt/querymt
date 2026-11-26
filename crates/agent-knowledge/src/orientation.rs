@@ -158,7 +158,7 @@ struct Source<'a> {
 }
 
 fn card(
-    source: Source<'_>,
+    source: &Source<'_>,
     section: &StoredSection,
     origin: CardOrigin,
     evidence: EvidenceState,
@@ -210,7 +210,7 @@ impl RepositoryService {
             }
             let state = evidence.state(self, &found.doc_path, &section_record_key(&found.section));
             cards.push(card(
-                Source {
+                &Source {
                     path: &found.doc_path,
                     id: &found.doc_id,
                     title: &found.doc_title,
@@ -347,7 +347,7 @@ impl RepositoryService {
             }
             let state = evidence.state(self, &document.path, &section_record_key(section));
             cards.push(card(
-                Source {
+                &Source {
                     path: &document.path,
                     id: &document.id,
                     title: &document.title,

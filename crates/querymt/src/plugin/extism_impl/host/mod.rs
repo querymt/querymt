@@ -272,7 +272,7 @@ impl ExtismFactory {
             allowed_hosts.join(", ")
         );
 
-        let manifest = Manifest::new([Wasm::data(wasm_content.clone())])
+        let manifest = Manifest::new([Wasm::data(wasm_content)])
             .with_allowed_hosts(allowed_hosts.clone().into_iter())
             .with_config(env_map.into_iter());
 

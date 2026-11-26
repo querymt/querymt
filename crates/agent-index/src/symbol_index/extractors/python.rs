@@ -100,7 +100,7 @@ fn collect_decorated_symbol(
             ));
         }
         "class_definition" => symbols.push(class_symbol_with_outer(
-            node, &inner, source, parent, decorator,
+            node, &inner, source, parent, &decorator,
         )),
         _ => {}
     }
@@ -108,7 +108,7 @@ fn collect_decorated_symbol(
 
 fn class_symbol(node: &Node, source: &str, parent: Option<&str>, decorated: bool) -> SymbolEntry {
     let name = identifier_name(node, source);
-    let signature = class_signature(node, source, String::new());
+    let signature = class_signature(node, source, "");
     let kind = if is_test_class(&name) {
         SymbolKind::Test
     } else {
@@ -125,7 +125,7 @@ fn class_symbol_with_outer(
     inner: &Node,
     source: &str,
     parent: Option<&str>,
-    decorator: String,
+    decorator: &str,
 ) -> SymbolEntry {
     let name = identifier_name(inner, source);
     let kind = if is_test_class(&name) {
@@ -278,7 +278,7 @@ fn function_signature(node: &Node, source: &str) -> String {
     format!("{prefix}def {name}{params}{return_type}")
 }
 
-fn class_signature(node: &Node, source: &str, decorator: String) -> String {
+fn class_signature(node: &Node, source: &str, decorator: &str) -> String {
     let name = identifier_name(node, source);
     let superclasses = find_child_by_kind(node, "argument_list")
         .map(|n| node_text(&n, source).to_string())

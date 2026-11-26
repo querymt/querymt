@@ -478,7 +478,7 @@ impl Prepared {
         let docs = request.lane != Lane::Navigation;
         let plan = SearchPlan {
             fts_expression: docs.then(|| fts_expression(&tokens)),
-            scope: scope.clone(),
+            scope,
             exact_paths: if docs { candidates.clone() } else { Vec::new() },
             // Headroom so de-duplication cannot starve the limit.
             fts_limit: (limit * 4).clamp(20, 200),

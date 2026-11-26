@@ -864,7 +864,7 @@ pub fn replay(
                 wrong += 1;
             }
         }
-        let summary = delivery.entry(class.clone()).or_default();
+        let summary = delivery.entry(class).or_default();
         summary.cards += gated.len();
         summary.added_tokens += tokens;
         summary.added_bytes += bytes;
