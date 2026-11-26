@@ -78,7 +78,7 @@ fn rows(items: &[Item]) -> Vec<Row> {
     out
 }
 
-/// QueryMT's golden cases at the pinned rev, by name.
+/// QueryMT's golden cases (from the workspace's session core), by name.
 fn core_cases() -> Vec<(String, Vec<Vec<SessionInput>>)> {
     querymt_agent_session_core::testing::golden_cases()
         .into_iter()

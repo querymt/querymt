@@ -32,6 +32,13 @@
 - `querymt-remote`: shared mesh and remote-provider primitives.
 - `querymt-service-client`: service OAuth and API client primitives, not a server.
 - Provider crates live under `crates/providers/`.
+- `querymt-gpui` (`crates/querymt-gpui`): QueryMT Desktop, the GPUI desktop and web
+  client. One binary crate (tests live in the bin target, so use `--bins`) that talks
+  to agents only over ACP and uses `querymt-agent-session-core` by path. It is not a
+  default member and builds for `wasm32-unknown-unknown` too; Linux builds need GPUI's
+  system libraries (devShell, or the apt list in `.github/workflows/test-gpui.yml`).
+  A change to `querymt-agent-session-core` or `querymt-agent-protocol-types` must keep
+  `cargo t-gpui` green. Its own notes are in `crates/querymt-gpui/knowledge/`.
 
 ## Development Environment
 
@@ -115,8 +122,10 @@
 
 ## Dashboard Boundary
 
-- UI implementation and testing belong to the separate `querymt-desktop` repository.
-  Report required UI follow-up rather than expanding backend work into that repo.
+- The embedded web dashboard belongs to the separate `querymt-desktop` repository.
+  Report required dashboard follow-up rather than expanding backend work into that
+  repo. The GPUI app (`crates/querymt-gpui`) lives here and is changed in the same
+  pull request when a backend change needs it.
 - For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
   from `.github/actions/rust-setup/action.yml` instead of rebuilding the frontend.
 
