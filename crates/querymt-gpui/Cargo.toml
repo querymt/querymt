@@ -80,7 +80,7 @@ png = "0.17"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 minisign-verify = "0.3"
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Swaps the running .app bundle for the downloaded one (design D10). The
@@ -155,7 +155,7 @@ gpui-pre-apple = "=0.3.14"
 
 [build-dependencies]
 dirs.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
