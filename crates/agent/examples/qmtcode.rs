@@ -12,7 +12,8 @@
 //! cargo run --example qmtcode --features api -- --api
 //! cargo run --example qmtcode --features api -- --api=0.0.0.0:8080
 //!
-//! # Embedded Svelte dashboard mode (from the workspace root)
+//! # Embedded QueryMT Desktop web dashboard mode (from the workspace root;
+//! # the first build compiles crates/querymt-gpui for wasm32)
 //! cargo run --example qmtcode --features dashboard -- --dashboard
 //! cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 //!
@@ -124,7 +125,7 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     api: Option<String>,
 
-    /// Run the embedded Svelte dashboard over ACP; optionally set bind address
+    /// Serve the embedded QueryMT Desktop web UI over same-origin ACP; optionally set bind address
     #[cfg(feature = "dashboard")]
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard: Option<String>,
