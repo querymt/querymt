@@ -194,14 +194,14 @@ pub(crate) struct QuickPanel {
 impl EventEmitter<QuickPanelEvent> for QuickPanel {}
 
 /// Window kinds to try, best first (design D7).
-fn window_kinds() -> Vec<WindowKind> {
+fn window_kinds(_compositor: &str) -> Vec<WindowKind> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         vec![WindowKind::PopUp]
     }
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if _compositor == "Wayland" {
             use gpui_kit::layer_shell::{KeyboardInteractivity, Layer, LayerShellOptions};
             // wlroots and KDE have layer-shell; GNOME refuses it and gets a
             // normal window.
@@ -351,7 +351,7 @@ pub(super) fn open_window(
 ) -> Result<(AnyWindowHandle, Entity<QuickPanel>)> {
     let mut last = None;
     let height = initial_height(resume.session.is_some());
-    for kind in window_kinds() {
+    for kind in window_kinds(cx.compositor_name()) {
         let movable = movable(&kind);
         let positions = store.read(cx).prefs.quick.positions.clone();
         let options = window_options(kind, display, height, &positions, cx);
