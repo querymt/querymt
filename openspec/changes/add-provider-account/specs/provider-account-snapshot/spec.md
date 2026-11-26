@@ -43,7 +43,7 @@ A non-success HTTP status from the account endpoint SHALL become the same classi
 - **THEN** the result is the classified authentication error, not a snapshot and not `Unsupported`
 
 #### Scenario: Malformed account body is a parse error
-- **WHEN** the account endpoint answers 200 with a body that is not the expected shape
+- **WHEN** the account endpoint answers 200 with a body that is not a JSON object
 - **THEN** the result is an error naming the parse failure and no partial snapshot is returned
 
 ### Requirement: Wasm plugins export the account contract optionally
@@ -57,6 +57,42 @@ A Wasm (Extism) HTTP plugin built with the plugin macro SHALL export `account_re
 #### Scenario: Plugin decline crosses the boundary as unsupported
 - **WHEN** a plugin's `account_request` returns no request for the given configuration
 - **THEN** the host answers `Unsupported` without performing any HTTP request
+
+### Requirement: Wasm account requests go only to allowed or declared hosts
+
+For a Wasm plugin the host SHALL issue the request built by `account_request` only when its host is one of the allowed hosts the plugin was loaded with or one of the account hosts the plugin declares; an empty allowed-hosts list SHALL allow every host, as for plugin-initiated HTTP. A request to any other host SHALL NOT be issued and SHALL fail with an invalid-request error naming the host and the `allowed_hosts` configuration key.
+
+#### Scenario: Account request to a host outside the allow-list is refused
+- **WHEN** a Wasm plugin loaded with allowed hosts `api.example.com` that declares no account hosts builds an account request for `other.example.net`
+- **THEN** no HTTP request is issued and the result is an invalid-request error naming `other.example.net` and `allowed_hosts`
+
+#### Scenario: Configured allowed host lets the account request through
+- **WHEN** the same plugin is loaded with `allowed_hosts` containing `other.example.net` and builds the same request
+- **THEN** the request is issued and its response is handed to the plugin's parser
+
+### Requirement: Plugins declare account hosts once at load
+
+A Wasm plugin MAY declare the hosts its account requests target through the optional `account_hosts` export; a plugin without the export declares none. The host SHALL read the declaration once when it loads the plugin, SHALL use it for account requests only, and SHALL NOT add it to the hosts the plugin itself may reach. Declared hosts SHALL apply whether or not a `base_url` is configured.
+
+#### Scenario: Declared account host needs no configuration
+- **WHEN** a Wasm plugin whose base-URL host is `api.x.ai` declares the account host `cli-chat-proxy.grok.com`, is loaded with no `allowed_hosts` setting, and builds an account request for that host
+- **THEN** the request is issued and its response is handed to the plugin's parser
+
+#### Scenario: Declared account host stays out of the plugin's own reach
+- **WHEN** the same plugin is loaded
+- **THEN** the allowed hosts for plugin-initiated HTTP are `api.x.ai` only
+
+### Requirement: Parsers tolerate absent optional fields
+
+A provider's parser SHALL treat every mapped field as optional: a field that is absent or null omits the plan, limit, limit attribute or credit it would have produced, and a limit without a percentage is omitted. A mapped field of the wrong JSON type SHALL be a parse error. A reset time that is not a UTC RFC 3339 timestamp SHALL leave its limit without `resets_at`.
+
+#### Scenario: Codex body without optional sections still parses
+- **WHEN** the usage endpoint returns only `rate_limit.primary_window.used_percent` 40, with no plan, window length, reset time, additional limits or credits
+- **THEN** the snapshot has one limit `primary` at 40 percent with no `window_seconds` and no `resets_at`, no plan and no credits
+
+#### Scenario: Unparseable reset time leaves the limit without a reset
+- **WHEN** the Claude usage endpoint returns `five_hour` at 24 percent with `resets_at` `2026-11-25T22:09:59+02:00`
+- **THEN** the snapshot has limit `five_hour` at 24 percent with `window_seconds` 18000 and no `resets_at`
 
 ### Requirement: Codex requests the ChatGPT usage endpoint
 
@@ -78,17 +114,25 @@ Codex SHALL parse `plan_type` as the plan; `rate_limit.primary_window` and `rate
 - **WHEN** the usage endpoint returns `plan_type: "pro"`, a primary window at 99 percent of a 604800-second window resetting at a given epoch second, no secondary window, one additional limit for `codex_other` scoped to a model slug, and credits with balance `"12701.63"`
 - **THEN** the snapshot has plan `pro`, limits `primary` (99, 604800, that epoch second, not reached) and `codex_other` (with the model slug as scope), no `secondary` limit, and credits balance `12701.63` not unlimited
 
-### Requirement: xAI reports an account only for OAuth credentials
+### Requirement: xAI reports an account only for xAI OAuth tokens
 
-The `xai` provider SHALL answer `Unsupported` unless its configuration selects OAuth (`auth_type = "oauth"`). With OAuth it SHALL request `/v1/billing?format=credits` on the Grok CLI proxy host with the resolved token as bearer, the Grok CLI token header and the user id taken from the token's subject claim.
+The `xai` provider SHALL answer `Unsupported` unless its resolved credential is an xAI OAuth access token, recognised as a JWT whose issuer claim is `https://auth.x.ai` and which carries a subject claim; the `auth_type` setting SHALL NOT be required. For such a token it SHALL request `/v1/billing?format=credits` on `cli-chat-proxy.grok.com` with the token as bearer, the Grok CLI token header and the user id taken from the subject claim, and it SHALL declare that host as its only account host.
 
 #### Scenario: xAI API key is unsupported
-- **WHEN** the configuration has an API key and no `auth_type`
+- **WHEN** the credential is an `xai-…` API key
+- **THEN** the account query answers `Unsupported` without an HTTP request
+
+#### Scenario: xAI ignores a token from another issuer
+- **WHEN** the credential is a JWT with a subject claim whose issuer is not `https://auth.x.ai`
 - **THEN** the account query answers `Unsupported` without an HTTP request
 
 #### Scenario: xAI OAuth request carries the Grok CLI headers
-- **WHEN** the configuration has `auth_type: "oauth"` and a token whose subject claim is a user id
+- **WHEN** the credential is a JWT issued by `https://auth.x.ai` whose subject claim is a user id, and no `auth_type` is configured
 - **THEN** the account request targets the Grok CLI proxy credits endpoint with the bearer token, the Grok CLI token header and that user id
+
+#### Scenario: xAI declares the Grok CLI proxy as its account host
+- **WHEN** the xai factory's account hosts are read
+- **THEN** they are exactly `cli-chat-proxy.grok.com`
 
 ### Requirement: xAI parses the credits body
 

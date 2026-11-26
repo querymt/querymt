@@ -4,7 +4,7 @@
 
 One additive contract, the same shape for every provider, and no new code path for credentials, HTTP or plugin loading. Everything below builds on the model-listing path, which already solves "run a credentialed, provider-specific GET through the host for static, Wasm and native factories".
 
-Boundaries: no header or stream capture, one request per snapshot, no persistence, no config keys.
+Boundaries: one request per snapshot, pull only (no header or stream capture; live updates are a follow-up change), no persistence, no new config keys.
 
 ## D1: The snapshot is an *account*, usage is one field of it
 
@@ -74,7 +74,7 @@ pub struct CreditBalance {
 
 Construction: the structs are `#[non_exhaustive]` (as `ChatCall` is) so later fields are not a break for plugin crates, which therefore build them through `#[must_use]` constructors instead of literals: `ProviderAccount::new()` with `with_plan`, `push_limit`, `with_credits`; `UsageLimit::new(id, used_percent)` with `with_label`, `with_scope`, `with_window_seconds`, `with_resets_at`, `with_reached` (unset → derived from `used_percent >= 100.0` at construction); `CreditBalance::new()` with `with_balance`, `with_currency`, `unlimited()`. Fields stay `pub` for reading. Integer conventions follow the repo: epoch seconds are `i64` with `typeshare(serialized_as = "number")` (`agent-core/src/delegation_update.rs`), durations that fit are `u32`; conversions from provider payloads use `TryFrom`/`saturating_sub`, never `as`.
 
-Why percent and not tokens: Codex, Claude and Grok all report percent used; none reports the token allowance. Why epoch seconds: no date dependency in `querymt`, and Codex already uses it. Claude and Grok return RFC 3339 timestamps; `querymt` already depends on `humantime`, whose `parse_rfc3339_weak` handles both (`2026-11-25T22:09:59.989045+00:00` needs the offset form; verify at implementation and, if `humantime` rejects a `+00:00` offset, add `humantime`'s sibling-free fallback: a small RFC 3339 parser in `querymt::plugin::account::parse_rfc3339_utc`, no new dependency). The helper lives in `querymt` so all plugins share it and wasm32 builds need nothing extra. `reached` is the provider's own flag (`limit_reached`, `locked_reason`), else `used_percent >= 100`.
+Why percent and not tokens: Codex, Claude and Grok all report percent used; none reports the token allowance. Why epoch seconds: no date dependency in `querymt`, and Codex already uses it. Claude and Grok return RFC 3339 timestamps in UTC with a `+00:00` offset and fractional seconds (observed: `2026-11-25T22:09:59.989045+00:00` and `2026-11-29T16:16:02.926+00:00`). The shared helper `querymt::plugin::account::parse_rfc3339_utc(&str) -> Option<i64>` wraps `humantime::parse_rfc3339_weak`, which accepts `Z` or `+00:00`, with or without fractional seconds, and rejects every other offset (read in the 2.3.0 and 2.4.0 sources; the lockfile has 2.4.0). `querymt` already depends on `humantime = "2"`; the requirement is raised to `"2.3"`, the lowest version checked. A timestamp the helper rejects yields `None` and the limit is reported without `resets_at`. The helper lives in `querymt` so all plugins share it and wasm32 builds need nothing extra. `reached` is the provider's own flag (`limit_reached`, `locked_reason`), else `used_percent >= 100`.
 
 Typeshare attributes follow `crates/querymt/src/chat/mod.rs`. `AccountReport` is a plain in-process enum; the ACP layer flattens it into the status entry (D5), and it is matched exhaustively there (adding a variant later is a deliberate, visible break for the one in-workspace matcher).
 
@@ -89,6 +89,9 @@ fn account_request(&self, _cfg: &str) -> Result<Option<Request<Vec<u8>>>, LLMErr
 fn parse_account(&self, _resp: Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
     Err(LLMError::NotImplemented("account snapshot".into()))
 }
+/// Hosts other than the base-URL host that `account_request` may target.
+/// A constant, so a Wasm host can read it once at load.
+fn account_hosts(&self) -> &'static [&'static str] { &[] }
 ```
 
 `crates/querymt/src/plugin/mod.rs LLMProviderFactory` gains the one method callers use:
@@ -102,10 +105,10 @@ fn account<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<AccountReport, LLMError>>
 `account_request` keeps `Option<Request>` because it answers a narrower question ("is there anything to fetch?"); only `account` is part of the caller-facing vocabulary, and there `Unsupported` is a named outcome rather than `None`.
 
 - `crates/querymt/src/plugin/adapters.rs HTTPFactoryAdapter::account`: `account_request` → `call_outbound` → `parse_account`, like `list_models`. A non-success status goes through `classify_http_status` (the `handle_http_error!` rule for non-chat paths) so 401/403 map to an auth error and 429/5xx stay retryable.
-- `crates/querymt/src/plugin/extism_impl/host/mod.rs`: `ExtismFactory` implements both traits' new methods the way `list_models_request` / `parse_list_models` are implemented (lock plugin, `call_get_error_code`, `decode_plugin_error`), with the `spawn_blocking` wrapping from `ExtismFactory::list_models`. `account_request` returns `Ok(None)` without calling the plugin when `!plug.function_exists("account_request")`, so `account` reports `Unsupported`.
-- Native non-HTTP factories (llama-cpp, mrs, izwi) inherit the default `None`.
+- `crates/querymt/src/plugin/extism_impl/host/mod.rs`: `ExtismFactory` implements both traits' new methods the way `list_models_request` / `parse_list_models` are implemented (lock plugin, `call_get_error_code`, `decode_plugin_error`), with the `spawn_blocking` wrapping from `ExtismFactory::list_models`. `account_request` returns `Ok(None)` without calling the plugin when `!plug.function_exists("account_request")`, so `account` reports `Unsupported`. Before issuing the request, `ExtismFactory::account` checks its host against the factory's allowed hosts and the plugin's declared account hosts (D4).
+- `LLMProviderFactory::account` sits on the generic trait because the runtime holds `dyn LLMProviderFactory` and needs one call that `HTTPFactoryAdapter` and `ExtismFactory` both answer. It is a dispatch point, not a contract for non-HTTP factories: llama-cpp, mrs and izwi inherit `Unsupported`, and the runtime reports them as `unsupported` without calling it (D5).
 
-The config string is the same pruned JSON the factory accepts for `from_config` and `list_models`; it contains `api_key` (already an OAuth access token when that is the active method), `base_url` and provider fields such as `auth_type`, so the plugin decides from the credential whether to issue a request.
+The config string is the same pruned JSON the factory accepts for `from_config` and `list_models`; it contains `api_key` (already an OAuth access token when that is the active method) and `base_url`. The runtime sets no marker for the auth method: `resolve_provider_config` writes `api_key` and nothing else, and does not set `auth_type`. A plugin therefore recognises an OAuth credential from the token itself.
 
 ## D3: Extism exports
 
@@ -114,17 +117,24 @@ The config string is the same pruned JSON the factory accepts for `from_config` 
 ```rust
 #[plugin_fn] pub fn account_request(Json(input): Json<ExtismAccountRequest>) -> FnResult<Json<Option<SerializableHttpRequest>>>
 #[plugin_fn] pub fn parse_account_response(Json(input): Json<ExtismAccountParseRequest>) -> FnResult<Json<ProviderAccount>>
+#[plugin_fn] pub fn account_hosts() -> FnResult<Json<Vec<String>>>
 ```
 
-with `ExtismAccountRequest { cfg: Value }` and `ExtismAccountParseRequest { resp: SerializableHttpResponse }` in `crates/querymt/src/plugin/extism_impl/interface.rs`, next to `ExtismListModelsRequest`. Errors are encoded with `PluginError::encode`, as every other export. A plugin built before this change simply lacks the exports; the host's `function_exists` probe makes it `Unsupported`. No contract-version constant changes (see proposal Impact for the review flag).
+with `ExtismAccountRequest { cfg: Value }` and `ExtismAccountParseRequest { resp: SerializableHttpResponse }` in `crates/querymt/src/plugin/extism_impl/interface.rs`, next to `ExtismListModelsRequest`. `account_hosts` takes no input and returns `HTTPLLMProviderFactory::account_hosts(&$Factory)`, as `api_key_name` does. Errors are encoded with `PluginError::encode`, as every other export. A plugin built before this change simply lacks the exports; the host's `function_exists` probe makes it `Unsupported`. No contract-version constant changes (see proposal Impact for the review flag).
 
 ## D4: Plugin implementations
 
 - `crates/providers/codex/src/lib.rs CodexFactory`: `account_request` builds `GET {base_url}/../wham/usage` (base URL `https://chatgpt.com/backend-api/codex/` → `https://chatgpt.com/backend-api/wham/usage`; derive by joining `../wham/usage` so custom base URLs keep working) with `Authorization: Bearer`, `ChatGPT-Account-ID` from `api.rs chatgpt_account_id`, `User-Agent` as chat. `parse_account`: `plan = plan_type`; limits `primary`/`secondary` from `rate_limit.{primary_window,secondary_window}` (`used_percent`, `limit_window_seconds`, `reset_at`, `reached = rate_limit.limit_reached` for primary), plus one limit per `additional_rate_limits[]` entry (`id = metered_feature`, `label = limit_name`, `scope = normal_model_slug`); credits from `credits.{balance, unlimited}` with currency `None` (ChatGPT credits are a unit, not a currency).
-- `crates/providers/xai/src/lib.rs XaiFactory`: `account_request` returns `None` unless `auth_type == "oauth"`; otherwise `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` with `Authorization: Bearer`, `X-XAI-Token-Auth: xai-grok-cli`, `x-userid: <JWT sub>` (decode the unsigned payload like `chatgpt_account_id` does). The host URL is a constant, not derived from `base_url` (`api.x.ai`). `parse_account`: one limit `weekly` (`label` from `currentPeriod.type`, `used_percent = creditUsagePercent`, `window_seconds = end - start`, `resets_at = end`), one scoped limit per `productUsage[]` entry (`id = "weekly:" + product`, `scope = product`), credits from `prepaidBalance.val` cents → `"12.34"`, currency `USD`. `plan = None`.
+- `crates/providers/xai/src/lib.rs XaiFactory`: `account_request` returns `None` unless `api_key` is an xAI OAuth access token, recognised as a JWT whose payload has `iss` `https://auth.x.ai` and a string `sub`. `auth_type` is not consulted, because the runtime does not set it. The issuer test keeps a JWT from another service, used with a custom `base_url`, from being sent to Grok. `account_hosts` returns `["cli-chat-proxy.grok.com"]`. For an xAI OAuth token: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` with `Authorization: Bearer`, `X-XAI-Token-Auth: xai-grok-cli`, `x-userid: <JWT sub>` (decode the unsigned payload like `chatgpt_account_id` does). The host URL is a constant, not derived from `base_url` (`api.x.ai`). The two extra headers are kept as grok-build sends them. In one probe (2026-11-25) the endpoint also answered 200 with the bearer token alone, so the code carries a `TODO` where they are set: consider identifying as QueryMT in `X-XAI-Token-Auth`, or dropping that header and `x-userid`. `parse_account`: one limit `weekly` (`label` from `currentPeriod.type`, `used_percent = creditUsagePercent`, `window_seconds = end - start`, `resets_at = end`), one scoped limit per `productUsage[]` entry (`id = "weekly:" + product`, `scope = product`), credits from `prepaidBalance.val` cents → `"12.34"`, currency `USD`. `plan = None`.
 - `crates/providers/anthropic/src/factory.rs`: `account_request` returns `None` unless `detect_auth_type` says OAuth; otherwise `GET {base_url}/api/oauth/usage` with `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version: 2023-06-01`. `parse_account`: limits `five_hour`, `seven_day` from the top-level objects (`used_percent = utilization`, `window_seconds` 18000 / 604800, `resets_at` parsed from RFC 3339, `reached = locked_reason.is_some() || utilization >= 100`), plus one scoped limit per `limits[]` entry whose `scope.model` is set (`id = kind`, `scope = scope.model.display_name`). `plan = None`. Credits from `spend.balance` when present.
 
-Extism host allow-lists: the Extism host restricts outbound hosts to the plugin's base URL plus configured `allowed_hosts` (`crates/querymt/src/plugin/extism_impl/host/mod.rs build_allowed_hosts`). The host runs the account request itself through `call_outbound`, not through the plugin's HTTP host function, so the allow-list does not apply; `chatgpt.com` and `cli-chat-proxy.grok.com` need no plugin manifest change. State this in the plugin docs so authors do not add them.
+Parser tolerance: each parser reads the body as a JSON object and treats every mapped field as optional. An absent or null field omits the plan, limit, limit attribute or credit it would have produced, and a limit whose percentage is absent is omitted. A body that is not a JSON object, or a mapped field of the wrong JSON type, is `LLMError::ResponseFormatError`, which the runtime reports as that provider's `error` entry. These endpoints are undocumented (proposal Risks), so shape drift has to degrade to fewer fields or one `error` entry.
+
+Allowed hosts for Wasm plugins: `ExtismFactory` already holds the allowed hosts it was loaded with (`allowed_hosts`, built by `build_allowed_hosts` from `[providers.config].allowed_hosts` plus the configured `base_url` host, or else the plugin's default `base_url` host) and already rejects a runtime `base_url` outside them (`validate_runtime_base_url`). Plugin-initiated HTTP is checked in the host functions (`extism_impl/host/functions.rs`), but a request the host runs for a plugin is not, so without a check a plugin could make the host send the user's token to a host chosen at call time. `ExtismFactory::account` therefore issues the request returned by `account_request` only when its host is in `allowed_hosts` or in the plugin's declared account hosts (an empty `allowed_hosts` allows every host, as today). Otherwise it returns `LLMError::InvalidRequest` naming the provider, the host and `[providers.config].allowed_hosts`, without issuing the request.
+
+Declared account hosts: `ExtismFactory::load` reads the optional `account_hosts` export once, on the init plugin where it already reads `name` and `base_url`, stores the result as `account_hosts: Vec<String>` and logs it with the allowed hosts. A plugin without the export declares nothing. The list is used only by the account check. It is not passed to `Manifest::with_allowed_hosts` or to `HostState`, so the plugin's own HTTP reach is unchanged. This is the trust the host already gives the plugin's `base_url` export, whose host is allowed without configuration: it does not protect against a plugin that is itself malicious, and it does stop a request to a host that was neither configured nor declared at load. Declared hosts apply whether or not `base_url` is configured, because the account endpoint does not move with the chat base URL.
+
+Consequences: Codex and Anthropic declare nothing, because their usage endpoints are on the base-URL host (also with a custom `base_url`). xAI declares `cli-chat-proxy.grok.com`, so its account query works under Wasm with no configuration; that host is contacted only for an account request, which xAI builds only for an xAI OAuth token. Statically linked factories are in-tree code and have no allow-list. Model listing and prepared chat requests keep their current behaviour (host-run, unchecked); closing that is outside this change.
 
 ## D5: Runtime method and caching
 
@@ -166,38 +176,10 @@ pub struct ProviderAccountStatus {
 }
 ```
 
-- Cache: `parking_lot::Mutex<HashMap<String, (Instant, ProviderAccountStatus)>>` on `OAuthService` (short critical sections, never held across an `.await`; the same choice as `ModelInventory`'s caches, while `OAuthService`'s existing `tokio::sync::Mutex` guards awaited flows), TTL 60 s for `ok` and `unsupported`; `unauthenticated` and `error` are never cached. `invalidate_auth_caches` clears it, so login, logout, token changes and method changes take effect on the next call. `refresh: true` ignores the cache for the requested providers.
-- Errors: `SessionError::CredentialRefresh` and missing-credential errors map to `unauthenticated`; `LLMError` from the factory maps to `error` with `Display` text and no secrets (request URLs and bodies are not echoed).
+- Cache: `parking_lot::Mutex<HashMap<String, (Instant, ProviderAccountStatus)>>` on `OAuthService` (short critical sections, never held across an `.await`; the same choice as `ModelInventory`'s caches, while `OAuthService`'s existing `tokio::sync::Mutex` guards awaited flows), TTL 60 s for `ok` and `unsupported`; `unauthenticated` and `error` are never cached. `invalidate_auth_caches` clears it, so login, logout, token changes and method changes take effect on the next call. `refresh: true` ignores the cache for the requested providers. The cache key is the provider name only, so a credential changed outside the ACP auth methods (an environment variable, a reloaded config `api_key`) is picked up when the entry expires or on `refresh: true`.
+- Errors: `SessionError::CredentialRefresh` and missing-credential errors map to `unauthenticated`; `LLMError` from the factory maps to `error` with `Display` text and no secrets (request paths, queries and bodies are not echoed; a refused-host error names the host only).
 
-## D6: Live snapshots from chat response headers
-
-Codex and Claude OAuth send the usage windows as headers on every chat response; xAI sends nothing (grok-build re-fetches `/billing` after each prompt instead). The hook is stateless and I/O-free so it costs one function call per response and nothing for providers that do not implement it.
-
-Plugin side (`crates/querymt/src/plugin/http.rs HTTPLLMProvider`):
-
-```rust
-/// Map a chat response's headers to a partial snapshot; None when the headers carry nothing.
-fn account_from_headers(&self, _headers: &http::HeaderMap) -> Option<ProviderAccount> { None }
-```
-
-- Codex (`crates/providers/codex/src/lib.rs`): parse the `x-codex-primary-*` / `x-codex-secondary-*` families (`used-percent`, `window-minutes` → seconds, `reset-at`) and `x-codex-credits-*` (`has-credits`, `unlimited`, `balance`), plus any other `x-<limit>-primary-used-percent` family as a limit with that id (Codex's `parse_all_rate_limits`). Only for OAuth (always, for Codex).
-- Anthropic (`crates/providers/anthropic/src/factory.rs`): only when the provider is OAuth; parse `anthropic-ratelimit-unified-5h-utilization` → `five_hour`, `-7d-utilization` → `seven_day`, `-reset` (RFC 3339 or epoch; verify at implementation) → `resets_at` on the window it names, `-status` (`rejected`) → `reached`. API-key `anthropic-ratelimit-requests-*` headers are ignored (non-goal).
-- xAI: default `None`.
-- Extism: the macro exports `account_from_headers(Json<ExtismAccountHeadersRequest { headers: Vec<(String, String)> }>) -> Json<Option<ProviderAccount>>`; the host probes with `function_exists` once per provider instance and never calls it when absent.
-
-Host side (`crates/querymt/src/adapters.rs HTTPProviderAdapter`, `crates/querymt/src/plugin/extism_impl/host`):
-
-- `OutboundStreamResult::Success` gains `headers: http::HeaderMap` (`crates/querymt/src/outbound.rs`; no users outside `querymt`) and both variants become `#[non_exhaustive]` so the next field is not a second break. The adapter's `chat` already holds the full response; both `chat` and `chat_stream` call `inner.account_from_headers(headers)` before parsing the body and hand a `Some` result to the observer. The Extism provider does the same in its `chat` export path and in `qmt_http_stream_open` after the status check (`functions.rs:300`).
-- Observer: `LLMProvider::set_account_observer(&mut self, Arc<dyn AccountObserver>)`, default no-op, mirroring `set_key_resolver`. `AccountObserver` is `trait AccountObserver: Send + Sync { fn observe(&self, account: ProviderAccount); }` in `querymt::plugin::account`. The adapter stores it as `Option<Arc<dyn AccountObserver>>`; `ExtismProvider` likewise.
-
-Runtime side:
-
-- `crates/agent-runtime/src/session/provider.rs build_provider_snapshot_with_route` attaches an observer right where it attaches the key resolver (`:741`), for every HTTP provider (not only OAuth: the hook itself decides). The observer holds the logical provider name and an `Arc<AccountCache>` shared with `OAuthService`.
-- Merge rule in `AccountCache::merge(provider, partial)`: if the provider has a cached `ok` entry, replace limits whose `id` matches, append new ids, keep the rest, replace `plan` and `credits` only when the partial has them; if there is no cached entry (or it is `unsupported`), store the partial as `ok`. `fetched_at` becomes now. The TTL in D5 applies from the merge time.
-- After a merge the runtime broadcasts `ExtNotification::new("querymt/auth/accountChanged", { provider, account, fetched_at })` through `broadcast_ext_notification`, debounced to at most one per provider per 2 s (a Codex turn with tool calls produces several responses in a row). Clients that did not call `auth/account` still receive it; it carries the full merged entry so no follow-up read is required.
-- Turn completion: when a session's run ends (`RunEnded`), the runtime marks the run's provider entry stale (`fetched_at` cleared; still returned until re-fetched) so the next `auth/account` call for that provider bypasses the 60 s TTL. This covers xAI and any provider without headers, without any background request.
-
-## D7: What stays out of the plugin trait on purpose
+## D6: What stays out of the plugin trait on purpose
 
 A single async `account(cfg)` on `HTTPLLMProviderFactory` that does its own HTTP would let plugins chain requests, but the HTTP factory traits are deliberately sync request builders so one host implementation serves static, Wasm and native loading and so outbound policy stays in the host. Chaining can be added later as `parse_account` returning "done or next request" without changing this wire shape.
 

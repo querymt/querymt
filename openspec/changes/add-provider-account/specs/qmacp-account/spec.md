@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines how the qmacp CLI and the qmcp MCP server expose provider account snapshots and their live updates to scripts, operators and MCP clients.
+Defines how the qmacp CLI and the qmcp MCP server expose provider account snapshots to scripts, operators and MCP clients.
 
 ## ADDED Requirements
 
@@ -29,15 +29,3 @@ qmcp SHALL expose a read-only, idempotent MCP tool `account` with optional argum
 #### Scenario: Account tool refuses an older server
 - **WHEN** an MCP client calls `account` against a server whose capabilities lack `auth_account`
 - **THEN** the tool returns an error naming the missing support and no `querymt/auth/account` call is made
-
-### Requirement: Account changes appear as compact stream events
-
-While qmacp `prompt` or `follow`, or qmcp `prompt`, `follow` or `watch`, streams events, a `querymt/auth/accountChanged` notification SHALL be emitted on stdout as the NDJSON event `{ "type": "account_changed", "provider", "account", "fetched_at" }`, in arrival order with the other compact events, without altering `done` detection.
-
-#### Scenario: Account change is visible during follow
-- **WHEN** the server sends `querymt/auth/accountChanged` for `codex` while `qmacp follow` is streaming
-- **THEN** stdout contains one `account_changed` event for `codex` carrying the notification's account, and the stream still terminates with its `done` event
-
-#### Scenario: Account change is collected by the qmcp follow tool
-- **WHEN** the server sends `querymt/auth/accountChanged` for `codex` while the qmcp `follow` tool is collecting events
-- **THEN** the tool's collected events include one `account_changed` event for `codex`

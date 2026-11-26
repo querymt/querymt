@@ -40,7 +40,7 @@ For each HTTP provider the agent SHALL resolve the configuration and credential 
 
 ### Requirement: Providers without a credential or an HTTP factory are reported, not queried
 
-A provider with no usable credential SHALL be reported as `unauthenticated`; an OAuth refresh failure that requires re-login SHALL also be `unauthenticated` with its message in `error`. A provider whose factory is not HTTP-based SHALL be reported as `unsupported` without resolving credentials. No status message SHALL contain the credential, the request URL or the response body.
+A provider with no usable credential SHALL be reported as `unauthenticated`; an OAuth refresh failure that requires re-login SHALL also be `unauthenticated` with its message in `error`. A provider whose factory is not HTTP-based SHALL be reported as `unsupported` without resolving credentials. No status message SHALL contain the credential, the request path or query, or the response body.
 
 #### Scenario: Missing credential is unauthenticated
 - **WHEN** a provider has no stored key, no environment variable and no OAuth tokens
