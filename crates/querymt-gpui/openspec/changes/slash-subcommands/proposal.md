@@ -32,4 +32,4 @@ None.
   - `src/ui/keys.rs`: palette entries per subcommand.
   - `src/ui/slash.rs`: the second-stage list, and completion of `/name sub `.
   - Tests in both files.
-- **Depends on** `slash-command-actions` (arity, deliveries, palette disabled state). Archive after it.
+- **Depends on** `slash-command-actions` (input need, accepted submissions, unavailable palette rows). Archive after it.

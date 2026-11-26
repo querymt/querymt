@@ -63,19 +63,44 @@ and can be dragged; its position is remembered per display in `Prefs.quick.posit
   pane's main switch), plus `radius`, `tint`, `rimmed`, `native_motion`, `white_through`
   and the root colours from `surfaces`. The window's `Root` must stay transparent or it
   covers the material.
-- **The bar of a new quick chat** (D19, `render_empty` in `panel.rs`): the input, then the
-  agent and folder, the model chip and the session-picker button. The agent mode and the
-  reasoning effort are not chips of the bar's: they are tags on the model chip's top edge
-  (mode left, reasoning right, also at `auto`), drawn by `kit::badged`/`kit::badge_tag`
-  with `BadgeSize::HUD` (the main window's model pill uses the same helper at
-  `BadgeSize::TOOLBAR`). Each tag is a button (`quick-mode`, `quick-reasoning`; click moves
-  to the next value, Shift+click the previous mode) that occludes, so it is not a drag area.
-  The label is `text` on `hud::tag_fill(tone)`, an opaque tint of the tone; the tag is cut
-  out of the chip only without a material (in `Chrome::surfaces`' root colour). The chip has
-  a minimum width so the tags do not overlap. The input's laid-out height is measured by a
-  canvas (`input_h`); past two lines of it (`bar_stacked`) the controls become a
-  bottom-aligned column beside the input, and return to one row only at one line or an
-  empty draft. The conversation's compact composer keeps its own mode and model chips.
+- **The bar of a new quick chat** (D19, `render_empty` in `panel.rs`): a column. The input
+  (`quick-composer`, 26 px lines, the kit's `xsmall` size so it adds no padding) has the full
+  width, the launch spinner at its trailing end; under it is one row of labels, 12 px text
+  set once on the row, whose first label's text starts where the prompt's text does. The
+  kit's `Textarea` insets its lines by `Size::XSmall.input_px()` (4 px, `BAR_TEXT_INSET`)
+  even without its appearance, so the row is pulled out by the items' 6 px padding less
+  those 4 px. The labels are the agent (only when several are configured), `quick-folder`,
+  `quick-mode` (a 6 px `mode_tone` dot and the name; the name keeps the selector
+  `quick-mode:{label}`; the label is as wide as the widest mode's name, the other names
+  laid out at zero height beside it, so cycling the mode moves nothing after it),
+  `quick-model` (name and a 10 px chevron),
+  `quick-reasoning` (`Brain` and the effort, also at `auto`), and `quick-picker-toggle` at
+  the trailing end. Items are 22 px, `p.muted` text and `p.dim` glyphs, no fill at rest,
+  `p.chip` and `p.text` on hover, with caps of 90 (agent), 160 (folder) and 220 px (model).
+  Each is a button that occludes, so it is not a drag area; the gaps between them are.
+  Click on the mode moves to the next one (Shift: the previous), on the reasoning to the
+  next effort; the folder and the model open their choosers. `BAR_HEIGHT` is 64: 8 px above
+  the input, 26, a 2 px gap, 22, 6 px below (the root's 1 px border counts in the 8 and 6).
+  A long prompt wraps at the full width and the bar grows through `bar_h`; nothing stacks
+  and the input's height is not measured.
+- **A conversation shows what it runs with and has no controls for it** (D20). The header
+  (`run_text` in `panel.rs`, data from `SessionPane::run_labels`) has `quick-run-model`, a
+  `·` and `quick-run-effort` between the drag area and the context meter: `text_xs` muted
+  text, no fill or chevron at rest, the bar's label hover, 60 % and inert while a change is
+  pending. Click on the model opens the sheet, on the effort moves to the next one; the
+  effort is absent when the agent has no reasoning option. The effort's box is as wide as
+  the widest effort name (`RunLabels.efforts`, the others at zero height): the group is
+  anchored on its right, so a box as wide as its text moves the model. The compact pill
+  has 6 px above and below its one row, so everything in it is on the pill's centre line
+  (the main window's composer keeps 4 above, 8 below). The compact composer is plus,
+  input, `composer-mode`, send: the mode is its name in a box as wide as the widest mode
+  name (`SessionPane::mode_name`, the other names at zero height), keeping the selector
+  `composer-mode:{label}`; Click/Shift+click or Tab/Shift+Tab change it. With modes the
+  pill has a 1 px outline all round in `mode_tone` at `MODE_OUTLINE_STRENGTH` (`composer-outline`,
+  replaces the white top highlight; without modes the highlight stays). There are no model or
+  mode chips. The model sheet (`PickerFrame::Sheet`) is the search field and the list only:
+  no title, reasoning footer, close button or Done; the reasoning effort changes by
+  Cmd/Ctrl+T or the header.
 - **Edge light** (D14): `activity.rs` turns what the shown session does into an
   `Activity` whose `phase` is a `Phase` (Running, Waiting, Error, Done, Idle; Done/Error
   are transitions only).

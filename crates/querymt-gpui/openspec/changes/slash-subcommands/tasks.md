@@ -2,7 +2,7 @@
 
 Verification commands: `cargo nextest run --package querymt-gpui --bins --locked`, `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`.
 
-Prerequisite: `slash-command-actions` groups 1 and 2 are done.
+Prerequisite: `slash-command-actions` groups 1 to 3 are done.
 
 ## 1. querymt core (separate repository, lands first)
 

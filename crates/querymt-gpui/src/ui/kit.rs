@@ -516,39 +516,10 @@ pub fn tip_with_stroke(
     wrap_tip(text).key_binding(kbd)
 }
 
-/// What an agent mode chip holds: a dot in the mode's tone and its label.
-/// The label carries the meaning and the tone is only a hint, so the chip
-/// does not rely on colour alone. The caller draws the chip around it.
-pub fn mode_chip_body<'a>(
-    label: impl Into<SharedString>,
-    ids: impl IntoIterator<Item = &'a str>,
-    current: &str,
-    p: &Palette,
-) -> Div {
-    let tone = super::start::mode_tone(ids, current, p);
-    h_flex()
-        .gap(px(6.))
-        .items_center()
-        .child(div().flex_none().size(px(7.)).rounded_full().bg(tone))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(p.text)
-                .child(label.into()),
-        )
-}
-
 /// The mode's colour by its place in the agent's list (see `start::mode_tone`).
 #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
 pub fn mode_tone<'a>(ids: impl IntoIterator<Item = &'a str>, current: &str, p: &Palette) -> Hsla {
     super::start::mode_tone(ids, current, p)
-}
-
-/// The colour of a reasoning effort (see `start::reasoning_color`).
-#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
-pub fn reasoning_tone(level: &str, p: &Palette) -> Hsla {
-    super::start::reasoning_color(level, p)
 }
 
 /// How big a badge's tags are, and where they sit on the control's top edge.
@@ -570,14 +541,6 @@ impl BadgeSize {
         text: 8.25,
         top: -6.,
     };
-    /// The quick panel's bar, next to an 18 px input: centred on the chip's
-    /// top edge.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
-    pub const HUD: Self = Self {
-        height: 16.,
-        text: 10.,
-        top: -8.,
-    };
 }
 
 /// A badge in `color`: the text in it over a 19% tint of it on the card fill,
@@ -585,17 +548,14 @@ impl BadgeSize {
 pub fn badged_tone(el: impl IntoElement, text: &str, color: Hsla, p: &Palette) -> Div {
     badged(
         el,
-        None,
-        Some(
-            badge_tag(
-                text,
-                color,
-                p.card.blend(color.opacity(0.19)),
-                Some(p.surface),
-                BadgeSize::TOOLBAR,
-            )
-            .into_any_element(),
-        ),
+        badge_tag(
+            text,
+            color,
+            p.card.blend(color.opacity(0.19)),
+            Some(p.surface),
+            BadgeSize::TOOLBAR,
+        )
+        .into_any_element(),
         BadgeSize::TOOLBAR,
     )
 }
@@ -628,14 +588,8 @@ pub fn badge_tag(text: &str, fg: Hsla, bg: Hsla, cut_out: Option<Hsla>, size: Ba
         .child(text.to_lowercase())
 }
 
-/// `el` with a tag at its top-left and one at its top-right edge, either
-/// optional (build them with [`badge_tag`]).
-pub fn badged(
-    el: impl IntoElement,
-    left: Option<AnyElement>,
-    right: Option<AnyElement>,
-    size: BadgeSize,
-) -> Div {
+/// `el` with a tag at its top-right edge (build it with [`badge_tag`]).
+pub fn badged(el: impl IntoElement, tag: AnyElement, size: BadgeSize) -> Div {
     let row = h_flex()
         .absolute()
         // CSS positions from inside the pill's 1px border; this wrapper is outside it.
@@ -643,11 +597,9 @@ pub fn badged(
         .left(px(6.))
         .right(px(6.))
         .h(px(size.height))
-        .when(left.is_some(), |el| el.justify_between())
-        .when(left.is_none(), |el| el.justify_end())
-        // Each tag truncates at half the control's width.
-        .children(left.map(|tag| div().min_w_0().max_w(relative(0.5)).child(tag)))
-        .children(right.map(|tag| div().min_w_0().max_w(relative(0.5)).child(tag)));
+        .justify_end()
+        // The tag truncates at half the control's width.
+        .child(div().min_w_0().max_w(relative(0.5)).child(tag));
     div().relative().flex_none().child(el).child(row)
 }
 

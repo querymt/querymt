@@ -1,35 +1,50 @@
 # Tasks
 
-Verification commands: `cargo nextest run --package querymt-gpui --bins --locked`, `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`.
+Verification commands:
+- `cargo nextest run --package querymt-gpui --bins --locked`
+- `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`
+- `cargo fmt --all -- --check`
+- `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`
 
-## 1. querymt core (separate repository, lands first)
+## 1. Descriptor and recognition
 
-- [ ] 1.1 Advertise `_meta.querymt { input, native, accepts }` on every `AvailableCommand`: built-ins from `Builtin` (`/compact`: optional, native, prompt+queue; `/worktree`: required, native, prompt), registry commands derived from template and hint with the `argument-required` frontmatter override (design D1). Verify: runtime unit tests in `slash_commands/acp.rs` and `builtin.rs` assert the three fields per command, including a template with `$ARGUMENTS`, one with a hint only, and one with the override.
-- [ ] 1.2 Parse the metadata into `SlashCommandView { input, native, accepts }` in `agent-session-core`, with the fallback for missing `_meta` (design D1). Verify: core tests for an update with metadata, without metadata (hint gives `Required`, no hint gives `None`), and with a malformed `_meta` (falls back, does not drop the command).
-- [ ] 1.3 Record `UserMessage.command: Option<CommandRun { name, args, native, output }>` when a prompt invoked a built-in or registry command; for registry commands the row keeps the typed text (design D4). Verify: core tests that `/compact x`, `/worktree list` and a registry command set `command`, and `/tmp is full` does not.
-- [ ] 1.4 Make `WorktreeCommandOutput` durable and replay it as the `querymt/command_output` update linked to its user message, not as `AgentMessageChunk` (design D4). Verify: replay test that a reloaded session yields the command output on the same `UserMessage`, and no assistant message.
+- [ ] 1.1 After querymt `add-slash-command-records` is merged, bump the `querymt-agent-session-core` revision in `Cargo.toml` (both entries) and fix any construction of `SlashCommandView` in tests (`src/ui/slash.rs` `command`, `src/session/view_tests.rs`). Verify: `cargo check --locked --all-targets` passes and the full suite passes with no behaviour change.
+- [ ] 1.2 Add `src/session/commands.rs` with `CommandTraits::of` and `recognise` (design D1). Verify: unit tests `descriptor_states_an_optional_input`, `command_without_a_descriptor`, `path_is_not_a_command`, `name_case_must_match` (spec: Descriptor states an optional input, Command without a descriptor, and the recognition half of Path is not a command and Name case must match).
 
-## 2. Client: metadata and palette
+## 2. Submission and readiness
 
-- [ ] 2.1 Bump the `querymt-agent-session-core` revision in `Cargo.toml` (both entries) to the commit with group 1. Verify: `cargo check --locked` after `cargo update -p querymt-agent-session-core`; the full suite passes unchanged.
-- [ ] 2.2 Replace `takes_input: bool` with `input: CommandInput` in `PaletteTarget::SlashCommand` and `SessionPane::run_slash_command`; `none` and `optional` send, `required` prefills; required labels end in `…` (design D2). Verify: update `palette_fills_the_composer_for_a_command_with_input` to a required-input command; new tests `palette_runs_an_optional_input_command` and `required_input_rows_end_with_an_ellipsis` (spec: Command with optional input, Command with input, Required and optional input side by side).
-- [ ] 2.3 Tab on a highlighted optional-input slash row prefills the composer (capture on the palette card, `CommandState::selected_index`), and the row's tooltip names Enter and Tab (design D2). Verify: test `tab_adds_arguments_to_an_optional_command` (spec: Adding arguments to an optional-input command); test that Tab on an Actions row does nothing.
-- [ ] 2.4 Add `SessionPane::command_readiness` and render blocked slash rows with `Disableable::disabled(true)` and the reason as their second line (design D3). Verify: tests `palette_disables_commands_while_disconnected` and `native_command_is_disabled_during_a_run_and_compact_is_not` (spec: Session not connected, Native command during a run); `palette_does_not_send_while_the_session_is_not_ready` is rewritten to assert the row is disabled and the palette stays open.
-- [ ] 2.5 Update the composer's slash list to show the same `…` marker for required input, so the composer and the palette agree. Verify: test in `src/ui/slash.rs` that `/review` is listed as `/review…` and completion still inserts `/review `.
+- [ ] 2.1 Replace the leading-slash test in `OpenSession::send` with `recognise`, and add the guard for a command that does not accept queueing (design D2). Verify: tests in `src/session/open.rs` or `src/store/open_tests.rs`: `path_is_steered_into_the_running_turn` and `typed_command_is_queued_not_steered` assert the wire method (spec: Path is not a command, Typed command is queued, not steered).
+- [ ] 2.2 Add `SessionPane::readiness` and `Blocked`, and make `session_ready` and `send_session_prompt` use it; show the reason in the composer's hint row for a blocked command (design D3). Verify: tests in `src/ui/slash.rs`: `typed_prompt_only_command_during_a_turn` (nothing sent, text kept, reason shown) and `typed_prompt_only_command_when_idle` (spec scenarios of the same names); the existing `session_ready` tests pass unchanged.
 
-## 3. Client: commands in the conversation
+## 3. Palette
 
-- [ ] 3.1 Add `ItemKind::Command { name, args, output, status }` and project `UserMessage.command` into it; fall back to an advertised first word for agents without group 1; skip `/compact` when a compaction follows and pass its args to that compaction (design D4). Verify: projection tests `command_message_becomes_a_command_item`, `unknown_slash_prompt_stays_a_prompt`, `compact_folds_into_its_compaction`, `reloaded_command_keeps_its_output` (spec: Worktree command and its output, Reloaded session, Compact, Prompt that only starts with a slash).
-- [ ] 3.2 Render the command row and its output (design D5) in both densities, with the copy action on hover and the output collapsed by default in compact density. Verify: session view tests that the row has no `accent_dim` fill (by `debug_selector`), that the output uses the tool output block and respects `Density::output_lines`, and a manual check on macOS in the main window and the quick panel, light and dark themes, recorded here.
-- [ ] 3.3 Show `/compact`'s instructions in the compaction row's details. Verify: test that a compaction with instructions shows them when expanded; settle the design's open question here.
-- [ ] 3.4 Update `openspec/specs/slash-commands` scenarios that the delta replaces (only through archive) and note in `README.md`, if it lists slash commands, that Enter runs and Tab adds arguments. Verify: `openspec validate slash-command-actions --type change --strict --no-interactive` passes.
+- [ ] 3.1 Replace `takes_input` with `input` and `blocked` in `PaletteTarget::SlashCommand`; build both in `palette_groups`; make `run_palette` keep the palette open for a blocked command; make `run_slash_command` submit for `None` and `Optional` and prefill for `Required` (design D4, D6). Verify: tests in `src/ui/keys.rs`:
+  - `palette_runs_an_optional_input_command` (spec: Command with optional input);
+  - `palette_fills_the_composer_for_a_command_with_input`, changed to a required-input command (spec: Command with input);
+  - `palette_disables_commands_while_disconnected` (spec: Session not connected);
+  - `prompt_only_command_is_unavailable_during_a_turn` (spec: Prompt-only command during a turn);
+  - `picking_an_unavailable_command_keeps_the_palette_open` (spec: Picking an unavailable command);
+  - `palette_does_not_send_while_the_session_is_not_ready`, rewritten to assert the row is blocked with "Session is loading" and the palette stays open;
+  - `palette_sends_a_command_without_input` and `palette_command_is_queued_while_running` pass unchanged (spec: Command without input, Palette command during a running turn).
+- [ ] 3.2 Draw every slash row with the custom child: `…` for required input, the `Prompt` mark, and the reason in place of the description; add source and `prompt` keywords (design D5). Verify: tests `required_input_rows_end_with_an_ellipsis`, `prompt_commands_are_marked`, `palette_searches_the_source` (spec: Required and optional input side by side, Prompt command is marked, Palette searches the source); `palette_lists_session_commands` passes with the description still on the second line.
+- [ ] 3.3 Check row layout by hand on macOS at the palette's 560 px width, light and dark themes, with the longest advertised name and a row that has both `…` and `Prompt`: the name truncates before the mark and the row height does not change. Verify: record the result here.
+- [ ] 3.4 Handle Tab on the palette card and add the footer key hint with `Command::footer` and `Command::on_select` (design D6). Verify: tests `tab_adds_arguments_to_an_optional_command`, `tab_on_a_command_without_input_does_nothing`, `key_hint_shows_for_an_optional_input_command` (spec: Adding arguments to an optional-input command, Tab on a command without input, Key hint for an optional-input command); a test that Tab on an Actions row changes nothing.
+- [ ] 3.5 Keep the composer's draft when prefilling (design D7). Verify: test `composer_draft_becomes_the_arguments` in `src/ui/keys.rs` (spec scenario of the same name), and `completion_replaces_the_first_word_and_keeps_the_arguments` in `src/ui/slash.rs` passes unchanged.
+- [ ] 3.6 If `README.md` or `knowledge/ui.md` describes picking slash commands in the palette, update it: Enter runs, Tab adds arguments, unavailable commands show a reason. Verify: the text matches the spec delta; if neither file mentions it, note that here.
 
 ## 4. Integration checks
 
-- [ ] 4.1 Run the verification commands. Verify: all pass; record the counts here.
-- [ ] 4.2 Against a querymt agent built with group 1, by hand on macOS: palette `compact` compacts at once; Tab adds instructions; `worktree` is disabled during a run; `/worktree list` shows as a command with its output and survives a reload; an agent without group 1 behaves as before. Verify: each item noted here pass/fail.
+- [ ] 4.1 Run the four verification commands. Verify: all pass; record the counts here.
+- [ ] 4.2 Against a querymt agent built with `add-slash-command-records`, by hand on macOS:
+  - `compact` runs on Enter and Tab puts `/compact ` in the composer;
+  - a project command from `.qmt/commands` shows `…` and `Prompt`;
+  - `worktree…` is unavailable during a turn, in the palette and when typed;
+  - `/tmp/x is broken` can be steered into a running turn;
+  - an agent without the descriptor behaves as before.
+  Verify: each item noted here as pass or fail.
+- [ ] 4.3 Run `openspec validate slash-command-actions --type change --strict --no-interactive`. Verify: it passes.
 
 ## Workflow follow-up
 
-- Archive after `add-quick-session-panel` only if task 3.2's quick panel check depends on it; otherwise independent.
-- `slash-subcommands` builds on the metadata of 1.1–1.2.
+- Archive before `slash-subcommands`, which modifies the same requirements.
+- `slash-subcommands` keeps its querymt work as tasks in this repository. Its subcommand descriptors should follow the catalog descriptor of querymt `add-slash-command-records` (`input`, `accepts`); review that before applying it.

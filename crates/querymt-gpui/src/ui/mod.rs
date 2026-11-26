@@ -51,7 +51,7 @@ pub use keys::bind_keys;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use session_pane::{SessionPane, SessionPaneEvent};
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use session_view::Density;
+pub(crate) use session_view::{Density, RunLabels};
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use sessions::matches_query;
 #[cfg(not(target_family = "wasm"))]

@@ -15,7 +15,7 @@ The quick panel hides state the main window shows, and it is less keyboard-drive
 - **Session list shortcut:** Cmd+K on macOS, Ctrl+K elsewhere, toggles the session list in the panel. Its triggers (the header title and the bar's button) show the shortcut in their tooltips.
 - **New quick chat shortcut:** Cmd/Ctrl+N starts a new quick chat, as the header's button does.
 - **Platform-correct shortcut hints:** the panel's tooltips render shortcuts from the actual key bindings in the platform's notation (⌘K on macOS, Ctrl+K elsewhere).
-- **Agent mode chip:**
+- **Agent mode chip** (revised by `add-quick-session-panel` D20: in a conversation, the mode's name in the composer):
   - In a conversation, a chip next to the model chip shows the session's mode. Clicking it or pressing Tab cycles the mode, and Shift+Tab goes back.
   - In a new quick chat's bar, the same chip shows the mode the quick chat will start in, and it can be changed for that chat only, without changing the start page's launch mode.
 - **Context usage indicator:** in a conversation, the header shows the main window's context ring (same thresholds and tooltip). From 70% it also shows the percentage as text.

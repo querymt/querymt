@@ -4,9 +4,9 @@
 
 - **Runtime:** `/worktree`'s operations exist only as a parser in querymt `ext_worktree_ops.rs` (the match on `"create"`, `"list"`, … `"recover"`) and as one hint string in `Builtin::entry`. Delivery rules for the whole command are in `Builtin::accepts` (prompt only).
 - **Client, after `slash-command-actions`:**
-  - `SlashCommandView` carries `input`, `native` and `accepts`.
-  - Palette entries are `PaletteTarget::SlashCommand { name, input }`, with readiness producing disabled rows.
-  - Tab is the secondary pick.
+  - `SlashCommandView` carries `source`, `effect`, `input` and `accepts` (querymt `add-slash-command-records`).
+  - Palette entries are `PaletteTarget::SlashCommand { name, input, blocked }`; a command the session cannot take is an unavailable row with a reason.
+  - Tab puts a command that takes input in the composer.
 - **Composer list:** `src/ui/slash.rs` shows the command list while the cursor is in the first word (`slash_list`), moves with `slash_move` (`:117`), completes with `slash_complete_highlighted` (`:134`) and closes with `close_slash_list` (`:204`). Completion replaces the first word and keeps the rest.
 
 ## Goals / Non-Goals
@@ -49,7 +49,7 @@
 - **Entries:** `palette_groups` emits one entry per subcommand, labelled `"{name} {sub}"` with the subcommand's description and keywords (parent name, subcommand name, description). The parent entry is omitted when it has subcommands.
 - **Picking:** goes through `run_slash_command(name, sub, input, destructive)`.
   - A destructive subcommand prefills `/{name} {sub} `.
-  - Any other subcommand follows `input` as in `slash-command-actions` D2, so Tab still prefills an optional one.
+  - Any other subcommand follows `input` as in `slash-command-actions` D6, so Tab still prefills an optional one.
 - **Readiness:** uses the subcommand's `accepts`.
 - **Destructive marker:** `IconName::TriangleAlert` in `p.danger` replaces the row's `SquareSlash` icon, and the tooltip begins "Destructive:". The label stays in `p.text`, so it stays readable and does not rely on colour alone.
 - **Ordering:** fan-out keeps the agent's order. The palette's group ranking (best match first) is unchanged.

@@ -15,6 +15,9 @@ use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use super::kit::{self, ButtonExt as _};
 use super::smooth_scroll::SmoothScroll;
 use crate::session::open::OpenSession;
@@ -69,6 +72,10 @@ pub(crate) enum PickerFrame {
 /// Space under the last row, inside the rows' scrolling box.
 const LIST_PAD_BOTTOM: f32 = 8.;
 
+/// Model rows a sheet makes room for; the rest scroll (search narrows them).
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+const SHEET_MODEL_ROWS: usize = 5;
+
 /// Presentation snapshot of the reasoning-effort control.
 struct ReasoningControl {
     /// Session config option to update; `None` edits the launch preference.
@@ -102,6 +109,10 @@ pub(crate) struct ModelPicker {
     palette: Option<Palette>,
     /// Scroll position of the list in [`Self::card`].
     scroll: ScrollHandle,
+    /// Index, among the list's children, of the row that ends the first
+    /// [`SHEET_MODEL_ROWS`] models (headings count as children, not models).
+    /// `None`: fewer models than that, so the whole list is wanted.
+    sheet_cap: Rc<Cell<Option<usize>>>,
     smooth_scroll: SmoothScroll,
     _subs: Vec<Subscription>,
 }
@@ -156,6 +167,7 @@ impl ModelPicker {
             cursor: None,
             palette: None,
             scroll: ScrollHandle::new(),
+            sheet_cap: Rc::new(Cell::new(None)),
             smooth_scroll,
             _subs: subs,
         }
@@ -431,6 +443,8 @@ impl ModelPicker {
         let total = pickable.len();
 
         let mut rows: Vec<AnyElement> = Vec::new();
+        let mut models_listed = 0;
+        let mut sheet_cap = None;
         for Group {
             label,
             shown: models,
@@ -470,6 +484,10 @@ impl ModelPicker {
                     &p,
                     cx,
                 ));
+                models_listed += 1;
+                if models_listed == SHEET_MODEL_ROWS {
+                    sheet_cap = Some(rows.len() - 1);
+                }
             }
             if hidden > 0 {
                 rows.push(
@@ -483,6 +501,7 @@ impl ModelPicker {
                 );
             }
         }
+        self.sheet_cap.set(sheet_cap);
         if total == 0 {
             rows.push(
                 div()
@@ -758,6 +777,7 @@ impl ModelPicker {
         });
         Some(
             v_flex()
+                .debug_selector(|| "model-reasoning".into())
                 .mx_4()
                 .pt_3()
                 .gap_1p5()
@@ -792,8 +812,16 @@ impl ModelPicker {
         let in_session = matches!(self.target, Some(Target::Session(_)));
         let rows = self.rows(cx);
         let search = self.search(&agent, &p, cx);
-        let footer = self.reasoning_footer(&p, cx);
         let smooth_scroll = self.smooth_scroll.clone();
+        // A sheet is the search field and the list and nothing else (design
+        // D20): no title, reasoning footer, close button or Done. The model
+        // and the effort change by key and in the conversation's header.
+        let is_card = matches!(frame, PickerFrame::Card { .. });
+        let footer = if is_card {
+            self.reasoning_footer(&p, cx)
+        } else {
+            None
+        };
         let (framed, probe) = match frame {
             PickerFrame::Card { width, max_h } => (
                 v_flex()
@@ -822,36 +850,39 @@ impl ModelPicker {
             framed
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .children(probe)
-                .child(
-                    h_flex()
-                        .px_4()
-                        .pt_4()
-                        .pb_3()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(div().font_semibold().child(if in_session {
-                                    "Switch model"
-                                } else {
-                                    "Choose a model"
-                                }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(p.dim)
-                                        .child("Search by model, provider, or mesh node."),
+                .when(is_card, |el| {
+                    el.child(
+                        h_flex()
+                            .px_4()
+                            .pt_4()
+                            .pb_3()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .child(div().font_semibold().child(if in_session {
+                                        "Switch model"
+                                    } else {
+                                        "Choose a model"
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.dim)
+                                            .child("Search by model, provider, or mesh node."),
+                                    ),
+                            )
+                            .child(
+                                kit::icon_button("model-close", IconName::X, "Close").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close(cx);
+                                    }),
                                 ),
-                        )
-                        .child(
-                            kit::icon_button("model-close", IconName::X, "Close").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.close(cx);
-                                }),
                             ),
-                        ),
-                )
-                .child(div().px_4().child(search))
+                    )
+                })
+                // The sheet's search row takes the title row's top padding.
+                .child(div().px_4().when(!is_card, |el| el.pt_4()).child(search))
                 .child(
                     // The rows are the box's direct children: the keyboard
                     // cursor scrolls to them by index.
@@ -867,37 +898,48 @@ impl ModelPicker {
                         .map(|el| smooth_scroll.region("model-list", el)),
                 )
                 .children(footer)
-                .child(
-                    h_flex().px_4().py_3().justify_end().child(
-                        kit::flat_btn("model-done", true, true, &p)
-                            .debug_selector(|| "model-done".into())
-                            .child("Done")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.close(cx);
-                            })),
-                    ),
-                ),
+                .when(is_card, |el| {
+                    el.child(
+                        h_flex().px_4().py_3().justify_end().child(
+                            kit::flat_btn("model-done", true, true, &p)
+                                .debug_selector(|| "model-done".into())
+                                .child("Done")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close(cx);
+                                })),
+                        ),
+                    )
+                }),
         )
     }
 
-    /// The rows' scrolling box, for [`Self::sheet_height`].
-    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
-    pub(crate) fn rows_scroll(&self) -> ScrollHandle {
+    /// The rows' scrolling box, to see in tests whether the list scrolls.
+    #[cfg(test)]
+    pub(crate) fn rows_scroll_for_test(&self) -> ScrollHandle {
         self.scroll.clone()
     }
 
-    /// How tall a sheet laid out `whole` tall needs to be to show every row
-    /// without scrolling: `whole`, less the rows' box, plus what the rows and
-    /// their padding take. Read after the sheet's layout (`rows` holds the
+    /// How tall a sheet laid out `whole` tall needs to be, as a function of
+    /// `whole`: it shows the first [`SHEET_MODEL_ROWS`] models without
+    /// scrolling (or every row when there are fewer), the rest scroll.
+    /// That is `whole`, less the rows' box, plus what those rows and their
+    /// padding take. Read after the sheet's layout (the handle holds the
     /// bounds of the last one).
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
-    pub(crate) fn sheet_height(rows: &ScrollHandle, whole: f32) -> f32 {
-        let count = rows.children_count();
-        let extent = match (
-            rows.bounds_for_item(0),
-            count.checked_sub(1).and_then(|l| rows.bounds_for_item(l)),
-        ) {
-            (Some(first), Some(last)) => f32::from(last.bottom() - first.top()),
+    pub(crate) fn sheet_measure(&self) -> impl Fn(f32) -> f32 + 'static + use<> {
+        let (rows, cap) = (self.scroll.clone(), self.sheet_cap.clone());
+        move |whole| Self::sheet_height(&rows, cap.get(), whole)
+    }
+
+    fn sheet_height(rows: &ScrollHandle, cap: Option<usize>, whole: f32) -> f32 {
+        let last = rows.children_count().checked_sub(1);
+        let end = match (cap, last) {
+            (Some(cap), Some(last)) => Some(cap.min(last)),
+            (None, last) => last,
+            (Some(_), None) => None,
+        };
+        let extent = match (rows.bounds_for_item(0), end.and_then(|e| rows.bounds_for_item(e))) {
+            (Some(first), Some(end)) => f32::from(end.bottom() - first.top()),
             _ => 0.,
         };
         whole - f32::from(rows.bounds().size.height) + extent + LIST_PAD_BOTTOM

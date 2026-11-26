@@ -2,19 +2,36 @@
 
 ## Why
 
-Slash commands are actions, but the app treats them as text. Picking `compact` in the command palette only writes `/compact ` into the composer, because the agent's only signal is a free-text input hint, and an optional hint looks the same as a required one. Once a command is sent, the conversation shows it as an ordinary user prompt in an accent bubble. The output of a native command such as `/worktree list` arrives as an assistant message, so it reads like a model reply, and it is not stored, so it is gone after a reload. Users cannot tell a deterministic command from an LLM request, either before or after running it.
+The command palette cannot tell what picking a slash command will do. The app knows a name, a description and a free-text input hint, so:
+
+- every command with a hint only fills the composer, even when its input is optional (`compact`);
+- a user-defined command that sends a prompt to the model looks the same as a built-in the agent runs itself;
+- a command the session cannot take now closes the palette and does nothing;
+- while a turn runs, any text that starts with `/` is queued, including a message that starts with a path, and a command the agent only takes as a prompt (`/worktree`) is queued and then rejected.
+
+querymt now states these facts per command (`add-slash-command-records` in the querymt repository): source, effect, input need and accepted submissions. This change makes the app use them. It covers built-in and user-defined commands (`~/.qmt/commands`, `<root>/.qmt/commands`, configured paths) with the same rules.
+
+This change replaces the earlier draft of `slash-command-actions`. The conversation part of that draft moved to `slash-command-transcript`.
 
 ## What Changes
 
-- **Command metadata from the agent (querymt core).** Each advertised command carries, under `_meta.querymt`:
-  - whether its input is `none`, `optional` or `required`;
-  - whether the agent runs it itself (native) or expands it into a prompt;
-  - how it may be delivered (prompt, queue, steer).
-  - Agents that send none of this keep today's behaviour.
-- **Palette runs optional-input commands.** Enter on a command whose input is optional sends it at once. Tab puts it in the composer to add arguments. A command whose input is required is still put in the composer, and its row ends in `…` so the difference shows before picking. **BREAKING** for the spec scenario "Command with input", which today requires `/compact` to fill the composer.
-- **Palette respects session state.** A command offered while the session cannot take it (not connected, loading, read-only, or a native command that cannot be queued during a run) is shown disabled with the reason, instead of closing the palette and doing nothing.
-- **Commands look like commands in the conversation.** A sent command is drawn as a command row (mono name and arguments, a command icon, no bubble), not as a user prompt. A native command's output is drawn under it as command output, not as an assistant reply, and survives a reload. `/compact` folds into the compaction row it produces.
-- **Core: command runs are recorded.** querymt marks a user message that invoked a command and stores native command output durably, so history renders the same as the live session.
+- **The app reads the command descriptor.** Each command's source, effect, input need and accepted submissions come from the agent. A command without a descriptor (an older or different agent) behaves as today.
+- **The palette runs commands that need no arguments.** Enter on a command whose input is `none` or `optional` sends it. A command whose input is `required` is put in the composer, and its row ends in `…`. Tab puts any command that takes input in the composer. **BREAKING** for the spec scenario "Command with input", which requires `/compact` to fill the composer.
+- **The palette says what a command is.** A command that becomes a model prompt is marked `Prompt`. The source and the mark are searchable.
+- **The palette shows commands the session cannot take.** Such a row is dimmed and shows the reason. Picking it does nothing and the palette stays open. Today the palette closes and nothing happens.
+- **One rule decides how a command is submitted**, for the palette and the composer:
+  - text is a command only when its first word is `/` plus an advertised name, exactly;
+  - a command is queued while a turn runs, never steered;
+  - a command that does not accept queueing is not sent while a turn runs: the palette row is unavailable, and a typed one stays in the composer with the reason shown;
+  - any other text that starts with `/` is an ordinary message and follows the composer's delivery choice. **BREAKING** for such messages: today they are always queued.
+
+## Non-goals
+
+- How commands look in the conversation (`slash-command-transcript`).
+- Subcommands and destructive commands (`slash-subcommands`, which builds on this change).
+- Markers in the composer's own command list. Completing there never sends, so "runs or asks for more" does not apply.
+- Sending a prompt-only command (`/worktree`) while a turn runs. The agent would accept it; the app waits for the turn to end.
+- A confirmation step before `compact`. Enter runs it, as it does for every command without required input.
 
 ## Capabilities
 
@@ -25,23 +42,20 @@ None.
 ### Modified Capabilities
 
 - `slash-commands`:
-  - running from the palette depends on the command's input arity;
-  - commands are disabled when the session cannot run them;
-  - commands and native command output have their own presentation in the conversation;
-  - the app reads the agent's command metadata.
+  - the app reads the agent's descriptor for each command;
+  - running from the palette depends on the command's input need;
+  - palette rows show required input, prompt commands and why a command is unavailable;
+  - submission of a typed or picked command follows the command's accepted submissions.
 
 ## Impact
 
-- **querymt (separate repository; must land first):**
-  - `agent-runtime/src/slash_commands/{acp.rs,builtin.rs}` advertise the `_meta.querymt` fields.
-  - `agent-session-core` exposes them on `SlashCommandView` and adds a command marker to `UserMessage` (or a command entry kind).
-  - `agent-protocol-types` makes `WorktreeCommandOutput` durable and replays it as command output instead of `AgentMessageChunk` (`replay.rs:463`).
+- **Depends on querymt `add-slash-command-records`** (catalog descriptor and `SlashCommandView` fields). That change must be merged and its revision pinned here first.
 - **This repository:**
-  - `Cargo.toml` bumps the `querymt-agent-session-core` revision.
-  - `src/ui/keys.rs`: palette targets, arity and disabled state.
-  - `src/ui/slash.rs`: `run_slash_command`, and the composer list markers.
-  - `src/session/projection.rs` and `src/session.rs`: a command item kind.
-  - `src/ui/session_view.rs`: rendering the command and output rows.
-  - Tests in `src/ui/keys.rs`, `src/ui/slash.rs` and the session view.
-- **Compatibility:** agents without the metadata behave exactly as today. History written before the core change shows commands as plain prompts.
-- **Related:** `slash-subcommands` builds on the same metadata.
+  - `Cargo.toml`: the `querymt-agent-session-core` revision (both entries).
+  - `src/ui/slash.rs`: command recognition, readiness, `run_slash_command`.
+  - `src/ui/keys.rs`: palette targets, row content, Tab, the key hint footer.
+  - `src/ui/session_view.rs`: `session_ready` and `send_session_prompt` use the shared readiness; the composer shows the reason.
+  - `src/session/open.rs`: `OpenSession::send` takes the delivery decision instead of testing for a leading `/`.
+  - Tests in `src/ui/keys.rs`, `src/ui/slash.rs`, `src/session/open.rs`.
+- **Compatibility:** with an agent that sends no descriptor, commands behave as before this change, except that text starting with `/` that names no command is no longer forced to queue.
+- **Related:** `slash-subcommands` depends on this change's input need, accepted submissions and unavailable rows. `slash-command-transcript` builds on tasks 1.1 and 1.2 of this change (the pinned revision and `src/session/commands.rs`).

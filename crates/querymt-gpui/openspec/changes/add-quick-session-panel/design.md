@@ -291,7 +291,7 @@ The panel is a HUD (Spotlight, Raycast), not a small main window.
 
 - **One fixed palette.** `hud_palette()` in `src/quick/hud.rs` returns a `Palette` with `dark: true` and its own tokens. The accent is the user's accent, lightened to read on dark glass. `Chrome::surfaces` tints from it instead of from the theme.
 - **It reaches the transcript.** The transcript takes its colours from the global `Palette`, read once per frame (`session_view.rs:5348`, `session_pane.rs:592`) and passed down. `SessionPane` gets an optional palette that replaces the global one there; `md.rs` (5 reads) and `turn_diff.rs:152` take the palette as an argument instead of reading the global. Popovers and tooltips outside the pane stay on the global.
-- **Shape.** Corner radius 20. No rule under the header, which becomes a small dim title row. The composer is a floating pill with a 1 px highlight along its top edge instead of a border, and no shadow over a material.
+- **Shape.** Corner radius 20. No rule under the header, which becomes a small dim title row. The composer is a floating pill with a 1 px highlight along its top edge instead of a border (in a conversation whose agent offers modes, a 1 px outline in the mode's colour, D20), and no shadow over a material.
 - **A new quick chat is one bar**, like Raycast's: the input at 18 px straight on the panel's surface, and under it one line of labels: the agent and folder, the mode, the model (which opens the model picker), the reasoning effort and the session-picker button (D19). No header and no box around the input. The header, with new chat, the session picker and "open in main window", appears with a conversation; its buttons are drawn in the panel's colours. The input rests at one line in the bar and at two in a conversation (`SessionPane::set_composer_bar`).
 - **See-through tokens over a material.** `hud_palette(user, glass)`: wells (`bg`: code blocks, tool cards) are 24 % black, raised bits (`card`, `border`) a little white, so the material shows through them instead of being covered by slabs. `surface` stays 86 % opaque, because popovers over the conversation are painted with it. Without a material every token is opaque. In the pane, the fades and halos that blend into a page colour are left out over a material.
 - **Transcript.** Assistant text sits directly on the glass, without a card. Your messages are a right-aligned pill tinted with the accent. Tool calls are one-line chips of low contrast (about 8 % white), not bordered cards. These are `Density::Compact` styling, so the main window is untouched.
@@ -304,7 +304,7 @@ The panel is a HUD (Spotlight, Raycast), not a small main window.
 - The picker's state and rendering live in `QmtApp` today (`ui/start.rs:566-684`, `:1377-1730`, plus `delegates.rs`). They move into a `ModelPicker` entity (`src/ui/model_picker.rs`) holding the query input and the open flag, rendering the search, the sections and the reasoning footer, and emitting `ModelPicked { key }`.
 - Its target is an enum: `Target::Session(Entity<OpenSession>)` sets the session's `model` option; `Target::Launch { agent }` reports the choice to the caller instead of writing a preference. The start page keeps writing `prefs.launch_models` on `ModelPicked`; the quick panel keeps the key in its own `QuickState.model: Option<String>` and puts it in `LaunchRequest.model`, so a model picked in the panel does not change what the start page starts new sessions with (spec: *Change the model from the panel*).
 - `LaunchRequest` gains `model: Option<String>`, applied as a config option at session creation the way the launch default is today. `None` keeps today's behaviour.
-- In the panel the picker opens from the model chip in the compact composer and from the `agent · model · folder` line of an empty quick chat (both become buttons), and from Cmd/Ctrl+M, as in the main window (`ui/keys.rs:60`). It renders inside the panel like the session picker, so it is not a second window.
+- In the panel the picker opens from the bar's model label, from the model name in a conversation's header (D20), and from Cmd/Ctrl+M, as in the main window (`ui/keys.rs:60`). It renders inside the panel like the session picker, so it is not a second window.
 - `SessionPaneEvent::ModelPicker` is then handled by the panel itself instead of falling through to "open in the main window" (`quick/panel.rs:234`).
 
 ### D13. The window grows with the conversation
@@ -325,6 +325,7 @@ The panel is a HUD (Spotlight, Raycast), not a small main window.
 - Overlays set a floor: while the session picker or the model picker is open, the requested height is at least what the overlay needs, so it is never clipped (spec: *Picker in a small panel*).
   - **The floor is measured, not estimated (review, 2026-11-25).** `picker_height` adds `PICKER_CHROME + rows * PICKER_ROW` in fixed pixels. It leaves out the gaps between rows (seven 4 px gaps for eight rows) and does not follow the rem scale the rows are laid out in, so the last row was cut off. Overlays report their laid-out height through a `canvas` measure, as the bar does (`bar_h`, `panel.rs:1721`), and the floor is the measured height plus the header. The estimate stays only for the first frame, before anything is laid out.
   - The list layout scrolls under its search row past the panel's limit, as the grid already does, so a short display never clips a row.
+  - The model sheet's floor is its search row and first five models (D20).
 - **macOS**: `setFrame:display:animate:` through `objc2-app-kit`, with the origin recomputed so the **bottom edge stays fixed** and the composer does not move under the cursor. The window has no shadow to recompute (D11).
 - **Windows and X11**: `Window::resize(size)`. GPUI has no reposition API in 0.3.12, so the top-left stays fixed and the panel grows downward. Accepted divergence (D11's stance: the panel is native per desktop, not identical).
 - **Wayland**: the compositor places the panel; with `LayerShell` the panel is centred by the compositor and the resize is applied where it sits.
@@ -333,7 +334,7 @@ The panel is a HUD (Spotlight, Raycast), not a small main window.
 ### D16. Keyboard and the panel's own choices
 
 - `Picks { model, cwd, reasoning }` replaces the lone model the panel kept: all three are the panel's own and survive a close like the model did. `LaunchRequest` gained `reasoning: Option<String>`; `None` is the launch default. A launch still remembers its folder as the last used one, for any surface.
-- The folder is chosen in an overlay that reuses `WorkspaceField` (arrows, Enter, Tab, completion), which now emits `Picked`; Enter on a typed path confirms it. The agent is named in the bar only when several are configured, to leave the input its width; the folder chip's tooltip names it always.
+- The folder is chosen in an overlay that reuses `WorkspaceField` (arrows, Enter, Tab, completion), which now emits `Picked`. Enter takes the typed path unless an arrow key moved to a suggestion; Tab completes into the first suggestion. Before, any suggestion that merely matched what was typed was taken, so a typed path could not be confirmed. The agent is named in the bar only when several are configured, to leave the input its width; the folder chip's tooltip names it always.
 - `ModelPicker` has a keyboard cursor over the pickable rows (headers and "N more" rows are skipped, the list scrolls to it); it rests on the chosen model, or the first while searching. Enter picks the cursor row, no longer always the first.
 - Cmd/Ctrl+1…8 reuse the app's `OpenSidebarSession` action: with the session list open they show that row; closed they do nothing in the panel.
 - The compact composer rests at one line (it grew from two) so the placeholder and the buttons share a centre line; the empty bar's height is no longer rounded to steps, which left a gap above it.
@@ -343,7 +344,7 @@ The panel is a HUD (Spotlight, Raycast), not a small main window.
 The session list, the model picker and the folder chooser each drew a card painted with `surface` (`0x1b1e23` at 86 %, `hud.rs:51`), with a border and `shadow_lg` (`panel.rs:1192`, `1310`; `model_picker.rs:771`). Over a material with no tint on the root, that card was the only coloured slab in the panel and read as a dark blue box. The composer, by contrast, already drops its shadow over a material (`session_view.rs:5293`).
 
 - **The session list opens in place.** With the list open, the panel's body shows the list instead of the pane, under the header (a new quick chat shows it above the bar). It is not an absolutely placed card: no surface, border or shadow of its own, rows straight on the panel's surface like the transcript. The pane is kept alive, not rebuilt, so the conversation returns at its scroll position. Escape and Cmd/Ctrl+K close it.
-- **Model picker and folder chooser open in place too** (revised 2026-11-25, user decision). First drawn as sheets over the panel on a `popover` token, they read as a dark box: a dimming layer (`black` at 30 %) covered the panel and the card was a near-opaque grey, and a see-through card would have let the transcript show through the list. So they take the conversation's place like the session list: no dimming, card, border or shadow, measured by the same floor (D13). The folder chooser's suggestions are laid out in it (a `WorkspaceField` option), not in a `deferred` dropdown, which took no room in the layout and so fell below the window's edge once the floor was measured.
+- **Model picker and folder chooser open in place too** (revised 2026-11-25, user decision). First drawn as sheets over the panel on a `popover` token, they read as a dark box: a dimming layer (`black` at 30 %) covered the panel and the card was a near-opaque grey, and a see-through card would have let the transcript show through the list. So they take the conversation's place like the session list: no dimming, card, border or shadow, measured by the same floor (D13). The folder chooser's suggestions are laid out in it (a `WorkspaceField` option), not in a `deferred` dropdown, which took no room in the layout and so fell below the window's edge once the floor was measured. In the panel the model picker is a search field over the rows only (D20).
 - **The composer's command list** (`slash.rs:309-312`) still floats, over the transcript inside the composer, so it keeps a box of its own that the transcript must not show through: the neutral `popover` token (`0x161616`, 72 % over a material, opaque without one) and the no-shadow rule. It is now the only overlay in the panel that uses `popover`.
 - **`hud.rs` gets one neutral `popover`** in place of the bluish `surface` for every overlay. `surface` stays for the few places that must be opaque over text: tooltips, and the edge cases listed in D15.
 - *Alternative: keep the cards and only neutralise their colour.* Rejected (user decision): a floating card inside a floating panel is a second layer of chrome, and the list reads more directly when it takes the conversation's place.
@@ -423,7 +424,7 @@ The bar of a new quick chat had grown to the input plus up to six controls in on
 - **Labels, not chips.** One text size for the row, 12 px, set once on the row so no label can fall back to the window's default. Labels in `p.muted`, glyphs in `p.dim` (decoration). Items are 22 px high with a 6 px radius, no fill at rest; on hover a `p.chip` fill and the label in `p.text`. The folder with its glyph (the agent's name before it when several are configured, D16); the mode as a 6 px dot in `mode_tone` and its name, so the colour is a hint and the name the signal; the model with a 10 px chevron, the one label that opens a list; the reasoning effort as `Brain` and its name, also at `auto`. Widths are capped (agent 90, folder 160, model 220) and truncate.
 - **Each label is a button.** `quick-folder` opens the folder chooser, `quick-mode` moves to the next mode (Shift+click the previous one) as Tab and Shift+Tab do, `quick-model` opens the model picker, `quick-reasoning` moves to the next effort as Cmd/Ctrl+T does. Each keeps its tooltip with its key and stops the mouse-down (D18); the gaps between them stay drag area. The `quick-mode:{label}` selector stays.
 - **A long prompt** wraps at the full width; the bar grows with it through `bar_h` as before (D13), with the labels under it. Nothing stacks, so the input's height is not measured and there is no hysteresis.
-- **Only the bar.** The compact composer of a conversation keeps its separate mode chip and model chip (`quick-panel-status-and-keys` D3); its layout is already one row beside a pill that grows upward.
+- **Only the bar.** A conversation shows the same things differently: the model and effort in the header and the mode in the composer, with no chips (D20).
 - **`kit::badged` stays in `ui/kit.rs`** (moved there by the first answer) for the main window's model pill and mode button, with its one right tag; the HUD size, the left tag and `hud::tag_fill` go.
 - *Alternative: mode and reasoning as tags on the model chip, the controls stacking beside the input past two lines (the first answer, 2026-11-25, implemented).* Rejected on use: the tags read as notification badges on the chip's edge; the chip's text fell back to the window's default size; the tags were opaque slabs on glass; two tones competed with the model for attention; and the row still took about 330 pt from the prompt. Its details follow, for the record.
 - *Alternative: one segmented capsule (mode | model | reasoning) beside the input.* Rejected: about 420 pt of the row, less room for the prompt than before.
@@ -447,6 +448,48 @@ The first answer, superseded:
 - *Alternative: let the row wrap (`flex_wrap`).* Rejected: it wraps by width, not by the input's height, so a long prompt would still keep every control on one line beside a narrow column of text.
 - *Alternative: the tags as a second line inside the model chip.* Rejected: it makes the chip taller than the input's line, so at rest the controls would no longer share the input's centre line.
 
+### D20. A conversation shows what it runs with, and does not set it (2026-11-26)
+
+The panel is for a quick look and a quick reply, like Spotlight. It is not the main window made small. In a conversation:
+- The composer carried a mode chip and a model chip beside the input (`quick-panel-status-and-keys` D3).
+- The mode chip was as wide as its name, so Tab moved the input and the model chip.
+- The reasoning effort was shown only inside the model sheet.
+- The sheet's title and Done rows took about 100 px of a window that grows to fit them.
+
+```
+  Session title              claude-opus-5 · High    72%  [+] [=] [↗]
+  ...conversation...
++------------------------------------------------------------------+
+| [+] Reply to the agent...                            Build  [^]  |  <- outline in the mode's tone
++------------------------------------------------------------------+
+```
+
+- **Rule.** In a conversation the panel shows the model, the reasoning effort and the mode, as text. It has no controls of its own for them. They change by key (Tab/Shift+Tab, Cmd/Ctrl+T, Cmd/Ctrl+M), by clicking the text that shows them, or in the main window (Cmd/Ctrl+Enter). The bar of a new quick chat is unchanged (D19): it is where the user chooses what a chat runs with.
+- **Header: model and reasoning effort.**
+  - Placed between the drag area and the context meter (`panel.rs:1374-1384`): the model's name, `·`, and the effort's name.
+  - Styled as `text_xs` in `p.muted`; the model is capped at 220 and truncates. At rest there is no fill, border, chevron or badge; on hover it takes the bar's label hover.
+  - Clicking the model opens the model sheet; clicking the effort moves to the next effort, as Cmd/Ctrl+T does. Tooltips name the value and the key.
+  - The effort is left out when the session has no reasoning option. While a change is pending, the text is at 60 % and inert.
+  - The effort's box is as wide as the widest of the agent's effort names (the mode's technique), so moving from Low to Medium to High does not move the model (revised 2026-11-26, after testing by hand: the header group is anchored on its right, so a box as wide as its text pushed the model sideways).
+  - Both occlude the drag area (D18).
+- **Composer: the mode's name.**
+  - The compact composer becomes plus, input, mode, send; the model chip goes.
+  - The mode is its name in `text_xs` `p.muted`, at the input row's trailing end.
+  - Its box is as wide as the widest of the agent's mode names (the bar's technique, `panel.rs:1998-2015`), so changing the mode moves nothing.
+  - Click moves to the next mode, Shift+click to the previous; the tooltip shows Tab.
+  - It is always shown while the agent offers modes.
+- **Composer: the mode's colour.** The pill's 1 px top highlight (D15) becomes a 1 px outline all round in `mode_tone`, at reduced strength. It starts at 45 % and is tuned by hand over a bright and a dark window. Without modes the white highlight stays. The colour is a hint; the name is the signal.
+- **Composer: one row, centred.** The compact pill has 6 px above and below its row, so the attach button, the input, the mode and the send button sit on the pill's centre line. It had the main window's 4 px above and 8 px below, which left the row 2 px high; the outline all round made it visible (revised 2026-11-26). The main window's composer keeps its padding.
+- **Model sheet: search and list.**
+  - In the panel (`PickerFrame::Sheet`) the picker is the search row and the rows only: no title row, reasoning footer, close button or Done.
+  - It closes on a pick, Esc, or Cmd/Ctrl+M.
+  - The panel makes room for the first five models (`SHEET_MODEL_ROWS`, headings not counted); the rest scroll under the search row.
+  - The main window's modal keeps its frame.
+- *Alternative: a second row of labels under the composer's input, as in the bar.* Rejected: it puts a control row in the place that should be the emptiest, and adds 22 px.
+- *Alternative: labels beside the input.* Rejected in D19 (about 300 px from the prompt).
+- *Alternative: the effort as a tag on a model chip.* Rejected in D19 (read as notification badges).
+- *Alternative: the mode by colour alone.* Rejected: the spec and the design guides forbid it.
+
 ## Risks / Trade-offs
 
 - **The agent keeps streaming every session loaded on the connection.** There is no `session/close`, so this already happens today and grows with more open sessions. → Accepted: inputs for unknown keys cost one hash lookup. A follow-up can use an agent-side unsubscribe if QueryMT adds one.
@@ -468,6 +511,8 @@ The first answer, superseded:
 - **The rim may not be created, or GPUI may rebuild its views under it.** → Every `EdgeLight` call returns an error that switches the panel to the ring for the rest of its life; tests cover the switch.
 - **Something can paint over the whole window.** The component library's root painted the app theme's background over the material on every desktop, unnoticed until the spike. → The panel's root is transparent, and a test guards it (D11).
 - **Recolouring the transcript touches code shared with the main window.** → The palette is passed in, with the global as its default, so the main window's colours are unchanged; the existing tests stay green (task 7.11).
+- **Mode colours are positional** (`start::mode_tone`, 8 tones), and the 6th and 7th are close to the panel's `danger` and `running`. → Agents so far offer two to four modes. If one offers more, give the HUD its own mode tones, kept clear of the status colours (D20).
+- **In a conversation no chip says the model or effort can be changed** (D20). → Hover state and tooltips with the keys; the bar still shows them as labels.
 
 ## Migration Plan
 
