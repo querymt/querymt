@@ -57,7 +57,7 @@ pub(super) const BAR_TEXT_INSET: f32 = 4.;
 /// The least the panel is tall around a conversation.
 pub(super) const MIN_HEIGHT: f32 = 260.;
 /// The panel never grows past this, nor past [`DISPLAY_SHARE`] of its display.
-const MAX_HEIGHT: f32 = 760.;
+pub(crate) const MAX_HEIGHT: f32 = 760.;
 const DISPLAY_SHARE: f32 = 0.7;
 /// Heights are requested in steps of this many px, so a streamed chunk does
 /// not resize the window every time.

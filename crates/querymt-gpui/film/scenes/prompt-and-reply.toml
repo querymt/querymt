@@ -1,0 +1,58 @@
+# The spike's clip (change `spike-gpui-demo-film`) as data: a prompt appears at
+# 0.3 s, the run starts at 0.8 s, a Markdown reply streams in from 1.0 s to
+# 4.0 s (58 words at 19.33 words/s = 3 s = 90 frames), the turn ends at 4.0 s.
+# The prompt is scripted (`notify`), as in the spike, not typed.
+version = 1
+name = "prompt-and-reply"
+fps = 30
+size = [1280, 800]
+theme = "dark"
+accent = "orange"
+stills = [0, 90]
+
+[world]
+kind = "fixture"
+agent_title = "qmtcode"
+cwd = "/workspace"
+model = "anthropic:claude-sonnet-4-5"
+models = [{ id = "anthropic:claude-sonnet-4-5", label = "Claude Sonnet 4.5", provider = "anthropic" }]
+sessions = [
+  { id = "s-1", title = "Refactor the parser", cwd = "/workspace/demo", updated = "2026-11-20T10:00:00Z", phase = "idle" },
+  { id = "s-2", title = "Fix the flaky login test", cwd = "/workspace/demo", updated = "2026-11-19T16:30:00Z", phase = "idle" },
+]
+session = { id = "film", title = "Film" }
+
+[[step]]
+at = 0.3
+notify = { method = "session/update", params = { sessionId = "film", update = { sessionUpdate = "user_message_chunk", messageId = "u1", content = { type = "text", text = "How do I stream a reply into a GPUI view?" } }, _meta = { querymt = { runId = "r1" } } } }
+
+[[step]]
+at = 0.8
+state = "running"
+
+[[step]]
+at = 1.0
+wps = 19.333333333333332
+stream = '''## Streaming a reply
+
+Each chunk the agent sends is applied to the transcript as it arrives:
+
+- the store queues the notification
+- a short timer flushes the queue into the view
+- the view re-renders only the rows that changed
+
+```rust
+fn on_chunk(view: &mut SessionView, text: &str) {
+    view.append(text);
+}
+```
+
+That is all it takes.'''
+
+[[step]]
+at = 4.0
+end_turn = "end_turn"
+
+[[step]]
+at = 5.0
+end = true

@@ -1,0 +1,60 @@
+# The quick panel on film: open it over the Start page, type a question, send
+# it with Enter, stream a reply, close it. `panel = "track"` writes the panel
+# as its own alpha track (panel.webm); `panel = "composite"` draws it over the
+# main window into main.mp4.
+version = 1
+name = "smoke-panel"
+fps = 30
+size = [1280, 800]
+theme = "dark"
+accent = "orange"
+panel = "track"
+stills = [0, 30, 90, 150, 239]
+
+[world]
+kind = "fixture"
+agent_title = "qmtcode"
+cwd = "/workspace/demo"
+model = "anthropic:claude-sonnet-4-5"
+models = [{ id = "anthropic:claude-sonnet-4-5", label = "Claude Sonnet 4.5", provider = "anthropic" }]
+sessions = [
+  { id = "s-1", title = "Refactor the parser", cwd = "/workspace/demo", updated = "2026-11-20T10:00:00Z", phase = "idle" },
+]
+
+[[step]]
+at = 0.5
+quick_open = true
+caption = "Summon the quick panel"
+
+[[step]]
+after = 0.5
+window = "panel"
+type = "What changed in the last commit?"
+cps = 20
+
+[[step]]
+after = 0.3
+window = "panel"
+press = "enter"
+
+[[step]]
+after = 0.2
+state = "running"
+
+[[step]]
+after = 0.3
+stream = "The last commit moves the **film harness** into its own module and reads clips from scene files."
+wps = 7
+caption = "The answer streams in"
+
+[[step]]
+after = 0.3
+end_turn = "end_turn"
+
+[[step]]
+after = 1.0
+quick_close = true
+
+[[step]]
+at = 8.0
+end = true

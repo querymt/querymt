@@ -28,6 +28,8 @@ use crate::store::{AgentsStore, QuickPrefs};
 use crate::ui::{QmtApp, SessionPaneEvent};
 use hotkey::Hotkey;
 pub(crate) use hotkey::HotkeyStatus;
+#[cfg(test)]
+pub(crate) use panel::{MAX_HEIGHT, WIDTH};
 pub(crate) use panel::{QuickPanel, QuickPanelEvent};
 use tray::Tray;
 
