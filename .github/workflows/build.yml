@@ -16,10 +16,6 @@ on:
         required: false
         type: boolean
         default: false
-      dashboard_revision:
-        description: 'Published querymt-desktop revision to embed'
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -28,46 +24,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  dashboard-ui:
-    name: Build dashboard UI
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout embedded dashboard source
-        uses: actions/checkout@v7
-        with:
-          repository: querymt/querymt-desktop
-          ref: ${{ inputs.dashboard_revision }}
-          persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-          cache: npm
-
-      - name: Build and verify embedded dashboard
-        env:
-          QUERYMT_UI_REVISION: ${{ inputs.dashboard_revision }}
-        run: |
-          npm ci
-          npm run test:embedded
-          npm run build:embedded
-          test -f build-embedded/index.html
-          test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
-          test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
-          test "$(git rev-parse HEAD)" = "$QUERYMT_UI_REVISION"
-          test "$(jq -r .revision build-embedded/querymt-ui.json)" = "$QUERYMT_UI_REVISION"
-
-      - name: Upload embedded dashboard
-        uses: actions/upload-artifact@v7
-        with:
-          name: dashboard-ui
-          path: build-embedded
-          if-no-files-found: error
-
   build:
     name: Build ${{ matrix.binary }} for ${{ matrix.target }}
-    needs: dashboard-ui
+    # qmtcode embeds the QueryMT Desktop web build from desktop-web (the
+    # internal `dashboard-ui` artifact), so the wasm is built once.
+    needs: desktop-web
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -267,7 +228,7 @@ jobs:
         with:
           key: ${{ matrix.target }}-${{ matrix.binary }}
 
-      - name: Download embedded dashboard
+      - name: Download embedded dashboard (QueryMT Desktop web)
         if: matrix.binary == 'qmtcode'
         uses: actions/download-artifact@v8
         with:
@@ -518,8 +479,10 @@ jobs:
           path: dist-desktop/*
           if-no-files-found: error
 
-  # The wasm build of QueryMT Desktop, packaged so qmtcode or any static server
-  # can serve it: querymt-desktop-web-<version_name>.tar.gz.
+  # The wasm build of QueryMT Desktop. Published as
+  # querymt-desktop-web-<version_name>.tar.gz for any static server, and handed
+  # unpacked to the qmtcode builds (internal `dashboard-ui` artifact, which the
+  # release jobs' `qm*-*` pattern skips) to embed for `qmtcode --dashboard`.
   desktop-web:
     name: Build QueryMT Desktop web
     runs-on: ubuntu-latest
@@ -579,4 +542,11 @@ jobs:
         with:
           name: qmt-desktop-web
           path: dist-desktop/*
+          if-no-files-found: error
+
+      - name: Upload embedded dashboard
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-ui
+          path: crates/querymt-gpui/dist
           if-no-files-found: error

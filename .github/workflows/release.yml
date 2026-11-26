@@ -10,21 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  resolve-ui:
-    name: Resolve dashboard revision
-    runs-on: ubuntu-latest
-    outputs:
-      revision: ${{ steps.pin.outputs.revision }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-      - name: Read embedded UI pin
-        id: pin
-        run: |
-          revision=$(tr -d '[:space:]' < crates/agent/embedded-ui-revision)
-          test -n "$revision"
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
-
   # Stable gate. Fails before anything is built or published when:
   #   - the tag does not match the workspace version, or
   #   - the tag version sorts above the published nightly and the tag commit
@@ -84,7 +69,7 @@ jobs:
 
   build:
     name: Build Release Binaries
-    needs: [resolve-ui, gate]
+    needs: gate
     uses: ./.github/workflows/build.yml
     with:
       # Stable passes vX.Y.Z for both: the asset label keeps the v, and
@@ -92,7 +77,6 @@ jobs:
       version_name: ${{ github.ref_name }}
       qmt_version: ${{ needs.gate.outputs.qmt_version }}
       is_nightly: false
-      dashboard_revision: ${{ needs.resolve-ui.outputs.revision }}
 
   release:
     name: Create GitHub Release
