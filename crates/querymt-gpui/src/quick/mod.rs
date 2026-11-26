@@ -17,6 +17,8 @@ pub(crate) mod hud;
 pub(crate) mod instance;
 mod panel;
 mod tray;
+#[cfg(target_os = "linux")]
+mod wayland;
 
 use std::time::{Duration, Instant};
 
