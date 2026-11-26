@@ -61,6 +61,9 @@ include = [
   "crates/querymt-gpui/src/ui/keys.rs",
   "crates/querymt-gpui/src/search.rs",
   "crates/querymt-gpui/src/theme.rs",
+  # The film harness and its scene files (the "Filming demo clips" note).
+  "crates/querymt-gpui/src/film/*.rs",
+  "crates/querymt-gpui/film/scenes/*.toml",
 ]
 # The evaluation harness is not part of the subject matter being documented, and
 # the config test module is large enough to bury the config note in search results.

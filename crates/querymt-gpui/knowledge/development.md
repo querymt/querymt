@@ -3,7 +3,7 @@ id: gpui-development
 title: Building, testing and changing querymt-gpui
 description: Build targets (native, wasm, Nix), where tests live and how CI runs them, golden files, the in-workspace session core, fonts, release packaging and the OpenSpec change workflow.
 tags: build, test, ci, nextest, clippy, wasm, web, nix, golden, fonts, session core, release, packaging, openspec, workflow
-knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", ".github/workflows/test-gpui.yml"]
+knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/src/film/*.rs", "crates/querymt-gpui/film/scenes/*.toml"]
 knowledge_sources: ["crates/querymt-gpui/Cargo.toml", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/web/build.sh"]
 ---
 
@@ -74,52 +74,156 @@ rows shows up here in the same pull request.
 pin to bump: a change to the core or to `querymt-agent-protocol-types` must keep
 `cargo t-gpui` green.
 
-## Filming demo clips (spike)
+## Filming demo clips
 
-`src/film.rs` (test-only, OpenSpec change `spike-gpui-demo-film`) renders the real `QmtApp`
-offscreen, frame by frame, on GPUI's `HeadlessAppContext` with a stepped fake clock, and pipes
-the frames to `ffmpeg`. It films one hard-coded scene: a user prompt, then a Markdown reply
-streamed in through `AgentsStore::notify_for_test`, 5 s at 30 fps. The tests are `#[ignore]`d,
-so `cargo t-gpui` and CI never run them.
+`src/film/` (test-only, OpenSpec changes `spike-gpui-demo-film` and `add-gpui-film-scenes`)
+renders the real `QmtApp` offscreen, frame by frame, on GPUI's `HeadlessAppContext` with a
+stepped fake clock, and pipes the frames to `ffmpeg`. A clip is a **scene file** (TOML) read
+at run time, so editing one needs no recompile. The film tests are `#[ignore]`d, so
+`cargo t-gpui` and CI never run them; only the scene, agent, timing and mask unit tests and
+the composer-id test run there.
 
 ```bash
-cargo nextest run -p querymt-gpui --bins --run-ignored only \
-  -E 'test(=film::film_prompt_and_streamed_reply)' --no-capture          # fixture world
-cargo nextest run -p querymt-gpui --bins --run-ignored only \
-  -E 'test(=film::film_prompt_and_streamed_reply_seeded)' --no-capture   # seeded from qmtcode
+QMT_FILM_SCENE=crates/querymt-gpui/film/scenes/smoke.toml \
+  cargo nextest run -p querymt-gpui --bins --run-ignored only \
+  -E 'test(=film::film_scene)' --no-capture
 ```
 
-- Needs `ffmpeg` (and, to inspect, `ffprobe`) on `PATH`.
-- Output goes to `$QMT_FILM_OUT`, default `target/film/`: `<take>.mp4` (2560x1600, 30 fps,
-  150 frames) plus `<take>-000.png` and `<take>-090.png` stills, where `<take>` is
-  `prompt-and-reply` or `prompt-and-reply-seeded`.
-- Two starting worlds. The fixture take uses `peer_fixture()`: a connected agent with no
-  session list and no models, so the sidebar reads "Loading sessions…" and the pill
-  "Model unknown". The seeded take connects to a running qmtcode over WebSocket at
-  `$QMT_FILM_AGENT` (default `localhost:3030`) through `launch::websocket_fixture` and the
-  real `AgentsStore::connect`, then waits (wall time, 20 s limit) until the session list and
-  model catalog have arrived. Only that seed comes from the agent: the filmed session `film`
-  does not exist there and its prompt and reply are still scripted, so nothing is sent to a
-  model. The pill shows `$QMT_FILM_MODEL` (a model id), else the catalog's first model.
-  `websocket_fixture` neither reads nor writes the user's `state.json` (unlike
-  `AgentsStore::new`).
-- The seeded take is not reproducible: the frame shows the agent's real session titles and
-  workspaces, the rest of the catalog keeps paging in during the take (the open-session count
-  grew from 201 to 7960 in one), and each scripted `session/update` makes the store re-list
-  sessions 1.2 s of film time later, so rows reorder as sessions on that agent change. Point it
-  at a qmtcode with a demo workspace for a public clip.
-- `probe_headless_input` shows that `window.press` and `window.click` work on a headless
-  window; `probe_seeded_from_agent` captures one seeded frame. Both write `probe-*.png`.
-- Limits: the window is 1280x800 logical at the test platform's 2x scale, with no OS frame or
-  traffic lights. The theme is forced dark with the orange accent (`prefs.dark` is set in
-  memory, because the test window's appearance is light). Capture takes 125-185 ms per frame
-  (Apple M4 Pro, Metal), so a clip renders slower than real time. On macOS the text system is
-  `gpui_apple::AppleTextSystem`, a macOS-only dev-dependency, because
-  `current_platform` builds a `MacPlatform`, which panics off the process main thread.
-  The composer has only a `debug_selector` (`composer-input`), no element id, so
-  `TestWindowExt::click` cannot target it; keystrokes reach it through focus. Find in session
-  does nothing on an empty transcript. The quick panel is not filmable (native panel).
-- Linux (wgpu) is untried.
+- Needs `ffmpeg` with `libx264` and `libvpx-vp9` (and `ffprobe`, to inspect) on `PATH`.
+- Environment: `QMT_FILM_SCENE` (a path relative to the repository root, or absolute; the test
+  fails with a message when unset), `QMT_FILM_OUT` (output base, default `target/film/`),
+  `QMT_FILM_AGENT` (`host:port` of a seeded world; overrides the scene's `address`),
+  `QMT_FILM_PANEL_CODEC=prores` (panel track as ProRes 4444 `panel.mov` instead of VP9 alpha).
+- Scenes live in `crates/querymt-gpui/film/scenes/`: `smoke.toml` (the harness's own check,
+  also `film::smoke_scene`), `smoke-panel.toml` (the quick panel) and `prompt-and-reply.toml`
+  (the spike's clip).
+
+### Scene format (`version = 1`)
+
+```toml
+version = 1
+name = "prompt-and-reply"          # output folder and file stem
+fps = 30
+size = [1280, 800]                 # logical; captured at the test window's 2x
+theme = "dark"                     # "dark" | "light"
+accent = "orange"
+panel = "track"                    # "track" (separate alpha track) | "composite"
+anchor = { x = 0.5, bottom = 0.15 } # where the panel sits in the main canvas
+stills = [0, 90]                   # frames also written as still-<frame>.png
+
+[world]
+kind = "fixture"                   # "fixture" | "agent" (seeded from a running qmtcode)
+agent_title = "qmtcode"
+cwd = "/workspace/demo"
+model = "anthropic:claude-sonnet-4-5"
+models = [{ id = "anthropic:claude-sonnet-4-5", label = "Claude Sonnet 4.5", provider = "anthropic" }]
+sessions = [{ id = "s-1", title = "Refactor the parser", cwd = "/workspace/demo", updated = "2026-11-20T10:00:00Z", phase = "idle" }]
+session = { id = "film", title = "Streaming replies" }   # open in the main pane; omit for the Start page
+
+[[step]]
+at = 0.3                           # seconds from the start; or `after = 0.5` = after the previous step ends
+type = "How do I stream a reply into a GPUI view?"
+cps = 18                           # characters per second (default 18)
+caption = "Ask anything"           # `caption` and `window = "main" | "panel"` go on any step
+
+[[step]]
+after = 0.3
+press = "enter"
+
+[[step]]
+after = 0.4
+stream = """## Streaming a reply
+..."""
+wps = 9                            # words per second (default 9)
+
+[[step]]
+after = 0.2
+end_turn = "end_turn"              # stop reason; answers the held session/prompt
+
+[[step]]
+at = 6.0
+end = true                         # the last frame; required, and last
+```
+
+- One action key per step: `wait` (seconds), `type`, `press`, `click`, `hover`, `scroll`
+  (`{ target, dx, dy }`), `quick_open`, `quick_close`, `stream`, `tool_call` (`{ id, title,
+  kind, status, content }`), `state` (`"running"` or `"idle"`), `end_turn`, `notify` (`{ method,
+  params }`, raw JSON), `mark` (`{ name, target }`) and `end`.
+- Targets (`click`, `hover`, `scroll`, `mark`): an element id (`"composer-input"`,
+  `"find-close"`), resolved with `TestWindowExt::find` in the step's window, or `{ at = [x, y] }`
+  in logical window pixels, sent as raw mouse events. Debug selectors cannot be targeted: on a
+  `HeadlessAppContext` window their bounds are private to GPUI.
+- Validation runs before frame 0, and errors name the step index and key: times may not go
+  back, one action per step, `end` last, a seeded world takes no agent steps, `window =
+  "panel"` needs an earlier `quick_open` and no `quick_close` since. A step overlapping a
+  running `type` or `stream` is allowed.
+- Durations: `type` lasts chars / `cps`, `stream` words / `wps`; times round to whole frames and
+  the clip lasts up to the `end` step's frame. Typing and streaming deliver one chunk per frame
+  (a reply is cut at whitespace only).
+
+### The fake agent
+
+A fixture world has no agent: the harness answers the app's requests every frame, as the
+quick-panel tests do. `session/new` gets the world session's id (else `q1`); `session/prompt`
+is held open until `end_turn`, and is acknowledged by echoing the prompt as
+`user_message_chunk` (with the request's `client_prompt_id`), as a real agent does, which
+turns the app's "Sending prompt…" row into the user's message; everything else gets `{}`.
+`stream`, `tool_call`, `state` and `notify` target the open turn's session, else the world's.
+A prompt typed into the composer and sent with Enter therefore goes through the app's real send
+path. A seeded world (`kind = "agent"`) talks to the real agent instead and refuses agent steps.
+
+### Outputs
+
+`$QMT_FILM_OUT/<name>/` holds `main.mp4` (H.264, 30 fps, 2x capture), `<name>.film.json` and
+`film.js` (the same object as `window.QMT_FILM = {...};`), `still-<frame>.png` for `stills`, and
+`panel.webm` (or `panel.mov`) when the scene opens the panel in `track` mode. The timing file
+(`version = 1`) has `fps`, `frames`, `scale`, `canvas`, `tracks` (one per window: `file`,
+`size`, `anchor`, the `visible` frame ranges and `bounds` as `[frame, x, y, w, h]` where the
+size changed), `events` (every input and agent step: `frame`, `t`, `kind`, `window`, `target`,
+`rect` in logical pixels and `pct` in % of the window's canvas, `text`, `key`, `until`), `marks`
+and `captions` (each lasts until the next one). For the panel, `rect` and `bounds` are in its
+track's canvas (or the main canvas in `composite` mode), not raw window coordinates.
+
+### The quick panel
+
+The film world installs `QuickHost` when a step uses the panel (`prefs.quick.enabled` stays
+off, so no hotkey or tray starts) and opens it with `host.show`. The panel films with its opaque
+"Reduce transparency" chrome (`Chrome::solid()`); there is no native material (Liquid Glass or
+visual effect), edge light, window shadow, global hotkey, tray or dragging.
+
+- `panel = "track"`: its own track on a fixed canvas of `quick::panel::WIDTH` x `MAX_HEIGHT`
+  (680 x 760 logical), bottom-centred, encoded as VP9 with alpha (`yuva420p`, `alpha_mode=1`).
+  Capture is opaque (the offscreen Metal renderer clears to alpha 1), so the harness multiplies
+  the alpha by a rounded-rectangle mask at `chrome::RADIUS`; the track is fully transparent
+  while the panel is closed, and has as many frames as `main.mp4`. ffprobe's native VP9 decoder
+  ignores the alpha plane: decode with `-c:v libvpx-vp9` to see it.
+- `panel = "composite"`: the masked panel and a soft shadow are blended onto the main frame at
+  the scene's `anchor`, into `main.mp4` alone.
+- The test window changes its size on `resize` without telling GPUI, so `Film::draw` calls
+  `Window::bounds_changed` when the viewport differs from the bounds (the panel grows with its
+  chat; without it only the bar is laid out).
+- Inside the panel, `type`/`press` steps carry no target while it is only a bar: the bar's
+  textarea has no element id that `find` resolves. Use a point target.
+
+### Limits
+
+- The composer's input has the element id `composer-input` (`.id(..).test_support()` in
+  `ui/session_view.rs`; a plain id is not found by `find`, and `test_support` is inert without
+  the kit's `test-support` feature). The id is unscoped, so a scene with split panes cannot
+  tell composers apart.
+- The window is 1280x800 logical at the test platform's 2x scale, with no OS frame or traffic
+  lights. The theme and accent come from the scene (`prefs.dark` and `prefs.accent` in memory,
+  because the test window's appearance is light). Capture takes 125-145 ms per frame (Apple
+  M-series, Metal, unoptimized build), so a clip renders slower than real time. On macOS the
+  text system is `gpui_apple::AppleTextSystem`, a macOS-only dev-dependency, because
+  `current_platform` builds a `MacPlatform`, which panics off the process main thread. Find in
+  session does nothing on an empty transcript.
+- A seeded world (`kind = "agent"`: `launch::websocket_fixture` and the real
+  `AgentsStore::connect`, waiting up to 20 s for sessions and models) is not reproducible: the
+  frame shows the agent's real sessions, and the store re-lists them after scripted updates.
+  Point it at a qmtcode with a demo workspace.
+- Linux (wgpu) and Windows filming are untried; the composer-id test runs everywhere but is
+  unverified on Linux CI.
 
 ## Releases
 

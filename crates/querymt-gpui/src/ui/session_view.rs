@@ -5334,6 +5334,11 @@ impl SessionPane {
         // While the command list shows, its keys come first (`slash_keys`).
         let input = self
             .slash_keys(div().relative(), cx)
+            // The id lets a test or a film scene click it by name; a plain
+            // id is not found by `find` unless the element is observed too
+            // (inert without the kit's `test-support` feature).
+            .id("composer-input")
+            .test_support()
             .debug_selector(|| "composer-input".into())
             .children(slash_list.map(|list| deferred(list).with_priority(1)))
             .px_1()

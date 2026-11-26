@@ -1,0 +1,55 @@
+# The harness's own end-to-end check (`film::smoke_scene`): a fixture world
+# with two sessions and a model, a prompt typed into the composer and sent
+# with Enter, a short streamed reply, then the end of the turn.
+version = 1
+name = "smoke"
+fps = 30
+size = [1280, 800]
+theme = "dark"
+accent = "orange"
+stills = [0, 15, 90, 179]
+
+[world]
+kind = "fixture"
+agent_title = "qmtcode"
+cwd = "/workspace/demo"
+model = "anthropic:claude-sonnet-4-5"
+models = [{ id = "anthropic:claude-sonnet-4-5", label = "Claude Sonnet 4.5", provider = "anthropic" }]
+sessions = [
+  { id = "s-1", title = "Refactor the parser", cwd = "/workspace/demo", updated = "2026-11-20T10:00:00Z", phase = "idle" },
+  { id = "s-2", title = "Fix the flaky login test", cwd = "/workspace/demo", updated = "2026-11-19T16:30:00Z", phase = "idle" },
+]
+session = { id = "film", title = "Smoke" }
+
+[[step]]
+at = 0.5
+click = "composer-input"
+caption = "Click the composer"
+
+[[step]]
+after = 0.2
+type = "Say hello in one line."
+cps = 24
+caption = "Type a prompt"
+
+[[step]]
+after = 0.3
+press = "enter"
+
+[[step]]
+after = 0.2
+state = "running"
+
+[[step]]
+after = 0.3
+stream = "Hello! This is a **scripted** reply from the fake agent."
+wps = 6
+caption = "The reply streams in"
+
+[[step]]
+after = 0.2
+end_turn = "end_turn"
+
+[[step]]
+at = 6.0
+end = true

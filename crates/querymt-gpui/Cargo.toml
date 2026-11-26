@@ -109,6 +109,8 @@ gpui-kit = { version = "0.11.0", features = ["test-support"] }
 # Tests replay the core's seeded golden cases (`testing::golden_cases()`)
 # instead of storing trace files.
 querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
+# Film scene files (src/film/scene.rs).
+toml = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # The film spike (src/film.rs) needs the CoreText text system without a
