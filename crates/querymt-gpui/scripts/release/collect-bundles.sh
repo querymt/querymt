@@ -9,10 +9,11 @@
 #
 # Environment:
 #   TARGET         Rust target triple (decides which bundles are expected)
-#   ASSET_PREFIX   e.g. QueryMT-GPUI
+#   ASSET_PREFIX   e.g. QueryMT-Desktop
 #   ASSET_SUFFIX   e.g. macos-aarch64, windows-x64-setup, linux-x86_64
 #   VERSION_NAME   vX.Y.Z | nightly
-#   CARGO_TARGET_DIR   optional, default target
+#   CARGO_TARGET_DIR   optional, default target (run from the workspace root)
+#   CARGO_PROFILE      optional, default release-gpui
 #   DIST               optional, default dist
 #
 # Expected bundles (written by scripts/package/*.sh):
@@ -36,7 +37,7 @@ die() {
   exit 1
 }
 
-BUNDLE="$TARGET_ROOT/$TARGET/release/bundle"
+BUNDLE="$TARGET_ROOT/$TARGET/${CARGO_PROFILE:-release-gpui}/bundle"
 [ -d "$BUNDLE" ] || die "bundle directory $BUNDLE does not exist"
 
 collected=0

@@ -1,5 +1,8 @@
 /target
 /crates/agent/dashboard-dist/
+/crates/querymt-gpui/dist/
+/dist/
+result
 .env*
 
 /docs/site/*

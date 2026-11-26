@@ -1,5 +1,9 @@
 //! Small helpers: clock, timestamps, labels.
 
+/// The app version: the published release or nightly version when CI set
+/// `QMT_VERSION` at build time, else the crate version (see `build.rs`).
+pub const APP_VERSION: &str = env!("QMT_BUILD_VERSION");
+
 pub fn now_ms() -> f64 {
     #[cfg(target_family = "wasm")]
     {

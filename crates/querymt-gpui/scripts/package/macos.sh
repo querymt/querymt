@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Package a macOS release build as QueryMT.app, an app.tar.gz and a dmg.
 #
-#   scripts/package/macos.sh <version> <target>
+#   crates/querymt-gpui/scripts/package/macos.sh <version> <target>
 #
-# Reads target/<target>/release/querymt-gpui and writes
-# target/<target>/release/bundle/{macos,dmg}/, the same layout `tauri build`
+# Reads <workspace target>/<target>/<profile>/querymt-gpui (profile from
+# CARGO_PROFILE, default release-gpui) and writes
+# <workspace target>/<target>/<profile>/bundle/{macos,dmg}/, the same layout `tauri build`
 # produces for querymt-desktop. The app is ad-hoc signed only: there is no
 # Developer ID signing or notarization yet.
 set -euo pipefail
 
+# The crate directory: packaging/ paths below are relative to it.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKSPACE="$(cd "$ROOT/../.." && pwd)"
 cd "$ROOT"
 
 VERSION="${1:?usage: macos.sh <version> <target>}"
@@ -20,11 +23,12 @@ case "$TARGET" in
   *) echo "unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
-TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
-BINARY="$TARGET_ROOT/$TARGET/release/querymt-gpui"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
+PROFILE="${CARGO_PROFILE:-release-gpui}"
+BINARY="$TARGET_ROOT/$TARGET/$PROFILE/querymt-gpui"
 [ -x "$BINARY" ] || { echo "binary not found at $BINARY" >&2; exit 1; }
 
-OUT="$TARGET_ROOT/$TARGET/release/bundle"
+OUT="$TARGET_ROOT/$TARGET/$PROFILE/bundle"
 rm -rf "$OUT/macos" "$OUT/dmg"
 mkdir -p "$OUT/macos" "$OUT/dmg"
 

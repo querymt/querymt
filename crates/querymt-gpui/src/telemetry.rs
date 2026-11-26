@@ -131,7 +131,7 @@ mod native {
             ])
             .with_service_name(SERVICE_NAME)
             .with_schema_url(
-                [KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION"))],
+                [KeyValue::new(SERVICE_VERSION, crate::util::APP_VERSION)],
                 SCHEMA_URL,
             )
             .build()

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Package a Windows release build as an NSIS setup exe (run from Git Bash).
 #
-#   scripts/package/windows.sh <version> <target>
+#   crates/querymt-gpui/scripts/package/windows.sh <version> <target>
 #
-# Reads target/<target>/release/querymt-gpui.exe and writes
-# target/<target>/release/bundle/nsis/, the same layout `tauri build` uses.
+# Reads <workspace target>/<target>/<profile>/querymt-gpui.exe (profile from
+# CARGO_PROFILE, default release-gpui) and writes
+# <workspace target>/<target>/<profile>/bundle/nsis/, the same layout `tauri build` uses.
 set -euo pipefail
 
+# The crate directory: packaging/ paths below are relative to it.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKSPACE="$(cd "$ROOT/../.." && pwd)"
 cd "$ROOT"
 
 VERSION="${1:?usage: windows.sh <version> <target>}"
@@ -18,11 +21,12 @@ case "$TARGET" in
   *) echo "unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
-TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
-BINARY="$TARGET_ROOT/$TARGET/release/querymt-gpui.exe"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
+PROFILE="${CARGO_PROFILE:-release-gpui}"
+BINARY="$TARGET_ROOT/$TARGET/$PROFILE/querymt-gpui.exe"
 [ -f "$BINARY" ] || { echo "binary not found at $BINARY" >&2; exit 1; }
 
-OUT="$TARGET_ROOT/$TARGET/release/bundle/nsis"
+OUT="$TARGET_ROOT/$TARGET/$PROFILE/bundle/nsis"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 

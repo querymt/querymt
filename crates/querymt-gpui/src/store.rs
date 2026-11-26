@@ -2772,7 +2772,7 @@ impl AgentsStore {
                     "initialize",
                     json!({
                         "protocolVersion": 1,
-                        "clientInfo": { "name": "QueryMT GPUI", "version": env!("CARGO_PKG_VERSION") },
+                        "clientInfo": { "name": "QueryMT GPUI", "version": crate::util::APP_VERSION },
                         // `session.compaction`: the agent sends ID-addressed
                         // `compaction_update` / `compaction_summary_chunk` only when advertised.
                         // `_meta.querymt.sessionLoadSnapshot.epoch` (as the desktop app): the
@@ -4589,7 +4589,7 @@ pub(crate) fn load_error_report(
          Error: {err}\n\n\
          Agent error (JSON-RPC):\n{raw}\n\n\
          Request params:\n{params}\n",
-        version = env!("CARGO_PKG_VERSION"),
+        version = crate::util::APP_VERSION,
         session = params
             .get("sessionId")
             .and_then(Value::as_str)
