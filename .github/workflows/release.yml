@@ -108,8 +108,8 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts/
-          # Match qmt-*, qmtcode-*, qmacp-* and qmcp-*, but not the internal
-          # dashboard-ui artifact.
+          # Match qmt-*, qmtcode-*, qmacp-*, qmcp-* and qmt-desktop-* (QueryMT
+          # Desktop), but not the internal dashboard-ui artifact.
           pattern: 'qm*-*'
           merge-multiple: true
 
