@@ -93,8 +93,8 @@
   runs share build artifacts: `cargo t-<pkg> [filter args]` (nextest) and
   `cargo cl-<pkg>` (clippy, `-D warnings`) for `agent`, `runtime`, `services`, `sqlite`,
   `knowledge`, `index` and `core`; for example `cargo t-runtime -E 'test(/compaction/)'`.
-  `agent` builds with `dashboard`, so set `QMT_UI_DIST` to the fixture (see Dashboard
-  Boundary); without it the build compiles the real dashboard (minutes).
+  `agent` uses `dashboard-server` (dashboard code, placeholder page), so it never builds
+  the wasm UI and needs no `QMT_UI_DIST` (see Dashboard Boundary).
   Loop: test the package you changed with its `t-<pkg>` alias, and build the facade
   (`cargo t-agent --no-run`) before pushing. Measured edit cost with incremental on:
   runtime/sqlite/services/facade edits 5-16 s and core edits 15-19 s (everything above
@@ -128,8 +128,11 @@
   `target/querymt-gpui-web`). The app lives here and is changed in the same pull
   request when a backend change needs it. The Tauri `querymt-desktop` repository is
   separate; report required follow-up there instead of expanding into it.
-- For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
-  from `.github/actions/rust-setup/action.yml` instead of building the wasm app.
+- `dashboard-server` is the dashboard server code (routes, same-origin ACP guard,
+  `--dashboard`) with a placeholder page from `crates/agent/dashboard-placeholder/`.
+  Use it for backend checks and tests (`t-agent`/`cl-agent` do). `dashboard` adds the
+  embedded UI; `QMT_UI_DIST` points it at a prebuilt UI directory instead of the wasm
+  build. The real embed path is checked by `test-gpui.yml` (dashboard-embed).
 
 ## Code Conventions
 

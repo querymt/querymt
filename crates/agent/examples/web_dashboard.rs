@@ -13,7 +13,7 @@
 //!
 //! Then open http://127.0.0.1:3030 in your browser.
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use querymt_agent::prelude::*;
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "dashboard"))]
+#[cfg(not(feature = "dashboard-server"))]
 fn main() {
     eprintln!(
         "This example requires the `dashboard` feature. Run: \

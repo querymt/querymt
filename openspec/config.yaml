@@ -22,12 +22,12 @@ context: |
   - nextest does not run doctests. When doc examples change, also run `cargo test -p <package> --doc`.
   - nextest fails when a filter matches no tests. Fix the filter; never drop it.
   - nextest is not in the Nix devShell. If `cargo nextest --version` fails, tell the user (`cargo install cargo-nextest --locked`), then fall back to `cargo test` with the same scope and record the fallback.
-  - .cargo/config.toml has aliases with the CI feature sets for the agent packages: `cargo t-<pkg>` (nextest) and `cargo cl-<pkg>` (clippy -D warnings) for agent, runtime, services, sqlite, knowledge, index, core, plus gpui (`t-gpui` runs the bin-target tests). Use them so local builds share artifacts. Loop: test the package you changed, build the facade (`cargo t-agent --no-run`) before pushing. `t-agent`/`cl-agent` need QMT_UI_DIST.
+  - .cargo/config.toml has aliases with the CI feature sets for the agent packages: `cargo t-<pkg>` (nextest) and `cargo cl-<pkg>` (clippy -D warnings) for agent, runtime, services, sqlite, knowledge, index, core, plus gpui (`t-gpui` runs the bin-target tests). Use them so local builds share artifacts. Loop: test the package you changed, build the facade (`cargo t-agent --no-run`) before pushing. `t-agent`/`cl-agent` use the dashboard-server feature and need no QMT_UI_DIST.
   - Never run `cargo nextest run --workspace`, or `--all-features` on querymt-agent. Default-feature (extism) provider test builds can fail to link, and native providers are expensive.
 
   Features (mirror .github/workflows):
   - querymt-agent-runtime CI features: remote,oauth,plugin-loaders,api (plus test-support for downstream tests). querymt-agent forwards its features to it. querymt-agent CI features: dashboard,oauth,zbus-secret-service,systemd-credentials,remote. Mesh code needs remote. The zbus/systemd features only take effect on Linux, so those paths stay unverified on macOS; say so.
-  - dashboard builds need QMT_UI_DIST pointing at the minimal fixture from .github/actions/rust-setup/action.yml, outside target/. Without it build.rs compiles the real dashboard (crates/querymt-gpui for wasm32, release-gpui-web profile, several minutes the first time).
+  - querymt-agent CI and the aliases use dashboard-server (dashboard routes, same-origin guard, placeholder page; no wasm build). The dashboard feature adds the embedded UI: build.rs compiles crates/querymt-gpui for wasm32 (release-gpui-web, several minutes the first time) unless QMT_UI_DIST names a prebuilt UI directory. Only test-gpui.yml (dashboard-embed) and release builds use dashboard.
   - querymt and querymt-remote CI use --all-features.
   - Providers default to the extism (wasm plugin) feature. Test them with --no-default-features --features native. qmt-mrs tests download models; skip them unless the change targets mrs.
   - Python crates need PYO3_PYTHON pointing at Python 3.10 or newer (abi3-py310).
@@ -70,7 +70,7 @@ rules:
     - Every scenario in the change's delta specs is covered by at least one task. A scenario that cannot be tested automatically says how it is verified instead.
     - Name scenario tests after the scenario in snake_case, so cargo nextest run -p <package> -E 'test(/<name>/)' selects them. Tests assert the THEN outcome through the production code path.
     - Verify with cargo nextest run -p <package>, exact features and a test filter. Never write bare cargo test, except cargo test --doc for doctests.
-    - Use each affected package's CI feature set and fixtures (QMT_UI_DIST for dashboard, --no-default-features --features native for providers).
+    - Use each affected package's CI feature set and fixtures (dashboard-server rather than dashboard for querymt-agent, --no-default-features --features native for providers).
     - Per package, order checks as cargo check, focused nextest, cargo fmt -p <package> -- --check, then cargo clippy --all-targets with CI features and -D warnings.
     - New config keys get default, accepted-value and rejected-value parse tests and a docs update. Add or extend an example profile in crates/agent/examples/confs only when it demonstrates a user-facing setting, together with a test that loads it.
     - The final group covers downstream packages (from cargo tree -i) and openspec validate <change> --strict. No workspace-wide runs and no --all-features on querymt-agent.

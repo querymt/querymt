@@ -88,7 +88,11 @@ The web build is also the `qmtcode --dashboard` UI: the `dashboard` feature of
 this crate for wasm32 with `release-gpui-web` in `target/querymt-gpui-web`, unless
 `QMT_UI_DIST` names a prebuilt directory (CI passes the `desktop-web` job's output; Nix
 passes `packages.querymt-gpui-web`). A web-breaking change here therefore breaks
-`cargo build -p querymt-agent --features dashboard` without `QMT_UI_DIST`.
+`cargo build -p querymt-agent --features dashboard` without `QMT_UI_DIST`; the
+`dashboard-embed` job in `test-gpui.yml` builds that path, serves the page from
+qmtcode and checks in headless Chrome that the app starts. The agent's own checks
+(`cargo t-agent`, `cargo cl-agent`, `test-agent.yml`) use `dashboard-server`, which
+serves a placeholder page and never builds this crate.
 
 ## Changing behaviour: OpenSpec
 

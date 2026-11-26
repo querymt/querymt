@@ -34,7 +34,7 @@
 # Keep the feature lists in sync with .cargo/config.toml (t-agent, t-runtime).
 set -euo pipefail
 
-AGENT_FEATURES="dashboard,oauth,zbus-secret-service,systemd-credentials,remote"
+AGENT_FEATURES="dashboard-server,oauth,zbus-secret-service,systemd-credentials,remote"
 RUNTIME_FEATURES="remote,oauth,plugin-loaders,api"
 
 PKGS="protocol core index knowledge sqlite services runtime agent"

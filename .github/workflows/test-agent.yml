@@ -22,7 +22,7 @@ concurrency:
 
 env:
   # Keep in sync with .cargo/config.toml and scripts/ci-agent-affected.sh.
-  AGENT_FEATURES: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
+  AGENT_FEATURES: 'dashboard-server,oauth,zbus-secret-service,systemd-credentials,remote'
 
 jobs:
   detect:
@@ -140,7 +140,6 @@ jobs:
         with:
           components: clippy
           cache-key: agent-clippy
-          dashboard-fixture: 'true'
 
       - name: Run Clippy
         run: cargo clippy ${{ matrix.flags }} --all-targets -- -D warnings
@@ -165,7 +164,6 @@ jobs:
         uses: ./.github/actions/rust-setup
         with:
           cache-key: agent-standalone
-          dashboard-fixture: 'true'
 
       - name: Install cargo-hakari
         uses: taiki-e/install-action@v2
@@ -231,7 +229,6 @@ jobs:
         with:
           components: llvm-tools-preview
           cache-key: agent-test
-          dashboard-fixture: 'true'
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

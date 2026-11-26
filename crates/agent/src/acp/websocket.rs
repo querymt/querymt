@@ -33,7 +33,7 @@ use crate::acp::shared::{
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
-#[cfg(any(feature = "dashboard", test))]
+#[cfg(any(feature = "dashboard-server", test))]
 use axum::http::{HeaderMap, header};
 use axum::{
     Router,
@@ -1192,7 +1192,7 @@ pub(crate) fn router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest("/acp", websocket_router(WsServerState::new(agent)))
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest(
         "/acp",
@@ -1201,7 +1201,7 @@ pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> 
     )
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 async fn enforce_same_origin(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -1234,7 +1234,7 @@ pub(crate) fn is_loopback_websocket_peer(peer: Option<std::net::SocketAddr>) -> 
     peer.is_some_and(|peer| peer.ip().is_loopback())
 }
 
-#[cfg(any(feature = "dashboard", test))]
+#[cfg(any(feature = "dashboard-server", test))]
 pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         // Non-browser ACP clients do not send Origin.

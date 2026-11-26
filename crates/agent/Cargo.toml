@@ -16,11 +16,17 @@ plugin-host-only = ["agent-mcp", "agent-tracing"]
 plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins", "querymt-agent-runtime/plugin-loaders"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
-# Embeds QueryMT Desktop web (crates/querymt-gpui built for wasm32-unknown-unknown
-# with the release-gpui-web profile) and serves it over same-origin ACP.
-# build.rs builds it in target/querymt-gpui-web; QMT_UI_DIST names a prebuilt UI
-# directory instead (CI test fixture, release artifact).
-dashboard = ["api", "plugin-loaders", "dep:wasm-bindgen-cli-support"]
+# The dashboard server without the UI: dashboard routes, the same-origin ACP guard,
+# asset serving and qmtcode's `--dashboard`, serving a placeholder page
+# (dashboard-placeholder/). For checks and tests of that code without the wasm
+# build (`cargo t-agent`, `cargo cl-agent`, CI).
+dashboard-server = ["api", "plugin-loaders"]
+# The dashboard server plus the embedded QueryMT Desktop web UI
+# (crates/querymt-gpui built for wasm32-unknown-unknown with the
+# release-gpui-web profile), served over same-origin ACP. build.rs builds it in
+# target/querymt-gpui-web; QMT_UI_DIST names a prebuilt UI directory instead
+# (release artifact).
+dashboard = ["dashboard-server", "dep:wasm-bindgen-cli-support"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth", "querymt-agent-runtime/oauth"]
 

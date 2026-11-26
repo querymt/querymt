@@ -51,11 +51,11 @@ Run the commands below from the repository root inside that environment.
 4. Expand to relevant neighbors and the applicable CI feature set before handoff.
    Agent CI-shaped lint is:
    ```sh
-   cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings
+   cargo cl-agent   # clippy with the CI features, including dashboard-server
    ```
-   Read the current workflow. Its small `QMT_UI_DIST` fixture satisfies backend
-   build requirements without compiling the embedded QueryMT Desktop web app
-   (`crates/querymt-gpui` for wasm32).
+   Read the current workflow. `dashboard-server` covers the dashboard server code
+   with a placeholder page, so backend checks never compile the embedded QueryMT
+   Desktop web app (`crates/querymt-gpui` for wasm32); the `dashboard` feature does.
    Use bounded nextest/runtime waits where appropriate; do not repeatedly build
    every example/provider or create a new target directory for each minor edit.
 5. Rebuild the candidate after the final runtime-affecting edit and run the chosen

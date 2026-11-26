@@ -3,18 +3,18 @@
 # `runtime_features`), so local builds share artifacts with each other and
 # with CI's flags. Keep the feature lists below in sync with that file.
 #
-#   AGENT_FEATURES   = dashboard,oauth,zbus-secret-service,systemd-credentials,remote
+#   AGENT_FEATURES   = dashboard-server,oauth,zbus-secret-service,systemd-credentials,remote
 #   RUNTIME_FEATURES = remote,oauth,plugin-loaders,api
 #
-# Aliases cannot set environment variables: `dashboard` builds (t-agent,
-# cl-agent) still need QMT_UI_DIST pointing at the minimal UI fixture from
-# test-agent.yml; without it build.rs compiles the real dashboard
-# (crates/querymt-gpui for wasm32). Extra arguments are appended, for example
+# `dashboard-server` covers the dashboard server code with a placeholder page, so
+# t-agent/cl-agent never build the wasm UI and need no QMT_UI_DIST. The real
+# `dashboard` feature (embedded QueryMT Desktop web) is built by
+# .github/workflows/test-gpui.yml (dashboard-embed). Extra arguments are appended, for example
 #   cargo t-runtime -E 'test(/compaction/)'
 #   cargo t-agent --no-run
 
 [alias]
-t-agent = "nextest run -p querymt-agent --features dashboard,oauth,zbus-secret-service,systemd-credentials,remote"
+t-agent = "nextest run -p querymt-agent --features dashboard-server,oauth,zbus-secret-service,systemd-credentials,remote"
 t-runtime = "nextest run -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api"
 t-services = "nextest run -p querymt-agent-services"
 t-sqlite = "nextest run -p querymt-agent-sqlite"
@@ -29,7 +29,7 @@ t-gpui = "nextest run -p querymt-gpui --bins"
 # Arguments go to the app: `cargo r-gpui`, `cargo r-gpui --agent 127.0.0.1:42069`.
 r-gpui = "run -p querymt-gpui --release --"
 
-cl-agent = "clippy -p querymt-agent --all-targets --features dashboard,oauth,zbus-secret-service,systemd-credentials,remote -- -D warnings"
+cl-agent = "clippy -p querymt-agent --all-targets --features dashboard-server,oauth,zbus-secret-service,systemd-credentials,remote -- -D warnings"
 cl-runtime = "clippy -p querymt-agent-runtime --all-targets --features remote,oauth,plugin-loaders,api -- -D warnings"
 cl-services = "clippy -p querymt-agent-services --all-targets -- -D warnings"
 cl-sqlite = "clippy -p querymt-agent-sqlite --all-targets -- -D warnings"
