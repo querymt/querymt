@@ -15,94 +15,21 @@ impl LocalAgentHandle {
         super::utils::ext_json_response(&capabilities)
     }
 
-    pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
-        match req.method.as_ref() {
-            "querymt/models" => self.handle_ext_models().await,
-            "querymt/profiles" => self.handle_ext_profiles(req).await,
-            "querymt/agents/list" => self.handle_ext_agents_list(req).await,
-            "querymt/agents/add" => self.handle_ext_agents_add(req).await,
-            "querymt/agents/remove" => self.handle_ext_agents_remove(req).await,
-            "querymt/profile/agents" => self.handle_ext_profile_agents(req).await,
-            "querymt/profile/setActive" => self.handle_ext_set_active_profile(req).await,
-            "querymt/session/setDelegateModel" => self.handle_ext_set_delegate_model(req).await,
-            "querymt/session/delegateModels" => self.handle_ext_delegate_models(req).await,
-            "querymt/refreshModels" => self.handle_ext_refresh_models().await,
-            "querymt/modelInfo" => self.handle_ext_model_info(req).await,
-            "querymt/chat" | "querymt/tokenCount" => Err(Error::from(
-                crate::error::AgentError::MethodNotImplemented {
-                    method: req.method.to_string(),
-                },
-            )),
-            "querymt/auth/status" => self.handle_ext_auth_status(req).await,
-            "querymt/auth/start" => self.handle_ext_auth_start(req).await,
-            "querymt/auth/complete" => self.handle_ext_auth_complete(req).await,
-            "querymt/auth/logout" => self.handle_ext_auth_logout(req).await,
-            "querymt/auth/setApiToken" => self.handle_ext_auth_set_api_token(req).await,
-            "querymt/auth/clearApiToken" => self.handle_ext_auth_clear_api_token(req).await,
-            "querymt/auth/setMethod" => self.handle_ext_auth_set_method(req).await,
-            "querymt/session/steer" => {
-                self.handle_ext_session_submit_input(
-                    req,
-                    crate::agent::messages::InputDelivery::Steer,
-                )
-                .await
-            }
-            "querymt/session/queue" => {
-                self.handle_ext_session_submit_input(
-                    req,
-                    crate::agent::messages::InputDelivery::Queue,
-                )
-                .await
-            }
-            "querymt/session/discardQueuedInput" => {
-                self.handle_ext_session_discard_queued_input(req).await
-            }
-            "querymt/session/runtimeState" => self.handle_ext_session_runtime_state(req).await,
-            "querymt/session/history" => self.handle_ext_session_history(req).await,
-            "querymt/session/toolContent" => self.handle_ext_session_tool_content(req).await,
-            "querymt/session/undo" => self.handle_ext_session_undo(req).await,
-            "querymt/session/redo" => self.handle_ext_session_redo(req).await,
-            "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,
-            "querymt/session/getLifecycle" => self.handle_ext_session_get_lifecycle(req).await,
-            "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
-            "querymt/session/setPinned" => self.handle_ext_session_set_pinned(req).await,
-            "querymt/worktree/create" => self.handle_ext_worktree_create(req).await,
-            "querymt/worktree/handoff" => self.handle_ext_worktree_handoff(req).await,
-            "querymt/worktree/list" => self.handle_ext_worktree_list().await,
-            "querymt/worktree/status" => self.handle_ext_worktree_status(req).await,
-            "querymt/worktree/result" => self.handle_ext_worktree_result(req).await,
-            "querymt/worktree/publish" => self.handle_ext_worktree_publish(req).await,
-            "querymt/worktree/merge" => self.handle_ext_worktree_merge(req).await,
-            "querymt/worktree/remove" => self.handle_ext_worktree_remove(req).await,
-            "querymt/worktree/recover" => self.handle_ext_worktree_recover(req).await,
-            "querymt/worktree/archive" => self.handle_ext_worktree_archive(req).await,
-            "querymt/capabilities" => self.handle_ext_capabilities().await,
-            "querymt/mesh/status" => self.handle_ext_mesh_status().await,
-            "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,
-            "querymt/mesh/nodes" => self.handle_ext_mesh_nodes().await,
-            m if super::ext_mesh::ACCESS_METHODS.contains(&m) => {
-                self.handle_ext_mesh_access(req).await
-            }
-            "querymt/mesh/createInvite" => self.handle_ext_mesh_create_invite(req).await,
-            "querymt/mesh/listInvites" => self.handle_ext_mesh_list_invites().await,
-            "querymt/mesh/revokeInvite" => self.handle_ext_mesh_revoke_invite(req).await,
-            "querymt/remote/sessions" => self.handle_ext_remote_sessions(req).await,
-            "querymt/remote/createSession" => self.handle_ext_remote_create_session(req).await,
-            "querymt/remote/attachSession" => self.handle_ext_remote_attach_session(req).await,
-            "querymt/remote/dismissSession" => self.handle_ext_remote_dismiss_session(req).await,
-            "querymt/schedules/create" => self.handle_ext_schedule_create(req).await,
-            "querymt/schedules/list" => self.handle_ext_schedule_list(req).await,
-            "querymt/schedules/get" => self.handle_ext_schedule_get(req).await,
-            "querymt/schedules/pause" => self.handle_ext_schedule_pause(req).await,
-            "querymt/schedules/resume" => self.handle_ext_schedule_resume(req).await,
-            "querymt/schedules/trigger" => self.handle_ext_schedule_trigger(req).await,
-            "querymt/schedules/delete" => self.handle_ext_schedule_delete(req).await,
-            "querymt/updatePlugins" => self.handle_ext_update_plugins().await,
-            _ => Err(Error::method_not_found()),
+    /// Dispatch an extension method to its handler.
+    ///
+    /// The handler future is built and boxed in its own small function (see
+    /// [`ext_method_handler`]), never in this one: an unoptimized build gives
+    /// a single `match` over awaited handlers one stack slot per arm, which
+    /// made this frame the sum of every handler's state (673 KiB) and
+    /// overflowed 2 MiB threads on the remote attach path.
+    pub(super) fn handle_ext_method(&self, req: ExtRequest) -> ExtHandlerFuture<'_> {
+        match ext_method_handler(req.method.as_ref()) {
+            Some(handler) => handler(self, req),
+            None => Box::pin(std::future::ready(Err(Error::method_not_found()))),
         }
     }
 
-    #[tracing::instrument(name = "acp.ext_notification", skip_all)]
+    /// The `acp.ext_notification` span is opened by the `SendAgent` entry point.
     pub(super) async fn handle_ext_notification(
         &self,
         _notif: ExtNotification,
@@ -110,4 +37,110 @@ impl LocalAgentHandle {
         // OK - extensions not yet implemented
         Ok(())
     }
+}
+
+/// A boxed extension handler future.
+pub(super) type ExtHandlerFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<ExtResponse, Error>>;
+
+/// Builds and boxes one handler's future. Each entry is its own function, so
+/// only that handler's state is ever on the stack while it is created.
+type ExtHandler = for<'a> fn(&'a LocalAgentHandle, ExtRequest) -> ExtHandlerFuture<'a>;
+
+/// The handler of an extension method, or `None` when it is unknown.
+fn ext_method_handler(method: &str) -> Option<ExtHandler> {
+    use crate::agent::messages::InputDelivery;
+    let handler: ExtHandler = match method {
+        "querymt/models" => |h, _| Box::pin(h.handle_ext_models()),
+        "querymt/profiles" => |h, req| Box::pin(h.handle_ext_profiles(req)),
+        "querymt/agents/list" => |h, req| Box::pin(h.handle_ext_agents_list(req)),
+        "querymt/agents/add" => |h, req| Box::pin(h.handle_ext_agents_add(req)),
+        "querymt/agents/remove" => |h, req| Box::pin(h.handle_ext_agents_remove(req)),
+        "querymt/profile/agents" => |h, req| Box::pin(h.handle_ext_profile_agents(req)),
+        "querymt/profile/setActive" => |h, req| Box::pin(h.handle_ext_set_active_profile(req)),
+        "querymt/session/setDelegateModel" => {
+            |h, req| Box::pin(h.handle_ext_set_delegate_model(req))
+        }
+        "querymt/session/delegateModels" => |h, req| Box::pin(h.handle_ext_delegate_models(req)),
+        "querymt/refreshModels" => |h, _| Box::pin(h.handle_ext_refresh_models()),
+        "querymt/modelInfo" => |h, req| Box::pin(h.handle_ext_model_info(req)),
+        "querymt/chat" | "querymt/tokenCount" => |_, req| {
+            Box::pin(std::future::ready(Err(Error::from(
+                crate::error::AgentError::MethodNotImplemented {
+                    method: req.method.to_string(),
+                },
+            ))))
+        },
+        "querymt/auth/status" => |h, req| Box::pin(h.handle_ext_auth_status(req)),
+        "querymt/auth/start" => |h, req| Box::pin(h.handle_ext_auth_start(req)),
+        "querymt/auth/complete" => |h, req| Box::pin(h.handle_ext_auth_complete(req)),
+        "querymt/auth/logout" => |h, req| Box::pin(h.handle_ext_auth_logout(req)),
+        "querymt/auth/setApiToken" => |h, req| Box::pin(h.handle_ext_auth_set_api_token(req)),
+        "querymt/auth/clearApiToken" => |h, req| Box::pin(h.handle_ext_auth_clear_api_token(req)),
+        "querymt/auth/setMethod" => |h, req| Box::pin(h.handle_ext_auth_set_method(req)),
+        "querymt/session/steer" => {
+            |h, req| Box::pin(h.handle_ext_session_submit_input(req, InputDelivery::Steer))
+        }
+        "querymt/session/queue" => {
+            |h, req| Box::pin(h.handle_ext_session_submit_input(req, InputDelivery::Queue))
+        }
+        "querymt/session/discardQueuedInput" => {
+            |h, req| Box::pin(h.handle_ext_session_discard_queued_input(req))
+        }
+        "querymt/session/runtimeState" => {
+            |h, req| Box::pin(h.handle_ext_session_runtime_state(req))
+        }
+        "querymt/session/history" => |h, req| Box::pin(h.handle_ext_session_history(req)),
+        "querymt/session/toolContent" => |h, req| Box::pin(h.handle_ext_session_tool_content(req)),
+        "querymt/session/undo" => |h, req| Box::pin(h.handle_ext_session_undo(req)),
+        "querymt/session/redo" => |h, req| Box::pin(h.handle_ext_session_redo(req)),
+        "querymt/session/undoStack" => |h, req| Box::pin(h.handle_ext_session_undo_stack(req)),
+        "querymt/session/getLifecycle" => {
+            |h, req| Box::pin(h.handle_ext_session_get_lifecycle(req))
+        }
+        "querymt/session/setLifecycle" => {
+            |h, req| Box::pin(h.handle_ext_session_set_lifecycle(req))
+        }
+        "querymt/session/setPinned" => |h, req| Box::pin(h.handle_ext_session_set_pinned(req)),
+        "querymt/worktree/create" => |h, req| Box::pin(h.handle_ext_worktree_create(req)),
+        "querymt/worktree/handoff" => |h, req| Box::pin(h.handle_ext_worktree_handoff(req)),
+        "querymt/worktree/list" => |h, _| Box::pin(h.handle_ext_worktree_list()),
+        "querymt/worktree/status" => |h, req| Box::pin(h.handle_ext_worktree_status(req)),
+        "querymt/worktree/result" => |h, req| Box::pin(h.handle_ext_worktree_result(req)),
+        "querymt/worktree/publish" => |h, req| Box::pin(h.handle_ext_worktree_publish(req)),
+        "querymt/worktree/merge" => |h, req| Box::pin(h.handle_ext_worktree_merge(req)),
+        "querymt/worktree/remove" => |h, req| Box::pin(h.handle_ext_worktree_remove(req)),
+        "querymt/worktree/recover" => |h, req| Box::pin(h.handle_ext_worktree_recover(req)),
+        "querymt/worktree/archive" => |h, req| Box::pin(h.handle_ext_worktree_archive(req)),
+        "querymt/capabilities" => |h, _| Box::pin(h.handle_ext_capabilities()),
+        "querymt/mesh/status" => |h, _| Box::pin(h.handle_ext_mesh_status()),
+        "querymt/mesh/join" => |h, req| Box::pin(h.handle_ext_mesh_join(req)),
+        "querymt/mesh/nodes" => |h, _| Box::pin(h.handle_ext_mesh_nodes()),
+        m if super::ext_mesh::ACCESS_METHODS.contains(&m) => {
+            |h, req| Box::pin(h.handle_ext_mesh_access(req))
+        }
+        "querymt/mesh/createInvite" => |h, req| Box::pin(h.handle_ext_mesh_create_invite(req)),
+        "querymt/mesh/listInvites" => |h, _| Box::pin(h.handle_ext_mesh_list_invites()),
+        "querymt/mesh/revokeInvite" => |h, req| Box::pin(h.handle_ext_mesh_revoke_invite(req)),
+        "querymt/remote/sessions" => |h, req| Box::pin(h.handle_ext_remote_sessions(req)),
+        "querymt/remote/createSession" => {
+            |h, req| Box::pin(h.handle_ext_remote_create_session(req))
+        }
+        "querymt/remote/attachSession" => {
+            |h, req| Box::pin(h.handle_ext_remote_attach_session(req))
+        }
+        "querymt/remote/dismissSession" => {
+            |h, req| Box::pin(h.handle_ext_remote_dismiss_session(req))
+        }
+        "querymt/schedules/create" => |h, req| Box::pin(h.handle_ext_schedule_create(req)),
+        "querymt/schedules/list" => |h, req| Box::pin(h.handle_ext_schedule_list(req)),
+        "querymt/schedules/get" => |h, req| Box::pin(h.handle_ext_schedule_get(req)),
+        "querymt/schedules/pause" => |h, req| Box::pin(h.handle_ext_schedule_pause(req)),
+        "querymt/schedules/resume" => |h, req| Box::pin(h.handle_ext_schedule_resume(req)),
+        "querymt/schedules/trigger" => |h, req| Box::pin(h.handle_ext_schedule_trigger(req)),
+        "querymt/schedules/delete" => |h, req| Box::pin(h.handle_ext_schedule_delete(req)),
+        "querymt/updatePlugins" => |h, _| Box::pin(h.handle_ext_update_plugins()),
+        _ => return None,
+    };
+    Some(handler)
 }

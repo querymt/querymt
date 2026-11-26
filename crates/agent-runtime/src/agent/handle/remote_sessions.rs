@@ -404,17 +404,22 @@ impl LocalAgentHandle {
         .await
     }
 
-    /// Read display-only profile identity from the session's owning node.
+    /// Read display-only profile identity from the session's owning node,
+    /// through `node_manager` when the caller already found it.
     #[cfg(feature = "remote")]
     pub(crate) async fn remote_session_profile(
         &self,
         node_id: &str,
         session_id: &str,
+        node_manager: Option<super::model_registry::NodeManagerRef>,
     ) -> Option<Option<crate::agent::remote::RemoteSessionProfile>> {
         use crate::agent::remote::GetRemoteSessionProfile;
         // Missing metadata must not block loading a healthy remote session.
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let manager = self.find_node_manager(node_id).await.ok()?;
+            let manager = match node_manager {
+                Some(manager) => manager,
+                None => self.find_node_manager(node_id).await.ok()?,
+            };
             self.ask_node_manager::<_, crate::error::AgentError>(
                 &manager,
                 &GetRemoteSessionProfile {

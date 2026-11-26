@@ -992,6 +992,23 @@ async fn summary_operation(
         .with_budget_cap(ctx.budget_cap_usd))
 }
 
+/// Boxed like [`execute_delegation_inner`].
+fn execute_delegation(
+    ctx: DelegationContext,
+    target: MemberAgent,
+    parent_session_id: String,
+    delegation: Delegation,
+    cancel_token: CancellationToken,
+) -> futures_util::future::BoxFuture<'static, ()> {
+    Box::pin(execute_delegation_unboxed(
+        ctx,
+        target,
+        parent_session_id,
+        delegation,
+        cancel_token,
+    ))
+}
+
 #[instrument(
     name = "delegation.execute",
     skip(ctx, target, delegation, cancel_token),
@@ -1005,7 +1022,7 @@ async fn summary_operation(
         has_routing = ctx.routing_snapshot.is_some(),
     )
 )]
-async fn execute_delegation(
+async fn execute_delegation_unboxed(
     ctx: DelegationContext,
     target: MemberAgent,
     parent_session_id: String,
@@ -1112,7 +1129,30 @@ async fn execute_delegation(
     .await;
 }
 
-async fn execute_delegation_inner(
+/// The delegation run, built and boxed here so that callers hold a pointer
+/// rather than the run's whole state (large in unoptimized builds, where it
+/// would add to the stack frame of every caller).
+fn execute_delegation_inner(
+    ctx: DelegationContext,
+    target: MemberAgent,
+    parent_session_id: String,
+    delegation: Delegation,
+    cancel_token: CancellationToken,
+    authority: &TurnAuthority,
+    restricted: bool,
+) -> futures_util::future::BoxFuture<'_, ()> {
+    Box::pin(execute_delegation_inner_unboxed(
+        ctx,
+        target,
+        parent_session_id,
+        delegation,
+        cancel_token,
+        authority,
+        restricted,
+    ))
+}
+
+async fn execute_delegation_inner_unboxed(
     ctx: DelegationContext,
     target: MemberAgent,
     parent_session_id: String,
@@ -2412,6 +2452,16 @@ async fn resolve_terminal_delegate_attempt(
     }
 }
 
+/// Record a failed delegation. Boxed: the delegation run fails at many points,
+/// and an unboxed future would take its own stack slot in the run's frame at
+/// each of them in unoptimized builds.
+fn fail_delegation<'a>(
+    ctx: DelegationFailureContext<'a>,
+    error_message: &'a str,
+) -> futures_util::future::BoxFuture<'a, ()> {
+    Box::pin(fail_delegation_unboxed(ctx, error_message))
+}
+
 #[instrument(
     name = "delegation.fail",
     skip(ctx, error_message),
@@ -2420,7 +2470,7 @@ async fn resolve_terminal_delegate_attempt(
         parent_session_id = %ctx.parent_session_id,
     )
 )]
-async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str) {
+async fn fail_delegation_unboxed(ctx: DelegationFailureContext<'_>, error_message: &str) {
     error!("Delegation failed");
     let transitioned = match ctx
         .store

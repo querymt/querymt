@@ -347,28 +347,24 @@ impl LocalAgentHandle {
         // The authorization is the first call through a reused attachment;
         // a dead one is replaced once (within the same budget).
         let authorize = async move {
-            match Self::authorize_remote_history(&state, &connected.session_ref).await {
-                Ok(()) => Ok(connected),
-                Err(error) if connected.reused_attachment_failed(&error) => {
-                    log::info!(
-                        "remote session {session_id} history: reused attachment_id={} failed \
-                         ({error}); replacing it",
-                        connected.attachment_id,
-                    );
-                    let recovered = self
-                        .replace_failed_remote_attachment(
-                            session_id,
-                            connected.attachment_id,
-                            connected.session_ref.remote_node_id(),
-                            false,
-                        )
-                        .await
-                        .map_err(|error| error.to_acp_error())?;
-                    Self::authorize_remote_history(&state, &recovered.session_ref).await?;
-                    Ok(recovered)
-                }
-                Err(error) => Err(Error::from(error)),
-            }
+            use super::remote_connect::{RemoteAttachmentCallError, attachment_unreachable};
+            self.call_through_remote_attachment(
+                session_id,
+                "history",
+                connected,
+                false,
+                attachment_unreachable,
+                |connected| {
+                    let state = state.clone();
+                    async move { Self::authorize_remote_history(&state, &connected.session_ref).await }
+                },
+            )
+            .await
+            .map(|((), connected)| connected)
+            .map_err(|error| match error {
+                RemoteAttachmentCallError::Replace(error) => error.to_acp_error(),
+                RemoteAttachmentCallError::Failed(error) => Error::from(error),
+            })
         };
         let (connected, deadline) = authorize_before_history_transfer(
             session_id,

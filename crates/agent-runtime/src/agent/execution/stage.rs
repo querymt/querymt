@@ -96,6 +96,19 @@ pub(crate) struct Run<'a> {
 /// model is already resolved (`resolve_model`) and is part of `env`.
 /// `session_mode` is the `AgentMode` captured at turn start; middleware reads
 /// it through its hook context.
+///
+/// The turn future is built and boxed here, so callers hold a pointer instead
+/// of the turn's whole state (large in unoptimized builds, where it would add
+/// to every caller's stack frame).
+pub(crate) fn run_turn<'a>(
+    config: &'a AgentConfig,
+    env: &'a TurnEnv,
+    turn: &'a mut Turn,
+    session_mode: crate::agent::core::AgentMode,
+) -> futures_util::future::BoxFuture<'a, Result<CycleOutcome, TurnError>> {
+    Box::pin(run_turn_unboxed(config, env, turn, session_mode))
+}
+
 #[instrument(
     name = "agent.execution.turn",
     skip(config, env, turn),
@@ -107,7 +120,7 @@ pub(crate) struct Run<'a> {
         completion_guard_continuations = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_turn(
+async fn run_turn_unboxed(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,

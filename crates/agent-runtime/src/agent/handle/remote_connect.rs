@@ -37,6 +37,22 @@ type PreparedCandidateSlot = std::sync::Arc<
     std::sync::Mutex<Option<crate::agent::session_registry::PreparedRemoteAttachment>>,
 >;
 
+/// How long a first-time attach may spend looking up the owner's display
+/// label; the node id is used when the lookup takes longer.
+const REMOTE_NODE_LABEL_BUDGET: Duration = Duration::from_millis(1_000);
+
+/// A candidate attachment that passed its health check and whose bookmark is
+/// saved, waiting to be installed outside the connect budget.
+struct VerifiedRemoteAttachment {
+    prepared: crate::agent::session_registry::PreparedRemoteAttachment,
+    expected_attachment_id: Option<u64>,
+    outcome: RemoteConnectOutcome,
+    bookmark: RemoteSessionBookmark,
+    backfill_sink: std::sync::Arc<querymt_agent_services::event_sink::EventSink>,
+    sync_cursor: Option<i64>,
+    windowed: bool,
+}
+
 /// A session actor found on its owner, and how it was found.
 struct LocatedRemoteActor {
     remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
@@ -64,7 +80,10 @@ pub(crate) enum RemoteConnectReason {
     StartupReattach,
     /// Attaching the session a delegation opened on a remote member.
     Delegation,
-    /// Extension-level attach request (`remote/attach_session`).
+    /// Extension-level attach request (`remote/attachSession`,
+    /// `remote/createSession`). The attach of a session that already has a
+    /// bookmark is a repair reconnect: it runs as [`Self::ExplicitReconnect`]
+    /// with [`RemoteReplacePolicy::ReplaceCurrent`] (decided under the gate).
     ExtensionAttach,
 }
 
@@ -159,7 +178,7 @@ impl RemoteConnectOutcome {
 /// by Phase 6/8 callers; the current ext attach migration only needs
 /// success/failure and the generation (`attachment_id`).
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ConnectedRemoteSession {
     pub(crate) session_ref: SessionActorRef,
     /// Attachment generation (relay actor id) installed/observed by this call.
@@ -178,11 +197,24 @@ impl ConnectedRemoteSession {
     /// A freshly installed attachment passed its health check moments ago;
     /// its failures are reported as they are instead of reconnecting again.
     pub(crate) fn reused_attachment_failed(&self, error: &AgentError) -> bool {
-        self.outcome == RemoteConnectOutcome::Reused
-            && error
-                .transport_failure()
-                .is_some_and(RemoteTransportFailure::is_retryable_kind)
+        self.outcome == RemoteConnectOutcome::Reused && attachment_unreachable(error)
     }
+}
+
+/// Whether `error` is a transport failure that a new attachment may fix.
+pub(crate) fn attachment_unreachable(error: &AgentError) -> bool {
+    error
+        .transport_failure()
+        .is_some_and(RemoteTransportFailure::is_retryable_kind)
+}
+
+/// Why [`LocalAgentHandle::call_through_remote_attachment`] failed.
+#[derive(Debug)]
+pub(crate) enum RemoteAttachmentCallError<E> {
+    /// The dead attachment could not be replaced.
+    Replace(RemoteSessionConnectError),
+    /// The call failed (on the replacement, when there was one).
+    Failed(E),
 }
 
 // ── Connect error ───────────────────────────────────────────────────────
@@ -562,9 +594,9 @@ impl Drop for RemoteConnectGate {
 
 impl LocalAgentHandle {
     /// Plan §2 entry point: ensure a connected attachment exists for a remote
-    /// session, recovering it when necessary. Consumed by Phase 6 operation
-    /// recovery and Phase 8 offline-first open; today exercised by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// session, recovering it when necessary, with the reason's default
+    /// replacement policy (operation recovery, resume, history sync and
+    /// startup reattach).
     pub(crate) async fn ensure_remote_session_connected(
         &self,
         session_id: &str,
@@ -626,7 +658,22 @@ impl LocalAgentHandle {
 
     /// Full coordinator entry point for callers with extra context
     /// (handoff from resume/create, explicit replacement policy).
-    pub(crate) async fn connect_remote_session(
+    ///
+    /// Every caller reaches the recovery stages through this one boxed
+    /// future, so their own frames hold a pointer instead of the whole
+    /// (large, in unoptimized builds) recovery state.
+    pub(crate) fn connect_remote_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        options: RemoteConnectOptions<'a>,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<ConnectedRemoteSession, RemoteSessionConnectError>,
+    > {
+        Box::pin(self.connect_remote_session_unboxed(session_id, options))
+    }
+
+    async fn connect_remote_session_unboxed(
         &self,
         session_id: &str,
         options: RemoteConnectOptions<'_>,
@@ -736,7 +783,7 @@ impl LocalAgentHandle {
     async fn connect_remote_session_gated(
         &self,
         session_id: &str,
-        options: RemoteConnectOptions<'_>,
+        mut options: RemoteConnectOptions<'_>,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         use crate::session::location::{SessionLocation, resolve_session_location};
         let store = self.config.provider.history_store();
@@ -770,6 +817,14 @@ impl LocalAgentHandle {
             .ok_or_else(|| RemoteSessionConnectError::BookmarkMissing {
                 session_id: session_id.to_string(),
             })?;
+        // A persisted remote identity makes an extension attach a repair
+        // reconnect (plan §12): reinstall instead of reusing a possibly
+        // broken attachment.
+        if options.reason == RemoteConnectReason::ExtensionAttach && bookmark.is_some() {
+            options.reason = RemoteConnectReason::ExplicitReconnect;
+            options.replace = RemoteReplacePolicy::ReplaceCurrent;
+            tracing::Span::current().record("reason", options.reason.as_str());
+        }
 
         // Attachment reuse/replacement decision. Replacement preparation keeps
         // this generation installed until the candidate is fully validated.
@@ -884,7 +939,8 @@ impl LocalAgentHandle {
                 state.note_history_denial();
                 Err(RemoteSessionConnectError::AccessDenied)
             }
-            Ok(connected) => connected,
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(verified)) => self.commit_remote_attachment(session_id, verified).await,
             Err(_) => {
                 // The budget cancelled the recovery future. Any candidate it
                 // had already prepared is parked in the slot: abort it
@@ -918,29 +974,22 @@ impl LocalAgentHandle {
         node_id: String,
         bookmark: Option<RemoteSessionBookmark>,
         prepared_slot: &PreparedCandidateSlot,
-    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
-        let peer_label = bookmark
+    ) -> Result<VerifiedRemoteAttachment, RemoteSessionConnectError> {
+        let peer_label = match bookmark
             .as_ref()
             .map(|b| b.peer_label.clone())
             .or_else(|| options.peer_label.map(str::to_owned))
-            .unwrap_or_else(|| node_id.clone());
-        // Only scan the mesh for a display label on first-time attaches that
-        // lack a bookmark (the label is cosmetic and the scan is expensive).
-        let peer_label = if bookmark.is_some() || options.peer_label.is_some() {
-            peer_label
-        } else {
-            self.list_remote_nodes()
-                .await
-                .into_iter()
-                .find(|n| n.node_id.to_string() == node_id)
-                .map(|n| n.hostname)
-                .unwrap_or(peer_label)
+        {
+            Some(label) => label,
+            // First-time attach without a label: look it up, bounded, since
+            // the label is cosmetic and must not spend the connect budget.
+            None => self.remote_node_label(&node_id).await,
         };
 
         // Pre-resolved handoff (extension attach from create/resume response).
         if let Some(handoff) = options.handoff {
             let remote_ref = self
-                .resolve_handoff(session_id, handoff)
+                .resolve_handoff(session_id, &node_id, handoff)
                 .await
                 .map_err(|e| {
                     if e.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND {
@@ -956,18 +1005,17 @@ impl LocalAgentHandle {
                         }
                     }
                 })?;
-            let merged = self
-                .build_connect_bookmark(
-                    session_id,
-                    RemoteSessionBookmarkUpdate {
-                        node_id: Some(node_id.clone()),
-                        peer_label: Some(peer_label.clone()),
-                        fork_origin: options.fork_origin.clone(),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await?;
+            let merged = Self::build_connect_bookmark(
+                session_id,
+                bookmark.as_ref(),
+                RemoteSessionBookmarkUpdate {
+                    node_id: Some(node_id.clone()),
+                    peer_label: Some(peer_label.clone()),
+                    fork_origin: options.fork_origin.clone(),
+                    ..Default::default()
+                },
+                None,
+            );
             return self
                 .attach_and_verify_remote(
                     session_id,
@@ -989,23 +1037,25 @@ impl LocalAgentHandle {
             session_id,
             node_id = node_id.as_str(),
         );
+        // A lookup error only means this stage found nothing; resume follows.
         let dht_hit = Self::lookup_remote_session_actor(&mesh, session_id, &node_id)
             .instrument(lookup_span)
-            .await;
+            .await
+            .ok()
+            .flatten();
 
         if let Some((remote_ref, matched_scope)) = dht_hit {
-            let merged = self
-                .build_connect_bookmark(
-                    session_id,
-                    RemoteSessionBookmarkUpdate {
-                        node_id: Some(node_id.clone()),
-                        peer_label: Some(peer_label.clone()),
-                        fork_origin: options.fork_origin.clone(),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await?;
+            let merged = Self::build_connect_bookmark(
+                session_id,
+                bookmark.as_ref(),
+                RemoteSessionBookmarkUpdate {
+                    node_id: Some(node_id.clone()),
+                    peer_label: Some(peer_label.clone()),
+                    fork_origin: options.fork_origin.clone(),
+                    ..Default::default()
+                },
+                None,
+            );
             match self
                 .attach_and_verify_remote(
                     session_id,
@@ -1020,7 +1070,7 @@ impl LocalAgentHandle {
                 )
                 .await
             {
-                Ok(connected) => return Ok(connected),
+                Ok(verified) => return Ok(verified),
                 Err(RemoteSessionConnectError::AccessDenied) => {
                     return Err(RemoteSessionConnectError::AccessDenied);
                 }
@@ -1091,7 +1141,7 @@ impl LocalAgentHandle {
         );
 
         let remote_ref = self
-            .resolve_handoff(session_id, resumed.handoff)
+            .resolve_handoff(session_id, &node_id, resumed.handoff)
             .await
             .map_err(|e| {
                 if e.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND {
@@ -1108,19 +1158,18 @@ impl LocalAgentHandle {
                 }
             })?;
 
-        let merged = self
-            .build_connect_bookmark(
-                session_id,
-                RemoteSessionBookmarkUpdate {
-                    node_id: Some(node_id.clone()),
-                    peer_label: Some(peer_label.clone()),
-                    cwd: resumed.cwd,
-                    title: resumed.title,
-                    fork_origin: options.fork_origin.clone(),
-                },
-                Some(resumed.created_at),
-            )
-            .await?;
+        let merged = Self::build_connect_bookmark(
+            session_id,
+            bookmark.as_ref(),
+            RemoteSessionBookmarkUpdate {
+                node_id: Some(node_id.clone()),
+                peer_label: Some(peer_label.clone()),
+                cwd: resumed.cwd,
+                title: resumed.title,
+                fork_origin: options.fork_origin.clone(),
+            },
+            Some(resumed.created_at),
+        );
         self.attach_and_verify_remote(
             session_id,
             LocatedRemoteActor {
@@ -1146,7 +1195,7 @@ impl LocalAgentHandle {
         bookmark: &RemoteSessionBookmark,
         prepared_slot: &PreparedCandidateSlot,
         windowed: bool,
-    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+    ) -> Result<VerifiedRemoteAttachment, RemoteSessionConnectError> {
         let LocatedRemoteActor {
             remote_ref,
             preferred_scope,
@@ -1166,6 +1215,8 @@ impl LocalAgentHandle {
             )
         };
         let backfill_sink = context.event_sink.clone();
+        // Read before the subscription starts: live events arriving after it
+        // must not move the cursor past history the backfill still needs.
         let sync_cursor = backfill_sink
             .journal()
             .remote_sync_cursor(session_id, &bookmark.node_id)
@@ -1202,10 +1253,11 @@ impl LocalAgentHandle {
         let session_ref = prepared.session_ref().clone();
         let attachment_id = prepared.attachment_id();
 
-        // Park the candidate while the health check is awaited: if the connect
-        // budget cancels this future mid-check, the coordinator finds the
-        // candidate in the slot and runs the full async teardown (remote
-        // unsubscribe + unlink) instead of the Drop-only partial cleanup.
+        // Park the candidate while the health check and the bookmark save are
+        // awaited: if the connect budget cancels this future meanwhile, the
+        // coordinator finds the candidate in the slot and runs the full async
+        // teardown (remote unsubscribe + unlink) instead of the Drop-only
+        // partial cleanup.
         {
             let mut parked = prepared_slot
                 .lock()
@@ -1230,17 +1282,22 @@ impl LocalAgentHandle {
         } else {
             Ok(())
         };
+        // No await from here on: once the candidate leaves the slot it is
+        // returned (or aborted) without another cancellation point.
         let prepared = prepared_slot
             .lock()
             .expect("prepared candidate slot poisoned")
             .take()
             .expect("prepared candidate parked before health check");
-        match health {
-            Ok(Ok(())) => {}
-            Ok(Err(AgentError::MeshAccessDenied)) => {
-                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
-                return Err(RemoteSessionConnectError::AccessDenied);
-            }
+        let failure = match health {
+            Ok(Ok(())) => match saved {
+                Ok(()) => None,
+                Err(error) => Some(RemoteSessionConnectError::BookmarkSaveFailed {
+                    session_id: session_id.to_string(),
+                    message: error.to_string(),
+                }),
+            },
+            Ok(Err(AgentError::MeshAccessDenied)) => Some(RemoteSessionConnectError::AccessDenied),
             Ok(Err(error)) => {
                 log::warn!(
                     "remote session {} connect: candidate attachment_id={} failed health check: {}",
@@ -1248,12 +1305,11 @@ impl LocalAgentHandle {
                     attachment_id,
                     error,
                 );
-                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
-                return Err(RemoteSessionConnectError::HealthCheckFailed {
+                Some(RemoteSessionConnectError::HealthCheckFailed {
                     session_id: session_id.to_string(),
                     transport: error.transport_failure().cloned(),
                     message: error.to_string(),
-                });
+                })
             }
             Err(_) => {
                 log::warn!(
@@ -1262,29 +1318,88 @@ impl LocalAgentHandle {
                     attachment_id,
                     health_timeout.as_millis(),
                 );
-                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
-                let message = format!(
-                    "control health check timed out after {}ms",
-                    health_timeout.as_millis()
-                );
-                return Err(RemoteSessionConnectError::HealthCheckFailed {
+                Some(RemoteSessionConnectError::HealthCheckFailed {
                     session_id: session_id.to_string(),
                     transport: Self::remote_health_check_timeout_error(health_timeout)
                         .transport_failure()
                         .cloned(),
-                    message,
-                });
+                    message: format!(
+                        "control health check timed out after {}ms",
+                        health_timeout.as_millis()
+                    ),
+                })
             }
-        }
-
-        if let Err(error) = saved {
+        };
+        if let Some(error) = failure {
+            // The candidate is out of the slot: a cancellation during this
+            // teardown leaves only the Drop cleanup, as before installation.
             crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
-            return Err(RemoteSessionConnectError::BookmarkSaveFailed {
-                session_id: session_id.to_string(),
-                message: error.to_string(),
-            });
+            return Err(error);
         }
+        Ok(VerifiedRemoteAttachment {
+            prepared,
+            expected_attachment_id,
+            outcome,
+            bookmark: bookmark.clone(),
+            backfill_sink,
+            sync_cursor,
+            windowed,
+        })
+    }
 
+    /// Install a verified candidate and start its backfill.
+    ///
+    /// Runs after the connect budget: once the candidate is verified and its
+    /// bookmark saved, the install, the release of the replaced generation and
+    /// the backfill start always complete, so a slow cleanup can neither leave
+    /// an installed attachment reported as timed out nor skip its backfill.
+    ///
+    /// The commit runs in its own task. The connect budget does not cover it,
+    /// but a caller's own deadline (the history authorization, a request
+    /// timeout) does cancel the caller's future; without the task, that could
+    /// drop the candidate while it waits for the registry lock, leaving only
+    /// the synchronous `Drop` cleanup (the owner's subscription and the relay
+    /// link would stay behind), or drop the replaced generation's cleanup
+    /// half-way. Dropping the caller's future detaches the task instead.
+    async fn commit_remote_attachment(
+        &self,
+        session_id: &str,
+        verified: VerifiedRemoteAttachment,
+    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        let task = tokio::spawn(Self::commit_verified_attachment(
+            self.registry.clone(),
+            session_id.to_string(),
+            verified,
+        ));
+        task.await.unwrap_or_else(|error| {
+            Err(RemoteSessionConnectError::RecoveryFailed {
+                transport: None,
+                message: format!("attachment commit task failed: {error}"),
+            })
+        })
+    }
+
+    /// The body of [`Self::commit_remote_attachment`]; needs only the registry,
+    /// so it can run detached from the handle.
+    async fn commit_verified_attachment(
+        registry: std::sync::Arc<
+            tokio::sync::Mutex<crate::agent::session_registry::SessionRegistry>,
+        >,
+        session_id: String,
+        verified: VerifiedRemoteAttachment,
+    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        let session_id = session_id.as_str();
+        let VerifiedRemoteAttachment {
+            prepared,
+            expected_attachment_id,
+            outcome,
+            bookmark,
+            backfill_sink,
+            sync_cursor,
+            windowed,
+        } = verified;
+        let session_ref = prepared.session_ref().clone();
+        let attachment_id = prepared.attachment_id();
         let commit_span = tracing::info_span!(
             "remote.session.attach.commit",
             session_id,
@@ -1293,7 +1408,7 @@ impl LocalAgentHandle {
             previous_attachment_id = ?expected_attachment_id,
         );
         let commit = async {
-            let mut registry = self.registry.lock().await;
+            let mut registry = registry.lock().await;
             registry.install_remote_attachment(prepared, expected_attachment_id)
         }
         .instrument(commit_span)
@@ -1312,17 +1427,6 @@ impl LocalAgentHandle {
                 });
             }
         };
-
-        if let Some(old) = old {
-            crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
-        }
-        log::info!(
-            "remote session {} connect: attachment committed (attachment_id={}, outcome={}, node={})",
-            session_id,
-            attachment_id,
-            outcome.as_str(),
-            bookmark.node_id,
-        );
 
         // Cursor-based backfill (plan §16): the live subscription was
         // established during prepare, so newly generated events cannot be
@@ -1346,12 +1450,75 @@ impl LocalAgentHandle {
             .backfill(attachment_id, sync_cursor, windowed, Some(sync_guard)),
         );
 
+        if let Some(old) = old {
+            crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
+        }
+        log::info!(
+            "remote session {} connect: attachment committed (attachment_id={}, outcome={}, node={})",
+            session_id,
+            attachment_id,
+            outcome.as_str(),
+            bookmark.node_id,
+        );
         Ok(ConnectedRemoteSession {
             session_ref,
             attachment_id,
-            bookmark: Some(bookmark.clone()),
+            bookmark: Some(bookmark),
             outcome,
         })
+    }
+
+    /// Run `call` through a connected remote session.
+    ///
+    /// A reused attachment can outlive the actor it points to (the owner
+    /// restarted before the link was seen to die). When `call` fails on a
+    /// reused attachment and `dead` says the failure shows that, the
+    /// attachment is replaced once and `call` repeated on the replacement.
+    /// A freshly installed attachment passed its health check moments ago, so
+    /// its failures are returned as they are.
+    ///
+    /// Returns the value and the session it was obtained through.
+    pub(crate) async fn call_through_remote_attachment<T, E, F, Fut>(
+        &self,
+        session_id: &str,
+        purpose: &str,
+        connected: ConnectedRemoteSession,
+        windowed: bool,
+        dead: impl Fn(&E) -> bool,
+        mut call: F,
+    ) -> Result<(T, ConnectedRemoteSession), RemoteAttachmentCallError<E>>
+    where
+        E: std::fmt::Display,
+        F: FnMut(ConnectedRemoteSession) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let error = match call(connected.clone()).await {
+            Ok(value) => return Ok((value, connected)),
+            Err(error) if connected.outcome == RemoteConnectOutcome::Reused && dead(&error) => {
+                error
+            }
+            Err(error) => return Err(RemoteAttachmentCallError::Failed(error)),
+        };
+        log::info!(
+            "remote session {session_id} {purpose}: reused attachment_id={} failed ({error}); \
+             replacing it",
+            connected.attachment_id,
+        );
+        let recovered = self
+            .replace_failed_remote_attachment(
+                session_id,
+                connected.attachment_id,
+                connected.session_ref.remote_node_id(),
+                windowed,
+            )
+            .await
+            .map_err(RemoteAttachmentCallError::Replace)?;
+        // `recovered` may itself be `Reused` when another caller installed a
+        // newer generation meanwhile; the call is not repeated a second time.
+        match call(recovered.clone()).await {
+            Ok(value) => Ok((value, recovered)),
+            Err(error) => Err(RemoteAttachmentCallError::Failed(error)),
+        }
     }
 
     /// Make a connected remote session's recent history local before a load
@@ -1388,6 +1555,15 @@ impl LocalAgentHandle {
             });
         }
         state.wait_synced().await;
+        if connected.outcome != RemoteConnectOutcome::Reused {
+            // A fresh attachment passed this check moments ago; a denial its
+            // backfill met since then is recorded in `state`.
+            return if state.history_denied() {
+                Err(crate::error::AgentError::MeshAccessDenied)
+            } else {
+                Ok(())
+            };
+        }
         Self::authorize_remote_history(&state, &connected.session_ref).await
     }
 
@@ -1410,33 +1586,25 @@ impl LocalAgentHandle {
         result
     }
 
-    /// Build candidate metadata without mutating durable state. Persistence is
-    /// performed only after attachment health validation.
-    /// Awaited: first-time identity must be durable before the attachment is
+    /// Build candidate metadata without mutating durable state, from the
+    /// bookmark the coordinator read under its gate. Persistence is performed
+    /// only after attachment health validation, and before the attachment is
     /// reported connected (plan §6). Existing `created_at` is preserved by
     /// `merge_confirmed`; a first write uses the resume-reported creation
     /// time when available.
-    async fn build_connect_bookmark(
-        &self,
+    fn build_connect_bookmark(
         session_id: &str,
+        existing: Option<&RemoteSessionBookmark>,
         update: RemoteSessionBookmarkUpdate,
         fallback_created_at: Option<i64>,
-    ) -> Result<RemoteSessionBookmark, RemoteSessionConnectError> {
-        let store = self.config.provider.history_store();
-        let existing = store
-            .get_remote_session_bookmark(session_id)
-            .await
-            .map_err(|e| RemoteSessionConnectError::BookmarkLookupFailed {
-                session_id: session_id.to_string(),
-                message: e.to_string(),
-            })?;
-        let merged = match existing {
+    ) -> RemoteSessionBookmark {
+        match existing {
             Some(bookmark) => {
                 log::debug!(
                     "remote session {} connect: merging bookmark metadata",
                     session_id
                 );
-                bookmark.merge_confirmed(update)
+                bookmark.clone().merge_confirmed(update)
             }
             None => RemoteSessionBookmark {
                 session_id: session_id.to_string(),
@@ -1452,8 +1620,7 @@ impl LocalAgentHandle {
                 title: update.title,
                 fork_origin: update.fork_origin,
             },
-        };
-        Ok(merged)
+        }
     }
 
     fn remote_actor_matches_node(
@@ -1467,15 +1634,19 @@ impl LocalAgentHandle {
     }
 
     /// Scoped DHT lookup for a session actor across all active scopes.
-    async fn lookup_remote_session_actor(
+    pub(super) async fn lookup_remote_session_actor(
         mesh: &crate::agent::remote::MeshHandle,
         session_id: &str,
         node_id: &str,
-    ) -> Option<(
-        kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
-        crate::agent::remote::scope::MeshScopeId,
-    )> {
+    ) -> Result<
+        Option<(
+            kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
+            crate::agent::remote::scope::MeshScopeId,
+        )>,
+        String,
+    > {
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let mut last_error = None;
         for scope in runtime.active_scopes() {
             let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
             match runtime
@@ -1491,7 +1662,7 @@ impl LocalAgentHandle {
                         "remote session {} connect: DHT publication found (scope matched)",
                         session_id
                     );
-                    return Some((found, scope));
+                    return Ok(Some((found, scope)));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1500,16 +1671,39 @@ impl LocalAgentHandle {
                         session_id,
                         e
                     );
+                    last_error = Some(e.to_string());
                 }
             }
         }
-        None
+        last_error.map_or(Ok(None), Err)
     }
 
     /// Whether a remote connect/recovery attempt is currently in flight for
     /// the session (a held or queued single-flight gate entry).
     pub(crate) fn remote_connect_in_flight(&self, session_id: &str) -> bool {
         self.remote_connect_gates.lock().contains_key(session_id)
+    }
+
+    /// Display label of a mesh node for a first-time attach: the cached node
+    /// info when present, otherwise a mesh listing bounded by
+    /// [`REMOTE_NODE_LABEL_BUDGET`]; the node id when neither answers.
+    async fn remote_node_label(&self, node_id: &str) -> String {
+        let cache_key = Self::peer_cache_key(node_id.parse().ok(), 0);
+        if let Some(info) = self.get_cached_remote_node(&cache_key)
+            && info.node_id.to_string() == node_id
+        {
+            return info.hostname;
+        }
+        tokio::time::timeout(REMOTE_NODE_LABEL_BUDGET, self.list_remote_nodes())
+            .await
+            .ok()
+            .and_then(|nodes| {
+                nodes
+                    .into_iter()
+                    .find(|n| n.node_id.to_string() == node_id)
+                    .map(|n| n.hostname)
+            })
+            .unwrap_or_else(|| node_id.to_string())
     }
 
     /// Bounded health-check timeout for candidate attachments.
@@ -2182,7 +2376,8 @@ mod tests {
                 false,
             )
             .await
-            .unwrap_err();
+            .err()
+            .expect("a candidate of another peer is rejected");
         assert_eq!(error.code(), "session_location_conflict");
         assert!(
             storage
@@ -2202,11 +2397,10 @@ mod tests {
             ),
         )
         .await;
-        assert!(
-            LocalAgentHandle::lookup_remote_session_actor(&mesh, session_id, "another-peer")
-                .await
-                .is_none()
-        );
+        assert!(matches!(
+            LocalAgentHandle::lookup_remote_session_actor(&mesh, session_id, "another-peer").await,
+            Ok(None)
+        ));
         let attached = handle
             .attach_and_verify_remote(
                 session_id,
@@ -2219,6 +2413,10 @@ mod tests {
                 &slot,
                 false,
             )
+            .await
+            .unwrap_or_else(|error| panic!("candidate verification failed: {error}"));
+        let attached = handle
+            .commit_remote_attachment(session_id, attached)
             .await
             .unwrap();
         let other_actor = SessionActor::spawn(
@@ -2269,6 +2467,79 @@ mod tests {
                 .await
                 .remote_attachment_id(session_id),
             Some(attached.attachment_id)
+        );
+    }
+
+    /// A caller deadline that fires while the commit waits for the registry
+    /// lock must not drop the verified candidate (which would leave only the
+    /// synchronous `Drop` cleanup): the commit completes detached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_survives_caller_cancellation() {
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let session_id = "commit-cancellation";
+        let actor = SessionActor::spawn(
+            SessionActor::new(
+                handle.config.clone(),
+                session_id.into(),
+                SessionRuntime::new(
+                    None,
+                    Default::default(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            )
+            .with_mesh(Some(mesh.clone())),
+        );
+        let remote = actor.clone().into_remote_ref().await;
+        let bookmark = test_bookmark(session_id, &mesh.peer_id().to_string());
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let verified = handle
+            .attach_and_verify_remote(
+                session_id,
+                LocatedRemoteActor {
+                    remote_ref: remote,
+                    preferred_scope: None,
+                    outcome: RemoteConnectOutcome::Reattached,
+                },
+                &bookmark,
+                &slot,
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("candidate verification failed: {error}"));
+        let attachment_id = verified.prepared.attachment_id();
+
+        // Hold the registry lock so the commit blocks, then cancel the caller.
+        let guard = handle.registry.lock().await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.commit_remote_attachment(session_id, verified),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the commit must be blocked on the lock");
+        drop(guard);
+
+        let installed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle
+                    .registry
+                    .lock()
+                    .await
+                    .remote_attachment_id(session_id)
+                    == Some(attachment_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            installed.is_ok(),
+            "the detached commit installs the verified attachment"
         );
     }
 

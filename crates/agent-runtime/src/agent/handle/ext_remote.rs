@@ -40,72 +40,41 @@ impl LocalAgentHandle {
         ext_json_response(&response)
     }
 
-    /// Extension/control-plane attach entry (`remote/attach_session`, UI attach).
+    /// Extension/control-plane attach (`remote/attachSession`,
+    /// `remote/createSession`): connect through the coordinator, then load.
     ///
-    /// Delegates to the connection coordinator (plan §2) so every caller shares
-    /// one recovery algorithm: single-flight per session, scoped DHT lookup,
-    /// node-manager resume fallback, handoff resolution, bounded health check,
-    /// merged bookmark persistence. First-time attaches reuse an
-    /// already-installed healthy attachment instead of re-attaching; re-attaches
-    /// of an already-bookmarked remote session are repair reconnects and always
-    /// reinstall through lookup/resume/attach/health validation.
+    /// A first-time attach reuses an already-installed healthy attachment;
+    /// the attach of an already-bookmarked session is a repair reconnect and
+    /// always reinstalls (decided by the coordinator under its gate, see
+    /// [`RemoteConnectReason::ExtensionAttach`]).
     #[cfg(feature = "remote")]
-    pub(crate) async fn connect_remote_for_ext(
-        &self,
-        node_id: &str,
-        session_id: &str,
+    pub(crate) fn open_remote_session_for_ext<'a>(
+        &'a self,
+        node_id: &'a str,
+        session_id: &'a str,
         handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
-        windowed: bool,
-    ) -> Result<
-        super::remote_connect::ConnectedRemoteSession,
-        super::remote_connect::RemoteSessionConnectError,
+        window: Option<crate::session::history_window::LoadWindow>,
+        node_manager: Option<super::model_registry::NodeManagerRef>,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<super::model_registry::OpenedRemoteSession, Error>,
     > {
-        // A persisted remote identity means this attach is a repair reconnect
-        // (plan §12), not a first-time attach: reinstall the attachment instead
-        // of early-returning a possibly-broken one.
-        let reconnect = match self
-            .config
-            .provider
-            .history_store()
-            .get_remote_session_bookmark(session_id)
-            .await
-        {
-            Ok(bookmark) => bookmark.is_some(),
-            Err(error) => {
-                log::warn!(
-                    "attach_remote_session: bookmark lookup failed for {}: {}; \
-                     falling back to first-time attach",
-                    session_id,
-                    error
-                );
-                false
-            }
-        };
-        let (reason, replace) = if reconnect {
-            (
-                RemoteConnectReason::ExplicitReconnect,
-                RemoteReplacePolicy::ReplaceCurrent,
-            )
-        } else {
-            (
-                RemoteConnectReason::ExtensionAttach,
-                RemoteReplacePolicy::ReuseIfPresent,
-            )
-        };
-        self.connect_remote_session(
+        self.open_remote_session(
             session_id,
+            node_id,
             RemoteConnectOptions {
                 node_hint: Some(node_id),
                 peer_label: None,
                 preferred_scope: None,
-                reason,
-                replace,
+                reason: RemoteConnectReason::ExtensionAttach,
+                replace: RemoteReplacePolicy::ReuseIfPresent,
                 handoff,
-                windowed,
+                windowed: window.is_some(),
                 fork_origin: None,
             },
+            window,
+            node_manager,
         )
-        .await
     }
 
     pub(super) async fn handle_ext_remote_dismiss_session(

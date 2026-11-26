@@ -116,22 +116,35 @@ fn default_attach() -> bool {
     true
 }
 
-/// Return owner-confirmed configuration options, leaving unavailable metadata empty.
+/// The attach response of an opened remote session.
 #[cfg(feature = "remote")]
-async fn attached_remote_config_options(
-    agent: &LocalAgentHandle,
-    session_id: &str,
-) -> Vec<serde_json::Value> {
-    match agent.remote_session_config_options(session_id).await {
-        Ok(options) => options.into_iter().filter_map(|option| {
-            serde_json::to_value(option).map_err(|error| {
-                tracing::warn!(session_id, error = %error, "could not serialize remote configuration option");
-            }).ok()
-        }).collect(),
-        Err(error) => {
-            tracing::warn!(session_id, error = %error, "remote configuration unavailable during attach");
-            Vec::new()
-        }
+fn remote_attach_info(
+    session_id: String,
+    node_id: String,
+    opened: crate::agent::handle::model_registry::OpenedRemoteSession,
+) -> RemoteSessionAttachInfo {
+    let config_options = opened
+        .config_options
+        .into_iter()
+        .filter_map(|option| {
+            serde_json::to_value(option)
+                .map_err(|error| {
+                    tracing::warn!(session_id, error = %error, "could not serialize remote configuration option");
+                })
+                .ok()
+        })
+        .collect();
+    let profile = opened.profile;
+    RemoteSessionAttachInfo {
+        session_id,
+        node_id,
+        attached: opened.attached,
+        config_options,
+        profile_id: profile
+            .as_ref()
+            .map(|value| value.as_ref().map(|value| value.profile_id.clone())),
+        profile_label: profile.map(|value| value.map(|value| value.profile_label)),
+        snapshot: Some(opened.snapshot),
     }
 }
 
@@ -246,40 +259,20 @@ pub async fn create_remote_session(
             });
         }
 
-        let connected = agent
-            .connect_remote_for_ext(
+        let opened = agent
+            .open_remote_session_for_ext(
                 &request.node_id,
                 &response.session_id,
                 Some(response.handoff),
-                false,
-            )
-            .await
-            .map_err(|error| error.to_acp_error())?;
-        use crate::agent::handle::model_registry::RemoteLoadError;
-        let (snapshot, profile, config_options) = agent
-            .load_connected_remote_session(
-                &response.session_id,
-                connected,
                 None,
-                || agent.remote_session_profile(&request.node_id, &response.session_id),
-                || async { Ok(attached_remote_config_options(agent, &response.session_id).await) },
+                Some(nm_ref),
             )
-            .await
-            .map_err(|error| match error {
-                RemoteLoadError::Connect(error) => error.to_acp_error(),
-                RemoteLoadError::Failed(error) => error,
-            })?;
-        Ok(RemoteSessionAttachInfo {
-            session_id: response.session_id,
-            node_id: request.node_id,
-            attached: true,
-            config_options,
-            profile_id: profile
-                .as_ref()
-                .map(|value| value.as_ref().map(|value| value.profile_id.clone())),
-            profile_label: profile.map(|value| value.map(|value| value.profile_label)),
-            snapshot: Some(snapshot),
-        })
+            .await?;
+        Ok(remote_attach_info(
+            response.session_id,
+            request.node_id,
+            opened,
+        ))
     }
 
     #[cfg(not(feature = "remote"))]
@@ -296,73 +289,20 @@ pub async fn attach_remote_session(
 ) -> Result<RemoteSessionAttachInfo, Error> {
     #[cfg(feature = "remote")]
     {
-        use crate::agent::handle::model_registry::RemoteLoadError;
-        let window = request.load_window();
-        let loaded = match agent
-            .connect_remote_for_ext(
+        let opened = agent
+            .open_remote_session_for_ext(
                 &request.node_id,
                 &request.session_id,
                 None,
-                window.is_some(),
+                request.load_window(),
+                None,
             )
-            .await
-        {
-            // Snapshot, profile and config options are independent once the
-            // session is connected; only the snapshot can fail the attach. A
-            // dead reused attachment is replaced once inside.
-            Ok(connected) => {
-                agent
-                    .load_connected_remote_session(
-                        &request.session_id,
-                        connected,
-                        window,
-                        || agent.remote_session_profile(&request.node_id, &request.session_id),
-                        || async {
-                            Ok(attached_remote_config_options(agent, &request.session_id).await)
-                        },
-                    )
-                    .await
-            }
-            Err(error) => Err(RemoteLoadError::Connect(error)),
-        };
-        let (snapshot, profile, config_options) = match loaded {
-            Ok(loaded) => loaded,
-            Err(RemoteLoadError::Failed(error)) => return Err(error),
-            Err(RemoteLoadError::Connect(error)) => {
-                // The owner cannot be reached: a window that is already local
-                // is served as a stale snapshot, without an attachment.
-                let stale = if error.owner_unreachable() {
-                    agent
-                        .stale_remote_snapshot(&request.session_id, window)
-                        .await?
-                } else {
-                    None
-                };
-                return match stale {
-                    Some(snapshot) => Ok(RemoteSessionAttachInfo {
-                        session_id: request.session_id,
-                        node_id: request.node_id,
-                        attached: false,
-                        config_options: Vec::new(),
-                        profile_id: None,
-                        profile_label: None,
-                        snapshot: Some(snapshot),
-                    }),
-                    None => Err(error.to_acp_error()),
-                };
-            }
-        };
-        Ok(RemoteSessionAttachInfo {
-            session_id: request.session_id,
-            node_id: request.node_id,
-            attached: true,
-            config_options,
-            profile_id: profile
-                .as_ref()
-                .map(|value| value.as_ref().map(|value| value.profile_id.clone())),
-            profile_label: profile.map(|value| value.map(|value| value.profile_label)),
-            snapshot: Some(snapshot),
-        })
+            .await?;
+        Ok(remote_attach_info(
+            request.session_id,
+            request.node_id,
+            opened,
+        ))
     }
 
     #[cfg(not(feature = "remote"))]
