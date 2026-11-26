@@ -4,6 +4,14 @@
 
 ### Added
 
+- **`dashboard-server` feature for `querymt-agent`.** The dashboard server code
+  (dashboard routes, the same-origin ACP guard, asset serving and qmtcode's
+  `--dashboard`) without the embedded UI: it serves a placeholder page and
+  never builds the QueryMT Desktop web wasm. `dashboard` now means
+  `dashboard-server` plus the embedded UI and is otherwise unchanged. The
+  `t-agent`/`cl-agent` aliases and `test-agent.yml` use `dashboard-server`, so
+  they no longer need a `QMT_UI_DIST` fixture; the CI fixture is removed.
+
 - **Lean 4 support in the code index.** `.lean` files are now accepted by
   `index`, `get_symbol`, `get_function`, `find_symbol_references` and
   `replace_symbol`, and yield symbol records in the repository knowledge store.

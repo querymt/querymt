@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QueryMT</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0a0a; }
+      body {
+        display: grid; place-items: center; color: #aaa;
+        font: 14px/1.6 system-ui, sans-serif; text-align: center; padding: 2rem;
+        box-sizing: border-box;
+      }
+      code { color: #ddd; }
+    </style>
+  </head>
+  <body>
+    <div>
+      <p>This QueryMT build has no embedded web UI.</p>
+      <p>
+        It was built with the <code>dashboard-server</code> feature only. Build with
+        <code>--features dashboard</code> to embed QueryMT Desktop web.
+      </p>
+      <p>The ACP endpoint <code>/acp/ws</code> on this server works.</p>
+    </div>
+  </body>
+</html>

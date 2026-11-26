@@ -2,18 +2,28 @@ use crate::api::ProfileRuntimeHandle;
 use crate::session::StorageBackend;
 use axum::Router;
 use axum::routing::get;
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 use rust_embed::RustEmbed;
 use std::sync::Arc;
 
+/// The web UI served by `ServerMode::Dashboard`: QueryMT Desktop web, prepared by
+/// build.rs (`dashboard` feature).
 #[cfg(feature = "dashboard")]
 #[derive(RustEmbed)]
 #[folder = "$QMT_UI_EMBED_DIR"]
+struct DashboardAssets;
+
+/// `dashboard-server` without `dashboard`: the dashboard routes and the same-origin
+/// ACP endpoint work, but the page only says the UI is not embedded. Lets checks and
+/// tests of the server code skip the wasm build.
+#[cfg(all(feature = "dashboard-server", not(feature = "dashboard")))]
+#[derive(RustEmbed)]
+#[folder = "dashboard-placeholder"]
 struct DashboardAssets;
 
 pub struct AgentServer {
@@ -24,7 +34,7 @@ pub struct AgentServer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerMode {
-    #[cfg(feature = "dashboard")]
+    #[cfg(feature = "dashboard-server")]
     Dashboard,
     Api,
 }
@@ -63,7 +73,7 @@ impl AgentServer {
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         match mode {
-            #[cfg(feature = "dashboard")]
+            #[cfg(feature = "dashboard-server")]
             ServerMode::Dashboard => log::info!("UI dashboard listening on http://{}", addr),
             ServerMode::Api => log::info!("API server listening on http://{}", addr),
         }
@@ -88,7 +98,7 @@ impl AgentServer {
 
     fn build_app(&self, mode: ServerMode) -> anyhow::Result<Router> {
         let acp_router = match mode {
-            #[cfg(feature = "dashboard")]
+            #[cfg(feature = "dashboard-server")]
             ServerMode::Dashboard => crate::acp::websocket::same_origin_router(self.agent.clone()),
             ServerMode::Api => crate::acp::websocket::router(self.agent.clone()),
         };
@@ -99,7 +109,7 @@ impl AgentServer {
         );
 
         Ok(match mode {
-            #[cfg(feature = "dashboard")]
+            #[cfg(feature = "dashboard-server")]
             ServerMode::Dashboard => app
                 .route("/", get(dashboard_index_handler))
                 .fallback(dashboard_static_handler),
@@ -108,17 +118,17 @@ impl AgentServer {
     }
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 async fn dashboard_index_handler() -> impl IntoResponse {
     serve_asset::<DashboardAssets>("index.html")
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 async fn dashboard_static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     serve_static_path::<DashboardAssets>(&uri)
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 fn serve_static_path<A: RustEmbed>(uri: &axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.is_empty() {
@@ -127,7 +137,7 @@ fn serve_static_path<A: RustEmbed>(uri: &axum::http::Uri) -> Response {
     serve_asset::<A>(path)
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "dashboard-server")]
 fn serve_asset<A: RustEmbed>(path: &str) -> Response {
     match A::get(path) {
         Some(content) => {
@@ -291,7 +301,7 @@ async fn handle_sft_export(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-#[cfg(all(test, feature = "dashboard"))]
+#[cfg(all(test, feature = "dashboard-server"))]
 mod dashboard_tests {
     use super::*;
     use axum::body::Body;

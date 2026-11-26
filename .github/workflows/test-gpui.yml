@@ -3,7 +3,9 @@ name: Test querymt-gpui
 # The QueryMT Desktop app (crates/querymt-gpui). It consumes the session core
 # and the protocol types from this workspace, so a change to either is checked
 # against the app (clippy, the golden transcript tests, the wasm build) in the
-# same pull request. Formatting and the workspace-hack check run in lint.yml.
+# same pull request. It is also the UI that `qmtcode --dashboard` embeds, so the
+# dashboard-embed job builds that path for real. Formatting and the
+# workspace-hack check run in lint.yml.
 on:
   push:
     branches: [main, master]
@@ -19,6 +21,13 @@ on:
       - 'Cargo.lock'
       - '.github/actions/rust-setup/**'
       - '.github/workflows/test-gpui.yml'
+      # qmtcode --dashboard embeds this app (dashboard-embed job).
+      - 'crates/agent/build.rs'
+      - 'crates/agent/build_support/**'
+      - 'crates/agent/dashboard-placeholder/**'
+      - 'crates/agent/Cargo.toml'
+      - 'crates/agent/src/server.rs'
+      - 'crates/agent/src/acp/websocket.rs'
   pull_request:
     paths:
       - 'crates/querymt-gpui/**'
@@ -32,6 +41,13 @@ on:
       - 'Cargo.lock'
       - '.github/actions/rust-setup/**'
       - '.github/workflows/test-gpui.yml'
+      # qmtcode --dashboard embeds this app (dashboard-embed job).
+      - 'crates/agent/build.rs'
+      - 'crates/agent/build_support/**'
+      - 'crates/agent/dashboard-placeholder/**'
+      - 'crates/agent/Cargo.toml'
+      - 'crates/agent/src/server.rs'
+      - 'crates/agent/src/acp/websocket.rs'
   workflow_dispatch:
 
 permissions:
@@ -170,3 +186,80 @@ jobs:
           test -f dist/querymt_gpui.js
           test -s dist/querymt_gpui_bg.wasm
           grep -q 'querymt_gpui.js' dist/index.html
+
+  # The real `dashboard` feature of querymt-agent: build.rs compiles this app for
+  # wasm32, runs wasm-bindgen and wasm-opt, and embeds the result. The agent's
+  # own test jobs use `dashboard-server` (placeholder page) and never build it.
+  # Serves the page from qmtcode and checks in headless Chrome that the app
+  # starts (canvas attached, loading text removed): a blank page fails here.
+  dashboard-embed:
+    name: Embedded dashboard (qmtcode --dashboard)
+    runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-key: gpui-dashboard-embed
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-opt (binaryen)
+        run: |
+          curl -fsSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256}  /tmp/binaryen.tar.gz" | sha256sum --check --strict
+          mkdir -p "$HOME/.local"
+          tar -xzf /tmp/binaryen.tar.gz -C "$HOME/.local"
+          echo "$HOME/.local/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build qmtcode with the embedded dashboard
+        run: |
+          unset QMT_UI_DIST
+          cargo build --locked -p querymt-agent --example qmtcode --features dashboard 2>&1 \
+            | tee build.log
+          grep -q 'querymt-ui: embedding QueryMT Desktop web' build.log
+
+      - name: Serve the dashboard and load it in headless Chrome
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/qmtcode"
+          mkdir -p "$state/home"
+          QMT_HOME="$state/home" target/debug/examples/qmtcode \
+            --db "$state/sessions.db" --dashboard=127.0.0.1:31337 > "$state/qmtcode.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:31337/ && break
+            sleep 1
+          done
+
+          check() { # path content-type
+            local type
+            type=$(curl -fsS -o /dev/null -w '%{content_type}' "http://127.0.0.1:31337$1")
+            echo "$1: $type"
+            [[ "$type" == "$2"* ]]
+          }
+          check / text/html
+          check /querymt_gpui.js text/javascript
+          check /querymt_gpui_bg.wasm application/wasm
+          curl -fsS http://127.0.0.1:31337/querymt-ui.json | grep -q '"app":"querymt-gpui"'
+
+          google-chrome --headless=new --no-sandbox --no-first-run \
+            --user-data-dir="$state/chrome" \
+            --use-angle=swiftshader --enable-unsafe-swiftshader \
+            --window-size=1280,800 --virtual-time-budget=30000 \
+            --dump-dom http://127.0.0.1:31337/ > "$state/dom.html"
+          if grep -q 'id="loading"' "$state/dom.html" || ! grep -q '<canvas' "$state/dom.html"; then
+            echo "::error::the embedded dashboard did not start (loading text still present or no canvas)"
+            cat "$state/dom.html"
+            tail -50 "$state/qmtcode.log"
+            exit 1
+          fi
+          echo "dashboard started: canvas attached, loading text removed"

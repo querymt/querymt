@@ -48,7 +48,7 @@ use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
     ProfileSource, ensure_unique_profile_ids, standard_embedded_profile_catalog_builder,
 };
-#[cfg(any(feature = "api", feature = "dashboard"))]
+#[cfg(any(feature = "api", feature = "dashboard-server"))]
 use querymt_agent::server::ServerMode;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,19 +73,19 @@ const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode --mesh --mesh-peer=/ip4/127.0.0.1/tcp/9001/p2p/PEER_ID\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
-    all(feature = "api", feature = "dashboard"),
+    all(feature = "api", feature = "dashboard-server"),
     command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api", "dashboard"]).multiple(false)))
 )]
 #[cfg_attr(
-    all(feature = "api", not(feature = "dashboard")),
+    all(feature = "api", not(feature = "dashboard-server")),
     command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api"]).multiple(false)))
 )]
 #[cfg_attr(
-    all(not(feature = "api"), feature = "dashboard"),
+    all(not(feature = "api"), feature = "dashboard-server"),
     command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "dashboard"]).multiple(false)))
 )]
 #[cfg_attr(
-    all(not(feature = "api"), not(feature = "dashboard")),
+    all(not(feature = "api"), not(feature = "dashboard-server")),
     command(group(ArgGroup::new("transport").args(["acp", "acp_ws"]).multiple(false)))
 )]
 struct Cli {
@@ -126,7 +126,7 @@ struct Cli {
     api: Option<String>,
 
     /// Serve the embedded QueryMT Desktop web UI over same-origin ACP; optionally set bind address
-    #[cfg(feature = "dashboard")]
+    #[cfg(feature = "dashboard-server")]
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard: Option<String>,
 
@@ -603,9 +603,9 @@ async fn run(
     let is_api = cli.api.is_some();
     #[cfg(not(feature = "api"))]
     let is_api = false;
-    #[cfg(feature = "dashboard")]
+    #[cfg(feature = "dashboard-server")]
     let is_dashboard = cli.dashboard.is_some();
-    #[cfg(not(feature = "dashboard"))]
+    #[cfg(not(feature = "dashboard-server"))]
     let is_dashboard = false;
     #[cfg(feature = "remote")]
     let has_mesh_join = cli.mesh_join.is_some();
@@ -949,13 +949,18 @@ async fn run(
             return Err("--api requires the `api` feature.".into());
         }
     } else if is_dashboard {
-        #[cfg(feature = "dashboard")]
+        #[cfg(feature = "dashboard-server")]
         {
             let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
+            #[cfg(not(feature = "dashboard"))]
+            eprintln!(
+                "Warning: built without the `dashboard` feature; the page only says the \
+                 web UI is not embedded (ACP at /acp/ws works)."
+            );
             eprintln!("Starting dashboard at http://{}", addr);
             runner.server().run(addr, ServerMode::Dashboard).await?;
         }
-        #[cfg(not(feature = "dashboard"))]
+        #[cfg(not(feature = "dashboard-server"))]
         {
             return Err("--dashboard requires the `dashboard` feature.".into());
         }
@@ -1385,7 +1390,7 @@ system = "inline"
         assert!(Cli::try_parse_from(["qmtcode", "--acp", "--acp-ws"]).is_err());
     }
 
-    #[cfg(feature = "dashboard")]
+    #[cfg(feature = "dashboard-server")]
     #[test]
     fn dashboard_flag_defaults_to_localhost() {
         let cli = Cli::try_parse_from(["qmtcode", "--dashboard"]).expect("CLI args should parse");
