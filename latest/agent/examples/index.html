@@ -2478,7 +2478,7 @@
 <hr />
 <h2 id="qmtcode">qmtcode</h2>
 <p>The primary example — a full-featured coding assistant with multiple run modes.
-The <code>dashboard</code> feature automatically resolves and builds the pinned querymt-desktop UI; this source build requires Node.js and npm.</p>
+The <code>dashboard</code> feature embeds QueryMT Desktop web (<code>crates/querymt-gpui</code> built for wasm32); the first build compiles it, which takes a few minutes. Set <code>QMT_UI_DIST</code> to a prebuilt UI directory to skip that.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-0-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-0-3"> 3</a></span>
@@ -2502,7 +2502,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <span class="normal"><a href="#__codelineno-0-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="c1"># ACP stdio mode (for subprocess integration)</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--<span class="w"> </span>--acp
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a>
-<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="c1"># Embedded Svelte dashboard over same-origin ACP (default: http://127.0.0.1:3000)</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="c1"># Embedded QueryMT Desktop web dashboard over same-origin ACP (default: http://127.0.0.1:3000)</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
 <a id="__codelineno-0-6" name="__codelineno-0-6"></a>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="c1"># Dashboard on custom address</span>
@@ -2751,7 +2751,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 - Useful for debugging and auditing</p>
 <hr />
 <h2 id="web_dashboard">web_dashboard</h2>
-<p>Starts the embedded Svelte dashboard without using the <code>qmtcode</code> binary. The browser communicates with the agent through same-origin ACP at <code>/acp/ws</code>.</p>
+<p>Starts the embedded QueryMT Desktop web dashboard without using the <code>qmtcode</code> binary. The browser communicates with the agent through same-origin ACP at <code>/acp/ws</code>.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>web_dashboard<span class="w"> </span>--features<span class="w"> </span>dashboard
 </code></pre></div></td></tr></table></div>
 <p><strong>What it demonstrates:</strong>

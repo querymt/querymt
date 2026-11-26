@@ -1576,6 +1576,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#removing-after-publishing" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Removing after publishing
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#removal-external-writers-and-retained-refs" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1760,6 +1771,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#merging-a-worktree" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Merging a worktree
+      </span>
+    </span>
+  </a>
   
 </li>
       
@@ -2383,10 +2405,24 @@ operations never shell out and never parse Git command output.</p>
 Local / Worktree choice at creation. Agents without the service omit it.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
 <span class="normal"><a href="#__codelineno-4-2">2</a></span>
-<span class="normal"><a href="#__codelineno-4-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"supported"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"defaultBaseline"</span><span class="p">:</span><span class="w"> </span><span class="s2">"commit"</span><span class="p">,</span>
+<span class="normal"><a href="#__codelineno-4-3">3</a></span>
+<span class="normal"><a href="#__codelineno-4-4">4</a></span>
+<span class="normal"><a href="#__codelineno-4-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"supported"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"defaultBaseline"</span><span class="p">:</span><span class="w"> </span><span class="s2">"commit"</span><span class="p">,</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">  </span><span class="nt">"executionModes"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"local"</span><span class="p">,</span><span class="w"> </span><span class="s2">"worktree"</span><span class="p">],</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"baselines"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"commit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"current_working_tree"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"baselines"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"commit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"current_working_tree"</span><span class="p">],</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="w">  </span><span class="nt">"sourceSession"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"handoff"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"handoffSummary"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">  </span><span class="nt">"merge"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p><code>merge: true</code> tells a client it can offer "Merge into source" for a worktree
+session (see <a href="#merging-a-worktree">Merging a worktree</a>).</p>
+<p>A host serving profiles also advertises support when only some profiles enable
+worktrees (<code>[agent.workspace]</code> or <code>[quorum.workspace]</code>), and adds <code>profiles</code>:
+the ids of those profiles. Offer the worktree choice only for them; elsewhere
+isolation fails with <code>workspace_service_unavailable</code>.</p>
+<p>Worktree administration runs in the runtime hosting the session. A session's
+<code>/worktree</code> commands, and <code>querymt/worktree/create</code> with a
+<code>source_session_id</code>, use that runtime's service, and the new session is bound
+to the source session's profile.</p>
 <p>For an isolated <code>session/new</code>, the response's
 <code>_meta.querymt.sessionWorkspace</code> discloses the resolved binding: <code>sessionCwd</code>
 (the directory the session actually executes in), <code>workspaceId</code>, <code>branch</code>,
@@ -2409,7 +2445,8 @@ to run Git commands:</p>
 <span class="normal"><a href="#__codelineno-5-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-5-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-5-10">10</a></span>
-<span class="normal"><a href="#__codelineno-5-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a>/worktree create
+<span class="normal"><a href="#__codelineno-5-11">11</a></span>
+<span class="normal"><a href="#__codelineno-5-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a>/worktree create
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a>/worktree create HEAD review
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a>/worktree create --include-local-changes review
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a>/worktree handoff [name] [--summary]
@@ -2417,9 +2454,10 @@ to run Git commands:</p>
 <a id="__codelineno-5-6" name="__codelineno-5-6"></a>/worktree status &lt;workspace-id&gt;
 <a id="__codelineno-5-7" name="__codelineno-5-7"></a>/worktree result &lt;workspace-id&gt;
 <a id="__codelineno-5-8" name="__codelineno-5-8"></a>/worktree publish [workspace-id]
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree archive [workspace-id]
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree remove [workspace-id] [--archive]
-<a id="__codelineno-5-11" name="__codelineno-5-11"></a>/worktree recover &lt;workspace-id&gt;
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree merge [workspace-id] [--commit &lt;rev&gt;] [--archive|--remove]
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree archive [workspace-id]
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a>/worktree remove [workspace-id] [--archive]
+<a id="__codelineno-5-12" name="__codelineno-5-12"></a>/worktree recover &lt;workspace-id&gt;
 </code></pre></div></td></tr></table></div>
 <p><code>create</code> returns a <strong>new session ID</strong>, workspace ID, checkout path, branch,
 and baseline. Attach to that new session to work there: the conversation
@@ -2431,9 +2469,21 @@ files are always excluded. <code>status</code>, <code>result</code>, and <code>p
 current session's workspace when no ID is supplied; local sessions must supply
 an ID. Results are also returned in prompt response <code>_meta["querymt.worktree"]</code>.</p>
 <p>The command's output is also delivered as an <code>agent_message_chunk</code> session
-update on the issuing session (an ephemeral event, never journaled or replayed)
-before the prompt response, on stdio and WebSocket alike, so every client
-attached to the session sees it. No client bridge route is involved. The legacy
+update on the issuing session before the prompt response, on stdio and
+WebSocket alike, so every client attached to the session sees it. The replies
+to <code>list</code>, <code>status</code>, <code>result</code> and <code>create</code>, and usage errors, are ephemeral
+events, never journaled or replayed. The replies to the mutating commands
+<code>publish</code>, <code>merge</code>, <code>archive</code>, <code>remove</code>, <code>recover</code> and <code>handoff</code>, successful or refused,
+are <strong>durable</strong>: they are recorded as a <code>worktree_command_completed</code> event,
+sent with the stable <code>message_id</code> <code>worktree-cmd-&lt;id&gt;</code> and
+<code>_meta.querymt.worktreeCommand = {command, code?, archived?}</code> (<code>code</code> is the
+stable error code and is absent on success; <code>archived: true</code> marks a refused
+removal that followed a successful archive), and replayed on load with the same
+identity. When the outcome is already recorded as a durable announcement on the
+issuing session's own stream (a handoff, or an archive, <code>remove --archive</code> or
+<code>merge --archive|--remove</code> of its own workspace), that announcement is the reply and no second update is
+recorded. If a durable reply cannot be recorded, it is sent as ephemeral output
+and the failure is logged. No client bridge route is involved. The legacy
 <code>AcpServer::run_stdio</code> forwarder does not track per-connection delivery, so
 there the update is sent but its ordering against the response is not
 guaranteed.</p>
@@ -2469,6 +2519,10 @@ guaranteed.</p>
 <tr>
 <td><code>querymt/worktree/publish</code></td>
 <td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;id&gt;"}</code></td>
+</tr>
+<tr>
+<td><code>querymt/worktree/merge</code></td>
+<td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;owner&gt;"}</code>, optional <code>"commit":"&lt;rev&gt;"</code>, <code>"archive":true</code> or <code>"remove":true</code> (not both: <code>invalid_options</code>)</td>
 </tr>
 <tr>
 <td><code>querymt/worktree/archive</code></td>
@@ -2520,7 +2574,16 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.</p>
 <span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-6-10">10</a></span>
-<span class="normal"><a href="#__codelineno-6-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">api</span><span class="p">::</span><span class="n">SessionOptions</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-6-11">11</a></span>
+<span class="normal"><a href="#__codelineno-6-12">12</a></span>
+<span class="normal"><a href="#__codelineno-6-13">13</a></span>
+<span class="normal"><a href="#__codelineno-6-14">14</a></span>
+<span class="normal"><a href="#__codelineno-6-15">15</a></span>
+<span class="normal"><a href="#__codelineno-6-16">16</a></span>
+<span class="normal"><a href="#__codelineno-6-17">17</a></span>
+<span class="normal"><a href="#__codelineno-6-18">18</a></span>
+<span class="normal"><a href="#__codelineno-6-19">19</a></span>
+<span class="normal"><a href="#__codelineno-6-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">api</span><span class="p">::</span><span class="n">SessionOptions</span><span class="p">;</span>
 <a id="__codelineno-6-2" name="__codelineno-6-2"></a>
 <a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="c1">// Explicit isolation; default options are a plain local session.</span>
 <a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
@@ -2531,29 +2594,40 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.</p>
 <a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="c1">// None when the agent has no workspace service.</span>
 <a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">worktrees</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">worktrees</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"enabled"</span><span class="p">);</span>
 <a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="kd">let</span><span class="w"> </span><span class="n">listed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">worktrees</span><span class="p">.</span><span class="n">list</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12"></a>
+<a id="__codelineno-6-13" name="__codelineno-6-13"></a><span class="c1">// Merge a worktree back into its source checkout.</span>
+<a id="__codelineno-6-14" name="__codelineno-6-14"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">worktree</span><span class="p">::{</span><span class="n">FollowUp</span><span class="p">,</span><span class="w"> </span><span class="n">MergeOptions</span><span class="p">,</span><span class="w"> </span><span class="n">WorkspaceTarget</span><span class="p">};</span>
+<a id="__codelineno-6-15" name="__codelineno-6-15"></a><span class="kd">let</span><span class="w"> </span><span class="n">merged</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">worktrees</span>
+<a id="__codelineno-6-16" name="__codelineno-6-16"></a><span class="w">    </span><span class="p">.</span><span class="n">merge</span><span class="p">(</span>
+<a id="__codelineno-6-17" name="__codelineno-6-17"></a><span class="w">        </span><span class="n">WorkspaceTarget</span><span class="p">::</span><span class="n">Session</span><span class="p">(</span><span class="n">owner</span><span class="p">),</span>
+<a id="__codelineno-6-18" name="__codelineno-6-18"></a><span class="w">        </span><span class="n">MergeOptions</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">commit</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span><span class="w"> </span><span class="n">follow_up</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">FollowUp</span><span class="p">::</span><span class="n">Archive</span><span class="p">)</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-6-19" name="__codelineno-6-19"></a><span class="w">    </span><span class="p">)</span>
+<a id="__codelineno-6-20" name="__codelineno-6-20"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
-<span class="normal"><a href="#__codelineno-7-2">2</a></span>
-<span class="normal"><a href="#__codelineno-7-3">3</a></span>
-<span class="normal"><a href="#__codelineno-7-4">4</a></span>
-<span class="normal"><a href="#__codelineno-7-5">5</a></span>
-<span class="normal"><a href="#__codelineno-7-6">6</a></span>
-<span class="normal"><a href="#__codelineno-7-7">7</a></span>
-<span class="normal"><a href="#__codelineno-7-8">8</a></span>
-<span class="normal"><a href="#__codelineno-7-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="n">session</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">chat_session</span><span class="p">(</span><span class="n">workspace</span><span class="o">=</span><span class="s2">"worktree"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"refactor"</span><span class="p">,</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-7-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-7-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-7-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-7-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-7-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-7-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-7-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-7-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-7-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="n">session</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">chat_session</span><span class="p">(</span><span class="n">workspace</span><span class="o">=</span><span class="s2">"worktree"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"refactor"</span><span class="p">,</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2"></a>                                   <span class="n">include_local_changes</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="nb">print</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">workspace</span><span class="p">[</span><span class="s2">"sessionCwd"</span><span class="p">])</span>      <span class="c1"># None for a local session</span>
 <a id="__codelineno-7-4" name="__codelineno-7-4"></a>
 <a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="n">wt</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">worktrees</span>                         <span class="c1"># None when not enabled</span>
 <a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">list</span><span class="p">();</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">status</span><span class="p">(</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">result</span><span class="p">(</span><span class="n">wid</span><span class="p">)</span>
 <a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>
-<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">archive</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>            <span class="c1"># or archive(session_id=owner)</span>
-<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>             <span class="c1"># or remove(session_id=owner, archive=True)</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">merge</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>              <span class="c1"># or merge(session_id=owner, commit=rev, archive=True)</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">archive</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>            <span class="c1"># or archive(session_id=owner)</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>             <span class="c1"># or remove(session_id=owner, archive=True)</span>
 </code></pre></div></td></tr></table></div>
 <p>Failures raise <code>querymt_agent.WorktreeError</code> (a <code>RuntimeError</code>) carrying a
-<code>.code</code>.</p>
+<code>.code</code> and, for merge refusals that name files, <code>.paths</code>.</p>
 </div>
 </div>
 </div>
@@ -2607,7 +2681,7 @@ readable messages may be reworded; codes do not change.</p>
 </tr>
 <tr>
 <td><code>unpreserved_content</code></td>
-<td>removal would discard uncommitted, untracked or ignored files; the (bounded) path lists are in the message</td>
+<td>removal would discard uncommitted, untracked or ignored files that no published result preserves; the (bounded) path lists are in the message, which names committing, publishing (<code>/worktree publish</code>) or deleting them as the way forward, and, when a published result exists but the files changed since, names that result as stale</td>
 </tr>
 <tr>
 <td><code>unpreserved_commits</code></td>
@@ -2624,6 +2698,22 @@ readable messages may be reworded; codes do not change.</p>
 <tr>
 <td><code>not_owner</code>, <code>workspace_not_ready</code>, <code>owner_not_local</code></td>
 <td>handoff refused: the target does not own a ready, locally hosted workspace (nothing is created)</td>
+</tr>
+<tr>
+<td><code>merge_conflict</code>, <code>touches_local_changes</code>, <code>baseline_local_edits</code>, <code>commit_rejected</code> and the other <a href="#refusal-codes">acceptance refusal codes</a></td>
+<td>merge refused; the offending files are in <code>paths</code> (ACP <code>data.paths</code>, Python <code>.paths</code>)</td>
+</tr>
+<tr>
+<td><code>source_missing</code></td>
+<td>merge: the source checkout no longer exists or is not a checkout of the same repository</td>
+</tr>
+<tr>
+<td><code>source_active</code></td>
+<td>merge: the session the worktree was created from is mid-turn</td>
+</tr>
+<tr>
+<td><code>commit_not_on_workspace_branch</code></td>
+<td>merge <code>--commit</code>: the revision is neither a retained result nor a commit on the worktree branch after its baseline</td>
 </tr>
 <tr>
 <td><code>summary_failed</code></td>
@@ -2669,12 +2759,49 @@ readable messages may be reworded; codes do not change.</p>
    <code>/worktree remove [id] --archive</code> for both). Without an id the command
    targets the issuing session's own workspace. See
    <a href="#archiving-from-any-session">Archiving from any session</a>.
-   Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
-   remain protected. There is no <code>--force</code>; successful removal reports retained refs.</li>
+    Ignored, externally owned, or unpreserved-result checkouts, and dirty or
+    untracked files that no published result preserves, remain protected.
+    There is no <code>--force</code>; successful removal reports retained refs.</li>
 </ol>
 <p>Removal safety does not depend on Git status configuration: untracked and
 ignored files are detected even when <code>status.showUntrackedFiles=no</code> is set,
-and any such content refuses removal with nothing deleted.</p>
+and any such content that is not preserved refuses removal with nothing
+deleted.</p>
+<h3 id="removing-after-publishing">Removing after publishing</h3>
+<p><code>/worktree publish</code> captures the full working state (tracked changes,
+deletions and non-ignored untracked files) into a retained result ref. A
+checkout with uncommitted work can then be removed without committing or
+deleting that work first, as long as its working state is <strong>exactly</strong> the tree
+of one of the workspace's retained published results. The comparison is by
+content (Git tree ids), re-checked under the removal's exclusive lease just
+before the removal is claimed, never by timestamps or by the fact that a
+publish happened. A result only counts while its ref still exists and points
+at the recorded commit; a deleted or moved result ref preserves nothing.
+Content that is staged and then changed or deleted on disk is in no published
+result, so such a checkout is refused until the staged content is committed or
+discarded. Plain editors and Git commands do not honor QueryMT's locks, so an
+edit made in the instant between that final check and the deletion can still
+be lost.
+The checkout is then deleted and the response names the result ref that
+preserves the discarded files in <code>preserved_by</code> (it is also listed in
+<code>retained_refs</code>); <code>/worktree result</code> still presents those edits.</p>
+<pre class="mermaid"><code>flowchart TD
+    A[remove requested] --&gt; B{ignored files present?}
+    B -- yes --&gt; R[refuse: unpreserved_content]
+    B -- no --&gt; C{working state tree equals a published result tree?}
+    C -- yes --&gt; D[delete checkout, report preserved_by]
+    C -- no --&gt; R</code></pre>
+<p>If files changed after the last publication, removal is refused with
+<code>unpreserved_content</code>; the message states that the working state differs from
+the last published result, names it, and suggests publishing again. An
+archived owner session can still run <code>/worktree publish</code> (it only pins a
+result ref and never changes the checkout), so after a refused
+<code>remove --archive</code> publish again from that conversation (or run
+<code>/worktree publish &lt;workspace_id&gt;</code> from any other local session) and retry the
+removal. Ignored
+files are never captured by a publication, so they always block removal. An
+interrupted removal of published work re-runs the same check on recovery and
+completes only if the working state still matches.</p>
 <h3 id="removal-external-writers-and-retained-refs">Removal, external writers, and retained refs</h3>
 <p>The repository-administration lock coordinates QueryMT processes only; plain
 Git commands and editors never honor it. Removal therefore assumes external
@@ -2687,8 +2814,9 @@ writers and is race-safe by construction:</p>
   <strong>retained, never deleted</strong>, and the removal response discloses the race in
   <code>branch_moved_during_removal</code> plus the branch in <code>retained_refs</code>.</li>
 <li>Removal responses always report exactly what remains:
-  <code>checkout_removed</code>, <code>removed_branch</code>, <code>branch_moved_during_removal</code>, and
-  <code>retained_refs</code>. A response never claims complete deletion when anything
+  <code>checkout_removed</code>, <code>removed_branch</code>, <code>branch_moved_during_removal</code>,
+  <code>retained_refs</code>, and, when uncommitted work was discarded because a
+  published result preserves it, <code>preserved_by</code>. A response never claims complete deletion when anything
   was retained or refused; baseline refs of removed workspaces are always
   retained and listed.</li>
 <li>Interrupted <code>removing</code> state recovers through the same safety checks, run
@@ -2992,7 +3120,11 @@ owner stays listable and loadable but never materializes an actor:</p>
 <p><strong>Archive announcement.</strong> Archiving an owned workspace records a durable
 <code>worktree_archived</code> event on the owner's stream, sent as an <code>agent_message_chunk</code>
 with the stable <code>message_id</code> <code>worktree-archived-&lt;workspace_id&gt;</code> and
-<code>_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}</code>. Every attached
+<code>_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}</code>. For
+<code>remove --archive</code> the update is recorded <strong>after</strong> the removal attempt and
+states its outcome (<code>removal</code> is <code>removed</code>, or <code>refused</code> with the code and
+reason); its text then says the workspace was archived and removed, or archived
+but not removed, instead of asking the user to run <code>/worktree remove</code>. Every attached
 client receives it before the response of a native command issued from the owner
 (except over the legacy <code>AcpServer::run_stdio</code> forwarder, where the update may
 arrive after the response; clients must not rely on that ordering there), and it
@@ -3010,8 +3142,14 @@ usage errors included, returns a successful prompt response whose
 <code>_meta["querymt.worktree"].error = {code, message}</code> and shows the message as a
 session update before the response (except over the legacy
 <code>AcpServer::run_stdio</code> forwarder, where the update may arrive after the response;
-clients must not rely on that ordering there). ACP extension methods keep returning
-JSON-RPC errors with <code>data.{code, message}</code>.</p>
+clients must not rely on that ordering there). Refusals of mutating commands
+are durable replies (see above) and survive a reload. ACP extension methods keep
+returning JSON-RPC errors with <code>data.{code, message}</code>.</p>
+<p><strong>Cancel on read-only sessions.</strong> <code>session/cancel</code> for an archived owner or a
+previous owner succeeds without effect (these sessions have no actor).</p>
+<p>A client should render <code>_meta.querymt.worktreeCommand</code> replies (with error
+styling by <code>code</code>) and switch the session to read-only live when
+<code>worktreeArchived</code> or <code>worktreeHandoff</code> metadata arrives.</p>
 <h2 id="undo-snapshots-and-workspace-references">Undo, snapshots, and workspace references</h2>
 <p>Undo and redo reuse the <strong>existing snapshot backend</strong>, unchanged. The
 backend is bound to the session's effective cwd, so each workspace keeps
@@ -3218,8 +3356,98 @@ rollback cannot run, the error says so and the next acceptance retries it.</p>
 <p>Delegation completion does not mean the objective succeeded: a delegate that
 stopped without changing anything reports a result with no baseline-relative
 changes, and the summary says so instead of offering it for acceptance.</p>
+<h2 id="merging-a-worktree">Merging a worktree</h2>
+<p><code>/worktree merge</code> brings a top-level worktree's work back to the checkout it was
+created from, using the same native pipeline as
+<a href="#accepting-a-delegate-result">accepting a delegate result</a>: a three-way merge of
+exactly the baseline-relative delta, refusal on local edits, the repository's
+commit hooks, a compare-and-swap branch update and crash recovery.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span>
+<span class="normal"><a href="#__codelineno-14-3">3</a></span>
+<span class="normal"><a href="#__codelineno-14-4">4</a></span>
+<span class="normal"><a href="#__codelineno-14-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>/worktree merge                       # snapshot this session's worktree and merge it
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a>/worktree merge &lt;workspace-id&gt;        # from the source session or any other
+<a id="__codelineno-14-3" name="__codelineno-14-3"></a>/worktree merge --commit 3f9a2c1      # merge a chosen version, no snapshot
+<a id="__codelineno-14-4" name="__codelineno-14-4"></a>/worktree merge --archive             # then archive the worktree
+<a id="__codelineno-14-5" name="__codelineno-14-5"></a>/worktree merge --remove              # then archive and remove it
+</code></pre></div></td></tr></table></div>
+<pre class="mermaid"><code>flowchart TD
+  A[/worktree merge/] --&gt; B{--commit?}
+  B -- no --&gt; C[owner idle?&lt;br/&gt;else owner_active]
+  C --&gt; D[snapshot working state&lt;br/&gt;as a retained result]
+  B -- yes --&gt; E{retained result or&lt;br/&gt;commit on the worktree branch?}
+  E -- no --&gt; X[commit_not_on_workspace_branch]
+  E -- yes --&gt; F[retain it as a result]
+  D --&gt; G[source session idle?&lt;br/&gt;else source_active]
+  F --&gt; G
+  G --&gt; H[three-way merge of baseline to result&lt;br/&gt;into the source branch]
+  H --&gt; I{outcome}
+  I -- merged / already merged / no changes --&gt; J[optional archive or remove]
+  I -- conflict or refusal --&gt; K[nothing changed, code and paths]</code></pre>
+<p><strong>What is merged.</strong> By default merge first publishes the worktree's current
+working state as a retained result, exactly like <code>/worktree publish</code> (commits,
+staged, unstaged and non-ignored untracked files; ignored files are reported, not
+captured), and merges that result. It refuses with <code>owner_active</code> while the
+worktree's owner session is mid-turn, so a half-finished tool write is never
+captured. <code>--commit &lt;rev&gt;</code> takes no snapshot: it merges a retained result (a full
+id or at least 7 hex digits) or a commit on the worktree branch after its
+baseline, which is then retained like a published result. An archived worktree can
+only merge an explicit <code>--commit</code>, because its live state is retired.</p>
+<p><strong>Squash semantics.</strong> The result lands as <strong>one commit</strong> on the source
+checkout's current branch, containing only the worktree's own changes. The
+worktree branch's individual commits are not kept as history and the commit has
+one parent. Its message is <code>Merge worktree &lt;name&gt;</code> with <code>QueryMT-Workspace</code>,
+<code>QueryMT-Result</code> and <code>QueryMT-Baseline</code> trailers. Because only the
+baseline-relative delta is applied, uncommitted files the worktree inherited from
+a dirty source are not committed, unlike <code>git merge &lt;managed-branch&gt;</code>.</p>
+<p><strong>Target.</strong> The source checkout is the effective checkout of the session the
+worktree was created from, otherwise the worktree's recorded source cwd. If that
+checkout is gone, merge refuses with <code>source_missing</code>. The source session must
+not be mid-turn (<code>source_active</code>). This is checked once, before the merge starts;
+it does not block a turn started afterwards, so do not start work in the source
+session while a merge is running.</p>
+<p><strong>Hooks and local work.</strong> <code>pre-commit</code>, <code>prepare-commit-msg</code> and <code>commit-msg</code> run
+with no way to skip them, and a rejection is <code>commit_rejected</code>. Paths the merge
+writes that have staged, unstaged, untracked or ignored local state in the source
+are refused (<code>touches_local_changes</code>); overlapping edits are reported as
+<code>merge_conflict</code> with the paths. Either way nothing changes. See the
+<a href="#hooks">hooks</a> and <a href="#refusal-codes">refusal codes</a> above; they apply unchanged.</p>
+<p><strong>Repeating a merge.</strong> Merging a version that is already contained in the source
+reports <code>already_merged</code> with the original commit, and a version with no changes
+reports <code>no_changes</code>. The reply states <code>merged</code>, <code>already_merged</code> or <code>no_changes</code>,
+the commit and branch, the changed paths, the merged result and whether this
+merge published it.</p>
+<p><strong><code>--archive</code> / <code>--remove</code>.</strong> Once the source contains the result (merged,
+already merged or no changes) the worktree is archived, or archived and removed
+under the usual safety rules. They are mutually exclusive. A follow-up refusal is
+reported next to the merge outcome (<code>follow_up.error</code>) and never undoes or hides
+the merge. After a refused merge the follow-up is skipped. When a session merges
+and archives its own worktree, the archive announcement on its stream carries the
+merge outcome.</p>
+<div class="admonition warning">
+<p class="admonition-title"><code>--include-local-changes</code> worktrees</p>
+<p>A worktree created with <code>--include-local-changes</code> starts from a baseline that
+already holds the source's uncommitted edits. If the worktree then changes a
+file that was uncommitted in the source, merge refuses it
+(<code>baseline_local_edits</code>), because it cannot tell your edit from the
+worktree's. Commit or stash the source edits and create the worktree again, or
+apply the published delta yourself. Stash or commit anything already staged
+first (so <code>git commit</code> records only the worktree's changes), and apply the
+whole baseline-to-result delta rather than cherry-picking the result commit,
+which would omit earlier commits on the worktree branch:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
+<span class="normal"><a href="#__codelineno-15-2">2</a></span>
+<span class="normal"><a href="#__codelineno-15-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply<span class="w"> </span>--index
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a>git<span class="w"> </span>commit
+</code></pre></div></td></tr></table></div>
+<p><code>git apply</code> refuses a path whose source content differs from the baseline, so
+for the file with your uncommitted edit, merge that file by hand.</p>
+</div>
 <h2 id="reviewing-and-integrating-results">Reviewing and integrating results</h2>
-<p>Nothing is ever merged back automatically. Delegates publish their uncommitted
+<p>Nothing is ever merged back automatically; <code>/worktree merge</code> is an explicit
+request. Delegates publish their uncommitted
 output automatically on completion; top-level workspaces publish explicitly
 with <code>/worktree publish</code> or <code>querymt/worktree/publish</code>. Either way the
 workspace — checkout path, managed branch, baseline, and a captured immutable
@@ -3241,9 +3469,9 @@ consulting the live checkout:</p>
   create-only ref.</li>
 </ul>
 <p>You can also reproduce the delta with Git directly:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
-<span class="normal"><a href="#__codelineno-14-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
 </code></pre></div></td></tr></table></div>
 <p>Example: a parent with uncommitted edits to <code>config.rs</code> dispatches an
 isolated delegate that changes <code>auth.rs</code> and leaves <code>notes.md</code> untracked.
@@ -3260,17 +3488,19 @@ workspace's changes since its baseline.</p>
 baseline, so <code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip
 wholesale) can bring the parent's baseline edits along with the
 workspace's work. Integrate the delta deliberately instead:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
-<span class="normal"><a href="#__codelineno-15-2">2</a></span>
-<span class="normal"><a href="#__codelineno-15-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
+<span class="normal"><a href="#__codelineno-17-2">2</a></span>
+<span class="normal"><a href="#__codelineno-17-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
 </code></pre></div></td></tr></table></div>
 <p>or, if the workspace produced real commits and the parent was clean,
 cherry-pick the commit range. If the parent was dirty, either commit the
 parent's state coherently first, or apply the baseline-relative patch as
-above. A clean worktree or a completed status never implies the result has
-been applied or accepted — review the delta and integrate it yourself.</p>
+above. For a top-level worktree, <a href="#merging-a-worktree"><code>/worktree merge</code></a>
+does this for you. A clean worktree or a completed status never implies the
+result has been applied or accepted — review the delta and integrate it
+yourself.</p>
 </div>
 <h2 id="what-isolation-does-not-do">What isolation does not do</h2>
 <ul>

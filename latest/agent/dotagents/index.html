@@ -2081,19 +2081,25 @@
 </code></pre></div></td></tr></table></div>
 <h3 id="previewing-without-side-effects">Previewing Without Side Effects</h3>
 <p>Resolution is side-effect free. <code>preview_dotagents_manifest</code> applies the same precedence as <code>build</code> but starts no MCP server, persists or schedules no task, imports no memory, and creates no directory:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
-<span class="normal"><a href="#__codelineno-3-2">2</a></span>
-<span class="normal"><a href="#__codelineno-3-3">3</a></span>
-<span class="normal"><a href="#__codelineno-3-4">4</a></span>
-<span class="normal"><a href="#__codelineno-3-5">5</a></span>
-<span class="normal"><a href="#__codelineno-3-6">6</a></span>
-<span class="normal"><a href="#__codelineno-3-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">manifest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">preview_dotagents_manifest</span><span class="p">()</span><span class="o">?</span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"layers resolved"</span><span class="p">);</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-3-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-3-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-3-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-3-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-3-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-3-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-3-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-3-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-3-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">manifest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">preview_dotagents_manifest</span><span class="p">()</span><span class="o">?</span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"layers resolved"</span><span class="p">);</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">server</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">manifest</span><span class="p">.</span><span class="n">mcp_servers</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{id}: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">server</span><span class="p">.</span><span class="n">transport</span><span class="p">);</span>
 <a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="p">}</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="k">for</span><span class="w"> </span><span class="n">diagnostic</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">manifest</span><span class="p">.</span><span class="n">diagnostics</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">    </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">"{diagnostic}"</span><span class="p">);</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">skill</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">manifest</span><span class="p">.</span><span class="n">skills</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{id}: {} ({})"</span><span class="p">,</span><span class="w"> </span><span class="n">skill</span><span class="p">.</span><span class="n">directory</span><span class="p">.</span><span class="n">display</span><span class="p">(),</span><span class="w"> </span><span class="n">skill</span><span class="p">.</span><span class="n">source_kind</span><span class="p">.</span><span class="n">as_str</span><span class="p">());</span>
 <a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="p">}</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="k">for</span><span class="w"> </span><span class="n">diagnostic</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">manifest</span><span class="p">.</span><span class="n">diagnostics</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9"></a><span class="w">    </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">"{diagnostic}"</span><span class="p">);</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="supported-directory-layout">Supported Directory Layout</h2>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1"> 1</a></span>
@@ -2110,7 +2116,7 @@
 <a id="__codelineno-4-3" name="__codelineno-4-3"></a>  system-prompt.md           # system prompt (singleton)
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a>  mcp.json                   # MCP servers, keyed by mcpServers entry name
 <a id="__codelineno-4-5" name="__codelineno-4-5"></a>  models.json                # model presets, keyed by preset name
-<a id="__codelineno-4-6" name="__codelineno-4-6"></a>  skills/&lt;id&gt;/skill.md       # or SKILL.md; keyed by id or directory name
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a>  skills/&lt;id&gt;/skill.md       # or SKILL.md; read by skill discovery, see Skills
 <a id="__codelineno-4-7" name="__codelineno-4-7"></a>  agents/&lt;id&gt;/agent.md       # sub-agent profile; keyed by id or directory name
 <a id="__codelineno-4-8" name="__codelineno-4-8"></a>  agents/&lt;id&gt;/config.json    # adjacent supported settings
 <a id="__codelineno-4-9" name="__codelineno-4-9"></a>  tasks/&lt;id&gt;/task.md         # repeat task; keyed by id or directory name
@@ -2142,8 +2148,12 @@
 <td>Top-level keys merge; a workspace key replaces the matching global key</td>
 </tr>
 <tr>
-<td><code>skills/</code>, <code>agents/</code>, <code>tasks/</code>, <code>memories/</code></td>
+<td><code>agents/</code>, <code>tasks/</code>, <code>memories/</code></td>
 <td>Entries merge by normalized ID; a workspace entry replaces the matching global entry</td>
+</tr>
+<tr>
+<td>skills</td>
+<td>Not merged by layer: the manifest lists what skill discovery offers (see <a href="#skills">Skills</a>)</td>
 </tr>
 </tbody>
 </table>
@@ -2189,7 +2199,9 @@
 <p><code>models.json</code> presets provide <code>provider</code>, <code>model</code>, optional credential, and provider parameters. Selecting a preset through <code>selected_model_preset</code> overlays only the LLM fields it represents, so unrelated explicit settings survive.</p>
 <p>Presets do not install providers and do not replace profile provider locks. An unknown preset, an unavailable provider, or a missing model identifier produces an actionable diagnostic and leaves the explicit base configuration in effect.</p>
 <h2 id="skills">Skills</h2>
-<p>Skill discovery continues to cover configured sources, <code>.skills</code>, <code>.claude/skills</code>, <code>.qmt/skills</code>, and <code>.agents/skills</code>. Inside <code>.agents/skills</code>, both protocol <code>skill.md</code> and existing <code>SKILL.md</code> are accepted; protocol <code>id</code>, <code>name</code>, <code>description</code>, and <code>enabled</code> metadata are honored, and the directory name is the ID when <code>id</code> is absent. Disabled skills are not exposed to the skill tool.</p>
+<p>Skills are read by one reader, shared by the <code>skill</code> tool and the manifest, over these sources (later ones override earlier ones): the <code>skills</code> folder of the QueryMT config directory, <code>~/.claude/skills</code>, <code>~/.agents/skills</code>, then <code>&lt;workspace&gt;/.skills</code>, <code>.claude/skills</code>, <code>.agents/skills</code>, <code>.qmt/skills</code>, then the configured <code>paths</code>. The <code>.agents</code> Protocol switch, the layer switches and the root overrides do not apply to skill discovery. Inside <code>.agents/skills</code>, both protocol <code>skill.md</code> and existing <code>SKILL.md</code> are accepted; protocol <code>id</code>, <code>name</code>, <code>description</code>, and <code>enabled</code> metadata are honored, and the directory name is the ID when <code>id</code> is absent. Disabled skills are not offered. Symbolic links are followed wherever they point and ignore files such as <code>.gitignore</code> do not apply; see <a href="../configuration/#skills-configuration">Skills Configuration</a>.</p>
+<p>The resolved manifest's <code>skills</code> is an <strong>inventory</strong> of the local skills the <code>skill</code> tool offers for the resolved workspace, ordered by callable ID. Each entry (<code>SkillInventoryEntry</code>) has the callable ID, name, description, source kind (<code>global</code>, <code>project</code> or <code>configured</code>), source folder, skill directory and, for a skill reached through a link, the resolved target (<code>link_target</code>). Skill bodies are not part of it, and skills published by MCP servers are not listed. The list is empty for an agent whose skills are disabled or whose tool list does not name <code>skill</code>. Resolving without an agent configuration (<code>DotagentsLoader</code> used directly) scans with the defaults of the skills configuration; <code>DotagentsLoadOptions::with_skill_scan</code> selects other settings.</p>
+<p>Every skill problem found while resolving (a malformed definition, both <code>skill.md</code> and <code>SKILL.md</code> in one folder, a broken or looping link, an unreadable entry, a duplicate ID) is a <strong>warning</strong> diagnostic that starts with the affected path. Skill problems never fail a <code>Strict</code> resolution.</p>
 <h2 id="sub-agents">Sub-Agents</h2>
 <p>Protocol <code>agents/&lt;id&gt;/agent.md</code> profiles with role <code>delegation-target</code> and a supported internal connection become delegation targets:</p>
 <ul>
@@ -2257,7 +2269,7 @@
 <p>If no knowledge store is configured, memories remain inspectable in the manifest and a non-fatal diagnostic reports that import was skipped. Other protocol features — prompts, skills, sub-agents — are unaffected.</p>
 <h2 id="security">Security</h2>
 <ul>
-<li><strong>Path confinement</strong>: references may resolve within their owning layer root or an explicitly configured trusted root. <code>..</code> traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started.</li>
+<li><strong>Path confinement</strong>: references may resolve within their owning layer root or an explicitly configured trusted root. <code>..</code> traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started. Skill folders are the exception: a skill directory reached through a symbolic link is accepted wherever its target is, because a skill is text that reaches the model only when it is loaded under the configured skill permission, and the supporting files of a linked skill stay confined to the link target.</li>
 <li><strong>No implicit creation</strong>: workspace discovery only happens when <code>&lt;workspace&gt;/.agents</code> already exists.</li>
 <li><strong>Secrets</strong>: <code>${VAR}</code> references are interpolated at activation; diagnostics, debug output, and inspectable manifests redact resolved secret values while retaining enough context to fix errors. Secret values are never used as entry IDs or persisted as reconciliation keys.</li>
 <li><strong>No executable sub-agents</strong>: <code>stdio</code>/executable connection types never launch a process.</li>
@@ -2314,7 +2326,7 @@
 </tr>
 <tr>
 <td><code>skills/&lt;id&gt;/skill.md</code></td>
-<td>skill tool source under <code>.agents/skills</code></td>
+<td>skill tool source under <code>.agents/skills</code>; the manifest lists every offered skill</td>
 </tr>
 <tr>
 <td><code>agents/&lt;id&gt;/agent.md</code></td>

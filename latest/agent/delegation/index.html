@@ -1881,6 +1881,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#subagents-over-acp" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Subagents over ACP
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#delegation-events" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -3214,6 +3225,66 @@ notification as an invalidation hint and call <code>querymt/agents/list</code> f
 <li>The remote session is a delegation child: it is not listed as a user session.</li>
 </ul>
 <p>See <a href="../mesh/#remote-agents">Mesh Networking</a> for the mesh side.</p>
+<h2 id="subagents-over-acp">Subagents over ACP</h2>
+<p>A client that advertises <code>clientCapabilities.subagents</code> sees every delegation as a subagent of the parent session. Each delegation event updates one folded state per delegation, which maps to a <code>subagent_update</code> on the parent session:</p>
+<table>
+<thead>
+<tr>
+<th>Delegation state</th>
+<th><code>state</code></th>
+<th><code>_meta.querymt</code></th>
+<th><code>capabilities</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Requested (no child yet)</td>
+<td>no update</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Forked, executing</td>
+<td><code>running</code></td>
+<td></td>
+<td><code>cancel</code></td>
+</tr>
+<tr>
+<td>Verifying, finalizing, cancel requested</td>
+<td><code>running</code></td>
+<td><code>stage</code></td>
+<td><code>cancel</code></td>
+</tr>
+<tr>
+<td>Completed, failed, cancelled</td>
+<td><code>idle</code></td>
+<td>stage cleared</td>
+<td><code>null</code> (cancel withdrawn)</td>
+</tr>
+</tbody>
+</table>
+<p>The title is the target agent id and the description is the objective. The confirmed model id, provider node id and the lifecycle timestamps always go in <code>_meta.querymt</code>.</p>
+<pre class="mermaid"><code>sequenceDiagram
+    participant Parent as Parent session
+    participant C as Client (subagents)
+    Parent-&gt;&gt;C: tool_call (delegate, completed)
+    Parent-&gt;&gt;C: subagent_update(c1, running, cancel)
+    Parent-&gt;&gt;C: tool_call_update(content: session c1)
+    Note over C: events of c1 may now flow
+    Parent-&gt;&gt;C: subagent_update(c1, running, stage=verifying)
+    alt completed
+        Parent-&gt;&gt;C: subagent_update(c1, idle, capabilities=null)
+    else failed or cancelled
+        Parent-&gt;&gt;C: subagent_update(c1, idle, capabilities=null)
+        Parent-&gt;&gt;C: tool_call_update(status=failed)
+    end</code></pre>
+<ul>
+<li><strong>Announce first.</strong> The announcement precedes any event of the child. For a child hosted on another mesh node, whose events can arrive before the fork event, the connection announces the child on the first event it sees.</li>
+<li><strong>Tool call status.</strong> The delegate call completes when the delegation is accepted, not when the child finishes. A delegation that fails or is cancelled sends a final <code>failed</code> update for that call. The child's outcome is otherwise reported through the child's state and the result injected into the parent.</li>
+<li><strong>Cancelling.</strong> While the delegation runs, the child advertises <code>cancel</code>. <code>session/cancel</code> for the child session cancels the delegation (the delegation is cancelled, the call is reported <code>failed</code> and the child becomes <code>idle</code>). The cancel is routed from the node that observed the delegation; a node that did not observe it treats the request as a plain session cancel.</li>
+<li><strong>Load.</strong> <code>session/load</code> replays one <code>subagent_update</code> per child ahead of the history that references it. Load snapshots carry the same latest updates in <code>subagentUpdates</code>, merged with the live state of running delegations.</li>
+</ul>
+<p>The wire shape is described in the <a href="../api_reference/#subagent-updates-for-delegations">API reference</a>.</p>
 <h2 id="delegation-events">Delegation Events</h2>
 <p>Agents emit events during delegation:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-29-1"> 1</a></span>
