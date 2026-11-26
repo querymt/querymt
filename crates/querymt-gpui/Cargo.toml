@@ -1,7 +1,9 @@
 [package]
 name = "querymt-gpui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QueryMT Desktop: the GPUI desktop and web client for QueryMT agents"
 publish = false
 
 [[bin]]
@@ -16,11 +18,9 @@ gpui-kit = { version = "0.11.0", features = ["syntect"] }
 # component library, without depending on its private highlighting API.
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
-# Session reducer, pinned to a pushed revision of querymt/querymt
-# (branch feat/agent-session-core). Bumping it means: change `rev` here and in
-# [dev-dependencies], refresh `cargoLock.outputHashes` in flake.nix, and run
-# the tests (they read the core's golden cases from the pinned rev).
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73" }
+# Session reducer, from the same workspace: changes to it are tested against
+# this app in the same pull request (the tests replay its golden cases).
+querymt-agent-session-core = { path = "../agent-session-core" }
 async-channel = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -106,9 +106,9 @@ web-sys = { version = "0.3", features = [
 
 [dev-dependencies]
 gpui-kit = { version = "0.11.0", features = ["test-support"] }
-# Same rev as above: tests replay the core's seeded golden cases
-# (`testing::golden_cases()`) instead of storing trace files.
-querymt-agent-session-core = { git = "https://github.com/querymt/querymt", rev = "b2e3c7259ea448e0b4bd14083cb57f42401dee73", features = ["test-support"] }
+# Tests replay the core's seeded golden cases (`testing::golden_cases()`)
+# instead of storing trace files.
+querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
 
 [build-dependencies]
 dirs = "6"
@@ -116,17 +116,7 @@ sha2 = "0.10"
 tempfile = "3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
-# Prioritize the shipped executable's size over compile time and peak throughput.
-[profile.release]
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-debug = 0
-strip = "symbols"
-panic = "abort"
-incremental = false
+# Release builds use the workspace profiles `release-gpui` (native) and
+# `release-gpui-web` (wasm), defined in the root Cargo.toml.
 
-[profile.release-web]
-inherits = "release"
-# wasm-bindgen needs target-feature metadata; wasm-opt strips names afterward.
-strip = "debuginfo"
+# querymt-workspace-hack is intentionally absent (see .config/hakari.toml `traversal-excludes`).

@@ -35,6 +35,9 @@ workspace-members = [
     "querymt-provider-common", "querymt-cli",
     # Standalone ACP/MCP client binaries: keep the agent stack out of their builds.
     "qmacp", "qmcp",
+    # The GPUI desktop app also builds for wasm32-unknown-unknown and talks to
+    # agents only over ACP: it must not inherit the agent stack's host features.
+    "querymt-gpui",
 ]
 
 # `querymt` is shared with the wasm32-wasip1 provider plugins, which must not
