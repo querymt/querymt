@@ -590,6 +590,71 @@ impl Drop for RemoteConnectGate {
     }
 }
 
+/// What one connect attempt owes once it has a result: the span fields, the
+/// cooldown bookkeeping and, last, the release of the session's gate.
+///
+/// The attempt owns it until the attachment is committed. The commit then
+/// runs in a detached task (see [`LocalAgentHandle::commit_remote_attachment`])
+/// and takes the scope along, so a caller that is cancelled meanwhile neither
+/// frees the gate for a racing connect before the install is done nor loses
+/// the outcome.
+struct ConnectScope {
+    session_id: String,
+    started: Instant,
+    span: tracing::Span,
+    cooldowns: RemoteConnectCooldownMap,
+    gate: RemoteConnectGate,
+}
+
+impl ConnectScope {
+    /// Record the outcome before the gate is released; otherwise the next
+    /// failed attempt can race ahead of its predecessor's cooldown.
+    fn finish(self, result: &Result<ConnectedRemoteSession, RemoteSessionConnectError>) {
+        self.span
+            .record("elapsed_ms", self.started.elapsed().as_millis() as u64);
+        record_connect_outcome(&self.cooldowns, &self.session_id, result);
+        match result {
+            Ok(connected) => {
+                self.span.record("outcome", connected.outcome.as_str());
+                self.span.record("attachment_id", connected.attachment_id);
+            }
+            Err(err) => {
+                self.span.record("error", err.code());
+            }
+        }
+        drop(self.gate);
+    }
+}
+
+/// Success clears the cooldown; transport-level failures extend it.
+fn record_connect_outcome(
+    cooldowns: &RemoteConnectCooldownMap,
+    session_id: &str,
+    result: &Result<ConnectedRemoteSession, RemoteSessionConnectError>,
+) {
+    let mut cooldowns = cooldowns.lock();
+    match result {
+        Ok(connected) if connected.outcome != RemoteConnectOutcome::Reused => {
+            cooldowns.remove(session_id);
+        }
+        Err(error) if error.counts_toward_cooldown() => {
+            let failures = cooldowns
+                .get(session_id)
+                .map_or(1, |state| state.failures.saturating_add(1));
+            cooldowns.insert(
+                session_id.to_string(),
+                ConnectCooldown {
+                    failures,
+                    failed_at: Instant::now(),
+                    wait: connect_cooldown_wait(failures),
+                    owner_unreachable: error.owner_unreachable(),
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
 // ── Coordinator ─────────────────────────────────────────────────────────
 
 impl LocalAgentHandle {
@@ -689,23 +754,21 @@ impl LocalAgentHandle {
             elapsed_ms = tracing::field::Empty,
             error = tracing::field::Empty,
         );
-        // Record the outcome before followers can acquire the gate; otherwise
-        // the next failed attempt can race ahead of its predecessor's cooldown.
-        let _gate = RemoteConnectGate::acquire(&self.remote_connect_gates, session_id).await;
+        let gate = RemoteConnectGate::acquire(&self.remote_connect_gates, session_id).await;
+        let mut scope = Some(ConnectScope {
+            session_id: session_id.to_string(),
+            started,
+            span: span.clone(),
+            cooldowns: self.remote_connect_cooldowns.clone(),
+            gate,
+        });
         let result = self
-            .connect_remote_session_gated(session_id, options)
-            .instrument(span.clone())
+            .connect_remote_session_gated(session_id, options, &mut scope)
+            .instrument(span)
             .await;
-        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
-        self.record_connect_outcome(session_id, &result);
-        match &result {
-            Ok(connected) => {
-                span.record("outcome", connected.outcome.as_str());
-                span.record("attachment_id", connected.attachment_id);
-            }
-            Err(err) => {
-                span.record("error", err.code());
-            }
+        // Still ours unless the commit task took it over and finished it.
+        if let Some(scope) = scope {
+            scope.finish(&result);
         }
         result
     }
@@ -751,39 +814,14 @@ impl LocalAgentHandle {
         })
     }
 
-    /// Success clears the cooldown; transport-level failures extend it.
-    fn record_connect_outcome(
-        &self,
-        session_id: &str,
-        result: &Result<ConnectedRemoteSession, RemoteSessionConnectError>,
-    ) {
-        let mut cooldowns = self.remote_connect_cooldowns.lock();
-        match result {
-            Ok(connected) if connected.outcome != RemoteConnectOutcome::Reused => {
-                cooldowns.remove(session_id);
-            }
-            Err(error) if error.counts_toward_cooldown() => {
-                let failures = cooldowns
-                    .get(session_id)
-                    .map_or(1, |state| state.failures.saturating_add(1));
-                cooldowns.insert(
-                    session_id.to_string(),
-                    ConnectCooldown {
-                        failures,
-                        failed_at: Instant::now(),
-                        wait: connect_cooldown_wait(failures),
-                        owner_unreachable: error.owner_unreachable(),
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
+    /// The recovery behind the gate. `scope` is taken (and finished by the
+    /// commit task) when an attachment is committed; otherwise the caller
+    /// finishes it with this result.
     async fn connect_remote_session_gated(
         &self,
         session_id: &str,
         mut options: RemoteConnectOptions<'_>,
+        scope: &mut Option<ConnectScope>,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         use crate::session::location::{SessionLocation, resolve_session_location};
         let store = self.config.provider.history_store();
@@ -940,7 +978,10 @@ impl LocalAgentHandle {
                 Err(RemoteSessionConnectError::AccessDenied)
             }
             Ok(Err(error)) => Err(error),
-            Ok(Ok(verified)) => self.commit_remote_attachment(session_id, verified).await,
+            Ok(Ok(verified)) => {
+                self.commit_remote_attachment(session_id, verified, scope.take())
+                    .await
+            }
             Err(_) => {
                 // The budget cancelled the recovery future. Any candidate it
                 // had already prepared is parked in the slot: abort it
@@ -1365,13 +1406,22 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
         verified: VerifiedRemoteAttachment,
+        scope: Option<ConnectScope>,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
-        let task = tokio::spawn(Self::commit_verified_attachment(
-            self.registry.clone(),
-            session_id.to_string(),
-            verified,
-        ));
+        // The task is part of this connect, so it keeps the connect span as
+        // its parent; the long-running backfill it starts opens its own.
+        let task = tokio::spawn(
+            Self::commit_verified_attachment(
+                self.registry.clone(),
+                session_id.to_string(),
+                verified,
+                scope,
+            )
+            .in_current_span(),
+        );
         task.await.unwrap_or_else(|error| {
+            // The task died before finishing its scope; dropping it released
+            // the gate, and the failure is reported to this caller only.
             Err(RemoteSessionConnectError::RecoveryFailed {
                 transport: None,
                 message: format!("attachment commit task failed: {error}"),
@@ -1387,8 +1437,25 @@ impl LocalAgentHandle {
         >,
         session_id: String,
         verified: VerifiedRemoteAttachment,
+        scope: Option<ConnectScope>,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
-        let session_id = session_id.as_str();
+        let result = Self::install_verified_attachment(registry, &session_id, verified).await;
+        // Even when the caller is gone: record the outcome, then release the
+        // gate, so a connect that was waiting on it sees the installed
+        // generation instead of racing the commit.
+        if let Some(scope) = scope {
+            scope.finish(&result);
+        }
+        result
+    }
+
+    async fn install_verified_attachment(
+        registry: std::sync::Arc<
+            tokio::sync::Mutex<crate::agent::session_registry::SessionRegistry>,
+        >,
+        session_id: &str,
+        verified: VerifiedRemoteAttachment,
+    ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         let VerifiedRemoteAttachment {
             prepared,
             expected_attachment_id,
@@ -1432,23 +1499,23 @@ impl LocalAgentHandle {
         // established during prepare, so newly generated events cannot be
         // lost; historical pages after the last persisted source cursor are
         // recovered with overlap-safe deduplication. Spawn-and-forget so
-        // connect latency never waits on backfill volume.
+        // connect latency never waits on backfill volume. It is not
+        // instrumented with the connect span: it outlives the connect and
+        // opens its own `remote.session.sync` root span.
         //
         // The sync is registered before the spawn so a load racing the task
         // start still waits on the barrier (see `RemoteSyncState::wait_synced`).
         let sync_guard = backfill_sink
             .remote_sync(session_id, &bookmark.node_id)
             .begin_sync();
-        tokio::spawn(
-            crate::agent::remote::event_backfill::RemoteSync::new(
-                backfill_sink,
-                session_ref.clone(),
-                session_id,
-                &bookmark.node_id,
-                &bookmark.peer_label,
-            )
-            .backfill(attachment_id, sync_cursor, windowed, Some(sync_guard)),
+        let backfill = crate::agent::remote::event_backfill::RemoteSync::new(
+            backfill_sink,
+            session_ref.clone(),
+            session_id,
+            &bookmark.node_id,
+            &bookmark.peer_label,
         );
+        tokio::spawn(backfill.backfill(attachment_id, sync_cursor, windowed, Some(sync_guard)));
 
         if let Some(old) = old {
             crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
@@ -1548,11 +1615,23 @@ impl LocalAgentHandle {
                 &bookmark.peer_label,
             );
             sync.open(windowed).await?;
-            tokio::spawn(async move {
-                if let Err(error) = sync.fill().await {
-                    tracing::warn!(%error, "background history fill failed");
+            // The fill outlives this load: a root span of its own, linked to
+            // the load that started it instead of keeping the load's span open.
+            let fill_span = tracing::info_span!(
+                parent: None,
+                "remote.session.fill",
+                session_id,
+                node_id = bookmark.node_id.as_str(),
+            );
+            fill_span.follows_from(tracing::Span::current());
+            tokio::spawn(
+                async move {
+                    if let Err(error) = sync.fill().await {
+                        tracing::warn!(%error, "background history fill failed");
+                    }
                 }
-            });
+                .instrument(fill_span),
+            );
         }
         state.wait_synced().await;
         if connected.outcome != RemoteConnectOutcome::Reused {
@@ -1970,14 +2049,15 @@ mod tests {
                 .is_ok()
         );
 
-        handle.record_connect_outcome("s1", &node_unavailable());
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &node_unavailable());
         let err = handle
             .check_connect_cooldown("s1", RemoteConnectReason::Open)
             .unwrap_err();
         assert_eq!(err.code(), "remote_connect_cooling_down");
         assert!(err.owner_unreachable());
 
-        handle.record_connect_outcome(
+        record_connect_outcome(
+            &handle.remote_connect_cooldowns,
             "s1",
             &Err(RemoteSessionConnectError::RecoveryFailed {
                 transport: None,
@@ -2000,9 +2080,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn consecutive_failures_extend_the_cooldown() {
         let (handle, _storage, _tmp) = handle_with_real_storage().await;
-        handle.record_connect_outcome("s1", &node_unavailable());
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &node_unavailable());
         let first = handle.remote_connect_cooldowns.lock()["s1"];
-        handle.record_connect_outcome("s1", &node_unavailable());
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &node_unavailable());
         let second = handle.remote_connect_cooldowns.lock()["s1"];
         assert_eq!(first.failures, 1);
         assert_eq!(second.failures, 2);
@@ -2012,7 +2092,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn structural_errors_do_not_start_a_cooldown() {
         let (handle, _storage, _tmp) = handle_with_real_storage().await;
-        handle.record_connect_outcome(
+        record_connect_outcome(
+            &handle.remote_connect_cooldowns,
             "s1",
             &Err(RemoteSessionConnectError::BookmarkMissing {
                 session_id: "s1".into(),
@@ -2051,7 +2132,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reused_attachment_preserves_failure_cooldown() {
         let (handle, _storage, _tmp) = handle_with_real_storage().await;
-        handle.record_connect_outcome("s1", &node_unavailable());
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &node_unavailable());
         let before = handle.remote_connect_cooldowns.lock()["s1"];
         let actor = SessionActor::spawn(SessionActor::new(
             handle.config.clone(),
@@ -2068,7 +2149,7 @@ mod tests {
             bookmark: None,
             outcome: RemoteConnectOutcome::Reused,
         });
-        handle.record_connect_outcome("s1", &result);
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &result);
         let after = handle.remote_connect_cooldowns.lock()["s1"];
         assert_eq!(after.failures, before.failures);
         assert_eq!(after.failed_at, before.failed_at);
@@ -2082,9 +2163,9 @@ mod tests {
             RemoteConnectOutcome::Resumed,
             RemoteConnectOutcome::Reattached,
         ] {
-            handle.record_connect_outcome("s1", &node_unavailable());
+            record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &node_unavailable());
             result.as_mut().unwrap().outcome = outcome;
-            handle.record_connect_outcome("s1", &result);
+            record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &result);
             assert!(handle.remote_connect_cooldowns.lock().is_empty());
         }
         actor.kill();
@@ -2124,7 +2205,7 @@ mod tests {
             bookmark: None,
             outcome: RemoteConnectOutcome::Resumed,
         });
-        handle.record_connect_outcome("s1", &ok);
+        record_connect_outcome(&handle.remote_connect_cooldowns, "s1", &ok);
         assert!(handle.remote_connect_cooldowns.lock().is_empty());
     }
 
@@ -2416,7 +2497,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("candidate verification failed: {error}"));
         let attached = handle
-            .commit_remote_attachment(session_id, attached)
+            .commit_remote_attachment(session_id, attached, None)
             .await
             .unwrap();
         let other_actor = SessionActor::spawn(
@@ -2516,7 +2597,7 @@ mod tests {
         let guard = handle.registry.lock().await;
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
-            handle.commit_remote_attachment(session_id, verified),
+            handle.commit_remote_attachment(session_id, verified, None),
         )
         .await;
         assert!(cancelled.is_err(), "the commit must be blocked on the lock");
@@ -2541,6 +2622,237 @@ mod tests {
             installed.is_ok(),
             "the detached commit installs the verified attachment"
         );
+    }
+
+    /// A verified candidate for a fresh actor of `session_id` on the test mesh.
+    async fn verified_candidate(
+        handle: &LocalAgentHandle,
+        mesh: &crate::agent::remote::MeshHandle,
+        session_id: &str,
+    ) -> VerifiedRemoteAttachment {
+        let actor = SessionActor::spawn(
+            SessionActor::new(
+                handle.config.clone(),
+                session_id.into(),
+                SessionRuntime::new(
+                    None,
+                    Default::default(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            )
+            .with_mesh(Some(mesh.clone())),
+        );
+        let remote = actor.clone().into_remote_ref().await;
+        let bookmark = test_bookmark(session_id, &mesh.peer_id().to_string());
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        handle
+            .attach_and_verify_remote(
+                session_id,
+                LocatedRemoteActor {
+                    remote_ref: remote,
+                    preferred_scope: None,
+                    outcome: RemoteConnectOutcome::Reattached,
+                },
+                &bookmark,
+                &slot,
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("candidate verification failed: {error}"))
+    }
+
+    /// A caller cancelled while its commit waits for the registry lock must
+    /// not free the session's gate: a connect racing the commit would reuse
+    /// or replace the generation being installed. The detached commit
+    /// records the outcome, then releases the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_commit_keeps_the_gate_until_installed() {
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let session_id = "commit-gate";
+        let verified = verified_candidate(&handle, &mesh, session_id).await;
+        let attachment_id = verified.prepared.attachment_id();
+
+        // A failure recorded earlier; a committed attachment clears it.
+        handle.remote_connect_cooldowns.lock().insert(
+            session_id.to_string(),
+            ConnectCooldown {
+                failures: 1,
+                failed_at: Instant::now(),
+                wait: Duration::from_secs(60),
+                owner_unreachable: true,
+            },
+        );
+        let gate = RemoteConnectGate::acquire(&handle.remote_connect_gates, session_id).await;
+        let scope = ConnectScope {
+            session_id: session_id.to_string(),
+            started: Instant::now(),
+            span: tracing::Span::none(),
+            cooldowns: handle.remote_connect_cooldowns.clone(),
+            gate,
+        };
+
+        let registry_guard = handle.registry.lock().await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.commit_remote_attachment(session_id, verified, Some(scope)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the commit must be blocked on the lock");
+
+        // The caller is gone, the commit is pending: the gate stays held and
+        // the outcome is not recorded yet.
+        let raced = tokio::time::timeout(
+            Duration::from_millis(100),
+            RemoteConnectGate::acquire(&handle.remote_connect_gates, session_id),
+        )
+        .await;
+        assert!(raced.is_err(), "the gate must outlive the cancelled caller");
+        assert!(
+            handle
+                .remote_connect_cooldowns
+                .lock()
+                .contains_key(session_id)
+        );
+        drop(registry_guard);
+
+        // The commit finishes: attachment installed, cooldown cleared, gate free.
+        let _gate = tokio::time::timeout(
+            Duration::from_secs(5),
+            RemoteConnectGate::acquire(&handle.remote_connect_gates, session_id),
+        )
+        .await
+        .expect("the commit releases the gate when it is done");
+        assert_eq!(
+            handle
+                .registry
+                .lock()
+                .await
+                .remote_attachment_id(session_id),
+            Some(attachment_id),
+            "a connect that waited on the gate sees the installed generation"
+        );
+        assert!(
+            !handle
+                .remote_connect_cooldowns
+                .lock()
+                .contains_key(session_id),
+            "the detached commit records the outcome"
+        );
+    }
+
+    /// The remote attach path must fit a 2 MiB thread stack in an unoptimized
+    /// build, where every `.await` in an `async fn` gets its own stack slot
+    /// and a `match` over awaited handlers sums them (the extension dispatcher
+    /// once reached 673 KiB, overflowing on this path). Release builds
+    /// overlap those slots, so only debug builds can regress; the test is
+    /// gated accordingly. It drives the request on a dedicated thread, as
+    /// the stdio / WebSocket transports do for their workers.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_attach_fits_a_small_thread_stack() {
+        const STACK_BYTES: usize = 2 * 1024 * 1024;
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let session_id = "stack-guard";
+        // An installed attachment plus its saved bookmark: the attach then
+        // takes the connect + load path end to end.
+        let verified = verified_candidate(&handle, &mesh, session_id).await;
+        handle
+            .commit_remote_attachment(session_id, verified, None)
+            .await
+            .unwrap();
+
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "node_id": mesh.peer_id().to_string(),
+        });
+        let request = ExtRequest::new(
+            "querymt/remote/attachSession",
+            Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
+        );
+        let runtime = tokio::runtime::Handle::current();
+        let outcome = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("small-stack-attach".into())
+                .stack_size(STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    runtime.block_on(handle.handle_ext_method(request))
+                })
+                .expect("spawn small-stack thread")
+                .join()
+        });
+        // A stack overflow aborts the process before reaching this point. The
+        // attach itself fails here (the test mesh does not publish the owner),
+        // which is fine: the extension dispatcher frame, the largest of the
+        // regression, is on the stack whatever the outcome. Measured: this
+        // passes down to 256 KiB and aborts at 128 KiB.
+        let _attach_result = outcome.expect("the attach thread must not panic");
+    }
+
+    /// Records each new span's name and its parent's name.
+    type SpanAndParent = (String, Option<String>);
+
+    #[derive(Clone, Default)]
+    struct SpanParents(Arc<parking_lot::Mutex<Vec<SpanAndParent>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for SpanParents
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let parent = ctx
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.name().to_string());
+            self.0
+                .lock()
+                .push((attrs.metadata().name().to_string(), parent));
+        }
+    }
+
+    /// The detached commit is part of the connect: its span stays a child of
+    /// the connect span instead of becoming a root.
+    #[tokio::test]
+    async fn commit_task_inherits_the_connect_span() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let spans = SpanParents::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let session_id = "commit-span";
+        let verified = verified_candidate(&handle, &mesh, session_id).await;
+
+        let connect = tracing::info_span!("remote.session.connect");
+        handle
+            .commit_remote_attachment(session_id, verified, None)
+            .instrument(connect)
+            .await
+            .unwrap();
+
+        let recorded = spans.0.lock().clone();
+        let commit = recorded
+            .iter()
+            .find(|(name, _)| name == "remote.session.attach.commit")
+            .unwrap_or_else(|| panic!("commit span not recorded: {recorded:?}"));
+        assert_eq!(commit.1.as_deref(), Some("remote.session.connect"));
     }
 
     #[tokio::test]
