@@ -119,15 +119,21 @@ jobs:
       - name: Create coverage directory
         run: mkdir -p ./coverage
 
+      # The film tests render through GPUI's headless wgpu renderer, which needs
+      # a Vulkan device. The runner has no GPU, so it relies on lavapipe (Mesa's
+      # software Vulkan driver, from mesa-vulkan-drivers). The loader finds it on
+      # its own; do not pin it with VK_DRIVER_FILES, the ICD file name differs
+      # between Ubuntu releases and a wrong path leaves the loader no driver.
+      - name: Check the software Vulkan driver (lavapipe)
+        run: |
+          sudo apt-get install -y vulkan-tools
+          ls /usr/share/vulkan/icd.d/
+          vulkaninfo --summary | grep -i llvmpipe
+
       # The crate is a single binary: its unit tests live in the bin target.
       - name: Run tests with coverage
         env:
           NEXTEST_PROFILE: ci
-          # The film tests render through GPUI's headless wgpu renderer, which
-          # needs a Vulkan device; the runner has no GPU, so use lavapipe
-          # (Mesa's software Vulkan driver, from mesa-vulkan-drivers).
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           cargo llvm-cov nextest \
             --locked \
