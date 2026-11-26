@@ -22,16 +22,16 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 # this app in the same pull request (the tests replay its golden cases).
 querymt-agent-session-core = { path = "../agent-session-core" }
 async-channel = "2"
-futures = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 similar = "2"
 qrcode = { version = "0.14", default-features = false }
 # Already built for gpui-kit's TextView; used to turn markdown into plain text.
 markdown = "1.0.0"
 # Instrumentation; spans and events cost nothing without a subscriber.
-tracing = "0.1"
+tracing.workspace = true
 # The system time zone, default of the automation time zone picker.
 iana-time-zone = "0.1"
 # Fuzzy, typo-tolerant matching behind every search box (src/search.rs).
@@ -39,22 +39,22 @@ frizbee = "0.13"
 limu = "~0.2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-dirs = "6"
+dirs.workspace = true
 # Native WebSocket client (ws:// and wss://) on a background thread.
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # OpenTelemetry export, same stack and versions as querymt-utils::telemetry.
 # OTLP over gRPC (tonic), as QueryMT exports.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace", "logs", "metrics"] }
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["logs", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace", "logs", "metrics"] }
 tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
 # Runs the tonic gRPC channel; the UI itself does not use Tokio.
 tokio = { version = "1", features = ["rt-multi-thread"] }
-opentelemetry-appender-tracing = "0.32"
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-appender-tracing = "0.33"
+opentelemetry-semantic-conventions = "0.33"
 # Quick panel (desktop only): the global shortcut on macOS, Windows and X11,
 # the tray icon, and the local socket a second instance forwards `--quick` over.
 global-hotkey = "0.10"
@@ -111,7 +111,7 @@ gpui-kit = { version = "0.11.0", features = ["test-support"] }
 querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
 
 [build-dependencies]
-dirs = "6"
+dirs.workspace = true
 sha2 = "0.10"
 tempfile = "3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
