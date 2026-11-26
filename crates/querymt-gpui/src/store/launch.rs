@@ -542,6 +542,31 @@ pub(crate) fn models_fixture(bulk: usize) -> AgentsStore {
     store
 }
 
+/// One WebSocket agent `test-agent` at `address` (`host:port`), not connected
+/// yet, and nothing read from or written to the user's saved state (unlike
+/// `AgentsStore::new`). The film spike seeds sessions and models from it.
+#[cfg(test)]
+pub(crate) fn websocket_fixture(address: &str) -> AgentsStore {
+    let (address, secure) = super::normalize_address(address).expect("a host:port address");
+    AgentsStore {
+        configs: vec![super::AgentConfig {
+            id: "test-agent".into(),
+            name: address.clone(),
+            endpoint: super::Endpoint::WebSocket { address, secure },
+            auto_start: false,
+            host_managed: false,
+        }],
+        prefs: Default::default(),
+        launch: Default::default(),
+        open_sessions: Default::default(),
+        requests: Vec::new(),
+        runtime: Default::default(),
+        sidebar: Default::default(),
+        early_commands: Default::default(),
+        first_run: false,
+    }
+}
+
 /// Append `models` (wire shape: `id`, `label`, `provider`) to the fixture
 /// agent's catalog, after the ones it has.
 #[cfg(test)]

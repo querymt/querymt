@@ -47,9 +47,9 @@ None. This is test-only developer tooling with no behaviour change, so the chang
 ## Impact
 
 - **Packages:** `querymt-gpui` only (bin target, `#[cfg(test)]` code). No feature flags change code. `querymt-agent-session-core` is used through its existing `test-support` dev-dependency.
-- **Dependencies:** none new expected. Frames are passed to `ffmpeg` as raw RGBA over stdin, and preview PNGs use the `png` crate the app already depends on. `gpui-kit`'s `test-support` (already a dev-dependency) brings `HeadlessAppContext` and `gpui_platform::current_headless_renderer`.
+- **Dependencies:** one macOS-only dev-dependency was needed after all (`gpui-pre-apple =0.3.14`, already in `Cargo.lock`; see design "Spike findings"). Otherwise none. Frames are passed to `ffmpeg` as raw RGBA over stdin, and preview PNGs use the `png` crate the app already depends on. `gpui-kit`'s `test-support` (already a dev-dependency) brings `HeadlessAppContext` and `gpui_platform::current_headless_renderer`.
 - **Tools:** `ffmpeg` on `PATH`, needed only by the ignored film test.
-- **Repository files:** a new `src/film.rs` (test module), `src/main.rs` (one `#[cfg(test)] mod film;` line), `knowledge/development.md`.
+- **Repository files:** a new `src/film.rs` (test module), `src/main.rs` (one `#[cfg(test)] mod film;` line and `install_fonts` made `pub(crate)`), `src/ui/mod.rs` and `src/store/launch.rs` (`#[cfg(test)]` helpers), `Cargo.toml` and `Cargo.lock` (the dev-dependency), `knowledge/development.md`.
 - **Special builds:** none. wasm32 and release builds compile no film code.
 - **CI:** unchanged. `cargo t-gpui` skips the ignored test.
 - **querymt-desktop:** no UI follow-up.

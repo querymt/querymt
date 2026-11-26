@@ -110,6 +110,12 @@ gpui-kit = { version = "0.11.0", features = ["test-support"] }
 # instead of storing trace files.
 querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The film spike (src/film.rs) needs the CoreText text system without a
+# `MacPlatform`, which only exists on the process main thread, and a test
+# thread is not. Same version gpui-kit already builds.
+gpui-pre-apple = "=0.3.14"
+
 [build-dependencies]
 dirs.workspace = true
 sha2 = "0.10"
