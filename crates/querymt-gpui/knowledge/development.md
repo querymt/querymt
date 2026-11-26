@@ -1,9 +1,9 @@
 ---
 id: gpui-development
 title: Building, testing and changing querymt-gpui
-description: Build targets (native, wasm, Nix), where tests live and how CI runs them, golden files, the in-workspace session core, fonts, release packaging and the OpenSpec change workflow.
-tags: build, test, ci, nextest, clippy, wasm, web, nix, golden, fonts, session core, release, packaging, openspec, workflow
-knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/src/film/*.rs", "crates/querymt-gpui/film/scenes/*.toml", "demos/README.md", "demos/film.sh", "demos/build.mjs", "demos/clips/*/scene.toml"]
+description: Build targets (native, wasm, Nix), where tests live and how CI runs them, hot-patching the UI under dx, golden files, the in-workspace session core, fonts, release packaging and the OpenSpec change workflow.
+tags: build, test, ci, nextest, clippy, wasm, web, nix, hot-patch, hot reload, dx, subsecond, golden, fonts, session core, release, packaging, openspec, workflow
+knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", "crates/querymt-gpui/scripts/hot-patch.sh", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/src/film/*.rs", "crates/querymt-gpui/film/scenes/*.toml", "demos/README.md", "demos/film.sh", "demos/build.mjs", "demos/clips/*/scene.toml"]
 knowledge_sources: ["crates/querymt-gpui/Cargo.toml", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/web/build.sh"]
 ---
 
@@ -53,6 +53,85 @@ feature gate; the app still runs single-threaded), then `wasm-bindgen` and, for 
 (`--profile release-gpui-web`), `wasm-opt`. The `wasm-bindgen` CLI in the root `flake.nix`
 and in the CI workflows must match the `wasm-bindgen` version pinned in the workspace
 `Cargo.lock`. Icons used on the web must be listed in `icon_assets!` in `src/main.rs`.
+
+## Hot-patching the UI
+
+For trying out UI ideas without restarting: an edit to a render function under `src/ui/`
+shows up in the running window in about 2 to 3 seconds, and the open session, scroll
+position and connection stay. It is opt-in developer tooling for debug native builds. The
+`hot-patch` cargo feature switches on GPUI's `hot-reload` (an optional direct dependency
+on `gpui-pre`, which only carries the feature), and the Dioxus CLI (`dx serve --hot-patch`,
+the `subsecond` runtime) builds each patch and sends it to the app. Default, CI, release and
+wasm builds do not include any of it.
+
+Install the Dioxus CLI, exactly version 0.7.10 (the version of `subsecond` that `gpui-pre`
+0.3.14 uses):
+
+```bash
+cargo binstall dioxus-cli@0.7.10        # or: cargo install dioxus-cli@0.7.10 --locked
+```
+
+A bare `dx` on `PATH` can be another tool (Deno installs a `dx`). The script therefore uses
+`$QMT_DX`, else `~/.cargo/bin/dx`, and exits with the install hint if that is not 0.7.10.
+
+Run it from the repository root; arguments go to the app, like `cargo r-gpui`:
+
+```bash
+crates/querymt-gpui/scripts/hot-patch.sh
+crates/querymt-gpui/scripts/hot-patch.sh --agent 127.0.0.1:42069 --page sessions
+```
+
+Things the script does that are easy to trip over:
+
+- `dx serve` takes the app arguments as one `--args=...` string, so an argument with a space
+  is refused.
+- It touches `src/main.rs` first. dx records the crate's linker arguments while cargo
+  compiles it; if cargo finds the crate up to date, dx stops with `Missing linker args for
+  fat link of 'querymt_gpui'`.
+- dx builds into `target/desktop-dev`, not `target/debug`, so `cargo clean -p querymt-gpui`
+  does not clear it.
+- `RUSTC_WRAPPER=sccache` makes no difference (dx's builds are incremental, which sccache
+  does not cache); the script leaves it alone.
+- Killing `dx serve` leaves the app window running: quit both.
+
+Speed, measured on an Apple Silicon Mac with the default `dev` profile: from the script to
+the app's first frame about 14 s when only the crate's changes are rebuilt (the build 5 s)
+and about 22 s with the crate's artifacts removed (the build 13 s); the first ever build,
+with no dependencies built, took about a minute. A patch
+takes 2 s for a padding change, 3 s for a new element with a handler, and the window
+updates when dx prints `Hot-patching: <file> took <N>ms`. The app does not log GPUI's
+`GPUI hot reload connected` line (it has no `log` bridge), so that line never shows;
+`lsof -nP -a -p <app pid> -iTCP` lists a connection to dx's port (8080 by default) when it
+is connected.
+
+What patches and what needs a restart (tried on macOS with a session open):
+
+| Change | Result |
+|---|---|
+| Body of a function reached from a render (`src/ui/**`) | Patched, 2 to 3 s, session kept. |
+| A handler closure built in a render | Patched; the new handler runs on the next click. |
+| A field added to a long-lived struct (`SessionPane`) | The app panicked (`cannot read SessionPane while it is already being updated`, exit 101) and the session was lost. Restart after changing a struct or enum that live state holds. |
+| Key bindings (`src/ui/keys.rs`) | The patch applies, but the old binding keeps working and the new one does nothing. Anything registered once at startup needs a restart. |
+| Code outside this crate (`crates/agent-session-core`, gpui-kit) | Not patched: dx reports `Missing rustc args for replay` and the app is unchanged. dx then refuses every later patch, including edits in this crate, so restart `hot-patch.sh`. |
+| Mermaid diagrams | Still drawn after a patch and after scrolling away and back. |
+| Code blocks | A change to their style (`src/ui/md.rs`, `styled`: border, radius, text size) shows at once in the open session and reverts the same way. They are still drawn with their syntax colours after other patches. |
+| The quick panel (`src/quick/`) | Opens and looks right after a patch, and a patch to its own code (`src/quick/panel.rs`) shows when it is reopened. Not tried: patching while it is open, and the global hotkey. See below to run it next to another copy of the app. |
+
+To try the quick panel while another copy of the app is running (that copy holds the global
+hotkey and the `--quick` socket), give the dev copy its own socket name, which comes from `$USER`,
+and forward `--quick` to it yourself. The dev copy then does not register the hotkey:
+
+```bash
+USER=hpqp crates/querymt-gpui/scripts/hot-patch.sh
+USER=hpqp target/dx/querymt-gpui/debug/macos/QuerymtGpui.app/Contents/MacOS/querymt-gpui --quick
+```
+
+Keeping it working: `gpui-pre = "=0.3.14"` in `Cargo.toml` must equal the version
+gpui-kit builds, and the Dioxus CLI version in `scripts/hot-patch.sh` must equal that
+`gpui-pre`'s `subsecond`. When gpui-kit is bumped, run
+`cargo check -p querymt-gpui --features hot-patch`; a version conflict means both pins move.
+CI does not build with this feature. If gpui-kit gains its own `hot-reload` feature, use it
+instead of the direct dependency. Background: the OpenSpec change `add-gpui-hot-patch`.
 
 ## Fonts
 

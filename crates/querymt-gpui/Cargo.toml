@@ -10,6 +10,12 @@ publish = false
 name = "querymt-gpui"
 path = "src/main.rs"
 
+[features]
+# Opt-in developer tooling: Rust hot-patching of the UI under `dx serve`
+# (scripts/hot-patch.sh). Debug native builds only; see the OpenSpec change
+# `add-gpui-hot-patch` and knowledge/development.md.
+hot-patch = ["dep:gpui-pre"]
+
 [dependencies]
 # gpui-kit pins a matching GPUI snapshot and re-exports gpui, gpui-base,
 # gpui-component and the Lucide icon assets, keeping their versions in sync.
@@ -40,6 +46,11 @@ limu = "~0.2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dirs.workspace = true
+# Only carries the `hot-reload` feature (`hot-patch` above): Cargo unifies
+# features per package, so it switches on hot-reload in the same GPUI that
+# gpui-kit builds. No source refers to it. Keep the `=` pin equal to gpui-kit's
+# `gpui-pre` pin (gpui-kit 0.11.0 -> 0.3.14), and bump both together.
+gpui-pre = { version = "=0.3.14", optional = true, features = ["hot-reload"] }
 # Native WebSocket client (ws:// and wss://) on a background thread.
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
