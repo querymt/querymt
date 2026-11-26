@@ -116,6 +116,12 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 # Wayland shortcuts go through the GlobalShortcuts portal. Only the feature is
 # added: gpui-base already selects the async runtime of the crate.
 ashpd = { version = "0.13", default-features = false, features = ["global_shortcuts"] }
+# Forward tray activation tokens to GPUI's existing Wayland surface. These
+# crates are already built by tray-icon and GPUI.
+ksni = { version = "0.3.7", default-features = false }
+raw-window-handle = "0.6"
+wayland-client = { version = "0.31.15", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # Must match the wasm-bindgen CLI version in flake.nix exactly.

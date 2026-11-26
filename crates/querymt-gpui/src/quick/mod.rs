@@ -41,7 +41,7 @@ pub(crate) enum Signal {
     /// Show the panel, or close it when it is open.
     TogglePanel,
     /// Bring the main window forward, reopening it when closed.
-    OpenMain,
+    OpenMain { activation_token: Option<String> },
     /// End the app.
     Quit,
     /// The portal answered a request to bind `shortcut`.
@@ -224,7 +224,7 @@ impl QuickHost {
     fn on_signal(&mut self, signal: Signal, cx: &mut Context<Self>) {
         match signal {
             Signal::TogglePanel => self.toggle(cx),
-            Signal::OpenMain => self.show_main(cx),
+            Signal::OpenMain { activation_token } => self.show_main(activation_token, cx),
             Signal::Quit => cx.quit(),
             #[cfg(target_os = "linux")]
             Signal::PortalBound { shortcut, result } => {
@@ -330,7 +330,7 @@ impl QuickHost {
     }
 
     /// Bring the main window forward, reopening it when it was closed.
-    pub(crate) fn show_main(&mut self, cx: &mut Context<Self>) {
+    fn show_main(&mut self, activation_token: Option<String>, cx: &mut Context<Self>) {
         let window = match self.live_main(cx) {
             Some((window, _)) => window,
             None => match crate::ui::open_main_window(&self.store, cx) {
@@ -345,7 +345,9 @@ impl QuickHost {
                 }
             },
         };
-        let _ = window.update(cx, |_, window, _| window.activate_window());
+        let _ = window.update(cx, |_, window, _| {
+            tray::activate_window(window, activation_token)
+        });
         cx.activate(true);
     }
 

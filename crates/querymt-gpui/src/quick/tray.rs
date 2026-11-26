@@ -43,7 +43,13 @@ impl Tray {
             (open.id().clone(), quick.id().clone(), quit.id().clone());
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let signal = if *event.id() == open_id {
-                Signal::OpenMain
+                Signal::OpenMain {
+                    // ksni only exposes the token while handling this click.
+                    #[cfg(target_os = "linux")]
+                    activation_token: ksni::current_xdg_activation_token(),
+                    #[cfg(not(target_os = "linux"))]
+                    activation_token: None,
+                }
             } else if *event.id() == quick_id {
                 Signal::TogglePanel
             } else if *event.id() == quit_id {
@@ -62,6 +68,82 @@ impl Tray {
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self { _icon: tray })
+    }
+}
+
+pub(super) fn activate_window(window: &gpui_kit::Window, activation_token: Option<String>) {
+    #[cfg(target_os = "linux")]
+    if let Some(token) = activation_token.filter(|token| !token.is_empty()) {
+        match wayland::activate(window, token) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => tracing::debug!(%error, "could not use the tray activation token"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = activation_token;
+    window.activate_window();
+}
+
+#[cfg(target_os = "linux")]
+mod wayland {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use wayland_client::backend::{Backend, ObjectId};
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
+    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::{
+        Request, XdgActivationV1,
+    };
+
+    struct Activation;
+    delegate_noop!(Activation: ignore XdgActivationV1);
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Activation {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    pub(super) fn activate(window: &gpui_kit::Window, token: String) -> Result<bool, String> {
+        let (Ok(display), Ok(surface)) = (
+            window.display_handle(),
+            HasWindowHandle::window_handle(window),
+        ) else {
+            return Ok(false);
+        };
+        let (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(surface)) =
+            (display.as_raw(), surface.as_raw())
+        else {
+            return Ok(false);
+        };
+
+        // SAFETY: GPUI lends both handles for the lifetime of this window borrow.
+        // The temporary backend uses its own event queue without owning the display;
+        // neither the backend nor the imported surface escapes this call.
+        let (connection, surface_id) = unsafe {
+            let backend = Backend::from_foreign_display(display.display.as_ptr().cast());
+            let id = ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast());
+            (Connection::from_backend(backend), id)
+        };
+        let surface = WlSurface::from_id(&connection, surface_id.map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let (globals, queue) =
+            registry_queue_init::<Activation>(&connection).map_err(|e| e.to_string())?;
+        let activation = globals.bind::<XdgActivationV1, _, _>(&queue.handle(), 1..=1, ());
+        globals.destroy();
+        let activation = activation.map_err(|e| e.to_string())?;
+        let sent = activation.send_request(Request::Activate { token, surface });
+        activation.destroy();
+        connection.flush().map_err(|e| e.to_string())?;
+        sent.map_err(|e| e.to_string())?;
+        Ok(true)
     }
 }
 
