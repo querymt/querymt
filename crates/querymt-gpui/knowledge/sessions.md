@@ -3,8 +3,8 @@ id: gpui-sessions
 title: Open sessions, the session core and the transcript projection
 description: How a conversation is held open (OpenSession, SessionKey, the store's weak hub), how agent inputs reach SessionCore and are projected into transcript Items, batching, background hydration, the single prompt path and steer/queue delivery.
 tags: session, open session, transcript, projection, reducer, session core, overlay, prompt, steer, queue, flush, hydration, lifetime, undo, fork
-knowledge_paths: ["src/session.rs", "src/session/*.rs", "src/ui/session_pane.rs"]
-knowledge_sources: ["src/session/open.rs", "src/session/view.rs", "src/session/projection.rs", "src/session/overlay.rs", "src/store.rs#AgentsStore::open"]
+knowledge_paths: ["crates/querymt-gpui/src/session.rs", "crates/querymt-gpui/src/session/*.rs", "crates/querymt-gpui/src/ui/session_pane.rs"]
+knowledge_sources: ["crates/querymt-gpui/src/session/open.rs", "crates/querymt-gpui/src/session/view.rs", "crates/querymt-gpui/src/session/projection.rs", "crates/querymt-gpui/src/session/overlay.rs", "crates/querymt-gpui/src/store.rs#AgentsStore::open"]
 ---
 
 # Open sessions, the session core and the transcript projection
