@@ -71,7 +71,7 @@ flowchart BT
 - `querymt-agent-session-core` depends only on protocol-types, serde and serde_json.
 - **Workspace hack.** `querymt-agent-protocol-types`, `querymt-agent-session-core` and `querymt-agent-session-core-wasm` go under hakari `[final-excludes]`, like `querymt`. They still count for feature unification but never get the `querymt-workspace-hack` dependency, so their closure has no tokio or rusqlite on any target and is the same when built from another workspace.
   - Dev-dependencies, crate-local: `proptest` (new, `default-features = false, features = ["std"]`) and `criterion = "0.8"` (already in the lockfile, without `async_tokio`).
-- `querymt-agent-session-core-wasm` depends on session-core and `wasm-bindgen = "=0.2.129"` (the version already locked). The pin keeps the generated JS glue in step with `wasm-bindgen-cli`.
+- `querymt-agent-session-core-wasm` depends on session-core and `wasm-bindgen = "=0.2.130"` (the version already locked). The pin keeps the generated JS glue in step with `wasm-bindgen-cli`.
 - Provider crates and their `wasm32-wasip1` builds are untouched. The tasks check one provider build anyway, because `querymt` features change.
 - *Alternative considered:* mirror types inside session-core (option A). Rejected by the user in favour of a real extraction, so drift becomes a compile error.
 
@@ -161,10 +161,10 @@ flowchart BT
   - Then `wasm-bindgen --target web` and `wasm-opt -Os`.
   - `scripts/session-core-wasm/build.sh` runs all three steps and writes `dist/` with `agent_session_core.js`, `agent_session_core_bg.wasm`, `agent_session_core.d.ts` and `metadata.json` (`version`, `commit`, `schema_version`).
 - **Size budget.** The script fails above 600 KiB gzipped and prints the size every time.
-- **Toolchain.** `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target. The flake devShell gains `binaryen` and a `wasm-bindgen-cli` built at 0.2.129, because the cli and library versions must match exactly. CI installs the same pinned cli.
+- **Toolchain.** `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target. The flake devShell gains `binaryen` and a `wasm-bindgen-cli` built at 0.2.130, because the cli and library versions must match exactly. CI installs the same pinned cli.
 
 ### D5a. Native consumers
-- **Dependency.** A client outside the workspace (querymt-gpui) declares `querymt-agent-session-core` as a git dependency pinned to a `rev`. Cargo resolves the crate and its path dependencies from that checkout, including the workspace's `[workspace.dependencies]` entries. The client never depends on the wasm crate, so its own `wasm-bindgen` version does not have to match 0.2.129.
+- **Dependency.** querymt-gpui (crates/querymt-gpui, formerly a separate repository that pinned a git `rev`) depends on `querymt-agent-session-core` by path. It never depends on the wasm crate, but it shares the workspace lock, so both use the same `wasm-bindgen` (0.2.130, pinned exactly by querymt-gpui).
 - **No workspace hack.** Because the three crates are in hakari `[final-excludes]` (D1), the client's tree has no `querymt-workspace-hack`.
 - **Nix.** A client using `rustPlatform.buildRustPackage` adds an `outputHashes` entry for the git source; a rev bump updates it.
 - **Threads.** `SessionCore: Send + 'static`, so a client can hydrate a large snapshot on a background executor and move the result to its UI thread.
