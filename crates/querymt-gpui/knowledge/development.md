@@ -81,7 +81,9 @@ renders the real `QmtApp` offscreen, frame by frame, on GPUI's `HeadlessAppConte
 stepped fake clock, and pipes the frames to `ffmpeg`. A clip is a **scene file** (TOML) read
 at run time, so editing one needs no recompile. The film tests are `#[ignore]`d, so
 `cargo t-gpui` and CI never run them; only the scene, agent, timing and mask unit tests and
-the composer-id test run there.
+the composer-id test run there. That test opens a real (headless) window, so on Linux it needs a
+Vulkan or GL driver; on a machine without a GPU, install Mesa's software Vulkan driver
+(`mesa-vulkan-drivers`, lavapipe), as the CI `test` job does.
 
 ```bash
 QMT_FILM_SCENE=crates/querymt-gpui/film/scenes/smoke.toml \

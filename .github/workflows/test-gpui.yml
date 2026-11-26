@@ -102,7 +102,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
             libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-x11-dev mesa-vulkan-drivers
 
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
@@ -123,6 +123,11 @@ jobs:
       - name: Run tests with coverage
         env:
           NEXTEST_PROFILE: ci
+          # The film tests render through GPUI's headless wgpu renderer, which
+          # needs a Vulkan device; the runner has no GPU, so use lavapipe
+          # (Mesa's software Vulkan driver, from mesa-vulkan-drivers).
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           cargo llvm-cov nextest \
             --locked \
