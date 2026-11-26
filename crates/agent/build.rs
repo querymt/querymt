@@ -1,44 +1,63 @@
 #[cfg(feature = "dashboard")]
-#[path = "build_support/embedded_ui.rs"]
-mod embedded_ui;
-
-#[cfg(feature = "dashboard")]
-fn pinned_ui_revision() -> &'static str {
-    include_str!("embedded-ui-revision").trim()
-}
+#[path = "build_support/gpui_web.rs"]
+mod gpui_web;
 
 fn main() {
     #[cfg(feature = "dashboard")]
     prepare_dashboard();
 }
 
+/// Embeds QueryMT Desktop web (crates/querymt-gpui built for wasm32) for
+/// `qmtcode --dashboard`, or the prebuilt directory named by QMT_UI_DIST.
 #[cfg(feature = "dashboard")]
 fn prepare_dashboard() {
-    println!("cargo:rerun-if-changed=embedded-ui-revision");
-    println!("cargo:rerun-if-env-changed=QMT_UI_DIST");
-    println!("cargo:rerun-if-env-changed=QMT_UI_REVISION");
+    use std::path::{Path, PathBuf};
 
-    let out_dir =
-        std::env::var_os("OUT_DIR").unwrap_or_else(|| panic!("Cargo did not set OUT_DIR"));
-    let ui_dist = std::env::var_os("QMT_UI_DIST");
-    let revision = if ui_dist.is_some() {
-        None
-    } else {
-        match std::env::var("QMT_UI_REVISION") {
-            Ok(revision) => Some(revision),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                panic!("QMT_UI_REVISION must be valid UTF-8")
-            }
-            Err(std::env::VarError::NotPresent) => None,
-        }
+    println!("cargo:rerun-if-env-changed=QMT_UI_DIST");
+    println!("cargo:rerun-if-env-changed=QMT_VERSION");
+
+    let out_dir = PathBuf::from(
+        std::env::var_os("OUT_DIR").unwrap_or_else(|| panic!("Cargo did not set OUT_DIR")),
+    );
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|| panic!("Cargo did not set CARGO_MANIFEST_DIR")),
+    );
+    let workspace_root = manifest_dir
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_dir.join("../.."));
+    let ui_dist = std::env::var_os("QMT_UI_DIST")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let version = std::env::var("QMT_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    let version = version.trim().trim_start_matches('v');
+
+    let bindgen = |wasm: &Path, out: &Path| -> Result<(), String> {
+        let mut bindgen = wasm_bindgen_cli_support::Bindgen::new();
+        bindgen
+            .input_path(wasm)
+            .out_name(gpui_web::OUT_NAME)
+            .typescript(false);
+        bindgen
+            .web(true)
+            .map_err(|err| format!("wasm-bindgen: {err:#}"))?;
+        bindgen
+            .generate(out)
+            .map_err(|err| format!("wasm-bindgen on {}: {err:#}", wasm.display()))
     };
-    let prepared = embedded_ui::prepare_ui(
-        std::path::Path::new(&out_dir),
+
+    let prepared = gpui_web::prepare_ui(
+        &out_dir,
+        &workspace_root,
         ui_dist.as_deref(),
-        revision.as_deref(),
-        pinned_ui_revision(),
+        version,
+        &bindgen,
     )
-    .unwrap_or_else(|err| panic!("failed to prepare embedded UI: {err}"));
+    .unwrap_or_else(|err| panic!("failed to prepare the embedded dashboard UI: {err}"));
 
     for path in prepared.watched_paths {
         println!("cargo:rerun-if-changed={}", path.display());

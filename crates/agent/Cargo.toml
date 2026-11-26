@@ -16,10 +16,11 @@ plugin-host-only = ["agent-mcp", "agent-tracing"]
 plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins", "querymt-agent-runtime/plugin-loaders"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
-# Embeds the pinned querymt-desktop Svelte dashboard served over same-origin ACP.
-# Default source revision is crates/agent/embedded-ui-revision.
-# QMT_UI_DIST and QMT_UI_REVISION optionally override the default source build.
-dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
+# Embeds QueryMT Desktop web (crates/querymt-gpui built for wasm32-unknown-unknown
+# with the release-gpui-web profile) and serves it over same-origin ACP.
+# build.rs builds it in target/querymt-gpui-web; QMT_UI_DIST names a prebuilt UI
+# directory instead (CI test fixture, release artifact).
+dashboard = ["api", "plugin-loaders", "dep:wasm-bindgen-cli-support"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth", "querymt-agent-runtime/oauth"]
 
@@ -88,7 +89,6 @@ dirs.workspace = true
 
 # OpenTelemetry trace context extraction from ACP _meta
 
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
 querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
@@ -97,12 +97,9 @@ name = "querymt_agent"
 path = "src/lib.rs"
 
 [build-dependencies]
-flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
-hex = "0.4"
-serde_json.workspace = true
-sha2 = "0.11"
-tar = { version = "0.4", optional = true, default-features = false }
-ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
+# wasm-bindgen as a library, so the dashboard build needs no wasm-bindgen CLI.
+# Must match the `wasm-bindgen` crate version querymt-gpui pins.
+wasm-bindgen-cli-support = { version = "=0.2.130", optional = true }
 
 [dev-dependencies]
 querymt-agent-runtime = { path = "../agent-runtime", features = ["test-support"] }
@@ -110,8 +107,6 @@ rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
-tar = { version = "0.4", default-features = false }
-ureq = { version = "3", default-features = false, features = ["rustls"] }
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive", "env"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
@@ -119,8 +114,8 @@ tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.30"
 
 [[test]]
-name = "embedded_ui_resolver"
-path = "build_support/embedded_ui.rs"
+name = "embedded_ui"
+path = "build_support/gpui_web.rs"
 
 [[bench]]
 name = "agent_startup"
