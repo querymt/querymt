@@ -91,6 +91,80 @@ if "$here/write-release-json.sh" 0.6.0 beta "$sha" "$tmp/x.json" 2>/dev/null; th
   fail "release.json: rejects unknown channel"
 else pass "release.json: rejects unknown channel"; fi
 
+# desktop_updates: the five self-updatable installers, with size and SHA-256.
+dd="$tmp/desktop-assets"
+mkdir -p "$dd"
+desktop_files=(
+  macos-aarch64.app.tar.gz macos-x86_64.app.tar.gz windows-x64-setup.exe
+  linux-x86_64.AppImage linux-aarch64.AppImage
+)
+for f in "${desktop_files[@]}"; do printf 'installer %s\n' "$f" > "$dd/QueryMT-Desktop-nightly-$f"; done
+# Files the manifest must not list.
+echo dmg > "$dd/QueryMT-Desktop-nightly-macos-aarch64.dmg"
+echo deb > "$dd/QueryMT-Desktop-nightly-linux-x86_64.deb"
+"$here/write-release-json.sh" "0.6.0-nightly.$TS" nightly "$sha" "$tmp/release-desktop.json" \
+  --desktop-dir "$dd" --version-name nightly
+expect_eq "manifest lists every self-updatable platform: keys" \
+  "darwin-aarch64 darwin-x86_64 linux-aarch64 linux-x86_64 windows-x86_64" \
+  "$(jq -r '.desktop_updates | keys | join(" ")' "$tmp/release-desktop.json")"
+expect_eq "manifest lists every self-updatable platform: files" \
+  "QueryMT-Desktop-nightly-macos-aarch64.app.tar.gz QueryMT-Desktop-nightly-windows-x64-setup.exe QueryMT-Desktop-nightly-linux-x86_64.AppImage" \
+  "$(jq -r '.desktop_updates | [."darwin-aarch64".file, ."windows-x86_64".file, ."linux-x86_64".file] | join(" ")' "$tmp/release-desktop.json")"
+win="$dd/QueryMT-Desktop-nightly-windows-x64-setup.exe"
+expect_eq "manifest lists every self-updatable platform: size and sha256" \
+  "$(wc -c < "$win" | tr -d ' ') $(if command -v sha256sum >/dev/null; then sha256sum "$win"; else shasum -a 256 "$win"; fi | cut -d' ' -f1)" \
+  "$(jq -r '.desktop_updates."windows-x86_64" | "\(.size) \(.sha256)"' "$tmp/release-desktop.json")"
+expect_eq "manifest keeps the existing fields" \
+  "$(jq -S 'del(.published_at)' "$tmp/release.json")" \
+  "$(jq -S 'del(.published_at, .desktop_updates)' "$tmp/release-desktop.json")"
+expect_eq "manifest keeps the existing fields: none added without the flags" "false" \
+  "$(jq 'has("desktop_updates")' "$tmp/release.json")"
+rm "$dd/QueryMT-Desktop-nightly-linux-aarch64.AppImage"
+if "$here/write-release-json.sh" "0.6.0-nightly.$TS" nightly "$sha" "$tmp/x.json" \
+  --desktop-dir "$dd" --version-name nightly 2>"$tmp/missing.err"; then
+  fail "missing desktop asset fails (expected failure)"
+elif grep -q "linux-aarch64" "$tmp/missing.err"; then pass "missing desktop asset fails"
+else fail "missing desktop asset fails: error does not name the platform: $(cat "$tmp/missing.err")"; fi
+if "$here/write-release-json.sh" "0.6.0-nightly.$TS" nightly "$sha" "$tmp/x.json" --desktop-dir "$dd" 2>/dev/null; then
+  fail "desktop flags go together"
+else pass "desktop flags go together"; fi
+
+# --- sign-release-json.sh ----------------------------------------------------
+# A throwaway key pair; the script verifies with it instead of the app's key.
+if ! command -v minisign >/dev/null 2>&1; then
+  fail "signature tests need minisign (brew install minisign, or apt-get install minisign)"
+else
+  keys="$tmp/keys"; mkdir -p "$keys"
+  minisign -G -W -f -p "$keys/test.pub" -s "$keys/test.key" >/dev/null
+  minisign -G -W -f -p "$keys/other.pub" -s "$keys/other.key" >/dev/null
+  cp "$tmp/release-desktop.json" "$tmp/signed.json"
+  QMT_UPDATE_SIGNING_KEY="$(cat "$keys/test.key")" QMT_UPDATE_PUBLIC_KEY="$keys/test.pub" \
+    "$here/sign-release-json.sh" "$tmp/signed.json" 0.6.0-nightly.$TS nightly >/dev/null
+  if out="$(minisign -V -p "$keys/test.pub" -m "$tmp/signed.json" -x "$tmp/signed.json.minisig" 2>&1)" \
+    && printf '%s\n' "$out" | grep -qF "Trusted comment: version:0.6.0-nightly.$TS channel:nightly"; then
+    pass "signature covers the manifest"
+  else fail "signature covers the manifest: $out"; fi
+  echo '{"version":"9.9.9"}' > "$tmp/tampered.json"
+  cp "$tmp/signed.json.minisig" "$tmp/tampered.json.minisig"
+  if minisign -V -p "$keys/test.pub" -m "$tmp/tampered.json" -x "$tmp/tampered.json.minisig" >/dev/null 2>&1; then
+    fail "signature covers the manifest: a changed manifest still verifies"
+  else pass "signature covers the manifest: a changed manifest does not verify"; fi
+  # No key: no signature file, and a failing exit.
+  rm -f "$tmp/unsigned.json.minisig"; cp "$tmp/release-desktop.json" "$tmp/unsigned.json"
+  if env -u QMT_UPDATE_SIGNING_KEY QMT_UPDATE_PUBLIC_KEY="$keys/test.pub" \
+    "$here/sign-release-json.sh" "$tmp/unsigned.json" 0.6.0 stable 2>"$tmp/nokey.err"; then
+    fail "missing signing key fails (expected failure)"
+  elif [ ! -e "$tmp/unsigned.json.minisig" ] && grep -q QMT_UPDATE_SIGNING_KEY "$tmp/nokey.err"; then
+    pass "missing signing key fails"
+  else fail "missing signing key fails: $(cat "$tmp/nokey.err")"; fi
+  # A secret that is not the pair of the embedded key must fail, not publish.
+  if QMT_UPDATE_SIGNING_KEY="$(cat "$keys/other.key")" QMT_UPDATE_PUBLIC_KEY="$keys/test.pub" \
+    "$here/sign-release-json.sh" "$tmp/unsigned.json" 0.6.0 stable >/dev/null 2>&1; then
+    fail "signing with a key that is not the embedded key's pair fails (expected failure)"
+  elif [ ! -e "$tmp/unsigned.json.minisig" ]; then pass "signing with a key that is not the embedded key's pair fails"
+  else fail "signing with a key that is not the embedded key's pair leaves a signature"; fi
+fi
+
 # --- stable-gate.sh ----------------------------------------------------------
 # History:  old --- nightly --- head
 repo="$tmp/repo"

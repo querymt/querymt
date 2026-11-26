@@ -48,6 +48,12 @@ jobs:
       # taken once here and passed to every matrix job, so all binaries of one
       # nightly report the same version. `version_name` stays a plain asset
       # label so the rolling release URL and asset names are stable.
+      # The release script tests sign a throwaway manifest with minisign.
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
       - name: Test release scripts
         run: scripts/release/test-release-scripts.sh
 
@@ -89,6 +95,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       QMT_VERSION: ${{ needs.check-changes.outputs.qmt_version }}
+      VERSION_NAME: ${{ needs.check-changes.outputs.version_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -103,12 +110,28 @@ jobs:
           merge-multiple: true
 
       # Machine-readable manifest: consumers read the version and commit from
-      # here instead of parsing asset names or release notes.
+      # here instead of parsing asset names or release notes. It also lists the
+      # desktop installers QueryMT Desktop updates itself from, and fails when
+      # one is missing.
       - name: Write release.json
         run: |
           scripts/release/write-release-json.sh \
-            "$QMT_VERSION" nightly "${{ github.sha }}" artifacts/release.json
+            "$QMT_VERSION" nightly "${{ github.sha }}" artifacts/release.json \
+            --desktop-dir artifacts --version-name "$VERSION_NAME"
           cat artifacts/release.json
+
+      # The app only trusts a release.json signed with the update key. A
+      # missing secret fails the run before anything is published.
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign release.json
+        env:
+          QMT_UPDATE_SIGNING_KEY: ${{ secrets.QMT_UPDATE_SIGNING_KEY }}
+        run: |
+          scripts/release/sign-release-json.sh artifacts/release.json "$QMT_VERSION" nightly
 
       # The rolling release is replaced in three steps so the time without a
       # `nightly` release is a few seconds instead of the whole upload:

@@ -114,10 +114,12 @@ pub(crate) fn forward(endpoint: &Endpoint, command: Command) -> bool {
         .is_ok()
 }
 
-/// The listening socket. Dropping it stops the thread and frees the name.
+/// The listening socket. Dropping it tells the thread to stop and returns at
+/// once; [`Listening::release`] also waits until the name is free.
 pub(crate) struct Listening {
     endpoint: Endpoint,
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Listen for commands of later instances and send them as signals.
@@ -131,7 +133,7 @@ pub(crate) fn listen(endpoint: &Endpoint, signals: Sender<Signal>) -> io::Result
         .create_sync()?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("quick-instance".into())
         .spawn(move || {
             for connection in listener.incoming() {
@@ -152,16 +154,47 @@ pub(crate) fn listen(endpoint: &Endpoint, signals: Sender<Signal>) -> io::Result
     Ok(Listening {
         endpoint: endpoint.clone(),
         stop,
+        thread: Some(thread),
     })
 }
 
-impl Drop for Listening {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+impl Listening {
+    /// Tell the thread to stop. Does nothing the second time, so a stopped
+    /// listener never pokes a socket that a new process may own by then.
+    fn signal_stop(&self) {
+        if self.stop.swap(true, Ordering::SeqCst) {
+            return;
+        }
         // Wake the thread out of `accept`; it sees the flag and ends.
         if let Ok(name) = self.endpoint.socket_name() {
             let _ = Stream::connect(name);
         }
+    }
+
+    /// Stop and wait until the name is free, so that a process started right
+    /// after this (the new version, in an update) finds nobody listening
+    /// instead of handing its request over to this one. The wait is bounded: a
+    /// client that holds the thread in a read must not hang the app.
+    ///
+    /// Blocks for a few milliseconds in the normal case; use it on the restart
+    /// path, not for toggling the quick panel (a plain drop is enough there).
+    pub(crate) fn release(mut self) {
+        self.signal_stop();
+        if let Some(thread) = self.thread.take() {
+            let give_up = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !thread.is_finished() && std::time::Instant::now() < give_up {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.signal_stop();
     }
 }
 
@@ -216,6 +249,29 @@ mod tests {
         drop(listening);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!forward(&endpoint, Command::Quick));
+    }
+
+    /// An update starts the new version right after the old one lets go of the
+    /// socket; the new one must find nobody, with no sleep in between.
+    #[test]
+    fn release_frees_the_name_before_it_returns() {
+        for _ in 0..20 {
+            let endpoint = endpoint();
+            let (signals, _requests) = async_channel::bounded(8);
+            let listening = listen(&endpoint, signals.clone()).expect("listen");
+            assert!(forward(&endpoint, Command::Show));
+
+            listening.release();
+
+            assert!(
+                !forward(&endpoint, Command::Show),
+                "the released instance still answered"
+            );
+            // And the next instance can take the name at once.
+            let again = listen(&endpoint, signals).expect("listen again");
+            assert!(forward(&endpoint, Command::Show));
+            again.release();
+        }
     }
 
     /// A crashed instance leaves its socket file behind.

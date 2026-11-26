@@ -12,7 +12,7 @@ QueryMT Desktop (crates/querymt-gpui) only works when the user has installed qmt
 - **Local agent seeding.** "Local qmtcode" is added when a bundled copy exists or qmtcode is on PATH. On Windows the PATH check now finds `qmtcode.exe`; before, it never matched. If the user deletes the seeded agent, it stays deleted. Reset app data restores it.
 - **Agent processes on Windows** start without a console window.
 - **App identity.** The app becomes "QueryMT Desktop":
-  - macOS: `QueryMT Desktop.app`, bundle id `com.querymt.desktop`.
+  - macOS: `QueryMT Desktop.app`, bundle id `mt.query.desktop` (the reverse of the `query.mt` domain).
   - Windows: install folder and uninstall entry "QueryMT Desktop".
   - Linux: deb package `querymt-desktop`, desktop entry "QueryMT Desktop".
 
@@ -55,6 +55,7 @@ None. No existing spec covers desktop packaging, local agent start or updates.
 - **New crate-local dependencies of querymt-gpui (native only):**
   - `ureq` 3 with rustls (already a build-dependency);
   - `minisign-verify`;
+  - `self_update` (macOS only, for the bundle swap; D10), which adds `self_update`, `self-replace` and `zipsign-api` to Cargo.lock (the last is not compiled);
   - `semver`, `sha2`, `tar` and `flate2`, already in Cargo.lock.
 - **CI and release:**
   - `.github/workflows/build.yml`: the desktop job splits into `desktop` (compile) and `desktop-package`.

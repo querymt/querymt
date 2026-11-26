@@ -314,6 +314,8 @@ mod tests {
             first_run: false,
             sidebar: Default::default(),
             early_commands: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            updates: Default::default(),
         }
     }
 

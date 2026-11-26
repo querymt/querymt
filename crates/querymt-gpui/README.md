@@ -8,7 +8,7 @@ run from the repository root.
 ## Native
 
 ```bash
-nix develop -c cargo run -p querymt-gpui                              # qmtcode on PATH is added as "Local qmtcode"
+nix develop -c cargo run -p querymt-gpui                              # qmtcode on PATH (or bundled) is added as "Local qmtcode"
 nix develop -c cargo run -p querymt-gpui -- --agent 127.0.0.1:42069   # add a WebSocket agent (also QMT_AGENT=...)
 QMT_DEBUG=1 nix develop -c cargo run -p querymt-gpui                  # log agent/RPC traffic to stderr
 cargo r-gpui                                                          # optimized build (release profile), then run
@@ -17,7 +17,27 @@ cargo t-gpui                                                          # tests (n
 cargo cl-gpui                                                         # clippy -D warnings
 ```
 
-Agents are stored in `~/.config/querymt-gpui/state.json`.
+Agents are stored in `~/.config/querymt-gpui/state.json` (the platform's config directory on
+macOS and Windows). The location does not depend on the app's installed name, so state carries
+over from earlier builds.
+
+### Local qmtcode
+
+A process agent whose command starts with the bare program `qmtcode` runs the copy bundled with
+the app first, then the first `qmtcode` on `PATH`. A command with a path (`/opt/qmt/qmtcode --acp`)
+or any other program runs as written. The agent log says which copy started ("bundled" or
+"PATH") with its full path and pid. The "Local qmtcode" agent (`qmtcode --acp`) is added on every
+start when a bundled or `PATH` copy exists; deleting it keeps it deleted, and Reset app data brings
+it back.
+
+The app looks for the bundled copy next to its executable and in `../lib/querymt-gpui/`:
+
+| Install | qmtcode |
+|---|---|
+| macOS | `QueryMT Desktop.app/Contents/MacOS/qmtcode` |
+| Windows | `qmtcode.exe` next to `querymt-gpui.exe` (`%LOCALAPPDATA%\Programs\QueryMT Desktop`) |
+| deb, AppImage | `usr/lib/querymt-gpui/qmtcode` (not on `PATH`) |
+| Nix | `lib/querymt-gpui/qmtcode` |
 
 ### Run or install with Nix
 
@@ -42,6 +62,29 @@ Releases ship with QueryMT's own nightly and stable releases (`.github/workflows
 `QueryMT-Desktop-<version>-<platform>` installers (dmg and app.tar.gz, Windows setup exe,
 AppImage and deb) plus `querymt-desktop-web-<version>.tar.gz`. The packaging scripts are in
 `scripts/package/`; the app reports the release version CI passes as `QMT_VERSION`.
+
+Each installer bundles the qmtcode built by the same release (the static musl build on Linux).
+The scripts take it from `QMTCODE_BINARY`: unset is an error under `CI` and a warning elsewhere,
+where the installer is built without qmtcode. `scripts/release/check-bundles.sh <target> <version>`
+checks the produced installers for it, and CI fails the build when one lacks it. To package
+locally:
+
+```bash
+cargo build -p querymt-gpui --profile release-gpui --target aarch64-apple-darwin
+cargo build -p querymt-agent --release --example qmtcode --target aarch64-apple-darwin   # features as in build.yml
+QMTCODE_BINARY=target/aarch64-apple-darwin/release/examples/qmtcode \
+  bash crates/querymt-gpui/scripts/package/macos.sh 0.0.0 aarch64-apple-darwin
+```
+
+The app is named "QueryMT Desktop" (the Rust package stays `querymt-gpui`):
+
+| Platform | Identity |
+|---|---|
+| macOS | `QueryMT Desktop.app`, bundle identifier `mt.query.desktop` |
+| Windows | install folder and uninstall entry "QueryMT Desktop"; setup removes an earlier "QueryMT GPUI" install silently |
+| Linux | deb package `querymt-desktop` (replaces and conflicts with `querymt-gpui`), desktop entry "QueryMT Desktop" |
+
+On macOS an earlier GPUI test install, `QueryMT.app`, is not replaced: delete it by hand.
 
 The desktop has only a binary target: no application `.so`, `.dylib`, `.dll`, or
 `.rlib` is built. Rust dependency archives remain internal Cargo build artifacts.

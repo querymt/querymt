@@ -52,11 +52,11 @@ The Nix `querymt-gpui` package SHALL provide the qmtcode of the same flake at `l
 - **THEN** its output contains `lib/querymt-gpui/qmtcode`, which runs the flake's qmtcode
 
 ### Requirement: App identity is QueryMT Desktop
-Installed builds SHALL identify as "QueryMT Desktop". On macOS the bundle is `QueryMT Desktop.app` with identifier `com.querymt.desktop`. On Windows the install directory and the uninstall entry are named "QueryMT Desktop". On Linux the deb package is `querymt-desktop` and the desktop entry is "QueryMT Desktop".
+Installed builds SHALL identify as "QueryMT Desktop". On macOS the bundle is `QueryMT Desktop.app` with identifier `mt.query.desktop`. On Windows the install directory and the uninstall entry are named "QueryMT Desktop". On Linux the deb package is `querymt-desktop` and the desktop entry is "QueryMT Desktop".
 
 #### Scenario: macOS bundle identity
 - **WHEN** the macOS bundle is built
-- **THEN** it is named `QueryMT Desktop.app`, its bundle identifier is `com.querymt.desktop` and its display name is "QueryMT Desktop"
+- **THEN** it is named `QueryMT Desktop.app`, its bundle identifier is `mt.query.desktop` and its display name is "QueryMT Desktop"
 
 #### Scenario: Deb replaces the earlier package name
 - **WHEN** the `querymt-desktop` deb is installed on a system with the `querymt-gpui` package installed

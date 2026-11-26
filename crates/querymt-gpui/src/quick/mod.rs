@@ -264,12 +264,7 @@ impl QuickHost {
                     Err(error) => tracing::warn!(%error, "no tray icon"),
                 }
             }
-            if self.listening.is_none() {
-                match instance::listen(&instance::Endpoint::for_user(), self.signals.clone()) {
-                    Ok(listening) => self.listening = Some(listening),
-                    Err(error) => tracing::warn!(%error, "not listening for `--quick`"),
-                }
-            }
+            self.ensure_listening();
         } else {
             cx.set_quit_mode(QuitMode::Default);
             self.hotkey = None;
@@ -278,6 +273,32 @@ impl QuickHost {
             self.listening = None;
         }
         cx.notify();
+    }
+
+    fn ensure_listening(&mut self) {
+        if self.listening.is_none() {
+            match instance::listen(&instance::Endpoint::for_user(), self.signals.clone()) {
+                Ok(listening) => self.listening = Some(listening),
+                Err(error) => tracing::warn!(%error, "not listening for `--quick`"),
+            }
+        }
+    }
+
+    /// Stop answering later instances and free their socket, before an update
+    /// starts the new version (which must not hand its start over to this
+    /// process). Returns once the socket is free.
+    pub(crate) fn release_instance_socket(&mut self) {
+        if let Some(listening) = self.listening.take() {
+            listening.release();
+        }
+    }
+
+    /// Listen again, if the panel is enabled, after a start that did not
+    /// happen.
+    pub(crate) fn restore_instance_socket(&mut self) {
+        if self.applied.as_ref().is_some_and(|prefs| prefs.enabled) {
+            self.ensure_listening();
+        }
     }
 
     fn register_shortcut(&mut self, prefs: &QuickPrefs, cx: &mut Context<Self>) {

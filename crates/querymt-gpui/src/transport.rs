@@ -32,6 +32,48 @@ pub struct Connection {
     pub outgoing: Sender<String>,
     pub incoming: Receiver<Inbound>,
     pub pid: Option<u32>,
+    /// Set once a local agent process has exited and been reaped. `None` for
+    /// a WebSocket, which has no process of ours.
+    pub exit: Option<Exit>,
+}
+
+/// Tells whether a local agent process has exited. The thread that owns the
+/// child marks it after `wait`; anyone else can wait for it with a timeout.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub struct Exit(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+impl Exit {
+    pub fn mark(&self) {
+        let (flag, wake) = &*self.0;
+        *flag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+
+    #[cfg(test)]
+    pub fn has_exited(&self) -> bool {
+        *self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Block until the process has exited or `timeout` passes. Returns whether
+    /// it exited. Blocks the calling thread, so keep it off the UI thread.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        let (flag, wake) = &*self.0;
+        let guard = flag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = wake
+            .wait_timeout_while(guard, timeout, |exited| !*exited)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard
+    }
 }
 
 pub async fn connect(target: Target) -> Result<Connection, String> {
@@ -71,14 +113,16 @@ mod native {
                     outgoing: out_tx,
                     incoming: in_rx,
                     pid: None,
+                    exit: None,
                 })
             }
             Target::Command(command_line) => {
-                let pid = spawn_process(&command_line, out_rx, in_tx)?;
+                let (pid, exit) = spawn_process(&command_line, out_rx, in_tx)?;
                 Ok(Connection {
                     outgoing: out_tx,
                     incoming: in_rx,
                     pid: Some(pid),
+                    exit: Some(exit),
                 })
             }
         }
@@ -171,23 +215,69 @@ mod native {
         command_line: &str,
         out_rx: Receiver<String>,
         in_tx: Sender<Inbound>,
-    ) -> Result<u32, String> {
-        let parts = split_command_line(command_line)?;
-        let (program, args) = parts.split_first().ok_or("Command line is empty.")?;
-        let mut child = Command::new(program)
+    ) -> Result<(u32, Exit), String> {
+        let exe = std::env::current_exe().ok();
+        let path_var = std::env::var_os("PATH");
+        spawn_process_with(
+            command_line,
+            exe.as_deref(),
+            path_var.as_deref(),
+            out_rx,
+            in_tx,
+        )
+    }
+
+    /// `CREATE_NO_WINDOW`: a GUI app's agent process gets no console window.
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// The command for an agent process: stdio piped to the app and, on
+    /// Windows, no console window.
+    fn agent_command(program: &std::path::Path, args: &[String]) -> Command {
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command
+    }
+
+    /// The log entry for a started agent process: which copy, which path.
+    fn start_note(resolved: &crate::local_agent::Resolved, command_line: &str, pid: u32) -> String {
+        use crate::local_agent::Source;
+        let path = resolved.path.display();
+        match resolved.source {
+            Source::Bundled => format!("Started bundled qmtcode `{path}` (pid {pid})."),
+            Source::Path => format!("Started PATH qmtcode `{path}` (pid {pid})."),
+            Source::AsWritten => format!("Started `{command_line}` (pid {pid})."),
+        }
+    }
+
+    /// [`spawn_process`] over an injected app executable and PATH value.
+    fn spawn_process_with(
+        command_line: &str,
+        exe: Option<&std::path::Path>,
+        path_var: Option<&std::ffi::OsStr>,
+        out_rx: Receiver<String>,
+        in_tx: Sender<Inbound>,
+    ) -> Result<(u32, Exit), String> {
+        let parts = split_command_line(command_line)?;
+        let (program, args) = parts.split_first().ok_or("Command line is empty.")?;
+        let resolved = crate::local_agent::resolve_program(program, exe, path_var)?;
+        let mut child = agent_command(&resolved.path, args)
             .spawn()
-            .map_err(|err| format!("Failed to start `{program}`: {err}"))?;
+            .map_err(|err| format!("Failed to start `{}`: {err}", resolved.path.display()))?;
         let pid = child.id();
         let mut stdin = child.stdin.take().ok_or("No stdin")?;
         let stdout = child.stdout.take().ok_or("No stdout")?;
         let stderr = child.stderr.take().ok_or("No stderr")?;
-        let _ = in_tx.try_send(Inbound::Note(format!(
-            "Started `{command_line}` (pid {pid})."
-        )));
+        let _ = in_tx.try_send(Inbound::Note(start_note(&resolved, command_line, pid)));
 
         let tx = in_tx.clone();
         std::thread::spawn(move || {
@@ -210,6 +300,8 @@ mod native {
                 let _ = tx.send_blocking(Inbound::Log(line));
             }
         });
+        let exit = Exit::default();
+        let exited = exit.clone();
         std::thread::spawn(move || {
             while let Ok(line) = out_rx.recv_blocking() {
                 if writeln!(stdin, "{line}")
@@ -221,8 +313,9 @@ mod native {
             }
             let _ = child.kill();
             let _ = child.wait();
+            exited.mark();
         });
-        Ok(pid)
+        Ok((pid, exit))
     }
 
     /// Minimal shell-style splitting: whitespace, single and double quotes, backslash escapes.
@@ -264,6 +357,164 @@ mod native {
             parts.push(current);
         }
         Ok(parts)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[cfg(unix)]
+        fn fake_qmtcode(path: &std::path::Path) {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\necho started\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The first note the production spawn path writes for `command_line`.
+        #[cfg(unix)]
+        fn first_note(
+            command_line: &str,
+            exe: &std::path::Path,
+            path_var: &std::ffi::OsStr,
+        ) -> (String, u32) {
+            let (_out_tx, out_rx) = async_channel::unbounded::<String>();
+            let (in_tx, in_rx) = async_channel::unbounded::<Inbound>();
+            let (pid, _exit) =
+                spawn_process_with(command_line, Some(exe), Some(path_var), out_rx, in_tx).unwrap();
+            loop {
+                match in_rx.recv_blocking().unwrap() {
+                    Inbound::Note(note) => return (note, pid),
+                    Inbound::Closed(why) => panic!("closed before a note: {why}"),
+                    _ => {}
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn log_shows_bundled_copy() {
+            let root = tempfile::tempdir().unwrap();
+            let bundled = root.path().join("app").join("qmtcode");
+            let on_path = root.path().join("bin").join("qmtcode");
+            fake_qmtcode(&bundled);
+            fake_qmtcode(&on_path);
+            let path_var = std::env::join_paths([root.path().join("bin")]).unwrap();
+            let exe = root.path().join("app").join("querymt-gpui");
+
+            let (note, pid) = first_note("qmtcode --acp", &exe, &path_var);
+            assert_eq!(
+                note,
+                format!(
+                    "Started bundled qmtcode `{}` (pid {pid}).",
+                    bundled.display()
+                )
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn log_shows_path_copy() {
+            let root = tempfile::tempdir().unwrap();
+            let on_path = root.path().join("bin").join("qmtcode");
+            fake_qmtcode(&on_path);
+            let path_var = std::env::join_paths([root.path().join("bin")]).unwrap();
+            let exe = root.path().join("app").join("querymt-gpui");
+
+            let (note, pid) = first_note("qmtcode --acp", &exe, &path_var);
+            assert_eq!(
+                note,
+                format!("Started PATH qmtcode `{}` (pid {pid}).", on_path.display())
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn explicit_path_is_logged_as_written() {
+            let root = tempfile::tempdir().unwrap();
+            let explicit = root.path().join("opt").join("qmtcode");
+            fake_qmtcode(&explicit);
+            let exe = root.path().join("app").join("querymt-gpui");
+            let command_line = format!("{} --acp", explicit.display());
+            let (note, pid) = first_note(&command_line, &exe, std::ffi::OsStr::new(""));
+            assert_eq!(note, format!("Started `{command_line}` (pid {pid})."));
+        }
+
+        #[test]
+        fn missing_qmtcode_fails_to_start() {
+            let (_out_tx, out_rx) = async_channel::unbounded::<String>();
+            let (in_tx, _in_rx) = async_channel::unbounded::<Inbound>();
+            let root = tempfile::tempdir().unwrap();
+            let exe = root.path().join("querymt-gpui");
+            let err = spawn_process_with(
+                "qmtcode --acp",
+                Some(&exe),
+                Some(std::ffi::OsStr::new("")),
+                out_rx,
+                in_tx,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("qmtcode") && err.contains("not found"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn exit_wait_times_out_until_marked() {
+            let exit = Exit::default();
+            assert!(!exit.has_exited());
+            assert!(!exit.wait(Duration::from_millis(20)));
+            let waiter = exit.clone();
+            let handle = std::thread::spawn(move || waiter.wait(Duration::from_secs(10)));
+            exit.mark();
+            assert!(handle.join().unwrap());
+            assert!(exit.has_exited());
+        }
+
+        /// Closing the outgoing channel is what stops the agent; the exit
+        /// signal is set only after the child was killed and reaped.
+        #[cfg(unix)]
+        #[test]
+        fn closing_the_channel_stops_the_process_and_marks_it_exited() {
+            let root = tempfile::tempdir().unwrap();
+            let agent = root.path().join("agent.sh");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::write(&agent, "#!/bin/sh\nexec sleep 60\n").unwrap();
+                std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let (out_tx, out_rx) = async_channel::unbounded::<String>();
+            let (in_tx, _in_rx) = async_channel::unbounded::<Inbound>();
+            let exe = root.path().join("querymt-gpui");
+            let (_pid, exit) = spawn_process_with(
+                agent.to_str().unwrap(),
+                Some(&exe),
+                Some(std::ffi::OsStr::new("")),
+                out_rx,
+                in_tx,
+            )
+            .unwrap();
+            assert!(!exit.has_exited());
+            out_tx.close();
+            assert!(exit.wait(Duration::from_secs(10)));
+        }
+
+        /// The creation flags cannot be read back from a `Command`; this
+        /// checks the flag value and that the production builder still
+        /// pipes all three standard streams.
+        #[cfg(windows)]
+        #[test]
+        fn no_console_window_for_a_local_agent() {
+            assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+            let args = ["/C".to_string(), "echo hello".to_string()];
+            let child = agent_command(std::path::Path::new("cmd"), &args)
+                .spawn()
+                .unwrap();
+            assert!(child.stdin.is_some() && child.stderr.is_some());
+            let out = child.wait_with_output().unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+        }
     }
 }
 
@@ -375,6 +626,7 @@ mod web {
             outgoing: out_tx,
             incoming: in_rx,
             pid: None,
+            exit: None,
         })
     }
 }

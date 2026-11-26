@@ -134,7 +134,19 @@ nix develop -c cargo run -p querymt-gpui
 ```
 
 Every release ships it as `QueryMT-Desktop-<version>-<platform>` installers and a
-`querymt-desktop-web-<version>.tar.gz` web build. See [its README](crates/querymt-gpui/README.md).
+`querymt-desktop-web-<version>.tar.gz` web build. Each installer bundles the `qmtcode` built by the
+same release, so the app works without a separate qmtcode install (a bare `qmtcode` command runs the
+bundled copy first, then `PATH`):
+
+| Platform | Installed as | Bundled qmtcode |
+|---|---|---|
+| macOS | `QueryMT Desktop.app` (`mt.query.desktop`) | `Contents/MacOS/qmtcode` |
+| Windows | `%LOCALAPPDATA%\Programs\QueryMT Desktop` | `qmtcode.exe` next to the app |
+| Linux | deb `querymt-desktop`, or the AppImage | `usr/lib/querymt-gpui/qmtcode` |
+
+Earlier GPUI test builds: the deb and the Windows installer replace them, and on macOS the old
+`QueryMT.app` is deleted by hand. App settings carry over. See
+[its README](crates/querymt-gpui/README.md).
 
 ## Release channels
 

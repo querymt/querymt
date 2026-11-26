@@ -77,7 +77,7 @@ flowchart LR
 Each script takes `QMTCODE_BINARY`. When it is unset: error if `CI` is set, otherwise a warning and no qmtcode in the bundle.
 
 - **macOS** (`macos.sh`):
-  - Bundle is `QueryMT Desktop.app`; `CFBundleExecutable` stays `querymt-gpui`. `CFBundleIdentifier` is `com.querymt.desktop`; `CFBundleName` and `CFBundleDisplayName` are `QueryMT Desktop`.
+  - Bundle is `QueryMT Desktop.app`; `CFBundleExecutable` stays `querymt-gpui`. `CFBundleIdentifier` is `mt.query.desktop` (the reverse of the `query.mt` domain, as the `mt.query.*` annotations elsewhere in the repo); `CFBundleName` and `CFBundleDisplayName` are `QueryMT Desktop`.
   - qmtcode is copied to `Contents/MacOS/qmtcode` and ad-hoc signed first (`codesign --force --sign - --timestamp=none`), then the bundle is signed as today. A bundle signature does not cover an unsigned helper in `Contents/MacOS`, so `codesign --verify --strict` would fail without the first step.
   - The update archive becomes `QueryMT Desktop.app.tar.gz`. `collect-bundles.sh` already globs `*.app.tar.gz`.
 - **Linux** (`linux.sh`):
@@ -250,20 +250,31 @@ stateDiagram-v2
 
 ### D10. Installing on macOS and AppImage
 
-Both replace files with renames on the same file system, so every step can be undone.
+The macOS bundle swap is done by the `self_update` crate, so we do not maintain it. The AppImage swap and the Windows install stay ours (reasons below).
 
-**macOS:**
+**macOS** (`self_update::backends::custom`, a spike of this flow is recorded in task 8.2):
 
-1. Download to `<parent>/.QueryMT Desktop.app.update-<pid>.tar.gz`.
-2. Verify size and SHA-256.
-3. Unpack with `tar` + `flate2` into `<parent>/.update-<pid>/`. Reject entries with absolute paths or `..`.
-4. Check that `QueryMT Desktop.app/Contents/Info.plist` and the executable exist, and run `codesign --verify --strict`.
-5. Stop local process agents.
-6. Rename the current bundle to `.QueryMT Desktop.app.old-<pid>`, then rename the new one into place.
-7. If the second rename fails, rename the old bundle back.
-8. Delete the old bundle and the temp files.
+- The source is one `Release` built from the verified `Offer`: `ReleaseAsset::new(<file name>, <url>)`. The crate is not given a digest: size and SHA-256 are checked once, in our `verify_archive` hook, so one place produces the messages the card shows. `current_version("0.0.0")` and `target(<asset file name>)`: `evaluate` and the platform key already decided that the offer is newer and which asset is ours, and the crate must not decide again.
+- `bundle_path_in_archive("QueryMT Desktop.app")`, `bundle_install_path(<installed bundle>)`, `no_confirm(true)`, `show_output(false)`, `show_download_progress(false)`. The crate downloads to its own temp dir and stages the extraction next to the installed bundle.
+- `progress_callback` feeds `UpdateState::Downloading`.
+- `verify_archive` runs on the downloaded file before anything is extracted. It checks size and SHA-256 against the verified manifest entry (`AssetCheck`, so the spec's size check holds), then scans the archive and rejects absolute or `..` entries, entries outside `QueryMT Desktop.app`, hard links, and links that point outside the bundle. The crate alone would skip traversal entries without an error and accept outward symlinks; we keep the stricter behaviour.
+- `verify_binary` runs on the staged bundle root before the first rename. It checks that the bundle has `Contents/Info.plist` and a runnable `Contents/MacOS/querymt-gpui` (the crate compares paths only when the updater runs from inside the bundle), runs `codesign --verify --strict`, then stops the local process agents (bounded wait) and fails when one is still running. A failing hook leaves the installed bundle untouched, and agents are stopped only for a bundle that passed every check.
+- The crate then stashes the old bundle, renames the new one into place, rolls back on failure and deletes the stash. It also reports `AppTranslocated`; `detect_install_kind` already makes translocated installs notify-only, so this is a second line.
 
 The running process keeps its mapped executable, so it is unaffected until restart.
+
+Spike result (scratch crate, local HTTP server, run from inside an installed bundle): the swap works with no leftovers; a wrong digest, a truncated gzip, an HTML error page and a bundle without the running executable's path are rejected with the old version intact; a failing `verify_binary` aborts before any rename; progress calls arrive (769 for a 6 MB file).
+
+**Why not a crate for AppImage and Windows:**
+
+- AppImage: with a raw `.AppImage` asset the crate extracts into the directory that holds the download, so a `bin_path_in_archive` equal to the asset name truncates the download and installs a 0-byte file, and the new file loses its executable bit. Both can be worked around (a different name, `chmod` in the hook), but that is the least exercised path in the crate and our own installer is small.
+- Windows: the crate swaps a bundle directory, which fails while the app or `qmtcode.exe` holds files open, and `self-replace` replaces only the single running exe. The release asset is an NSIS setup, so the setup does the replacement (D11).
+
+**Alternatives rejected:**
+
+- `cargo-packager-updater`: on macOS a failed move of the new bundle drops the temp dir that holds the old app, so the app can be lost; it exits the process itself on Windows; it holds the whole download in memory; and its feed signs each asset instead of binding version and channel in one signed manifest.
+- `self-replace`: replaces only the running executable file, which breaks the macOS bundle signature and cannot reach `$APPIMAGE` or `qmtcode`.
+- Velopack: replaces packaging and the release manifest as well; a separate change.
 
 **AppImage:**
 
@@ -274,7 +285,7 @@ The running process keeps its mapped executable, so it is unaffected until resta
 **Restart** (`restart_to_update`):
 
 1. Stop agents.
-2. Drop `QuickHost`'s `Listening`, which frees the single-instance socket so the new process does not forward to the old one.
+2. Release `QuickHost`'s `Listening` (`Listening::release`), which signals the listener thread and waits, bounded, until the socket name is free, so the new process does not forward to the old one. A plain drop only signals and returns; the wait is for this path, not for switching the quick panel off.
 3. Spawn the new app detached: `open -n "<bundle>"` on macOS, `$APPIMAGE` for AppImage.
 4. `cx.quit()`.
 
@@ -319,8 +330,9 @@ All are crate-local to `querymt-gpui` under `[target.'cfg(not(target_family = "w
 | `minisign-verify` | none | New. Pure Rust, no dependencies. |
 | `semver = "1"` | default | In Cargo.lock. |
 | `sha2 = "0.10"` | default | In Cargo.lock. |
-| `tar = "0.4"` | default | macOS only. In Cargo.lock. |
-| `flate2 = "1"` | default | macOS only. In Cargo.lock. |
+| `self_update = "1.3"` | `default-features = false`, `ureq`, `rustls`, `archive-tar`, `compression-tar-gz` | macOS only (D10). Adds `self_update`, `self-replace` and `zipsign-api` to Cargo.lock; `zipsign-api` and the lock's `reqwest` edge belong to features that are not on, so neither is compiled. Its `ureq`, `tar`, `flate2`, `semver`, `regex` and `tempfile` are already locked. Needs Rust 1.88. |
+| `tar = "0.4"` | default | macOS only. In Cargo.lock. The archive scan in `verify_archive` (D10). |
+| `flate2 = "1"` | default | macOS only. In Cargo.lock. Same use. |
 
 No provider crate or wasm32-wasip1 build is affected. The wasm32-unknown-unknown build of querymt-gpui compiles none of these.
 
@@ -339,7 +351,7 @@ No provider crate or wasm32-wasip1 build is affected. The wasm32-unknown-unknown
 - **Bigger installers** (qmtcode is around 255 MB in a local unstripped build).
   - Mitigation: verify `strip` in the qmtcode release profile when implementing; the dmg, AppImage and NSIS formats compress.
 - **Dual install with the Tauri app.**
-  - macOS: same bundle name and identifier, so a drag install replaces the Tauri app. This is the intended takeover; Tauri data in `~/Library/Application Support/com.querymt.desktop` is left alone.
+  - macOS: same bundle name, different identifier. A drag install into `/Applications` still meets the Tauri `QueryMT Desktop.app` by file name, and Finder offers to replace it. macOS then sees a new app: permissions and Keychain items are not carried over, and the Tauri data in `~/Library/Application Support/com.querymt.desktop` (if that is its identifier) is left alone and not read.
   - Windows: separate directory and uninstall key, so both show as "QueryMT Desktop" until the retirement change.
   - Accepted for now; the retirement change resolves it.
 - **`ureq` blocking calls on the GPUI background executor** take one of its threads for up to 15 minutes during a download.

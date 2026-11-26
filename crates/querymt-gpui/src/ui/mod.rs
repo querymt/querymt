@@ -28,6 +28,8 @@ mod slash;
 mod smooth_scroll;
 mod start;
 mod turn_diff;
+#[cfg(not(target_family = "wasm"))]
+mod updates;
 pub(crate) mod workspace_select;
 mod workspaces;
 mod worktree;
@@ -899,6 +901,11 @@ impl QmtApp {
 
     fn render_sidebar_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
+        // "Update available", when a newer version was found (native only).
+        #[cfg(not(target_family = "wasm"))]
+        let update_item = self.update_nav(true, &p, cx);
+        #[cfg(target_family = "wasm")]
+        let update_item: Option<AnyElement> = None;
         // Pinned then open, in their tab order (see `sidebar_shown`).
         let tiles = self.side_list(true, window, cx);
         let separator = || {
@@ -968,6 +975,7 @@ impl QmtApp {
                     .child(separator())
                     .child(div().flex_1().min_h_0().w_full().flex().child(tiles))
                     .child(separator())
+                    .children(update_item)
                     .child(self.nav_item(
                         Page::Settings,
                         IconName::Settings,
@@ -1010,6 +1018,11 @@ impl QmtApp {
 
     fn render_sidebar_full(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
+        // "Update available", when a newer version was found (native only).
+        #[cfg(not(target_family = "wasm"))]
+        let update_item = self.update_nav(false, &p, cx);
+        #[cfg(target_family = "wasm")]
+        let update_item: Option<AnyElement> = None;
         // Pinned then open, in tab order, virtualized (see `side_list`).
         let sessions_list = self.side_list(false, window, cx);
         let (pinned_in_list, open_total) = self.side_header_info();
@@ -1126,6 +1139,7 @@ impl QmtApp {
                     .children(open_header)
                     .child(sessions_list)
                     .child(div().pt_1().pb_1().child(hairline()))
+                    .children(update_item)
                     .child(
                         h_flex()
                             .gap_1()
