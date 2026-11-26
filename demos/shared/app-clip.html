@@ -1,0 +1,621 @@
+<!doctype html>
+<!--
+  The shared QueryMT Desktop clip composition (change add-gpui-demo-videos).
+  demos/build.mjs turns this template into target/demos/<clip>/index.html by
+  replacing the {{...}} placeholders; nothing else in the file is touched.
+
+  Placeholders:
+    {{DURATION}}    root length in seconds: title card + footage + end card
+    {{FPS}}         frame rate of the footage
+    {{FOOTAGE_W}}, {{FOOTAGE_H}}   the film canvas, in logical pixels
+    {{FOOTAGE_S}}   footage length in seconds
+    {{FOOTAGE_AT}}  when the footage starts (the title card's length)
+    {{END_AT}}      when the end card starts
+    {{END_S}}       the end card's length in seconds
+    {{PANEL_VIDEO}} the panel's <video> element, or nothing when the clip has no panel track
+
+  Everything that moves is a paused GSAP timeline built from window.QMT_FILM
+  (assets/film.js) and the clip's variables. No wall clock, no random, no
+  fetch beyond GSAP and the local assets.
+-->
+<html
+  lang="en"
+  data-composition-variables='[
+    {"id":"title","type":"string","label":"Title","default":""},
+    {"id":"subtitle","type":"string","label":"Subtitle","default":""},
+    {"id":"show_title_card","type":"boolean","label":"Title card","default":true},
+    {"id":"show_end_card","type":"boolean","label":"End card","default":true},
+    {"id":"cursor","type":"boolean","label":"Cursor","default":true},
+    {"id":"zoom","type":"number","label":"Zoom (1.0 to 2.0)","default":1.35},
+    {"id":"background","type":"string","label":"Background: dark, light or accent","default":"dark"},
+    {"id":"accent","type":"color","label":"Accent","default":"#f97316"}
+  ]'
+>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"></script>
+    <script src="assets/film.js"></script>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #0b0b0f;
+        font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+      }
+      #root {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+      }
+      #bg {
+        position: absolute;
+        inset: 0;
+      }
+      #world {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 1920px;
+        height: 1080px;
+        transform-origin: 0 0;
+      }
+      #win {
+        position: absolute;
+        border-radius: 10px;
+        background: #111;
+        box-shadow:
+          0 40px 90px rgba(0, 0, 0, 0.45),
+          0 0 0 1px rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+      /* The app draws no title bar of its own: its header is transparent and macOS
+         puts the three buttons inside it, at traffic_light_position (14, 15) in
+         crates/querymt-gpui/src/ui/mod.rs. The film is offscreen, so nothing draws
+         them; they are drawn here at that spot, 12 px wide, 20 px apart. */
+      #lights {
+        position: absolute;
+        left: 0;
+        top: 0;
+        pointer-events: none;
+      }
+      #lights .dot {
+        position: absolute;
+        top: 0;
+        border-radius: 50%;
+      }
+      #screen {
+        position: absolute;
+        left: 0;
+        top: 0;
+        overflow: hidden;
+        background: #000;
+      }
+      #screen .film {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: fill;
+      }
+      #panel {
+        position: absolute;
+        opacity: 0;
+      }
+      #panel-glass {
+        position: absolute;
+        background: rgba(20, 20, 24, 0.18);
+        -webkit-backdrop-filter: blur(18px);
+        backdrop-filter: blur(18px);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+      }
+      #panel-video {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+      }
+      #cursor,
+      #ring {
+        position: absolute;
+        left: 0;
+        top: 0;
+        opacity: 0;
+        pointer-events: none;
+      }
+      #cursor svg {
+        position: absolute;
+        left: 0;
+        top: 0;
+        filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
+      }
+      #ring {
+        width: 64px;
+        height: 64px;
+        margin: -32px 0 0 -32px;
+        border-radius: 32px;
+        border: 4px solid var(--accent, #f97316);
+      }
+      #caption {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 54px;
+        text-align: center;
+        opacity: 0;
+      }
+      #caption span {
+        display: inline-block;
+        padding: 14px 30px;
+        border-radius: 14px;
+        background: rgba(10, 10, 14, 0.78);
+        color: #fff;
+        font-size: 34px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .card {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        color: #fff;
+        background: #0b0b0f;
+      }
+      .card h1 {
+        font-size: 84px;
+        font-weight: 700;
+        letter-spacing: -0.035em;
+      }
+      .card p {
+        margin-top: 18px;
+        font-size: 34px;
+        color: rgba(255, 255, 255, 0.66);
+      }
+      .card .bar {
+        width: 120px;
+        height: 6px;
+        border-radius: 3px;
+        margin-top: 34px;
+        background: var(--accent, #f97316);
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="app-clip"
+      data-start="0"
+      data-duration="{{DURATION}}"
+      data-fps="{{FPS}}"
+      data-width="1920"
+      data-height="1080"
+    >
+      <div id="bg"></div>
+
+      <div id="world">
+        <div id="win">
+          <div id="screen">
+            <img
+              id="still-first"
+              class="clip film"
+              src="assets/first.png"
+              data-start="0"
+              data-duration="{{FOOTAGE_AT}}"
+              data-track-index="0"
+              alt=""
+            />
+            <video
+              id="main-video"
+              class="clip film"
+              src="assets/main.mp4"
+              data-start="{{FOOTAGE_AT}}"
+              data-duration="{{FOOTAGE_S}}"
+              data-track-index="1"
+              muted
+              playsinline
+            ></video>
+            <img
+              id="still-last"
+              class="clip film"
+              src="assets/last.png"
+              data-start="{{END_AT}}"
+              data-duration="{{END_S}}"
+              data-track-index="2"
+              alt=""
+            />
+          </div>
+          <div id="lights">
+            <span class="dot" style="background: #ff5f57"></span>
+            <span class="dot" style="background: #febc2e"></span>
+            <span class="dot" style="background: #28c840"></span>
+          </div>
+        </div>
+
+        <div id="panel">
+          <div id="panel-glass"></div>
+          {{PANEL_VIDEO}}
+        </div>
+
+        <div id="ring"></div>
+        <div id="cursor">
+          <svg id="arrow" width="30" height="36" viewBox="0 0 30 36">
+            <path
+              d="M3 2 L3 28 L10 21.5 L15 33 L20 31 L15 19.5 L25 19.5 Z"
+              fill="#fff"
+              stroke="#111"
+              stroke-width="2"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <svg id="ibeam" width="30" height="36" viewBox="0 0 30 36" style="opacity: 0; left: -15px; top: -18px">
+            <path d="M10 4 H20 M15 4 V32 M10 32 H20" stroke="#111" stroke-width="6" fill="none" stroke-linecap="round" />
+            <path d="M10 4 H20 M15 4 V32 M10 32 H20" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" />
+          </svg>
+        </div>
+      </div>
+
+      <div id="caption"><span></span></div>
+
+      <div
+        id="title-card"
+        class="clip card"
+        data-start="0"
+        data-duration="{{FOOTAGE_AT}}"
+        data-track-index="4"
+      >
+        <h1 id="title-text"></h1>
+        <p id="subtitle-text"></p>
+        <div class="bar"></div>
+      </div>
+
+      <div
+        id="end-card"
+        class="clip card"
+        data-start="{{END_AT}}"
+        data-duration="{{END_S}}"
+        data-track-index="5"
+      >
+        <h1 id="end-title"></h1>
+        <p id="end-subtitle"></p>
+        <div class="bar"></div>
+      </div>
+    </div>
+
+    <script>
+      /* zoomPlan:start */
+      // Pure helpers, no DOM: tested from demos/build.test.mjs, which cuts this
+      // block out between the two marker comments. Triggers are
+      // {t, x, y, until?}: seconds into the footage and the point as % of the
+      // main frame. `until` keeps a zoom open while text is typed.
+      var ZOOM_PUSH = 0.6;
+      var ZOOM_BACK = 0.6;
+      var ZOOM_QUIET = 1.2;
+      var ZOOM_NEAR = 30;
+
+      // Push towards the first trigger, hold while triggers stay near each
+      // other and close in time, return after ZOOM_QUIET seconds of nothing.
+      function zoomPlan(triggers) {
+        var sorted = triggers.slice().sort(function (a, b) {
+          return a.t - b.t;
+        });
+        var segs = [];
+        var cur = null;
+        function close(next) {
+          if (!cur) return;
+          cur.returnStart = cur.lastEnd + ZOOM_QUIET;
+          if (next !== undefined) {
+            // The next push begins before this return would: return sooner.
+            cur.returnStart = Math.max(cur.pushEnd, Math.min(cur.returnStart, next - ZOOM_BACK));
+          }
+          cur.returnEnd = cur.returnStart + ZOOM_BACK;
+          segs.push(cur);
+          cur = null;
+        }
+        sorted.forEach(function (tr) {
+          var end = tr.until === undefined ? tr.t : Math.max(tr.until, tr.t);
+          if (cur) {
+            var last = cur.points[cur.points.length - 1];
+            var near = Math.max(Math.abs(tr.x - last.x), Math.abs(tr.y - last.y)) <= ZOOM_NEAR;
+            if (near && tr.t <= cur.lastEnd + ZOOM_QUIET) {
+              cur.points.push({ t: tr.t, x: tr.x, y: tr.y });
+              cur.lastEnd = Math.max(cur.lastEnd, end);
+              return;
+            }
+            close(tr.t);
+          }
+          var prevEnd = segs.length ? segs[segs.length - 1].returnEnd : 0;
+          var pushStart = Math.max(prevEnd, tr.t - ZOOM_PUSH, 0);
+          cur = {
+            pushStart: pushStart,
+            pushEnd: Math.max(tr.t, pushStart + 0.3),
+            points: [{ t: tr.t, x: tr.x, y: tr.y }],
+            lastEnd: end,
+            returnStart: 0,
+            returnEnd: 0,
+          };
+        });
+        close();
+        return segs;
+      }
+
+      // Where an event or mark sits in the main frame, as % of it. The panel's
+      // own track has its own canvas, placed by the anchor.
+      function mainPoint(film, window_, pct, atLeft) {
+        var main = film.tracks.filter(function (k) {
+          return k.window === "main";
+        })[0];
+        var track = film.tracks.filter(function (k) {
+          return k.window === window_ && k.file;
+        })[0];
+        var x = pct[0] + (atLeft ? 0 : pct[2] / 2);
+        var y = pct[1] + pct[3] / 2;
+        if (window_ === "panel" && track && track.anchor && main) {
+          var fw = film.canvas.width;
+          var fh = film.canvas.height;
+          var left = track.anchor.x * fw - track.size[0] / 2;
+          var top = fh * (1 - track.anchor.bottom) - track.size[1];
+          x = ((left + (x / 100) * track.size[0]) / fw) * 100;
+          y = ((top + (y / 100) * track.size[1]) / fh) * 100;
+        }
+        return { x: x, y: y };
+      }
+
+      // Zoom triggers: every mark, and every click and type that has a place.
+      function zoomTriggers(film) {
+        var out = [];
+        (film.marks || []).forEach(function (m) {
+          var p = mainPoint(film, m.window, m.pct, false);
+          out.push({ t: m.frame / film.fps, x: p.x, y: p.y });
+        });
+        (film.events || []).forEach(function (e) {
+          if ((e.kind !== "click" && e.kind !== "type") || !e.pct) return;
+          var p = mainPoint(film, e.window, e.pct, e.kind === "type");
+          var tr = { t: e.t, x: p.x, y: p.y };
+          if (e.kind === "type" && e.until !== undefined) tr.until = e.until;
+          out.push(tr);
+        });
+        return out;
+      }
+      /* zoomPlan:end */
+    </script>
+
+    <script>
+      (function () {
+        var film = window.QMT_FILM;
+        var vars = window.__hyperframes.getVariables();
+        var FW = {{FOOTAGE_W}};
+        var FH = {{FOOTAGE_H}};
+        var T0 = {{FOOTAGE_AT}};
+        var FS = {{FOOTAGE_S}};
+        var END_AT = {{END_AT}};
+        var DUR = {{DURATION}};
+
+        // ---- Layout: the window takes 80% of the stage at the footage's aspect.
+        var s = Math.min((0.8 * 1920) / FW, (0.8 * 1080) / FH);
+        var cw = FW * s;
+        var ch = FH * s;
+        var winW = cw;
+        var winH = ch;
+        var winL = (1920 - winW) / 2;
+        var winT = (1080 - winH) / 2;
+        var q = function (id) {
+          return document.getElementById(id);
+        };
+        var win = q("win");
+        win.style.left = winL + "px";
+        win.style.top = winT + "px";
+        win.style.width = winW + "px";
+        win.style.height = winH + "px";
+        var screen = q("screen");
+        screen.style.width = cw + "px";
+        screen.style.height = ch + "px";
+
+        // The window buttons, where macOS draws them in the app: traffic_light_position
+        // (14, 15), 12 px wide, 20 px apart, all in the footage's logical pixels.
+        var lights = q("lights");
+        lights.style.left = 14 * s + "px";
+        lights.style.top = 15 * s + "px";
+        Array.prototype.forEach.call(lights.children, function (dot, i) {
+          dot.style.left = i * 20 * s + "px";
+          dot.style.width = 12 * s + "px";
+          dot.style.height = 12 * s + "px";
+        });
+        win.style.borderRadius = 10 * s + "px";
+
+        var accent = vars.accent || "#f97316";
+        document.documentElement.style.setProperty("--accent", accent);
+        var bgs = {
+          dark: "linear-gradient(135deg, #14141b 0%, #23202e 55%, #2d1f1a 100%)",
+          light: "linear-gradient(135deg, #e8ecf4 0%, #f6f1ea 100%)",
+          accent: "linear-gradient(135deg, " + accent + " 0%, #1b1020 100%)",
+        };
+        q("bg").style.background = bgs[vars.background] || bgs.dark;
+
+        // Stage position of a point given in % of the main frame.
+        function stage(x, y) {
+          return { x: winL + (x / 100) * cw, y: winT + (y / 100) * ch };
+        }
+
+        // ---- Cards.
+        q("title-text").textContent = vars.title || "";
+        q("subtitle-text").textContent = vars.subtitle || "";
+        q("end-title").textContent = vars.title || "";
+        q("end-subtitle").textContent = vars.subtitle || "";
+        if (!vars.show_title_card) q("title-card").style.display = "none";
+        if (!vars.show_end_card) q("end-card").style.display = "none";
+
+        // ---- Panel layer: the panel's canvas, placed by the anchor.
+        var panel = film.tracks.filter(function (k) {
+          return k.window === "panel" && k.file;
+        })[0];
+        var panelEl = q("panel");
+        if (panel) {
+          var pl = winL + (panel.anchor.x * FW - panel.size[0] / 2) * s;
+          var pt = winT + (FH * (1 - panel.anchor.bottom) - panel.size[1]) * s;
+          panelEl.style.left = pl + "px";
+          panelEl.style.top = pt + "px";
+          panelEl.style.width = panel.size[0] * s + "px";
+          panelEl.style.height = panel.size[1] * s + "px";
+        } else {
+          panelEl.style.display = "none";
+        }
+
+        // ---- Timeline.
+        var tl = gsap.timeline({ paused: true });
+        var world = q("world");
+        gsap.set(world, { scale: 1, x: 0, y: 0, transformOrigin: "0 0" });
+
+        // Cards fade out into the footage and back in after it.
+        tl.fromTo("#title-card", { opacity: 1 }, { opacity: 0, duration: 0.4, ease: "power1.inOut" }, T0 - 0.4);
+        tl.fromTo("#end-card", { opacity: 0 }, { opacity: 1, duration: 0.4, ease: "power1.inOut" }, END_AT);
+
+        // Panel: shown in its visible ranges; the glass follows the bounds.
+        if (panel) {
+          var glass = q("panel-glass");
+          tl.set(panelEl, { opacity: 0 }, 0);
+          panel.visible.forEach(function (r) {
+            tl.set(panelEl, { opacity: 1 }, T0 + r[0] / film.fps);
+            tl.set(panelEl, { opacity: 0 }, T0 + (r[1] + 1) / film.fps);
+          });
+          panel.bounds.forEach(function (b) {
+            tl.set(
+              glass,
+              {
+                left: b[1] * s,
+                top: b[2] * s,
+                width: b[3] * s,
+                height: b[4] * s,
+                borderRadius: 14 * s,
+              },
+              T0 + b[0] / film.fps
+            );
+          });
+        }
+
+        // Cursor: moves between the events that have a place.
+        var stops = [];
+        (film.events || []).forEach(function (e) {
+          if (!e.pct) return;
+          if (e.kind !== "click" && e.kind !== "hover" && e.kind !== "type" && e.kind !== "scroll") return;
+          var p = mainPoint(film, e.window, e.pct, e.kind === "type");
+          var pos = stage(p.x, p.y);
+          if (e.kind === "type") pos.x += 16;
+          stops.push({ t: T0 + e.t, kind: e.kind, until: e.until === undefined ? null : T0 + e.until, x: pos.x, y: pos.y });
+        });
+        stops.sort(function (a, b) {
+          return a.t - b.t;
+        });
+        if (vars.cursor && stops.length) {
+          var cur = q("cursor");
+          var ring = q("ring");
+          var prev = null;
+          var floor = T0;
+          stops.forEach(function (st) {
+            var arrive = st.t - 0.12;
+            if (!prev) {
+              tl.set(cur, { x: st.x, y: st.y }, Math.max(0, arrive - 0.4));
+              tl.fromTo(cur, { opacity: 0 }, { opacity: 1, duration: 0.3 }, Math.max(0, arrive - 0.4));
+            } else {
+              var dist = Math.hypot(st.x - prev.x, st.y - prev.y);
+              var dur = Math.min(0.6, 0.15 + dist / 2500);
+              var start = Math.max(floor, arrive - dur);
+              tl.fromTo(
+                cur,
+                { x: prev.x, y: prev.y },
+                { x: st.x, y: st.y, duration: Math.max(0.05, arrive - start), ease: "power2.inOut" },
+                start
+              );
+            }
+            if (st.kind === "type") {
+              tl.set("#arrow", { opacity: 0 }, st.t);
+              tl.set("#ibeam", { opacity: 1 }, st.t);
+              tl.set("#ibeam", { opacity: 0 }, st.until === null ? st.t + 0.5 : st.until);
+              tl.set("#arrow", { opacity: 1 }, st.until === null ? st.t + 0.5 : st.until);
+            }
+            if (st.kind === "click") {
+              tl.fromTo("#arrow", { scale: 1 }, { scale: 0.85, duration: 0.04, transformOrigin: "3px 2px" }, st.t - 0.04);
+              tl.to("#arrow", { scale: 1, duration: 0.04, transformOrigin: "3px 2px" }, st.t);
+              tl.set(ring, { x: st.x, y: st.y }, st.t);
+              tl.fromTo(
+                ring,
+                { scale: 0.4, opacity: 0.9 },
+                { scale: 1.4, opacity: 0, duration: 0.35, ease: "power2.out" },
+                st.t
+              );
+            }
+            floor = Math.max(floor, st.t);
+            prev = st;
+          });
+          var lastT = Math.max(stops[stops.length - 1].t, stops[stops.length - 1].until || 0);
+          tl.to(cur, { opacity: 0, duration: 0.3 }, Math.min(END_AT - 0.3, lastT + 1.5));
+        }
+
+        // Zoom: the window and everything on it push in towards the target.
+        var z = Math.min(2, Math.max(1, Number(vars.zoom) || 1));
+        if (z > 1) {
+          zoomPlan(zoomTriggers(film)).forEach(function (seg) {
+            function target(pt) {
+              var p = stage(pt.x, pt.y);
+              // Pull the target part of the way to the stage centre.
+              var fx = p.x + (960 - p.x) * 0.4;
+              var fy = p.y + (540 - p.y) * 0.4;
+              return { x: fx - z * p.x, y: fy - z * p.y };
+            }
+            var first = target(seg.points[0]);
+            tl.fromTo(
+              world,
+              { scale: 1, x: 0, y: 0 },
+              { scale: z, x: first.x, y: first.y, duration: seg.pushEnd - seg.pushStart, ease: "power2.inOut" },
+              T0 + seg.pushStart
+            );
+            seg.points.slice(1).forEach(function (pt, i) {
+              var from = target(seg.points[i]);
+              var to = target(pt);
+              tl.fromTo(
+                world,
+                { x: from.x, y: from.y },
+                { x: to.x, y: to.y, duration: 0.4, ease: "power2.inOut" },
+                Math.max(T0 + seg.pushEnd, T0 + pt.t - 0.4)
+              );
+            });
+            var lastPt = target(seg.points[seg.points.length - 1]);
+            tl.fromTo(
+              world,
+              { scale: z, x: lastPt.x, y: lastPt.y },
+              { scale: 1, x: 0, y: 0, duration: seg.returnEnd - seg.returnStart, ease: "power2.inOut" },
+              T0 + seg.returnStart
+            );
+          });
+        }
+
+        // Captions: fade and lift in at `from`, out at `to`.
+        var cap = q("caption");
+        var capText = cap.querySelector("span");
+        (film.captions || []).forEach(function (c) {
+          var from = T0 + c.from;
+          var to = Math.min(END_AT, T0 + c.to);
+          tl.set(capText, { textContent: c.text }, from);
+          tl.fromTo(cap, { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.3, ease: "power2.out" }, from);
+          tl.to(cap, { opacity: 0, duration: 0.3, ease: "power1.in" }, Math.max(from + 0.3, to - 0.3));
+        });
+
+        window.__timelines = window.__timelines || {};
+        window.__timelines["app-clip"] = tl;
+      })();
+    </script>
+  </body>
+</html>

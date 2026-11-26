@@ -98,8 +98,8 @@ Other behaviour:
 Plain Node ESM using only `fs` and `path`:
 
 - **Input checks:** the timing file has `version === 1` and `name === <clip>`, and every track file exists.
-- **Assets:** copies `main.mp4`, `panel.webm` (if listed) and `film.js` into `assets/`, and `shared/hyperframes.json` alongside.
-- **`index.html`:** produced from `shared/app-clip.html` by replacing four placeholders:
+- **Assets:** copies `main.mp4`, `panel.webm` (if listed) and `film.js` into `assets/`, and `shared/hyperframes.json` alongside. As built, it also cuts `first.png` and `last.png` from `main.mp4` with `ffmpeg`, which hold the footage under a disabled card.
+- **`index.html`:** produced from `shared/app-clip.html` by replacing placeholders (the first four below; as built, also `{{FOOTAGE_S}}`, `{{FOOTAGE_AT}}`, `{{END_AT}}`, `{{END_S}}` and `{{PANEL_VIDEO}}`, which keep media timings static):
 
   | Placeholder | Value |
   |---|---|
@@ -114,13 +114,12 @@ Plain Node ESM using only `fs` and `path`:
 ### D4. The shared composition `app-clip.html`
 
 - **Root:** `data-composition-id="app-clip"`, 1920x1080, `data-fps="{{FPS}}"`, `data-duration="{{DURATION}}"`.
-- **Variables (`data-composition-variables`):**
+- **Variables (`data-composition-variables`, on the `<html>` element as an array of declarations; `background` is a string, since the declaration types are string, number, boolean and color):**
 
   | Variable | Type | Default |
   |---|---|---|
   | `title` | string | — |
   | `subtitle` | string | — |
-  | `window_title` | string | `"QueryMT"` |
   | `show_title_card` | boolean | true |
   | `show_end_card` | boolean | true |
   | `cursor` | boolean | true |
@@ -129,7 +128,7 @@ Plain Node ESM using only `fs` and `path`:
   | `accent` | color | `#f97316` |
 - **Structure, back to front:**
   1. a background (a gradient by `background`);
-  2. the window frame: rounded, with a title bar showing three dots and `window_title`, fitted to 80% of the stage at the footage's aspect ratio;
+  2. the window: rounded, fitted to 80% of the stage at the footage's aspect ratio. It has **no title bar of its own**: the app's header is transparent and its window buttons are left to macOS (`traffic_light_position` (14, 15) in `src/ui/mod.rs`), which an offscreen film never draws. The three buttons are drawn over the footage at that spot (12 px wide, 20 px apart, scaled with the footage). This replaces the first design's separate title bar and `window_title` variable, which put a second bar above the app's header;
   3. the main `<video class="clip">` with `src="assets/main.mp4"`, timed after the title card;
   4. the panel layer: `<video>` of `assets/panel.webm`, absolutely placed from `tracks[panel].anchor` and the current `bounds`, with a soft shadow and a backdrop blur over the main footage, shown during `visible` ranges;
   5. the cursor (an SVG arrow; an I-beam during `type` events);
@@ -147,7 +146,7 @@ Plain Node ESM using only `fs` and `path`:
 ### D5. Clips
 
 - **`prompt-and-reply`:** the scene moves from `crates/querymt-gpui/film/scenes/prompt-and-reply.toml`. `clip.json` sets `title` "Ask, and watch it stream" and `subtitle` "QueryMT Desktop".
-- **`quick-chat`:** a fixture world with a few sessions and an open session in the main window. It opens the quick panel, types a question, presses Enter, streams a short answer, ends the turn, then hands off to the main window with `submit_and_open` or the panel's open button, whichever has an element id (checked while writing the scene). `panel = "track"`.
+- **`quick-chat`:** a fixture world with a few sessions and an open session in the main window. It opens the quick panel, types a question, presses Enter, streams a short answer, ends the turn, then hands off to the main window with `submit_and_open` (the scene presses `cmd-enter` in the panel; the panel has no element id for an open button). `panel = "track"`.
 
 ## Risks / Trade-offs
 

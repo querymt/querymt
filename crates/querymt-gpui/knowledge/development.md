@@ -3,7 +3,7 @@ id: gpui-development
 title: Building, testing and changing querymt-gpui
 description: Build targets (native, wasm, Nix), where tests live and how CI runs them, golden files, the in-workspace session core, fonts, release packaging and the OpenSpec change workflow.
 tags: build, test, ci, nextest, clippy, wasm, web, nix, golden, fonts, session core, release, packaging, openspec, workflow
-knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/src/film/*.rs", "crates/querymt-gpui/film/scenes/*.toml"]
+knowledge_paths: ["crates/querymt-gpui/Cargo.toml", "crates/querymt-gpui/build.rs", "crates/querymt-gpui/web/build.sh", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/src/film/*.rs", "crates/querymt-gpui/film/scenes/*.toml", "demos/README.md", "demos/film.sh", "demos/build.mjs", "demos/clips/*/scene.toml"]
 knowledge_sources: ["crates/querymt-gpui/Cargo.toml", ".github/workflows/test-gpui.yml", "crates/querymt-gpui/web/build.sh"]
 ---
 
@@ -94,9 +94,16 @@ QMT_FILM_SCENE=crates/querymt-gpui/film/scenes/smoke.toml \
   fails with a message when unset), `QMT_FILM_OUT` (output base, default `target/film/`),
   `QMT_FILM_AGENT` (`host:port` of a seeded world; overrides the scene's `address`),
   `QMT_FILM_PANEL_CODEC=prores` (panel track as ProRes 4444 `panel.mov` instead of VP9 alpha).
-- Scenes live in `crates/querymt-gpui/film/scenes/`: `smoke.toml` (the harness's own check,
-  also `film::smoke_scene`), `smoke-panel.toml` (the quick panel) and `prompt-and-reply.toml`
-  (the spike's clip).
+- Harness scenes live in `crates/querymt-gpui/film/scenes/`: `smoke.toml` (the harness's own
+  check, also `film::smoke_scene`) and `smoke-panel.toml` (the quick panel). Scenes for demo
+  videos live with their clip, in `demos/clips/<clip>/scene.toml`, for example
+  `demos/clips/prompt-and-reply/scene.toml` (the spike's clip).
+
+### Demo videos
+
+`demos/` turns filmed scenes into finished 1920x1080 videos (window frame, cursor, zoom, captions,
+title cards) with HyperFrames: `demos/film.sh <clip>` films, assembles and renders. See
+`demos/README.md` for the prerequisites, how to add a clip and the composition variables.
 
 ### Scene format (`version = 1`)
 
