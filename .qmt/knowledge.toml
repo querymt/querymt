@@ -44,6 +44,7 @@ include = [
   "crates/querymt-gpui/Cargo.toml",
   "crates/querymt-gpui/build.rs",
   "crates/querymt-gpui/web/build.sh",
+  "crates/querymt-gpui/scripts/hot-patch.sh",
   ".github/workflows/test-gpui.yml",
   "crates/querymt-gpui/src/main.rs",
   "crates/querymt-gpui/src/transport.rs",
