@@ -199,6 +199,7 @@ displaydoc = { version = "0.2" }
 either = { version = "1", features = ["use_std"] }
 fallible-iterator = { version = "0.3", features = ["std"] }
 fastrand = { version = "2" }
+flate2 = { version = "1" }
 fnv = { version = "1" }
 foldhash = { version = "0.2" }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }

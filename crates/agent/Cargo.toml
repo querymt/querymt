@@ -20,7 +20,7 @@ agent-tracing = ["querymt/tracing"]
 # asset serving and qmtcode's `--dashboard`, serving a placeholder page
 # (dashboard-placeholder/). For checks and tests of that code without the wasm
 # build (`cargo t-agent`, `cargo cl-agent`, CI).
-dashboard-server = ["api", "plugin-loaders"]
+dashboard-server = ["api", "plugin-loaders", "dep:flate2"]
 # The dashboard server plus the embedded QueryMT Desktop web UI
 # (crates/querymt-gpui built for wasm32-unknown-unknown with the
 # release-gpui-web profile), served over same-origin ACP. build.rs builds it in
@@ -80,6 +80,9 @@ tokio-util = { version = "0.7", features = ["compat", "rt"] }
 base64.workspace = true
 hex = "0.4"
 sha2 = "0.11"
+# Dashboard assets are embedded gzipped (build.rs); decompressed only for clients
+# that do not accept gzip.
+flate2 = { version = "1", optional = true }
 
 # Unix process-group cleanup on cancellation (shell tool)
 
@@ -106,6 +109,10 @@ path = "src/lib.rs"
 # wasm-bindgen as a library, so the dashboard build needs no wasm-bindgen CLI.
 # Must match the `wasm-bindgen` crate version querymt-gpui pins.
 wasm-bindgen-cli-support = { version = "=0.2.130", optional = true }
+# Gzips the embedded dashboard assets (build_support/gpui_web.rs). `dep:flate2`
+# in `dashboard-server` enables it together with the runtime dependency; build.rs
+# only uses it with `dashboard`.
+flate2 = { version = "1", optional = true }
 
 [dev-dependencies]
 querymt-agent-runtime = { path = "../agent-runtime", features = ["test-support"] }
@@ -117,6 +124,8 @@ env_logger = "0.11"
 clap = { version = "4.5", features = ["derive", "env"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 tower = { version = "0.5", features = ["util"] }
+# build_support/gpui_web.rs is also the `embedded_ui` test target.
+flate2 = "1"
 tokio-tungstenite = "0.30"
 
 [[test]]

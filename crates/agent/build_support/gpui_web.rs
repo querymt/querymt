@@ -3,10 +3,12 @@
 //! or a prebuilt directory named by `QMT_UI_DIST`.
 //!
 //! Used by `build.rs` (which supplies the wasm-bindgen step) and compiled as the
-//! `embedded_ui` test target. It only uses std so the tests need no extra dependencies.
+//! `embedded_ui` test target. Besides std it uses `flate2` (a build- and
+//! dev-dependency) to gzip the assets.
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,6 +71,8 @@ pub(crate) fn prepare_ui(
             }
         };
         write_manifest_if_missing(&staging, version)?;
+        let compressed = compress_assets(&staging)?;
+        let source_log = format!("{source_log}; {}", compressed.summary());
         remove_path_if_exists(&destination)?;
         fs::rename(&staging, &destination).map_err(|err| {
             format!(
@@ -88,6 +92,114 @@ pub(crate) fn prepare_ui(
         let _ = remove_path_if_exists(&staging);
     }
     result
+}
+
+/// Extensions worth gzipping: text and wasm. Images and fonts are already compressed.
+const COMPRESSIBLE: &[&str] = &[
+    "wasm", "js", "mjs", "html", "css", "json", "svg", "map", "txt",
+];
+/// Smaller files stay plain: gzip saves next to nothing on them, and the
+/// `querymt-ui.json` manifest stays readable in the build output.
+const MIN_COMPRESS_BYTES: usize = 1024;
+
+/// What `compress_assets` did, for the build log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CompressionReport {
+    pub(crate) files: usize,
+    pub(crate) original_bytes: u64,
+    pub(crate) compressed_bytes: u64,
+}
+
+impl CompressionReport {
+    pub(crate) fn summary(&self) -> String {
+        if self.files == 0 {
+            return "no assets gzipped".into();
+        }
+        format!(
+            "gzipped {} files, {} -> {}",
+            self.files,
+            human_bytes(self.original_bytes),
+            human_bytes(self.compressed_bytes)
+        )
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MiB", bytes as f64 / MB)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Replaces every compressible asset under `dir` with `<name>.gz` (gzip level 9,
+/// zero timestamp, so builds are reproducible). The server sends the `.gz` bytes
+/// as-is with `Content-Encoding: gzip` (crates/agent/src/server.rs), so only the
+/// compressed copy is embedded. Files under 1 KiB, and files gzip does not make
+/// smaller, stay as they are.
+pub(crate) fn compress_assets(dir: &Path) -> Result<CompressionReport, String> {
+    let mut report = CompressionReport::default();
+    compress_directory(dir, &mut report)?;
+    Ok(report)
+}
+
+fn compress_directory(dir: &Path, report: &mut CompressionReport) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read {}: {err}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+        if kind.is_dir() {
+            compress_directory(&path, report)?;
+        } else if kind.is_file() && is_compressible(&path) {
+            compress_file(&path, report)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_compressible(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| COMPRESSIBLE.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+fn compress_file(path: &Path, report: &mut CompressionReport) -> Result<(), String> {
+    let original =
+        fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if original.len() < MIN_COMPRESS_BYTES {
+        return Ok(());
+    }
+    let compressed =
+        gzip(&original).map_err(|err| format!("failed to gzip {}: {err}", path.display()))?;
+    if compressed.len() >= original.len() {
+        return Ok(());
+    }
+    let mut target = path.as_os_str().to_owned();
+    target.push(".gz");
+    let target = PathBuf::from(target);
+    fs::write(&target, &compressed)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+    report.files += 1;
+    report.original_bytes += original.len() as u64;
+    report.compressed_bytes += compressed.len() as u64;
+    Ok(())
+}
+
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = flate2::GzBuilder::new().mtime(0).write(
+        Vec::with_capacity(data.len() / 2),
+        flate2::Compression::best(),
+    );
+    encoder.write_all(data)?;
+    encoder.finish()
 }
 
 /// Copies a prebuilt UI directory (for example the CI test fixture or the release
@@ -449,6 +561,89 @@ mod tests {
         fs::write(dir.path().join(format!("{OUT_NAME}.js")), "").unwrap();
         let err = verify_bindgen_output(dir.path()).unwrap_err();
         assert!(err.contains("did not write"), "{err}");
+    }
+
+    fn gunzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(data)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn compressible_assets_are_replaced_by_gzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm: Vec<u8> = b"\0asm".iter().copied().cycle().take(64 * 1024).collect();
+        let js = "export function init() { return 42; }\n".repeat(500);
+        fs::write(dir.path().join("app_bg.wasm"), &wasm).unwrap();
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("assets/app.js"), &js).unwrap();
+        // Already compressed or too small to shrink: left as is.
+        fs::write(dir.path().join("logo.png"), b"\x89PNG").unwrap();
+        fs::write(dir.path().join("tiny.json"), b"{}").unwrap();
+
+        let report = compress_assets(dir.path()).unwrap();
+
+        assert_eq!(report.files, 2);
+        assert_eq!(report.original_bytes, (wasm.len() + js.len()) as u64);
+        assert!(report.compressed_bytes < report.original_bytes);
+        assert!(!dir.path().join("app_bg.wasm").exists());
+        assert_eq!(
+            gunzip(&fs::read(dir.path().join("app_bg.wasm.gz")).unwrap()),
+            wasm
+        );
+        assert_eq!(
+            gunzip(&fs::read(dir.path().join("assets/app.js.gz")).unwrap()),
+            js.as_bytes()
+        );
+        assert!(dir.path().join("logo.png").is_file());
+        assert!(dir.path().join("tiny.json").is_file());
+        assert!(!dir.path().join("tiny.json.gz").exists());
+        assert!(report.summary().starts_with("gzipped 2 files"));
+    }
+
+    #[test]
+    fn gzip_output_is_reproducible() {
+        let data = "QueryMT ".repeat(4096);
+        assert_eq!(
+            gzip(data.as_bytes()).unwrap(),
+            gzip(data.as_bytes()).unwrap()
+        );
+        // Zero mtime in the gzip header (bytes 4..8).
+        assert_eq!(&gzip(data.as_bytes()).unwrap()[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn prepared_prebuilt_ui_is_gzipped() {
+        let dist = tempfile::tempdir().unwrap();
+        let html = format!(
+            "<!doctype html><title>QueryMT</title>{}",
+            "<p>x</p>".repeat(200)
+        );
+        fs::write(dist.path().join("index.html"), &html).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let prepared = prepare_ui(
+            out.path(),
+            Path::new("/nonexistent-workspace"),
+            Some(dist.path()),
+            "0.6.0",
+            &no_bindgen,
+        )
+        .unwrap();
+
+        assert!(!prepared.embed_dir.join("index.html").exists());
+        assert_eq!(
+            gunzip(&fs::read(prepared.embed_dir.join("index.html.gz")).unwrap()),
+            html.as_bytes()
+        );
+        assert!(
+            prepared.source_log.contains("gzipped"),
+            "{}",
+            prepared.source_log
+        );
     }
 
     #[test]

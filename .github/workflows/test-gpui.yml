@@ -251,6 +251,23 @@ jobs:
           check /querymt_gpui_bg.wasm application/wasm
           curl -fsS http://127.0.0.1:31337/querymt-ui.json | grep -q '"app":"querymt-gpui"'
 
+          # The wasm is embedded gzipped: sent as-is to gzip clients, decompressed
+          # for others, and revalidated with ETag/If-None-Match.
+          wasm=http://127.0.0.1:31337/querymt_gpui_bg.wasm
+          headers=$(curl -fsS -o "$state/wasm.gz" -D - -H 'Accept-Encoding: gzip' "$wasm" | tr -d '\r')
+          echo "$headers"
+          grep -qi '^content-encoding: gzip$' <<<"$headers"
+          grep -qi '^content-type: application/wasm$' <<<"$headers"
+          etag=$(awk -F': ' 'tolower($1)=="etag"{print $2}' <<<"$headers")
+          test -n "$etag"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Accept-Encoding: gzip' -H "If-None-Match: $etag" "$wasm")
+          echo "revalidation: $status"
+          test "$status" = 304
+          curl -fsS -o "$state/wasm.raw" "$wasm"
+          gunzip -c "$state/wasm.gz" | cmp - "$state/wasm.raw"
+          head -c 4 "$state/wasm.raw" | od -An -tx1 | grep -q '00 61 73 6d'
+
           google-chrome --headless=new --no-sandbox --no-first-run \
             --user-data-dir="$state/chrome" \
             --use-angle=swiftshader --enable-unsafe-swiftshader \
