@@ -6,7 +6,7 @@
 //! here and neither side keeps a copy: tool kinds, the todo plan, reasoning
 //! chunks, workspace announcements and compaction identity.
 
-use crate::events::{AgentEventKind, ArchiveRemoval, ReasoningPartStored};
+use crate::events::{AgentEventKind, ArchiveMerge, ArchiveRemoval, ReasoningPartStored};
 use crate::protocol::{
     CompactionId, Content, ContentBlock, ContentChunk, CursorAnchor, CursorAnchorPosition,
     CursorCapabilities, CursorCompactionAnchor, CursorForkCapabilities, CursorMessageAnchor,
@@ -331,28 +331,41 @@ pub fn stored_summary_updates(
 /// `removal` is the outcome of a removal attempted together with the archive;
 /// without it the text points at `/worktree remove`, and with it the text
 /// states what happened instead of asking the user to run it again.
+///
+/// `merged` is the merge into the source checkout that preceded the archive
+/// (`/worktree merge --archive`); the text then states its outcome.
 pub fn worktree_archived_chunk(
     workspace_id: &str,
     by_session_id: Option<&str>,
     removal: Option<&ArchiveRemoval>,
+    merged: Option<&ArchiveMerge>,
 ) -> ContentChunk {
+    let subject = match merged {
+        None => format!("This session's workspace {workspace_id} was archived"),
+        Some(merge) => format!(
+            "This session's workspace {workspace_id} {}, then archived",
+            merge_outcome_text(merge)
+        ),
+    };
     let text = match removal {
         None => format!(
-            "This session's workspace {workspace_id} was archived. This session is now \
-             read-only; run `/worktree remove` to delete the checkout."
+            "{subject}. This session is now read-only; run `/worktree remove` to delete the \
+             checkout."
         ),
-        Some(ArchiveRemoval::Removed) => format!(
-            "This session's workspace {workspace_id} was archived and removed. This \
-             session is now read-only."
-        ),
+        Some(ArchiveRemoval::Removed) => {
+            format!("{subject} and removed. This session is now read-only.")
+        }
         Some(ArchiveRemoval::Refused { code, message }) => format!(
-            "This session's workspace {workspace_id} was archived, but removal was \
-             refused ({code}): {message}. This session is now read-only."
+            "{subject}, but removal was refused ({code}): {message}. This session is now \
+             read-only."
         ),
     };
     let mut details = serde_json::json!({ "workspaceId": workspace_id });
     if let Some(by) = by_session_id {
         details["bySessionId"] = by.into();
+    }
+    if let Some(merge) = merged {
+        details["merged"] = serde_json::to_value(merge).unwrap_or_default();
     }
     ContentChunk::new(text_block(&text))
         .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
@@ -360,6 +373,25 @@ pub fn worktree_archived_chunk(
             QUERYMT_META_NAMESPACE.to_owned(),
             serde_json::json!({ "worktreeArchived": details }),
         )]))
+}
+
+/// How a merge outcome reads inside the archived update.
+fn merge_outcome_text(merge: &ArchiveMerge) -> String {
+    let branch = merge
+        .branch
+        .as_deref()
+        .map(|branch| format!(" on {branch}"))
+        .unwrap_or_default();
+    match (merge.outcome.as_str(), merge.commit.as_deref()) {
+        ("merged", Some(commit)) => {
+            format!("was merged into its source as commit {commit}{branch}")
+        }
+        ("already_merged", Some(commit)) => {
+            format!("was already merged into its source as commit {commit}{branch}")
+        }
+        ("no_changes", _) => "had nothing to merge: its source already contains the changes".into(),
+        (other, _) => format!("was merged into its source ({other})"),
+    }
 }
 
 /// Reply to a mutating native `/worktree` command. The `message_id` is
@@ -537,10 +569,12 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
             workspace_id,
             by_session_id,
             removal,
+            merged,
         } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
             workspace_id,
             by_session_id.as_deref(),
             removal.as_ref(),
+            merged.as_ref(),
         ))],
         _ => Vec::new(),
     }
@@ -1241,6 +1275,7 @@ mod tests {
             workspace_id: "w1".into(),
             by_session_id: None,
             removal: None,
+            merged: None,
         };
         let updates = replayable_updates(&archived);
         assert!(matches!(
@@ -1306,6 +1341,7 @@ mod tests {
             workspace_id: "w1".into(),
             by_session_id: None,
             removal,
+            merged: None,
         };
 
         let plain = chunk_text(&chunk_of(&archived(None)));
@@ -1335,6 +1371,69 @@ mod tests {
         let value =
             serde_json::to_value(chunk_of(&archived(Some(ArchiveRemoval::Removed)))).unwrap();
         assert_eq!(value["messageId"], "worktree-archived-w1");
+    }
+
+    #[test]
+    fn archived_update_replayed_with_the_merge_outcome() {
+        let archived = |removal, merged| AgentEventKind::WorktreeArchived {
+            workspace_id: "w1".into(),
+            by_session_id: None,
+            removal,
+            merged,
+        };
+        let merge = |outcome: &str, commit: Option<&str>, branch: Option<&str>| ArchiveMerge {
+            outcome: outcome.into(),
+            commit: commit.map(Into::into),
+            branch: branch.map(Into::into),
+        };
+
+        let merged = chunk_text(&chunk_of(&archived(
+            None,
+            Some(merge("merged", Some("abc123"), Some("main"))),
+        )));
+        assert_eq!(
+            merged,
+            "This session's workspace w1 was merged into its source as commit abc123 on main, \
+             then archived. This session is now read-only; run `/worktree remove` to delete \
+             the checkout."
+        );
+
+        let removed = chunk_text(&chunk_of(&archived(
+            Some(ArchiveRemoval::Removed),
+            Some(merge("merged", Some("abc123"), None)),
+        )));
+        assert_eq!(
+            removed,
+            "This session's workspace w1 was merged into its source as commit abc123, then \
+             archived and removed. This session is now read-only."
+        );
+
+        let refused = chunk_text(&chunk_of(&archived(
+            Some(ArchiveRemoval::Refused {
+                code: "unpreserved_content".into(),
+                message: "1 uncommitted".into(),
+            }),
+            Some(merge("already_merged", Some("abc123"), None)),
+        )));
+        assert!(refused.contains("was already merged into its source as commit abc123"));
+        assert!(refused.contains("removal was refused (unpreserved_content)"));
+
+        let nothing = chunk_text(&chunk_of(&archived(
+            None,
+            Some(merge("no_changes", None, None)),
+        )));
+        assert!(nothing.contains("had nothing to merge"), "{nothing}");
+
+        let value = serde_json::to_value(chunk_of(&archived(
+            None,
+            Some(merge("merged", Some("abc123"), Some("main"))),
+        )))
+        .unwrap();
+        assert_eq!(value["messageId"], "worktree-archived-w1");
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE]["worktreeArchived"]["merged"],
+            serde_json::json!({"outcome": "merged", "commit": "abc123", "branch": "main"})
+        );
     }
 
     fn compaction_update(id: &str) -> SessionUpdate {

@@ -96,6 +96,22 @@ pub enum ArchiveRemoval {
     },
 }
 
+/// The merge that preceded a self-archive (`/worktree merge --archive`).
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveMerge {
+    /// `merged`, `already_merged` or `no_changes`.
+    pub outcome: String,
+    /// The commit on the source branch: the new merge commit, or the one that
+    /// already contained the result. Absent for `no_changes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The source branch that received the commit, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 impl From<StopType> for StopReason {
     fn from(stop_type: StopType) -> Self {
         match stop_type {
@@ -817,6 +833,10 @@ pub enum AgentEventKind {
         /// plain archive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removal: Option<ArchiveRemoval>,
+        /// The merge into the source checkout that preceded the archive
+        /// (`/worktree merge --archive`); absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        merged: Option<ArchiveMerge>,
     },
     DelegationRequested {
         delegation: Delegation,
@@ -2385,6 +2405,7 @@ mod tests {
                 code: "unpreserved_content".into(),
                 message: "m".into(),
             }),
+            merged: None,
         };
         let value = serde_json::to_value(&refused).unwrap();
         assert_eq!(
@@ -2394,6 +2415,57 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ArchiveRemoval::Removed).unwrap(),
             serde_json::json!({"type": "removed"})
+        );
+    }
+
+    #[test]
+    fn worktree_archived_with_merge_round_trips() {
+        let plain: AgentEventKind = serde_json::from_value(serde_json::json!({
+            "type": "worktree_archived",
+            "data": {"workspace_id": "w"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            plain,
+            AgentEventKind::WorktreeArchived { merged: None, .. }
+        ));
+        let merged = AgentEventKind::WorktreeArchived {
+            workspace_id: "w".into(),
+            by_session_id: Some("s".into()),
+            removal: None,
+            merged: Some(ArchiveMerge {
+                outcome: "merged".into(),
+                commit: Some("abc123".into()),
+                branch: Some("main".into()),
+            }),
+        };
+        let value = serde_json::to_value(&merged).unwrap();
+        assert_eq!(
+            value["data"]["merged"],
+            serde_json::json!({"outcome": "merged", "commit": "abc123", "branch": "main"})
+        );
+        assert!(value["data"].get("removal").is_none());
+        let back: AgentEventKind = serde_json::from_value(value).unwrap();
+        let AgentEventKind::WorktreeArchived {
+            merged: Some(back), ..
+        } = back
+        else {
+            panic!("the merge must round-trip");
+        };
+        assert_eq!(back.outcome, "merged");
+        assert_eq!(back.commit.as_deref(), Some("abc123"));
+        assert_eq!(back.branch.as_deref(), Some("main"));
+        assert_eq!(merged.tag(), "worktree_archived");
+
+        // `no_changes` carries neither a commit nor a branch.
+        assert_eq!(
+            serde_json::to_value(ArchiveMerge {
+                outcome: "no_changes".into(),
+                commit: None,
+                branch: None,
+            })
+            .unwrap(),
+            serde_json::json!({"outcome": "no_changes"})
         );
     }
 

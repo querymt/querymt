@@ -139,6 +139,7 @@ impl WorkspaceService {
             "sourceSession": true,
             "handoff": true,
             "handoffSummary": true,
+            "merge": true,
         })
     }
 
@@ -394,6 +395,7 @@ impl WorkspaceService {
             return WorkspaceBinding::new(record, &self.storage_root);
         }
 
+        let options = options.with_source_session(intent.source_session_id.clone());
         let binding = self
             .allocate_for_fork(&intent.source_cwd, &options, None)
             .await?;
@@ -511,7 +513,9 @@ impl WorkspaceService {
                 baseline_mode: options.baseline,
                 delegation_batch_id: None,
                 parent_workspace_id: None,
-                parent_session_id: None,
+                // The session forked from: worktree merge lands in its
+                // effective checkout, not the project-group cwd above.
+                parent_session_id: options.source_session_id.clone(),
                 delegation_id: None,
                 preset_baseline: None,
                 mutation_gate: Some(source_gate),
@@ -813,18 +817,33 @@ impl WorkspaceService {
             Some(gate) => gate.run(capture).await??,
             None => capture.await?,
         };
+        self.retain_result(
+            record,
+            &captured.commit,
+            &captured.source_head,
+            verification,
+        )
+        .await
+    }
 
-        // Unique create-only refs preserve results even after partial
-        // publication. The ref is written through the record's canonical
-        // common directory — the administration handle — never through the
-        // checkout path.
+    /// Retain `commit` as an immutable result of `record`: a unique
+    /// create-only ref `refs/qmt/results/<workspace>/<uuid>` written through
+    /// the record's canonical common directory (never the checkout path) and
+    /// a registry row. Shared by [`Self::publish_result`] (a fresh capture)
+    /// and by merging a commit that already exists on the workspace branch.
+    ///
+    /// Unique create-only refs preserve results even after partial
+    /// publication; a partially written ref is never silently replaced.
+    pub async fn retain_result(
+        &self,
+        record: &WorkspaceRecord,
+        commit: &str,
+        captured_head: &str,
+        verification: Option<ResultVerificationStatus>,
+    ) -> WorktreeResult<ResultProvenance> {
         let result_ref = format!("refs/qmt/results/{}/{}", record.id, uuid::Uuid::now_v7());
         self.git
-            .create_ref_if_absent(
-                &record.repository.common_dir,
-                result_ref.as_str(),
-                &captured.commit,
-            )
+            .create_ref_if_absent(&record.repository.common_dir, result_ref.as_str(), commit)
             .await?;
 
         let provenance = ResultProvenance {
@@ -832,12 +851,12 @@ impl WorkspaceService {
                 .baseline
                 .as_ref()
                 .map(|b| b.baseline_commit.clone())
-                .unwrap_or_else(|| captured.source_head.clone()),
-            result_commit: Some(captured.commit.clone()),
+                .unwrap_or_else(|| captured_head.to_string()),
+            result_commit: Some(commit.to_string()),
             result_ref: Some(result_ref),
             verification,
             captured_at: time::OffsetDateTime::now_utc(),
-            captured_head: Some(captured.source_head),
+            captured_head: Some(captured_head.to_string()),
         };
         self.registry.record_result(&record.id, &provenance).await?;
         Ok(provenance)
@@ -2392,6 +2411,256 @@ mod tests {
         assert_eq!(commit, done.commit);
     }
 
+    // ── Worktree merge into the source checkout ──────────────────────────────
+
+    async fn git_in(path: &Path, args: &[&str]) -> String {
+        CliGit::new()
+            .run(path, args)
+            .await
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string()
+    }
+
+    /// An unmanaged source checkout (session `sess-src`) and a top-level
+    /// worktree created from it and owned by `sess-wt`. With `dirty_source`
+    /// the source has an uncommitted edit to `file.txt` when the worktree is
+    /// created from its current working tree.
+    async fn merge_world(
+        dirty_source: bool,
+    ) -> (
+        TempDir,
+        TempDir,
+        Arc<crate::worktree::FaultInjectingRepoOps>,
+        WorkspaceService,
+        WorkspaceRecord,
+    ) {
+        use crate::worktree::FaultInjectingRepoOps;
+
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "one")]);
+        // gix fixtures leave no index: build it so the checkout is clean.
+        git_in(repo.path(), &["reset", "-q"]).await;
+        let storage = TempDir::new().unwrap();
+        let faults = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        for id in ["sess-src", "sess-wt"] {
+            conn.execute(
+                "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+                 VALUES (?1, ?1, '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+                [id],
+            )
+            .unwrap();
+        }
+        let svc = WorkspaceService::new(
+            faults.clone(),
+            Arc::new(SqliteWorkspaceRepository::new(Arc::new(StdMutex::new(
+                conn,
+            )))),
+            storage.path(),
+        );
+        let baseline = if dirty_source {
+            fs::write(repo.path().join("file.txt"), "uncommitted").unwrap();
+            BaselineMode::CurrentWorkingTree
+        } else {
+            BaselineMode::Commit
+        };
+        let binding = svc
+            .allocate_for_new_session(
+                repo.path(),
+                &SessionCreationOptions::isolated_worktree(baseline)
+                    .with_source_session("sess-src"),
+            )
+            .await
+            .unwrap()
+            .expect("isolation allocates");
+        let record = svc.bind_owner(&binding.record.id, "sess-wt").await.unwrap();
+        (repo, storage, faults, svc, record)
+    }
+
+    /// Publish the worktree's working state and return the result commit.
+    async fn snapshot(svc: &WorkspaceService, record: &WorkspaceRecord) -> String {
+        svc.publish_result(
+            record,
+            &record.checkout_path,
+            None,
+            Some(ResultVerificationStatus::Skipped),
+        )
+        .await
+        .unwrap()
+        .result_commit
+        .unwrap()
+    }
+
+    async fn merge_of(
+        svc: &WorkspaceService,
+        record: &WorkspaceRecord,
+        result: &str,
+    ) -> crate::worktree::IntegrationOutcome {
+        svc.merge_workspace(&crate::worktree::MergeRequest {
+            record,
+            result_commit: result,
+            source_session_cwd: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The worktree changes only `b.txt`; the source's uncommitted edit to
+    /// `file.txt` (inherited into the baseline) is neither committed nor
+    /// disturbed.
+    #[tokio::test]
+    async fn merge_commits_only_the_worktrees_own_changes() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (repo, _storage, _faults, svc, record) = merge_world(true).await;
+        let head_before = git_in(repo.path(), &["rev-parse", "HEAD"]).await;
+        fs::write(record.checkout_path.join("b.txt"), "worktree work").unwrap();
+        let result = snapshot(&svc, &record).await;
+
+        let IntegrationOutcome::Integrated(done) = merge_of(&svc, &record, &result).await else {
+            panic!("the merge must create a commit");
+        };
+
+        let paths: Vec<_> = done.changed_paths.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt"]);
+        assert_eq!(done.parent, head_before);
+        assert_eq!(
+            git_in(repo.path(), &["rev-parse", "HEAD"]).await,
+            done.commit
+        );
+        assert_eq!(
+            git_in(repo.path(), &["show", "--name-only", "--format=", "HEAD"]).await,
+            "b.txt"
+        );
+        assert_eq!(
+            git_in(repo.path(), &["log", "-1", "--format=%an <%ae>"]).await,
+            "test <test@example.com>"
+        );
+        // The uncommitted file stays uncommitted and untouched.
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "uncommitted"
+        );
+        assert_eq!(git_in(repo.path(), &["show", "HEAD:file.txt"]).await, "one");
+        assert_eq!(
+            fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+            "worktree work"
+        );
+    }
+
+    /// The source branch gained an unrelated commit after the worktree was
+    /// created: the merge commit sits on top and keeps that change.
+    #[tokio::test]
+    async fn merge_layers_onto_a_moved_source_branch() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (repo, _storage, _faults, svc, record) = merge_world(false).await;
+        fs::write(repo.path().join("other.txt"), "moved on").unwrap();
+        git_in(repo.path(), &["add", "other.txt"]).await;
+        git_in(repo.path(), &["commit", "-q", "-m", "unrelated"]).await;
+        let moved = git_in(repo.path(), &["rev-parse", "HEAD"]).await;
+        fs::write(record.checkout_path.join("b.txt"), "worktree work").unwrap();
+        let result = snapshot(&svc, &record).await;
+
+        let IntegrationOutcome::Integrated(done) = merge_of(&svc, &record, &result).await else {
+            panic!("the merge must layer onto the moved branch");
+        };
+
+        assert_eq!(done.parent, moved);
+        assert_eq!(
+            git_in(repo.path(), &["show", "HEAD:other.txt"]).await,
+            "moved on"
+        );
+        assert_eq!(
+            git_in(repo.path(), &["show", "HEAD:b.txt"]).await,
+            "worktree work"
+        );
+    }
+
+    /// Several worktree commits plus uncommitted edits land as exactly one
+    /// commit whose only parent is the previous source HEAD.
+    #[tokio::test]
+    async fn merge_is_a_single_squashed_commit() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (repo, _storage, _faults, svc, record) = merge_world(false).await;
+        let head_before = git_in(repo.path(), &["rev-parse", "HEAD"]).await;
+        let wt = record.checkout_path.clone();
+        for (name, body) in [("one.txt", "1"), ("two.txt", "2")] {
+            fs::write(wt.join(name), body).unwrap();
+            git_in(&wt, &["add", name]).await;
+            git_in(&wt, &["commit", "-q", "-m", name]).await;
+        }
+        fs::write(wt.join("three.txt"), "3").unwrap();
+        let result = snapshot(&svc, &record).await;
+
+        let IntegrationOutcome::Integrated(done) = merge_of(&svc, &record, &result).await else {
+            panic!("the merge must create a commit");
+        };
+
+        assert_eq!(
+            git_in(
+                repo.path(),
+                &["rev-list", "--count", &format!("{head_before}..HEAD")]
+            )
+            .await,
+            "1"
+        );
+        assert_eq!(
+            git_in(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]).await,
+            format!("{} {head_before}", done.commit)
+        );
+        let message = git_in(repo.path(), &["log", "-1", "--format=%B"]).await;
+        assert!(
+            message.starts_with(&format!("Merge worktree {}", record.branch.as_str())),
+            "{message}"
+        );
+        assert!(message.contains(&format!("QueryMT-Workspace: {}", record.id)));
+        assert!(message.contains(&format!("QueryMT-Result: {result}")));
+        assert!(message.contains(&format!(
+            "QueryMT-Baseline: {}",
+            record.baseline.as_ref().unwrap().baseline_commit
+        )));
+        let paths: Vec<_> = done.changed_paths.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["one.txt", "three.txt", "two.txt"]);
+    }
+
+    /// Neither the source session's checkout nor the recorded source cwd
+    /// resolves to a checkout of the repository: refused, nothing changes.
+    #[tokio::test]
+    async fn merge_source_checkout_no_longer_exists() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (repo, _storage, _faults, svc, record) = merge_world(false).await;
+        let head_before = git_in(repo.path(), &["rev-parse", "HEAD"]).await;
+        fs::write(record.checkout_path.join("b.txt"), "worktree work").unwrap();
+        let result = snapshot(&svc, &record).await;
+
+        let elsewhere = init_repo();
+        for source_cwd in [
+            "/nonexistent/qmt/source".to_string(),
+            elsewhere.path().display().to_string(),
+        ] {
+            let mut orphaned = record.clone();
+            orphaned.source_cwd = source_cwd;
+            let IntegrationOutcome::Refused(refusal) = merge_of(&svc, &orphaned, &result).await
+            else {
+                panic!("a missing source must refuse");
+            };
+            assert_eq!(refusal.code, "source_missing");
+        }
+        assert_eq!(
+            git_in(repo.path(), &["rev-parse", "HEAD"]).await,
+            head_before
+        );
+        assert!(!repo.path().join("b.txt").exists());
+    }
+
     /// A lock QueryMT did not create is never removed; the acceptance is
     /// refused and nothing changes.
     #[tokio::test]
@@ -2720,6 +2989,38 @@ mod tests {
             fs::read_to_string(nested.effective_cwd.join("file.txt")).unwrap(),
             "parent edit"
         );
+    }
+
+    /// A fork records the session it was forked from as the workspace's
+    /// parent, so `worktree merge` targets that session's checkout rather
+    /// than the project-group cwd a nested fork inherits.
+    #[tokio::test]
+    async fn fork_records_the_source_session_as_parent() {
+        let (repo, _storage, svc) = service().await;
+        let options = SessionCreationOptions::isolated_worktree(BaselineMode::Commit);
+        let top = svc
+            .allocate_for_new_session(repo.path(), &options)
+            .await
+            .unwrap()
+            .expect("isolation allocates")
+            .record;
+        assert_eq!(top.ownership.parent_session_id, None);
+
+        let forked = svc
+            .allocate_for_fork(
+                &top.session_cwd(),
+                &options.clone().with_source_session("sess-owner"),
+                None,
+            )
+            .await
+            .unwrap()
+            .record;
+        assert_eq!(
+            forked.ownership.parent_session_id.as_deref(),
+            Some("sess-owner")
+        );
+        // The project grouping is unchanged: only the merge target differs.
+        assert_eq!(forked.source_cwd, top.source_cwd);
     }
 
     /// The source cwd is stored as given (not canonicalized) so it matches
@@ -3312,6 +3613,22 @@ mod tests {
             .await
             .unwrap();
         assert!(binding.is_none(), "unbound sessions keep local behavior");
+    }
+
+    /// Clients learn that worktrees can be merged back into their source.
+    #[tokio::test]
+    async fn merge_capability_advertised() {
+        let (_repo, _storage, svc) = service().await;
+        for meta in [
+            svc.capability_meta(),
+            WorkspaceService::capability_meta_for(BaselineMode::Commit),
+        ] {
+            assert_eq!(meta["merge"], true);
+            // Existing features stay advertised.
+            assert_eq!(meta["handoff"], true);
+            assert_eq!(meta["handoffSummary"], true);
+            assert_eq!(meta["sourceSession"], true);
+        }
     }
 
     #[test]

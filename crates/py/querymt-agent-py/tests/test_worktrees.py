@@ -35,6 +35,10 @@ def repo(tmp_path: Path) -> Path:
     path = tmp_path / "repo"
     path.mkdir()
     git(path, "init", "-q", "-b", "main")
+    # Native integration (worktree merge) reads the identity from the repository
+    # config, not from this helper's environment, and CI has no global config.
+    git(path, "config", "user.name", "t")
+    git(path, "config", "user.email", "t@example.com")
     (path / "README.md").write_text("hello\n")
     git(path, "add", "README.md")
     git(path, "commit", "-q", "-m", "initial")
@@ -235,6 +239,88 @@ def test_handoff_moves_ownership_to_a_new_session(repo, tmp_path):
         with pytest.raises(WorktreeError) as bad:
             await agent.worktrees.handoff()
         assert bad.value.code == "invalid_options"
+
+    run(scenario())
+
+
+def head_subject(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "log", "-1", "--format=%s"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_merge_lands_the_worktree_as_one_commit_in_the_source(repo, tmp_path):
+    async def scenario():
+        agent = await make_agent(
+            repo, tmp_path, worktrees={"storage_root": str(tmp_path / "wt")}
+        )
+        created = await agent.worktrees.create(name="feature")
+        cwd = Path(created["session_cwd"])
+        (cwd / "feature.txt").write_text("new\n")
+        (cwd / "README.md").write_text("changed\n")
+
+        merged = await agent.worktrees.merge(workspace_id=created["workspace_id"])
+        assert merged["outcome"] == "merged"
+        assert merged["published"] is True
+        assert merged["commit"]
+        assert sorted(p["path"] for p in merged["changed_paths"]) == [
+            "README.md",
+            "feature.txt",
+        ]
+        assert (repo / "feature.txt").read_text() == "new\n"
+        assert (repo / "README.md").read_text() == "changed\n"
+        assert head_subject(repo).startswith("Merge worktree")
+
+        # The same version again is recognised, not committed twice.
+        again = await agent.worktrees.merge(
+            session_id=created["session_id"], commit=merged["result"]["result_commit"]
+        )
+        assert again["outcome"] == "already_merged"
+        assert again["commit"] == merged["commit"]
+
+        # Follow-up: archive once the source contains the result.
+        archived = await agent.worktrees.merge(
+            workspace_id=created["workspace_id"],
+            commit=merged["result"]["result_commit"],
+            archive=True,
+        )
+        assert archived["follow_up"]["archived"] is True
+        status = await agent.worktrees.status(created["workspace_id"])
+        assert status["lifecycle"] == "archived"
+
+    run(scenario())
+
+
+def test_merge_refusals_carry_code_and_paths(repo, tmp_path):
+    async def scenario():
+        agent = await make_agent(
+            repo, tmp_path, worktrees={"storage_root": str(tmp_path / "wt")}
+        )
+        created = await agent.worktrees.create(name="clash")
+        (Path(created["session_cwd"]) / "README.md").write_text("from worktree\n")
+        # A local edit in the source to a file the worktree changed.
+        (repo / "README.md").write_text("local edit\n")
+
+        with pytest.raises(WorktreeError) as refused:
+            await agent.worktrees.merge(workspace_id=created["workspace_id"])
+        assert refused.value.code == "touches_local_changes"
+        assert refused.value.paths == ["README.md"]
+        assert (repo / "README.md").read_text() == "local edit\n"
+
+        with pytest.raises(WorktreeError) as both:
+            await agent.worktrees.merge(
+                workspace_id=created["workspace_id"], archive=True, remove=True
+            )
+        assert both.value.code == "invalid_options"
+        assert both.value.paths == []
+
+        with pytest.raises(WorktreeError) as none:
+            await agent.worktrees.merge()
+        assert none.value.code == "invalid_options"
 
     run(scenario())
 

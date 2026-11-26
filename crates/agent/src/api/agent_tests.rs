@@ -2887,6 +2887,144 @@ mod workspace_api {
         assert_eq!(created.baseline_mode, "commit");
     }
 
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// An isolated worktree session that has written `file` (relative to its
+    /// checkout); returns `(session id, workspace id)`.
+    async fn worktree_writing(f: &Fixture, file: &str) -> (String, String) {
+        let session = f
+            .agent
+            .chat_session_with(SessionOptions::worktree())
+            .await
+            .unwrap();
+        let binding = session.workspace().expect("disclosed binding");
+        let cwd = std::path::PathBuf::from(binding["sessionCwd"].as_str().unwrap());
+        std::fs::write(cwd.join(file), "work\n").unwrap();
+        (
+            session.id().to_string(),
+            binding["workspaceId"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The same merge through the facade, native `/worktree merge` and
+    /// `querymt/worktree/merge`: the same outcome and, when refused, the
+    /// same code and paths.
+    #[tokio::test]
+    async fn equivalent_merge_across_surfaces() {
+        use crate::worktree::MergeOptions;
+
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        // gix fixtures leave no index: build it so the checkout is clean.
+        git(f.repo.path(), &["reset", "-q"]);
+        let worktrees = f.agent.worktrees().unwrap();
+        let handle = f.agent.handle();
+
+        let native = async |session_id: &str, line: &str| -> serde_json::Value {
+            let response = handle
+                .prompt(crate::acp::protocol::PromptRequest::new(
+                    session_id.to_owned(),
+                    vec![crate::acp::protocol::ContentBlock::Text(
+                        crate::acp::protocol::TextContent::new(line),
+                    )],
+                ))
+                .await
+                .unwrap();
+            response.meta.unwrap()["querymt.worktree"].clone()
+        };
+        let ext = async |workspace_id: &str| -> Result<serde_json::Value, serde_json::Value> {
+            let params = serde_json::json!({ "workspace_id": workspace_id }).to_string();
+            match handle
+                .ext_method(crate::acp::protocol::ExtRequest::new(
+                    "querymt/worktree/merge",
+                    Arc::from(serde_json::value::RawValue::from_string(params).unwrap()),
+                ))
+                .await
+            {
+                Ok(response) => Ok(serde_json::from_str(response.0.get()).unwrap()),
+                Err(err) => Err(err.data.unwrap_or_default()),
+            }
+        };
+
+        // A refused merge: the source holds local state on the touched path.
+        let (native_session, native_ws) = worktree_writing(&f, "clash.txt").await;
+        let (_, facade_ws) = worktree_writing(&f, "clash.txt").await;
+        let (_, ext_ws) = worktree_writing(&f, "clash.txt").await;
+        std::fs::write(f.repo.path().join("clash.txt"), "mine\n").unwrap();
+        let head = git(f.repo.path(), &["rev-parse", "HEAD"]);
+
+        let facade_err = worktrees
+            .merge(
+                WorkspaceTarget::Workspace(facade_ws),
+                MergeOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        let facade_refusal = facade_err.error_data();
+        let native_refusal =
+            native(&native_session, &format!("/worktree merge {native_ws}")).await["error"].clone();
+        let ext_refusal = ext(&ext_ws).await.unwrap_err();
+        for refusal in [&facade_refusal, &native_refusal, &ext_refusal] {
+            assert_eq!(refusal["code"], "touches_local_changes", "{refusal}");
+            assert_eq!(refusal["paths"], serde_json::json!(["clash.txt"]));
+        }
+        assert_eq!(git(f.repo.path(), &["rev-parse", "HEAD"]), head);
+
+        // Successful merges: three worktrees each adding one file.
+        std::fs::remove_file(f.repo.path().join("clash.txt")).unwrap();
+        let (native_session, native_ws) = worktree_writing(&f, "native.txt").await;
+        let (_, facade_ws) = worktree_writing(&f, "facade.txt").await;
+        let (_, ext_ws) = worktree_writing(&f, "ext.txt").await;
+
+        let facade_done = serde_json::to_value(
+            worktrees
+                .merge(
+                    WorkspaceTarget::Workspace(facade_ws),
+                    MergeOptions::default(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let native_done = native(&native_session, &format!("/worktree merge {native_ws}")).await;
+        let ext_done = ext(&ext_ws).await.unwrap();
+
+        for done in [&facade_done, &native_done, &ext_done] {
+            assert_eq!(done["outcome"], "merged", "{done}");
+            assert_eq!(done["published"], true);
+            assert_eq!(done["branch"], facade_done["branch"]);
+            assert_eq!(done["ignored_files"], facade_done["ignored_files"]);
+            assert_eq!(done["changed_paths"].as_array().map(Vec::len), Some(1));
+            assert_eq!(
+                done["changed_paths"][0]["kind"],
+                facade_done["changed_paths"][0]["kind"]
+            );
+            assert!(done.get("follow_up").is_none(), "{done}");
+        }
+        for file in ["native.txt", "facade.txt", "ext.txt"] {
+            assert!(f.repo.path().join(file).exists(), "{file} merged");
+        }
+        assert_eq!(
+            git(
+                f.repo.path(),
+                &["rev-list", "--count", &format!("{head}..HEAD")]
+            ),
+            "3",
+            "one squashed commit per merge"
+        );
+    }
+
     /// A loaded isolated session reports its durable binding; a loaded local
     /// session still reports none.
     #[tokio::test]

@@ -112,7 +112,44 @@
   while its delegation runs cancels that delegation, as a cancel requested by the
   agent does.
 
+- **`/worktree merge`: merge a top-level worktree into its source checkout.**
+  `/worktree merge [id] [--commit <rev>] [--archive|--remove]`, the
+  `querymt/worktree/merge` extension method, `AgentWorktrees::merge` and
+  `agent.worktrees.merge(...)` (Python) snapshot the worktree's working state, or
+  take a chosen retained result or commit on the worktree branch, and land it as
+  one squashed commit on the source checkout's current branch. Only the
+  baseline-relative delta is committed, so uncommitted files a dirty source
+  contributed to the baseline are not swept in. It runs the same native pipeline
+  as accepting a delegate result: refusal on local edits, the repository's commit
+  hooks with no bypass, compare-and-swap branch update and crash recovery.
+  Refusals carry stable codes (`merge_conflict`, `touches_local_changes`,
+  `source_missing`, `source_active`, `commit_not_on_workspace_branch`, ...) and
+  the offending `paths`; Python's `WorktreeError` gains `.paths`. `--archive` and
+  `--remove` run after the source contains the result, and a failure there never
+  undoes the merge. See "Merging a worktree" in the worktrees guide.
+
 ### Behavior changes
+
+- **BREAKING (ACP wire shape, additive): worktree merge.** New extension method
+  `querymt/worktree/merge` (`{workspace_id|session_id, commit?, archive?,
+  remove?}`; `archive` with `remove` is `invalid_options`); the native
+  `/worktree` usage text lists `merge`; `worktree_command_completed` can carry
+  `command = "merge"` and its reply is durable and replayed on load; the
+  workspace capability metadata gains `merge: true`; merge refusals add `paths`
+  to the error data. Clients should offer "Merge into source" when `merge` is
+  advertised.
+
+- **BREAKING (journal and typeshare, additive): `worktree_archived` carries the
+  merge.** The event gains an optional `merged` field (`ArchiveMerge`: `outcome`,
+  and `commit` and `branch` when present), set when a session merges and archives
+  its own worktree, so the replayed archive update states the merge outcome.
+  Consumers of the generated types (querymt-desktop) need the new field.
+
+- **BREAKING (Rust API): `OwnerHost` gains `ensure_idle`, and `announce_archived`
+  takes the merge.** Out-of-tree implementors of
+  `querymt_agent::worktree::OwnerHost` must implement `ensure_idle` and accept the
+  new `merged` argument; `WorktreeOpError` gains a `Refused` variant. In-tree
+  implementors are updated.
 
 - **BREAKING (ACP wire shape, additive): `session/list` reports each session's
   plans.** Entries for local sessions with a todo list carry the top-level

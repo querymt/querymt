@@ -1256,7 +1256,9 @@ impl SessionMaterializer {
         // source is a live managed workspace.
         Ok(Some(ForkWorkspacePlan {
             source_cwd,
-            options,
+            // Records the forked-from session so `worktree merge` targets its
+            // checkout (a nested fork of a managed checkout included).
+            options: options.with_source_session(source_session_id),
             source_gate: source_binding.as_ref().map(|b| b.mutation_gate.clone()),
         }))
     }

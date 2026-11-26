@@ -12,7 +12,7 @@ use crate::worktree::{
     BaselineMode, BaselineSource, ResultProvenance, ResultVerificationStatus, WorkspaceId,
     WorkspaceLifecycle, WorkspaceRecord, WorkspaceService, WorktreeError,
 };
-use querymt_agent_core::events::ArchiveRemoval;
+use querymt_agent_core::events::{ArchiveMerge, ArchiveRemoval};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,12 +54,40 @@ pub enum WorktreeOpError {
     /// (for example `workspace_service_unavailable` or `isolation_unsupported_layout`).
     #[error("{message}")]
     Rejected { code: String, message: String },
+    /// An integration (merge) was refused or conflicted without changing the
+    /// target checkout. `paths` names the offending paths when there are any;
+    /// the readable text lists them too, so a replayed reply keeps them.
+    #[error("{}", refused_text(.message, .paths))]
+    Refused {
+        code: String,
+        message: String,
+        paths: Vec<String>,
+    },
     /// A workspace-level failure.
     #[error(transparent)]
     Worktree(#[from] WorktreeError),
     /// An invariant of the operation was violated.
     #[error("{0}")]
     Internal(String),
+}
+
+/// Readable text of a refusal: its message, then the offending paths (the
+/// first few, with a count of the rest).
+fn refused_text(message: &str, paths: &[String]) -> String {
+    const SHOWN: usize = 10;
+    if paths.is_empty() {
+        return message.to_owned();
+    }
+    let listed = paths
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match paths.len().saturating_sub(SHOWN) {
+        0 => format!("{message}: {listed}"),
+        more => format!("{message}: {listed} and {more} more"),
+    }
 }
 
 fn removal_state(archived: &bool) -> &'static str {
@@ -82,7 +110,7 @@ impl WorktreeOpError {
     /// Stable machine-readable error code.
     pub fn code(&self) -> &str {
         match self {
-            Self::Rejected { code, .. } => code,
+            Self::Rejected { code, .. } | Self::Refused { code, .. } => code,
             Self::ServiceUnavailable => "workspace_service_unavailable",
             Self::InvalidOptions(_) => "invalid_options",
             Self::UnknownWorkspace(_) => "workspace_not_found",
@@ -96,13 +124,29 @@ impl WorktreeOpError {
         }
     }
 
+    /// A refusal from the integration pipeline, keeping its stable code and
+    /// offending paths.
+    pub(crate) fn refused(refusal: crate::worktree::integrate::Refusal) -> Self {
+        Self::Refused {
+            code: refusal.code.to_owned(),
+            message: refusal.message,
+            paths: refusal.paths,
+        }
+    }
+
     /// The machine-readable error body shared by ACP error data and native
     /// command responses: `{ code, message }`, plus `archived: true` when a
-    /// refused removal followed a successful archive.
+    /// refused removal followed a successful archive and `paths` when a
+    /// refusal names offending paths.
     pub fn error_data(&self) -> serde_json::Value {
         let mut data = serde_json::json!({ "code": self.code(), "message": self.to_string() });
         if matches!(self, Self::RemovalRefused { archived: true, .. }) {
             data["archived"] = true.into();
+        }
+        if let Self::Refused { paths, .. } = self
+            && !paths.is_empty()
+        {
+            data["paths"] = serde_json::json!(paths);
         }
         data
     }
@@ -387,6 +431,84 @@ pub struct ArchiveOutcome {
     pub announcement: Option<Announcement>,
 }
 
+/// What happens to a worktree after its result was merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUp {
+    /// Archive the workspace (the checkout stays).
+    Archive,
+    /// Archive, then remove the workspace under the usual safety rules.
+    Remove,
+}
+
+/// Inputs of [`WorktreeOps::merge`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeOptions {
+    /// Merge this version instead of snapshotting the working state: a
+    /// retained result (full id or at least 7 hex digits) or a commit on the
+    /// worktree branch after its baseline.
+    pub commit: Option<String>,
+    pub follow_up: Option<FollowUp>,
+}
+
+/// A refusal of the follow-up step, reported next to a successful merge.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeFollowUpError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// Result of the `--archive` / `--remove` step of a merge.
+#[derive(Debug, Clone, Serialize)]
+pub struct FollowUpOutcome {
+    pub archived: bool,
+    pub removed: bool,
+    /// The removal report (retained refs and so on) when the workspace was
+    /// removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal: Option<WorktreeRemoveResponse>,
+    /// Why the follow-up did not complete; the merge itself still happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WorktreeFollowUpError>,
+}
+
+/// Result of merging a worktree into its source checkout.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeMergeResponse {
+    pub workspace_id: String,
+    /// The worktree's own branch.
+    pub workspace_branch: String,
+    /// `merged`, `already_merged` or `no_changes`.
+    pub outcome: String,
+    /// The commit on the source branch: the new merge commit, or the one that
+    /// already contained the result. Absent for `no_changes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The source branch that received the commit, when it was created now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Paths the merged version changes relative to the baseline.
+    pub changed_paths: Vec<WorktreeChangedPath>,
+    /// The merged version.
+    pub result: WorktreeResultEntry,
+    /// Whether this merge published `result` (a default merge snapshots the
+    /// working state; `--commit` merges an existing version).
+    pub published: bool,
+    /// Ignored files the snapshot did not capture.
+    pub ignored_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<FollowUpOutcome>,
+}
+
+/// [`WorktreeOps::merge_announced`]'s response plus the owner-stream
+/// announcement of a self-archive, when the follow-up made one.
+#[derive(Debug, Clone)]
+pub struct MergeOutcome {
+    pub response: WorktreeMergeResponse,
+    pub announcement: Option<Announcement>,
+}
+
 fn removal_response(report: crate::worktree::RemovalReport) -> WorktreeRemoveResponse {
     WorktreeRemoveResponse {
         workspace_id: report.workspace_id.to_string(),
@@ -424,19 +546,38 @@ pub trait OwnerHost: Send + Sync {
     /// refused with `owner_active` and the actor is left untouched.
     async fn quiesce_owner(&self, session_id: &str) -> Result<(), WorktreeOpError>;
 
+    /// Refuse with `owner_active` when `session_id` has a running turn,
+    /// queued input or steering, without unloading it (unlike
+    /// [`Self::quiesce_owner`]). A session that is unknown or not loaded is
+    /// idle. Used before a merge snapshots a worktree and before it
+    /// integrates into the source checkout of a running session.
+    ///
+    /// Only observes: it does not reserve the session, so a turn can start
+    /// right after it returns.
+    async fn ensure_idle(&self, session_id: &str) -> Result<(), WorktreeOpError>;
+
+    /// The persisted cwd of `session_id`, `None` when the session is unknown
+    /// or not hosted here. Merge uses it as the source checkout when the
+    /// session is not bound to a managed workspace.
+    async fn session_cwd(&self, _session_id: &str) -> Result<Option<PathBuf>, WorktreeOpError> {
+        Ok(None)
+    }
+
     /// Announce a committed archive on the owner's event stream.
     ///
     /// Best effort: a failure is logged by the host and never fails the
     /// archive, which is already committed. Returns the event's `session_seq`.
     ///
     /// `removal` is the outcome of the removal attempted with the archive
-    /// (`remove --archive`); `None` for a plain archive.
+    /// (`remove --archive`); `None` for a plain archive. `merged` is the
+    /// merge into the source checkout that preceded it (`merge --archive`).
     async fn announce_archived(
         &self,
         owner: &str,
         workspace_id: &str,
         by_session_id: Option<&str>,
         removal: Option<ArchiveRemoval>,
+        merged: Option<ArchiveMerge>,
     ) -> Option<i64>;
 }
 
@@ -1012,14 +1153,30 @@ impl WorktreeOps {
         target: &WorkspaceTarget,
     ) -> Result<WorktreePublishResponse, WorktreeOpError> {
         let record = self.resolve(target).await?;
+        let provenance = self.publish_snapshot(&record).await?;
+        Ok(WorktreePublishResponse {
+            workspace_id: record.id.to_string(),
+            checkout_path: record.checkout_path.display().to_string(),
+            branch: record.branch.as_str().to_string(),
+            baseline_includes_uncommitted_edits: includes_uncommitted_edits(&record),
+            integration_warning: dirty_baseline_warning(&record),
+            result: self.result_entry(&record, &provenance).await,
+        })
+    }
+
+    /// Capture the checkout's working state under its mutation gate and
+    /// retain it as a result (verification `skipped`).
+    async fn publish_snapshot(
+        &self,
+        record: &WorkspaceRecord,
+    ) -> Result<ResultProvenance, WorktreeOpError> {
         let gate = crate::worktree::CheckoutMutationGate::new(
             self.service.storage_root(),
             &record.checkout_path,
         )?;
-        let provenance = self
-            .service
+        self.service
             .publish_result(
-                &record,
+                record,
                 &record.checkout_path,
                 Some(&gate),
                 Some(ResultVerificationStatus::Skipped),
@@ -1031,15 +1188,7 @@ impl WorktreeOps {
                      files are retained unchanged; nothing was integrated.",
                     record.id
                 )))
-            })?;
-        Ok(WorktreePublishResponse {
-            workspace_id: record.id.to_string(),
-            checkout_path: record.checkout_path.display().to_string(),
-            branch: record.branch.as_str().to_string(),
-            baseline_includes_uncommitted_edits: includes_uncommitted_edits(&record),
-            integration_warning: dirty_baseline_warning(&record),
-            result: self.result_entry(&record, &provenance).await,
-        })
+            })
     }
 
     /// Retire a workspace's execution while preserving history and ownership.
@@ -1075,6 +1224,19 @@ impl WorktreeOps {
         target: &WorkspaceTarget,
         by_session: Option<&str>,
     ) -> Result<ArchiveOutcome, WorktreeOpError> {
+        self.archive_after_merge(host, target, by_session, None)
+            .await
+    }
+
+    /// [`Self::archive_announced`] whose announcement also states the merge
+    /// that preceded the archive.
+    async fn archive_after_merge(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        by_session: Option<&str>,
+        merged: Option<ArchiveMerge>,
+    ) -> Result<ArchiveOutcome, WorktreeOpError> {
         let record = self.resolve(target).await?;
         let unchanged = |record: &WorkspaceRecord| ArchiveOutcome {
             summary: WorktreeSummary::from(record),
@@ -1090,7 +1252,7 @@ impl WorktreeOps {
         let archived = self.service.manager().archive_held(&record, &lease).await?;
         drop(lease);
         let announcement = self
-            .announce_archive(host, &archived, by_session, None)
+            .announce_archive(host, &archived, by_session, None, merged)
             .await;
         Ok(ArchiveOutcome {
             summary: WorktreeSummary::from(&archived),
@@ -1104,15 +1266,378 @@ impl WorktreeOps {
         archived: &WorkspaceRecord,
         by_session: Option<&str>,
         removal: Option<ArchiveRemoval>,
+        merged: Option<ArchiveMerge>,
     ) -> Option<Announcement> {
         let owner = archived.ownership.owner_session_id.as_deref()?;
         let seq = host
-            .announce_archived(owner, archived.id.as_str(), by_session, removal)
+            .announce_archived(owner, archived.id.as_str(), by_session, removal, merged)
             .await?;
         Some(Announcement {
             session_id: owner.to_owned(),
             seq,
         })
+    }
+
+    /// Merge a worktree into its source checkout as one squashed commit on
+    /// that checkout's current branch, containing exactly the
+    /// baseline-relative delta of the merged version.
+    ///
+    /// By default the worktree's working state is published first (owner
+    /// idle, `Ready` workspaces only) and that result is merged; with
+    /// `options.commit` the named retained result, or a commit on the
+    /// worktree branch after its baseline, is merged without a snapshot. The
+    /// integration is the one delegate acceptance uses, so local state,
+    /// conflicts, hooks and crash recovery behave identically.
+    ///
+    /// # Errors
+    /// Lifecycle refusals (`workspace_archived`, `workspace_not_ready`),
+    /// `owner_active`, `source_active`, `commit_not_on_workspace_branch`,
+    /// `ambiguous_result_commit`, `source_missing`, and every integration
+    /// refusal (`touches_local_changes`, `baseline_local_edits`,
+    /// `merge_conflict`, `commit_rejected`, ...) with its paths; the source
+    /// checkout is unchanged by any of them. A failed follow-up is *not* an
+    /// error: it is reported in the response.
+    pub async fn merge(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        options: MergeOptions,
+    ) -> Result<WorktreeMergeResponse, WorktreeOpError> {
+        self.merge_announced(host, target, options, None)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    /// [`Self::merge`], additionally returning the owner-stream announcement
+    /// made when the follow-up archived the workspace (`by_session` names the
+    /// session that issued the command).
+    ///
+    /// # Errors
+    /// Same as [`Self::merge`].
+    pub async fn merge_announced(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        options: MergeOptions,
+        by_session: Option<&str>,
+    ) -> Result<MergeOutcome, WorktreeOpError> {
+        use crate::worktree::IntegrationOutcome;
+
+        let MergeOptions { commit, follow_up } = options;
+        let record = self.resolve(target).await?;
+        Self::ensure_mergeable(&record, commit.is_some())?;
+
+        // The source session must not be mid-turn. Built-in write tools take
+        // the checkout gate (a managed or checkout-keyed one) and so serialize
+        // with the integration below, but shell and MCP tools do not. Checked
+        // before anything is published so a refusal leaves no trace.
+        //
+        // This is a point-in-time check, not a reservation: nothing holds off
+        // a turn that starts after it returns, so a shell/MCP write from such
+        // a turn can still overlap the integration. The index lock and the
+        // local-state checks in the integration are the remaining protection.
+        let parent = record.ownership.parent_session_id.clone();
+        let mut source_cwd = None;
+        if let Some(parent) = parent.as_deref()
+            && host.is_local(parent).await.unwrap_or(false)
+        {
+            host.ensure_idle(parent).await.map_err(|err| {
+                if err.code() == "owner_active" {
+                    WorktreeOpError::rejected(
+                        "source_active",
+                        format!(
+                            "source session {parent} has a running turn or queued input; merge \
+                             again when it is idle"
+                        ),
+                    )
+                } else {
+                    err
+                }
+            })?;
+            source_cwd = host.session_cwd(parent).await?;
+        }
+
+        // Version selection.
+        let (provenance, published) = match commit.as_deref() {
+            Some(rev) => (self.select_commit(&record, rev).await?, false),
+            None => {
+                // A tool write mid-turn would land in a half-finished snapshot.
+                // Point-in-time as well: capture itself runs under the
+                // checkout gate and validates the tree before and after.
+                if let Some(owner) = record.ownership.owner_session_id.as_deref() {
+                    if !host.is_local(owner).await? {
+                        return Err(WorktreeOpError::rejected(
+                            "owner_not_local",
+                            format!("owner session {owner} is not hosted on this node"),
+                        ));
+                    }
+                    host.ensure_idle(owner).await?;
+                }
+                (self.publish_snapshot(&record).await?, true)
+            }
+        };
+        let result_commit = provenance.result_commit.clone().ok_or_else(|| {
+            WorktreeOpError::Internal("the merged result has no commit".to_string())
+        })?;
+        let ignored_files = if published {
+            self.service
+                .manager()
+                .status(&record)
+                .await
+                .map(|status| status.ignored)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let entry = self.result_entry(&record, &provenance).await;
+
+        let integrated = self
+            .service
+            .merge_workspace(&crate::worktree::MergeRequest {
+                record: &record,
+                result_commit: &result_commit,
+                source_session_cwd: source_cwd,
+            })
+            .await?;
+        let (outcome, merged_commit, branch, changed_paths) = match integrated {
+            IntegrationOutcome::Integrated(done) => (
+                "merged",
+                Some(done.commit),
+                Some(done.branch),
+                done.changed_paths
+                    .into_iter()
+                    .map(|changed| WorktreeChangedPath {
+                        path: changed.path,
+                        kind: changed.kind.to_string(),
+                    })
+                    .collect(),
+            ),
+            IntegrationOutcome::AlreadyIntegrated { commit } => (
+                "already_merged",
+                Some(commit),
+                None,
+                entry.changed_paths.clone(),
+            ),
+            IntegrationOutcome::NoChanges => ("no_changes", None, None, Vec::new()),
+            IntegrationOutcome::Conflicted { paths } => {
+                return Err(WorktreeOpError::Refused {
+                    code: "merge_conflict".to_owned(),
+                    message: format!(
+                        "the worktree's changes conflict with the source branch in {} path(s); \
+                         nothing was changed",
+                        paths.len()
+                    ),
+                    paths,
+                });
+            }
+            IntegrationOutcome::Refused(refusal) => return Err(WorktreeOpError::refused(refusal)),
+        };
+
+        // The source contains the result now: run the requested follow-up.
+        // Its failure never undoes or hides the merge.
+        let mut announcement = None;
+        let follow_up = match follow_up {
+            Some(step) => {
+                let merged = ArchiveMerge {
+                    outcome: outcome.to_owned(),
+                    commit: merged_commit.clone(),
+                    branch: branch.clone(),
+                };
+                let (done, announced) = self
+                    .run_follow_up(host, &record, step, by_session, merged)
+                    .await;
+                announcement = announced;
+                Some(done)
+            }
+            None => None,
+        };
+
+        Ok(MergeOutcome {
+            response: WorktreeMergeResponse {
+                workspace_id: record.id.to_string(),
+                workspace_branch: record.branch.as_str().to_string(),
+                outcome: outcome.to_owned(),
+                commit: merged_commit,
+                branch,
+                changed_paths,
+                result: entry,
+                published,
+                ignored_files,
+                follow_up,
+            },
+            announcement,
+        })
+    }
+
+    /// A workspace can be merged while `Ready`, or while `Archived` when an
+    /// explicit version is named (its live state is retired).
+    fn ensure_mergeable(
+        record: &WorkspaceRecord,
+        explicit_version: bool,
+    ) -> Result<(), WorktreeOpError> {
+        match record.lifecycle {
+            WorkspaceLifecycle::Ready => Ok(()),
+            WorkspaceLifecycle::Archived if explicit_version => Ok(()),
+            WorkspaceLifecycle::Archived => Err(WorktreeOpError::rejected(
+                "workspace_archived",
+                format!(
+                    "workspace {} is archived and its working state is retired; name a \
+                     published result or a branch commit with --commit",
+                    record.id
+                ),
+            )),
+            other => Err(WorktreeOpError::rejected(
+                "workspace_not_ready",
+                format!("workspace {} is {other}", record.id),
+            )),
+        }
+    }
+
+    /// Resolve `rev` to a retained result of the workspace: an existing one
+    /// (full id or at least 7 hex digits), else a commit on the worktree
+    /// branch strictly after its baseline, which is retained like a
+    /// published result.
+    async fn select_commit(
+        &self,
+        record: &WorkspaceRecord,
+        rev: &str,
+    ) -> Result<ResultProvenance, WorktreeOpError> {
+        use crate::worktree::integrate::Stop;
+
+        match self.service.match_result(record, rev).await {
+            Ok(Some(commit)) => {
+                let results = self.service.registry().list_results(&record.id).await?;
+                return results
+                    .into_iter()
+                    .find(|r| r.result_commit.as_deref() == Some(commit.as_str()))
+                    .ok_or_else(|| {
+                        WorktreeOpError::Internal(format!("result {commit} vanished while merging"))
+                    });
+            }
+            Ok(None) => {}
+            Err(Stop::Refused(refusal)) => return Err(WorktreeOpError::refused(refusal)),
+            Err(Stop::Failed(err)) => return Err(err.into()),
+        }
+
+        let not_on_branch = || {
+            WorktreeOpError::rejected(
+                "commit_not_on_workspace_branch",
+                format!(
+                    "{rev} is neither a retained result of workspace {} nor a commit on branch \
+                     {} after its baseline",
+                    record.id,
+                    record.branch.as_str()
+                ),
+            )
+        };
+        let Some(baseline) = record.baseline.as_ref() else {
+            return Err(WorktreeOpError::rejected(
+                "no_baseline",
+                "the workspace has no recorded baseline",
+            ));
+        };
+        let common_dir = &record.repository.common_dir;
+        let git = self.service.ops();
+        let Some(resolved) = git.resolve_commit(common_dir, rev).await? else {
+            return Err(not_on_branch());
+        };
+        let Some(tip) = git.branch_tip(common_dir, &record.branch).await? else {
+            return Err(not_on_branch());
+        };
+        if resolved == baseline.baseline_commit
+            || !git
+                .is_ancestor(common_dir, &baseline.baseline_commit, &resolved)
+                .await?
+            || !git.is_ancestor(common_dir, &resolved, &tip).await?
+        {
+            return Err(not_on_branch());
+        }
+        Ok(self
+            .service
+            .retain_result(
+                record,
+                &resolved,
+                &tip,
+                Some(ResultVerificationStatus::Skipped),
+            )
+            .await?)
+    }
+
+    /// The `--archive` / `--remove` step of a merge.
+    async fn run_follow_up(
+        &self,
+        host: &dyn OwnerHost,
+        record: &WorkspaceRecord,
+        step: FollowUp,
+        by_session: Option<&str>,
+        merged: ArchiveMerge,
+    ) -> (FollowUpOutcome, Option<Announcement>) {
+        let target = WorkspaceTarget::Workspace(record.id.to_string());
+        let failure = |err: &WorktreeOpError| WorktreeFollowUpError {
+            code: err.code().to_owned(),
+            message: err.to_string(),
+            paths: err
+                .error_data()
+                .get("paths")
+                .and_then(|paths| serde_json::from_value(paths.clone()).ok())
+                .unwrap_or_default(),
+        };
+        match step {
+            FollowUp::Archive => match self
+                .archive_after_merge(host, &target, by_session, Some(merged))
+                .await
+            {
+                Ok(done) => (
+                    FollowUpOutcome {
+                        archived: true,
+                        removed: false,
+                        removal: None,
+                        error: None,
+                    },
+                    done.announcement,
+                ),
+                Err(err) => (
+                    FollowUpOutcome {
+                        archived: false,
+                        removed: false,
+                        removal: None,
+                        error: Some(failure(&err)),
+                    },
+                    None,
+                ),
+            },
+            FollowUp::Remove => {
+                let outcome = self
+                    .remove_after_merge(host, &target, true, by_session, Some(merged))
+                    .await;
+                let done = match outcome.result {
+                    Ok(removal) => FollowUpOutcome {
+                        archived: true,
+                        removed: true,
+                        removal: Some(removal),
+                        error: None,
+                    },
+                    Err(err) => {
+                        // A refused removal after the archive leaves the
+                        // workspace archived.
+                        let archived = match &err {
+                            WorktreeOpError::RemovalRefused { archived, .. } => *archived,
+                            _ => false,
+                        } || self
+                            .lookup(record.id.as_str())
+                            .await
+                            .is_ok_and(|now| now.lifecycle.is_retired());
+                        FollowUpOutcome {
+                            archived,
+                            removed: false,
+                            removal: None,
+                            error: Some(failure(&err)),
+                        }
+                    }
+                };
+                (done, outcome.announcement)
+            }
+        }
     }
 
     /// Conservative removal. Refuses active ownership or any content that
@@ -1147,9 +1672,23 @@ impl WorktreeOps {
         archive: bool,
         by_session: Option<&str>,
     ) -> RemoveOutcome {
+        self.remove_after_merge(host, target, archive, by_session, None)
+            .await
+    }
+
+    /// [`Self::remove_announced`] whose archive announcement also states the
+    /// merge that preceded it.
+    async fn remove_after_merge(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        archive: bool,
+        by_session: Option<&str>,
+        merged: Option<ArchiveMerge>,
+    ) -> RemoveOutcome {
         let mut announcement = None;
         let result = self
-            .remove_inner(host, target, archive, by_session, &mut announcement)
+            .remove_inner(host, target, archive, by_session, merged, &mut announcement)
             .await;
         RemoveOutcome {
             result,
@@ -1163,6 +1702,7 @@ impl WorktreeOps {
         target: &WorkspaceTarget,
         archive: bool,
         by_session: Option<&str>,
+        merged: Option<ArchiveMerge>,
         announcement_out: &mut Option<Announcement>,
     ) -> Result<WorktreeRemoveResponse, WorktreeOpError> {
         let record = self.resolve(target).await?;
@@ -1224,7 +1764,7 @@ impl WorktreeOps {
                 },
             };
             *announcement_out = self
-                .announce_archive(host, &current, by_session, Some(removal))
+                .announce_archive(host, &current, by_session, Some(removal), merged)
                 .await;
         }
         result
@@ -1273,6 +1813,10 @@ impl WorktreeOps {
 }
 
 #[cfg(test)]
+#[path = "ops_merge_tests.rs"]
+mod merge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1290,6 +1834,32 @@ mod tests {
             "workspace ws is removing and cannot change owner".into(),
         ));
         assert_eq!(stale.code(), "workspace_not_ready");
+    }
+
+    #[test]
+    fn refused_error_data_carries_paths() {
+        use crate::worktree::integrate::Refusal;
+        let with_paths = WorktreeOpError::refused(
+            Refusal::new("touches_local_changes", "local edits")
+                .with_paths(vec!["a.txt".into(), "b/c.txt".into()]),
+        );
+        assert_eq!(with_paths.code(), "touches_local_changes");
+        let data = with_paths.error_data();
+        assert_eq!(data["code"], "touches_local_changes");
+        assert_eq!(data["message"], "local edits: a.txt, b/c.txt");
+        assert_eq!(with_paths.to_string(), "local edits: a.txt, b/c.txt");
+        assert_eq!(data["paths"], serde_json::json!(["a.txt", "b/c.txt"]));
+
+        let many = WorktreeOpError::refused(
+            Refusal::new("touches_local_changes", "local edits")
+                .with_paths((0..12).map(|i| format!("f{i}")).collect()),
+        );
+        assert!(many.to_string().ends_with("f9 and 2 more"), "{many}");
+        assert_eq!(many.error_data()["paths"].as_array().unwrap().len(), 12);
+
+        let without = WorktreeOpError::refused(Refusal::new("source_missing", "gone"));
+        assert_eq!(without.code(), "source_missing");
+        assert!(without.error_data().get("paths").is_none());
     }
 
     #[test]

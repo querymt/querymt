@@ -283,6 +283,48 @@ impl LocalAgentHandle {
         self.unload_idle_in_runtime(session_id).await
     }
 
+    /// Whether `session_id` has a running turn, queued input or pending
+    /// steering. Unlike [`Self::unload_session_if_idle`] it never unloads the
+    /// session; a session that is not loaded is idle, and a stalled actor
+    /// (status timeout) is treated as busy.
+    pub async fn session_is_busy(&self, session_id: &str) -> Result<bool, Error> {
+        if let Some((session_handle, _)) = self.bound_session_handle(session_id).await?
+            && let Some(local) = session_handle.as_any().downcast_ref::<LocalAgentHandle>()
+        {
+            return Box::pin(local.session_is_busy_in_runtime(session_id)).await;
+        }
+        self.session_is_busy_in_runtime(session_id).await
+    }
+
+    async fn session_is_busy_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
+        use crate::agent::messages::SessionRuntimePhase;
+
+        let session = {
+            let registry = self.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        let Some(session) = session else {
+            return Ok(false);
+        };
+        if session.is_remote() {
+            return Ok(true);
+        }
+        let status = match session
+            .get_runtime_status_with_timeout(
+                UNLOAD_STATUS_MAILBOX_TIMEOUT,
+                UNLOAD_STATUS_REPLY_TIMEOUT,
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(crate::error::AgentError::SessionTimeout { .. }) => return Ok(true),
+            Err(err) => return Err(Error::from(err)),
+        };
+        Ok(status.phase != SessionRuntimePhase::Idle
+            || status.queued_input_count > 0
+            || status.pending_steering_count > 0)
+    }
+
     async fn unload_idle_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
         use crate::agent::messages::SessionRuntimePhase;
 
