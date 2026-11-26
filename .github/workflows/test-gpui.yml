@@ -1,0 +1,172 @@
+name: Test querymt-gpui
+
+# The QueryMT Desktop app (crates/querymt-gpui). It consumes the session core
+# and the protocol types from this workspace, so a change to either is checked
+# against the app (clippy, the golden transcript tests, the wasm build) in the
+# same pull request. Formatting and the workspace-hack check run in lint.yml.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/querymt-gpui/**'
+      - 'crates/agent-session-core/**'
+      - 'crates/agent-protocol-types/**'
+      - 'crates/querymt/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-gpui.yml'
+  pull_request:
+    paths:
+      - 'crates/querymt-gpui/**'
+      - 'crates/agent-session-core/**'
+      - 'crates/agent-protocol-types/**'
+      - 'crates/querymt/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-gpui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match the `wasm-bindgen` crate version in Cargo.lock (see flake.nix).
+  WASM_BINDGEN_VERSION: '0.2.130'
+  BINARYEN_VERSION: '133'
+  BINARYEN_SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+
+jobs:
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          components: clippy
+          cache-key: gpui-clippy
+
+      - name: Run Clippy
+        run: cargo clippy --locked --package querymt-gpui --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          components: llvm-tools-preview
+          cache-key: gpui-test
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      # The crate is a single binary: its unit tests live in the bin target.
+      - name: Run tests with coverage
+        env:
+          NEXTEST_PROFILE: ci
+        run: |
+          cargo llvm-cov nextest \
+            --locked \
+            --package querymt-gpui \
+            --bins \
+            --codecov --output-path ./coverage/codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov.json
+          flags: querymt-gpui
+          verbose: true
+          fail_ci_if_error: false
+
+  # The wasm build of the app (the same build the release ships as
+  # querymt-desktop-web-<version>.tar.gz), so web-only breakage shows up here.
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    if: github.actor != 'renovate[bot]'  # handled by renovate-hakari.yml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: gpui-web
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+
+      - name: Install wasm-opt (binaryen)
+        run: |
+          curl -fsSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256}  /tmp/binaryen.tar.gz" | sha256sum --check --strict
+          mkdir -p "$HOME/.local"
+          tar -xzf /tmp/binaryen.tar.gz -C "$HOME/.local"
+          echo "$HOME/.local/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build web app
+        run: crates/querymt-gpui/web/build.sh --release
+
+      - name: Verify web artifact
+        working-directory: crates/querymt-gpui
+        run: |
+          test -f dist/index.html
+          test -f dist/querymt_gpui.js
+          test -s dist/querymt_gpui_bg.wasm
+          grep -q 'querymt_gpui.js' dist/index.html

@@ -27,3 +27,5 @@ flag_management:
       paths: [crates/querymt-remote/]
     - name: providers
       paths: [crates/providers/]
+    - name: querymt-gpui
+      paths: [crates/querymt-gpui/]
