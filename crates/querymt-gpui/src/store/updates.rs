@@ -1077,6 +1077,9 @@ mod tests {
     fn local_agents_stop_before_files_change(cx: &mut gpui_kit::TestAppContext) {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // The real subprocess transport wakes GPUI tasks from its I/O threads.
+        cx.executor().allow_parking();
+
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent.sh");
         std::fs::write(&agent, "#!/bin/sh\nexec sleep 60\n").unwrap();

@@ -537,6 +537,31 @@ fn open_in_main_reopens_a_closed_main_window(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_tray_reuses_the_main_window_and_reopens_it_if_closed(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let open_from_tray = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            rig.host.update(cx, |host, cx| {
+                host.on_signal(
+                    super::Signal::OpenMain {
+                        activation_token: Some("test-tray-token".into()),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        rig.host.read_with(cx, |h, _| h.main_for_test()).unwrap()
+    };
+
+    assert_eq!(open_from_tray(cx), rig.main);
+    cx.update_window(rig.main, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert_ne!(open_from_tray(cx), rig.main);
+}
+
+#[gpui_kit::test]
 fn a_session_view_can_be_shown_without_the_main_window(cx: &mut TestAppContext) {
     // The panel's pane only needs the store; adopting a view shows it.
     let rig = rig(cx);
