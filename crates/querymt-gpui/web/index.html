@@ -11,16 +11,30 @@
         position: fixed; inset: 0; display: grid; place-items: center;
         color: #888; font: 14px system-ui, sans-serif;
       }
+      #loading.failed {
+        color: #e88; padding: 2rem; box-sizing: border-box;
+        white-space: pre-wrap; text-align: center;
+      }
     </style>
   </head>
   <body>
     <div id="loading">Loading QueryMT…</div>
     <script type="module">
       import init from "./querymt_gpui.js";
+      const loading = document.getElementById("loading");
       try {
-        await init(); // runs the #[wasm_bindgen(start)] entry
-      } finally {
-        document.getElementById("loading")?.remove();
+        // Name the wasm explicitly: the page then does not depend on how
+        // wasm-bindgen generated the loader (CLI or library, with or without a
+        // default module path). Runs the #[wasm_bindgen(start)] entry.
+        await init({ module_or_path: new URL("./querymt_gpui_bg.wasm", import.meta.url) });
+        loading?.remove();
+      } catch (error) {
+        // Keep startup failures visible instead of leaving a blank page.
+        console.error("QueryMT failed to start:", error);
+        if (loading) {
+          loading.classList.add("failed");
+          loading.textContent = `QueryMT failed to start.\n\n${error?.message ?? error}\n\nSee the browser console for details.`;
+        }
       }
     </script>
   </body>

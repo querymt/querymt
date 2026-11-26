@@ -38,10 +38,15 @@ fn prepare_dashboard() {
 
     let bindgen = |wasm: &Path, out: &Path| -> Result<(), String> {
         let mut bindgen = wasm_bindgen_cli_support::Bindgen::new();
+        // Same output as `wasm-bindgen --target web --no-typescript`. The library
+        // defaults to omitting the default wasm path (`new URL('<name>_bg.wasm',
+        // import.meta.url)`), the CLI does not; without it `init()` cannot find the
+        // wasm. gpui_web::prepare_ui checks the result.
         bindgen
             .input_path(wasm)
             .out_name(gpui_web::OUT_NAME)
-            .typescript(false);
+            .typescript(false)
+            .omit_default_module_path(false);
         bindgen
             .web(true)
             .map_err(|err| format!("wasm-bindgen: {err:#}"))?;
