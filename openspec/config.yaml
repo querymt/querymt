@@ -11,6 +11,7 @@ context: |
   - querymt-remote (mesh, remote providers), querymt-utils (shared utils, OAuth, secret store), querymt-service-client (service OAuth/API client).
   - querymt-cli (crates/cli, the qmt binary), querymt-py and querymt-agent-py (crates/py, PyO3), querymt-mobile-ffi (over querymt-agent).
   - qmt-<name> (crates/providers/<name>): providers. Many build on qmt-openai, which is also a dev-dependency of querymt-agent and querymt-remote.
+  - querymt-gpui (crates/querymt-gpui): QueryMT Desktop, the GPUI desktop/web client (native + wasm32-unknown-unknown). It talks to agents over ACP and uses querymt-agent-session-core by path, so session-core and protocol-type changes are checked against it (`cargo t-gpui`, `cargo cl-gpui`). Not a default member. Its changes (slash commands, quick panel, session find, …) live in this openspec/ too; file paths in them (`src/...`, `tests/...`, `web/...`) are relative to crates/querymt-gpui.
   Use `cargo tree -i <package> --workspace --depth 1` to find downstream packages before choosing validation scope.
 
   Tests:
@@ -21,7 +22,7 @@ context: |
   - nextest does not run doctests. When doc examples change, also run `cargo test -p <package> --doc`.
   - nextest fails when a filter matches no tests. Fix the filter; never drop it.
   - nextest is not in the Nix devShell. If `cargo nextest --version` fails, tell the user (`cargo install cargo-nextest --locked`), then fall back to `cargo test` with the same scope and record the fallback.
-  - .cargo/config.toml has aliases with the CI feature sets for the agent packages: `cargo t-<pkg>` (nextest) and `cargo cl-<pkg>` (clippy -D warnings) for agent, runtime, services, sqlite, knowledge, index, core. Use them so local builds share artifacts. Loop: test the package you changed, build the facade (`cargo t-agent --no-run`) before pushing. `t-agent`/`cl-agent` need QMT_UI_DIST.
+  - .cargo/config.toml has aliases with the CI feature sets for the agent packages: `cargo t-<pkg>` (nextest) and `cargo cl-<pkg>` (clippy -D warnings) for agent, runtime, services, sqlite, knowledge, index, core, plus gpui (`t-gpui` runs the bin-target tests). Use them so local builds share artifacts. Loop: test the package you changed, build the facade (`cargo t-agent --no-run`) before pushing. `t-agent`/`cl-agent` need QMT_UI_DIST.
   - Never run `cargo nextest run --workspace`, or `--all-features` on querymt-agent. Default-feature (extism) provider test builds can fail to link, and native providers are expensive.
 
   Features (mirror .github/workflows):
@@ -40,7 +41,7 @@ context: |
   Contracts:
   - Session DB migrations (crates/agent-sqlite/src/session/sqlite_storage/migrations.rs) are forward-only. Never edit a released migration; append one. legacy_baseline_upgrade_matches_fresh_install guards this.
   - Changing the Extism host/plugin interface means bumping ITEM_AWARE_CHAT_CONTRACT_VERSION or PREPARED_CHAT_CONTRACT_VERSION and checking `cargo build -p qmt-<name> --release --target wasm32-wasip1`.
-  - #[typeshare] types and ACP payloads are consumed by querymt-desktop. Changes need a reported UI follow-up, not UI work here.
+  - #[typeshare] types and ACP payloads are consumed by querymt-desktop (separate repo) and by querymt-gpui (this workspace). Changes need a reported querymt-desktop UI follow-up, not UI work there; querymt-gpui is updated in the same change.
   - Any behaviour change to config, hooks, middleware, tools or ACP is marked **BREAKING** in the proposal and gets an entry under "Unreleased" in CHANGELOG.md.
   - Per AGENTS.md, do not add compatibility layers or keep legacy behaviour unless the user asks for it; flag the need instead.
 
@@ -52,7 +53,7 @@ rules:
     - Include a short Non-goals section after What Changes, listing related work this change deliberately leaves out.
     - In Impact, list affected Cargo packages by package name and the feature flags whose code changes.
     - Call out every change to public Rust API, TOML/JSON config, hook or middleware behaviour, ACP or provider wire shapes, the Extism plugin contract, the session DB schema, Python bindings or typeshare types, and mark breaking ones **BREAKING**.
-    - Name any required querymt-desktop UI follow-up instead of planning UI work.
+    - Name any required querymt-desktop UI follow-up instead of planning UI work there. querymt-gpui UI work is planned here like any other package.
     - Use skip_specs only for refactor, tooling, dependency or docs changes with no behavior change.
   specs:
     - Describe observable behavior (tool calls, ACP updates, config keys, wire payloads, persisted state), not Rust types, modules or file paths.

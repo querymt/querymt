@@ -7,7 +7,7 @@ section: devel
 maintainer: QueryMT
 vendor: QueryMT
 description: Native desktop control center for QueryMT (GPUI)
-homepage: https://github.com/querymt/querymt-gpui
+homepage: https://github.com/querymt/querymt
 license: MIT
 
 contents:

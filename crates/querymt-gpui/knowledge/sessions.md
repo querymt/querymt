@@ -45,8 +45,8 @@ GPUI panics on re-entrant entity updates, so:
 
 ## From agent inputs to rows
 
-- `querymt_agent_session_core::SessionCore` (git dependency pinned by `rev` in
-  `Cargo.toml`) is the **only writer** of conversation state. `SessionView` (struct in
+- `querymt_agent_session_core::SessionCore` (`crates/agent-session-core`, a path
+  dependency in the same workspace) is the **only writer** of conversation state. `SessionView` (struct in
   `src/session.rs`, methods in `src/session/view.rs`) wraps it with a projection
   (`src/session/projection.rs`) and an `Overlay` (`src/session/overlay.rs`).
 - Agent notifications become `SessionInput`s (`queue_session_update`, `queue_state_update`,

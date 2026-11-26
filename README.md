@@ -122,6 +122,18 @@ macOS Silicon users who download the `qmtcode` release binary need to clear the 
 xattr -dr com.apple.quarantine qmtcode
 ```
 
+## QueryMT Desktop
+
+`crates/querymt-gpui` is QueryMT Desktop, a native (macOS, Windows, Linux) and web client for
+QueryMT agents built with GPUI. It connects to `qmtcode` over ACP, locally or over WebSocket.
+
+```bash
+nix develop -c cargo run -p querymt-gpui
+```
+
+Every release ships it as `QueryMT-Desktop-<version>-<platform>` installers and a
+`querymt-desktop-web-<version>.tar.gz` web build. See [its README](crates/querymt-gpui/README.md).
+
 ## Release channels
 
 | Channel | Release | `--version` |

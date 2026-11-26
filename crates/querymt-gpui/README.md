@@ -1,15 +1,18 @@
-# QueryMT GPUI (prototype)
+# QueryMT Desktop (querymt-gpui)
 
 GPUI rebuild of QueryMT Desktop. One Rust UI, two targets: a native window and a web app
-(wasm + WebGPU/WebGL2). Scope so far: the QueryMT shell, the **Start** page and the **Agents** page,
-wired to real agents over ACP.
+(wasm + WebGPU/WebGL2), wired to real agents over ACP. It lives in the QueryMT workspace
+(package `querymt-gpui`) and uses `querymt-agent-session-core` from it by path. Commands below
+run from the repository root.
 
 ## Native
 
 ```bash
-nix develop -c cargo run                                   # qmtcode on PATH is added as "Local qmtcode"
-nix develop -c cargo run -- --agent 127.0.0.1:42069        # add a WebSocket agent (also QMT_AGENT=...)
-QMT_DEBUG=1 nix develop -c cargo run                       # log agent/RPC traffic to stderr
+nix develop -c cargo run -p querymt-gpui                              # qmtcode on PATH is added as "Local qmtcode"
+nix develop -c cargo run -p querymt-gpui -- --agent 127.0.0.1:42069   # add a WebSocket agent (also QMT_AGENT=...)
+QMT_DEBUG=1 nix develop -c cargo run -p querymt-gpui                  # log agent/RPC traffic to stderr
+cargo t-gpui                                                          # tests (nextest, bin target)
+cargo cl-gpui                                                         # clippy -D warnings
 ```
 
 Agents are stored in `~/.config/querymt-gpui/state.json`.
@@ -17,10 +20,10 @@ Agents are stored in `~/.config/querymt-gpui/state.json`.
 ### Run or install with Nix
 
 ```bash
-nix run github:querymt/querymt-gpui                          # build and run without installing
-nix run github:querymt/querymt-gpui -- --agent 127.0.0.1:42069
-nix profile install github:querymt/querymt-gpui              # install (adds a "QueryMT" launcher entry)
-nix build                                                    # local checkout: ./result/bin/querymt-gpui
+nix run github:querymt/querymt#querymt-gpui                   # build and run without installing
+nix run github:querymt/querymt#querymt-gpui -- --agent 127.0.0.1:42069
+nix profile install github:querymt/querymt#querymt-gpui       # install (adds a "QueryMT" launcher entry)
+nix build .#querymt-gpui                                      # local checkout: ./result/bin/querymt-gpui
 ```
 
 The package embeds the pinned IBM Plex fonts (pre-fetched, since the Nix build has no network),
@@ -30,13 +33,18 @@ loads at runtime.
 ### Release
 
 ```bash
-nix develop -c cargo build --release       # target/release/querymt-gpui
+nix develop -c cargo build -p querymt-gpui --profile release-gpui   # target/release-gpui/querymt-gpui
 ```
+
+Releases ship with QueryMT's own nightly and stable releases (`.github/workflows/build.yml`):
+`QueryMT-Desktop-<version>-<platform>` installers (dmg and app.tar.gz, Windows setup exe,
+AppImage and deb) plus `querymt-desktop-web-<version>.tar.gz`. The packaging scripts are in
+`scripts/package/`; the app reports the release version CI passes as `QMT_VERSION`.
 
 The desktop has only a binary target: no application `.so`, `.dylib`, `.dll`, or
 `.rlib` is built. Rust dependency archives remain internal Cargo build artifacts.
-Release builds use `opt-level = "z"`, full LTO, one codegen unit, no debug symbols,
-and abort-on-panic (a panic terminates the app instead of unwinding).
+The `release-gpui` profile (root `Cargo.toml`) uses `opt-level = "z"`, full LTO, one codegen
+unit, no debug symbols, and abort-on-panic (a panic terminates the app instead of unwinding).
 System graphics/windowing libraries are still required; this is not a fully static
 portable Linux binary. Size optimization can reduce peak throughput; use debug
 builds when you need symbols and panic backtraces.
@@ -63,7 +71,7 @@ Turn it on in **Settings → General → Quick panel**. It is off by default. Wh
 When nothing is running it starts the app with only the panel open:
 
 ```bash
-cargo run -- --quick              # from a checkout
+cargo run -p querymt-gpui -- --quick   # from a checkout
 querymt-gpui --quick              # installed binary
 ```
 
@@ -88,8 +96,8 @@ which may appear behind a fullscreen application.
 ## Web
 
 ```bash
-nix develop -c ./web/build.sh --release
-nix develop -c miniserve --index index.html dist           # http://localhost:8080
+nix develop -c crates/querymt-gpui/web/build.sh --release
+nix develop -c miniserve --index index.html crates/querymt-gpui/dist   # http://localhost:8080
 ```
 
 - Served by qmtcode itself (embedded): the page connects to its own origin `/acp/ws` automatically.
@@ -131,4 +139,5 @@ rather than downloading them; the first uncached build needs network access.
 
 - Icons for the web are embedded with `icon_assets!` in `src/main.rs`. Add new icon names there.
 - `RUSTC_BOOTSTRAP=1` (set in `build.sh`) is needed for `wasm_thread`'s nightly feature gate.
-- The `wasm-bindgen` CLI in `flake.nix` must match `wasm-bindgen` in `Cargo.lock` (pinned `=0.2.130`).
+- The `wasm-bindgen` CLI in the root `flake.nix` and in the CI workflows must match `wasm-bindgen`
+  in the workspace `Cargo.lock` (pinned `=0.2.130` here).
