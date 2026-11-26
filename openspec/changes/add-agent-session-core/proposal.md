@@ -46,7 +46,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 - **New package `querymt-agent-session-core-wasm`** (`crates/agent-session-core-wasm`, `publish = false`). These are wasm-bindgen bindings that keep the state inside the module and exchange JSON batches and change reports.
 - **Native Rust consumers.** A client outside this workspace (querymt-gpui) depends on `querymt-agent-session-core` through a git dependency pinned to a revision. The three new crates are listed under hakari `[final-excludes]`, so they never depend on `querymt-workspace-hack` and their dependency closure is the same inside and outside the workspace.
 - **Release artifacts.** Nightly and stable releases publish `agent-session-core-wasm-<version>.tar.gz` plus its `.sha256`, listed in `release.json`.
-- **Toolchain.** `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target. The devShell gains `wasm-bindgen-cli` (matching the locked `wasm-bindgen` 0.2.129) and `binaryen`.
+- **Toolchain.** `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target. The devShell gains `wasm-bindgen-cli` (matching the locked `wasm-bindgen` 0.2.130) and `binaryen`.
 - **`querymt` features.** The `which` dependency becomes optional and is enabled by the `mcp` feature, which is its only user. As a result, `querymt` with `default-features = false` builds for `wasm32-unknown-unknown`.
 - **Typeshare.** `scripts/generate-types.sh` reads the two new crates. Declarations of moved types are unchanged. The new session event and view types are added.
 - **BREAKING (Rust API):**

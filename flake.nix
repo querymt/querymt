@@ -152,6 +152,141 @@
               doCheck = false;
               meta.mainProgram = name;
             };
+
+          # wasm-bindgen CLI for the wasm builds (crates/querymt-gpui/web/build.sh).
+          # Must match the `wasm-bindgen` crate version in Cargo.lock exactly
+          # (querymt-gpui pins `=0.2.130`). Bump version + hashes together.
+          wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
+            src = pkgs.fetchCrate {
+              pname = "wasm-bindgen-cli";
+              version = "0.2.130";
+              hash = "sha256-9Og1O/6/VC3sc5hBjoIWBErmLW2UHGMsTQO+6+m/dng=";
+            };
+            cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+              inherit src;
+              inherit (src) pname version;
+              hash = "sha256-j81sUf1m5yXU4FJfGj7GV+hdqVCV8mRmNb0QIsMCjqw=";
+            };
+          };
+
+          # ─── QueryMT Desktop (crates/querymt-gpui) ─────────────────────────
+          # Libraries GPUI loads at runtime on Linux (dlopen'd, so they must be on
+          # LD_LIBRARY_PATH): Vulkan for rendering, Wayland/X11 for windowing,
+          # xkbcommon for keyboard, fontconfig/freetype for text.
+          gpuiRuntimeLibs = with pkgs;
+            lib.optionals stdenv.hostPlatform.isLinux [
+              vulkan-loader
+              wayland
+              libxkbcommon
+              libx11
+              libxcb
+              libxcursor
+              libxrandr
+              libxi
+              fontconfig
+              freetype
+            ];
+          gpuiBuildLibs = gpuiRuntimeLibs ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.alsa-lib pkgs.zstd];
+
+          # crates/querymt-gpui/build.rs embeds pinned IBM Plex fonts and downloads
+          # them when its cache is empty. The Nix sandbox has no network, so
+          # pre-fetch the same files (same revision and SHA-256 as build.rs) into
+          # the cache layout it reads: `$QMT_FONT_CACHE/<revision>/<file>`.
+          plexRevision = "383c681f015ed2626e919ec4e3cca16ccc204e9d";
+          plexFonts = [
+            ["Sans" "IBMPlexSans-Regular.ttf" "975dcda37d80f038dcd143c22e33ca2d97a0cc5a929aace1c749153b0fe1afa5"]
+            ["Sans" "IBMPlexSans-Medium.ttf" "331c8639d7598b2cde62a911a71db195e30cb655cd6bdf2e324a7e984955f907"]
+            ["Sans" "IBMPlexSans-SemiBold.ttf" "a20caf8286023a6a7a85e40b1d2a4ae9fc3e3b1f9eda8f4c542dd4986af67bb1"]
+            ["Sans" "IBMPlexSans-Bold.ttf" "9e6c74a889a700d707613d24548fe4ffa6bc59559a0689d2cf9e133bdcdafb2f"]
+            ["Mono" "IBMPlexMono-Regular.ttf" "fe11304a5fe956d5744e9b6a246cc83d90425245e75a62230044966ca96a7f50"]
+          ];
+          plexFontCache = pkgs.linkFarm "querymt-gpui-font-cache" (map (font: let
+              family = builtins.elemAt font 0;
+              name = builtins.elemAt font 1;
+            in {
+              name = "${plexRevision}/${name}";
+              path = pkgs.fetchurl {
+                url = "https://raw.githubusercontent.com/IBM/plex/${plexRevision}/IBM-Plex-${family}/fonts/complete/ttf/${name}";
+                sha256 = builtins.elemAt font 2;
+              };
+            })
+            plexFonts);
+
+          gpuiDesktopItem = pkgs.makeDesktopItem {
+            name = "querymt-gpui";
+            desktopName = "QueryMT";
+            comment = "Native desktop control center for QueryMT";
+            exec = "querymt-gpui %U";
+            icon = "querymt-gpui";
+            categories = ["Development"];
+            # Matches the window's `app_id` so the shell groups it with this entry.
+            startupWMClass = "querymt-gpui";
+          };
+
+          # The toolchain from rust-toolchain.toml, as the GPUI repository built it.
+          toolchainRustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+
+          querymtGpui = toolchainRustPlatform.buildRustPackage {
+            pname = "querymt-gpui";
+            version = workspaceCargoToml.workspace.package.version;
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = ["-p" "querymt-gpui" "--bin" "querymt-gpui"];
+
+            nativeBuildInputs = with pkgs; [pkg-config makeWrapper copyDesktopItems];
+            buildInputs = gpuiBuildLibs;
+            desktopItems = [gpuiDesktopItem];
+
+            # buildRustPackage always builds `--release`; give it the settings of
+            # the workspace's `release-gpui` profile (size over speed).
+            CARGO_PROFILE_RELEASE_OPT_LEVEL = "z";
+            CARGO_PROFILE_RELEASE_LTO = "fat";
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
+            CARGO_PROFILE_RELEASE_PANIC = "abort";
+            CARGO_PROFILE_RELEASE_STRIP = "symbols";
+
+            preBuild = ''
+              # build.rs writes into its cache directory, so give it a writable copy.
+              export QMT_FONT_CACHE="$TMPDIR/qmt-fonts"
+              cp -rL ${plexFontCache} "$QMT_FONT_CACHE"
+              chmod -R u+w "$QMT_FONT_CACHE"
+              export CARGO_NET_OFFLINE=true
+            '';
+
+            # See qmt below: cargo-auditable fails on this workspace's `dep:` features.
+            auditable = false;
+            # Tested by .github/workflows/test-gpui.yml (GPUI tests need a display
+            # stack the sandbox does not have).
+            doCheck = false;
+            buildPhase = "cargoBuildHook";
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/querymt-gpui $out/bin/querymt-gpui
+              install -Dm644 crates/querymt-gpui/assets/brand/querymt-stencil.svg \
+                $out/share/icons/hicolor/scalable/apps/querymt-gpui.svg
+              runHook postInstall
+            '';
+
+            # GPUI dlopens Vulkan, Wayland/X11 and xkbcommon at runtime.
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              wrapProgram $out/bin/querymt-gpui \
+                --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath gpuiRuntimeLibs}"
+            '';
+
+            meta = {
+              description = "QueryMT Desktop: the GPUI desktop client for QueryMT agents";
+              homepage = "https://github.com/querymt/querymt";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "querymt-gpui";
+              platforms = pkgs.lib.platforms.linux ++ pkgs.lib.platforms.darwin;
+            };
+          };
         in {
           packages = {
             dashboard-ui = dashboardUi;
@@ -250,6 +385,7 @@
               name = "qmcp";
               shaVar = "QMCP_GIT_SHA";
             };
+            querymt-gpui = querymtGpui;
           };
 
           apps = {
@@ -269,18 +405,28 @@
               type = "app";
               program = "${self.packages.${system}.qmcp}/bin/qmcp";
             };
+            querymt-gpui = {
+              type = "app";
+              program = "${querymtGpui}/bin/querymt-gpui";
+            };
           };
 
           devShells =
             {
               default = pkgs.mkShell {
-                # wasm-bindgen-cli must match the locked wasm-bindgen crate (0.2.129) exactly.
+                # wasm-bindgen-cli must match the locked wasm-bindgen crate (0.2.130) exactly.
+                # The GPUI libraries let `cargo run -p querymt-gpui` work on Linux;
+                # miniserve serves the desktop app's web build.
                 buildInputs =
                   commonInputs
-                  ++ (with pkgs; [
-                    binaryen
-                    wasm-bindgen-cli_0_2_129
-                  ]);
+                  ++ gpuiBuildLibs
+                  ++ [
+                    pkgs.binaryen
+                    pkgs.miniserve
+                    wasmBindgenCli
+                  ];
+
+                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath gpuiRuntimeLibs;
 
                 shellHook =
                   /*
