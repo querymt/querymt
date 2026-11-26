@@ -171,11 +171,39 @@ fn build_gpui_web(
         .join(WASM_PROFILE)
         .join("querymt-gpui.wasm");
     bindgen(&wasm, staging)?;
+    verify_bindgen_output(staging)?;
 
     let optimized = run_wasm_opt(&staging.join(format!("{OUT_NAME}_bg.wasm")))?;
     fs::copy(gpui.join("web/index.html"), staging.join("index.html"))
         .map_err(|err| format!("failed to copy crates/querymt-gpui/web/index.html: {err}"))?;
     Ok(optimized)
+}
+
+/// Checks that wasm-bindgen produced a web loader that can find its wasm on its own,
+/// like the CLI's `--target web` output: `init()` with no argument fetches
+/// `<name>_bg.wasm` next to the JS. The library's default omits that fallback, which
+/// leaves a blank page.
+pub(crate) fn verify_bindgen_output(directory: &Path) -> Result<(), String> {
+    let wasm = directory.join(format!("{OUT_NAME}_bg.wasm"));
+    if !wasm.is_file() {
+        return Err(format!("wasm-bindgen did not write {}", wasm.display()));
+    }
+    let js_path = directory.join(format!("{OUT_NAME}.js"));
+    let js = fs::read_to_string(&js_path).map_err(|err| {
+        format!(
+            "wasm-bindgen did not write a readable {}: {err}",
+            js_path.display()
+        )
+    })?;
+    let default_path = format!("new URL('{OUT_NAME}_bg.wasm', import.meta.url)");
+    if !js.contains(&default_path) {
+        return Err(format!(
+            "{} has no default wasm path (`{default_path}`); wasm-bindgen must run with \
+             omit_default_module_path(false) and the web target",
+            js_path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Environment that would make the nested wasm build follow the outer build instead
@@ -387,6 +415,40 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("no index.html"), "{err}");
         assert!(!out.path().join("querymt-ui").exists());
+    }
+
+    fn write_bindgen_output(directory: &Path, js: &str) {
+        fs::write(directory.join(format!("{OUT_NAME}.js")), js).unwrap();
+        fs::write(directory.join(format!("{OUT_NAME}_bg.wasm")), b"\0asm").unwrap();
+    }
+
+    #[test]
+    fn web_loader_with_a_default_wasm_path_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bindgen_output(
+            dir.path(),
+            "if (module_or_path === undefined) {\n    module_or_path = new URL('querymt_gpui_bg.wasm', import.meta.url);\n}",
+        );
+        verify_bindgen_output(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn web_loader_without_a_default_wasm_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bindgen_output(
+            dir.path(),
+            "async function __wbg_init_once(module_or_path) { const imports = {}; }",
+        );
+        let err = verify_bindgen_output(dir.path()).unwrap_err();
+        assert!(err.contains("omit_default_module_path(false)"), "{err}");
+    }
+
+    #[test]
+    fn missing_wasm_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(format!("{OUT_NAME}.js")), "").unwrap();
+        let err = verify_bindgen_output(dir.path()).unwrap_err();
+        assert!(err.contains("did not write"), "{err}");
     }
 
     #[test]
