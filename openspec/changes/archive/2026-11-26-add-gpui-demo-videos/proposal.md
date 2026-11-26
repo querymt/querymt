@@ -16,7 +16,7 @@ HyperFrames (HTML compositions rendered deterministically to video, CLI `npx hyp
   - `demos/film.sh`: the one entry point;
   - `demos/README.md`.
 - **Shared composition `app-clip.html`**, a deterministic, paused GSAP timeline. GSAP 3 loads from jsDelivr before frame 0, as HyperFrames' own docs do; there are no other network reads. It has:
-  - a 1920x1080 stage, with a macOS-style window frame drawn around the footage (patterned on the catalog's `browser-device-stage` "window" chrome);
+  - a 1920x1080 stage, with the footage in a rounded window whose macOS buttons are drawn where the app leaves room for them (the app has no title bar of its own; this replaces the catalog's `browser-device-stage` bar with title);
   - the main footage;
   - the transparent panel layer, placed by the timing file's anchor and bounds, with a soft shadow and a backdrop blur;
   - a cursor that moves between the timing file's event points, with a click ring on clicks and an I-beam while typing;

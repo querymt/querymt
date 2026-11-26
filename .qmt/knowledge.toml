@@ -64,6 +64,11 @@ include = [
   # The film harness and its scene files (the "Filming demo clips" note).
   "crates/querymt-gpui/src/film/*.rs",
   "crates/querymt-gpui/film/scenes/*.toml",
+  # The demo videos built from filmed scenes (the "Demo videos" pointer in that note).
+  "demos/README.md",
+  "demos/film.sh",
+  "demos/build.mjs",
+  "demos/clips/*/scene.toml",
 ]
 # The evaluation harness is not part of the subject matter being documented, and
 # the config test module is large enough to bury the config note in search results.

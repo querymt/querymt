@@ -1,0 +1,64 @@
+# The quick panel over a session: summon it, type a question, send it with
+# Cmd+Enter (start the chat and open it in the main window), watch the answer
+# stream in there. The panel is its own alpha track (`panel = "track"`), so the
+# demo composition can frame and blur it.
+version = 1
+name = "quick-chat"
+fps = 30
+size = [1280, 800]
+theme = "dark"
+accent = "orange"
+panel = "track"
+stills = [0, 90, 239]
+
+[world]
+kind = "fixture"
+agent_title = "qmtcode"
+cwd = "/workspace/demo"
+model = "anthropic:claude-sonnet-4-5"
+models = [{ id = "anthropic:claude-sonnet-4-5", label = "Claude Sonnet 4.5", provider = "anthropic" }]
+sessions = [
+  { id = "s-1", title = "Refactor the parser", cwd = "/workspace/demo", updated = "2026-11-20T10:00:00Z", phase = "idle" },
+  { id = "s-2", title = "Fix the flaky login test", cwd = "/workspace/demo", updated = "2026-11-19T16:30:00Z", phase = "idle" },
+]
+session = { id = "film", title = "Film" }
+
+[[step]]
+at = 0.4
+click = "composer-input"
+caption = "Working in a session"
+
+[[step]]
+after = 0.8
+quick_open = true
+caption = "Summon the quick panel from anywhere"
+
+[[step]]
+after = 0.5
+window = "panel"
+type = "What changed in the last commit?"
+cps = 20
+
+[[step]]
+after = 0.3
+window = "panel"
+press = "cmd-enter"
+caption = "Cmd+Enter opens the chat in the main window"
+
+[[step]]
+after = 0.2
+state = "running"
+
+[[step]]
+after = 0.3
+stream = "The last commit moves the **film harness** into its own module and reads clips from scene files."
+wps = 7
+caption = "The answer streams in"
+
+[[step]]
+after = 0.3
+end_turn = "end_turn"
+
+[[step]]
+at = 9.0
+end = true
