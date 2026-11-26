@@ -136,6 +136,14 @@ The spike does not simulate typing or clicks. Keystrokes and clicks have known t
 - **[The fixture's agent needs extra state to show a running turn]** → Use the same `phase`/state updates the existing tests use. If the spinner cannot be shown, note it; it does not block the spike.
 - **[Trade-off: code-defined scene]** Changing the clip needs a recompile. That is accepted for a spike; data-defined scenes are the follow-up.
 
+## Spike findings (deviations from the plan above)
+
+- **D2 text system:** `gpui_kit::platform::current_platform(true)` panics with "Mac platform not created on main thread" on a test thread, and neither fallback (`--test-threads=1`, `VisualTestAppContext`) avoids it, because both build a `MacPlatform`. The test builds `gpui_apple::AppleTextSystem::new()` directly on macOS instead. That adds one macOS-only dev-dependency, `gpui-pre-apple = "=0.3.14"` (already locked through gpui-kit), which the proposal's "no new dependencies" did not expect. Other platforms keep `current_platform(true).text_system()` (untried).
+- **D3 app state:** `QmtApp` opens on the Start page and the headless window's appearance is light. The test sets `store.prefs.dark = Some(true)` in memory, calls `apply_theme`, and calls a new `#[cfg(test)]` `QmtApp::show_session_for_test` in `src/ui/mod.rs`. Non-test code is still unchanged apart from `install_fonts` becoming `pub(crate)`.
+- **D6 input:** keystrokes (`window.press`) and clicks by element id (`window.click`) work on a headless window. The composer has no element id, only a `debug_selector`, so it cannot be clicked that way. Find in session needs a non-empty transcript.
+- **D3 starting world, added after review:** besides `peer_fixture()`, a take can be seeded from a running qmtcode over WebSocket (`launch::websocket_fixture` plus the real `AgentsStore::connect`, waiting in wall time for the session list and model catalog before frame 0). Only the seed is real; the scene stays scripted and nothing is sent to a model. It is not reproducible (real session titles, catalog paging and re-lists during the take), so the follow-up should decide between a live seed and a seed saved to a file.
+- Measured: about 126 ms per captured frame at 2560x1600 on an Apple M4 Pro, 23 s for the 150-frame clip. See tasks.md for the numbers and the answers to the Open Questions below.
+
 ## Open Questions
 
 These are answered by running the spike and recorded in tasks.md; none changes this plan:

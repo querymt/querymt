@@ -15151,6 +15151,7 @@ dependencies = [
  "futures",
  "global-hotkey",
  "gpui-kit",
+ "gpui-pre-apple",
  "iana-time-zone",
  "interprocess",
  "js-sys",

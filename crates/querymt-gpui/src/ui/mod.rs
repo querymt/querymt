@@ -593,6 +593,15 @@ impl QmtApp {
         }
     }
 
+    /// The session page with its composer focused, as a window opens on a
+    /// session (the film spike).
+    #[cfg(test)]
+    pub(crate) fn show_session_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.go(Page::Session, cx);
+        self.pane
+            .update(cx, |pane, cx| pane.focus_composer(window, cx));
+    }
+
     fn go(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         self.pane.update(cx, |pane, _| pane.close_panels());

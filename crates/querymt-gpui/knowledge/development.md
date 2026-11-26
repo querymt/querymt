@@ -74,6 +74,53 @@ rows shows up here in the same pull request.
 pin to bump: a change to the core or to `querymt-agent-protocol-types` must keep
 `cargo t-gpui` green.
 
+## Filming demo clips (spike)
+
+`src/film.rs` (test-only, OpenSpec change `spike-gpui-demo-film`) renders the real `QmtApp`
+offscreen, frame by frame, on GPUI's `HeadlessAppContext` with a stepped fake clock, and pipes
+the frames to `ffmpeg`. It films one hard-coded scene: a user prompt, then a Markdown reply
+streamed in through `AgentsStore::notify_for_test`, 5 s at 30 fps. The tests are `#[ignore]`d,
+so `cargo t-gpui` and CI never run them.
+
+```bash
+cargo nextest run -p querymt-gpui --bins --run-ignored only \
+  -E 'test(=film::film_prompt_and_streamed_reply)' --no-capture          # fixture world
+cargo nextest run -p querymt-gpui --bins --run-ignored only \
+  -E 'test(=film::film_prompt_and_streamed_reply_seeded)' --no-capture   # seeded from qmtcode
+```
+
+- Needs `ffmpeg` (and, to inspect, `ffprobe`) on `PATH`.
+- Output goes to `$QMT_FILM_OUT`, default `target/film/`: `<take>.mp4` (2560x1600, 30 fps,
+  150 frames) plus `<take>-000.png` and `<take>-090.png` stills, where `<take>` is
+  `prompt-and-reply` or `prompt-and-reply-seeded`.
+- Two starting worlds. The fixture take uses `peer_fixture()`: a connected agent with no
+  session list and no models, so the sidebar reads "Loading sessions…" and the pill
+  "Model unknown". The seeded take connects to a running qmtcode over WebSocket at
+  `$QMT_FILM_AGENT` (default `localhost:3030`) through `launch::websocket_fixture` and the
+  real `AgentsStore::connect`, then waits (wall time, 20 s limit) until the session list and
+  model catalog have arrived. Only that seed comes from the agent: the filmed session `film`
+  does not exist there and its prompt and reply are still scripted, so nothing is sent to a
+  model. The pill shows `$QMT_FILM_MODEL` (a model id), else the catalog's first model.
+  `websocket_fixture` neither reads nor writes the user's `state.json` (unlike
+  `AgentsStore::new`).
+- The seeded take is not reproducible: the frame shows the agent's real session titles and
+  workspaces, the rest of the catalog keeps paging in during the take (the open-session count
+  grew from 201 to 7960 in one), and each scripted `session/update` makes the store re-list
+  sessions 1.2 s of film time later, so rows reorder as sessions on that agent change. Point it
+  at a qmtcode with a demo workspace for a public clip.
+- `probe_headless_input` shows that `window.press` and `window.click` work on a headless
+  window; `probe_seeded_from_agent` captures one seeded frame. Both write `probe-*.png`.
+- Limits: the window is 1280x800 logical at the test platform's 2x scale, with no OS frame or
+  traffic lights. The theme is forced dark with the orange accent (`prefs.dark` is set in
+  memory, because the test window's appearance is light). Capture takes 125-185 ms per frame
+  (Apple M4 Pro, Metal), so a clip renders slower than real time. On macOS the text system is
+  `gpui_apple::AppleTextSystem`, a macOS-only dev-dependency, because
+  `current_platform` builds a `MacPlatform`, which panics off the process main thread.
+  The composer has only a `debug_selector` (`composer-input`), no element id, so
+  `TestWindowExt::click` cannot target it; keystrokes reach it through focus. Find in session
+  does nothing on an empty transcript. The quick panel is not filmable (native panel).
+- Linux (wgpu) is untried.
+
 ## Releases
 
 The app ships with the main QueryMT release and nightly (`.github/workflows/build.yml`) as

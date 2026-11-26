@@ -11,6 +11,8 @@
 // The browser starts through wasm-bindgen, not Rust's executable entry point.
 #![cfg_attr(target_family = "wasm", no_main)]
 
+#[cfg(test)]
+mod film;
 mod highlight;
 mod profile_templates;
 #[cfg(not(target_family = "wasm"))]
@@ -128,7 +130,7 @@ impl<A: AssetSource> AssetSource for AppAssets<A> {
     }
 }
 
-fn install_fonts(cx: &mut App) {
+pub(crate) fn install_fonts(cx: &mut App) {
     const FONTS: &[&[u8]] = &[
         include_bytes!(concat!(env!("OUT_DIR"), "/fonts/IBMPlexSans-Regular.ttf")),
         include_bytes!(concat!(env!("OUT_DIR"), "/fonts/IBMPlexSans-Medium.ttf")),
