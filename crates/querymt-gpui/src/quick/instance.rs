@@ -46,7 +46,9 @@ impl Command {
     fn signal(self) -> Signal {
         match self {
             Self::Quick => Signal::TogglePanel,
-            Self::Show => Signal::OpenMain,
+            Self::Show => Signal::OpenMain {
+                activation_token: None,
+            },
         }
     }
 }
@@ -243,7 +245,12 @@ mod tests {
 
         // A plain start asks for the main window.
         assert!(forward(&endpoint, Command::Show));
-        assert!(matches!(next(&requests), Some(Signal::OpenMain)));
+        assert!(matches!(
+            next(&requests),
+            Some(Signal::OpenMain {
+                activation_token: None
+            })
+        ));
 
         // Once the first instance is gone, a new one starts again.
         drop(listening);

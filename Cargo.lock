@@ -15165,6 +15165,7 @@ dependencies = [
  "iana-time-zone",
  "interprocess",
  "js-sys",
+ "ksni",
  "limu",
  "markdown",
  "minisign-verify",
@@ -15205,6 +15206,8 @@ dependencies = [
  "ureq 3.5.2",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wayland-client",
+ "wayland-protocols",
  "web-sys",
  "web-time",
 ]
