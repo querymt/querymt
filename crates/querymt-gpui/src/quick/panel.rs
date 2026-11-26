@@ -1458,9 +1458,7 @@ impl QuickPanel {
                 kit::tip_with_key(model_tip.clone(), &OpenModelPicker, window).build(window, cx)
             })
             .when(model_live, |el| {
-                el.on_click(
-                    cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)),
-                )
+                el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
             });
         let efforts = run.efforts;
         let effort = run.effort.map(|effort| {
