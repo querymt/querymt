@@ -11,6 +11,8 @@ run from the repository root.
 nix develop -c cargo run -p querymt-gpui                              # qmtcode on PATH is added as "Local qmtcode"
 nix develop -c cargo run -p querymt-gpui -- --agent 127.0.0.1:42069   # add a WebSocket agent (also QMT_AGENT=...)
 QMT_DEBUG=1 nix develop -c cargo run -p querymt-gpui                  # log agent/RPC traffic to stderr
+cargo r-gpui                                                          # optimized build (release profile), then run
+cargo r-gpui --agent 127.0.0.1:42069                                  # same, plus a WebSocket agent (host:port, ws:// or wss://)
 cargo t-gpui                                                          # tests (nextest, bin target)
 cargo cl-gpui                                                         # clippy -D warnings
 ```

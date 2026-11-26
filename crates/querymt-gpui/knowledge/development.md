@@ -31,6 +31,7 @@ repository root does not build it (it needs GPUI's system libraries on Linux). A
 nix develop -c cargo run -p querymt-gpui                              # native; qmtcode on PATH becomes "Local qmtcode"
 nix develop -c cargo run -p querymt-gpui -- --agent 127.0.0.1:42069   # add a WebSocket agent (also QMT_AGENT)
 QMT_DEBUG=1 nix develop -c cargo run -p querymt-gpui                  # agent/RPC traffic to stderr
+cargo r-gpui [--agent host:port]                                      # optimized (release profile) build and run
 cargo t-gpui                                                          # tests, as CI runs them (nextest --bins)
 cargo cl-gpui                                                         # clippy -D warnings
 cargo fmt --all -- --check

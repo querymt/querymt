@@ -23,6 +23,10 @@ t-protocol = "nextest run -p querymt-agent-protocol-types --features test-suppor
 t-core = "nextest run -p querymt-agent-core"
 # QueryMT Desktop (crates/querymt-gpui): its tests live in the bin target.
 t-gpui = "nextest run -p querymt-gpui --bins"
+# Run QueryMT Desktop as an optimized build (Cargo's default release profile:
+# much faster than debug, much quicker to build than the shipped release-gpui).
+# Arguments go to the app: `cargo r-gpui`, `cargo r-gpui --agent 127.0.0.1:42069`.
+r-gpui = "run -p querymt-gpui --release --"
 
 cl-agent = "clippy -p querymt-agent --all-targets --features dashboard,oauth,zbus-secret-service,systemd-credentials,remote -- -D warnings"
 cl-runtime = "clippy -p querymt-agent-runtime --all-targets --features remote,oauth,plugin-loaders,api -- -D warnings"
