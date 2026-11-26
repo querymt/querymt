@@ -33,6 +33,12 @@ jobs:
         with:
           fetch-depth: 0  # merge-base needs the full history
 
+      # The release script tests sign a throwaway manifest with minisign.
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
       - name: Test release scripts
         run: scripts/release/test-release-scripts.sh
 
@@ -102,8 +108,22 @@ jobs:
       - name: Write release.json
         run: |
           scripts/release/write-release-json.sh \
-            "${GITHUB_REF_NAME#v}" stable "$GITHUB_SHA" artifacts/release.json
+            "${GITHUB_REF_NAME#v}" stable "$GITHUB_SHA" artifacts/release.json \
+            --desktop-dir artifacts --version-name "$GITHUB_REF_NAME"
           cat artifacts/release.json
+
+      # The app only trusts a release.json signed with the update key. A
+      # missing secret fails the run before anything is published.
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign release.json
+        env:
+          QMT_UPDATE_SIGNING_KEY: ${{ secrets.QMT_UPDATE_SIGNING_KEY }}
+        run: |
+          scripts/release/sign-release-json.sh artifacts/release.json "${GITHUB_REF_NAME#v}" stable
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v3

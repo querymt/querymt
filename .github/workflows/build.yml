@@ -336,9 +336,13 @@ jobs:
           path: ${{ env.ASSET_PATH }}
 
   # ─── QueryMT Desktop (crates/querymt-gpui) ──────────────────────────────────
-  # Native installers, named QueryMT-Desktop-<version_name>-<platform>.<ext>.
-  # The artifact names start with `qmt-desktop-` so the release jobs' `qm*-*`
-  # download pattern picks them up.
+  # Two jobs. `desktop` compiles the app, in parallel with the qmtcode builds in
+  # `build` (the fat-LTO compile is the long step). `desktop-package` waits for
+  # both, bundles the qmtcode built by this same run into each installer, checks
+  # the installers and uploads them, named
+  # QueryMT-Desktop-<version_name>-<platform>.<ext>. The packaged artifact names
+  # start with `qmt-desktop-` so the release jobs' `qm*-*` download pattern picks
+  # them up; the compiled `desktop-bin-*` artifacts do not match it.
   desktop:
     name: Build QueryMT Desktop for ${{ matrix.target }}
     runs-on: ${{ matrix.platform }}
@@ -348,29 +352,19 @@ jobs:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
-            asset_suffix: macos-aarch64
+            bin: querymt-gpui
           - platform: macos-latest
             target: x86_64-apple-darwin
-            asset_suffix: macos-x86_64
+            bin: querymt-gpui
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_suffix: windows-x64-setup
+            bin: querymt-gpui.exe
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset_suffix: linux-x86_64
-            arch: x86_64
-            nfpm_arch: x86_64
-            nfpm_sha256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
-            appimagetool_sha256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
-            appimage_runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+            bin: querymt-gpui
           - platform: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset_suffix: linux-aarch64
-            arch: aarch64
-            nfpm_arch: arm64
-            nfpm_sha256: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
-            appimagetool_sha256: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
-            appimage_runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+            bin: querymt-gpui
     env:
       QMT_VERSION: ${{ inputs.qmt_version }}
       VERSION_NAME: ${{ inputs.version_name }}
@@ -397,6 +391,84 @@ jobs:
             libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
             libxkbcommon-x11-dev
 
+      # GPUI compiles its Metal shaders with `xcrun metal`; Xcode 26 ships the
+      # Metal toolchain as a separate component.
+      - name: Install Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if ! xcrun -f metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -f metal
+
+      # QMT_VERSION (env) is what the app reports (crates/querymt-gpui/build.rs).
+      - name: Build QueryMT Desktop
+        shell: bash
+        run: cargo build --locked -p querymt-gpui --profile release-gpui --target ${{ matrix.target }}
+
+      - name: Upload compiled app
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release-gpui/${{ matrix.bin }}
+          if-no-files-found: error
+
+  desktop-package:
+    name: Package QueryMT Desktop for ${{ matrix.target }}
+    needs: [desktop, build]
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            qmtcode_target: aarch64-apple-darwin
+            asset_suffix: macos-aarch64
+            bin: querymt-gpui
+            qmtcode_bin: qmtcode
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            qmtcode_target: x86_64-apple-darwin
+            asset_suffix: macos-x86_64
+            bin: querymt-gpui
+            qmtcode_bin: qmtcode
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            qmtcode_target: x86_64-pc-windows-msvc
+            asset_suffix: windows-x64-setup
+            bin: querymt-gpui.exe
+            qmtcode_bin: qmtcode.exe
+          # Linux installers carry the static musl qmtcode.
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            qmtcode_target: x86_64-unknown-linux-musl
+            asset_suffix: linux-x86_64
+            bin: querymt-gpui
+            qmtcode_bin: qmtcode
+            arch: x86_64
+            nfpm_arch: x86_64
+            nfpm_sha256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+            appimagetool_sha256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+            appimage_runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            qmtcode_target: aarch64-unknown-linux-musl
+            asset_suffix: linux-aarch64
+            bin: querymt-gpui
+            qmtcode_bin: qmtcode
+            arch: aarch64
+            nfpm_arch: arm64
+            nfpm_sha256: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
+            appimagetool_sha256: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+            appimage_runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+    env:
+      QMT_VERSION: ${{ inputs.qmt_version }}
+      VERSION_NAME: ${{ inputs.version_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
         env:
@@ -408,6 +480,9 @@ jobs:
           APPIMAGE_RUNTIME_VERSION: '20251108'
           APPIMAGE_RUNTIME_SHA256: ${{ matrix.appimage_runtime_sha256 }}
         run: |
+          # dpkg-deb: check-bundles.sh lists the deb with it.
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
           mkdir -p "$HOME/.local/bin"
           curl -fsSL -o /tmp/nfpm.tar.gz \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
@@ -423,16 +498,6 @@ jobs:
             "$HOME/.local/bin/appimage-runtime"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # GPUI compiles its Metal shaders with `xcrun metal`; Xcode 26 ships the
-      # Metal toolchain as a separate component.
-      - name: Install Metal toolchain
-        if: runner.os == 'macOS'
-        run: |
-          if ! xcrun -f metal >/dev/null 2>&1; then
-            xcodebuild -downloadComponent MetalToolchain
-          fi
-          xcrun -f metal
-
       - name: Install NSIS
         if: runner.os == 'Windows'
         shell: pwsh
@@ -442,10 +507,42 @@ jobs:
             choco install nsis -y --no-progress
           }
 
-      # QMT_VERSION (env) is what the app reports (crates/querymt-gpui/build.rs).
-      - name: Build QueryMT Desktop
+      # The packaging scripts read the app from target/<target>/release-gpui/.
+      # Artifacts do not keep file modes, so the app is made executable again.
+      - name: Download compiled app
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release-gpui
+
+      - name: Download qmtcode
+        uses: actions/download-artifact@v8
+        with:
+          name: qmtcode-${{ matrix.qmtcode_target }}
+          path: qmtcode-archive
+
+      # The qmtcode artifact holds an archive: a tar.gz with a top-level
+      # directory (Unix) or a zip with the files at its root (Windows).
+      - name: Unpack qmtcode
         shell: bash
-        run: cargo build --locked -p querymt-gpui --profile release-gpui --target ${{ matrix.target }}
+        env:
+          QMTCODE_BIN: ${{ matrix.qmtcode_bin }}
+        run: |
+          chmod +x "target/${{ matrix.target }}/release-gpui/${{ matrix.bin }}"
+          mkdir -p qmtcode-unpack
+          shopt -s nullglob
+          archives=(qmtcode-archive/*)
+          [ "${#archives[@]}" -eq 1 ] || { echo "::error::expected one qmtcode archive, found ${#archives[@]}"; exit 1; }
+          case "${archives[0]}" in
+            *.tar.gz) tar -xzf "${archives[0]}" -C qmtcode-unpack ;;
+            *.zip) 7z x -y -oqmtcode-unpack "${archives[0]}" >/dev/null ;;
+            *) echo "::error::unknown qmtcode archive ${archives[0]}"; exit 1 ;;
+          esac
+          found="$(find qmtcode-unpack -type f -name "$QMTCODE_BIN" | head -n 1)"
+          [ -n "$found" ] || { echo "::error::$QMTCODE_BIN not found in ${archives[0]}"; exit 1; }
+          chmod +x "$found"
+          # An absolute path: the packaging scripts change directory.
+          echo "QMTCODE_BINARY=$PWD/$found" >> "$GITHUB_ENV"
 
       # Bundle metadata (Info.plist, deb, NSIS) needs X.Y.Z[-pre], without the v.
       - name: Package macOS bundles
@@ -462,6 +559,12 @@ jobs:
         run: |
           APPIMAGE_RUNTIME_FILE="$HOME/.local/bin/appimage-runtime" \
             bash crates/querymt-gpui/scripts/package/linux.sh "${QMT_VERSION#v}" ${{ matrix.target }}
+
+      # Fails the job, and so the release, when an installer lacks qmtcode or
+      # its qmtcode is not the version of this release.
+      - name: Check installers contain qmtcode
+        shell: bash
+        run: bash crates/querymt-gpui/scripts/release/check-bundles.sh ${{ matrix.target }} "${QMT_VERSION#v}"
 
       - name: Collect installers
         shell: bash

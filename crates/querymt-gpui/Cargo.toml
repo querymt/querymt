@@ -63,8 +63,21 @@ tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 interprocess = "2"
 # Decodes the app icon for the tray.
 png = "0.17"
+# Self-update (src/update): HTTPS with rustls (ring, like tungstenite above),
+# minisign verification of the signed release manifest, semver precedence and
+# the SHA-256 of downloaded installers.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+minisign-verify = "0.3"
+semver = "1"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Swaps the running .app bundle for the downloaded one (design D10). The
+# archive scan in `update/install/macos.rs` reads the tarball with `tar` and
+# `flate2` before the crate extracts it.
+self_update = { version = "1.3", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-tar-gz"] }
+tar = "0.4"
+flate2 = "1"
 # Panel material and sizing (src/quick/chrome). Same versions GPUI already
 # builds, so they add no new compilation.
 objc2 = "0.6"
@@ -111,6 +124,11 @@ gpui-kit = { version = "0.11.0", features = ["test-support"] }
 querymt-agent-session-core = { path = "../agent-session-core", features = ["test-support"] }
 # Film scene files (src/film/scene.rs).
 toml = { workspace = true }
+tempfile = "3"
+# Update tests sign their fixtures the way the minisign CLI does (a pre-hashed
+# `ED` signature plus a trusted comment) with a throwaway key.
+ed25519-dalek = "2"
+blake2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # The film spike (src/film.rs) needs the CoreText text system without a

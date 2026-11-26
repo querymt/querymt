@@ -18,6 +18,8 @@ mod plans;
 pub(crate) mod plugins;
 pub(crate) mod setup;
 pub(crate) mod sidebar;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod updates;
 pub(crate) mod worktree;
 
 #[cfg(test)]
@@ -1229,6 +1231,8 @@ pub struct AgentRuntime {
     /// JSON-RPC traffic across reconnects (debug events, Developer mode).
     pub wire: Rc<crate::rpc_log::WireLog>,
     pub pid: Option<u32>,
+    /// Set when the local agent process has exited; what an install waits on.
+    exit: Option<transport::Exit>,
     pub connected_at: Option<f64>,
     pub busy: bool,
     rpc: Option<Rc<RpcClient>>,
@@ -1398,6 +1402,13 @@ pub struct Prefs {
     #[serde(default)]
     pub launch_models: HashMap<String, String>,
     pub primary_agent: Option<String>,
+    /// Update channel, automatic checks and the skipped version.
+    #[serde(default)]
+    pub updates: crate::update::UpdatePrefs,
+    /// Seeded agents the user deleted (only `local-qmtcode`); they are not
+    /// added again on later starts. Reset app data clears the list.
+    #[serde(default)]
+    pub dismissed_seeds: Vec<String>,
     #[serde(default)]
     pub sidebar_collapsed: bool,
     /// Width of the turn diff panel the user dragged it to; `None` keeps the
@@ -1679,20 +1690,13 @@ fn seed_configs() -> Vec<AgentConfig> {
                 host_managed: false,
             });
         }
-        let on_path = std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("qmtcode").is_file())
-        });
-        if on_path {
-            seeds.push(AgentConfig {
-                id: "local-qmtcode".into(),
-                name: "Local qmtcode".into(),
-                endpoint: Endpoint::Process {
-                    command: "qmtcode --acp".into(),
-                },
-                auto_start: true,
-                host_managed: false,
-            });
-        }
+        let exe = std::env::current_exe().ok();
+        let path_var = std::env::var_os("PATH");
+        seeds.extend(local_qmtcode_seed(
+            exe.as_deref(),
+            path_var.as_deref(),
+            std::env::consts::EXE_SUFFIX,
+        ));
     }
     #[cfg(target_family = "wasm")]
     if let Some(location) = web_sys::window().map(|w| w.location()) {
@@ -1735,6 +1739,61 @@ fn seed_configs() -> Vec<AgentConfig> {
         }
     }
     seeds
+}
+
+/// Id of the seeded agent that runs the bundled (or PATH) qmtcode.
+#[cfg(not(target_family = "wasm"))]
+const LOCAL_QMTCODE_ID: &str = "local-qmtcode";
+
+/// "Local qmtcode", when a bundled copy exists or qmtcode is on PATH.
+#[cfg(not(target_family = "wasm"))]
+fn local_qmtcode_seed(
+    exe: Option<&std::path::Path>,
+    path_var: Option<&std::ffi::OsStr>,
+    exe_suffix: &str,
+) -> Option<AgentConfig> {
+    crate::local_agent::available_with_suffix(exe, path_var, exe_suffix).then(|| AgentConfig {
+        id: LOCAL_QMTCODE_ID.into(),
+        name: "Local qmtcode".into(),
+        endpoint: Endpoint::Process {
+            command: "qmtcode --acp".into(),
+        },
+        auto_start: true,
+        host_managed: false,
+    })
+}
+
+/// The agents, preferences and first-run flag a start begins with: the saved
+/// state (if any) plus the seeds that are neither already present nor
+/// dismissed.
+fn startup_state(
+    loaded: Option<Persisted>,
+    seeds: Vec<AgentConfig>,
+) -> (Vec<AgentConfig>, Prefs, bool) {
+    // No saved state: a fresh install, decided before anything is saved.
+    // State saved before setup existed is an existing user: setup is done.
+    let first_run = loaded.is_none();
+    let mut persisted = loaded.unwrap_or_default();
+    if !first_run && !persisted.prefs.onboarding.done() {
+        persisted.prefs.onboarding = setup::Onboarding {
+            version: setup::ONBOARDING_VERSION,
+            completed_at: Some(crate::util::rfc3339_now()),
+            skipped_at: None,
+        };
+    }
+    let mut configs = persisted.configs;
+    for seed in seeds {
+        if persisted.prefs.dismissed_seeds.contains(&seed.id) {
+            continue;
+        }
+        if !configs
+            .iter()
+            .any(|c| c.id == seed.id || c.endpoint == seed.endpoint)
+        {
+            configs.insert(0, seed);
+        }
+    }
+    (configs, persisted.prefs, first_run)
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,43 +1852,30 @@ pub struct AgentsStore {
     /// Slash commands advertised for sessions that have no view yet, until
     /// a view takes them (design D3).
     early_commands: early_commands::EarlyCommands,
+    /// Self-update: what the last check found and the schedule (native only).
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) updates: updates::Updates,
 }
 
 impl AgentsStore {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let loaded = load_persisted();
-        // No saved state: a fresh install, decided before anything is saved.
-        // State saved before setup existed is an existing user: setup is done.
-        let first_run = loaded.is_none();
-        let mut persisted = loaded.unwrap_or_default();
-        if !first_run && !persisted.prefs.onboarding.done() {
-            persisted.prefs.onboarding = setup::Onboarding {
-                version: setup::ONBOARDING_VERSION,
-                completed_at: Some(crate::util::rfc3339_now()),
-                skipped_at: None,
-            };
-        }
-        let mut configs = persisted.configs;
-        for seed in seed_configs() {
-            if !configs
-                .iter()
-                .any(|c| c.id == seed.id || c.endpoint == seed.endpoint)
-            {
-                configs.insert(0, seed);
-            }
-        }
+        let (configs, prefs, first_run) = startup_state(load_persisted(), seed_configs());
         let mut this = Self {
             configs,
-            prefs: persisted.prefs,
+            prefs,
             launch: LaunchState::default(),
             open_sessions: Default::default(),
             requests: Vec::new(),
             runtime: HashMap::new(),
             sidebar: Default::default(),
             early_commands: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            updates: Default::default(),
             first_run,
         };
         this.save();
+        #[cfg(not(target_family = "wasm"))]
+        this.start_update_scheduler(cx);
         let auto: Vec<String> = this
             .configs
             .iter()
@@ -2027,6 +2073,12 @@ impl AgentsStore {
         self.configs.retain(|c| c.id != id);
         self.prefs.launch_models.remove(id);
         self.prefs.launch_profiles.remove(id);
+        // A deleted seeded agent stays deleted; `--agent` agents come back
+        // whenever they are requested again.
+        #[cfg(not(target_family = "wasm"))]
+        if id == LOCAL_QMTCODE_ID && !self.prefs.dismissed_seeds.iter().any(|s| s == id) {
+            self.prefs.dismissed_seeds.push(id.to_owned());
+        }
         self.save();
         cx.notify();
     }
@@ -2345,6 +2397,12 @@ impl AgentsStore {
     /// preferences) and start over like a fresh install. Sessions on the
     /// agents, provider sign-ins and project files are not touched.
     pub fn reset_app_data(&mut self, cx: &mut Context<Self>) {
+        self.reset_with_seeds(seed_configs(), cx);
+    }
+
+    /// [`Self::reset_app_data`] over the given seeds. The preferences are
+    /// replaced, so earlier dismissals no longer hide a seed.
+    fn reset_with_seeds(&mut self, seeds: Vec<AgentConfig>, cx: &mut Context<Self>) {
         let ids: Vec<String> = self.runtime.keys().cloned().collect();
         for id in &ids {
             self.disconnect(id, cx);
@@ -2354,7 +2412,11 @@ impl AgentsStore {
         self.open_sessions = OpenSessions::default();
         self.launch = LaunchState::default();
         self.prefs = Prefs::default();
-        self.configs = seed_configs();
+        // The channel is back to the build's: an offer found (or a check
+        // started) under the old one no longer applies.
+        #[cfg(not(target_family = "wasm"))]
+        self.updates.invalidate();
+        self.configs = seeds;
         // Starts over like a fresh install, setup included.
         self.first_run = true;
         self.save();
@@ -2695,6 +2757,7 @@ impl AgentsStore {
         rt.models_loaded = false;
         rt.state = ConnState::Connecting;
         rt.pid = None;
+        rt.exit = None;
         rt.log(format!("Connecting to {}…", config.endpoint_label()));
         cx.notify();
 
@@ -2758,6 +2821,7 @@ impl AgentsStore {
                     rpc.set_wire_log(rt.wire.clone());
                     rt.rpc = Some(rpc.clone());
                     rt.pid = conn.pid;
+                    rt.exit = conn.exit;
                     rt.tasks.push(reader);
                     true
                 })
@@ -2850,6 +2914,7 @@ impl AgentsStore {
             rt.tasks.clear();
             rt.state = ConnState::Idle;
             rt.pid = None;
+            rt.exit = None;
             rt.log("Disconnected.");
             self.retire_requests(id);
             self.rebind_sessions(id, false, cx);
@@ -4988,6 +5053,8 @@ mod tests {
             runtime: HashMap::new(),
             sidebar: Default::default(),
             early_commands: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            updates: Default::default(),
             first_run: false,
         };
         store.runtime.entry("a".into()).or_default().models = models.clone();
@@ -5251,5 +5318,213 @@ mod tests {
         assert!(recovery_transport_ok(&ws("[::1]:3030", false)));
         assert!(recovery_transport_ok(&ws("example.com:443", true)));
         assert!(!recovery_transport_ok(&ws("10.0.0.2:3030", false)));
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod seed_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// A temp dir with an app executable directory and a PATH directory.
+    struct Env {
+        root: tempfile::TempDir,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            Self {
+                root: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn touch(&self, rel: &str) {
+            let path = self.root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+
+        fn exe(&self) -> PathBuf {
+            self.root.path().join("app").join("querymt-gpui")
+        }
+
+        fn path_var(&self) -> OsString {
+            std::env::join_paths([self.root.path().join("bin")]).unwrap()
+        }
+
+        fn seed(&self, suffix: &str) -> Option<AgentConfig> {
+            local_qmtcode_seed(Some(&self.exe()), Some(&self.path_var()), suffix)
+        }
+    }
+
+    const SUFFIX: &str = std::env::consts::EXE_SUFFIX;
+
+    fn ws_seed() -> AgentConfig {
+        AgentConfig {
+            id: "ws-host:1234".into(),
+            name: "host:1234".into(),
+            endpoint: Endpoint::WebSocket {
+                address: "host:1234".into(),
+                secure: false,
+            },
+            auto_start: true,
+            host_managed: false,
+        }
+    }
+
+    fn local_seed() -> AgentConfig {
+        AgentConfig {
+            id: LOCAL_QMTCODE_ID.into(),
+            name: "Local qmtcode".into(),
+            endpoint: Endpoint::Process {
+                command: "qmtcode --acp".into(),
+            },
+            auto_start: false,
+            host_managed: false,
+        }
+    }
+
+    fn ids(configs: &[AgentConfig]) -> Vec<&str> {
+        configs.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    /// The app is renamed "QueryMT Desktop", but its state stays where the
+    /// earlier builds wrote it: nothing in the path follows the bundle name
+    /// or identifier.
+    #[test]
+    fn user_state_survives_the_rename() {
+        let path = state_path().expect("a config directory");
+        assert!(
+            path.ends_with(std::path::Path::new("querymt-gpui").join("state.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn bundled_qmtcode_seeds_the_local_agent() {
+        let env = Env::new();
+        env.touch(&format!("app/qmtcode{SUFFIX}"));
+        let seed = env.seed(SUFFIX).expect("seeded");
+        assert_eq!(seed.id, "local-qmtcode");
+        assert_eq!(seed.name, "Local qmtcode");
+        assert_eq!(
+            seed.endpoint,
+            Endpoint::Process {
+                command: "qmtcode --acp".into()
+            }
+        );
+        assert!(seed.auto_start);
+        let (configs, ..) = startup_state(None, vec![seed]);
+        assert_eq!(ids(&configs), ["local-qmtcode"]);
+    }
+
+    #[test]
+    fn windows_path_qmtcode_seeds_the_local_agent() {
+        let env = Env::new();
+        // A suffix-less file is not a Windows executable.
+        env.touch("bin/qmtcode");
+        assert!(env.seed(".exe").is_none());
+        env.touch("bin/qmtcode.exe");
+        assert_eq!(env.seed(".exe").unwrap().id, "local-qmtcode");
+    }
+
+    #[test]
+    fn nothing_to_seed_without_qmtcode() {
+        let env = Env::new();
+        assert!(env.seed(SUFFIX).is_none());
+        let (configs, ..) = startup_state(None, Vec::new());
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn existing_installs_gain_the_local_agent() {
+        let saved = Persisted {
+            configs: vec![ws_seed()],
+            prefs: Prefs::default(),
+        };
+        let (configs, prefs, first_run) = startup_state(Some(saved), vec![local_seed()]);
+        assert_eq!(ids(&configs), ["local-qmtcode", "ws-host:1234"]);
+        assert!(!first_run);
+        assert!(prefs.dismissed_seeds.is_empty());
+    }
+
+    #[test]
+    fn older_state_files_load_without_dismissals() {
+        // Written before dismissals existed.
+        let text = r#"{"configs":[],"prefs":{"dark":true}}"#;
+        let saved: Persisted = serde_json::from_str(text).unwrap();
+        assert!(saved.prefs.dismissed_seeds.is_empty());
+        let (configs, ..) = startup_state(Some(saved), vec![local_seed()]);
+        assert_eq!(ids(&configs), ["local-qmtcode"], "nothing is dismissed");
+    }
+
+    #[gpui_kit::test]
+    fn deleted_local_agent_does_not_return(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| {
+            let mut store = automations::schedule_ui_fixture();
+            store.configs = vec![local_seed()];
+            store
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.delete_config(LOCAL_QMTCODE_ID, cx)));
+        // What the next start reads back.
+        let saved = cx.update(|cx| {
+            let s = store.read(cx);
+            Persisted {
+                configs: s.configs.clone(),
+                prefs: s.prefs.clone(),
+            }
+        });
+        assert_eq!(saved.prefs.dismissed_seeds, ["local-qmtcode"]);
+        let json = serde_json::to_string(&saved).unwrap();
+        let reloaded: Persisted = serde_json::from_str(&json).unwrap();
+        let (configs, ..) = startup_state(Some(reloaded), vec![local_seed()]);
+        assert!(
+            ids(&configs).is_empty(),
+            "still deleted: {:?}",
+            ids(&configs)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn reset_app_data_restores_the_local_agent(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| {
+            let mut store = automations::schedule_ui_fixture();
+            store.configs = Vec::new();
+            store.prefs.dismissed_seeds = vec!["local-qmtcode".into()];
+            store
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.reset_with_seeds(vec![local_seed()], cx)));
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(s.prefs.dismissed_seeds.is_empty());
+            assert_eq!(ids(&s.configs), ["local-qmtcode"]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn requested_agent_returns_after_deletion(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| {
+            let mut store = automations::schedule_ui_fixture();
+            store.configs = vec![ws_seed()];
+            store
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.delete_config("ws-host:1234", cx)));
+        let saved = cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(s.configs.is_empty());
+            Persisted {
+                configs: s.configs.clone(),
+                prefs: s.prefs.clone(),
+            }
+        });
+        assert!(saved.prefs.dismissed_seeds.is_empty(), "not dismissible");
+        // The next start passes `--agent host:1234` again.
+        let (configs, ..) = startup_state(Some(saved), vec![ws_seed()]);
+        assert_eq!(ids(&configs), ["ws-host:1234"]);
     }
 }

@@ -1,4 +1,4 @@
-name: querymt-gpui
+name: querymt-desktop
 arch: ${PKG_ARCH}
 platform: linux
 version: ${PKG_VERSION}
@@ -6,9 +6,17 @@ release: "1"
 section: devel
 maintainer: QueryMT
 vendor: QueryMT
-description: Native desktop control center for QueryMT (GPUI)
+description: QueryMT Desktop, the native control center for QueryMT (GPUI)
 homepage: https://github.com/querymt/querymt
 license: MIT
+
+# Takes over from the earlier package name.
+replaces:
+  - querymt-gpui
+conflicts:
+  - querymt-gpui
+provides:
+  - querymt-gpui
 
 contents:
   - src: ${PKGROOT}/usr/

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=QueryMT
+Name=QueryMT Desktop
 Comment=Native desktop control center for QueryMT
 Exec=querymt-gpui %U
 Icon=querymt-gpui

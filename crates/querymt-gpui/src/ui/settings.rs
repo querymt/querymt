@@ -67,7 +67,7 @@ const TABS: [(SettingsTab, IconName, &str, &str); 6] = [
 const HAS_PROFILE_TEMPLATES: bool = cfg!(not(target_family = "wasm"));
 
 /// Rounded card that groups [`simple_row`]s (desktop `.settings-simple-row` list).
-fn settings_card(p: &Palette) -> Div {
+pub(super) fn settings_card(p: &Palette) -> Div {
     v_flex()
         .min_w_0()
         .rounded(px(12.))
@@ -76,8 +76,8 @@ fn settings_card(p: &Palette) -> Div {
 }
 
 /// One row of a [`settings_card`]: title and help on the left, control on the right.
-fn simple_row(
-    title: &'static str,
+pub(super) fn simple_row(
+    title: impl Into<SharedString>,
     desc: impl Into<SharedString>,
     control: impl IntoElement,
     first: bool,
@@ -100,7 +100,7 @@ fn simple_row(
                         .text_size(px(13.4))
                         .font_semibold()
                         .text_color(p.text)
-                        .child(title),
+                        .child(title.into()),
                 )
                 .child(
                     div()
@@ -641,11 +641,18 @@ impl QmtApp {
         #[cfg(target_family = "wasm")]
         let quick: Option<Div> = None;
 
+        // Updates are a desktop feature: the web build has no updater.
+        #[cfg(not(target_family = "wasm"))]
+        let updates = Some(self.settings_updates(p, cx));
+        #[cfg(target_family = "wasm")]
+        let updates: Option<Div> = None;
+
         v_flex()
             .gap(px(12.8))
             .child(sidebar)
             .children(quick)
             .child(setup)
+            .children(updates)
             .child(advanced)
             .child(danger)
     }

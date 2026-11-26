@@ -7,6 +7,10 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+// The same function the app uses to read its channel back (src/update).
+#[path = "src/update/channel.rs"]
+mod channel;
+
 // IBM Plex v6.4.0: these files match the previously embedded font binaries.
 const REVISION: &str = "383c681f015ed2626e919ec4e3cca16ccc204e9d";
 const DOWNLOAD_BASE: &str = "https://raw.githubusercontent.com/IBM/plex";
@@ -67,6 +71,19 @@ fn set_build_version() {
     let version = version.trim();
     let normalized = version.strip_prefix('v').unwrap_or(version);
     println!("cargo:rustc-env=QMT_BUILD_VERSION={normalized}");
+    set_update_channel();
+}
+
+/// The update channel of this build (`dev`, `nightly` or `stable`). Only a
+/// build with a release version (`QMT_VERSION`, set by CI) can update itself;
+/// `dev` builds make no update requests.
+fn set_update_channel() {
+    println!("cargo:rerun-if-changed=src/update/channel.rs");
+    let version = env::var("QMT_VERSION").ok();
+    println!(
+        "cargo:rustc-env=QMT_UPDATE_CHANNEL={}",
+        channel::name_for_version(version.as_deref())
+    );
 }
 
 fn prepare_fonts() -> Result<(), String> {

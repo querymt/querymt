@@ -14,6 +14,8 @@
 #[cfg(test)]
 mod film;
 mod highlight;
+#[cfg(not(target_family = "wasm"))]
+mod local_agent;
 mod profile_templates;
 #[cfg(not(target_family = "wasm"))]
 mod quick;
@@ -26,6 +28,7 @@ mod telemetry;
 mod theme;
 mod transport;
 mod ui;
+mod update;
 mod usage;
 mod util;
 

@@ -470,6 +470,8 @@ pub(crate) fn schedule_ui_fixture() -> AgentsStore {
         runtime: HashMap::from([(id, runtime)]),
         sidebar: Default::default(),
         early_commands: Default::default(),
+        #[cfg(not(target_family = "wasm"))]
+        updates: Default::default(),
         first_run: false,
     }
 }

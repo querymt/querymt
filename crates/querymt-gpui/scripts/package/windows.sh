@@ -6,12 +6,18 @@
 # Reads <workspace target>/<target>/<profile>/querymt-gpui.exe (profile from
 # CARGO_PROFILE, default release-gpui) and writes
 # <workspace target>/<target>/<profile>/bundle/nsis/, the same layout `tauri build` uses.
+#
+# QMTCODE_BINARY is the qmtcode.exe of the same release; the installer puts it
+# next to the app. Unset: an error under CI, a warning elsewhere (the installer
+# is then built without qmtcode).
 set -euo pipefail
 
 # The crate directory: packaging/ paths below are relative to it.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE="$(cd "$ROOT/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=common.sh
+source "$ROOT/scripts/package/common.sh"
 
 VERSION="${1:?usage: windows.sh <version> <target>}"
 TARGET="${2:?usage: windows.sh <version> <target>}"
@@ -25,6 +31,8 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
 PROFILE="${CARGO_PROFILE:-release-gpui}"
 BINARY="$TARGET_ROOT/$TARGET/$PROFILE/querymt-gpui.exe"
 [ -f "$BINARY" ] || { echo "binary not found at $BINARY" >&2; exit 1; }
+# Before anything is written: a CI run without qmtcode leaves no installer.
+QMTCODE="$(resolve_qmtcode)" || exit 1
 
 OUT="$TARGET_ROOT/$TARGET/$PROFILE/bundle/nsis"
 rm -rf "$OUT"
@@ -39,9 +47,14 @@ fi
 # makensis is a native Windows program: hand it Windows paths. `-D` rather than
 # `/D` so Git Bash does not rewrite the option as a path.
 winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+QMTCODE_ARGS=()
+if [ -n "$QMTCODE" ]; then
+  QMTCODE_ARGS+=("-DQMTCODE_EXE=$(winpath "$QMTCODE")")
+fi
 "$MAKENSIS" -V3 \
   "-DVERSION=$VERSION" \
   "-DSRC_EXE=$(winpath "$BINARY")" \
+  ${QMTCODE_ARGS[@]+"${QMTCODE_ARGS[@]}"} \
   "-DICON=$(winpath "$ROOT/packaging/icons/icon.ico")" \
   "-DOUT_FILE=$(winpath "$OUT/QueryMT_${VERSION}_${ARCH}-setup.exe")" \
   "$(winpath "$ROOT/packaging/windows/installer.nsi")"
