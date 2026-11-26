@@ -27,9 +27,10 @@ use gpui_kit::*;
 use super::connectors::oauth_flow_box;
 use super::kit;
 use super::kit::ButtonExt as _;
+use super::kit::badged_tone;
 use super::kit::{accent_btn, flat_btn};
 use super::session_pane::{SessionPane, SessionPaneEvent};
-use super::start::{badged_tone, mode_tone, toolbar_button};
+use super::start::{mode_tone, toolbar_button};
 use crate::session::open::{Delivery, SessionKey};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,

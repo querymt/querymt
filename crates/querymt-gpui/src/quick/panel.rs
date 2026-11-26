@@ -19,7 +19,7 @@ use gpui_kit::*;
 use super::activity::{self, Activity, Observation, Tracker};
 use super::chrome::{self, Chrome};
 use super::edge::{self, Edge, EdgeColours, EdgeFrame, EdgeLight, EdgeState, MOTION, Outline};
-use super::hud::{PROGRESS_FILL_ALPHA, hud_palette, progress_colour};
+use super::hud::{PROGRESS_FILL_ALPHA, hud_palette, progress_colour, tag_fill};
 use super::{Picks, Resume};
 use crate::session::PlanDigest;
 use crate::session::open::{OpenSession, SessionKey, SessionRef};
@@ -32,6 +32,7 @@ use crate::ui::keys::{
     ChooseFolder, CycleReasoning, NewSession, OpenModelPicker, OpenSidebarSession,
     ToggleSessionList,
 };
+use crate::ui::kit::BadgeSize;
 use crate::ui::model_picker::{ModelPicker, ModelPickerEvent, PickerFrame, Target};
 use crate::ui::workspace_select::{WorkspaceEvent, WorkspaceField, home_dir};
 use crate::ui::{Density, SessionPane, SessionPaneEvent, SmoothScroll, kit};
@@ -44,6 +45,23 @@ pub(super) const BAR_HEIGHT: f32 = 64.;
 const BAR_TEXT: f32 = 18.;
 /// Height of its lines, when more than one is typed.
 const BAR_LINE: f32 = 26.;
+/// Least width of the bar's model chip, so its two tags do not overlap.
+const MODEL_CHIP_MIN_W: f32 = 140.;
+
+/// Whether the bar's controls stack beside its input (design D19). They stack
+/// once the input is taller than two lines, and return to one row only when it
+/// is one line again or the draft is empty: stacked, the input is wider and
+/// may wrap back to two lines, which must not unstack them. `input_h` is the
+/// input as laid out, 0 before it is.
+pub(super) fn bar_stacked(was: bool, input_h: f32, empty: bool) -> bool {
+    if input_h > 2. * BAR_LINE + 0.5 {
+        true
+    } else if empty || input_h <= BAR_LINE + 0.5 {
+        false
+    } else {
+        was
+    }
+}
 /// The least the panel is tall around a conversation.
 pub(super) const MIN_HEIGHT: f32 = 260.;
 /// The panel never grows past this, nor past [`DISPLAY_SHARE`] of its display.
@@ -121,6 +139,10 @@ pub(crate) struct QuickPanel {
     /// Height the bar of a new quick chat needs, as last laid out: it grows
     /// with the lines typed and with an error shown above it.
     bar_h: Rc<Cell<f32>>,
+    /// Height of the bar's input as last laid out, and whether the bar's
+    /// controls are stacked beside it (design D19).
+    input_h: Rc<Cell<f32>>,
+    stacked: bool,
     /// What the open overlays need, as last laid out (design D13): the session
     /// list's search row and its rows, the model picker's card and the folder
     /// chooser's card. 0 while not laid out; the fixed estimates then stand in.
@@ -506,6 +528,8 @@ impl QuickPanel {
             opening: Rc::new(Cell::new(0.)),
             stepped: Rc::new(Cell::new(None)),
             bar_h: Rc::new(Cell::new(0.)),
+            input_h: Rc::new(Cell::new(0.)),
+            stacked: false,
             list_search_h: Rc::new(Cell::new(0.)),
             list_rows_h: Rc::new(Cell::new(0.)),
             model_h: Rc::new(Cell::new(0.)),
@@ -1899,14 +1923,24 @@ impl QuickPanel {
     /// A new quick chat: its bar, with the session `list` above it when open.
     fn render_empty(&mut self, list: Option<AnyElement>, cx: &mut Context<Self>) -> AnyElement {
         let p = self.hud(cx);
+        // Stacked or one row, from the input as last laid out (design D19).
+        let empty_draft = self.pane.read(cx).draft(cx).is_empty();
+        self.stacked = bar_stacked(self.stacked, self.input_h.get(), empty_draft);
+        let stacked = self.stacked;
+        // The cut-out of a tag is the colour the chip sits on, which over a
+        // material is none: the tag is filled and overlaps the chip's edge.
+        let cut_out = (!self.chrome.glass).then(|| self.chrome.surfaces(&p).bg);
         // The agent and folder, then the model as a button.
-        let summary = match self.launch_parts(cx) {
-            None => div()
-                .flex_none()
-                .text_xs()
-                .text_color(p.muted)
-                .child("No agent connected")
-                .into_any_element(),
+        let (agent_folder, model_chip) = match self.launch_parts(cx) {
+            None => (
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .child("No agent connected")
+                    .into_any_element(),
+                None,
+            ),
             Some((agent, cwd)) => {
                 let model = self.model_label(cx);
                 // The agent is named in the bar only when there is a choice.
@@ -1919,14 +1953,15 @@ impl QuickPanel {
                     .map_or(mode.as_str(), |(_, label, _)| *label)
                     .to_string();
                 let mode_tip = format!("Agent mode for this chat: {mode_label}");
+                let mode_tone = kit::mode_tone(LAUNCH_MODES.iter().map(|(id, ..)| *id), &mode, &p);
                 let reasoning = self.reasoning_now(cx);
-                let auto = reasoning == "auto";
                 let reasoning_label = LAUNCH_REASONING
                     .iter()
                     .find(|(id, ..)| *id == reasoning)
                     .map_or(reasoning.as_str(), |(_, label, _)| *label)
                     .to_string();
                 let reasoning_tip = format!("Reasoning effort: {reasoning_label}");
+                let reasoning_tone = kit::reasoning_tone(&reasoning, &p);
                 // One shape for the chips, all the height of the model chip.
                 let chip = |id: &'static str| {
                     h_flex()
@@ -1941,7 +1976,71 @@ impl QuickPanel {
                         .cursor_pointer()
                         .hover(move |s| s.bg(p.card_hover))
                 };
-                h_flex()
+                // A tag of the model chip: a button that stops the press, so
+                // it is neither the chip's nor a drag area (design D18, D19).
+                let tag = |id: &'static str, text: &str, tone: Hsla, selector: String| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.into())
+                        .occlude()
+                        .cursor_pointer()
+                        .child(
+                            kit::badge_tag(text, p.text, tag_fill(tone), cut_out, BadgeSize::HUD)
+                                .debug_selector(move || selector.clone()),
+                        )
+                };
+                let mode_tag =
+                    tag(
+                        "quick-mode",
+                        &mode_label,
+                        mode_tone,
+                        format!("quick-mode:{mode_label}"),
+                    )
+                    .tooltip(move |window, cx| {
+                        kit::tip_with_stroke(mode_tip.clone(), "tab").build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.cycle_mode(window.modifiers().shift, cx)
+                    }));
+                // Shown at `auto` too, as the main window's model pill does.
+                let reasoning_tag = tag(
+                    "quick-reasoning",
+                    &reasoning_label,
+                    reasoning_tone,
+                    "quick-reasoning-label".to_string(),
+                )
+                .tooltip(move |window, cx| {
+                    kit::tip_with_key(reasoning_tip.clone(), &CycleReasoning, window)
+                        .build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.cycle_reasoning(cx)));
+                let model_chip = chip("quick-model")
+                    // Room for both tags, so they do not overlap.
+                    .min_w(px(MODEL_CHIP_MIN_W))
+                    .justify_between()
+                    .tooltip(|window, cx| {
+                        kit::tip_with_key("Model for this chat", &OpenModelPicker, window)
+                            .build(window, cx)
+                    })
+                    .child(
+                        div()
+                            .max_w(px(130.))
+                            .truncate()
+                            .text_color(p.text)
+                            .child(model),
+                    )
+                    .child(kit::icon(IconName::ChevronDown, 12., p.muted))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)),
+                    );
+                let model_chip = kit::badged(
+                    model_chip,
+                    Some(mode_tag.into_any_element()),
+                    Some(reasoning_tag.into_any_element()),
+                    BadgeSize::HUD,
+                )
+                .into_any_element();
+                let agent_folder = h_flex()
                     .flex_none()
                     .gap_1p5()
                     .items_center()
@@ -1976,74 +2075,22 @@ impl QuickPanel {
                                 this.open_folder_chooser(window, cx)
                             })),
                     )
-                    .child(
-                        chip("quick-mode")
-                            .tooltip(move |window, cx| {
-                                kit::tip_with_stroke(mode_tip.clone(), "tab").build(window, cx)
-                            })
-                            .child(
-                                div()
-                                    .debug_selector({
-                                        let label = mode_label.clone();
-                                        move || format!("quick-mode:{label}")
-                                    })
-                                    .child(kit::mode_chip_body(
-                                        mode_label.clone(),
-                                        LAUNCH_MODES.iter().map(|(id, ..)| *id),
-                                        &mode,
-                                        &p,
-                                    )),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cycle_mode(window.modifiers().shift, cx)
-                            })),
-                    )
-                    .child(
-                        chip("quick-model")
-                            .tooltip(|window, cx| {
-                                kit::tip_with_key("Model for this chat", &OpenModelPicker, window)
-                                    .build(window, cx)
-                            })
-                            .child(
-                                div()
-                                    .max_w(px(130.))
-                                    .truncate()
-                                    .text_color(p.text)
-                                    .child(model),
-                            )
-                            .child(kit::icon(IconName::ChevronDown, 12., p.muted))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_model_picker(window, cx)
-                            })),
-                    )
-                    .child(
-                        chip("quick-reasoning")
-                            .tooltip(move |window, cx| {
-                                kit::tip_with_key(reasoning_tip.clone(), &CycleReasoning, window)
-                                    .build(window, cx)
-                            })
-                            .child(kit::icon(
-                                IconName::Brain,
-                                13.,
-                                if auto { p.muted } else { p.text },
-                            ))
-                            // The level shows once it is not the default.
-                            .when(!auto, |el| {
-                                el.child(div().text_color(p.text).child(reasoning_label.clone()))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_reasoning(cx))),
-                    )
-                    .into_any_element()
+                    .into_any_element();
+                (agent_folder, Some(model_chip))
             }
         };
         let launching = self.launching.is_some();
         let error = self.error.clone();
+        let measure_input = Self::measure(&self.input_h, cx);
         let input = div()
             .debug_selector(|| "quick-composer".into())
             // Pressing in the text selects it; it does not drag (design D18).
             .occlude()
+            // The canvas measuring the input is placed in it.
+            .relative()
             .flex_1()
             .min_w_0()
+            .child(measure_input)
             .capture_action(cx.listener(|this, a: &Enter, window, cx| {
                 // Enter starts the chat, Shift+Enter breaks the line, and
                 // Cmd/Ctrl+Enter starts it in the main window.
@@ -2076,6 +2123,35 @@ impl QuickPanel {
                     .text_size(px(BAR_TEXT))
                     .line_height(px(BAR_LINE)),
             );
+        let picker_button = Self::icon_button(
+            "quick-picker-toggle",
+            IconName::MessagesSquare,
+            "Sessions",
+            Some(&ToggleSessionList),
+            &p,
+        )
+        .debug_selector(|| "quick-picker-toggle".into())
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx)));
+        // One row on the input's centre line; past two lines a column beside
+        // it, bottom-aligned (the edge that stays put, D13). The gap of the
+        // column clears the tags above the model chip.
+        let controls = if stacked {
+            v_flex()
+                .flex_none()
+                .items_end()
+                .gap(px(12.))
+                .child(agent_folder)
+                .children(model_chip)
+                .child(picker_button)
+        } else {
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap_1p5()
+                .child(agent_folder)
+                .children(model_chip)
+                .child(picker_button)
+        };
         // The bar is the whole panel: nothing is drawn around the input, which
         // sits straight on the panel's surface (design D15).
         // Around its controls the bar is a drag area (design D18).
@@ -2089,7 +2165,8 @@ impl QuickPanel {
             )
             .w_full()
             .min_h(px(BAR_HEIGHT - 2.))
-            .items_center()
+            .when(stacked, |el| el.items_end().py_2())
+            .when(!stacked, |el| el.items_center())
             .gap_2()
             .pl_4()
             .pr_3()
@@ -2098,17 +2175,7 @@ impl QuickPanel {
             .when(launching, |el| {
                 el.child(kit::spinner("quick-launch", 16., p.muted))
             })
-            .child(summary)
-            .child(
-                Self::icon_button(
-                    "quick-picker-toggle",
-                    IconName::MessagesSquare,
-                    "Sessions",
-                    Some(&ToggleSessionList),
-                    &p,
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx))),
-            );
+            .child(controls);
         // What the bar and the error above it need: the window follows it.
         let measure = Self::measure(&self.bar_h, cx);
         // The bar stays at the bottom edge, which is the one that does not

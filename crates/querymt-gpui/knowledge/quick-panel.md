@@ -63,6 +63,19 @@ and can be dragged; its position is remembered per display in `Prefs.quick.posit
   pane's main switch), plus `radius`, `tint`, `rimmed`, `native_motion`, `white_through`
   and the root colours from `surfaces`. The window's `Root` must stay transparent or it
   covers the material.
+- **The bar of a new quick chat** (D19, `render_empty` in `panel.rs`): the input, then the
+  agent and folder, the model chip and the session-picker button. The agent mode and the
+  reasoning effort are not chips of the bar's: they are tags on the model chip's top edge
+  (mode left, reasoning right, also at `auto`), drawn by `kit::badged`/`kit::badge_tag`
+  with `BadgeSize::HUD` (the main window's model pill uses the same helper at
+  `BadgeSize::TOOLBAR`). Each tag is a button (`quick-mode`, `quick-reasoning`; click moves
+  to the next value, Shift+click the previous mode) that occludes, so it is not a drag area.
+  The label is `text` on `hud::tag_fill(tone)`, an opaque tint of the tone; the tag is cut
+  out of the chip only without a material (in `Chrome::surfaces`' root colour). The chip has
+  a minimum width so the tags do not overlap. The input's laid-out height is measured by a
+  canvas (`input_h`); past two lines of it (`bar_stacked`) the controls become a
+  bottom-aligned column beside the input, and return to one row only at one line or an
+  empty draft. The conversation's compact composer keeps its own mode and model chips.
 - **Edge light** (D14): `activity.rs` turns what the shown session does into an
   `Activity` whose `phase` is a `Phase` (Running, Waiting, Error, Done, Idle; Done/Error
   are transitions only).
