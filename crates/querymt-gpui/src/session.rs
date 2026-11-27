@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::usage::{Accounting, Breakdown};
 
+pub(crate) mod commands;
 #[cfg(test)]
 mod golden;
 pub(crate) mod open;

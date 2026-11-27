@@ -29,8 +29,9 @@ use super::kit;
 use super::kit::ButtonExt as _;
 use super::kit::badged_tone;
 use super::kit::{accent_btn, flat_btn};
-use super::session_pane::{SessionPane, SessionPaneEvent};
+use super::session_pane::{Blocked, SessionPane, SessionPaneEvent};
 use super::start::{mode_tone, toolbar_button};
+use crate::session::commands::{CommandTraits, recognise};
 use crate::session::open::{Delivery, SessionKey};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
@@ -41,6 +42,7 @@ use crate::store::worktree::WorktreeAction;
 use crate::theme::Palette;
 use crate::usage::{self, TokenKey};
 use crate::util::{human_size, workspace_name};
+use querymt_agent_session_core::view::SlashCommandView;
 
 const OUTPUT_LINES: usize = 80;
 /// Floating composer: height of the fade above it, and its background-colored halo.
@@ -4096,12 +4098,19 @@ impl SessionPane {
         self.set_option(&option.id, &value, cx);
     }
 
-    /// The shown session can take a prompt now: its agent is connected, it
-    /// has loaded without error, and a running turn can be steered or queued.
-    /// Typed prompts and palette commands share this check.
-    pub(crate) fn session_ready(&self, cx: &App) -> bool {
+    /// Whether the shown session can take `command` (or, with `None`, an
+    /// ordinary prompt) now, and if not, why (slash-command-actions D3): its
+    /// agent is connected, it has loaded without error, and a running turn
+    /// can be steered or queued (a command must also accept queueing).
+    /// Typed prompts and palette commands share this check; the first
+    /// failing check wins.
+    pub(crate) fn readiness(
+        &self,
+        command: Option<&SlashCommandView>,
+        cx: &App,
+    ) -> Result<(), Blocked> {
         let Some(session) = self.session.as_ref() else {
-            return false;
+            return Err(Blocked::NotConnected);
         };
         let open = session.read(cx);
         let view = &open.view;
@@ -4112,19 +4121,42 @@ impl SessionPane {
             .read(cx)
             .runtime(&view.agent_id)
             .is_some_and(|rt| rt.is_connected());
+        if !connected {
+            return Err(Blocked::NotConnected);
+        }
         // A read-only session (archived, handed off) takes no prompts.
-        connected
-            && view.access.is_none()
-            && !view.loading
-            && view.error.is_none()
-            && (!view.running() || open.can_control_run())
+        if view.access.is_some() {
+            return Err(Blocked::ReadOnly);
+        }
+        if view.loading {
+            return Err(Blocked::Loading);
+        }
+        if view.error.is_some() {
+            return Err(Blocked::LoadFailed);
+        }
+        if view.running() {
+            let queues = command.is_none_or(|c| CommandTraits::of(c).accepts_queue);
+            if !open.can_control_run() || !queues {
+                return Err(Blocked::TurnRunning);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.prompt.read(cx).value().trim().to_string();
-        if (text.is_empty() && self.attachments.is_empty()) || !self.session_ready(cx) {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
+        let command = recognise(&text, self.slash_commands(cx)).cloned();
+        if let Err(blocked) = self.readiness(command.as_ref(), cx) {
+            // A blocked command keeps its text and says why under the
+            // composer; an ordinary prompt stays silent, as before.
+            self.blocked = command.map(|_| blocked);
+            cx.notify();
+            return;
+        }
+        self.blocked = None;
         let Some(session) = self.session.clone() else {
             return;
         };

@@ -668,8 +668,18 @@ impl OpenSession {
             cx.notify();
             return;
         }
-        // Like desktop: slash commands can't steer, they always queue.
-        let wanted = if text.trim_start().starts_with('/') || delivery == Delivery::Queue {
+        // A recognised command can't steer, it queues; a command that does
+        // not accept queueing waits for the turn to end (the pane blocks it
+        // first, this guards other callers). Any other text, a path
+        // included, follows the caller's delivery.
+        let command = super::commands::recognise(&text, &self.view.slash_commands)
+            .map(super::commands::CommandTraits::of);
+        if command.is_some_and(|c| !c.accepts_queue) {
+            self.view.push_notice("Available when the turn ends", true);
+            cx.notify();
+            return;
+        }
+        let wanted = if command.is_some() || delivery == Delivery::Queue {
             Delivery::Queue
         } else {
             Delivery::Steer

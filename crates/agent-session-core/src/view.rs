@@ -2,7 +2,12 @@
 
 use crate::input::UndoFrame;
 use querymt_agent_protocol_types::accounting::AccountingSnapshot;
-use querymt_agent_protocol_types::events::{SlashCommandEffect, SlashCommandSource};
+// Re-exported so a client names a command's source, effect and invocation
+// record from the same module as `SlashCommandView`, without depending on
+// the protocol-types crate.
+pub use querymt_agent_protocol_types::events::{
+    SlashCommandEffect, SlashCommandRecord, SlashCommandSource,
+};
 use querymt_agent_protocol_types::protocol::PlanEntry;
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::{
