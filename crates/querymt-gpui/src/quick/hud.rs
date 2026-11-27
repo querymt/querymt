@@ -86,12 +86,15 @@ pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
         )
     };
     Palette {
+        // The panel never follows the app theme: QueryMT Dark's syntax colours.
+        theme: crate::theme::ThemeId::QMT_DARK,
         dark: true,
         bg,
         surface,
         popover,
         card,
         card_hover,
+        selected: card,
         border,
         border_strong,
         text: hex(0xf5f5f5),

@@ -96,7 +96,7 @@ impl QmtApp {
         self.setup.step = index;
         self.setup.visited = index;
         self.setup.skipped.clear();
-        self.palette_open = false;
+        self.close_palette(cx);
         self.go(Page::Setup, cx);
         if let Some(agent) = self.store.read(cx).primary_agent() {
             self.store.update(cx, |s, cx| s.refresh_extras(&agent, cx));
@@ -837,7 +837,7 @@ mod tests {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = cx.update(|cx| {
             let store = cx.new(|_| {
@@ -877,5 +877,48 @@ mod tests {
             let store = app.store.read(cx);
             assert!(!store.first_run && store.prefs.onboarding.done());
         });
+    }
+
+    /// The setup's Appearance step has the same two theme selects and the
+    /// Theme swatch as Settings (spec: The theme selects mark the theme in use).
+    #[gpui_kit::test]
+    fn appearance_step_has_the_theme_selects_and_swatch(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::VisualTestContext;
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
+        });
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| crate::store::automations::schedule_ui_fixture());
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_setup(Some(Step::Appearance), cx);
+                assert_eq!(app.setup_step(cx), Step::Appearance);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(app.read(cx).page, Page::Setup));
+        for selector in [
+            "theme-select-dark",
+            "theme-select-light",
+            "accent-theme",
+            "accent-blue",
+        ] {
+            assert!(
+                VisualTestContext::from_window(handle, cx)
+                    .debug_bounds(selector)
+                    .is_some(),
+                "{selector} is on the setup page"
+            );
+        }
     }
 }

@@ -338,7 +338,7 @@ mod tests {
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<QmtApp>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = cx.update(|cx| {
             let store = cx.new(|_| schedule_ui_fixture());
@@ -399,7 +399,7 @@ mod tests {
     fn development_build_shows_updates_unavailable(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         // This test binary is a development build: no controls.
         let (handle, app) = cx.update(|cx| {

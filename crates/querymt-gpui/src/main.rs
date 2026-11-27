@@ -176,8 +176,8 @@ pub fn run(app: Application, panel_only: bool) {
                 WindowAppearance::Dark | WindowAppearance::VibrantDark
             )
         });
-        let accent = store.read(cx).prefs.accent.clone();
-        theme::apply(dark, &accent, cx);
+        let appearance = store.read(cx).prefs.appearance(dark);
+        theme::apply(appearance, cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         #[cfg(not(target_family = "wasm"))]

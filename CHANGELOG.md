@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Colour themes in QueryMT Desktop.** Settings -> Appearance has a Dark theme
+  and a Light theme select next to the System / Light / Dark cards; System
+  switches between the two with the desktop. QueryMT Dark and Light stay the
+  defaults and look as before. 42 themes (36 from gpui-kit: Catppuccin, Tokyo
+  Night, Gruvbox, Solarized, Flexoki, Everforest and others; six converted from
+  Zed: Ayu Mirage, One Dark, One Light, Gruvbox Dark Soft, Gruvbox Light Hard
+  and Light Soft) are bundled and recolour the whole window, including code.
+  The command palette (Ctrl/Cmd+P) has Select theme…: it previews each theme
+  as you move through the list, Enter keeps it (a theme of the other
+  appearance also switches the mode to Dark or Light; System stays System for
+  one of the desktop's appearance), Esc puts the previous one back. The Accent
+  color row has a Theme swatch
+  (the default): the accent follows the theme, and a picked preset overrides it
+  on every theme. The quick panel keeps its dark glass colours and QueryMT
+  Dark's code colours. New preferences: `theme_dark`, `theme_light` and an
+  internal `appearance_version`; an `accent` of `orange` saved by an older
+  version is read as the theme's accent once. Film scenes may name a
+  `color_theme`.
 - **The embedded dashboard is served gzipped and cached.** `qmtcode
   --dashboard` embeds the QueryMT Desktop web assets gzipped (level 9,
   reproducible): the wasm drops from 17.6 MiB to 7.2 MiB in the binary and on
@@ -149,6 +167,11 @@
 
 ### Behavior changes
 
+- **QueryMT Desktop: button label on light accent presets.** On QueryMT Light
+  the label on the Teal, Green and Amber accent presets is now black (it was
+  white, 1.9 to 2.5:1 contrast with those fills). A preset's label keeps the
+  theme's own colour when it has at least 3:1 contrast with the fill, and is
+  black or white otherwise.
 - **BREAKING (ACP wire shape, additive): worktree merge.** New extension method
   `querymt/worktree/merge` (`{workspace_id|session_id, commit?, archive?,
   remove?}`; `archive` with `remove` is `invalid_options`); the native

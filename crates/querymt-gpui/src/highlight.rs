@@ -403,4 +403,47 @@ mod tests {
             assert!(highlighter(&unknown).is_empty());
         }
     }
+
+    /// Colour of each byte of `code` under `spans`.
+    fn colours(
+        spans: &[(std::ops::Range<usize>, gpui_kit::HighlightStyle)],
+        len: usize,
+    ) -> Vec<Option<gpui_kit::Hsla>> {
+        let mut out = vec![None; len];
+        for (range, style) in spans {
+            out[range.clone()].fill(style.color);
+        }
+        out
+    }
+
+    #[gpui_kit::test]
+    fn tool_output_and_fences_agree(cx: &mut gpui_kit::TestAppContext) {
+        use crate::theme::{Accent, Appearance, ThemeId};
+        use gpui_kit::component::Theme;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(
+                Appearance {
+                    theme: ThemeId::resolve("tokyo-night", true),
+                    accent: Accent::Theme,
+                },
+                cx,
+            );
+        });
+        // What fences are highlighted with (the kit's global theme, which
+        // `install` hands to the text views) and what tool output uses.
+        let (fence_theme, tool_theme) = cx.update(|cx| {
+            (
+                Theme::global(cx).highlight_theme.clone(),
+                crate::theme::syntax(crate::theme::palette(cx)),
+            )
+        });
+        assert!(std::sync::Arc::ptr_eq(&fence_theme, &tool_theme));
+        let code = "fn main() {\n    let s = \"hi\"; // note\n    run(42);\n}\n";
+        let fence = code_block_highlighter(fence_theme)(&CodeBlock::from_code(code, Some("rs")));
+        let tool = highlight_code("rs", code, tool_theme.as_ref());
+        let (fence, tool) = (colours(&fence, code.len()), colours(&tool, code.len()));
+        assert_eq!(fence, tool);
+        assert!(fence.iter().any(Option::is_some), "the snippet has colours");
+    }
 }

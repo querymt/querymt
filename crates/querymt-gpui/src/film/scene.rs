@@ -237,6 +237,11 @@ pub(super) struct Scene {
     pub size: [u32; 2],
     #[serde(default = "default_theme")]
     pub theme: Theme,
+    /// Key of a bundled colour theme of the scene's appearance (`tokyo-night`);
+    /// empty: the QueryMT theme.
+    #[serde(default)]
+    pub color_theme: String,
+    /// Accent preset id; empty: the colour theme's own accent.
     #[serde(default = "default_accent")]
     pub accent: String,
     #[serde(default = "default_panel")]
@@ -249,6 +254,17 @@ pub(super) struct Scene {
     pub world: WorldCfg,
     #[serde(default)]
     pub step: Vec<RawStep>,
+}
+
+impl Scene {
+    /// What the clip is painted with: the colour theme of the scene's
+    /// appearance (the QueryMT theme when none is named) and its accent.
+    pub(super) fn appearance(&self) -> crate::theme::Appearance {
+        crate::theme::Appearance {
+            theme: crate::theme::ThemeId::resolve(&self.color_theme, self.theme == Theme::Dark),
+            accent: crate::theme::Accent::parse(&self.accent),
+        }
+    }
 }
 
 fn default_fps() -> u32 {
@@ -264,7 +280,7 @@ fn default_theme() -> Theme {
 }
 
 fn default_accent() -> String {
-    "orange".into()
+    String::new()
 }
 
 fn default_panel() -> PanelMode {
@@ -916,5 +932,61 @@ end = true
         assert_eq!(n.params["n"], 3);
         assert!(matches!(&r.steps[2].action, Action::Mark(m) if m.name == "reply"));
         assert!(matches!(&r.steps[3].action, Action::Scroll(s) if s.dy == -200.0));
+    }
+
+    fn scene(extra: &str) -> Scene {
+        let text = format!("version = 1\nname = \"t\"\n{extra}\n");
+        toml::from_str(&text).expect("scene parses")
+    }
+
+    #[test]
+    fn scene_color_theme_defaults_to_built_in() {
+        use crate::theme::{Accent, Palette, Preset, ThemeId};
+        for (name, text) in [
+            ("smoke", include_str!("../../film/scenes/smoke.toml")),
+            (
+                "smoke-panel",
+                include_str!("../../film/scenes/smoke-panel.toml"),
+            ),
+        ] {
+            let resolved = parse(text, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let appearance = resolved.scene.appearance();
+            assert_eq!(resolved.scene.color_theme, "", "{name}");
+            assert_eq!(appearance.theme, ThemeId::QMT_DARK, "{name}");
+            assert_eq!(appearance.accent, Accent::Preset(Preset::ORANGE), "{name}");
+            assert_eq!(appearance.palette(), Palette::dark(), "{name}");
+        }
+        // Neither key: the built-in theme with its own accent, still orange.
+        let bare = scene("theme = \"light\"").appearance();
+        assert_eq!(bare.theme, ThemeId::QMT_LIGHT);
+        assert_eq!(bare.palette(), Palette::light());
+    }
+
+    #[test]
+    fn scene_color_theme_is_applied() {
+        use crate::theme::ThemeId;
+        let appearance = scene("theme = \"dark\"\ncolor_theme = \"tokyo-night\"").appearance();
+        assert_eq!(appearance.theme, ThemeId::resolve("tokyo-night", true));
+        assert_eq!(appearance.theme.label(), "Tokyo Night");
+        assert_eq!(
+            appearance.palette().bg,
+            appearance.theme.palette_swatches()[0]
+        );
+        // A theme of the other appearance is not used.
+        let wrong = scene("theme = \"light\"\ncolor_theme = \"tokyo-night\"").appearance();
+        assert_eq!(wrong.theme, ThemeId::QMT_LIGHT);
+    }
+
+    #[test]
+    fn scene_color_theme_without_accent_uses_the_theme_accent() {
+        use crate::theme::{Accent, ThemeId};
+        let appearance = scene("color_theme = \"tokyo-night\"").appearance();
+        assert_eq!(appearance.accent, Accent::Theme);
+        let tokyo = ThemeId::resolve("tokyo-night", true);
+        assert_eq!(appearance.palette().accent, tokyo.accent());
+        assert_ne!(
+            appearance.palette().accent,
+            crate::theme::Palette::dark().accent
+        );
     }
 }

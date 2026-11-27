@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use super::{Page, QmtApp, ToggleSidebar};
 use crate::store::{LAUNCH_REASONING, SessionSummary};
-use crate::theme::palette;
+use crate::theme::{self, Appearance, ThemeId, palette};
 use crate::util::workspace_name;
 
 gpui_kit::actions!(
@@ -100,6 +100,21 @@ enum PaletteTarget {
         name: String,
         takes_input: bool,
     },
+    /// "Select theme…": the palette lists the themes instead (design D12).
+    SelectTheme,
+    /// A row of the theme list.
+    Theme(ThemeId),
+}
+
+/// What the command palette lists (design D12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PaletteMode {
+    Commands,
+    /// The theme list. `restore` is what the window showed when it opened:
+    /// closing without confirming puts it back.
+    Themes {
+        restore: Appearance,
+    },
 }
 
 /// One palette row: what it shows, what the search matches besides the
@@ -111,6 +126,8 @@ struct PaletteEntry {
     /// A dimmed second line under the label (a slash command's help).
     description: Option<SharedString>,
     keywords: Vec<String>,
+    /// Marked with a check (the theme in use).
+    checked: bool,
     target: PaletteTarget,
 }
 
@@ -121,8 +138,14 @@ impl PaletteEntry {
             icon,
             description: None,
             keywords: Vec::new(),
+            checked: false,
             target,
         }
+    }
+
+    fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
     }
 
     /// Show `description` under the label; a blank one shows nothing.
@@ -182,6 +205,26 @@ fn filter_palette(groups: Vec<PaletteGroup>, query: &str) -> Vec<PaletteGroup> {
     // Stable: equal scores keep the groups' built order.
     found.sort_by_key(|(best, _)| std::cmp::Reverse(*best));
     found.into_iter().map(|(_, group)| group).collect()
+}
+
+/// The theme list: the dark themes, then the light ones, each in catalogue
+/// order, `shown` (the theme in use) marked.
+fn theme_groups(shown: ThemeId) -> Vec<PaletteGroup> {
+    [
+        (true, "Dark themes", IconName::Moon),
+        (false, "Light themes", IconName::Sun),
+    ]
+    .into_iter()
+    .map(|(dark, label, icon)| PaletteGroup {
+        label,
+        entries: ThemeId::of_appearance(dark)
+            .into_iter()
+            .map(|id| {
+                PaletteEntry::new(id.label(), icon, PaletteTarget::Theme(id)).checked(id == shown)
+            })
+            .collect(),
+    })
+    .collect()
 }
 
 const PAGES: [(Page, IconName, &str); 8] = [
@@ -274,7 +317,7 @@ impl QmtApp {
 
     /// Start page with the prompt focused.
     pub(super) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = false;
+        self.close_palette(cx);
         self.go(Page::Start, cx);
         self.prompt.update(cx, |s, cx| s.focus(window, cx));
     }
@@ -289,7 +332,7 @@ impl QmtApp {
         let Some(s) = self.sidebar_sessions(cx).into_iter().nth(index) else {
             return;
         };
-        self.palette_open = false;
+        self.close_palette(cx);
         self.open_summary(&s, cx);
         self.restore_focus(window, cx);
     }
@@ -314,7 +357,7 @@ impl QmtApp {
     }
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.palette_open) {
+        if self.close_palette(cx) {
             self.restore_focus(window, cx);
         } else {
             self.palette_open = true;
@@ -330,9 +373,126 @@ impl QmtApp {
         cx.notify();
     }
 
+    /// Close the palette. A theme list that was not confirmed puts the
+    /// theme it opened over back (design D12); every way of closing comes
+    /// through here, so none can forget it. Returns whether it was open.
+    pub(super) fn close_palette(&mut self, cx: &mut Context<Self>) -> bool {
+        self.theme_highlight = None;
+        let was_open = std::mem::take(&mut self.palette_open);
+        if let PaletteMode::Themes { restore } =
+            std::mem::replace(&mut self.palette_mode, PaletteMode::Commands)
+        {
+            theme::apply(restore, cx);
+            cx.notify();
+        }
+        was_open
+    }
+
+    /// What the window showed, theme and accent, as the preferences say.
+    fn shown_appearance(&self, cx: &App) -> Appearance {
+        Appearance {
+            theme: palette(cx).theme,
+            accent: self.store.read(cx).prefs.accent_choice(),
+        }
+    }
+
+    /// "Select theme…": the palette lists the themes, the one shown marked
+    /// and highlighted once the list is drawn.
+    fn open_theme_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let restore = self.shown_appearance(cx);
+        self.palette_mode = PaletteMode::Themes { restore };
+        // The rows are the dark group, then the light one, as `theme_groups`
+        // builds them.
+        let dark = restore.theme.dark();
+        let row = ThemeId::of_appearance(dark)
+            .iter()
+            .position(|id| *id == restore.theme);
+        self.theme_highlight = row.map(|row| (usize::from(!dark), row));
+        self.palette.update(cx, |s, cx| {
+            s.set_query("", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Show `id` without saving it, with the accent the window had.
+    fn preview_theme(&mut self, id: ThemeId, cx: &mut Context<Self>) {
+        let PaletteMode::Themes { restore } = self.palette_mode else {
+            return;
+        };
+        if palette(cx).theme != id {
+            theme::apply(
+                Appearance {
+                    theme: id,
+                    accent: restore.accent,
+                },
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    /// Show the highlighted row's theme: the highlight moves by itself when
+    /// the search changes the rows.
+    fn sync_theme_preview(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.palette_mode, PaletteMode::Themes { .. }) {
+            return;
+        }
+        let query = self.palette.read(cx).query(cx).to_string();
+        let groups = filter_palette(self.palette_groups(cx), &query);
+        let target = self.palette.read(cx).selected_index().and_then(|ix| {
+            groups
+                .get(ix.section)?
+                .entries
+                .get(ix.row)
+                .map(|e| e.target.clone())
+        });
+        if let Some(PaletteTarget::Theme(id)) = target {
+            self.preview_theme(id, cx);
+        }
+    }
+
+    /// Enter on a theme: save it as the theme of its appearance. The mode
+    /// follows only when that is not the appearance shown, so System stays
+    /// System for a theme of the desktop's appearance.
+    fn confirm_theme(&mut self, id: ThemeId, window: &mut Window, cx: &mut Context<Self>) {
+        let PaletteMode::Themes { restore } = self.palette_mode else {
+            return;
+        };
+        // Confirmed: nothing to put back.
+        self.palette_mode = PaletteMode::Commands;
+        self.close_palette(cx);
+        let dark = id.dark();
+        let key = id.key().to_string();
+        self.store.update(cx, |s, cx| {
+            s.update_prefs(
+                |p| {
+                    if dark {
+                        p.theme_dark = key;
+                    } else {
+                        p.theme_light = key;
+                    }
+                    if dark != restore.theme.dark() {
+                        p.dark = Some(dark);
+                    }
+                },
+                cx,
+            )
+        });
+        self.apply_theme(window, cx);
+        self.restore_focus(window, cx);
+    }
+
     fn run_palette(&mut self, target: PaletteTarget, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = false;
         match target {
+            PaletteTarget::SelectTheme => return self.open_theme_list(window, cx),
+            PaletteTarget::Theme(id) => return self.confirm_theme(id, window, cx),
+            _ => {}
+        }
+        self.close_palette(cx);
+        match target {
+            // Handled above.
+            PaletteTarget::SelectTheme | PaletteTarget::Theme(_) => return,
             PaletteTarget::NewSession => return self.new_session(window, cx),
             PaletteTarget::SchedulePrompt | PaletteTarget::ScheduleCurrentSession => {
                 self.open_automation_dialog(
@@ -378,10 +538,30 @@ impl QmtApp {
     pub(super) fn render_palette(
         &mut self,
         radii: Corners<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.palette_open {
             return None;
+        }
+        if matches!(self.palette_mode, PaletteMode::Themes { .. }) {
+            // After this frame the list's rows exist: highlight the theme in
+            // use, then show the highlighted one.
+            let this = cx.entity().downgrade();
+            let highlight = self.theme_highlight.take();
+            let state = self.palette.clone();
+            window.defer(cx, move |window, cx| {
+                if let Some((section, row)) = highlight {
+                    state.update(cx, |s, cx| {
+                        s.set_selected_index(
+                            Some(IndexPath::default().section(section).row(row)),
+                            window,
+                            cx,
+                        )
+                    });
+                }
+                let _ = this.update(cx, |this, cx| this.sync_theme_preview(cx));
+            });
         }
         let p = *palette(cx);
         let card = div()
@@ -411,7 +591,7 @@ impl QmtApp {
                 .items_start()
                 .pt(px(96.))
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.palette_open = false;
+                    this.close_palette(cx);
                     this.restore_focus(window, cx);
                     cx.notify();
                 }))
@@ -437,6 +617,8 @@ impl QmtApp {
         let this = cx.entity().downgrade();
         let cancel = this.clone();
         let requery = this.clone();
+        let selected = this.clone();
+        let on_select_targets = targets.clone();
         let mut command = Command::new(&self.palette)
             .placeholder("Search actions, commands, pages and sessions…")
             .max_h(px(380.))
@@ -445,6 +627,17 @@ impl QmtApp {
             // A new query rebuilds the groups on the next render.
             .on_query(move |_, _, cx| {
                 let _ = requery.update(cx, |_, cx| cx.notify());
+            })
+            // Moving the highlight over the theme list shows that theme.
+            .on_select(move |ix: IndexPath, _, cx| {
+                let Some(PaletteTarget::Theme(id)) = on_select_targets
+                    .get(ix.section)
+                    .and_then(|g| g.get(ix.row))
+                    .cloned()
+                else {
+                    return;
+                };
+                let _ = selected.update(cx, |this, cx| this.preview_theme(id, cx));
             });
         for group in groups {
             command = command.group(CommandGroup::new().label(group.label).items(
@@ -452,6 +645,7 @@ impl QmtApp {
                     let item = CommandItem::new()
                         .label(e.label.clone())
                         .icon(e.icon)
+                        .checked(e.checked)
                         .keywords(e.keywords);
                     // The kit draws icon and label only; a description needs
                     // a row of our own (the label and keywords still search).
@@ -501,7 +695,7 @@ impl QmtApp {
             })
             .on_cancel(move |window, cx| {
                 let _ = cancel.update(cx, |this, cx| {
-                    this.palette_open = false;
+                    this.close_palette(cx);
                     this.restore_focus(window, cx);
                     cx.notify();
                 });
@@ -513,6 +707,9 @@ impl QmtApp {
     /// open session's slash commands (only on the session page, and only when
     /// it advertises some), Go to, and the sidebar's sessions.
     fn palette_groups(&self, cx: &App) -> Vec<PaletteGroup> {
+        if let PaletteMode::Themes { restore } = self.palette_mode {
+            return theme_groups(restore.theme);
+        }
         let mut actions = vec![
             PaletteEntry::new("New session", IconName::Plus, PaletteTarget::NewSession),
             PaletteEntry::new(
@@ -536,6 +733,14 @@ impl QmtApp {
                 );
             }
         }
+        actions.push(
+            PaletteEntry::new(
+                "Select theme…",
+                IconName::Palette,
+                PaletteTarget::SelectTheme,
+            )
+            .keywords(["colour", "color", "appearance", "dark", "light"]),
+        );
         actions.push(
             PaletteEntry::new("Run setup", IconName::Wand, PaletteTarget::RunSetup).keywords([
                 "onboarding",
@@ -652,7 +857,7 @@ mod tests {
     ) -> Rig {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::launch::peer_fixture();
         let (_rpc, requests) = store.rpc_for_test("test-agent");
@@ -959,6 +1164,9 @@ mod tests {
                         | PaletteTarget::RunSetup,
                         "Actions",
                     ) => {}
+                    (PaletteTarget::SelectTheme, "Actions") => {
+                        assert_eq!(entry.label.as_ref(), "Select theme…");
+                    }
                     _ => panic!(
                         "{} carries the wrong target in {}",
                         entry.label, group.label
@@ -1287,5 +1495,330 @@ mod tests {
             },
         );
         assert_eq!(prompts(&sent(&rig)), ["/web"]);
+    }
+
+    // ---- the theme list (design D12)
+
+    use super::PaletteMode;
+    use crate::theme::{ThemeId, palette};
+    use gpui_kit::{Modifiers, Rgba, VisualTestContext, point, px};
+
+    /// A theme of the catalogue by key.
+    fn id(key: &str) -> ThemeId {
+        [true, false]
+            .into_iter()
+            .map(|dark| ThemeId::resolve(key, dark))
+            .find(|id| *id.key() == *key)
+            .unwrap_or_else(|| panic!("no theme {key}"))
+    }
+
+    /// Where the theme list shows `theme`: the dark group first.
+    fn row_of(theme: ThemeId) -> (usize, usize) {
+        let dark = theme.dark();
+        let row = ThemeId::of_appearance(dark)
+            .iter()
+            .position(|t| *t == theme)
+            .expect("listed");
+        (usize::from(!dark), row)
+    }
+
+    fn render(cx: &mut TestAppContext, rig: &Rig) {
+        cx.update_window(rig.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Change preferences and apply them, as the settings page does.
+    fn set_prefs(
+        cx: &mut TestAppContext,
+        rig: &Rig,
+        change: impl FnOnce(&mut crate::store::Prefs),
+    ) {
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.store.update(cx, |s, cx| s.update_prefs(change, cx));
+                app.apply_theme(window, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    /// Open the palette and pick "Select theme…".
+    fn open_themes(cx: &mut TestAppContext, rig: &Rig) {
+        open_palette(cx, rig);
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.run_palette(PaletteTarget::SelectTheme, window, cx)
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // The highlight is set after the list's first frame.
+        render(cx, rig);
+        render(cx, rig);
+    }
+
+    /// Move the highlight to `theme`, as the arrow keys do.
+    fn highlight(cx: &mut TestAppContext, rig: &Rig, theme: ThemeId) {
+        let (section, row) = row_of(theme);
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.palette.update(cx, |s, cx| {
+                    s.set_selected_index(
+                        Some(IndexPath::default().section(section).row(row)),
+                        window,
+                        cx,
+                    )
+                });
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        render(cx, rig);
+    }
+
+    fn shown(cx: &mut TestAppContext) -> ThemeId {
+        cx.update(|cx| palette(cx).theme)
+    }
+
+    fn pref(cx: &mut TestAppContext, rig: &Rig) -> (Option<bool>, String, String, String) {
+        rig.app.read_with(cx, |app, cx| {
+            let p = &app.store.read(cx).prefs;
+            (
+                p.dark,
+                p.theme_dark.clone(),
+                p.theme_light.clone(),
+                p.accent.clone(),
+            )
+        })
+    }
+
+    fn confirm(cx: &mut TestAppContext, rig: &Rig) {
+        VisualTestContext::from_window(rig.handle, cx).simulate_keystrokes("enter");
+        cx.run_until_parked();
+        render(cx, rig);
+    }
+
+    use gpui_kit::component::IndexPath;
+
+    #[gpui_kit::test]
+    fn select_theme_lists_both_appearances_and_marks_the_shown_one(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Start, None, |_| {});
+        assert!(
+            entry_labels(&groups(cx, &rig), "Actions")
+                .iter()
+                .any(|l| l == "Select theme…")
+        );
+        set_prefs(cx, &rig, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+        });
+        open_themes(cx, &rig);
+        let all = groups(cx, &rig);
+        assert_eq!(group_labels(&all), ["Dark themes", "Light themes"]);
+        assert_eq!(entry_labels(&all, "Dark themes").len(), 29);
+        assert_eq!(entry_labels(&all, "Light themes").len(), 15);
+        let checked: Vec<String> = all
+            .iter()
+            .flat_map(|g| &g.entries)
+            .filter(|e| e.checked)
+            .map(|e| e.label.to_string())
+            .collect();
+        assert_eq!(checked, ["Tokyo Night"]);
+        let selected = rig
+            .app
+            .read_with(cx, |app, cx| app.palette.read(cx).selected_index())
+            .expect("a row is highlighted");
+        assert_eq!(
+            (selected.section, selected.row),
+            row_of(id("tokyo-night")),
+            "Tokyo Night is highlighted"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn moving_the_highlight_previews_without_saving(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+        });
+        let before = pref(cx, &rig);
+        open_themes(cx, &rig);
+        assert_eq!(shown(cx), id("tokyo-night"));
+        highlight(cx, &rig, id("catppuccin-mocha"));
+        assert_eq!(shown(cx), id("catppuccin-mocha"), "previewed");
+        assert_eq!(pref(cx, &rig), before, "nothing saved");
+    }
+
+    #[gpui_kit::test]
+    fn confirming_a_theme_of_the_shown_appearance_keeps_the_mode(cx: &mut TestAppContext) {
+        // Dark mode, a dark theme.
+        let rig_dark = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig_dark, |p| p.dark = Some(true));
+        open_themes(cx, &rig_dark);
+        highlight(cx, &rig_dark, id("one-dark"));
+        confirm(cx, &rig_dark);
+        let (mode, dark, light, _) = pref(cx, &rig_dark);
+        assert_eq!(
+            (mode, dark.as_str(), light.as_str()),
+            (Some(true), "one-dark", "")
+        );
+        assert_eq!(shown(cx), id("one-dark"));
+        rig_dark.app.read_with(cx, |app, _| {
+            assert!(!app.palette_open);
+            assert_eq!(app.palette_mode, PaletteMode::Commands);
+        });
+
+        // System mode: the theme of the desktop's appearance. The test
+        // platform's desktop appearance is whatever the window reports.
+        let rig_system = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig_system, |p| p.dark = None);
+        let desktop_dark = cx
+            .update_window(rig_system.handle, |_, window, _| {
+                matches!(
+                    window.appearance(),
+                    gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+                )
+            })
+            .unwrap();
+        let key = if desktop_dark {
+            "one-dark"
+        } else {
+            "one-light"
+        };
+        open_themes(cx, &rig_system);
+        highlight(cx, &rig_system, id(key));
+        confirm(cx, &rig_system);
+        let (mode, dark, light, _) = pref(cx, &rig_system);
+        assert_eq!(mode, None, "System stays System");
+        // Saved as the theme of its appearance, and only that one.
+        let (saved, other) = if desktop_dark {
+            (dark, light)
+        } else {
+            (light, dark)
+        };
+        assert_eq!((saved.as_str(), other.as_str()), (key, ""));
+        assert_eq!(shown(cx), id(key));
+    }
+
+    #[gpui_kit::test]
+    fn confirming_a_theme_of_the_other_appearance_switches_the_mode(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+        });
+        open_themes(cx, &rig);
+        highlight(cx, &rig, id("solarized-light"));
+        confirm(cx, &rig);
+        let (mode, dark, light, _) = pref(cx, &rig);
+        assert_eq!(mode, Some(false), "the mode follows the theme");
+        assert_eq!(light, "solarized-light");
+        assert_eq!(dark, "tokyo-night", "the dark theme is untouched");
+        assert_eq!(shown(cx), id("solarized-light"));
+    }
+
+    #[gpui_kit::test]
+    fn closing_without_confirming_restores_the_theme(cx: &mut TestAppContext) {
+        for closer in ["escape", "toggle", "scrim"] {
+            let rig = rig(cx, Page::Start, None, |_| {});
+            set_prefs(cx, &rig, |p| {
+                p.dark = Some(true);
+                p.theme_dark = "tokyo-night".into();
+            });
+            let before = pref(cx, &rig);
+            open_themes(cx, &rig);
+            highlight(cx, &rig, id("ayu-mirage"));
+            assert_eq!(shown(cx), id("ayu-mirage"), "{closer}: previewed");
+            match closer {
+                "escape" => {
+                    VisualTestContext::from_window(rig.handle, cx).simulate_keystrokes("escape")
+                }
+                "toggle" => cx
+                    .update_window(rig.handle, |_, window, cx| {
+                        rig.app.update(cx, |app, cx| app.toggle_palette(window, cx))
+                    })
+                    .unwrap(),
+                _ => VisualTestContext::from_window(rig.handle, cx)
+                    .simulate_click(point(px(8.), px(300.)), Modifiers::none()),
+            }
+            cx.run_until_parked();
+            render(cx, &rig);
+            assert_eq!(shown(cx), id("tokyo-night"), "{closer}: restored");
+            assert_eq!(pref(cx, &rig), before, "{closer}: nothing saved");
+            rig.app.read_with(cx, |app, _| {
+                assert!(!app.palette_open, "{closer}: closed");
+                assert_eq!(app.palette_mode, PaletteMode::Commands, "{closer}");
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn typing_filters_the_theme_list(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+        });
+        open_themes(cx, &rig);
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.palette
+                    .update(cx, |s, cx| s.set_query("gruv", window, cx))
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        render(cx, &rig);
+        let found = rig.app.read_with(cx, |app, cx| {
+            let query = app.palette.read(cx).query(cx).to_string();
+            filter_palette(app.palette_groups(cx), &query)
+        });
+        let labels: Vec<String> = found
+            .iter()
+            .flat_map(|g| &g.entries)
+            .map(|e| e.label.to_string())
+            .collect();
+        assert_eq!(labels.len(), 5, "{labels:?}");
+        assert!(
+            labels.iter().all(|l| l.starts_with("Gruvbox")),
+            "{labels:?}"
+        );
+        // The highlight moved to a Gruvbox row, and that theme is shown.
+        assert!(
+            shown(cx).label().starts_with("Gruvbox"),
+            "{}",
+            shown(cx).label()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_accent_choice_is_kept(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Start, None, |_| {});
+        set_prefs(cx, &rig, |p| {
+            p.dark = Some(true);
+            p.accent = "blue".into();
+        });
+        let blue: gpui_kit::Hsla = gpui_kit::rgb(0x60a5fa).into();
+        let is_blue = |cx: &mut TestAppContext| {
+            let (a, b) = (
+                Rgba::from(cx.update(|cx| palette(cx).accent)),
+                Rgba::from(blue),
+            );
+            (a.r - b.r).abs() < 2e-3 && (a.g - b.g).abs() < 2e-3 && (a.b - b.b).abs() < 2e-3
+        };
+        assert!(is_blue(cx), "blue before");
+        open_themes(cx, &rig);
+        highlight(cx, &rig, id("gruvbox-dark"));
+        assert_eq!(shown(cx), id("gruvbox-dark"));
+        assert!(is_blue(cx), "blue while previewing");
+        confirm(cx, &rig);
+        assert!(is_blue(cx), "blue after confirming");
+        assert_eq!(pref(cx, &rig).3, "blue");
     }
 }

@@ -742,7 +742,7 @@ mod tests {
     ) -> (AnyWindowHandle, Entity<Fixture>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let source: SharedString = source.to_string().into();
         let (handle, view) = cx.update(|cx| {
@@ -1018,9 +1018,9 @@ mod tests {
         let cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let (light, dark) = cx.update(|cx| {
-            crate::theme::apply(false, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(false), cx);
             let light = *crate::theme::palette(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
             (light, *crate::theme::palette(cx))
         });
         let (l, d) = (look(&light), look(&dark));
@@ -1041,7 +1041,7 @@ mod tests {
         let (handle, _view) = setup(cx, source, 300.);
         let before = column(cx, handle);
         let runs = layout_runs();
-        cx.update(|cx| crate::theme::apply(false, "orange", cx));
+        cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
         cx.update_window(handle, |_, window, _| window.refresh())
             .unwrap();
         let after = column(cx, handle);

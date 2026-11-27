@@ -158,11 +158,11 @@ nix develop -c miniserve --index index.html crates/querymt-gpui/dist   # http://
 - `src/transport.rs`: WebSocket (native thread + rustls, browser `WebSocket`) and stdio process transport
 - `src/rpc.rs`: JSON-RPC 2.0 client
 - `src/store.rs`: agents store (configs, persistence, connect/disconnect, capabilities, models, sessions, mesh, launch)
-- `src/theme.rs`: QueryMT design tokens (light/dark) applied to gpui-component
+- `src/theme/`: QueryMT design tokens (light/dark) and the bundled colour themes (`catalogue.rs`), the accent rule (`accent.rs`), applied to gpui-component
 - `src/ui/`: shell + sidebar (`mod.rs`), `start.rs`, `agents.rs`, shared bits (`kit.rs`)
 - `src/main.rs`: shared UI and native/WASM entry points (no library target)
 - `build.rs`: downloads and caches the pinned IBM Plex fonts for embedding
-- `assets/`: the QueryMT mark and provider icons
+- `assets/`: the QueryMT mark and provider icons; `assets/themes/kit/` holds the bundled gpui-kit theme files and `assets/themes/extra/` the six themes converted from Zed by `convert_zed.py` (source, commit and licences in each folder's `NOTICE.md`)
 
 ## Dependencies
 

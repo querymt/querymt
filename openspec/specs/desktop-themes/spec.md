@@ -1,4 +1,4 @@
-# Spec Delta
+# desktop-themes Specification
 
 ## Purpose
 
@@ -7,21 +7,32 @@ dark and light appearance, from the built-in QueryMT themes and a set of
 bundled whole-app themes, choose whether the accent follows the theme, and
 keeps those choices across restarts.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Dark theme catalogue
-The dark list SHALL offer QueryMT Dark, then: Adventure, Adventure Time, Alduin, Asciinema, Ayu Dark, Catppuccin Frappe, Catppuccin Macchiato, Catppuccin Mocha, Everforest Dark, Fahrenheit, Flexoki Dark, Gruvbox Dark, Harper, Hybrid Dark, Jellybeans, Kibble, macOS Classic Dark, Mellifluous Dark, Molokai Dark, Solarized Dark, Spaceduck, Tokyo Moon, Tokyo Night, Tokyo Storm, Twilight.
+The dark list SHALL offer QueryMT Dark, then: Adventure, Adventure Time, Alduin, Asciinema, Ayu Dark, Ayu Mirage, Catppuccin Frappe, Catppuccin Macchiato, Catppuccin Mocha, Everforest Dark, Fahrenheit, Flexoki Dark, Gruvbox Dark, Gruvbox Dark Soft, Harper, Hybrid Dark, Jellybeans, Kibble, macOS Classic Dark, Mellifluous Dark, Molokai Dark, One Dark, Solarized Dark, Spaceduck, Tokyo Moon, Tokyo Night, Tokyo Storm, Twilight.
 
 #### Scenario: Dark list
 - **WHEN** the user opens the Dark theme select in Settings -> Appearance
-- **THEN** it lists QueryMT Dark first, then the 25 dark themes above by name, and no light theme
+- **THEN** it lists QueryMT Dark first, then the 28 dark themes above by name, and no light theme
 
 ### Requirement: Light theme catalogue
-The light list SHALL offer QueryMT Light, then: Aurora Light, Ayu Light, Catppuccin Latte, Everforest Light, Flexoki Light, Gruvbox Light, Hybrid Light, macOS Classic Light, Mellifluous Light, Molokai Light, Solarized Light.
+The light list SHALL offer QueryMT Light, then: Aurora Light, Ayu Light, Catppuccin Latte, Everforest Light, Flexoki Light, Gruvbox Light, Gruvbox Light Hard, Gruvbox Light Soft, Hybrid Light, macOS Classic Light, Mellifluous Light, Molokai Light, One Light, Solarized Light.
 
 #### Scenario: Light list
 - **WHEN** the user opens the Light theme select
-- **THEN** it lists QueryMT Light first, then the 11 light themes above by name, and no dark theme
+- **THEN** it lists QueryMT Light first, then the 14 light themes above by name, and no dark theme
+
+### Requirement: Added themes follow their Zed originals
+Ayu Mirage, Gruvbox Dark Soft, Gruvbox Light Hard, Gruvbox Light Soft, One Dark and One Light SHALL use the colours of the theme of the same name built into Zed: the page is Zed's editor background, the sidebar its surface background, menus its elevated surface background, cards its element background, the highlighted row its selected element background, borders its border, main and faint text its text and muted text, the accent its accent text colour, and code its syntax colours.
+
+#### Scenario: One Dark
+- **WHEN** the shown theme is One Dark
+- **THEN** the page background is `#282c33`, main text `#dce0e5`, the accent `#74ade8`, the highlighted row `#454a56`, and a Rust `// comment` is `#5d636f`
+
+#### Scenario: Gruvbox Light Soft
+- **WHEN** the shown theme is Gruvbox Light Soft
+- **THEN** the page background is `#f2e5bc`, where Gruvbox Light Hard's is `#f9f5d7`
 
 ### Requirement: A dark and a light theme are chosen separately
 The user SHALL pick one dark theme and one light theme. The existing System / Light / Dark mode SHALL decide which is shown: Dark shows the dark theme, Light the light theme, System the one matching the desktop appearance, switching when the desktop switches. Picking a theme SHALL apply at once when it is the one shown.
@@ -84,6 +95,22 @@ With a bundled theme shown, the page, sidebar, popovers, cards, hovered cards an
 #### Scenario: Fonts and sizes stay the app's
 - **GIVEN** any bundled theme is shown
 - **THEN** text uses the app's fonts, sizes and corner radii, the same as with QueryMT Dark
+
+### Requirement: The highlighted row is visible on every theme
+The row highlighted in the command palette and in the app's popover menus SHALL be painted with the theme's selection colour: the colour the theme gives its accent background, or its secondary background when it gives none. For a bundled theme that colour SHALL differ from the colour of the sidebar and of the popover it is shown on. QueryMT Dark and Light SHALL keep the colour they use now (their card colour).
+
+#### Scenario: Highlight in One Dark
+- **GIVEN** the shown theme is One Dark, whose sidebar and cards are both nearly `#2f343e`
+- **WHEN** the command palette is open with a row highlighted
+- **THEN** the row is painted `#454a56`, not the palette's own colour
+
+#### Scenario: Every bundled theme
+- **WHEN** any bundled theme is shown
+- **THEN** its selection colour is not equal to its sidebar colour or its popover colour
+
+#### Scenario: Built-in themes
+- **WHEN** QueryMT Dark or QueryMT Light is shown
+- **THEN** the highlighted row is painted with the theme's card colour, as before
 
 ### Requirement: Code uses the theme's syntax colours
 Fenced code in messages, tool output, diffs and code inputs in the main window SHALL use the shown theme's syntax colours; code kinds the theme gives no colour SHALL use its foreground. Themes SHALL be shown as authored: their colours SHALL NOT be adjusted for contrast.
@@ -197,6 +224,47 @@ Preferences SHALL record an appearance version. A preferences file saved before 
 - **GIVEN** the user picks the Orange preset with this version, then restarts (or resets the app's data and picks Orange again)
 - **WHEN** the user picks Tokyo Night as the dark theme
 - **THEN** primary buttons are still orange and the Orange swatch is selected
+
+### Requirement: Themes can be picked from the command palette
+The command palette SHALL offer a Select theme action. It SHALL list every theme, dark ones and light ones in two groups in the catalogue order, with the theme shown marked and highlighted. While the list is open, the highlighted theme SHALL be shown in the window without being saved, with the accent choice unchanged.
+
+#### Scenario: Open the theme list
+- **GIVEN** the shown theme is Tokyo Night
+- **WHEN** the user picks Select theme in the command palette
+- **THEN** the palette lists the dark themes and the light themes, with Tokyo Night marked and highlighted
+
+#### Scenario: Preview while moving
+- **GIVEN** the theme list is open and the shown theme is Tokyo Night
+- **WHEN** the user moves the highlight to Catppuccin Mocha
+- **THEN** the window shows Catppuccin Mocha, and the saved dark theme is still Tokyo Night
+
+#### Scenario: Search the list
+- **GIVEN** the theme list is open
+- **WHEN** the user types `gruv`
+- **THEN** only the Gruvbox themes are listed
+
+### Requirement: Confirming or closing the palette's theme list
+Confirming a theme in the palette's theme list SHALL save it as the theme of its appearance. When its appearance is not the one shown, the mode SHALL become Dark or Light to match; otherwise the mode SHALL stay as it was. Closing the list without confirming SHALL show the previous theme and change no preference. The accent choice SHALL not change.
+
+#### Scenario: Confirm a theme of the shown appearance
+- **GIVEN** the mode is System, the desktop is dark, and the theme list is open
+- **WHEN** the user confirms One Dark
+- **THEN** One Dark is saved as the dark theme and shown, and the mode is still System
+
+#### Scenario: Confirm a theme of the other appearance
+- **GIVEN** the mode is Dark and the theme list is open
+- **WHEN** the user confirms Solarized Light
+- **THEN** Solarized Light is saved as the light theme, the mode becomes Light, and the window shows Solarized Light
+
+#### Scenario: Close without confirming
+- **GIVEN** the shown theme is Tokyo Night and the theme list is open with Ayu Mirage highlighted
+- **WHEN** the user presses Esc with an empty search, clicks outside the palette, or presses Ctrl/Cmd+P
+- **THEN** the window shows Tokyo Night again, and no preference changed
+
+#### Scenario: Accent preset kept
+- **GIVEN** the Blue preset is picked and the theme list is open
+- **WHEN** the user moves the highlight to Gruvbox Dark and confirms it
+- **THEN** primary buttons use Blue's fill while previewing and after confirming, and the Blue swatch stays selected
 
 ### Requirement: The theme selects mark the theme in use
 Each theme select SHALL show and mark the theme actually in use for its appearance, whatever id is saved. The two selects and the Theme swatch SHALL appear wherever the appearance controls do, in Settings and in first-run setup.

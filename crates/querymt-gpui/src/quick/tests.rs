@@ -29,7 +29,7 @@ struct Rig {
 fn rig(cx: &mut TestAppContext) -> Rig {
     cx.update(|cx| {
         gpui_kit::init(cx);
-        crate::theme::apply(true, "orange", cx);
+        crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
     });
     let mut store = crate::store::automations::schedule_ui_fixture();
     store.prefs.cwd = "/w".into();
@@ -3567,7 +3567,7 @@ fn typed_colour<S: gpui_kit::EntityInputHandler>(
 fn typed_text_is_the_panels_text_colour_in_a_light_app_theme(cx: &mut TestAppContext) {
     let rig = rig(cx);
     with_models(&rig, cx);
-    cx.update(|cx| crate::theme::apply(false, "orange", cx));
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
     let (window, panel) = rig.open_panel(cx);
     // Until the opening animation ends the panel is drawn see-through.
     finish_opening(cx, window);
@@ -3977,7 +3977,7 @@ fn caret_bounds(
 #[gpui_kit::test]
 fn the_composers_caret_is_the_panels_in_a_light_app_theme(cx: &mut TestAppContext) {
     let rig = rig(cx);
-    cx.update(|cx| crate::theme::apply(false, "orange", cx));
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
     let (window, panel) = rig.open_panel(cx);
     finish_opening(cx, window);
     let hud = panel.read_with(cx, |p, cx| p.hud_for_test(cx));
@@ -4019,4 +4019,106 @@ fn the_panels_fields_use_its_palette(cx: &mut TestAppContext) {
     assert_eq!(style.muted_foreground, p.muted, "the placeholder");
     assert_eq!(style.caret, p.accent);
     assert_eq!(style.selection, p.accent.opacity(0.32));
+}
+
+// The panel keeps QueryMT Dark's code colours whatever theme the main window
+// shows (desktop-themes / The quick panel keeps its own colours).
+fn panel_pane_palette(
+    cx: &mut TestAppContext,
+    rig: &Rig,
+) -> (crate::theme::Palette, crate::theme::Palette) {
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    show_view(cx, rig, &panel, long_view("code", 1, "idle"));
+    settle(cx, window);
+    panel.read_with(cx, |p, cx| {
+        (
+            p.hud_for_test(cx),
+            p.pane_for_test().read(cx).palette_for_test(cx),
+        )
+    })
+}
+
+fn assert_qmt_dark_code(
+    cx: &mut TestAppContext,
+    hud: crate::theme::Palette,
+    pane: crate::theme::Palette,
+) {
+    use gpui_kit::component::highlighter::HighlightTheme;
+    use std::sync::Arc;
+    assert_eq!(pane, hud, "the pane paints with the panel's palette");
+    assert_eq!(pane.theme, crate::theme::ThemeId::QMT_DARK);
+    assert!(Arc::ptr_eq(
+        &crate::theme::syntax(&pane),
+        &HighlightTheme::default_dark()
+    ));
+    let style = crate::ui::view_style(&pane);
+    assert!(
+        Arc::ptr_eq(&style.highlight_theme, &HighlightTheme::default_dark()),
+        "fences"
+    );
+    let app = cx.update(|cx| *crate::theme::palette(cx));
+    assert!(
+        !Arc::ptr_eq(&crate::theme::syntax(&app), &HighlightTheme::default_dark()),
+        "the test needs the two to differ"
+    );
+}
+
+#[gpui_kit::test]
+fn panel_code_uses_qmt_dark_with_a_bundled_theme(cx: &mut TestAppContext) {
+    use crate::theme::{Accent, Appearance, ThemeId};
+    let rig = rig(cx);
+    let theme = ThemeId::resolve("solarized-light", false);
+    cx.update(|cx| {
+        crate::theme::apply(
+            Appearance {
+                theme,
+                accent: Accent::Theme,
+            },
+            cx,
+        )
+    });
+    let (hud, pane) = panel_pane_palette(cx, &rig);
+    assert_qmt_dark_code(cx, hud, pane);
+    // Its surfaces are its own dark ones, not the theme's.
+    let app = cx.update(|cx| *crate::theme::palette(cx));
+    assert!(hud.dark && !app.dark);
+    assert_ne!(hud.bg, app.bg);
+    assert_ne!(hud.border, app.border);
+}
+
+#[gpui_kit::test]
+fn panel_code_uses_qmt_dark_in_light_mode(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
+    let (hud, pane) = panel_pane_palette(cx, &rig);
+    assert_qmt_dark_code(cx, hud, pane);
+}
+
+#[gpui_kit::test]
+fn panel_follows_the_theme_accent(cx: &mut TestAppContext) {
+    use crate::theme::{Accent, Appearance, ThemeId};
+    let rig = rig(cx);
+    let theme = ThemeId::resolve("tokyo-night", true);
+    cx.update(|cx| {
+        crate::theme::apply(
+            Appearance {
+                theme,
+                accent: Accent::Theme,
+            },
+            cx,
+        )
+    });
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    let hud = panel.read_with(cx, |p, cx| p.hud_for_test(cx));
+    let own = theme.accent();
+    // Tokyo Night's primary, lightened for the dark glass.
+    assert!((hud.accent.h - own.h).abs() < 1e-4 && (hud.accent.s - own.s).abs() < 1e-4);
+    assert!(hud.accent.l >= own.l);
+    let orange = crate::theme::Palette::dark().accent;
+    assert!(
+        (hud.accent.h - orange.h).abs() > 0.01,
+        "not QueryMT's orange"
+    );
 }

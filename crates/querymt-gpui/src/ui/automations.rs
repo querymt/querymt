@@ -2189,7 +2189,7 @@ mod tests {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = cx.update(|cx| {
             let store = cx.new(|_| crate::store::automations::schedule_ui_fixture());
