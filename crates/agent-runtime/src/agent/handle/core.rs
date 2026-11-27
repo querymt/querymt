@@ -128,6 +128,7 @@ impl LocalAgentHandle {
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             delegation_service: parking_lot::Mutex::new(None),
             admin_cancels: Default::default(),
+            delegation_holds: Default::default(),
             shutdown_done: AtomicBool::new(false),
             slash_global_watch: ParkingMutex::new(None),
         }

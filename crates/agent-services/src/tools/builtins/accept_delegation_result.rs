@@ -187,6 +187,23 @@ impl ToolTrait for AcceptDelegationResultTool {
                 ToolError::InvalidRequest(format!("Unknown delegation '{delegation_id}'"))
             })?;
 
+        // After a delegation by handoff the worktree keeps this delegation's
+        // name, but the result was produced by a later run in it: judge that
+        // run's status, so a completed reviewer's result is acceptable even
+        // when the coder that created the worktree failed.
+        let run_status = match service
+            .result_publisher(delegation_id, result_commit)
+            .await
+            .map_err(|e| ToolError::Other(anyhow::anyhow!("integration failed: {e}")))?
+        {
+            Some(publisher) if publisher != delegation_id => store
+                .get_delegation(&publisher)
+                .await
+                .map_err(|e| ToolError::SessionError(e.to_string()))?
+                .map_or(delegation.status, |run| run.status),
+            _ => delegation.status,
+        };
+
         // Serialize on the session's checkout gate; the service falls back
         // to the checkout-keyed gate when the context provides none.
         let gate = context.checkout_mutation_gate();
@@ -197,7 +214,7 @@ impl ToolTrait for AcceptDelegationResultTool {
                 requesting_session_id: context.session_id(),
                 target_cwd: cwd,
                 objective: &delegation.objective,
-                delegation_status: delegation.status,
+                delegation_status: run_status,
                 mutation_gate: gate.as_deref(),
             })
             .await

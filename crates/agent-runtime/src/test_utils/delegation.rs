@@ -90,6 +90,10 @@ pub enum DelegateBehavior {
     /// Delegate's execution is stopped by middleware (e.g. context threshold).
     /// This simulates a premature stop that should be treated as a delegation failure.
     StoppedByMiddleware,
+    /// The delegate's session-start hook fails, so a new delegate session is
+    /// created (and owns its workspace) but its finalization fails after the
+    /// actor started.
+    SessionStartHookFails,
     /// Delegate hits ContextThreshold, auto-compaction runs and succeeds, then
     /// the delegate resumes and completes normally. Verifies that the delegation
     /// orchestrator sees `EndTurn` (success) when compaction recovers the session.
@@ -100,6 +104,22 @@ pub enum DelegateBehavior {
     ContextThresholdCompactionFails,
 }
 
+/// One member of a workspace harness: id, behaviour and an optional MCP
+/// attachment source.
+pub type HarnessMember = (
+    String,
+    DelegateBehavior,
+    Option<Arc<dyn crate::agent::session_mcp::SessionMcpAttachmentSource>>,
+);
+
+/// A real git repository and the managed-workspace service delegates share,
+/// for isolated-delegation tests.
+pub struct WorkspaceFixture {
+    pub service: Arc<crate::worktree::WorkspaceService>,
+    pub repo: TempDir,
+    pub _storage_root: TempDir,
+}
+
 pub struct TestHarness {
     pub config: Arc<AgentConfig>,
     /// The root handle the orchestrator is weakly bound to.
@@ -108,6 +128,8 @@ pub struct TestHarness {
     pub(crate) turn: Turn,
     pub provider: Arc<Mutex<MockLlmProvider>>,
     pub orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
+    pub workspace: Option<WorkspaceFixture>,
+    pub storage: Arc<SqliteStorage>,
     pub _temp_dir: TempDir,
 }
 
@@ -120,6 +142,54 @@ impl TestHarness {
         history: Vec<AgentMessage>,
         behavior: DelegateBehavior,
         delegate_reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        let members = ["agent", "agent1", "agent2"]
+            .map(|id| (id.to_string(), behavior.clone(), None))
+            .to_vec();
+        Self::build(history, members, delegate_reasoning_effort, false, None).await
+    }
+
+    /// A harness whose parent runs `hooks` (for example a `pre_delegation`
+    /// command that records its input).
+    pub async fn new_with_hooks(behavior: DelegateBehavior, hooks: crate::hooks::Hooks) -> Self {
+        let members = ["agent", "agent1", "agent2"]
+            .map(|id| (id.to_string(), behavior.clone(), None))
+            .to_vec();
+        Self::build(vec![], members, None, false, Some(hooks)).await
+    }
+
+    /// A harness whose parent session runs in a real git repository and whose
+    /// delegates and orchestrator share a managed-workspace service, so
+    /// isolated delegation allocates real worktrees.
+    pub async fn new_with_workspace(behavior: DelegateBehavior) -> Self {
+        let members = ["agent", "agent1", "agent2"]
+            .map(|id| (id.to_string(), behavior.clone(), None))
+            .to_vec();
+        Self::new_with_workspace_members(members).await
+    }
+
+    /// [`Self::new_with_workspace`] with explicit members: each has its own
+    /// behaviour and optionally an MCP attachment source (to inject a start
+    /// failure).
+    pub async fn new_with_workspace_members(members: Vec<HarnessMember>) -> Self {
+        Self::build(vec![], members, None, true, None).await
+    }
+
+    /// [`Self::new_with_workspace_members`] whose root runs `hooks` (the
+    /// orchestrator's delegation hooks).
+    pub async fn new_with_workspace_members_and_hooks(
+        members: Vec<HarnessMember>,
+        hooks: crate::hooks::Hooks,
+    ) -> Self {
+        Self::build(vec![], members, None, true, Some(hooks)).await
+    }
+
+    async fn build(
+        history: Vec<AgentMessage>,
+        members: Vec<HarnessMember>,
+        delegate_reasoning_effort: Option<ReasoningEffort>,
+        with_workspace: bool,
+        hooks: Option<crate::hooks::Hooks>,
     ) -> Self {
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared_provider = SharedLlmProvider {
@@ -146,9 +216,38 @@ impl TestHarness {
         .with_agent_id(Some("parent".into()));
         let provider_context = Arc::new(provider_context);
 
+        let workspace = if with_workspace {
+            let repo = crate::worktree::test_support::init_repo();
+            let files = [("README.md", "hello\n")];
+            crate::worktree::test_support::commit_files(repo.path(), "initial", &files);
+            crate::worktree::test_support::materialize(repo.path(), &files);
+            let storage_root = TempDir::new().expect("workspace storage root");
+            let service = Arc::new(crate::worktree::WorkspaceService::new(
+                Arc::new(crate::worktree::GixRepoOps::new()),
+                shared_storage
+                    .workspace_repository()
+                    .expect("sqlite storage exposes a workspace repository"),
+                storage_root.path(),
+            ));
+            Some(WorkspaceFixture {
+                service,
+                repo,
+                _storage_root: storage_root,
+            })
+        } else {
+            None
+        };
+        let workspace_service = workspace.as_ref().map(|fixture| fixture.service.clone());
+
         // Create the parent session via SessionProvider so LLM config is set up.
         let context = provider_context
-            .create_session(None, None, &SessionExecutionConfig::default())
+            .create_session(
+                workspace
+                    .as_ref()
+                    .map(|fixture| fixture.repo.path().to_path_buf()),
+                None,
+                &SessionExecutionConfig::default(),
+            )
             .await
             .expect("create parent session");
         let session_id = context.session().public_id.clone();
@@ -174,37 +273,50 @@ impl TestHarness {
         // resolves correctly when creating delegation sessions.
         let roster =
             crate::delegation::roster::test_roster_on(registry.clone(), shared_storage.clone());
-        for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle =
-                build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
-                    .await;
+        for (id, behavior, attachments) in members {
+            let delegate_handle = build_delegate_handle_in(
+                behavior,
+                store.clone(),
+                delegate_reasoning_effort,
+                workspace_service.clone(),
+                attachments,
+            )
+            .await;
             roster
                 .add(Member::built(
-                    agent_info(id),
+                    agent_info(&id),
                     MemberOrigin::Config,
                     MemberAgent::Local(delegate_handle),
                 ))
                 .expect("unique delegate id");
         }
 
-        let config = Arc::new(
+        let mut config_builder =
             crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
                 shared_storage.clone(),
                 provider_context,
                 shared_storage.event_journal(),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)
-            .with_roster(roster.clone())
-            .build(),
-        );
+            .with_roster(roster.clone());
+        if let Some(service) = &workspace_service {
+            config_builder = config_builder.with_workspace_service(service.clone());
+        }
+        if let Some(hooks) = hooks {
+            config_builder = config_builder.with_hooks(hooks);
+        }
+        let config = Arc::new(config_builder.build());
 
         // The root handle owns its own session registry.
         let delegator = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
-        let orchestrator = Arc::new(
+        let mut orchestrator =
             DelegationOrchestrator::new(&delegator, roster, &Default::default(), None)
-                .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
-        );
+                .with_delegate_model_overrides(config.delegate_model_overrides.clone());
+        if let Some(service) = &workspace_service {
+            orchestrator = orchestrator.with_workspace_service(service.clone());
+        }
+        let orchestrator = Arc::new(orchestrator);
         let orchestrator_handle = Some(orchestrator.start_listening(config.event_sink.fanout()));
 
         // Create a SessionRuntime for the execution context
@@ -224,6 +336,8 @@ impl TestHarness {
             turn,
             provider,
             orchestrator_handle,
+            workspace,
+            storage: shared_storage,
             _temp_dir: temp_dir,
         }
     }
@@ -416,11 +530,23 @@ pub async fn build_delegate_handle(
     shared_store: Arc<dyn SessionStore>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Arc<crate::agent::LocalAgentHandle> {
+    build_delegate_handle_in(behavior, shared_store, reasoning_effort, None, None).await
+}
+
+/// [`build_delegate_handle`] that can run isolated delegations: it shares the
+/// given managed-workspace service.
+pub async fn build_delegate_handle_in(
+    behavior: DelegateBehavior,
+    shared_store: Arc<dyn SessionStore>,
+    reasoning_effort: Option<ReasoningEffort>,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    attachments: Option<Arc<dyn crate::agent::session_mcp::SessionMcpAttachmentSource>>,
+) -> Arc<crate::agent::LocalAgentHandle> {
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     {
         let mut mock = delegate_provider.lock().await;
         match &behavior {
-            DelegateBehavior::AlwaysOk => {
+            DelegateBehavior::AlwaysOk | DelegateBehavior::SessionStartHookFails => {
                 mock.expect_chat()
                     .times(0..)
                     .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
@@ -521,6 +647,13 @@ pub async fn build_delegate_handle(
     .with_max_steps(1)
     .with_execution_timeout_secs(30);
 
+    if let Some(service) = workspace_service {
+        builder = builder.with_workspace_service(service);
+    }
+    if let Some(source) = attachments {
+        builder = builder.with_session_mcp_attachment_source(source);
+    }
+
     if let DelegateBehavior::PauseBeforeLlmCall { entered, release } = &behavior {
         builder = builder.with_middleware(CancellationGateMiddleware {
             entered: entered.clone(),
@@ -530,6 +663,30 @@ pub async fn build_delegate_handle(
 
     if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
         builder = builder.with_middleware(always_stop());
+    }
+
+    if matches!(behavior, DelegateBehavior::SessionStartHookFails) {
+        use crate::hooks::config::{HookHandlerConfig, HooksConfig, MatcherGroupConfig};
+        let hooks = crate::hooks::Hooks::new(HooksConfig {
+            enabled: true,
+            bypass_trust: true,
+            session_start: vec![MatcherGroupConfig {
+                matcher: None,
+                hooks: vec![HookHandlerConfig::Command(
+                    crate::hooks::HookCommandConfig {
+                        id: None,
+                        command: "echo 'injected session start failure' >&2; exit 1".into(),
+                        timeout_sec: Some(5),
+                        status_message: None,
+                        additional_context_limit: None,
+                        env: Default::default(),
+                    },
+                )],
+            }],
+            ..HooksConfig::default()
+        })
+        .expect("session start hook");
+        builder = builder.with_hooks(hooks);
     }
 
     if matches!(

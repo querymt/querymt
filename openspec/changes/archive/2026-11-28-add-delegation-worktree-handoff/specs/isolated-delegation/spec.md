@@ -25,7 +25,7 @@ A delegating session SHALL be able to run a new delegate in the isolated worktre
 - **AND** the tool result discloses that the delegate runs in the existing worktree of that delegation rather than a new or shared checkout
 
 ### Requirement: Refused delegation handoff changes nothing
-A delegation with `handoff_from` SHALL fail before its delegate runs, with an error naming the reason, when the named delegation was not made by the delegating session, has no isolated worktree, the worktree is not ready, its owner is busy or not hosted locally, or the call also requests `isolation = "shared"`. Ownership, files and the previous owner's access SHALL be unchanged and no worktree SHALL be allocated.
+A delegation with `handoff_from` SHALL fail before its delegate runs, with an error naming the reason, when the named delegation was not made by the delegating session, has no isolated worktree, the worktree is not ready, its owner is busy, its owner's delegation has not reported its terminal state, its owner is not hosted locally, or the call also requests `isolation = "shared"`. Ownership, files and the previous owner's access SHALL be unchanged and no worktree SHALL be allocated.
 
 #### Scenario: Handoff from another session's delegation
 - **WHEN** session Q calls `delegate` with `handoff_from` naming a delegation made by session P
@@ -39,6 +39,10 @@ A delegation with `handoff_from` SHALL fail before its delegate runs, with an er
 - **WHEN** `handoff_from` names a delegation whose worktree owner has a running turn or queued input
 - **THEN** the delegation fails with `owner_active` and the running owner is not interrupted
 
+#### Scenario: Owner's delegation still finishing
+- **WHEN** `handoff_from` names a delegation whose delegate's turn ended but which is still verifying, summarizing or capturing its result
+- **THEN** the delegation fails with `owner_active`, the owner's session is not unloaded, and the finishing delegation publishes its result from the unchanged worktree
+
 #### Scenario: Shared isolation with handoff
 - **WHEN** a `delegate` call sets both `handoff_from` and `isolation = "shared"`
 - **THEN** the call is rejected as an invalid request and nothing is queued
@@ -48,7 +52,7 @@ A delegation with `handoff_from` SHALL fail before its delegate runs, with an er
 - **THEN** the delegation fails with an error naming the id and nothing is allocated
 
 ### Requirement: Handoff results are accepted under the worktree's delegation
-A delegate that ran by handoff SHALL publish its result on the worktree when it completes, fails or is cancelled, as any isolated delegate does. Its completion output SHALL name the delegation that created the worktree as the id to pass to `accept_delegation_result`. Accepting that id with the new result commit SHALL integrate the whole baseline-relative delta, including earlier owners' edits.
+A delegate that ran by handoff SHALL publish its result on the worktree when it completes, as any isolated delegate does. Its completion output SHALL name the delegation that created the worktree as the id to pass to `accept_delegation_result`. Accepting that id with the new result commit SHALL integrate the whole baseline-relative delta, including earlier owners' edits.
 
 #### Scenario: Accept coder work plus reviewer fixes
 - **WHEN** the coder of D1 changed file A, the reviewer that took over by handoff fixed file B and completed with result R2, and P calls `accept_delegation_result` with D1 and R2
@@ -57,3 +61,14 @@ A delegate that ran by handoff SHALL publish its result on the worktree when it 
 #### Scenario: Completion names the worktree's delegation
 - **WHEN** a delegate that ran by handoff from D1 completes with changes
 - **THEN** its completion output tells the delegating session to call `accept_delegation_result` with delegation id D1 and the new result commit
+
+### Requirement: Acceptance judges the run that published the result
+Every result a delegation publishes on completion SHALL record that delegation as its publisher. `accept_delegation_result` SHALL require the result's publishing delegation to be complete, and the worktree's own delegation when the result has no publisher.
+
+#### Scenario: Accept after a failed coder
+- **WHEN** the coder of D1 failed after editing file A, a reviewer that took over by handoff completed with result R2, and P calls `accept_delegation_result` with D1 and R2
+- **THEN** one commit changing A is created on P's branch
+
+#### Scenario: Result without a publisher
+- **WHEN** D1 failed and P accepts a result of its worktree that was published without a delegation (an explicit publish)
+- **THEN** the acceptance is refused with `delegation_not_complete` and nothing changes

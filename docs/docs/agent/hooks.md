@@ -360,6 +360,8 @@ When `pre_compaction` blocks, QueryMT does not start compaction. The hook reason
 }
 ```
 
+The `pre_delegation` command input includes the `delegate` call's fields (`target_agent_id`, `objective`, `context`, `constraints`, `expected_output`) and `handoff_from`: the earlier delegation whose worktree the delegate takes over by ownership handoff, or `null`. `handoff_from` is read-only. A hook can block a handoff delegation but `updated_delegation` cannot change it, and a handoff always runs isolated whatever `updated_delegation.isolation` says.
+
 `pre_delegation` is the only delegation hook that can change behavior. If it blocks, QueryMT rewrites the delegate tool result so the model sees `Delegation blocked by hook: ...` instead of the original queued message.
 
 ### delegation_start planning context

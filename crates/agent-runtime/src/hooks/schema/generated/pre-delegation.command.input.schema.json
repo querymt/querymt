@@ -22,6 +22,14 @@
     "expected_output": {
       "$ref": "#/definitions/NullableString"
     },
+    "handoff_from": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/NullableString"
+        }
+      ],
+      "description": "Earlier delegation whose isolated worktree this delegate takes over by\nownership handoff, or null. Read-only: hooks cannot redirect it."
+    },
     "hook_event_name": {
       "const": "pre_delegation",
       "type": "string"
@@ -77,7 +85,8 @@
     "objective",
     "context",
     "constraints",
-    "expected_output"
+    "expected_output",
+    "handoff_from"
   ],
   "title": "pre-delegation.command.input",
   "type": "object"

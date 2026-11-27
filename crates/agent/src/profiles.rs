@@ -40,6 +40,7 @@ const DEFAULT_EMBEDDED_PROFILE_PATH: &str = concat!(
 );
 const STANDARD_SINGLE_CODER_CONFIG: &str = include_str!("../examples/confs/single_coder.toml");
 const STANDARD_CODER_DELEGATE_CONFIG: &str = include_str!("../examples/confs/coder_delegate.toml");
+const STANDARD_CODER_TEAM_CONFIG: &str = include_str!("../examples/confs/coder_team.toml");
 
 #[derive(RustEmbed)]
 #[folder = "examples/"]
@@ -137,7 +138,9 @@ impl Default for ProfileCatalogBuilder {
 /// Build the standard qmtcode/mobile embedded profile catalog.
 ///
 /// The returned builder contains the inlined `default` and `coder-delegate`
-/// TOML profiles without adding any user profile directories.
+/// TOML profiles without adding any user profile directories. Hosts that want
+/// the `coder-team` profile add [`embedded_coder_team_profile_toml`] themselves
+/// (qmtcode does; the mobile catalog does not).
 pub fn standard_embedded_profile_catalog_builder() -> Result<ProfileCatalogBuilder> {
     let single_coder = embedded_profile_config("single_coder.toml", STANDARD_SINGLE_CODER_CONFIG)?;
     let coder_delegate =
@@ -147,6 +150,16 @@ pub fn standard_embedded_profile_catalog_builder() -> Result<ProfileCatalogBuild
         .include_embedded_default(false)
         .embedded_profile_toml(single_coder)?
         .embedded_profile_toml(coder_delegate)
+}
+
+/// The `coder-team` example profile (an orchestrator, an isolated coder, a
+/// reviewer that takes over the coder's worktree, and a read-only explorer)
+/// with its prompt files inlined, for
+/// [`ProfileCatalogBuilder::embedded_profile_toml`]. Not part of
+/// [`standard_embedded_profile_catalog_builder`]: it needs managed worktrees and
+/// is only offered by hosts that choose to.
+pub fn embedded_coder_team_profile_toml() -> Result<String> {
+    embedded_profile_config("coder_team.toml", STANDARD_CODER_TEAM_CONFIG)
 }
 
 fn embedded_profile_config(config_name: &str, config: &str) -> Result<String> {
@@ -1908,6 +1921,114 @@ model = "model.gguf"
         assert_eq!(delegate_config.delegates.len(), 2);
         crate::api::Agent::builder_from_config(*delegate_config)
             .expect("embedded coder delegate tools should validate");
+    }
+
+    #[tokio::test]
+    async fn coder_team_profile_loads() {
+        use crate::worktree::DelegationIsolation;
+
+        // Offered by hosts that choose to, not by the standard catalog.
+        let standard = standard_embedded_profile_catalog_builder()
+            .expect("standard catalog should build")
+            .build();
+        assert!(
+            !standard
+                .list_profiles()
+                .await
+                .expect("profiles should list")
+                .iter()
+                .any(|profile| profile.id == "coder-team")
+        );
+
+        let catalog = standard_embedded_profile_catalog_builder()
+            .expect("standard catalog should build")
+            .embedded_profile_toml(
+                embedded_coder_team_profile_toml().expect("coder-team config inlines"),
+            )
+            .expect("coder-team is a valid embedded profile")
+            .build();
+        let profiles = catalog.list_profiles().await.expect("profiles should list");
+        let listed = profiles
+            .iter()
+            .find(|profile| profile.id == "coder-team")
+            .expect("coder-team is listed as an embedded profile");
+        assert_eq!(listed.name, "Coder Team");
+        assert_eq!(listed.config_kind, Some(ProfileConfigKind::Single));
+        assert!(matches!(listed.source, ProfileSource::EmbeddedToml { .. }));
+
+        let document = catalog
+            .load_profile("coder-team")
+            .await
+            .expect("coder-team profile should load");
+        let config = match document.config {
+            Config::Single(config) => config,
+            Config::Multi(_) => panic!("expected a single agent config with delegates"),
+        };
+
+        // The roster: a coder and a reviewer that run isolated, a shared explorer.
+        let isolation: Vec<(&str, DelegationIsolation)> = config
+            .delegates
+            .iter()
+            .map(|delegate| (delegate.id.as_str(), delegate.isolation))
+            .collect();
+        assert_eq!(
+            isolation,
+            [
+                ("coder", DelegationIsolation::Isolated),
+                ("reviewer", DelegationIsolation::Isolated),
+                ("explorer", DelegationIsolation::Shared),
+            ]
+        );
+
+        // Managed worktrees and `.agents` loading are on; delegates start from
+        // the checkout's current edits.
+        assert!(config.agent.workspace.enabled);
+        assert_eq!(
+            config.agent.workspace.baseline,
+            crate::worktree::BaselineMode::CurrentWorkingTree
+        );
+        assert!(config.dotagents.enabled);
+
+        // The planning-summary LLM call is configured but off: it delays every
+        // delegation and the delegate already gets the objective it was given.
+        let summary = config
+            .agent
+            .delegation
+            .summary
+            .as_ref()
+            .expect("coder-team keeps the summary section for opting back in");
+        assert!(!summary.enabled);
+
+        // Every merge asks the user.
+        let always_ask = format!("{:?}", config.agent.permissions.always_ask);
+        assert!(
+            always_ask.contains("accept_delegation_result"),
+            "{always_ask}"
+        );
+
+        // The orchestrator can delegate and merge but never edits or runs commands.
+        let tools: Vec<String> = config
+            .agent
+            .tools
+            .iter()
+            .map(|tool| format!("{tool:?}"))
+            .collect();
+        let has = |name: &str| {
+            tools
+                .iter()
+                .any(|tool| tool.contains(&format!("\"{name}\"")))
+        };
+        assert!(has("delegate"), "{tools:?}");
+        assert!(has("accept_delegation_result"), "{tools:?}");
+        for forbidden in ["shell", "edit", "write_file", "multiedit", "replace_symbol"] {
+            assert!(
+                !has(forbidden),
+                "the orchestrator must not have {forbidden}"
+            );
+        }
+
+        crate::api::Agent::builder_from_config(*config)
+            .expect("embedded coder-team tools should validate");
     }
 
     #[test]

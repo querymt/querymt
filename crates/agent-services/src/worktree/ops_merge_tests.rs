@@ -373,6 +373,7 @@ async fn merge_refuses_an_unrelated_commit() {
                     verification: None,
                     captured_at: time::OffsetDateTime::now_utc(),
                     captured_head: None,
+                    delegation_id: None,
                 },
             )
             .await
@@ -729,4 +730,68 @@ async fn follow_up_skipped_after_a_refused_merge() {
         assert!(w.wt().exists());
         assert!(w.host.announced.lock().unwrap().is_empty());
     }
+}
+
+// ── Pending handoff (delegation handoff core) ───────────────────────────────
+
+/// A pending handoff holds the checkout's exclusive lease; dropping it
+/// without a commit leaves the owner unchanged and releases the checkout.
+#[tokio::test]
+async fn pending_handoff_drop_releases_the_lease() {
+    let w = world(false).await;
+
+    let pending = w
+        .ops
+        .begin_handoff(&w.host, &w.target())
+        .await
+        .expect("idle owner begins a handoff");
+    assert_eq!(pending.previous(), "sess-wt");
+    assert_eq!(pending.record().id, w.record.id);
+
+    // While pending, nothing else may take the checkout.
+    let Err(held) = w.ops.acquire_exclusive_activity(&w.record).await else {
+        panic!("a pending handoff must hold the checkout");
+    };
+    assert_eq!(held.code(), "owner_active");
+
+    drop(pending);
+
+    let after = w.ops.lookup(w.record.id.as_str()).await.unwrap();
+    assert_eq!(after.ownership.owner_session_id.as_deref(), Some("sess-wt"));
+    assert_eq!(after.lifecycle, WorkspaceLifecycle::Ready);
+    w.ops
+        .acquire_exclusive_activity(&w.record)
+        .await
+        .expect("the lease is released when the pending handoff is dropped");
+}
+
+/// Committing transfers ownership with one compare-and-swap and releases the
+/// lease; a refused begin changes nothing.
+#[tokio::test]
+async fn pending_handoff_commit_transfers_ownership() {
+    let w = world(false).await;
+
+    let pending = w.ops.begin_handoff(&w.host, &w.target()).await.unwrap();
+    let moved = pending.commit(&w.ops, "sess-src").await.unwrap();
+    assert_eq!(
+        moved.ownership.owner_session_id.as_deref(),
+        Some("sess-src")
+    );
+    w.ops
+        .acquire_exclusive_activity(&w.record)
+        .await
+        .expect("commit releases the lease");
+
+    // The old owner no longer owns it; a busy new owner refuses a begin and
+    // leaves ownership as it was.
+    w.host.set_busy("sess-src");
+    let Err(refused) = w.ops.begin_handoff(&w.host, &w.target()).await else {
+        panic!("a busy owner must refuse the handoff");
+    };
+    assert_eq!(refused.code(), "owner_active");
+    let after = w.ops.lookup(w.record.id.as_str()).await.unwrap();
+    assert_eq!(
+        after.ownership.owner_session_id.as_deref(),
+        Some("sess-src")
+    );
 }

@@ -444,6 +444,7 @@ impl DelegationOrchestrator {
                 delegation,
                 batch_id,
                 cycle_id,
+                handoff_from,
                 ..
             } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
@@ -584,6 +585,7 @@ impl DelegationOrchestrator {
                 let hooks = self.hooks.clone();
                 let workspace_service = self.workspace_service.clone();
                 let batch_id = batch_id.clone();
+                let handoff_from = handoff_from.clone();
                 let requesting_cycle_id = cycle_id.clone();
                 let budget_pricing = self.budget_pricing.clone();
                 let budget_cap_usd = self.budget_cap_usd;
@@ -650,6 +652,7 @@ impl DelegationOrchestrator {
                             cancellation: cancellation_for_spawn,
                             workspace_service,
                             batch_id,
+                            handoff_from,
                             requesting_cycle_id,
                             budget_pricing,
                             budget_cap_usd,
@@ -885,6 +888,9 @@ struct DelegationContext {
     cancellation: Arc<DelegationCancellation>,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     batch_id: Option<String>,
+    /// Earlier delegation of the parent whose isolated worktree this
+    /// delegation takes over by ownership handoff.
+    handoff_from: Option<String>,
     /// Parent execution cycle that requested this delegation. The planning
     /// summary is charged to it even if it settles after newer cycles begin.
     requesting_cycle_id: Option<String>,
@@ -1208,6 +1214,30 @@ async fn execute_delegation_inner_unboxed(
         return;
     }
 
+    // A handoff continues an isolated worktree: it never degrades to a shared
+    // checkout, whatever isolation was recorded with the request.
+    if ctx.handoff_from.is_some()
+        && delegation.isolation != crate::worktree::DelegationIsolation::Isolated
+    {
+        fail_delegation(
+            DelegationFailureContext {
+                delegator: &ctx.delegator,
+                store: &ctx.store,
+                hooks: Some(&ctx.hooks),
+                parent_session_id: &parent_session_id,
+                delegation_id: &delegation.public_id,
+                target_agent_id: Some(&delegation.target_agent_id),
+                objective: Some(&delegation.objective),
+                execution_cwd: None,
+                child_session: None,
+            },
+            "delegation handoff refused: handoff_from requires isolated execution",
+        )
+        .await;
+        ctx.active_delegations.lock().await.remove(&delegation_id);
+        return;
+    }
+
     // Snapshot the parent's current per-session setting. UI changes persist this value
     // before returning, so delegation inherits the value active when it starts.
     let parent_reasoning_effort = match ctx.store.get_session_llm_config(&parent_session_id).await {
@@ -1341,10 +1371,57 @@ async fn execute_delegation_inner_unboxed(
     // the child is never launched into shared execution. The parent's
     // mutation gate is held only around batch baseline capture, never while
     // waiting on the delegate.
+    let mut pending_handoff: Option<crate::worktree::PendingHandoff> = None;
     let child_workspace = match (
         delegation.isolation == crate::worktree::DelegationIsolation::Isolated,
         ctx.workspace_service.as_ref(),
     ) {
+        // Delegation by handoff: the delegate takes over the worktree of an
+        // earlier delegation instead of allocating one. Every refusal fails
+        // the delegation before any session exists; the previous owner is
+        // untouched and nothing is allocated.
+        (true, Some(service)) if ctx.handoff_from.is_some() => {
+            let source = ctx.handoff_from.as_deref().unwrap_or_default();
+            let refusal = if _restricted {
+                Some(
+                    "handoff_unavailable: a restricted mesh delegation cannot take over a worktree"
+                        .to_string(),
+                )
+            } else if cancel_token.is_cancelled() {
+                Some("delegation cancelled".to_string())
+            } else {
+                None
+            };
+            let begun = match refusal {
+                Some(message) => Err(message),
+                None => begin_delegation_handoff(&ctx, service, &parent_session_id, source).await,
+            };
+            match begun {
+                Ok((binding, pending)) => {
+                    pending_handoff = Some(pending);
+                    Some(binding)
+                }
+                Err(message) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                            execution_cwd: None,
+                            child_session: None,
+                        },
+                        &format!("delegation handoff from '{source}' refused: {message}"),
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            }
+        }
         (true, Some(service)) => {
             let Some(parent_cwd) = effective_cwd.clone() else {
                 fail_delegation(
@@ -1499,6 +1576,7 @@ async fn execute_delegation_inner_unboxed(
         }
         Err(_) => warn!("Delegation start hook failed"),
     }
+    let mut handoff_previous_owner: Option<String> = None;
     let (child_session_id, session_ref) = match async {
         #[cfg(feature = "remote")]
         if _restricted {
@@ -1509,13 +1587,24 @@ async fn execute_delegation_inner_unboxed(
                 .create_confined_delegation_session(parent_session_id.clone(), authority)
                 .await;
         }
-        match child_workspace.as_ref() {
-            Some(binding) => {
+        match (child_workspace.as_ref(), pending_handoff.take()) {
+            (Some(binding), Some(pending)) => {
+                // Ownership moves inside this call, before the actor starts.
+                handoff_previous_owner = Some(pending.previous().to_owned());
+                target
+                    .create_handoff_delegation_session(
+                        binding.clone(),
+                        parent_session_id.clone(),
+                        pending,
+                    )
+                    .await
+            }
+            (Some(binding), None) => {
                 target
                     .create_isolated_delegation_session(binding.clone(), parent_session_id.clone())
                     .await
             }
-            None => {
+            (None, _) => {
                 target
                     .create_delegation_session(
                         &ctx.delegator,
@@ -1535,9 +1624,13 @@ async fn execute_delegation_inner_unboxed(
             // session owns it, so mark it failed (resources retained for
             // explicit recovery/removal) instead of leaving an orphaned
             // Ready workspace, and disclose it in the failure.
-            if let (Some(binding), Some(service)) =
-                (child_workspace.as_ref(), ctx.workspace_service.as_ref())
-            {
+            // A handoff never fails the workspace: it already had an owner,
+            // and the materializer returned or kept ownership consistently.
+            if let (Some(binding), Some(service), None) = (
+                child_workspace.as_ref(),
+                ctx.workspace_service.as_ref(),
+                handoff_previous_owner.as_deref(),
+            ) {
                 let _ = service
                     .mark_owner_binding_failed(
                         &binding.record.id,
@@ -1570,6 +1663,40 @@ async fn execute_delegation_inner_unboxed(
             ctx.active_delegations.lock().await.remove(&delegation_id);
             return;
         }
+    };
+    // Hold the delegate's checkout until the delegation reports its terminal
+    // state: verification, the history read and the result capture below run
+    // there after the delegate's actor went idle. Taken before anything else
+    // can wait, so no handoff, archive or snapshot merge slips in between.
+    let _delegation_hold = hold_delegate_checkout(
+        &target,
+        ctx.workspace_service.as_ref(),
+        child_workspace.as_ref(),
+        &child_session_id,
+    );
+    // Ownership moved to the delegate: record it on the previous owner's
+    // stream (best effort, like `/worktree handoff`) and refresh the binding
+    // so later steps see the delegate as the owner.
+    let child_workspace = match (child_workspace, handoff_previous_owner.as_deref()) {
+        (Some(binding), Some(previous)) => {
+            use crate::worktree::HandoffHost as _;
+            ctx.delegator
+                .announce_handoff(
+                    previous,
+                    binding.record.id.as_str(),
+                    &child_session_id,
+                    false,
+                )
+                .await;
+            Some(match ctx.workspace_service.as_ref() {
+                Some(service) => match service.registry().get_workspace(&binding.record.id).await {
+                    Ok(Some(record)) => service.binding_for(record).unwrap_or(binding),
+                    _ => binding,
+                },
+                None => binding,
+            })
+        }
+        (binding, _) => binding,
     };
     let _ = ctx.cancellation.child.set(DelegationChild {
         target: target.clone(),
@@ -2004,6 +2131,7 @@ async fn execute_delegation_inner_unboxed(
             ctx.activity.stage(Some(crate::control::delegation_notifications::DelegationStage::CancelRequested));
             // Cancellation — cancel the child session
             let _ = session_ref.cancel().await;
+            release_delegate_checkout(&target, &child_session_id);
 
             match ctx
                 .store
@@ -2229,7 +2357,7 @@ async fn execute_delegation_inner_unboxed(
                 (child_workspace.as_ref(), ctx.workspace_service.as_ref())
             {
                 match service
-                    .publish_result(
+                    .publish_delegation_result(
                         &binding.record,
                         &binding.effective_cwd,
                         Some(&binding.mutation_gate),
@@ -2242,6 +2370,10 @@ async fn execute_delegation_inner_unboxed(
                                 crate::worktree::ResultVerificationStatus::Skipped
                             },
                         ),
+                        // This run published it; after a handoff it is not
+                        // the worktree's own delegation, and acceptance
+                        // judges this run's status.
+                        Some(&delegation.public_id),
                     )
                     .await
                 {
@@ -2268,7 +2400,16 @@ async fn execute_delegation_inner_unboxed(
                                         "After reviewing, integrate it with \
                                          accept_delegation_result(delegation_id=\"{}\", \
                                          result_commit=\"{}\"); do not delegate patch/merge work.",
-                                        delegation.public_id, review.result_commit,
+                                        // The worktree stays named by the
+                                        // delegation that created it, also
+                                        // after a delegation by handoff.
+                                        binding
+                                            .record
+                                            .ownership
+                                            .delegation_id
+                                            .as_deref()
+                                            .unwrap_or(delegation.public_id.as_str()),
+                                        review.result_commit,
                                     )
                                 };
                                 summary.push_str(&format!(
@@ -2314,6 +2455,8 @@ async fn execute_delegation_inner_unboxed(
                 }
             }
 
+            // Verification, the history read and the result capture are done.
+            release_delegate_checkout(&target, &child_session_id);
             match ctx
                 .store
                 .transition_delegation_status(
@@ -2404,6 +2547,102 @@ fn workspace_retention_note(child_workspace: Option<&crate::worktree::WorkspaceB
     }
 }
 
+/// Holds an isolated local delegate's session and checkout for the rest of the
+/// delegation (see [`crate::agent::handle::delegation_hold`]). `None` for a
+/// shared or remote delegate: nothing of theirs can be handed off.
+fn hold_delegate_checkout(
+    target: &MemberAgent,
+    orchestrator_service: Option<&Arc<crate::worktree::WorkspaceService>>,
+    child_workspace: Option<&crate::worktree::WorkspaceBinding>,
+    child_session_id: &str,
+) -> Option<crate::agent::handle::delegation_hold::DelegationHold> {
+    let binding = child_workspace?;
+    let member = target.as_local()?;
+    // The lease lives under the storage root of the service the delegate's
+    // own actor and the worktree operations use: the member's.
+    let lease = member
+        .config
+        .workspace_service()
+        .or_else(|| orchestrator_service.cloned())
+        .and_then(|service| {
+            crate::worktree::gate::CheckoutActivityLease::acquire(
+                service.storage_root(),
+                &binding.record.checkout_path,
+                false,
+            )
+            .inspect_err(|err| {
+                warn!(
+                    "delegation: could not take the shared activity lease of {}: {err}",
+                    binding.record.checkout_path.display()
+                );
+            })
+            .ok()
+        });
+    Some(member.delegation_holds.hold(child_session_id, lease))
+}
+
+/// Ends the hold of [`hold_delegate_checkout`] before the delegation reports
+/// its terminal state: the delegating session may hand the worktree on as
+/// soon as it learns that the delegation ended.
+fn release_delegate_checkout(target: &MemberAgent, child_session_id: &str) {
+    if let Some(member) = target.as_local() {
+        member.delegation_holds.release(child_session_id);
+    }
+}
+
+/// First half of a delegation by handoff: find the worktree of `source`, check
+/// that the delegating session made it, stop its idle owner and hold the
+/// checkout. Nothing is created or changed; every refusal names its code.
+///
+/// The worktree stays recorded under the delegation that created it, so
+/// `source` is always that delegation (the id the orchestrator was shown); a
+/// handoff delegation's own id has no worktree of its own.
+async fn begin_delegation_handoff(
+    ctx: &DelegationContext,
+    service: &Arc<crate::worktree::WorkspaceService>,
+    parent_session_id: &str,
+    source: &str,
+) -> Result<
+    (
+        crate::worktree::WorkspaceBinding,
+        crate::worktree::PendingHandoff,
+    ),
+    String,
+> {
+    match ctx.store.get_delegation(source).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(format!("unknown_delegation: no delegation '{source}'")),
+        Err(err) => return Err(format!("cannot look up delegation '{source}': {err}")),
+    }
+    let record = match service.registry().get_workspace_by_delegation(source).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Err(format!(
+                "no_isolated_workspace: delegation '{source}' has no isolated worktree \
+                 (it ran in a shared checkout, or only continued another delegation's worktree)"
+            ));
+        }
+        Err(err) => return Err(format!("cannot look up the worktree of '{source}': {err}")),
+    };
+    if record.ownership.parent_session_id.as_deref() != Some(parent_session_id) {
+        return Err(format!(
+            "not_parent_session: delegation '{source}' was not made by this session"
+        ));
+    }
+    let ops = crate::worktree::WorktreeOps::new(service.clone());
+    let pending = ops
+        .begin_handoff(
+            &*ctx.delegator,
+            &crate::worktree::WorkspaceTarget::Workspace(record.id.to_string()),
+        )
+        .await
+        .map_err(|err| format!("{}: {err}", err.code()))?;
+    let binding = service
+        .binding_for(pending.record().clone())
+        .map_err(|err| format!("cannot bind the worktree: {err}"))?;
+    Ok((binding, pending))
+}
+
 async fn persist_delegate_runtime_binding(
     store: &dyn SessionStore,
     parent_session_id: &str,
@@ -2472,6 +2711,9 @@ fn fail_delegation<'a>(
 )]
 async fn fail_delegation_unboxed(ctx: DelegationFailureContext<'_>, error_message: &str) {
     error!("Delegation failed");
+    if let Some((target, child_session_id)) = ctx.child_session {
+        release_delegate_checkout(target, child_session_id);
+    }
     let transitioned = match ctx
         .store
         .transition_delegation_status(
@@ -2876,6 +3118,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         );
         let activity = WorkflowActivity::new(
@@ -3285,6 +3528,7 @@ mod tests {
                     tool_call_id: None,
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             })
             .await
@@ -3410,6 +3654,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         });
         orchestrator.handle_envelope(&envelope).await;
@@ -3645,6 +3890,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         });
         orchestrator.handle_envelope(&envelope).await;

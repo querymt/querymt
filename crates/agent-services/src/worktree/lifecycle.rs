@@ -1603,6 +1603,7 @@ mod tests {
                     verification: Some(ResultVerificationStatus::Passed),
                     captured_at: time::OffsetDateTime::now_utc(),
                     captured_head: None,
+                    delegation_id: None,
                 },
             )
             .await
@@ -2151,6 +2152,7 @@ mod tests {
                     verification: Some(ResultVerificationStatus::Passed),
                     captured_at: time::OffsetDateTime::now_utc(),
                     captured_head: None,
+                    delegation_id: None,
                 },
             )
             .await

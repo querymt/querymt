@@ -279,6 +279,15 @@ impl WorkspaceRepository for FaultInjectingWorkspaceRepository {
         self.inner().transfer_owner(id, from, to).await
     }
 
+    async fn revert_transfer(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        previous: &str,
+        successor: &str,
+    ) -> crate::session::error::SessionResult<crate::worktree::domain::WorkspaceRecord> {
+        self.inner().revert_transfer(id, previous, successor).await
+    }
+
     async fn transferred_to(
         &self,
         session_id: &str,

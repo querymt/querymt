@@ -79,11 +79,11 @@ pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
     Announcement, ArchiveOutcome, FollowUp, FollowUpOutcome, HandoffHost, HandoffOptions,
-    IsolatedSessionSpawner, MergeOptions, MergeOutcome, OwnerHost, RemoveOutcome, WorkspaceTarget,
-    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeFollowUpError, WorktreeHandoffResponse,
-    WorktreeListResponse, WorktreeMergeResponse, WorktreeOpError, WorktreeOps,
-    WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry,
-    WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
+    IsolatedSessionSpawner, MergeOptions, MergeOutcome, OwnerHost, PendingHandoff, RemoveOutcome,
+    WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeFollowUpError,
+    WorktreeHandoffResponse, WorktreeListResponse, WorktreeMergeResponse, WorktreeOpError,
+    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
+    WorktreeResultEntry, WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
 pub use querymt_agent_core::worktree::repository::WorkspaceRepository;

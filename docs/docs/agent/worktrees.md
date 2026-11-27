@@ -794,6 +794,57 @@ event fanout and storage journal, so announcements reach connections served by
 the root agent; runtimes given separate fanouts are only forwarded if they are
 registered as event sources.
 
+### Delegating to a successor (`handoff_from`)
+
+An orchestrating session can also hand a worktree to a **delegate**: the
+`delegate` tool's `handoff_from` argument names an earlier isolated delegation
+of the same session, and the new delegate session becomes the owner of *that*
+delegation's worktree (see [Delegation](delegation.md)). It uses the same
+ordering as `/worktree handoff` (stop the idle owner, take the exclusive
+activity lease, create the successor behind its startup barrier, transfer with
+one compare-and-swap, release), with these differences:
+
+- the successor is a delegate session: parent is the delegating session, fork
+  origin `delegation`, no copied history, hidden from listings;
+- ownership moves **before** the delegate's actor starts, and the previous
+  owner's stream records `worktree_ownership_transferred` (no summary);
+- a failed start (also one after the delegate's actor started) never fails the
+  workspace: ownership goes back to the previous owner, which is writable again
+  and can be handed off later, and the successor is discarded; if that is
+  refused too, the successor keeps the workspace and `recover` resolves it;
+- a delegation holds its delegate's worktree until it reports its terminal
+  state, not only while the delegate's turn runs: verification, the summary
+  read and the result capture happen after the turn. Until then a handoff (by
+  `handoff_from` or `/worktree handoff`), archive, removal or snapshot merge of
+  that worktree is refused with `owner_active` and changes nothing;
+- the worktree stays recorded under the delegation that created it, so results
+  of every owner are accepted with that one id.
+
+```mermaid
+sequenceDiagram
+  participant P as Orchestrator session
+  participant O as Delegation orchestrator
+  participant W as Worktree ops
+  participant C as Coder session (owner)
+  participant R as Reviewer session
+  P->>O: delegate(reviewer, handoff_from=D1)
+  O->>W: find D1's worktree, check it was made by P
+  O->>W: begin_handoff: stop idle owner, hold exclusive lease
+  W->>C: unload (refused with owner_active while it runs)
+  O->>R: create session behind startup barrier
+  W->>W: transfer owner C to R, release lease
+  O->>C: record worktree_ownership_transferred
+  R->>R: start actor, run, edit files in place
+  O->>W: publish result R2 on the worktree
+  O-->>P: completed, accept_delegation_result(D1, R2)
+  P->>W: accept_delegation_result(D1, R2): one commit, coder + reviewer changes
+```
+
+Delegates read `.agents` (skills, commands, `AGENTS.md`) from **their own
+checkout**, so a worktree delegate sees the files committed or present in its
+baseline. A gitignored `.agents/` directory is not in a delegate's baseline and
+is therefore not visible to delegates.
+
 ## Archiving from any session
 
 `archive` permanently retires execution in a managed checkout while preserving
@@ -934,6 +985,17 @@ runtime code, not a prompt:
   parent session may accept, and never into the delegate's own workspace.
 - A refusal or conflict is final for that result. Delegate the underlying change
   again from the current state rather than patching by hand.
+
+A delegate that ran by [handoff](#delegating-to-a-successor-handoff_from) in
+an earlier delegate's worktree publishes its own result on that worktree.
+Accept it with the **worktree's original delegation id** (the one that created
+it) and the new result commit: the delta is still `baseline → result`, so it
+contains the earlier owners' edits as well as the new owner's. Each retained
+result records the delegation whose completion published it, and acceptance
+requires *that* run to be complete: a result published by a completed reviewer
+is accepted even when the coder that created the worktree failed or was
+cancelled. A result published without a delegation (`/worktree publish`, a
+merge snapshot) is judged on the worktree's own delegation, as before.
 
 ### How an acceptance runs
 

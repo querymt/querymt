@@ -254,6 +254,27 @@ impl MemberAgent {
         }
     }
 
+    /// Opens a delegate session in an existing workspace by ownership
+    /// handoff. Local members only: a remote member cannot take over a
+    /// checkout on this node.
+    pub async fn create_handoff_delegation_session(
+        &self,
+        workspace: crate::worktree::WorkspaceBinding,
+        parent_session_id: String,
+        pending: crate::worktree::PendingHandoff,
+    ) -> Result<(String, SessionActorRef), AcpError> {
+        match self {
+            Self::Local(handle) => {
+                handle
+                    .create_handoff_delegation_session(workspace, parent_session_id, pending)
+                    .await
+            }
+            #[cfg(feature = "remote")]
+            Self::Remote(_) => Err(AcpError::invalid_request()
+                .data("delegation handoff requires local workspace execution")),
+        }
+    }
+
     /// Sets persisted lifecycle state without loading the session actor.
     #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub async fn set_session_lifecycle(

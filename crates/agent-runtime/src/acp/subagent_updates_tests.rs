@@ -71,6 +71,7 @@ fn requested() -> EventEnvelope {
             tool_call_id: Some("call-1".into()),
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     )
 }
@@ -521,6 +522,7 @@ fn delegation_history_ending(
                 tool_call_id: Some(tool_call_id.into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ),
         agent_event(
@@ -657,6 +659,7 @@ async fn snapshot_shows_a_running_delegation() {
         tool_call_id: Some("call-1".into()),
         batch_id: None,
         cycle_id: None,
+        handoff_from: None,
     });
     stream.emit(AgentEventKind::SessionForked {
         parent_session_id: session_id.clone(),

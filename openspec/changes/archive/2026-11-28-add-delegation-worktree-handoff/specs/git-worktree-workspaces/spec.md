@@ -45,5 +45,6 @@ A delegating session SHALL be able to move ownership of a ready workspace create
 - **AND** a durable ownership-transferred event naming the workspace and the delegate session, with no summary seeded, is recorded on the previous owner's stream
 
 #### Scenario: Delegate successor fails to start
-- **WHEN** ownership has moved to a delegate session by delegation handoff and the delegate session then fails to start
+- **WHEN** ownership has moved to a delegate session by delegation handoff and the delegate session then fails to start, before or after its actor started
 - **THEN** the delegation fails, the workspace stays ready and is not marked failed, and the workspace is owned by either the previous owner or the delegate session, never by no session
+- **AND** when it is back with the previous owner, that owner is writable again (not marked as handed off) and the workspace can be handed off again

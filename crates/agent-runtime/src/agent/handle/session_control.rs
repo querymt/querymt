@@ -280,7 +280,27 @@ impl LocalAgentHandle {
         {
             return Box::pin(local.unload_idle_in_runtime(session_id)).await;
         }
+        if let Some(member) = self.member_hosting_session(session_id).await {
+            return Box::pin(member.unload_idle_in_runtime(session_id)).await;
+        }
         self.unload_idle_in_runtime(session_id).await
+    }
+
+    /// The built local member whose registry holds `session_id`'s actor, when
+    /// this handle does not hold it itself. In a config-file run a delegate
+    /// session is not profile-bound: its actor lives in its member's registry,
+    /// so the root's own registry reports it as not loaded. Observe only; a
+    /// member is never built.
+    async fn member_hosting_session(&self, session_id: &str) -> Option<Arc<LocalAgentHandle>> {
+        if self.registry.lock().await.get(session_id).is_some() {
+            return None;
+        }
+        for member in self.local_members() {
+            if member.registry.lock().await.get(session_id).is_some() {
+                return Some(member);
+            }
+        }
+        None
     }
 
     /// Whether `session_id` has a running turn, queued input or pending
@@ -293,12 +313,19 @@ impl LocalAgentHandle {
         {
             return Box::pin(local.session_is_busy_in_runtime(session_id)).await;
         }
+        if let Some(member) = self.member_hosting_session(session_id).await {
+            return Box::pin(member.session_is_busy_in_runtime(session_id)).await;
+        }
         self.session_is_busy_in_runtime(session_id).await
     }
 
     async fn session_is_busy_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
         use crate::agent::messages::SessionRuntimePhase;
 
+        // A delegation still finishing in this delegate's checkout.
+        if self.delegation_holds.is_held(session_id) {
+            return Ok(true);
+        }
         let session = {
             let registry = self.registry.lock().await;
             registry.get(session_id).cloned()
@@ -328,6 +355,11 @@ impl LocalAgentHandle {
     async fn unload_idle_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
         use crate::agent::messages::SessionRuntimePhase;
 
+        // A delegation still finishing in this delegate's checkout reads its
+        // history through the actor: never unload it from under it.
+        if self.delegation_holds.is_held(session_id) {
+            return Ok(true);
+        }
         // The idle check and the removal happen under one registry lock, so a
         // prompt cannot look the actor up between them: it either runs first
         // (the session is then busy) or finds the session unloaded.

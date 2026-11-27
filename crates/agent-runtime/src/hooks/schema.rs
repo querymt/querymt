@@ -655,6 +655,9 @@ pub struct PreDelegationCommandInput {
     pub context: NullableString,
     pub constraints: NullableString,
     pub expected_output: NullableString,
+    /// Earlier delegation whose isolated worktree this delegate takes over by
+    /// ownership handoff, or null. Read-only: hooks cannot redirect it.
+    pub handoff_from: NullableString,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

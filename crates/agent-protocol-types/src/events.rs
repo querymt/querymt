@@ -931,6 +931,12 @@ pub enum AgentEventKind {
         /// it settles after a newer cycle began. Absent on older events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cycle_id: Option<String>,
+        /// Earlier delegation of the same session whose isolated worktree
+        /// this delegation takes over by ownership handoff. Absent when the
+        /// delegation allocates or shares its own checkout, and on older
+        /// events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_from: Option<String>,
     },
     DelegationCompleted {
         delegation_id: String,

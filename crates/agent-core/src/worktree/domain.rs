@@ -601,6 +601,12 @@ pub struct ResultProvenance {
     /// from the workspace baseline in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_head: Option<String>,
+    /// The delegation whose completion published this result. After a
+    /// delegation by handoff it differs from the workspace's own delegation,
+    /// and acceptance judges the run that produced the result. `None` for an
+    /// explicit publish, a merge snapshot, and rows written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
 }
 
 /// How a path changed between two immutable trees (baseline → result).
@@ -1046,6 +1052,7 @@ mod tests {
             verification: Some(ResultVerificationStatus::Passed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
             captured_head: Some("head789".into()),
+            delegation_id: Some("delegation-2".into()),
         };
         assert_eq!(roundtrip(&provenance), provenance);
     }
@@ -1059,6 +1066,7 @@ mod tests {
             verification: Some(ResultVerificationStatus::Failed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
             captured_head: None,
+            delegation_id: None,
         };
         assert_eq!(roundtrip(&provenance), provenance);
     }
@@ -1074,6 +1082,7 @@ mod tests {
         });
         let provenance: ResultProvenance = serde_json::from_value(legacy).unwrap();
         assert_eq!(provenance.captured_head, None);
+        assert_eq!(provenance.delegation_id, None);
     }
 
     #[test]

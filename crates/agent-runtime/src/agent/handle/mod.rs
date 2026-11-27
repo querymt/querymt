@@ -4,6 +4,7 @@
 pub(crate) mod admin_cancel;
 pub(crate) mod agent_handle_impl;
 pub(crate) mod core;
+pub(crate) mod delegation_hold;
 pub(crate) mod ext;
 pub(crate) mod ext_auth;
 pub(crate) mod ext_mesh;
@@ -52,7 +53,9 @@ use crate::acp::protocol::{
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
 use crate::agent::remote::SessionActorRef;
-use crate::agent::session_materializer::{PreparedSessionResult, SessionMaterializer};
+use crate::agent::session_materializer::{
+    PreallocatedWorkspace, PreparedSessionResult, SessionMaterializer,
+};
 use crate::agent::session_registry::SessionRegistry;
 use crate::middleware::CompositeDriver;
 use crate::profile_host::ProfileRuntimeHost;
@@ -185,6 +188,11 @@ pub struct LocalAgentHandle {
     /// Cancellable administration steps that run without a session actor (a
     /// handoff summary), reached by `session/cancel`.
     pub(crate) admin_cancels: admin_cancel::AdminCancels,
+
+    /// Delegate sessions hosted here whose delegation is still verifying,
+    /// summarizing or publishing in their checkout: reported busy, so no
+    /// worktree operation unloads them or takes their checkout.
+    pub(crate) delegation_holds: delegation_hold::DelegationHolds,
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,

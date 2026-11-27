@@ -196,8 +196,53 @@
   sends the todo plan once as a `plan_update` for plan-operations clients.
   Clients that ignore unknown notifications and `_meta` keys see no change.
 
+- **A delegate can run in an earlier delegate's worktree (`handoff_from`).** The
+  `delegate` tool takes an optional `handoff_from`: the id of an earlier isolated
+  delegation of the same session. The new delegate session takes over that
+  delegation's worktree by ownership handoff (the compare-and-swap transfer
+  `/worktree handoff` uses): same checkout, branch, baseline and edits, no
+  worktree allocated, the previous owner becomes read-only (`owner_transferred`)
+  and the new delegate session is a delegate of the requesting session (fork
+  origin `delegation`). A refused handoff (`not_parent_session`,
+  `no_isolated_workspace`, `owner_active`, unknown delegation, owner not local)
+  fails the delegation before the delegate runs and changes nothing; combining it
+  with `isolation = "shared"` is rejected. The worktree keeps the id of the
+  delegation that created it, so `accept_delegation_result` takes that id with
+  the latest result and merges every owner's edits; each retained result
+  records the delegation whose completion published it (new nullable
+  `workspace_results.delegation_id` column, migration
+  `0042_workspace_result_publisher`), and acceptance requires that run to be
+  complete, so a completed reviewer's result is accepted after a failed coder.
+  A delegation holds its delegate's worktree until it reports its terminal
+  state (verification, summary and result capture run after the delegate's
+  turn): a handoff, archive or snapshot merge in that window is refused with
+  `owner_active` instead of unloading the delegate. A delegate successor that
+  fails after ownership moved to it, also after its actor started, returns the
+  worktree to the previous owner, which stays writable. **BREAKING (tool and wire
+  shape, additive):** the `delegate` tool schema, the `delegation_requested`
+  event (`handoff_from`, omitted when unused; older events deserialize without
+  it) and the `pre_delegation` hook input (`handoff_from`, `null` when unused,
+  read-only for hooks) each gain an optional field. querymt-desktop can show
+  "continues delegation X" for events that carry it.
+- **`coder-team` example profile.** An orchestrator in plan mode that explores,
+  delegates and merges (every `accept_delegation_result` asks the user), an
+  isolated `coder`, a `reviewer` that takes over the coder's worktree with
+  `handoff_from`, reviews and fixes in place and ends with a verdict, and a
+  shared read-only `explorer`. `[dotagents]` and `[agent.workspace]` are on.
+  Embedded in `qmtcode` next to `coder-delegate` and selectable there; the
+  mobile catalog does not include it.
+
 ### Behavior changes
 
+- **The `coder-team` profile no longer writes a planning summary before each
+  delegation.** Its `[agent.delegation.summary]` is kept but set to
+  `enabled = false`. The summary was an extra LLM call on every delegation's
+  critical path (12-15 s per delegation in traces), and with the default
+  `max_tokens = 2000` the brief was cut off and discarded, so delegates never
+  received it. Delegates still get the objective, context and constraints
+  written in the `delegate` call, and the result handed back to the
+  orchestrator is unchanged (it never used this summary). Set `enabled = true`
+  in a copy of the profile, with a larger `max_tokens`, to bring it back.
 - **BREAKING (behaviour): a session reads the slash commands of its own
   folder.** Fixes `/` not offering, and `/explain` not running, the
   `.qmt/commands/*.md` of the folder a session was opened in (a `qmtcode`
@@ -1094,6 +1139,13 @@
   way.
 
 ### Fixed
+
+- **Stopping a delegate's session finds it in config-file runs.** The root's
+  idle-unload and busy check looked only in its own registry and the profile
+  runtimes, so a delegate's actor living in its member's registry was reported
+  as not loaded while it was still running. `/worktree handoff`, archive and
+  removal of a delegate-owned worktree now unload (or refuse as `owner_active`)
+  the member's actor first.
 
 - **A failed scheduled run is attributed to its own cycle.** The scheduler now
   names the run it fires, and the run's terminal events (including a failure

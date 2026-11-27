@@ -187,6 +187,7 @@ cargo run --example qmtcode --profile default
 **Available embedded profiles:**
 - `default` - Default single coder configuration
 - `coder_delegate` - Coder with delegation support
+- `coder-team` - (qmtcode only) Orchestrator with an isolated `coder`, a `reviewer` that takes over the coder's worktree by handoff, and a read-only `explorer`; every merge asks you first (see [Examples](examples.md#coder_teamtoml-orchestrator-coder-and-reviewer-in-one-worktree))
 
 ### Catalog Resolution Order
 

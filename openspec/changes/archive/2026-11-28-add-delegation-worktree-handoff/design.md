@@ -108,7 +108,7 @@ The worktree record's `delegation_id` stays D1. For a delegate that ran by hando
 
 ### D6. `coder-team` profile
 
-`crates/agent/examples/confs/coder_team.toml`, embedded in `crates/agent/src/profiles.rs` next to `coder-delegate`:
+`crates/agent/examples/confs/coder_team.toml`, embedded by `crates/agent/src/profiles.rs` (`embedded_coder_team_profile_toml`) and added to the catalog by `qmtcode` only, next to `coder-delegate`. `standard_embedded_profile_catalog_builder` (shared with the mobile catalog) is unchanged, so mobile does not get the profile:
 
 - `[dotagents] enabled = true` and `[agent.workspace] enabled = true` (`baseline = "current_working_tree"`, so delegates start from the user's current edits).
 - `[agent]` (orchestrator): `mode = "plan"`, read-only tools plus `delegate`, `accept_delegation_result`, `question`, todos, `skill`, `browse`. No `shell` and no edit tools: exploration that needs commands goes to `explorer`.

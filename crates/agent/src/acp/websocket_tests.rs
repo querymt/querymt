@@ -541,6 +541,7 @@ async fn status_consistency_lag_refreshes_ephemeral_runtime_and_cleanup() {
         tool_call_id: None,
         batch_id: None,
         cycle_id: None,
+        handoff_from: None,
     });
     stream.emit_ephemeral(AgentEventKind::DelegationStageChanged {
         delegation_id: "lag-workflow".into(),
@@ -1201,6 +1202,7 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         }));
 
@@ -1245,6 +1247,7 @@ async fn loaded_session_emits_live_delegation_completion_without_reloading() {
         tool_call_id: Some("call-1".into()),
         batch_id: None,
         cycle_id: None,
+        handoff_from: None,
     });
     stream.emit(AgentEventKind::SessionForked {
         parent_session_id: session_id.clone(),

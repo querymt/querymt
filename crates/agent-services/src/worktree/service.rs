@@ -292,6 +292,16 @@ impl WorkspaceService {
         Ok(Some(WorkspaceBinding::new(record, &self.storage_root)?))
     }
 
+    /// The binding of an existing workspace record: its execution cwd and the
+    /// checkout's mutation gate. Used by a delegation that takes over a
+    /// workspace by ownership handoff instead of allocating one.
+    ///
+    /// # Errors
+    /// When the checkout's mutation gate cannot be created.
+    pub fn binding_for(&self, record: WorkspaceRecord) -> WorktreeResult<WorkspaceBinding> {
+        WorkspaceBinding::new(record, &self.storage_root)
+    }
+
     /// Bind a freshly created session as the workspace's single writable
     /// owner. Fails when another session already owns it (fail closed; a
     /// second writable attachment is rejected, not silently shared).
@@ -804,6 +814,24 @@ impl WorkspaceService {
         gate: Option<&CheckoutMutationGate>,
         verification: Option<ResultVerificationStatus>,
     ) -> WorktreeResult<ResultProvenance> {
+        self.publish_delegation_result(record, checkout, gate, verification, None)
+            .await
+    }
+
+    /// [`Self::publish_result`] for the completion of `delegation_id`, which
+    /// is recorded as the result's publisher. After a delegation by handoff
+    /// it is not the workspace's own delegation; acceptance judges it.
+    ///
+    /// # Errors
+    /// Same as [`Self::publish_result`].
+    pub async fn publish_delegation_result(
+        &self,
+        record: &WorkspaceRecord,
+        checkout: &Path,
+        gate: Option<&CheckoutMutationGate>,
+        verification: Option<ResultVerificationStatus>,
+        delegation_id: Option<&str>,
+    ) -> WorktreeResult<ResultProvenance> {
         crate::worktree::placement::ensure_local_filesystem_execution(checkout)?;
 
         let message = result_commit_message(&record.id);
@@ -817,11 +845,12 @@ impl WorkspaceService {
             Some(gate) => gate.run(capture).await??,
             None => capture.await?,
         };
-        self.retain_result(
+        self.retain_result_published_by(
             record,
             &captured.commit,
             &captured.source_head,
             verification,
+            delegation_id,
         )
         .await
     }
@@ -841,6 +870,18 @@ impl WorkspaceService {
         captured_head: &str,
         verification: Option<ResultVerificationStatus>,
     ) -> WorktreeResult<ResultProvenance> {
+        self.retain_result_published_by(record, commit, captured_head, verification, None)
+            .await
+    }
+
+    async fn retain_result_published_by(
+        &self,
+        record: &WorkspaceRecord,
+        commit: &str,
+        captured_head: &str,
+        verification: Option<ResultVerificationStatus>,
+        delegation_id: Option<&str>,
+    ) -> WorktreeResult<ResultProvenance> {
         let result_ref = format!("refs/qmt/results/{}/{}", record.id, uuid::Uuid::now_v7());
         self.git
             .create_ref_if_absent(&record.repository.common_dir, result_ref.as_str(), commit)
@@ -857,6 +898,7 @@ impl WorkspaceService {
             verification,
             captured_at: time::OffsetDateTime::now_utc(),
             captured_head: Some(captured_head.to_string()),
+            delegation_id: delegation_id.map(str::to_owned),
         };
         self.registry.record_result(&record.id, &provenance).await?;
         Ok(provenance)

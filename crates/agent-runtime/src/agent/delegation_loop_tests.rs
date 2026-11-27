@@ -106,6 +106,7 @@ async fn custom_delegate_runs_on_host_under_its_stored_authority() {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     tokio::time::timeout(Duration::from_secs(8), async {
@@ -563,6 +564,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             };
             let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
             async {
@@ -1463,6 +1465,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     let parent = store
@@ -1499,6 +1502,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     // The delegation status is persisted before the child session is resolved,
@@ -1654,6 +1658,7 @@ async fn wait_timeout_cancellation_resolves_child_and_preserves_reopen() {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1986,6 +1991,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2278,6 +2284,7 @@ async fn verification_failure_resolves_terminal_delegate_child() {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
 

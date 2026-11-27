@@ -201,7 +201,19 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0041_session_todo_plans",
         apply: migration_0041_session_todo_plans,
     },
+    Migration {
+        version: "0042_workspace_result_publisher",
+        apply: migration_0042_workspace_result_publisher,
+    },
 ];
+
+/// Record which delegation published each retained result, so a result
+/// published by a delegation that ran by handoff is accepted on that run's
+/// status. Existing rows keep NULL. Guarded so the migration is idempotent
+/// for fresh installs.
+fn migration_0042_workspace_result_publisher(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_result_publisher(conn)
+}
 
 /// Persisted todo plan per session, for `session/list`. Existing sessions are
 /// backfilled from the last `todowrite` call in their journal, through the

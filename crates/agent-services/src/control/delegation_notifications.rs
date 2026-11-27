@@ -620,6 +620,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         let mut stage = event(
@@ -682,6 +683,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         let stage = |seq, value| {
@@ -733,6 +735,7 @@ mod tests {
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         );
         let forked = event(
@@ -793,6 +796,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         let update = projector
@@ -827,6 +831,7 @@ mod tests {
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         projector.project_event(&event(
@@ -836,6 +841,7 @@ mod tests {
                 tool_call_id: Some("call-2".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
 
@@ -855,6 +861,7 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         let update = projector
@@ -898,6 +905,7 @@ mod tests {
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             ))
             .unwrap();
@@ -940,6 +948,7 @@ mod tests {
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             ))
             .unwrap();
@@ -960,6 +969,7 @@ mod tests {
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ));
         let completed = projector
@@ -1014,6 +1024,7 @@ mod tests {
                     tool_call_id: None,
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             ));
         }
@@ -1042,6 +1053,7 @@ mod tests {
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             ),
             event(
@@ -1090,6 +1102,7 @@ mod tests {
             tool_call_id: None,
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         })
         .unwrap();
         let mut value = value.as_object().unwrap().clone();
@@ -1103,8 +1116,50 @@ mod tests {
                 tool_call_id: None,
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn requested_event_handoff_from_is_additive_and_round_trips() {
+        // An event without the field (older journals) deserializes to None
+        // and does not serialize the key.
+        let without = serde_json::to_value(AgentEventKind::DelegationRequested {
+            delegation: delegation(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+            handoff_from: None,
+        })
+        .unwrap();
+        assert!(without["data"].get("handoff_from").is_none());
+        let decoded: AgentEventKind = serde_json::from_value(without).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEventKind::DelegationRequested {
+                handoff_from: None,
+                ..
+            }
+        ));
+
+        // An event with the field round-trips.
+        let with = serde_json::to_value(AgentEventKind::DelegationRequested {
+            delegation: delegation(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+            handoff_from: Some("delegation-0".into()),
+        })
+        .unwrap();
+        assert_eq!(with["data"]["handoff_from"], "delegation-0");
+        let decoded: AgentEventKind = serde_json::from_value(with).unwrap();
+        match decoded {
+            AgentEventKind::DelegationRequested { handoff_from, .. } => {
+                assert_eq!(handoff_from.as_deref(), Some("delegation-0"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 }

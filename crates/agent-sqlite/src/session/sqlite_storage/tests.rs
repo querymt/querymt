@@ -2788,6 +2788,7 @@ fn worktree_workspace_migration_upgrades_existing_database() {
                 "verification",
                 "captured_at",
                 "captured_head",
+                "delegation_id",
             ],
         ),
     ] {

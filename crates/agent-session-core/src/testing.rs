@@ -272,6 +272,7 @@ fn delegation(events: &mut Vec<Value>, seq: &mut i64, ids: &DelegationIds) {
             batch_id: None,
             tool_call_id: Some(ids.tool_call_id.clone()),
             cycle_id: None,
+            handoff_from: None,
         },
     );
     push(

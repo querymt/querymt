@@ -46,7 +46,8 @@ use clap::{ArgAction, ArgGroup, Parser};
 use querymt_agent::prelude::*;
 use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
-    ProfileSource, ensure_unique_profile_ids, standard_embedded_profile_catalog_builder,
+    ProfileSource, embedded_coder_team_profile_toml, ensure_unique_profile_ids,
+    standard_embedded_profile_catalog_builder,
 };
 #[cfg(any(feature = "api", feature = "dashboard-server"))]
 use querymt_agent::server::ServerMode;
@@ -365,7 +366,10 @@ fn qmtcode_profile_catalog_with_user_dir(
     profiles_dirs: &[PathBuf],
     user_profiles_dir: Option<PathBuf>,
 ) -> anyhow::Result<LocalProfileCatalog> {
-    let mut builder = standard_embedded_profile_catalog_builder()?;
+    // qmtcode also offers the `coder-team` example profile (the mobile catalog,
+    // which shares the standard builder, does not).
+    let mut builder = standard_embedded_profile_catalog_builder()?
+        .embedded_profile_toml(embedded_coder_team_profile_toml()?)?;
 
     // ~/.qmt/profiles is the conventional user-local profile directory; missing dirs are ignored.
     builder = match user_profiles_dir {
@@ -1083,7 +1087,8 @@ mod tests {
             .expect("catalog should build");
         let profiles = catalog.list_profiles().await.expect("profiles should list");
 
-        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles.len(), 3);
+        assert!(profiles.iter().any(|profile| profile.id == "coder-team"));
         let default = profiles
             .iter()
             .find(|profile| profile.id == DEFAULT_EMBEDDED_PROFILE_KEY)
